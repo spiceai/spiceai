@@ -47,18 +47,18 @@ use arrow_tools::map_entries::MapEntriesNormalizer;
 use datafusion::catalog::{
     Session, TableFunctionImpl, TableProvider, default_table_source::provider_as_source,
 };
+use datafusion::common::TableReference;
 use datafusion::common::{Column, DataFusionError, Result as DataFusionResult, Spans};
 use datafusion::datasource::TableType;
 use datafusion::execution::SessionState;
 use datafusion::logical_expr::{
     ColumnarValue, LogicalPlan, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Subquery,
-    TableScan, Volatility as DfVolatility,
+    TableScanBuilder, Volatility as DfVolatility,
     simplify::{ExprSimplifyResult, SimplifyContext},
 };
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::{Expr, SessionContext};
 use datafusion::scalar::ScalarValue;
-use datafusion::sql::TableReference;
 use datafusion_datasource::memory::MemorySourceConfig;
 use datafusion_datasource::source::DataSourceExec;
 use serde_json::Value;
@@ -448,13 +448,11 @@ impl ScalarUDFImpl for WasmScalarTableArgUdf {
         #[expect(deprecated)]
         let provider = self.table_func.call(&args)?;
         let table_source = provider_as_source(provider);
-        let table_scan = TableScan::try_new(
+        let table_scan = TableScanBuilder::new(
             TableReference::bare(format!("{}_result", self.name)),
             table_source,
-            None,
-            vec![],
-            None,
-        )?;
+        )
+        .build()?;
         Ok(ExprSimplifyResult::Simplified(Expr::ScalarSubquery(
             Subquery {
                 subquery: Arc::new(LogicalPlan::TableScan(table_scan)),
@@ -1959,12 +1957,15 @@ mod tests {
         )
         .expect("entries struct");
 
-        let data = ArrayData::builder(data_type.clone())
+        let builder = ArrayData::builder(data_type.clone())
             .len(1)
             .add_buffer(Buffer::from_slice_ref([0_i32, 1]))
-            .add_child_data(entries.to_data())
-            .build()
-            .expect("map array data");
+            .add_child_data(entries.to_data());
+        // SAFETY: the offsets, buffers and child data are well formed. Only the
+        // `entries` nullability declaration is what `ArrayData::validate` rejects,
+        // and reproducing it is the point of the fixture — the IPC reader builds
+        // such a map without either entries check.
+        let data = unsafe { builder.build_unchecked() };
 
         RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("m", data_type, true)])),

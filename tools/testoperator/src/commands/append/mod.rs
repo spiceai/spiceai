@@ -40,14 +40,17 @@ use test_framework::{
     },
     spiced::SpicedInstance,
     spicepod::acceleration::RefreshMode,
-    spicetest::{SpiceTest, append::NotStarted},
+    spicetest::{
+        SpiceTest,
+        append::{NotStarted, tpch_conflict_markers},
+    },
     telemetry::Telemetry,
     tokio_util::sync::CancellationToken,
     utils::observe_memory,
 };
 
-/// How long to wait for the tables to reach their expected row counts. The last
-/// load's refresh can still be in flight when the test window ends.
+/// How long to wait for the tables to reach their expected contents. The last
+/// load's refresh can still be in flight when the loads finish.
 const VERIFICATION_SETTLE_TIMEOUT: Duration = Duration::from_mins(3);
 
 /// How often to re-count the tables while waiting for them to settle.
@@ -169,6 +172,7 @@ pub(crate) async fn run(args: &AppendTestArgs) -> anyhow::Result<()> {
         query_overrides,
         args.test_args.scale_factor.unwrap_or(1.0),
         args.test_args.validate,
+        args.with_conflict_data,
     )
     .await;
 
@@ -364,6 +368,7 @@ async fn verify_appended_data(
     query_overrides: Option<QueryOverrides>,
     scale_factor: f64,
     validate_results: bool,
+    with_conflict_data: bool,
 ) -> anyhow::Result<()> {
     println!("Verifying appended data");
 
@@ -371,7 +376,7 @@ async fn verify_appended_data(
     // a cached result would report an earlier load step.
     let spice_client = Arc::new(spiced.spice_client(None, true).await?);
 
-    check_table_counts(&spice_client, query_set, scale_factor).await?;
+    wait_for_appended_data(&spice_client, query_set, scale_factor, with_conflict_data).await?;
 
     if !validate_results {
         println!("Skipping query result verification, pass --validate to enable it");
@@ -428,30 +433,80 @@ async fn table_count_mismatches(
     Ok(mismatches)
 }
 
+/// Counts the conflicting rows still present in each table that has them. Each
+/// one is a copy the last load supersedes, so a table holding any has not yet
+/// applied that load's upsert. Row counts can't show this: a superseded copy
+/// takes up the same key, so the table already holds its final row count.
+async fn conflict_row_mismatches(spice_client: &spiceai::Client) -> anyhow::Result<Vec<String>> {
+    let mut mismatches = Vec::new();
+
+    for marker in tpch_conflict_markers() {
+        let sql = format!(
+            "SELECT COUNT(*) FROM {} WHERE {}",
+            marker.table,
+            marker.predicate()
+        );
+        let batches = spice_client
+            .sql(&sql)
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+        let count = batches
+            .first()
+            .and_then(|batch| {
+                batch
+                    .column(0)
+                    .as_primitive_opt::<arrow::datatypes::Int64Type>()
+            })
+            .context("Failed to get count as a Int64Type")?
+            .value(0);
+        if count > 0 {
+            mismatches.push(format!(
+                "table {} still has {count} superseded conflicting rows",
+                marker.table
+            ));
+        }
+    }
+
+    Ok(mismatches)
+}
+
 /// Waits, up to [`VERIFICATION_SETTLE_TIMEOUT`], for every table to reach its
-/// expected row count, so verification runs against the fully loaded dataset.
-async fn check_table_counts(
+/// expected row count and, with conflict data, to hold no superseded rows, so
+/// verification runs against the fully loaded dataset.
+async fn wait_for_appended_data(
     spice_client: &spiceai::Client,
     query_set: &QuerySet,
     scale_factor: f64,
+    with_conflict_data: bool,
 ) -> anyhow::Result<()> {
-    let deadline = Instant::now() + VERIFICATION_SETTLE_TIMEOUT;
+    let start = Instant::now();
+    let deadline = start + VERIFICATION_SETTLE_TIMEOUT;
     let mismatches = loop {
-        let mismatches = table_count_mismatches(spice_client, query_set, scale_factor).await?;
+        let mut mismatches = table_count_mismatches(spice_client, query_set, scale_factor).await?;
+        if with_conflict_data && matches!(query_set, QuerySet::Tpch) {
+            mismatches.extend(conflict_row_mismatches(spice_client).await?);
+        }
         if mismatches.is_empty() || Instant::now() >= deadline {
             break mismatches;
         }
 
+        println!(
+            "Waiting for appended data to settle ({:?} elapsed): {}",
+            start.elapsed(),
+            mismatches.join("; ")
+        );
         tokio::time::sleep(VERIFICATION_POLL_INTERVAL).await;
     };
 
     if !mismatches.is_empty() {
         return Err(anyhow::anyhow!(
-            "Table row counts do not match expected values: {}",
+            "Appended data did not settle within {VERIFICATION_SETTLE_TIMEOUT:?}: {}",
             mismatches.join("; ")
         ));
     }
 
+    println!("Appended data settled after {:?}", start.elapsed());
     Ok(())
 }
 

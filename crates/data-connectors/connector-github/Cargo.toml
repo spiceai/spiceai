@@ -32,6 +32,9 @@ chrono.workspace = true
 connector-graphql = { path = "../connector-graphql" }
 data_components = { path = "../../data_components" }
 datafusion.workspace = true
+# `ExecutionPlan::try_to_proto` exists only with datafusion-physical-plan's `proto`
+# feature, which datafusion-proto enables.
+datafusion-proto.workspace = true
 futures.workspace = true
 globset.workspace = true
 governor.workspace = true
@@ -57,6 +60,7 @@ zip = "8.3.0"
 runtime = { path = "../../runtime" }
 runtime-secrets = { path = "../../runtime-secrets", default-features = false }
 spicepod = { path = "../../spicepod" }
+wiremock = "0.6"
 
 [features]
 default = []

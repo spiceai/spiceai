@@ -27,9 +27,10 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use datafusion::{
     arrow::datatypes::SchemaRef,
+    common::TableReference,
     error::Result as DataFusionResult,
     physical_plan::{PhysicalExpr, SendableRecordBatchStream},
-    sql::{TableReference, unparser::dialect::Dialect},
+    sql::unparser::dialect::Dialect,
 };
 use datafusion_federation::{
     FederatedTableProviderAdaptor, FederatedTableSource,
@@ -143,6 +144,7 @@ mod tests {
     use datafusion::arrow::datatypes::{DataType, Field, IntervalMonthDayNano, Schema, TimeUnit};
     use datafusion::catalog::Session;
     use datafusion::common::Column;
+    use datafusion::common::TableReference;
     use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
     use datafusion::config::ConfigOptions;
     use datafusion::datasource::DefaultTableSource;
@@ -164,7 +166,6 @@ mod tests {
     use datafusion::physical_plan::ExecutionPlan;
     use datafusion::prelude::{col, lit};
     use datafusion::scalar::ScalarValue;
-    use datafusion::sql::TableReference;
     use datafusion::sql::unparser::Unparser;
     use datafusion::sql::unparser::dialect::{
         BigQueryDialect, CustomDialect, CustomDialectBuilder, DefaultDialect, DuckDBDialect,
@@ -1109,6 +1110,255 @@ mod tests {
             ),
             "refused for another reason: {err}"
         );
+    }
+
+    /// A scan of `name(id)` holding `ids`. Unlike `id_source`'s, `DataFusion` can
+    /// execute it, so a guard can set what the plan returns beside what its
+    /// unparsed SQL returns from a real engine.
+    fn id_table(name: &str, ids: &[&str]) -> LogicalPlan {
+        use datafusion::arrow::array::{RecordBatch, StringArray};
+        use datafusion::datasource::{MemTable, provider_as_source};
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(StringArray::from(ids.to_vec()))],
+        )
+        .expect("build the id batch");
+        let table = MemTable::try_new(schema, vec![vec![batch]]).expect("build the id table");
+        LogicalPlanBuilder::scan(name, provider_as_source(Arc::new(table)), Some(vec![0]))
+            .expect("scan")
+            .build()
+            .expect("build scan")
+    }
+
+    /// `id_table(name, ids)` keeping only the row whose `id` is `kept`.
+    fn id_table_where(name: &str, ids: &[&str], kept: &str) -> LogicalPlan {
+        LogicalPlanBuilder::from(id_table(name, ids))
+            .filter(col(format!("{name}.id")).eq(lit(kept)))
+            .expect("filter")
+            .build()
+            .expect("build filter")
+    }
+
+    /// Sorted rows as text, with `None` for NULL, so two engines' answers compare
+    /// as multisets.
+    #[cfg(feature = "sqlite")]
+    type Rows = Vec<Vec<Option<String>>>;
+
+    /// What `DataFusion` returns for `plan`: the oracle the unparsed SQL is held
+    /// to. Executing a plan shares no code with unparsing it.
+    #[cfg(feature = "sqlite")]
+    async fn datafusion_rows(plan: &LogicalPlan) -> Rows {
+        use datafusion::arrow::array::{Array, AsArray};
+        use datafusion::arrow::compute::cast;
+
+        let batches = SessionContext::new()
+            .execute_logical_plan(plan.clone())
+            .await
+            .expect("plan the oracle")
+            .collect()
+            .await
+            .expect("execute the oracle");
+        let mut rows = Rows::new();
+        for batch in batches {
+            let columns = batch
+                .columns()
+                .iter()
+                .map(|column| cast(column, &DataType::Utf8).expect("render a column as text"))
+                .collect::<Vec<_>>();
+            for row in 0..batch.num_rows() {
+                rows.push(
+                    columns
+                        .iter()
+                        .map(|column| {
+                            let column = column.as_string::<i32>();
+                            (!column.is_null(row)).then(|| column.value(row).to_string())
+                        })
+                        .collect(),
+                );
+            }
+        }
+        rows.sort();
+        rows
+    }
+
+    /// What `SQLite` returns for `sql` over `tables`, each `name(id TEXT)`.
+    #[cfg(feature = "sqlite")]
+    fn sqlite_rows(tables: &[(&str, &[&str])], sql: &str) -> Rows {
+        let conn = rusqlite::Connection::open_in_memory().expect("open SQLite");
+        for (name, ids) in tables {
+            conn.execute(&format!("CREATE TABLE {name} (id TEXT NOT NULL)"), [])
+                .expect("create a table");
+            for id in *ids {
+                conn.execute(&format!("INSERT INTO {name} VALUES (?1)"), [id])
+                    .expect("insert a row");
+            }
+        }
+        let mut statement = conn
+            .prepare(sql)
+            .unwrap_or_else(|error| panic!("SQLite refused {sql}: {error}"));
+        let width = statement.column_count();
+        let mut rows = statement
+            .query_map([], |row| {
+                (0..width)
+                    .map(|index| row.get::<_, Option<String>>(index))
+                    .collect::<Result<Vec<_>, _>>()
+            })
+            .unwrap_or_else(|error| panic!("SQLite could not run {sql}: {error}"))
+            .collect::<Result<Rows, _>>()
+            .unwrap_or_else(|error| panic!("SQLite failed reading the rows of {sql}: {error}"));
+        rows.sort();
+        rows
+    }
+
+    /// Unparses `plan` for `SQLite`, runs it over `tables`, and demands the rows
+    /// `DataFusion` returns for the plan itself.
+    #[cfg(feature = "sqlite")]
+    async fn assert_sqlite_returns_the_plans_rows(
+        shape: &str,
+        plan: &LogicalPlan,
+        tables: &[(&str, &[&str])],
+    ) {
+        let expected = datafusion_rows(plan).await;
+        assert!(
+            expected.len() > 1,
+            "{shape}: the plan returns {} row(s), too few for a wrong scope to change",
+            expected.len()
+        );
+        let sql = unparse_with("sqlite", &SqliteDialect {}, plan);
+        assert_eq!(
+            sqlite_rows(tables, &sql),
+            expected,
+            "{shape}: SQLite returned other rows than the plan for: {sql}"
+        );
+    }
+
+    /// Regression test for #14373, fixed by fork PR #233: a join that is the
+    /// *right* input of another join was linearised into the enclosing `FROM`
+    /// with its right side first — `a ⋈ (b ⋈ c)` came out as
+    /// `FROM a INNER JOIN c ON b.id = c.id … JOIN b ON a.id = b.id`, naming `b`
+    /// before it is in scope. `PostgreSQL`, `DuckDB` and `SQLite` reject it, and an
+    /// engine that binds lazily runs a different join tree. The nested join stays
+    /// a parenthesised joined table on the right, and a LEFT JOIN folds a filter
+    /// from inside it into its own `ON`, since the shared `WHERE` would discard
+    /// the left rows the LEFT JOIN preserves.
+    #[tokio::test]
+    async fn a_join_that_is_another_joins_right_input_stays_on_its_right() {
+        let a: &[&str] = &["1", "2", "3"];
+        let b: &[&str] = &["1", "2"];
+        let c: &[&str] = &["1", "2", "4"];
+        let nested = |b_input: LogicalPlan, outer: JoinType| {
+            LogicalPlanBuilder::from(id_table("a", a))
+                .join(
+                    id_join(b_input, id_table("c", c), JoinType::Inner, ("b.id", "c.id")),
+                    outer,
+                    (vec!["a.id"], vec!["b.id"]),
+                    None,
+                )
+                .expect("outer join")
+                .project(vec![col("a.id"), col("b.id"), col("c.id")])
+                .expect("projection")
+                .build()
+                .expect("build")
+        };
+        let shapes = [
+            (
+                "a INNER JOIN (b JOIN c)",
+                nested(id_table("b", b), JoinType::Inner),
+            ),
+            (
+                "a FULL JOIN (b JOIN c)",
+                nested(id_table("b", b), JoinType::Full),
+            ),
+            (
+                "a LEFT JOIN (b[id = '1'] JOIN c)",
+                nested(id_table_where("b", b, "1"), JoinType::Left),
+            ),
+        ];
+        #[cfg(feature = "sqlite")]
+        {
+            let tables = [("a", a), ("b", b), ("c", c)];
+            for (shape, plan) in &shapes {
+                assert_sqlite_returns_the_plans_rows(shape, plan, &tables).await;
+            }
+        }
+
+        for (shape, plan) in &shapes {
+            let sql = federated_sql(plan);
+            // `b` has to be in scope where the outer join's `ON` names it, so the
+            // nested join is introduced, parenthesised, before that `ON`.
+            assert_precedes(&sql, "JOIN (b", "ON a.id = b.id");
+            assert!(
+                !sql.contains("WHERE"),
+                "{shape}: a filter from the nested input reached the enclosing WHERE: {sql}"
+            );
+        }
+    }
+
+    /// Regression test for #14375, fixed by fork PR #234: a `Limit` that is a join
+    /// input got a scope of its own only when the enclosing `SELECT` already had a
+    /// `WHERE` or a projection. Without either, its `LIMIT` landed on the enclosing
+    /// query and bounded the join's output instead of one input — with
+    /// `b = {1, 2}` and `c = {1}`, `b FULL JOIN (c LIMIT 1)` returns two rows and
+    /// the SQL returned one. The limited input is derived under its scan's own
+    /// name, which the join's `ON` and the select list already use.
+    #[tokio::test]
+    async fn a_limit_on_a_join_input_bounds_that_input_rather_than_the_join() {
+        let b: &[&str] = &["1", "2"];
+        let c: &[&str] = &["1"];
+        let limited = |name: &str, ids: &[&str]| {
+            LogicalPlanBuilder::from(id_table(name, ids))
+                .limit(0, Some(1))
+                .expect("limit")
+                .build()
+                .expect("build limit")
+        };
+        let shapes = [
+            (
+                "b FULL JOIN (c LIMIT 1)",
+                id_join(
+                    id_table("b", b),
+                    limited("c", c),
+                    JoinType::Full,
+                    ("b.id", "c.id"),
+                ),
+            ),
+            (
+                "b LEFT JOIN (c LIMIT 1)",
+                id_join(
+                    id_table("b", b),
+                    limited("c", c),
+                    JoinType::Left,
+                    ("b.id", "c.id"),
+                ),
+            ),
+            (
+                "(c LIMIT 1) RIGHT JOIN b",
+                id_join(
+                    limited("c", c),
+                    id_table("b", b),
+                    JoinType::Right,
+                    ("c.id", "b.id"),
+                ),
+            ),
+        ];
+        #[cfg(feature = "sqlite")]
+        {
+            let tables = [("b", b), ("c", c)];
+            for (shape, plan) in &shapes {
+                assert_sqlite_returns_the_plans_rows(shape, plan, &tables).await;
+            }
+        }
+
+        for (shape, plan) in &shapes {
+            let sql = federated_sql(plan);
+            assert!(
+                paren_depth_at(&sql, first_offset_of(&sql, "LIMIT 1")) >= 1,
+                "{shape}: the input's LIMIT bounds the whole join instead of a derived table \
+                 of its own: {sql}"
+            );
+        }
     }
 
     fn federation_dialects() -> Vec<(&'static str, Arc<dyn Dialect>)> {
@@ -3335,5 +3585,299 @@ mod tests {
         })
         .expect("walking a logical plan cannot fail");
         negated
+    }
+
+    /// `products AS p LEFT JOIN categories AS c`, where both relations expose a
+    /// column called `name`, so a projection passing both through has two outputs no
+    /// bare name tells apart.
+    fn products_left_join_categories() -> LogicalPlanBuilder {
+        let products = LogicalPlanBuilder::scan(
+            "products",
+            table_source(vec![
+                Field::new("category_id", DataType::Int32, false),
+                Field::new("name", DataType::Utf8, false),
+                Field::new("price", DataType::Int32, false),
+            ]),
+            None,
+        )
+        .expect("scan products")
+        .alias("p")
+        .expect("alias products")
+        .build()
+        .expect("build products");
+        let categories = LogicalPlanBuilder::scan(
+            "categories",
+            table_source(vec![
+                Field::new("category_id", DataType::Int32, false),
+                Field::new("name", DataType::Utf8, false),
+            ]),
+            None,
+        )
+        .expect("scan categories")
+        .alias("c")
+        .expect("alias categories")
+        .build()
+        .expect("build categories");
+        LogicalPlanBuilder::from(products)
+            .join(
+                categories,
+                JoinType::Left,
+                (vec!["p.category_id"], vec!["c.category_id"]),
+                None,
+            )
+            .expect("join products to categories")
+    }
+
+    /// Whether the outermost `SELECT` list of `sql` qualifies a column by
+    /// `relation` while the outermost `FROM` does not bring `relation` into scope.
+    ///
+    /// Matched on nesting depth rather than on a rendered string, so it holds across
+    /// the dialects' quoting: `p.`, `"p".` and `` `p`. `` are all the same
+    /// reference, and `AS p`, `AS "p"` and `` AS `p` `` the same declaration.
+    fn outer_select_reads_an_out_of_scope_relation(sql: &str, relation: &str) -> bool {
+        let Some(from_at) = sql
+            .match_indices(" FROM ")
+            .map(|(at, _)| at)
+            .find(|at| paren_depth_at(sql, *at) == 0)
+        else {
+            panic!("expected a top-level FROM in: {sql}");
+        };
+        let spellings = [
+            relation.to_string(),
+            format!("\"{relation}\""),
+            format!("`{relation}`"),
+        ];
+        let select_list = &sql[..from_at];
+        let referenced = spellings.iter().any(|spelling| {
+            select_list
+                .match_indices(&format!("{spelling}."))
+                .any(|(at, _)| {
+                    select_list[..at]
+                        .chars()
+                        .next_back()
+                        .is_none_or(|before| !before.is_alphanumeric() && before != '_')
+                })
+        });
+        let declared = spellings.iter().any(|spelling| {
+            sql[from_at..]
+                .match_indices(&format!("AS {spelling}"))
+                .any(|(at, _)| paren_depth_at(sql, from_at + at) == 0)
+        });
+        referenced && !declared
+    }
+
+    /// Prepares `sql` against an in-memory `DuckDB` holding the two tables the
+    /// plans below read, which binds every reference without running anything.
+    #[cfg(feature = "duckdb")]
+    fn duckdb_binds(sql: &str) -> Result<(), duckdb::Error> {
+        let conn = duckdb::Connection::open_in_memory()?;
+        conn.execute_batch(
+            "CREATE TABLE products (category_id INTEGER NOT NULL, name VARCHAR NOT NULL, \
+             price INTEGER NOT NULL); \
+             CREATE TABLE categories (category_id INTEGER NOT NULL, name VARCHAR NOT NULL);",
+        )?;
+        conn.prepare(sql).map(|_| ())
+    }
+
+    /// Regression test for the `spiceai/datafusion` fork's Date32 literal fix
+    /// (spiceai/datafusion#237, refs spiceai/spiceai#14491): the unparser spelled
+    /// every date literal `CAST('…' AS DATE)`, which `SQLite` reads as the number
+    /// `1994`, so a date range pushed to `SQLite` compared text against a number and
+    /// matched no row. The literal's cast must use the dialect's date type, as a
+    /// plain cast already did.
+    #[test]
+    fn a_date_range_unparsed_for_sqlite_keeps_the_rows_it_selects() {
+        let date = |days: i32| lit(ScalarValue::Date32(Some(days)));
+        // 1994-01-01 and 1995-01-01 as days since the Unix epoch.
+        let (from, to) = (8766, 9131);
+        let plan = LogicalPlanBuilder::scan(
+            "events",
+            table_source(vec![Field::new("d", DataType::Date32, false)]),
+            None,
+        )
+        .expect("scan events")
+        .filter(col("d").gt_eq(date(from)).and(col("d").lt(date(to))))
+        .expect("filter")
+        .build()
+        .expect("build");
+
+        let sql = unparse_with("sqlite", &SqliteDialect {}, &plan);
+        assert!(
+            !sql.contains("AS DATE"),
+            "a date literal must not be cast to DATE for SQLite, which reads it as a number: {sql}"
+        );
+
+        #[cfg(feature = "sqlite")]
+        {
+            let conn = rusqlite::Connection::open_in_memory().expect("open SQLite");
+            conn.execute_batch(
+                "CREATE TABLE events (d TEXT NOT NULL); \
+                 INSERT INTO events VALUES ('1993-12-31'), ('1994-01-01'), ('1994-06-30'), \
+                 ('1994-12-31'), ('1995-01-01');",
+            )
+            .expect("create events");
+            let count: i64 = conn
+                .query_row(&format!("SELECT COUNT(*) FROM ({sql})"), [], |row| {
+                    row.get(0)
+                })
+                .unwrap_or_else(|error| panic!("SQLite refused {sql}: {error}"));
+            assert_eq!(
+                count, 3,
+                "SQLite must keep the three 1994 rows the filter selects: {sql}"
+            );
+        }
+    }
+
+    /// Regression test for the unparser's `rescope_projection_over_projection`,
+    /// carried by the `spiceai/datafusion` fork (upstream's
+    /// apache/datafusion#22961): common subexpression elimination leaves a
+    /// `Projection` directly over another `Projection`, and the unparser renders the
+    /// inner one as an unaliased derived table. The outer one's references still name
+    /// the relations the inner one reads — `p`, `c` — which that derived table hides,
+    /// so without the fix the federated statement is
+    /// `SELECT p."name" … FROM (SELECT … FROM products AS p LEFT JOIN …)`, and the
+    /// remote engine refuses it (`DuckDB`: "Referenced table p not found").
+    ///
+    /// Three arms, because the fix makes three different decisions: outputs whose
+    /// names are unique are read from the derived table by name; two same-named
+    /// outputs (`p.name`, `c.name`), which no name in the derived table addresses,
+    /// merge the two projections so the qualifiers are in scope again; and a merge
+    /// that would repeat a volatile expression is refused rather than rendered.
+    #[test]
+    fn a_projection_over_a_derived_projection_reads_only_relations_in_scope() {
+        let unique_outputs = products_left_join_categories()
+            .project(vec![
+                (col("p.price") + lit(1)).alias("__common_expr_1"),
+                col("p.name"),
+            ])
+            .expect("inner projection")
+            .project(vec![
+                col("p.name").alias("product_name"),
+                col("__common_expr_1"),
+            ])
+            .expect("outer projection")
+            .build()
+            .expect("build");
+        let same_named_outputs = products_left_join_categories()
+            .project(vec![
+                (col("p.price") + lit(1)).alias("__common_expr_1"),
+                col("p.name"),
+                col("c.name"),
+            ])
+            .expect("inner projection")
+            .project(vec![
+                col("p.name").alias("product_name"),
+                col("c.name").alias("category_name"),
+                (col("__common_expr_1") * lit(2)).alias("doubled"),
+                col("__common_expr_1"),
+            ])
+            .expect("outer projection")
+            .build()
+            .expect("build");
+
+        for (shape, plan) in [
+            ("unique outputs", &unique_outputs),
+            ("same-named outputs", &same_named_outputs),
+        ] {
+            for (dialect_name, dialect) in federation_dialects() {
+                let sql = unparse_with(dialect_name, dialect.as_ref(), plan);
+                for relation in ["p", "c"] {
+                    assert!(
+                        !outer_select_reads_an_out_of_scope_relation(&sql, relation),
+                        "{dialect_name}/{shape}: the outer SELECT qualifies a column by '{relation}', \
+                         which the derived table below it hides, so the remote engine cannot bind \
+                         the statement: {sql}"
+                    );
+                }
+                for output in ["product_name", "__common_expr_1"] {
+                    assert!(
+                        sql[..first_offset_of(&sql, " FROM ")].contains(output),
+                        "{dialect_name}/{shape}: the outer SELECT lost its `{output}` output: {sql}"
+                    );
+                }
+            }
+
+            #[cfg(feature = "duckdb")]
+            {
+                let sql = unparse_with("duckdb", &DuckDBDialect::new(), plan);
+                if let Err(error) = duckdb_binds(&sql) {
+                    panic!(
+                        "duckdb/{shape}: DuckDB refused the federated statement: {error}: {sql}"
+                    );
+                }
+            }
+        }
+
+        let over_a_volatile_output = products_left_join_categories()
+            .project(vec![
+                datafusion::functions::expr_fn::random().alias("r"),
+                col("p.name"),
+                col("c.name"),
+            ])
+            .expect("inner projection")
+            .project(vec![
+                col("p.name").alias("product_name"),
+                col("c.name").alias("category_name"),
+                col("r"),
+            ])
+            .expect("outer projection")
+            .build()
+            .expect("build");
+        match federated_sql_result(&over_a_volatile_output) {
+            Err(DataFusionError::NotImplemented(_)) => {}
+            other => panic!(
+                "merging the projections would evaluate `random()` once per reference rather \
+                 than once per row, and no name addresses the same-named outputs, so the plan \
+                 has to be refused as unsupported; got {other:?}"
+            ),
+        }
+    }
+
+    /// Regression test for `SchemaCastScanExec` forwarding its input's statistics
+    /// through `DataFusion` 55's `StatisticsContext`, carried by the
+    /// `spiceai/datafusion-federation` fork. 55 derives plan statistics through
+    /// `ExecutionPlan::statistics_from_inputs` and its built-in nodes no longer
+    /// implement the deprecated `partition_statistics`, so a cast node that still
+    /// forwards the latter reports an unknown row count over a scan that knows its
+    /// own, and join sizing and statistics-answered aggregates above a federated scan
+    /// lose it.
+    #[test]
+    fn a_schema_cast_scan_reports_its_inputs_statistics() {
+        use datafusion::arrow::array::{Int32Array, RecordBatch};
+        use datafusion::common::stats::Precision;
+        use datafusion::datasource::memory::MemorySourceConfig;
+        use datafusion::physical_plan::{StatisticsArgs, StatisticsContext};
+        use datafusion_federation::schema_cast::SchemaCastScanExec;
+
+        let input_schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&input_schema),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .expect("build the input batch");
+        let input = MemorySourceConfig::try_new_exec(&[vec![batch]], input_schema, None)
+            .expect("build the input scan");
+        let input_rows = StatisticsContext::new()
+            .compute(input.as_ref(), &StatisticsArgs::new())
+            .expect("the input's statistics")
+            .num_rows;
+        assert_eq!(
+            input_rows,
+            Precision::Exact(3),
+            "the input has to know its own row count, or this guard proves nothing"
+        );
+
+        let cast = SchemaCastScanExec::new(
+            input,
+            Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)])),
+        );
+        let stats = StatisticsContext::new()
+            .compute(&cast, &StatisticsArgs::new())
+            .expect("the cast node's statistics");
+        assert_eq!(
+            stats.num_rows, input_rows,
+            "casting changes column types, not row counts, so the cast node has to report \
+             its input's row count"
+        );
     }
 }

@@ -38,7 +38,9 @@ use datafusion::sql::unparser::dialect::{
     CustomDialect, CustomDialectBuilder, DateFieldExtractStyle, DefaultDialect, Dialect,
     IntervalStyle, MySqlDialect, PostgreSqlDialect, SqliteDialect,
 };
+use datafusion_table_providers::util::supported_functions::FunctionSupport;
 use runtime_component::dataset::DatasetSpec;
+use runtime_datafusion::function_support::expression_support_for_engine;
 use runtime_parameters::{ParameterSpec, Parameters};
 use runtime_udfs_api::deny_spice_specific_functions;
 use snafu::prelude::*;
@@ -135,6 +137,35 @@ impl From<&str> for ODBCProfile {
                 ODBCProfile::Unknown
             }
         }
+    }
+}
+
+impl ODBCProfile {
+    /// The engine behind the profile, by the name
+    /// [`expression_support_for_engine`] keys on; `None` where the profile
+    /// names no engine Spice has a per-expression gate for.
+    fn engine(&self) -> Option<&'static str> {
+        match self {
+            ODBCProfile::MySql => Some("mysql"),
+            ODBCProfile::PostgreSql => Some("postgresql"),
+            ODBCProfile::Sqlite => Some("sqlite"),
+            ODBCProfile::Athena => Some("athena"),
+            ODBCProfile::Databricks | ODBCProfile::Unknown => None,
+        }
+    }
+}
+
+/// The federation function-support policy for an ODBC connection to `engine`:
+/// the Spice function deny-list, so Spice-only UDFs are evaluated locally
+/// instead of pushed into SQL the driver rejects (#10703), plus the engine's
+/// per-expression gate where one exists, so a cast the engine evaluates
+/// differently from `DataFusion` stays local on this route as on the engine's
+/// own connector (issue #14482).
+fn function_support_for_engine(engine: Option<&str>) -> FunctionSupport {
+    let support = deny_spice_specific_functions().as_ref().clone();
+    match engine.and_then(expression_support_for_engine) {
+        Some(gate) => support.with_expression_support(gate),
+        None => support,
     }
 }
 
@@ -245,41 +276,44 @@ impl DataConnectorFactory for ODBCFactory {
             parameter_is_integer(&params.parameters, "max_bytes_per_batch")?;
             parameter_is_integer(&params.parameters, "max_num_rows_per_batch")?;
 
-            let dialect =
-                if let Some(sql_dialect) = params.parameters.get("sql_dialect").expose().ok() {
-                    let sql_dialect = SQLDialectParam::new(sql_dialect);
-                    sql_dialect.try_into()
-                } else {
-                    let driver = params
-                        .parameters
-                        .get("connection_string")
-                        .expose()
-                        .ok_or_else(|p| MissingParameterSnafu { param: p.0 }.build())?
-                        .to_lowercase();
+            let (dialect, engine): (
+                Result<Option<Arc<dyn Dialect + Send + Sync>>>,
+                Option<String>,
+            ) = if let Some(sql_dialect) = params.parameters.get("sql_dialect").expose().ok() {
+                let engine = sql_dialect.to_string();
+                let sql_dialect = SQLDialectParam::new(sql_dialect);
+                (sql_dialect.try_into(), Some(engine))
+            } else {
+                let driver = params
+                    .parameters
+                    .get("connection_string")
+                    .expose()
+                    .ok_or_else(|p| MissingParameterSnafu { param: p.0 }.build())?
+                    .to_lowercase();
 
-                    let driver = driver
-                        .split(';')
-                        .find(|s| s.starts_with("driver="))
-                        .context(NoDriverSpecifiedSnafu)?;
+                let driver = driver
+                    .split(';')
+                    .find(|s| s.starts_with("driver="))
+                    .context(NoDriverSpecifiedSnafu)?;
 
-                    // explicitly check if the user has tried to specify a file path
-                    if driver_is_file(driver) {
-                        return Err(Error::DirectDriverNotPermitted {}.into());
-                    }
+                // explicitly check if the user has tried to specify a file path
+                if driver_is_file(driver) {
+                    return Err(Error::DirectDriverNotPermitted {}.into());
+                }
 
-                    Ok(ODBCProfile::from(driver).into())
-                }?;
+                let profile = ODBCProfile::from(driver);
+                let engine = profile.engine().map(str::to_string);
+                (Ok(profile.into()), engine)
+            };
+            let dialect = dialect?;
 
             let pool: Arc<ODBCDbConnectionPool> = Arc::new(
                 ODBCPool::new(params.parameters.to_secret_map())
                     .context(UnableToCreateODBCConnectionPoolSnafu)?,
             );
 
-            // Install the Spice function deny-list so Spice-only UDFs
-            // (json_get_str, etc.) are evaluated locally instead of pushed into
-            // the SQL sent through ODBC, which would reject them (#10703).
             let odbc_factory = ODBCTableFactory::new(pool, dialect)
-                .with_function_support(deny_spice_specific_functions().as_ref().clone());
+                .with_function_support(function_support_for_engine(engine.as_deref()));
 
             Ok(Arc::new(ODBC { odbc_factory }) as Arc<dyn DataConnector>)
         })
@@ -356,6 +390,96 @@ mod test {
         assert_eq!(actual, "CAST(a AS VARCHAR)");
 
         Ok(())
+    }
+
+    /// Regression test for #14482 on the ODBC route: the MySQL, PostgreSQL and
+    /// Athena profiles reach engines that round a fractional-to-integer cast
+    /// `DataFusion` truncates, so their policy must keep the cast local. The
+    /// `SQLite` profile keeps it local too, under the `SQLite` gate: `SQLite`
+    /// saturates a float past `i64` where `DataFusion` refuses it. A profile
+    /// with no engine keeps the plain policy and the pushdown.
+    #[test]
+    fn a_fractional_to_integer_cast_stays_local_on_the_odbc_profiles_that_round() {
+        use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder};
+        use datafusion::prelude::lit;
+        use datafusion_table_providers::util::supported_functions::contains_unsupported_functions;
+
+        fn plan_projecting(expr: datafusion::prelude::Expr) -> LogicalPlan {
+            LogicalPlanBuilder::values(vec![vec![lit(1_i64)]])
+                .expect("values")
+                .project(vec![expr])
+                .expect("project")
+                .build()
+                .expect("build plan")
+        }
+        let rounding = cast(lit(1.5_f64), DataType::Int64);
+        for profile in [
+            ODBCProfile::MySql,
+            ODBCProfile::PostgreSql,
+            ODBCProfile::Athena,
+            ODBCProfile::Sqlite,
+        ] {
+            let support = function_support_for_engine(profile.engine());
+            assert!(
+                contains_unsupported_functions(&plan_projecting(rounding.clone()), &support)
+                    .expect("the support check must not error"),
+                "the {profile:?} profile does not evaluate {rounding} as DataFusion does, so its policy must keep it local"
+            );
+        }
+        for profile in [ODBCProfile::Databricks, ODBCProfile::Unknown] {
+            let support = function_support_for_engine(profile.engine());
+            assert!(
+                !contains_unsupported_functions(&plan_projecting(rounding.clone()), &support)
+                    .expect("the support check must not error"),
+                "the {profile:?} profile evaluates {rounding} as DataFusion does, so the pushdown is kept"
+            );
+        }
+        assert_eq!(
+            SQLDialectParam::new("postgresql").0,
+            "postgresql",
+            "the sql_dialect parameter is the engine name the gate keys on"
+        );
+    }
+
+    /// Regression test for #14753 and #14754 on the ODBC route: `SQLite` has
+    /// no date, time or interval types, so the `SQLite` profile keeps a
+    /// timestamp literal, a date literal and an interval local, while a plain
+    /// literal still pushes down.
+    #[test]
+    fn a_temporal_value_stays_local_on_the_odbc_sqlite_profile() {
+        use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder};
+        use datafusion::prelude::lit;
+        use datafusion::scalar::ScalarValue;
+        use datafusion_table_providers::util::supported_functions::contains_unsupported_functions;
+
+        fn plan_projecting(expr: datafusion::prelude::Expr) -> LogicalPlan {
+            LogicalPlanBuilder::values(vec![vec![lit(1_i64)]])
+                .expect("values")
+                .project(vec![expr])
+                .expect("project")
+                .build()
+                .expect("build plan")
+        }
+        let sqlite = function_support_for_engine(ODBCProfile::Sqlite.engine());
+        for temporal in [
+            cast(
+                lit("2026-01-30 23:00:00"),
+                DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Nanosecond, None),
+            ),
+            cast(lit("2026-01-31"), DataType::Date32),
+            lit(ScalarValue::new_interval_mdn(0, 0, 3_600_000_000_000)),
+        ] {
+            assert!(
+                contains_unsupported_functions(&plan_projecting(temporal.clone()), &sqlite)
+                    .expect("the support check must not error"),
+                "the Sqlite profile must keep {temporal} local"
+            );
+        }
+        assert!(
+            !contains_unsupported_functions(&plan_projecting(lit(1_i64)), &sqlite)
+                .expect("the support check must not error"),
+            "the Sqlite profile must still push down a plain literal"
+        );
     }
 
     #[test]

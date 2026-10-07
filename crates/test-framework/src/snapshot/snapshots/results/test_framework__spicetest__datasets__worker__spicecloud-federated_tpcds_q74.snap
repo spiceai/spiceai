@@ -7,12 +7,12 @@ description: "Query: tpcds_q74"
 +------------------+---------------------+--------------------+
 | AAAAAAAAIADEBAAA | Diane               | Aldridge           |
 | AAAAAAAALIOPAAAA | Derek               | Allen              |
+| AAAAAAAALDDMAAAA | Edna                | Ashley             |
 | AAAAAAAAIBHHAAAA | Jennifer            | Ballard            |
+| AAAAAAAAANFAAAAA | Philip              | Banks              |
+| AAAAAAAAPDFBAAAA | Terrance            | Banks              |
 | AAAAAAAAHMJNAAAA | Ryan                | Baptiste           |
-| AAAAAAAACGKBBAAA | Betty               | Bell               |
 | AAAAAAAAKBCABAAA | Debra               | Bell               |
 | AAAAAAAAHJLAAAAA | Audrey              | Beltran            |
 | AAAAAAAAEOAKAAAA | Molly               | Benjamin           |
-| AAAAAAAADLHBBAAA | Henry               | Bertrand           |
-| AAAAAAAADBEFBAAA | Bennie              | Bowers             |
 +------------------+---------------------+--------------------+

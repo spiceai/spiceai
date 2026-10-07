@@ -201,7 +201,8 @@ impl CayennePartitionCreator {
         .with_context(Arc::clone(&self.context))
         .with_retention_filters(self.retention_filters.clone())
         .with_scan_view_reuse(self.scan_view_reuse)
-        .with_secondary_indexes(self.secondary_indexes.clone());
+        .with_secondary_indexes(self.secondary_indexes.clone())
+        .with_dataset_name(&self.table_name);
         if let Some(ref rb) = self.time_retention_filter_builder {
             builder = builder.with_time_retention_filter_builder(rb.clone());
         }
@@ -442,31 +443,23 @@ impl PartitionCreator for CayennePartitionCreator {
         Ok(result)
     }
 
+    /// This creator reports every filter `Inexact`, so a filter it is asked about
+    /// stays available to `scan()`, where the partition providers use it to prune
+    /// files, prune the mem-tier, and detect primary-key point lookups.
+    /// `Unsupported` would withhold the filter from `scan()` entirely and buy no
+    /// extra safety.
+    ///
+    /// That result is this creator's alone, and it is not what the caller
+    /// necessarily sees. `PartitionTableProvider` promotes a filter comparing a
+    /// partition expression to a literal to `Exact`, and its `scan()` additionally
+    /// withholds from the partition scans any filter over a single simple
+    /// partition column — so `region IN ('us', 'eu')` under `partition_by:
+    /// [region]` stays `Inexact` here yet never reaches a child scan.
     fn supports_filters_pushdown(
         &self,
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>, DataFusionError> {
-        let partition_columns: std::collections::HashSet<_> = self
-            .partition_by
-            .iter()
-            .flat_map(|p| p.expression.column_refs())
-            .collect();
-
-        Ok(filters
-            .iter()
-            .map(|filter| {
-                let filter_columns = filter.column_refs();
-                let matches = filter_columns.is_empty()
-                    || filter_columns
-                        .iter()
-                        .all(|fc| partition_columns.iter().any(|pc| fc.name == pc.name));
-                if matches {
-                    TableProviderFilterPushDown::Inexact
-                } else {
-                    TableProviderFilterPushDown::Unsupported
-                }
-            })
-            .collect())
+        Ok(vec![TableProviderFilterPushDown::Inexact; filters.len()])
     }
 }
 
@@ -938,5 +931,97 @@ mod tests {
             vec![impostor],
             "the real partition child must go and the name-alike must stay"
         );
+    }
+
+    /// Regression test for #12959: a filter on a non-partition column must reach
+    /// every partition's `scan()`. Withheld, it is only re-applied above the
+    /// union, and each partition loses file pruning, mem-tier pruning, primary
+    /// key point-lookup detection, and its secondary indexes.
+    #[tokio::test]
+    async fn a_non_partition_filter_reaches_every_partition_scan() {
+        use datafusion::arrow::util::pretty::pretty_format_batches;
+        use datafusion::catalog::TableProvider as _;
+        use datafusion::prelude::lit;
+        use runtime_table_partition::provider::PartitionTableProvider;
+
+        let fixture = fixture().await;
+        let partition_by = vec![PartitionedBy {
+            name: "bucket".to_string(),
+            expression: col("bucket"),
+        }];
+        let provider = Arc::new(
+            PartitionTableProvider::new(
+                Arc::new(creator_for(&fixture)),
+                partition_by,
+                Arc::clone(&fixture.schema),
+            )
+            .await
+            .expect("the partitioned table opens"),
+        );
+
+        let data_filter = col("id").eq(lit(3_i64));
+        let partition_filter = col("bucket").eq(lit("a"));
+        let mixed_filter = col("bucket").eq(lit("a")).or(col("id").eq(lit(4_i64)));
+        assert_eq!(
+            provider
+                .supports_filters_pushdown(&[&data_filter, &partition_filter, &mixed_filter])
+                .expect("pushdown is classified"),
+            vec![
+                TableProviderFilterPushDown::Inexact,
+                TableProviderFilterPushDown::Exact,
+                TableProviderFilterPushDown::Inexact,
+            ],
+            "only a filter partition pruning fully resolves may be Exact"
+        );
+
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::clone(&provider) as _)
+            .expect("the table registers");
+        ctx.sql("INSERT INTO t VALUES (1, 'a'), (2, 'a'), (3, 'b'), (4, 'b'), (5, 'c')")
+            .await
+            .expect("the insert plans")
+            .collect()
+            .await
+            .expect("the insert runs");
+
+        let plan = ctx
+            .sql("SELECT id FROM t WHERE id = 3")
+            .await
+            .expect("the query plans")
+            .into_optimized_plan()
+            .expect("the plan optimizes");
+        let plan = plan.display_indent().to_string();
+        assert!(
+            plan.contains("partial_filters=[t.id = Int64(3)]"),
+            "the non-partition filter must be handed to scan():\n{plan}"
+        );
+
+        for (sql, expected) in [
+            (
+                "SELECT id FROM t WHERE id = 3",
+                "+----+\n| id |\n+----+\n| 3  |\n+----+",
+            ),
+            (
+                "SELECT id FROM t WHERE bucket = 'a' OR id = 4 ORDER BY id",
+                "+----+\n| id |\n+----+\n| 1  |\n| 2  |\n| 4  |\n+----+",
+            ),
+            (
+                "SELECT id FROM t WHERE bucket = 'b' AND id > 3",
+                "+----+\n| id |\n+----+\n| 4  |\n+----+",
+            ),
+            ("SELECT id FROM t WHERE id > 99", "++\n++"),
+        ] {
+            let batches = ctx
+                .sql(sql)
+                .await
+                .expect("the query plans")
+                .collect()
+                .await
+                .expect("the query runs");
+            let actual = pretty_format_batches(&batches)
+                .expect("batches format")
+                .to_string();
+            assert_eq!(actual, expected, "wrong rows for `{sql}`");
+        }
     }
 }

@@ -23,25 +23,27 @@ limitations under the License.
 
 mod common;
 
+use common::lookup_index::{
+    TableSpec, explain_total, int64_column, open_table, overwrite, query, runtime_with_pool,
+};
+
 use std::sync::Arc;
 
 use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use cayenne::metadata::{CreateTableOptions, VortexConfig};
-use cayenne::provider::CayenneContext;
-use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
+use cayenne::metadata::VortexConfig;
 
 use datafusion::datasource::TableProvider;
-use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
-use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
 use datafusion::prelude::SessionContext;
 
 const TABLE: &str = "svc_budget";
 /// A second table small enough to fit under the same cap, so the cap test
 /// cannot pass merely because an INT64 key never worked.
 const SMALL_TABLE: &str = "svc_budget_small";
+/// A table whose first write's index fits the pool and whose second's does not.
+const PARTIAL_TABLE: &str = "svc_budget_partial";
 const ROWS: usize = 40_000;
 /// Above the inline caps (`inline_max_rows`), so the overwrite actually writes
 /// Vortex files. An inlined overwrite leaves the snapshot directory empty and
@@ -58,16 +60,6 @@ const INDEX_KEY: [&str; 2] = ["TenantId", "ServiceId"];
 /// this, before it could compress anything.
 const POOL_BYTES: usize = 1024 * 1024;
 
-/// A runtime whose query memory pool holds [`POOL_BYTES`].
-fn bounded_runtime() -> (Arc<RuntimeEnv>, Arc<dyn MemoryPool>) {
-    let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(POOL_BYTES));
-    let runtime_env = RuntimeEnvBuilder::new()
-        .with_memory_pool(Arc::clone(&pool))
-        .build_arc()
-        .expect("runtime env");
-    (runtime_env, pool)
-}
-
 fn service_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
         Field::new("AutoId", DataType::Int64, false),
@@ -78,11 +70,17 @@ fn service_schema() -> Arc<Schema> {
 }
 
 fn service_rows(rows: usize) -> RecordBatch {
+    service_rows_from(0, rows)
+}
+
+/// `rows` rows whose `AutoId`s start at `offset`, so a second write's keys are
+/// distinct from the first's.
+fn service_rows_from(offset: usize, rows: usize) -> RecordBatch {
     let mut auto_id = Vec::with_capacity(rows);
     let mut tenant = Vec::with_capacity(rows);
     let mut service = Vec::with_capacity(rows);
     let mut payload = Vec::with_capacity(rows);
-    for i in 0..rows {
+    for i in offset..offset + rows {
         let id = i64::try_from(i).expect("fits i64");
         auto_id.push(id);
         tenant.push(id % 997);
@@ -101,79 +99,9 @@ fn service_rows(rows: usize) -> RecordBatch {
     .expect("fixture batch")
 }
 
-async fn build_table(
-    fixture: &common::TestFixture,
-    runtime_env: Arc<RuntimeEnv>,
-) -> Arc<CayenneTableProvider> {
-    build_named(fixture, runtime_env, TABLE).await
-}
-
-async fn build_named(
-    fixture: &common::TestFixture,
-    runtime_env: Arc<RuntimeEnv>,
-    name: &str,
-) -> Arc<CayenneTableProvider> {
-    let vortex_config = VortexConfig {
-        target_vortex_file_size_mb: 1,
-        ..VortexConfig::default()
-    };
-    let context = CayenneContext::new(&vortex_config, Arc::clone(&runtime_env), name);
-    let options = CreateTableOptions {
-        table_name: name.to_string(),
-        schema: service_schema(),
-        primary_key: vec![],
-        on_conflict: None,
-        base_path: fixture.data_path.to_string_lossy().to_string(),
-        partition_column: None,
-        vortex_config,
-    };
-    let catalog = Arc::clone(&fixture.catalog);
-    let catalog: Arc<dyn MetadataCatalog> = catalog;
-    Arc::new(
-        CayenneTableProviderBuilder::new(catalog, runtime_env)
-            .with_context(context)
-            .with_secondary_indexes(vec![INDEX_KEY.iter().map(|c| (*c).to_string()).collect()])
-            .create(options)
-            .await
-            .expect("create table"),
-    )
-}
-
-async fn overwrite(provider: &Arc<CayenneTableProvider>, batch: RecordBatch) {
-    let ctx = SessionContext::new();
-    let exec = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
-        &[vec![batch]],
-        service_schema(),
-        None,
-    )
-    .expect("overwrite source");
-    let plan = provider
-        .insert_into(
-            &ctx.state(),
-            exec,
-            datafusion_expr::dml::InsertOp::Overwrite,
-        )
-        .await
-        .expect("overwrite plan");
-    datafusion_physical_plan::collect(plan, ctx.task_ctx())
-        .await
-        .expect("overwrite");
-}
-
-async fn query(provider: &Arc<CayenneTableProvider>, sql: &str) -> Vec<RecordBatch> {
-    query_on(provider, TABLE, sql).await
-}
-
-async fn query_on(provider: &Arc<CayenneTableProvider>, name: &str, sql: &str) -> Vec<RecordBatch> {
-    let ctx = SessionContext::new();
-    ctx.register_table(name, Arc::clone(provider) as Arc<dyn TableProvider>)
-        .expect("register");
-    ctx.sql(sql)
-        .await
-        .expect("plan")
-        .collect()
-        .await
-        .expect("execute")
+/// The indexed table `name`, in file mode unless `spec` says otherwise.
+fn spec(name: &str) -> TableSpec<'_> {
+    TableSpec::new(name, service_schema(), &[&INDEX_KEY])
 }
 
 fn rows_of(batches: &[RecordBatch]) -> usize {
@@ -191,14 +119,18 @@ async fn an_index_the_memory_pool_cannot_fit_is_not_published() {
     let fixture = common::TestFixture::new(common::BackendType::Sqlite)
         .await
         .expect("fixture");
-    let (runtime_env, pool) = bounded_runtime();
-    let table = build_table(&fixture, Arc::clone(&runtime_env)).await;
-    overwrite(&table, service_rows(ROWS)).await;
+    let (runtime_env, pool) = runtime_with_pool(POOL_BYTES);
+    let table = open_table(&fixture, Arc::clone(&runtime_env), spec(TABLE)).await;
+    overwrite(&table, vec![service_rows(ROWS)]).await;
 
-    // The write-time build ran and was refused; nothing may be published.
+    // The write's runs were built and refused; no file may be covered.
+    let verification = table
+        .verify_lookup_index_against_read_back()
+        .await
+        .expect("verify");
     assert!(
-        table.verify_lookup_index_against_read_back().await.is_err(),
-        "an index the pool cannot fit must not be published"
+        verification.files == 0 && verification.uncovered_files > 0,
+        "an index the pool cannot fit must not cover any file: {verification:?}"
     );
     let counters = table
         .lookup_index_counters()
@@ -223,13 +155,13 @@ async fn an_index_the_memory_pool_cannot_fit_is_not_published() {
          AND \"ServiceId\" = 'SV{:032x}' ORDER BY \"AutoId\"",
         42
     );
-    assert_eq!(rows_of(&query(&table, &sql).await), 1);
+    assert_eq!(rows_of(&query(&table, TABLE, &sql).await), 1);
 
     let counters = table
         .lookup_index_counters()
         .expect("table has index state");
     assert_eq!(
-        counters.selected, 0,
+        counters.full, 0,
         "no selection may be attached without a published index: {counters:?}"
     );
     assert_eq!(
@@ -237,12 +169,12 @@ async fn an_index_the_memory_pool_cannot_fit_is_not_published() {
         "no row selection may reach the scan: {counters:?}"
     );
     assert!(
-        counters.unbuilt > 0,
-        "a table the pool refused should record its probes as unbuilt: {counters:?}"
+        counters.none > 0,
+        "a table the pool refused should record its probes' coverage as none: {counters:?}"
     );
 
     // Every row is still reachable.
-    let total = query(&table, &format!("SELECT COUNT(*) AS n FROM {TABLE}")).await;
+    let total = query(&table, TABLE, &format!("SELECT COUNT(*) AS n FROM {TABLE}")).await;
     let count = total[0]
         .column(0)
         .as_any()
@@ -263,9 +195,9 @@ async fn a_mixed_type_composite_key_is_indexed() {
     let fixture = common::TestFixture::new(common::BackendType::Sqlite)
         .await
         .expect("fixture");
-    let (runtime_env, pool) = bounded_runtime();
-    let table = build_named(&fixture, Arc::clone(&runtime_env), SMALL_TABLE).await;
-    overwrite(&table, service_rows(SMALL_ROWS)).await;
+    let (runtime_env, pool) = runtime_with_pool(POOL_BYTES);
+    let table = open_table(&fixture, Arc::clone(&runtime_env), spec(SMALL_TABLE)).await;
+    overwrite(&table, vec![service_rows(SMALL_ROWS)]).await;
 
     let report = table
         .verify_lookup_index_against_read_back()
@@ -305,7 +237,7 @@ async fn a_mixed_type_composite_key_is_indexed() {
          AND \"ServiceId\" = 'SV{:032x}' ORDER BY \"AutoId\"",
         42
     );
-    let rows = query_on(&table, SMALL_TABLE, &sql).await;
+    let rows = query(&table, SMALL_TABLE, &sql).await;
     assert_eq!(
         rows_of(&rows),
         1,
@@ -315,8 +247,126 @@ async fn a_mixed_type_composite_key_is_indexed() {
         .lookup_index_counters()
         .expect("table has index state");
     assert_eq!(
-        after.selected,
-        before.selected + 1,
+        after.full,
+        before.full + 1,
         "the INT64 composite key did not use the index: {before:?} -> {after:?}"
+    );
+}
+
+/// A write whose index the pool cannot fit is read in full beside the index of
+/// the writes that did fit, and the lookup says so: coverage `partial`, with
+/// that file counted in `uncovered_files`, and never `full` — even through a
+/// join's runtime filter, when the indexed files hold no candidate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_lookup_reads_an_unindexed_write_in_full_beside_the_index() {
+    let fixture = common::TestFixture::new(common::BackendType::Sqlite)
+        .await
+        .expect("fixture");
+    let (runtime_env, _pool) = runtime_with_pool(POOL_BYTES);
+    // One file per write, so the background build of the append's file needs
+    // as much memory as its write did and is refused too.
+    let config = VortexConfig {
+        target_vortex_file_size_mb: 256,
+        ..VortexConfig::default()
+    };
+    let table = open_table(
+        &fixture,
+        Arc::clone(&runtime_env),
+        spec(PARTIAL_TABLE).config(config),
+    )
+    .await;
+    overwrite(&table, vec![service_rows(SMALL_ROWS)]).await;
+    let indexed = table
+        .lookup_index_counters()
+        .expect("table has index state");
+    assert!(
+        indexed.index_bytes > 0,
+        "the first write's index must fit: {indexed:?}"
+    );
+    common::insert_batches(&table, vec![service_rows_from(SMALL_ROWS, ROWS)])
+        .await
+        .expect("append");
+    let refused = table
+        .lookup_index_counters()
+        .expect("table has index state");
+    assert!(
+        refused.builds_unpublished > indexed.builds_unpublished,
+        "the append's index must be refused for this test to mean anything: \
+         {indexed:?} -> {refused:?}"
+    );
+
+    let key = |id: usize| (id % 997, format!("SV{id:032x}"));
+    for (id, what) in [
+        (42, "the indexed write"),
+        (SMALL_ROWS + 12_345, "the unindexed append"),
+    ] {
+        let (tenant, service) = key(id);
+        let sql = format!(
+            "SELECT \"AutoId\" FROM {PARTIAL_TABLE} WHERE \"TenantId\" = {tenant} \
+             AND \"ServiceId\" = '{service}'"
+        );
+        let explain = query(&table, PARTIAL_TABLE, &format!("EXPLAIN {sql}")).await;
+        let plan = arrow::util::pretty::pretty_format_batches(&explain)
+            .expect("format plan")
+            .to_string();
+        assert!(
+            plan.contains("lookup_index=(TenantId, ServiceId)")
+                && explain_total(&plan, "uncovered_files") > 0,
+            "a key in {what} must be partly covered, reading the unindexed file in full:\n{plan}"
+        );
+        let found = int64_column(&query(&table, PARTIAL_TABLE, &sql).await);
+        assert_eq!(
+            found,
+            vec![i64::try_from(id).expect("fits i64")],
+            "a key in {what} returned the wrong rows"
+        );
+    }
+
+    // The join's runtime filter carries only the append's key, which no indexed
+    // file holds. The unindexed file is still read, so the probe is a selection.
+    let (tenant, service) = key(SMALL_ROWS + 12_345);
+    let key_schema = Arc::new(Schema::new(vec![
+        Field::new("tenant", DataType::Int64, false),
+        Field::new("service", DataType::Utf8, false),
+    ]));
+    let key_batch = RecordBatch::try_new(
+        Arc::clone(&key_schema),
+        vec![
+            Arc::new(Int64Array::from(vec![
+                i64::try_from(tenant).expect("fits i64"),
+            ])),
+            Arc::new(StringArray::from(vec![service])),
+        ],
+    )
+    .expect("key batch");
+    let keys = datafusion::datasource::MemTable::try_new(key_schema, vec![vec![key_batch]])
+        .expect("key table");
+    let ctx = SessionContext::new();
+    ctx.register_table(PARTIAL_TABLE, Arc::clone(&table) as Arc<dyn TableProvider>)
+        .expect("register table");
+    ctx.register_table("keys", Arc::new(keys))
+        .expect("register keys");
+    let before = table
+        .lookup_index_counters()
+        .expect("table has index state");
+    let rows = ctx
+        .sql(&format!(
+            "SELECT s.\"AutoId\" FROM keys k INNER JOIN {PARTIAL_TABLE} s \
+             ON k.tenant = s.\"TenantId\" AND k.service = s.\"ServiceId\""
+        ))
+        .await
+        .expect("join plan")
+        .collect()
+        .await
+        .expect("join execution");
+    assert_eq!(rows_of(&rows), 1, "the join lost the append's row");
+    let after = table
+        .lookup_index_counters()
+        .expect("table has index state");
+    assert_eq!(
+        (after.partial - before.partial, after.full - before.full),
+        (1, 0),
+        "a runtime probe that reads an unindexed file is partly covered: \
+         {before:?} -> {after:?}"
     );
 }

@@ -27,13 +27,18 @@ use arrow_flight::{
     FlightClient, FlightDescriptor, PutResult, encode::FlightDataEncoderBuilder, error::FlightError,
 };
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use futures::{Stream, TryStreamExt as _};
 use rand::RngExt as _;
 use runtime::{
-    Runtime, accelerated::refresh::Refresh, auth::EndpointAuth,
-    component::dataset::acceleration::Acceleration, config::Config, datafusion::DataFusion,
-    flight::RateLimits, internal_table::create_internal_accelerated_table,
+    Runtime,
+    accelerated::refresh::Refresh,
+    auth::EndpointAuth,
+    component::dataset::acceleration::{Acceleration, Engine},
+    config::Config,
+    datafusion::DataFusion,
+    flight::RateLimits,
+    internal_table::create_internal_accelerated_table,
 };
 use runtime_auth::FlightBasicAuth;
 use runtime_secrets::Secrets;
@@ -252,7 +257,10 @@ async fn register_test_table(
         table_name.clone(),
         schema,
         None,
-        Acceleration::default(),
+        Acceleration {
+            engine: Engine::Arrow,
+            ..Acceleration::default()
+        },
         Refresh::default(),
         None,
         Arc::new(RwLock::new(Secrets::default())),

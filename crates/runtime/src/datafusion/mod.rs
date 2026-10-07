@@ -19,14 +19,17 @@ use std::sync::{Arc, OnceLock, RwLock, Weak};
 use std::time::Duration;
 
 use crate::accelerated::refresh::{self, RefreshOverrides};
-use crate::accelerated::refresh_completion::RefreshCompletionWaiter;
+use crate::accelerated::refresh_completion::{RefreshCompletionOutcome, RefreshCompletionWaiter};
 use crate::accelerated::refresh_task::changes::{CdcSchemaEvolution, install_cdc_schema_evolution};
 use crate::accelerated::refresh_task::probe_acceleration_contents;
-use crate::accelerated::snapshots::SnapshotRefreshState;
+use crate::accelerated::snapshots::{SnapshotRefreshState, reload_on_snapshot_notifications};
 use crate::accelerated::{
     self, AcceleratedTableBuilderError, SnapshotCreateTrigger, SnapshotCreationConfig,
 };
-use crate::accelerated::{AcceleratedTable, Retention, refresh::Refresh};
+use crate::accelerated::{
+    AcceleratedTable, Retention,
+    refresh::{Refresh, VersionsByTime},
+};
 use crate::catalogconnector::deferred::DeferredCatalogProvider;
 use crate::component::access::AccessMode;
 use crate::component::dataset::acceleration::{Acceleration, Engine, Mode, RefreshMode};
@@ -59,11 +62,14 @@ use crate::tracing_util::view_registered_trace;
 use crate::view::prepare_view;
 use crate::{status, view};
 use data_accelerator_api::swappable::SwappableTableProvider;
+use data_connector_api::accelerated::RegisteredAcceleratedTable;
 use data_connector_api::federated::FederatedTableProvider;
+use runtime_acceleration::acceleration::DEFAULT_SNAPSHOT_REFRESH_CHECK_INTERVAL;
 use runtime_acceleration::acceleration_source::resolved_refresh_mode;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
 use runtime_acceleration::sidecar::OpenOption;
 use runtime_acceleration::snapshot::SnapshotBehavior;
+use runtime_acceleration::snapshot::notifications::{SnapshotNotifications, Subscription};
 use runtime_search::udtf::TEXT_SEARCH_UDTF_NAME;
 
 use snafu::ResultExt;
@@ -89,6 +95,7 @@ use data_components::poly::PolyTableProvider;
 use datafusion::catalog::CatalogProvider;
 use datafusion::catalog::SchemaProvider;
 use datafusion::common::{Constraint, Constraints, ToDFSchema};
+use datafusion::common::{ResolvedTableReference, TableReference};
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionContext;
@@ -99,7 +106,6 @@ use datafusion::logical_expr::dml::InsertOp;
 use datafusion::physical_plan::collect;
 use datafusion::sql::parser::{DFParser, Statement};
 use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
-use datafusion::sql::{ResolvedTableReference, TableReference};
 use datafusion_expr::Expr;
 use datafusion_federation::FederatedTableProviderAdaptor;
 use error::{find_datafusion_root, format_datafusion_error};
@@ -271,7 +277,7 @@ pub enum Error {
     UnableToGetWriteBackDeliverer { source: DataConnectorError },
 
     #[snafu(display(
-        "Table {table_name} was marked as read_write, but the underlying provider only supports reads."
+        "Dataset '{table_name}' sets `access: read_write`, but its source connector only supports reads, so the dataset cannot load. Set `acceleration.write_mode: acceleration` to keep its writes in the acceleration, or set `access: read`. See: https://spiceai.org/docs/reference/spicepod/datasets#accelerationwrite_mode"
     ))]
     WriteProviderNotImplemented { table_name: String },
 
@@ -538,6 +544,12 @@ pub enum Error {
         source: crate::dataaccelerator::FilePathError,
     },
 
+    #[snafu(display("Failed to register dataset {dataset_name}: {source}"))]
+    SnapshotNotificationsConfig {
+        dataset_name: String,
+        source: runtime_acceleration::snapshot::notifications::Error,
+    },
+
     #[snafu(display("Pre-refresh partition discovery failed for table '{table_name}': {source}"))]
     PreRefreshPartitionDiscoveryFailed {
         table_name: String,
@@ -578,6 +590,8 @@ impl Error {
                 | Self::SnapshotRefreshModeRequiresSnapshots
                 | Self::SnapshotRefreshModeUnsupportedEngine { .. }
                 | Self::SnapshotRefreshModeReloadUnsupported { .. }
+                // An invalid `snapshots.params.s3_queue_url`.
+                | Self::SnapshotNotificationsConfig { .. }
                 // Unparseable `snapshots_trigger_threshold` value.
                 | Self::InvalidSnapshotCreationInterval { .. }
                 | Self::InvalidSnapshotCreationBatches { .. }
@@ -639,7 +653,7 @@ enum AcceleratedWriteMode {
 }
 
 /// Decide where an accelerated dataset's writes should go, given its source connector,
-/// access mode, `on_conflict`/CDC configuration, and configured write mode.
+/// access mode, and configured write mode.
 ///
 /// The `sink` connector is special: it discards writes and disables refresh, so its
 /// accelerator is never fed by a refresh cycle. Routing sink writes through the default
@@ -649,15 +663,8 @@ enum AcceleratedWriteMode {
 fn select_accelerated_write_mode(
     source: &str,
     allows_write: bool,
-    has_on_conflict: bool,
-    has_changes_refresh: bool,
     configured_write_mode: spicepod::acceleration::WriteMode,
 ) -> AcceleratedWriteMode {
-    // on_conflict without CDC means the source may be read-only; writes go to the accelerator.
-    if has_on_conflict && !has_changes_refresh {
-        return AcceleratedWriteMode::AcceleratorOnly;
-    }
-
     if !allows_write {
         return AcceleratedWriteMode::WriteThrough;
     }
@@ -669,6 +676,7 @@ fn select_accelerated_write_mode(
     match configured_write_mode {
         spicepod::acceleration::WriteMode::WriteBack => AcceleratedWriteMode::WriteBack,
         spicepod::acceleration::WriteMode::WriteThrough => AcceleratedWriteMode::WriteThrough,
+        spicepod::acceleration::WriteMode::Acceleration => AcceleratedWriteMode::AcceleratorOnly,
     }
 }
 
@@ -725,12 +733,6 @@ fn remap_constraints_to_refresh_schema(
 
 const DEFAULT_SNAPSHOT_CREATION_INTERVAL: Duration = Duration::from_mins(10);
 const DEFAULT_SNAPSHOT_CREATION_BATCHES: i64 = 100;
-
-/// Default polling interval for `refresh_mode: snapshot` when the user does
-/// not specify `refresh_check_interval` explicitly. Picked to be slightly
-/// shorter than the default snapshot creation interval so a freshly created
-/// snapshot is picked up promptly without aggressive object-store load.
-pub(crate) const DEFAULT_SNAPSHOT_REFRESH_CHECK_INTERVAL: Duration = Duration::from_mins(1);
 
 pub enum Table {
     Accelerated {
@@ -853,6 +855,10 @@ pub enum DeferredRefreshOutcome {
     /// Every recorder was dropped before a completion was recorded: no refresh
     /// ran, and none can.
     Abandoned,
+    /// The refresh failed and will not be retried. The table may still be
+    /// registered, but it did not load; do not broadcast readiness or create
+    /// a follow-on schedule.
+    Failed,
     /// A refresh landed, but the table has since been removed, or rebuilt as a
     /// new instance, so the action is no longer about the table registered under
     /// this name.
@@ -873,10 +879,18 @@ pub struct DataFusion {
     /// Used by the extension planner to pass `Weak<DataFusion>` to physical plans.
     datafusion_ref: iceberg_ddl::SharedDataFusionRef,
     accelerated_tables: TokioRwLock<HashSet<TableReference>>,
+    /// The SQS consumers that reload `refresh_mode: snapshot` datasets when
+    /// their snapshot location reports a new snapshot. Shared, so datasets on
+    /// one queue use one consumer.
+    snapshot_notifications: Arc<SnapshotNotifications>,
     /// Datasets whose table provider is installed somewhere other than the
     /// default catalog, keyed by dataset name (see [`DatasetPlacement`]).
     dataset_placements: dashmap::DashMap<String, Arc<dyn DatasetPlacement>>,
     caching: Arc<Caching>,
+    /// First 10 distinct SQL results-cache plan shapes, replayed after the
+    /// first full/append refresh until the cache is full. No-op unless
+    /// `runtime.caching.sql_results.warmup` is `on_first_refresh`.
+    pub(crate) results_cache_warmer: query::ResultsCacheWarmer,
     /// Per-dataset locks that keep writes from overlapping a schema evolution's provider
     /// swap. Writes take the lock shared, evolution takes it exclusively. Without this, a
     /// write can complete through the provider being replaced, and its rows are then
@@ -1030,6 +1044,15 @@ impl DataFusion {
     #[must_use]
     pub fn caching(&self) -> Arc<Caching> {
         Arc::clone(&self.caching)
+    }
+
+    pub(crate) async fn accelerated_table_names(&self) -> Vec<TableReference> {
+        self.accelerated_tables
+            .read()
+            .await
+            .iter()
+            .cloned()
+            .collect()
     }
 
     #[must_use]
@@ -1283,7 +1306,9 @@ impl DataFusion {
     /// caller cannot answer the first and forget the second. `Abandoned` alone is
     /// not enough: it reports only a drop that happens *before* any completion
     /// was recorded, while a completion recorded and *then* invalidated by a
-    /// removal or a rebuild still reads as answered.
+    /// removal or a rebuild still reads as answered. A terminal failure is
+    /// reported as [`DeferredRefreshOutcome::Failed`] so a one-shot load error
+    /// cannot be mistaken for a successful refresh.
     ///
     /// A `None` waiter is a caller with nothing to wait for; the table is still
     /// re-resolved, since it may have gone in the meantime.
@@ -1293,10 +1318,16 @@ impl DataFusion {
         instance: TableInstance,
         waiter: Option<RefreshCompletionWaiter>,
     ) -> DeferredRefreshOutcome {
-        if let Some(waiter) = waiter
-            && waiter.wait().await.is_abandoned()
-        {
-            return DeferredRefreshOutcome::Abandoned;
+        if let Some(waiter) = waiter {
+            match waiter.wait().await {
+                RefreshCompletionOutcome::Abandoned => {
+                    return DeferredRefreshOutcome::Abandoned;
+                }
+                RefreshCompletionOutcome::TerminalFailure => {
+                    return DeferredRefreshOutcome::Failed;
+                }
+                RefreshCompletionOutcome::Answered => {}
+            }
         }
 
         if self.table_instance_is_current(&instance).await {
@@ -2696,7 +2727,9 @@ impl DataFusion {
             .fail()?;
         }
 
-        let StreamingDataUpdate { data, update_type } = streaming_update;
+        let StreamingDataUpdate {
+            data, update_type, ..
+        } = streaming_update;
         let update_schema = data.schema();
         let broadcast_table_reference = self.normalize_table_reference(table_reference.clone());
 
@@ -2900,29 +2933,18 @@ impl DataFusion {
         source: Arc<dyn DataConnector>,
         federated_read_table: FederatedTable,
         secrets: Arc<TokioRwLock<Secrets>>,
-        bootstrap_status: BootstrapStatus,
+        mut bootstrap_status: BootstrapStatus,
         initial_partition_filters: Option<Vec<datafusion_expr::Expr>>,
     ) -> Result<AcceleratedTable> {
         tracing::trace!("Creating accelerated table {dataset:?}");
 
-        // For accelerated tables with on_conflict configured, the source doesn't need
-        // to support writes - writes go to the accelerated table only.
-        // Only require a read-write source when replication is enabled and no on_conflict
-        // is configured (writes need to go back to the source).
-        let has_on_conflict = dataset
-            .acceleration
-            .as_ref()
-            .is_some_and(|acc| !acc.on_conflict.is_empty());
-        // When refresh_mode is `changes` (CDC), on_conflict provides WAL UPDATE upsert routing
-        // only — it does not imply accelerator-only writes. Writes should reach the federated
-        // source per write_mode. Without CDC, on_conflict means the source may be read-only and
-        // writes are directed to the accelerator only.
-        let has_changes_refresh = dataset.acceleration.as_ref().is_some_and(|acc| {
-            acc.refresh_mode
-                .is_some_and(|m| matches!(m, RefreshMode::Changes))
-        });
-        let needs_source_writes =
-            dataset.access().allows_write() && (!has_on_conflict || has_changes_refresh);
+        // A writable dataset writes through its source (or, for write-back, back to
+        // it), so the source must accept writes, unless its writes stay in the
+        // acceleration.
+        let needs_source_writes = dataset.access().allows_write()
+            && dataset.acceleration.as_ref().is_none_or(|acc| {
+                acc.write_mode != spicepod::acceleration::WriteMode::Acceleration
+            });
 
         let source_table_provider = if needs_source_writes {
             let read_write_provider = source
@@ -3097,6 +3119,26 @@ impl DataFusion {
                 (accelerated_table_provider, None)
             };
 
+        // Subscribed before the table is built, so a bad `s3_queue_url` fails the
+        // dataset before its first refresh starts.
+        let snapshot_subscription = match &snapshot_refresh_state {
+            Some(state) => {
+                let subscription = match bootstrap_status.take_snapshot_subscription() {
+                    Some(subscription) => Some(subscription),
+                    None => {
+                        self.subscribe_to_snapshot_notifications(
+                            dataset,
+                            &acceleration_settings.snapshot_behavior,
+                            state,
+                        )
+                        .await?
+                    }
+                };
+                subscription.map(|subscription| (subscription, state.clone()))
+            }
+            None => None,
+        };
+
         // If we already have an existing dataset checkpoint table that has been checkpointed,
         // it means there is data from a previous acceleration and we don't need
         // to wait for the first refresh to complete to mark it ready.
@@ -3175,6 +3217,26 @@ impl DataFusion {
         if let Some(append_overlap) = acceleration_settings.refresh_append_overlap {
             refresh = refresh.append_overlap(append_overlap);
         }
+        refresh = refresh.versions_by_time(
+            acceleration_settings
+                .orders_versions_by_time(dataset.time_column.as_deref(), refresh_mode)
+                .then(|| {
+                    VersionsByTime {
+                        // An unpartitioned Cayenne table resolves a full refresh's repeated
+                        // keys as it writes them, ordered by the row versions the refresh
+                        // supplies: in file mode after writing, in memory mode over the
+                        // buffered write. Only file mode does so for an append into an
+                        // empty table.
+                        versions_resolved_after_write: acceleration_settings.engine
+                            == Engine::Cayenne
+                            && acceleration_settings.partition_by.is_empty(),
+                        appends_resolved_after_write: acceleration_settings.engine
+                            == Engine::Cayenne
+                            && acceleration_settings.mode == Mode::File
+                            && acceleration_settings.partition_by.is_empty(),
+                    }
+                }),
+        );
         if let Some(caching_ttl) = acceleration_settings.caching_ttl {
             refresh = refresh.caching_ttl(caching_ttl);
         }
@@ -3186,7 +3248,7 @@ impl DataFusion {
             refresh = refresh.period(refresh_data_window);
         }
         refresh
-            .validate_time_format(dataset.name.to_string(), &refresh_schema)
+            .validate_time_format(&dataset.name.to_string(), &refresh_schema)
             .context(InvalidTimeColumnTimeFormatSnafu)?;
 
         // Apply initial partition filters before the refresher starts to avoid a race
@@ -3479,6 +3541,8 @@ impl DataFusion {
             accelerated_table_builder.with_resource_monitor(resource_monitor.clone());
         }
 
+        accelerated_table_builder.with_query_runtime_env(self.ctx.runtime_env());
+
         if let Some(metrics) = &self.metrics {
             accelerated_table_builder.metrics(metrics.clone());
         }
@@ -3540,14 +3604,9 @@ impl DataFusion {
                 .await;
         }
 
-        // on_conflict forces accelerator-only writes when CDC is not in use. With CDC
-        // (refresh_mode: changes), on_conflict is for WAL UPDATE upsert routing only and
-        // does not override the write destination — writes follow write_mode instead.
         match select_accelerated_write_mode(
             dataset.source(),
             dataset.access().allows_write(),
-            has_on_conflict,
-            has_changes_refresh,
             acceleration_settings.write_mode,
         ) {
             AcceleratedWriteMode::AcceleratorOnly => {
@@ -3619,12 +3678,57 @@ impl DataFusion {
             .await
             .context(AccelerationRegistrationSnafu)?;
 
-        accelerated_table_builder
-            .build()
+        let mut accelerated_table = accelerated_table_builder.build().await.context(
+            UnableToBuildAcceleratedTableSnafu {
+                dataset_name: dataset.name.to_string(),
+            },
+        )?;
+
+        if let Some((subscription, state)) = snapshot_subscription
+            && let Some(requester) = accelerated_table.refresh_requester()
+            && let Some(completion) = accelerated_table.refresher().refresh_completion()
+        {
+            accelerated_table.attach_task(self.io_runtime.spawn(reload_on_snapshot_notifications(
+                subscription,
+                move || state.current_loaded_id(),
+                requester,
+                completion,
+            )));
+        }
+
+        Ok(accelerated_table)
+    }
+
+    /// Subscribe a `refresh_mode: snapshot` dataset to its snapshot location's
+    /// S3 event notifications, when `snapshots.params.s3_queue_url` names the
+    /// SQS queue that receives them. `None` when no queue is configured, and on
+    /// a scheduler, which loads no accelerations itself.
+    async fn subscribe_to_snapshot_notifications(
+        &self,
+        dataset: &Dataset,
+        snapshot_behavior: &SnapshotBehavior,
+        state: &SnapshotRefreshState,
+    ) -> Result<Option<Subscription>> {
+        let Some(notifications) = self.snapshot_notifications() else {
+            return Ok(None);
+        };
+        notifications
+            .subscribe_for_behavior(snapshot_behavior, &state.manager)
             .await
-            .context(UnableToBuildAcceleratedTableSnafu {
+            .context(SnapshotNotificationsConfigSnafu {
                 dataset_name: dataset.name.to_string(),
             })
+    }
+
+    /// The queue consumers shared by local snapshot bootstrap and refresh.
+    pub(crate) fn snapshot_notifications(&self) -> Option<Arc<SnapshotNotifications>> {
+        if matches!(
+            self.cluster_config.effective_role(),
+            Some(crate::config::ClusterRole::Scheduler)
+        ) {
+            return None;
+        }
+        Some(Arc::clone(&self.snapshot_notifications))
     }
 
     // Compare the checkpoint schema (from the previous run) against the source/refresh
@@ -5716,6 +5820,17 @@ async fn build_snapshot_creation_config(
         return Ok(None);
     }
 
+    // Same gate as `snapshot_before_recreate`.
+    if acceleration_settings.uses_cayenne_datalake() {
+        tracing::warn!(
+            dataset = %dataset.name,
+            "Snapshot creation is disabled for dataset '{}': {}",
+            dataset.name,
+            runtime_acceleration::acceleration::CAYENNE_DATALAKE_SNAPSHOT_REASON
+        );
+        return Ok(None);
+    }
+
     let is_streaming_refresh = matches!(refresh_mode, RefreshMode::Changes)
         || (matches!(refresh_mode, RefreshMode::Append) && dataset.time_column.is_none());
     let snapshot_trigger = &acceleration_settings.snapshots_trigger;
@@ -5846,6 +5961,17 @@ async fn build_snapshot_creation_config(
     .await
     .map(|sm| {
         let sm = sm.with_snapshots_creation_policy(acceleration_settings.snapshots_creation_policy);
+        // How often the dataset creates snapshots decides how long its snapshot
+        // writer lease lasts without renewal.
+        let snapshot_interval = match &snapshot_creation_trigger {
+            SnapshotCreateTrigger::Interval(interval) => Some(*interval),
+            SnapshotCreateTrigger::RefreshComplete => dataset.refresh_check_interval(),
+            SnapshotCreateTrigger::Batches(_) => None,
+        };
+        let sm = match snapshot_interval {
+            Some(interval) => sm.with_snapshot_interval(interval),
+            None => sm,
+        };
         let sm = if let Some(engine) = snapshot_engine_override {
             sm.with_snapshot_engine(engine)
         } else {
@@ -6123,11 +6249,29 @@ mod tests {
             spicepod::acceleration::WriteMode::WriteBack,
         ] {
             assert_eq!(
-                select_accelerated_write_mode(SINK_DATACONNECTOR, true, false, false, configured),
+                select_accelerated_write_mode(SINK_DATACONNECTOR, true, configured),
                 AcceleratedWriteMode::AcceleratorOnly,
                 "accelerated sink dataset (configured={configured:?}) must write accelerator-only"
             );
         }
+    }
+
+    #[test]
+    fn a_read_only_source_names_write_mode_acceleration() {
+        assert_eq!(
+            Error::WriteProviderNotImplemented {
+                table_name: "orders".to_string(),
+            }
+            .to_string(),
+            "Dataset 'orders' sets `access: read_write`, but its source connector only supports reads, so the dataset cannot load. Set `acceleration.write_mode: acceleration` to keep its writes in the acceleration, or set `access: read`. See: https://spiceai.org/docs/reference/spicepod/datasets#accelerationwrite_mode"
+        );
+        assert_eq!(
+            crate::Error::AccelerationWriteModeWithChanges {
+                dataset_name: "orders".to_string(),
+            }
+            .to_string(),
+            "Dataset 'orders' sets `acceleration.write_mode: acceleration` and refreshes by `changes` (set by `refresh_mode` or by its connector's default), but the source's changes would overwrite writes kept only in the acceleration, so the dataset cannot load. Use `write_mode: write_through` or `write_back` with a change stream, or another `refresh_mode`. See: https://spiceai.org/docs/reference/spicepod/datasets#accelerationwrite_mode"
+        );
     }
 
     #[test]
@@ -6137,8 +6281,6 @@ mod tests {
             select_accelerated_write_mode(
                 "postgres",
                 true,
-                false,
-                false,
                 spicepod::acceleration::WriteMode::WriteThrough,
             ),
             AcceleratedWriteMode::WriteThrough,
@@ -6147,42 +6289,25 @@ mod tests {
             select_accelerated_write_mode(
                 "postgres",
                 true,
-                false,
-                false,
                 spicepod::acceleration::WriteMode::WriteBack,
             ),
             AcceleratedWriteMode::WriteBack,
         );
 
-        // on_conflict without CDC forces accelerator-only regardless of source.
+        // `write_mode: acceleration` keeps writes in the acceleration, whatever the source.
         assert_eq!(
             select_accelerated_write_mode(
-                "postgres",
+                "file",
                 true,
-                true,
-                false,
-                spicepod::acceleration::WriteMode::WriteThrough,
+                spicepod::acceleration::WriteMode::Acceleration,
             ),
             AcceleratedWriteMode::AcceleratorOnly,
-        );
-        // on_conflict *with* CDC does not force accelerator-only.
-        assert_eq!(
-            select_accelerated_write_mode(
-                "postgres",
-                true,
-                true,
-                true,
-                spicepod::acceleration::WriteMode::WriteThrough,
-            ),
-            AcceleratedWriteMode::WriteThrough,
         );
 
         // A read-only dataset stays WriteThrough even for a sink source (no writes routed).
         assert_eq!(
             select_accelerated_write_mode(
                 SINK_DATACONNECTOR,
-                false,
-                false,
                 false,
                 spicepod::acceleration::WriteMode::WriteThrough,
             ),
@@ -7266,6 +7391,24 @@ mod tests {
                 df.await_refresh_completion(instance, Some(waiter)).await,
                 DeferredRefreshOutcome::Apply,
                 "an untouched table must still apply, or every deferred action is dropped"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_terminal_failure_does_not_apply() {
+            let df = test_df();
+            let name = TableReference::bare("orders");
+            register(&df, &name);
+
+            let instance = df.capture_table_instance(&name).await;
+            let completion = RefreshCompletion::new();
+            let waiter = completion.next();
+            completion.record_terminal_failure(completion.issue());
+
+            assert_eq!(
+                df.await_refresh_completion(instance, Some(waiter)).await,
+                DeferredRefreshOutcome::Failed,
+                "a failed one-shot refresh must not broadcast PartitionsLoaded"
             );
         }
 

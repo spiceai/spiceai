@@ -2,17 +2,17 @@
 source: crates/test-framework/src/spicetest/datasets/worker.rs
 description: "Query: tpcds_q21"
 ---
-+---------------------+------------------+------------+-----------+
-| w_warehouse_name    | i_item_id        | inv_before | inv_after |
-+---------------------+------------------+------------+-----------+
-| Conventional childr | AAAAAAAAAAHDAAAA | 1861       | 2672      |
-| Conventional childr | AAAAAAAAAALAAAAA | 2031       | 2323      |
-| Conventional childr | AAAAAAAAACLDAAAA | 2267       | 2625      |
-| Conventional childr | AAAAAAAAACPDAAAA | 1794       | 2310      |
-| Conventional childr | AAAAAAAAADGBAAAA | 2264       | 2930      |
-| Conventional childr | AAAAAAAAAEADAAAA | 1583       | 2049      |
-| Conventional childr | AAAAAAAAAFACAAAA | 1591       | 2075      |
-| Conventional childr | AAAAAAAAAFDCAAAA | 2432       | 3101      |
-| Conventional childr | AAAAAAAAAJCAAAAA | 2406       | 2772      |
-| Conventional childr | AAAAAAAAAJKBAAAA | 1216       | 1457      |
-+---------------------+------------------+------------+-----------+
++----------------------+------------------+------------+-----------+
+| w_warehouse_name     | i_item_id        | inv_before | inv_after |
++----------------------+------------------+------------+-----------+
+| Bad cards must make. | AAAAAAAAABBDAAAA | 1480       | 2780      |
+| Bad cards must make. | AAAAAAAAACLDAAAA | 1663       | 2144      |
+| Bad cards must make. | AAAAAAAAACOBAAAA | 1202       | 1558      |
+| Bad cards must make. | AAAAAAAAADKBAAAA | 2404       | 2414      |
+| Bad cards must make. | AAAAAAAAAFDCAAAA | 2331       | 2523      |
+| Bad cards must make. | AAAAAAAAAHDEAAAA | 2456       | 2620      |
+| Bad cards must make. | AAAAAAAAAHHAAAAA | 1901       | 1973      |
+| Bad cards must make. | AAAAAAAAAIECAAAA | 2282       | 2837      |
+| Bad cards must make. | AAAAAAAAALCEAAAA | 2138       | 2731      |
+| Bad cards must make. | AAAAAAAAAMBEAAAA | 1736       | 2501      |
++----------------------+------------------+------------+-----------+

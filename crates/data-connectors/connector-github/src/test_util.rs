@@ -39,6 +39,12 @@ fn shared_runtime() -> &'static (tokio::runtime::Runtime, Arc<runtime::Runtime>)
     })
 }
 
+/// Drive an async test on the shared runtime. `#[tokio::test]` cannot call
+/// [`shared_component`]: that initializes this runtime with `Runtime::new`.
+pub(crate) fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+    shared_runtime().0.block_on(fut)
+}
+
 /// A `ConnectorComponent` for a GitHub dataset named `dataset_name`.
 pub(crate) fn shared_component(dataset_name: &str) -> ConnectorComponent {
     let (_, spice_runtime) = shared_runtime();

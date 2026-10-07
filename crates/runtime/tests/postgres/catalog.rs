@@ -309,8 +309,8 @@ async fn test_partitioned_table_registers_parent_only() -> Result<(), anyhow::Er
 
     test_request_context()
         .scope(async {
-            let port = common::get_random_port()?;
-            let _container = common::start_postgres_docker_container(port).await?;
+            let container = common::start_postgres_docker_container().await?;
+            let port = usize::from(container.host_port(5432)?);
 
             seed_partitioned_schema(port).await?;
 
@@ -374,8 +374,8 @@ async fn test_materialized_view_and_foreign_table_discovered() -> Result<(), any
 
     test_request_context()
         .scope(async {
-            let port = common::get_random_port()?;
-            let _container = common::start_postgres_docker_container(port).await?;
+            let container = common::start_postgres_docker_container().await?;
+            let port = usize::from(container.host_port(5432)?);
 
             seed_matview_and_foreign_table(port).await?;
 
@@ -490,8 +490,8 @@ async fn test_unsupported_type_action_defaults_to_string() -> Result<(), anyhow:
 
     test_request_context()
         .scope(async {
-            let port = common::get_random_port()?;
-            let _container = common::start_postgres_docker_container(port).await?;
+            let container = common::start_postgres_docker_container().await?;
+            let port = usize::from(container.host_port(5432)?);
 
             seed_unsupported_type_table(port).await?;
 
@@ -551,8 +551,8 @@ async fn test_unsupported_type_action_override_drops_table() -> Result<(), anyho
 
     test_request_context()
         .scope(async {
-            let port = common::get_random_port()?;
-            let _container = common::start_postgres_docker_container(port).await?;
+            let container = common::start_postgres_docker_container().await?;
+            let port = usize::from(container.host_port(5432)?);
 
             seed_unsupported_type_table(port).await?;
 
@@ -606,8 +606,8 @@ async fn test_catalog_discovery_ignores_a_shadowed_version_function() -> Result<
 
     test_request_context()
         .scope(async {
-            let port = common::get_random_port()?;
-            let _container = common::start_postgres_docker_container(port).await?;
+            let container = common::start_postgres_docker_container().await?;
+            let port = usize::from(container.host_port(5432)?);
 
             let pool = common::get_postgres_connection_pool(port, None).await?;
             let conn = pool
@@ -686,7 +686,7 @@ impl RecordingRead {
 impl Read for RecordingRead {
     async fn table_provider(
         &self,
-        table_reference: datafusion::sql::TableReference,
+        table_reference: datafusion::common::TableReference,
     ) -> Result<
         Arc<dyn datafusion::datasource::TableProvider + 'static>,
         Box<dyn std::error::Error + Send + Sync>,
@@ -702,7 +702,7 @@ impl Read for RecordingRead {
 
     async fn table_provider_with_schema(
         &self,
-        table_reference: datafusion::sql::TableReference,
+        table_reference: datafusion::common::TableReference,
         schema: arrow::datatypes::SchemaRef,
     ) -> Result<
         Arc<dyn datafusion::datasource::TableProvider + 'static>,
@@ -737,8 +737,8 @@ async fn test_bulk_schema_resolution_honors_unsupported_type_action() -> Result<
 
     test_request_context()
         .scope(async {
-            let port = common::get_random_port()?;
-            let _container = common::start_postgres_docker_container(port).await?;
+            let container = common::start_postgres_docker_container().await?;
+            let port = usize::from(container.host_port(5432)?);
 
             seed_unsupported_type_table(port).await?;
 
@@ -804,8 +804,8 @@ async fn test_filtered_refresh_builds_only_selected_tables_from_the_bulk_lookup(
 
     test_request_context()
         .scope(async {
-            let port = common::get_random_port()?;
-            let _container = common::start_postgres_docker_container(port).await?;
+            let container = common::start_postgres_docker_container().await?;
+            let port = usize::from(container.host_port(5432)?);
 
             let pool = common::get_postgres_connection_pool(port, None).await?;
             pool.connect_direct()
@@ -956,8 +956,8 @@ async fn test_refresh_registers_a_table_created_at_the_source() -> Result<(), an
 
     test_request_context()
         .scope(async {
-            let port = common::get_random_port()?;
-            let _container = common::start_postgres_docker_container(port).await?;
+            let container = common::start_postgres_docker_container().await?;
+            let port = usize::from(container.host_port(5432)?);
 
             source_exec(port, "CREATE TABLE before_only (id INT PRIMARY KEY)").await?;
 
@@ -1043,8 +1043,8 @@ async fn test_refresh_removes_a_dropped_table() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
-            let port = common::get_random_port()?;
-            let _container = common::start_postgres_docker_container(port).await?;
+            let container = common::start_postgres_docker_container().await?;
+            let port = usize::from(container.host_port(5432)?);
 
             source_exec(
                 port,
@@ -1097,8 +1097,8 @@ async fn test_refresh_tracks_schema_creation_and_removal() -> Result<(), anyhow:
 
     test_request_context()
         .scope(async {
-            let port = common::get_random_port()?;
-            let _container = common::start_postgres_docker_container(port).await?;
+            let container = common::start_postgres_docker_container().await?;
+            let port = usize::from(container.host_port(5432)?);
 
             let (provider, _ctx) = refreshable_catalog(port).await?;
             provider
@@ -1159,8 +1159,8 @@ async fn test_refresh_sees_a_rename_as_a_removal_and_an_addition() -> Result<(),
 
     test_request_context()
         .scope(async {
-            let port = common::get_random_port()?;
-            let _container = common::start_postgres_docker_container(port).await?;
+            let container = common::start_postgres_docker_container().await?;
+            let port = usize::from(container.host_port(5432)?);
 
             source_exec(
                 port,
@@ -1236,8 +1236,8 @@ async fn test_refresh_reports_a_table_it_cannot_load() -> Result<(), anyhow::Err
 
     test_request_context()
         .scope(async {
-            let port = common::get_random_port()?;
-            let _container = common::start_postgres_docker_container(port).await?;
+            let container = common::start_postgres_docker_container().await?;
+            let port = usize::from(container.host_port(5432)?);
 
             source_exec(port, "CREATE TABLE orders (id INT PRIMARY KEY)").await?;
 
@@ -1306,7 +1306,7 @@ struct UnloadableTables;
 impl Read for UnloadableTables {
     async fn table_provider(
         &self,
-        table_reference: datafusion::sql::TableReference,
+        table_reference: datafusion::common::TableReference,
     ) -> Result<
         Arc<dyn datafusion::datasource::TableProvider + 'static>,
         Box<dyn std::error::Error + Send + Sync>,
@@ -1333,8 +1333,8 @@ async fn test_refresh_registers_nothing_when_include_matches_no_table() -> Resul
 
     test_request_context()
         .scope(async {
-            let port = common::get_random_port()?;
-            let _container = common::start_postgres_docker_container(port).await?;
+            let container = common::start_postgres_docker_container().await?;
+            let port = usize::from(container.host_port(5432)?);
 
             source_exec(port, "CREATE TABLE present (id INT PRIMARY KEY)").await?;
 
@@ -1474,8 +1474,8 @@ async fn test_catalog_evaluates_a_spice_only_udf_locally() -> Result<(), anyhow:
 
     test_request_context()
         .scope(async {
-            let port = common::get_random_port()?;
-            let _container = common::start_postgres_docker_container(port).await?;
+            let container = common::start_postgres_docker_container().await?;
+            let port = usize::from(container.host_port(5432)?);
 
             seed_json_documents(port).await?;
             let rt = start_runtime(pg_catalog(port)).await?;

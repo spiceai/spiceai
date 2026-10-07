@@ -40,10 +40,14 @@ use mediatype::{MediaType, names};
 use runtime_request_context::{AsyncMarker, RequestContext};
 
 use futures::StreamExt;
-use llms::chat::nsql::{FailedAttempt, QueryGenerationContext, default::DefaultSqlGeneration};
+use llms::chat::{
+    Chat,
+    nsql::{FailedAttempt, QueryGenerationContext, default::DefaultSqlGeneration},
+};
 use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::RwLock;
+use tracing::Span;
 use tracing_futures::Instrument;
 
 use crate::datafusion::query::QueryBuilder;
@@ -516,8 +520,16 @@ pub(crate) async fn post(
     // track ai_inferences_with_spice_count metric
     let context = RequestContext::current(AsyncMarker::new().await);
 
+    // Resolved before the response starts, so a model that cannot serve the request is rejected
+    // with the same status and message whether or not it streams: once an event stream opens,
+    // its status is already 200.
+    let target = match resolve_nsql_target(&rt, &llms, &context, &payload).await {
+        Ok(target) => target,
+        Err((status, message)) => return (status, message).into_response(),
+    };
+
     if payload.stream {
-        let stream = futures::stream::once(handle_nsql_query(rt, context, llms, accept, payload))
+        let stream = futures::stream::once(handle_nsql_query(rt, context, target, accept, payload))
             .map(|(status, _, body)| {
                 if status.is_success() {
                     Ok(Event::default().data(body))
@@ -533,16 +545,56 @@ pub(crate) async fn post(
             )
             .into_response()
     } else {
-        handle_nsql_query(rt, context, llms, accept, payload)
+        handle_nsql_query(rt, context, target, accept, payload)
             .await
             .into_response()
     }
 }
 
-pub(crate) async fn handle_nsql_query(
+/// The model an NSQL request runs on, confirmed loaded, and the `nsql` task span it is recorded
+/// under.
+struct NsqlTarget {
+    model: String,
+    nql_model: Arc<dyn Chat>,
+    span: Span,
+}
+
+/// Resolves the model a request uses and confirms it can serve the request. The task span opens
+/// first, so a rejected request is still recorded in `runtime.task_history`.
+async fn resolve_nsql_target(
+    rt: &Arc<Runtime>,
+    llms: &RwLock<LLMChatCompletionsModelStore>,
+    context: &Arc<RequestContext>,
+    payload: &Request,
+) -> Result<NsqlTarget, (StatusCode, String)> {
+    let model = resolve_nsql_model_name(payload.model.clone(), rt).await?;
+
+    crate::model::add_tools_used(context, 1);
+
+    let span = tracing::span!(target: "task_history", tracing::Level::INFO, "nsql", input = %payload.query, model = %model, "labels");
+
+    crate::task_history::correlation::record_task_history_trace_id(&span, context);
+
+    let nql_model = llms.read().await.get(&model).cloned();
+    let Some(nql_model) = nql_model else {
+        let message = rt
+            .status()
+            .unavailable_model_reason(&model)
+            .unwrap_or_else(|| format!("Model {model} not found"));
+        return Err((StatusCode::BAD_REQUEST, message));
+    };
+
+    Ok(NsqlTarget {
+        model,
+        nql_model,
+        span,
+    })
+}
+
+async fn handle_nsql_query(
     rt: Arc<Runtime>,
     context: Arc<RequestContext>,
-    llms: Arc<RwLock<LLMChatCompletionsModelStore>>,
+    target: NsqlTarget,
     accept: Option<TypedHeader<Accept>>,
     payload: Request,
 ) -> (StatusCode, HeaderMap, String) {
@@ -558,23 +610,16 @@ pub(crate) async fn handle_nsql_query(
 
     let Request {
         query,
-        model: requested_model,
         sample_data_enabled,
         datasets,
         prompt_cache_key,
         ..
     } = payload;
-
-    let model = match resolve_nsql_model_name(requested_model, &rt).await {
-        Ok(model) => model,
-        Err((status, message)) => return (status, headers, message),
-    };
-
-    crate::model::add_tools_used(&context, 1);
-
-    let span = tracing::span!(target: "task_history", tracing::Level::INFO, "nsql", input = %query, model = %model, "labels");
-
-    crate::task_history::correlation::record_task_history_trace_id(&span, &context);
+    let NsqlTarget {
+        model,
+        nql_model,
+        span,
+    } = target;
 
     let nsql_context = match build_nsql_context(
         Arc::clone(&rt),
@@ -593,18 +638,6 @@ pub(crate) async fn handle_nsql_query(
         }
     };
     let table_allowlist_opt = nsql_context.table_allowlist.clone();
-
-    let nql_model = {
-        let models = llms.read().await;
-        let Some(nql_model) = models.get(&model) else {
-            let message = rt
-                .status()
-                .unavailable_model_reason(&model)
-                .unwrap_or_else(|| format!("Model {model} not found"));
-            return (StatusCode::BAD_REQUEST, headers, message);
-        };
-        Arc::clone(nql_model)
-    };
 
     let default_sql_generation = DefaultSqlGeneration {};
     let sql_gen = nql_model.as_sql().unwrap_or(&default_sql_generation);
@@ -800,7 +833,7 @@ mod tests {
     };
     use app::AppBuilder;
     use axum_extra::extract::Query as ExtraQuery;
-    use datafusion::sql::TableReference;
+    use datafusion::common::TableReference;
     use http::Uri;
     use http_body_util::BodyExt;
     use serde_json::json;
@@ -1457,6 +1490,58 @@ mod tests {
         );
 
         assert!(entries.is_empty());
+    }
+
+    // regression test for #14394
+    #[tokio::test]
+    async fn model_that_failed_to_load_is_rejected_before_any_response_streams() {
+        let rt = Arc::new(Runtime::builder().build().await);
+        *rt.app().write().await = Some(Arc::new(app_with_models(vec![Model::new(
+            "openai:deepseek-chat",
+            "deepseek",
+        )])));
+        rt.status().update_model(
+            "deepseek",
+            crate::status::ComponentStatus::error_with_message("Insufficient Balance"),
+        );
+        // A model that failed to load is never inserted into the chat model store.
+        let llms: Arc<RwLock<LLMChatCompletionsModelStore>> = Arc::default();
+
+        for stream in [true, false] {
+            for model in [Some("deepseek"), None] {
+                let mut request = json!({ "query": "how many rows", "stream": stream });
+                if let Some(model) = model {
+                    request["model"] = json!(model);
+                }
+                let payload: Request =
+                    serde_json::from_value(request).expect("request should deserialize");
+
+                let response = post(
+                    Extension(Arc::clone(&rt)),
+                    Extension(Arc::clone(&llms)),
+                    None,
+                    Json(payload),
+                )
+                .await;
+
+                assert_eq!(
+                    response.status(),
+                    StatusCode::BAD_REQUEST,
+                    "stream: {stream}, model: {model:?}"
+                );
+                let body = response
+                    .into_body()
+                    .collect()
+                    .await
+                    .expect("response body should collect")
+                    .to_bytes();
+                assert_eq!(
+                    String::from_utf8(body.to_vec()).expect("response body should be UTF-8"),
+                    "Model 'deepseek' failed to load, so it cannot serve requests. Cause: Insufficient Balance",
+                    "stream: {stream}, model: {model:?}"
+                );
+            }
+        }
     }
 
     #[test]

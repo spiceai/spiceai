@@ -33,7 +33,7 @@ use arrow_schema::{DataType, Field, Schema};
 use aws_sdk_credential_bridge::{S3CredentialProvider, get_or_init_sdk_config};
 use data_components::RefreshableCatalogProvider;
 use datafusion::assert_batches_eq;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use futures::{StreamExt, TryStreamExt};
 use object_store::ObjectStoreExt;
 use object_store::{ClientOptions, ObjectStore, aws::AmazonS3Builder, path::Path as ObjectPath};
@@ -556,6 +556,7 @@ async fn test_cayenne_s3_express_multi_zone_live() -> Result<(), String> {
                 refresh_mode: Some(RefreshMode::Full),
                 primary_key: Some("VendorID".to_string()),
                 on_conflict,
+                write_mode: spicepod::acceleration::WriteMode::Acceleration,
                 params: Some(accel_params),
                 ..Acceleration::default()
             });

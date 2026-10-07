@@ -62,8 +62,6 @@ use crate::{
     utils::{runtime_ready_check, test_request_context},
 };
 
-const S3_HOST_PORT: u16 = 19_137;
-const PROXY_PORT: u16 = 19_138;
 const ACCESS_KEY: &str = "rustfsadmin";
 const SECRET_KEY: &str = "rustfsadmin";
 const BUCKET: &str = "overwrite-race";
@@ -358,10 +356,10 @@ async fn overwrite_object(
 /// with versioning enabled, so a replaced object keeps a fetchable `versionId`,
 /// and `If-Match` on GET, so a read pinned to a stale `ETag` fails with 412
 /// rather than returning the replacement's bytes.
-async fn start_object_store() -> Result<RunningContainer<'static>, anyhow::Error> {
+async fn start_object_store() -> Result<RunningContainer, anyhow::Error> {
     let container = ContainerRunnerBuilder::new("spice_test_rustfs_parquet_overwrite")
         .image("rustfs/rustfs:latest".to_string())
-        .add_port_binding(9000, S3_HOST_PORT)
+        .publish_port(9000)
         .add_env_var("RUSTFS_ACCESS_KEY", ACCESS_KEY)
         .add_env_var("RUSTFS_SECRET_KEY", SECRET_KEY)
         .command(["/data"])
@@ -379,7 +377,12 @@ async fn start_object_store() -> Result<RunningContainer<'static>, anyhow::Error
         .build()?
         .run(Some(Duration::from_mins(2)))
         .await?;
-    wait_for_tcp_port("127.0.0.1", S3_HOST_PORT, Duration::from_mins(1)).await?;
+    wait_for_tcp_port(
+        "127.0.0.1",
+        container.host_port(9000)?,
+        Duration::from_mins(1),
+    )
+    .await?;
     Ok(container)
 }
 
@@ -404,29 +407,40 @@ struct ProxyCounters {
 /// use the pinned GET, or they fire during inference and miss the 412 path.
 struct MixProxy {
     counters: Arc<ProxyCounters>,
+    port: u16,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for MixProxy {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 impl MixProxy {
-    fn start() -> Self {
+    async fn start(upstream_port: u16) -> Result<Self, anyhow::Error> {
+        let listener = TcpListener::bind(("127.0.0.1", 0)).await?;
+        let port = listener.local_addr()?.port();
         let counters = Arc::new(ProxyCounters::default());
         let listening = Arc::clone(&counters);
-        tokio::spawn(async move {
-            let listener = TcpListener::bind(("127.0.0.1", PROXY_PORT))
-                .await
-                .expect("bind delay proxy");
+        let task = tokio::spawn(async move {
             loop {
                 let Ok((client, _)) = listener.accept().await else {
                     continue;
                 };
                 let counters = Arc::clone(&listening);
                 tokio::spawn(async move {
-                    if let Err(err) = proxy_connection(client, &counters).await {
+                    if let Err(err) = proxy_connection(client, &counters, upstream_port).await {
                         tracing::debug!("overwrite-race proxy connection ended: {err}");
                     }
                 });
             }
         });
-        Self { counters }
+        Ok(Self {
+            counters,
+            port,
+            task,
+        })
     }
 
     fn reset(&self) {
@@ -526,6 +540,7 @@ fn is_generation_pinned_object_get(headers: &[u8]) -> bool {
 async fn proxy_connection(
     mut client: TcpStream,
     counters: &ProxyCounters,
+    upstream_port: u16,
 ) -> Result<(), anyhow::Error> {
     loop {
         let Some((headers, body)) = read_http_message(&mut client, true).await? else {
@@ -540,7 +555,7 @@ async fn proxy_connection(
         if delay_later_gets {
             tokio::time::sleep(Duration::from_millis(400)).await;
         }
-        let mut upstream = TcpStream::connect(("127.0.0.1", S3_HOST_PORT)).await?;
+        let mut upstream = TcpStream::connect(("127.0.0.1", upstream_port)).await?;
         upstream.write_all(&headers).await?;
         upstream.write_all(&body).await?;
         let Some((resp_headers, resp_body)) = read_http_message(&mut upstream, !is_head).await?
@@ -1145,10 +1160,10 @@ async fn listing_table_scan_does_not_decode_a_replaced_object() -> Result<(), an
     test_request_context()
         .scope(async {
             let container = start_object_store().await?;
-            let store_endpoint = format!("http://127.0.0.1:{S3_HOST_PORT}");
-            let proxy = format!("http://127.0.0.1:{PROXY_PORT}");
-            let mix = MixProxy::start();
-            wait_for_tcp_port("127.0.0.1", PROXY_PORT, Duration::from_secs(5)).await?;
+            let store_port = container.host_port(9000)?;
+            let store_endpoint = format!("http://127.0.0.1:{store_port}");
+            let mix = MixProxy::start(store_port).await?;
+            let proxy = format!("http://127.0.0.1:{}", mix.port);
 
             let gen_a = generation_table(1);
             let gen_b = generation_table(2);

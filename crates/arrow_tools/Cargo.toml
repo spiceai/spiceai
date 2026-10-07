@@ -18,6 +18,8 @@ arrow-ipc.workspace = true
 # elsewhere in the graph.
 arrow-schema = { workspace = true, features = ["serde"] }
 base64 = "0.22.1"
+# The flatbuffer an Arrow IPC schema message is, read to correct a map declaration in place.
+flatbuffers.workspace = true
 snafu.workspace = true
 datafusion.workspace = true
 serde_json.workspace = true
