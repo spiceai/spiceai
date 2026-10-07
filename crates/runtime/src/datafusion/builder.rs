@@ -4338,7 +4338,7 @@ mod tests {
         );
     }
 
-    /// The point-lookup fast path skips rules by name, so a rule that DataFusion renames or
+    /// The point-lookup fast path skips rules by name, so a rule that `DataFusion` renames or
     /// merges silently stops being skipped (`EnsureRequirements` took the place of
     /// `EnforceDistribution` and `EnforceSorting`). Every name `SKIPPABLE_RULES` lists must
     /// belong to a rule the session registers once every optional rule is on.
