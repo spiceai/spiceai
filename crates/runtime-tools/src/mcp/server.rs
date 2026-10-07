@@ -817,21 +817,22 @@ impl ServerHandler for RuntimeServer {
         let tool_name = request.name.clone().into_owned();
         let arguments = request.arguments.clone();
         Box::pin(async move {
-            let run = self.call_tool_with_auth(request, tool_name, arguments);
+            let run = self.call_tool_with_auth(request, tool_name.clone(), arguments);
             let spice_ctx = spice_request_context_from_mcp(&context);
-            let has_principal = spice_ctx
-                .as_ref()
-                .is_some_and(|ctx| AuthRequestContext::auth_principal(ctx.as_ref()).is_some());
-            if has_principal {
-                spice_ctx.expect("checked above").scope(run).await
-            } else {
-                // `/v1/mcp` requires `runtime.auth`. Missing principal means
-                // propagation failed — fail closed as read-only, never as
-                // auth-disabled (writes allowed).
-                tracing::warn!(
-                    "MCP tools/call missing authenticated principal on request Parts; binding fail-closed read-only principal so writes are refused"
-                );
-                mcp_fail_closed_read_only_context().scope(run).await
+            match spice_ctx.filter(|ctx| {
+                AuthRequestContext::auth_principal(ctx.as_ref()).is_some()
+            }) {
+                Some(ctx) => ctx.scope(run).await,
+                None => {
+                    // `/v1/mcp` requires `runtime.auth`. Missing principal means
+                    // propagation failed — fail closed as read-only, never as
+                    // auth-disabled (writes allowed).
+                    tracing::warn!(
+                        tool = %tool_name,
+                        "MCP tools/call for '{tool_name}' had no authenticated principal; treating this call as read-only so writes are refused. Retry with a valid API key (use a ':rw' key for writes). See https://spiceai.org/docs/api/auth and https://spiceai.org/docs/reference/runtime#auth"
+                    );
+                    mcp_fail_closed_read_only_context().scope(run).await
+                }
             }
         })
     }
@@ -4558,26 +4559,176 @@ mod tests {
         assert_eq!(payload.get("wrote"), Some(&Value::Bool(true)));
     }
 
+    /// Initialize a legacy-era MCP session and return its `Mcp-Session-Id`.
+    ///
+    /// `2026-07-28` is always sessionless; only legacy `initialize` creates a
+    /// session worker that can retain prior request state across tools/call.
+    async fn initialize_legacy_mcp_session(
+        service: &rmcp::transport::streamable_http_server::StreamableHttpService<
+            RuntimeServer,
+            rmcp::transport::streamable_http_server::session::local::LocalSessionManager,
+        >,
+    ) -> String {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "runtime-tools-test", "version": "0.0.0"}
+            }
+        });
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", "localhost")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-protocol-version", "2025-11-25")
+            .body(http_body_util::Full::new(bytes::Bytes::from(body.to_string())))
+            .expect("valid initialize request");
+        let response = service.handle(request).await;
+        let status = response.status();
+        let session_id = response
+            .headers()
+            .get("mcp-session-id")
+            .unwrap_or_else(|| panic!("initialize must return Mcp-Session-Id, status={status}"))
+            .to_str()
+            .expect("session id utf8")
+            .to_owned();
+        let _ = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("initialize body");
+
+        let initialized = http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", "localhost")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-protocol-version", "2025-11-25")
+            .header("mcp-session-id", &session_id)
+            .body(http_body_util::Full::new(bytes::Bytes::from(
+                r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            )))
+            .expect("valid initialized notification");
+        let response = service.handle(initialized).await;
+        assert!(
+            response.status().is_success() || response.status() == http::StatusCode::ACCEPTED,
+            "notifications/initialized must be accepted, got {}",
+            response.status()
+        );
+        let _ = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("initialized body");
+        session_id
+    }
+
+    async fn post_legacy_tools_call_with_session(
+        service: &rmcp::transport::streamable_http_server::StreamableHttpService<
+            RuntimeServer,
+            rmcp::transport::streamable_http_server::session::local::LocalSessionManager,
+        >,
+        session_id: &str,
+        tool_name: &str,
+        spice_ctx: Option<Arc<SpiceRequestContext>>,
+        rpc_id: u64,
+    ) -> (http::StatusCode, Value) {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": rpc_id,
+            "method": "tools/call",
+            "params": {
+                "name": tool_name,
+                "arguments": {}
+            }
+        });
+        let mut request = http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", "localhost")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-protocol-version", "2025-11-25")
+            .header("mcp-session-id", session_id)
+            .body(http_body_util::Full::new(bytes::Bytes::from(body.to_string())))
+            .expect("valid legacy tools/call request");
+        if let Some(ctx) = spice_ctx {
+            if let Some(principal) = AuthRequestContext::auth_principal(ctx.as_ref()) {
+                request.extensions_mut().insert(Arc::clone(principal));
+            }
+            let auth_ctx: Arc<dyn AuthRequestContext + Send + Sync> =
+                Arc::clone(&ctx) as Arc<dyn AuthRequestContext + Send + Sync>;
+            request.extensions_mut().insert(auth_ctx);
+            request.extensions_mut().insert(ctx);
+        }
+        let response = service.handle(request).await;
+        let status = response.status();
+        let collected = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("response body");
+        let bytes = collected.to_bytes();
+        let json_str = std::str::from_utf8(&bytes).unwrap_or("<non-utf8>");
+        // Legacy session responses are SSE; skip empty `data:` keepalive frames.
+        let json_payload = json_str
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("data: ")
+                    .map(str::trim)
+                    .filter(|payload| !payload.is_empty())
+            })
+            .unwrap_or(json_str);
+        let json: Value = serde_json::from_str(json_payload)
+            .unwrap_or_else(|e| panic!("JSON-RPC body ({status}): {e}: {json_str:?}"));
+        (status, json)
+    }
+
     #[tokio::test]
     async fn mcp_session_reuse_evaluates_current_request_principal() {
-        // Session started under RW, then tools/call with RO Parts must still be read-only.
+        // Legacy session worker can retain prior-request state; each tools/call
+        // must still evaluate the *current* request's HTTP Parts principal.
         let service = mcp_http_service(principal_probe_server());
+        let session_id = initialize_legacy_mcp_session(&service).await;
+
         let rw = spice_ctx_with_api_key("writer456:rw");
-        let (_status, json_rw) =
-            post_tools_call_with_spice_ctx(&service, "principal_probe", Some(rw)).await;
+        let (status_rw, json_rw) = post_legacy_tools_call_with_session(
+            &service,
+            &session_id,
+            "principal_probe",
+            Some(rw),
+            2,
+        )
+        .await;
+        assert_eq!(
+            status_rw,
+            http::StatusCode::OK,
+            "RW tools/call on legacy session: {json_rw}"
+        );
         let payload_rw: Value =
             serde_json::from_str(&tool_result_text(&json_rw)).expect("rw payload");
         assert_eq!(payload_rw.get("read_only"), Some(&Value::Bool(false)));
 
         let ro = spice_ctx_with_api_key("topsecret123");
-        let (_status, json_ro) =
-            post_tools_call_with_spice_ctx(&service, "principal_probe", Some(ro)).await;
+        let (status_ro, json_ro) = post_legacy_tools_call_with_session(
+            &service,
+            &session_id,
+            "principal_probe",
+            Some(ro),
+            3,
+        )
+        .await;
+        assert_eq!(
+            status_ro,
+            http::StatusCode::OK,
+            "RO tools/call on same legacy session: {json_ro}"
+        );
         let payload_ro: Value =
             serde_json::from_str(&tool_result_text(&json_ro)).expect("ro payload");
         assert_eq!(
             payload_ro.get("read_only"),
             Some(&Value::Bool(true)),
-            "subsequent MCP request must use its own principal, not a prior session key"
+            "same Mcp-Session-Id must still use the current request principal, not a prior session key; got {payload_ro} from {json_ro}"
         );
     }
 }
