@@ -39,6 +39,7 @@ use http::{HeaderMap, HeaderValue, header::CONTENT_TYPE};
 use mediatype::{MediaType, names};
 use runtime_request_context::{AsyncMarker, RequestContext};
 
+use async_openai::types::chat::ReasoningEffort;
 use futures::StreamExt;
 use llms::chat::{
     Chat,
@@ -134,6 +135,10 @@ pub struct Request {
     /// Stable prompt-cache key forwarded to the configured NSQL model for provider-specific cache handling.
     #[serde(skip_serializing_if = "Option::is_none", alias = "promptcachekey")]
     pub prompt_cache_key: Option<String>,
+
+    /// How much the model reasons before it writes SQL. Omitted keeps the model setting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -613,6 +618,7 @@ async fn handle_nsql_query(
         sample_data_enabled,
         datasets,
         prompt_cache_key,
+        reasoning_effort,
         ..
     } = payload;
     let NsqlTarget {
@@ -669,6 +675,10 @@ async fn handle_nsql_query(
         req.messages.push(nsql_context.message.clone());
         if let Some(prompt_cache_key) = &prompt_cache_key {
             req.prompt_cache_key = Some(prompt_cache_key.clone());
+        }
+        // ReasoningEffort is not Copy. Clone it so a SQL retry keeps the level.
+        if let Some(effort) = reasoning_effort.clone() {
+            req.reasoning_effort = Some(effort);
         }
 
         // Race the LLM call against the NSQL cancellation token so that a
@@ -959,6 +969,29 @@ mod tests {
 
         assert!(request.sample_data_enabled);
         assert_eq!(request.prompt_cache_key.as_deref(), Some("sales-dashboard"));
+    }
+
+    #[test]
+    fn request_accepts_reasoning_effort_and_rejects_unknown_levels() {
+        let request: Request = serde_json::from_value(json!({
+            "query": "show total sales",
+            "reasoning_effort": "low"
+        }))
+        .expect("request should accept a known effort");
+
+        assert_eq!(
+            request.reasoning_effort,
+            Some(async_openai::types::chat::ReasoningEffort::Low)
+        );
+
+        assert!(
+            serde_json::from_value::<Request>(json!({
+                "query": "show total sales",
+                "reasoning_effort": "max"
+            }))
+            .is_err(),
+            "max is not a Spice reasoning effort"
+        );
     }
 
     #[test]
