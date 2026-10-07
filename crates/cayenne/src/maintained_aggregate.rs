@@ -912,8 +912,24 @@ impl MaintainedAggregateRebuilder {
             .map(|field| new_null_array(field.data_type(), rows))
             .collect::<Vec<ArrayRef>>();
         for (position, &column) in columns.iter().enumerate() {
-            arrays[column] = Arc::clone(batch.column(position));
-            fields[column] = Arc::clone(&batch.schema_ref().fields()[position]);
+            let read = batch.column(position);
+            let read_field = &batch.schema_ref().fields()[position];
+            // A table with `force_view_read_schema` scans a stored `Utf8`
+            // column as `Utf8View` (`viewify_read_schema`). The views and the
+            // retraction index hold the stored types, so such a column is
+            // folded back to `Utf8`; any other difference from the stored type
+            // reaches them unchanged and is refused there.
+            if read.data_type() == &DataType::Utf8View
+                && self.schema.field(column).data_type() == &DataType::Utf8
+            {
+                arrays[column] = arrow::compute::cast(read, &DataType::Utf8)
+                    .map_err(|source| DataFusionError::ArrowError(Box::new(source), None))?;
+                fields[column] =
+                    Arc::new(read_field.as_ref().clone().with_data_type(DataType::Utf8));
+            } else {
+                arrays[column] = Arc::clone(read);
+                fields[column] = Arc::clone(read_field);
+            }
         }
         let widened = RecordBatch::try_new_with_options(
             Arc::new(Schema::new(fields)),

@@ -58240,16 +58240,22 @@ mod tests {
     /// `CountQueryColumn::AllRows`), `sum(value)` over the column, `AggregateMode::Single`.
     fn build_id_count_sum_aggregate_exec() -> AggregateExec {
         use arrow::datatypes::{DataType, Field, Schema};
+
+        build_count_sum_aggregate_exec_over(Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ])))
+    }
+
+    /// [`build_id_count_sum_aggregate_exec`] over an `(id, value)` input schema
+    /// of the caller's choosing, such as a table's view-typed read schema.
+    fn build_count_sum_aggregate_exec_over(schema: SchemaRef) -> AggregateExec {
         use datafusion::physical_expr::aggregate::AggregateExprBuilder;
         use datafusion::physical_expr::expressions::{col, lit};
         use datafusion::physical_plan::aggregates::{AggregateMode, PhysicalGroupBy};
         use datafusion_functions_aggregate::count::count_udaf;
         use datafusion_functions_aggregate::sum::sum_udaf;
 
-        let schema: SchemaRef = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("value", DataType::Int64, false),
-        ]));
         let input = MemorySourceConfig::try_new_exec(&[vec![]], Arc::clone(&schema), None)
             .expect("memory source exec for aggregate input");
 
@@ -58534,6 +58540,135 @@ mod tests {
             collect_id_count_sum(&poll_maintained_serve(&provider, &aggregate_exec).await),
             vec![(1, 1, 10), (2, 1, 20), (3, 1, 30)],
             "a rebuild with no write during its scan serves every row"
+        );
+    }
+
+    /// With `force_view_read_schema`, a scan returns a stored `Utf8` primary key
+    /// as `Utf8View`. A maintained-aggregate rebuild folds that scan into views and
+    /// a retraction index keyed in the stored types, so the rebuild must fold the
+    /// key back to `Utf8`: otherwise it fails and the views stay stale.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_maintained_aggregate_rebuild_folds_a_view_typed_string_key() {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let ctx = SessionContext::new();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str path"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str path"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
+        let catalog = Arc::new(
+            CayenneCatalog::new(format!("sqlite://{metadata_dir}/cayenne.db"))
+                .expect("catalog created"),
+        ) as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        // As `create_cdc_upsert_table_with_maintained_aggregates`, with the read
+        // schema mapped to view types. That flag is carried by the injected
+        // context, not the persisted metadata (see
+        // `force_view_read_schema_scan_emits_utf8view`).
+        let vortex_config = VortexConfig {
+            cdc_durability: crate::metadata::CdcDurability::File,
+            inline_max_rows: 0,
+            deletion_mode: crate::metadata::DeletionMode::Key,
+            force_view_read_schema: true,
+            ..VortexConfig::default()
+        };
+        let context = CayenneContext::new(
+            &vortex_config,
+            ctx.runtime_env(),
+            "ma_rebuild_view_typed_key",
+        );
+        let options = CreateTableOptions {
+            table_name: "ma_rebuild_view_typed_key".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec!["id".to_string()],
+            on_conflict: Some(OnConflict::Upsert(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "id".to_string(),
+                ]),
+            )),
+            base_path: data_dir,
+            partition_column: None,
+            vortex_config,
+        };
+        let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
+            .with_context(context)
+            .with_maintained_aggregates(vec![id_count_sum_spec()])
+            .create(options)
+            .await
+            .expect("table created");
+        assert_eq!(
+            provider.read_schema().field(0).data_type(),
+            &DataType::Utf8View,
+            "precondition: the scan the rebuild reads returns the key as Utf8View"
+        );
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["a", "b"])),
+                Arc::new(Int64Array::from(vec![10, 20])),
+            ],
+        )
+        .expect("id/value batch");
+        let write = provider
+            .write_cdc_append_stream(single_batch_stream(batch), &ctx.task_ctx())
+            .await
+            .expect("CDC write prepares");
+        write.finish().await.expect("CDC write publishes");
+
+        provider.mark_maintained_aggregates_stale();
+        let rebuilt = provider
+            .rebuild_maintained_aggregates_from_visible_state()
+            .await
+            .map_err(|error| error.to_string());
+        assert_eq!(
+            rebuilt,
+            Ok(MaintainedAggregateRebuild::Rebuilt),
+            "a rebuild over a view-typed string key must install its views"
+        );
+
+        // The views hold the stored types, and the registry matches an aggregate
+        // whose output schema has them.
+        let served = poll_maintained_serve(
+            &provider,
+            &build_count_sum_aggregate_exec_over(Arc::clone(&schema)),
+        )
+        .await;
+        let ids = served
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("id is Utf8");
+        let counts = served
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("count(*) is Int64");
+        let sums = served
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("sum(value) is Int64");
+        let mut rows = (0..served.num_rows())
+            .map(|row| {
+                (
+                    ids.value(row).to_string(),
+                    counts.value(row),
+                    sums.value(row),
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![("a".to_string(), 1, 10), ("b".to_string(), 1, 20)],
+            "the rebuilt views must serve every row"
         );
     }
 
