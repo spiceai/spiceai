@@ -217,7 +217,7 @@ impl Fixture {
         // channel still exercises real enqueueing and the in-flight claim stays
         // held by it. Abort every task before awaiting any: awaiting yields, and
         // a task not yet aborted could then run its first sweep.
-        let handlers: Vec<_> = table.handlers.get_mut().drain(..).collect();
+        let handlers = std::mem::take(table.handlers.get_mut());
         for handler in &handlers {
             handler.abort();
         }
