@@ -1305,11 +1305,9 @@ impl Refresher {
                         // is added to the timer, `next_scheduled_refresh_timer`.
                         let override_jitter = overrides_opt.as_ref().and_then(|o| o.max_jitter);
                         let delay = Self::compute_delay(Duration::ZERO, override_jitter.or(max_jitter));
-                        // Without an interval, retain the triggered refresh's due time
-                        // until completion, including when it has no jitter.
-                        if refresh_check_interval.is_none() {
-                            refresh_status.record_dataset_next_refresh(&dataset_name, SystemTime::now() + delay);
-                        }
+                        // An external trigger replaces the interval timer. Retain its
+                        // due time until completion, including when it has no jitter.
+                        refresh_status.record_dataset_next_refresh(&dataset_name, SystemTime::now() + delay);
                         if !delay.is_zero() {
                             sleep(delay).await;
                         }
@@ -1405,7 +1403,7 @@ impl Refresher {
                         // For datasets with no periodic refresh, this will be a no-op. The next
                         // refresh is due an interval after the last successful one, so a failed
                         // refresh retries on the timer but leaves the recorded due time, now past.
-                        if refresh_check_interval.is_none() {
+                        if refresh_check_interval.is_none() && refresh_succeeded {
                             refresh_status.clear_dataset_next_refresh(&dataset_name);
                         }
                         if let Some(refresh_check_interval) = refresh_check_interval {
@@ -1434,9 +1432,13 @@ impl Refresher {
         }
 
         if let Some(refresh_task_runner) = &self.refresh_task_runner {
+            let child = synchronized_table.child_dataset_name();
+            let parent = synchronized_table.parent_dataset_name();
             refresh_task_runner
                 .add_synchronized_table(synchronized_table)
                 .await;
+            self.runtime_status
+                .record_dataset_refresh_source(&child, &parent);
         } else {
             unreachable!(
                 "Only tables configured with a full refresh mode can subscribe to new table providers - this is an implementation bug"

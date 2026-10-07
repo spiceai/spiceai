@@ -221,7 +221,7 @@ fn dataset_infos(
                 .as_ref()
                 .and_then(|s| s.error_message().map(String::from));
             let (last_refresh, next_refresh) = if include_status {
-                dataset_freshness(df, d)
+                dataset_freshness(df, d, datasets)
             } else {
                 (None, None)
             };
@@ -242,20 +242,37 @@ fn dataset_infos(
 }
 
 /// `ds`'s last refresh and next scheduled refresh, as RFC 3339 timestamps, for an
-/// accelerated dataset. Only a dataset with a schedule has a next refresh. For a
+/// accelerated dataset, following its active parent scheduler when synchronized.
+/// Only a dataset with a schedule has a next refresh. For a
 /// `refresh_cron` dataset it is the next cron time after now, or, once a refresh
 /// has been triggered, its recorded due time including jitter until completion.
-fn dataset_freshness(df: &DataFusion, ds: &Dataset) -> (Option<String>, Option<String>) {
-    let Some(acceleration) = ds.acceleration.as_ref().filter(|a| a.enabled) else {
+fn dataset_freshness(
+    df: &DataFusion,
+    ds: &Dataset,
+    datasets: &[Arc<Dataset>],
+) -> (Option<String>, Option<String>) {
+    let Some(_) = ds.acceleration.as_ref().filter(|a| a.enabled) else {
         return (None, None);
     };
     let freshness = df.runtime_status().dataset_freshness(&ds.name);
-    let scheduled =
-        acceleration.refresh_check_interval.is_some() || acceleration.refresh_cron.is_some();
-    let next_refresh = freshness.next_refresh.filter(|_| scheduled).or_else(|| {
-        let cron = acceleration.refresh_cron.as_deref()?;
-        scheduler::channel::cron::next_cron_time(cron, std::time::SystemTime::now()).ok()
-    });
+    let next_refresh = df
+        .runtime_status()
+        .dataset_refresh_source(&ds.name)
+        .and_then(|source| {
+            let source_dataset = datasets.iter().find(|dataset| dataset.name == source)?;
+            let acceleration = source_dataset.acceleration.as_ref().filter(|a| a.enabled)?;
+            let scheduled = acceleration.refresh_check_interval.is_some()
+                || acceleration.refresh_cron.is_some();
+            df.runtime_status()
+                .dataset_freshness(&source)
+                .next_refresh
+                .filter(|_| scheduled)
+                .or_else(|| {
+                    let cron = acceleration.refresh_cron.as_deref()?;
+                    scheduler::channel::cron::next_cron_time(cron, std::time::SystemTime::now())
+                        .ok()
+                })
+        });
     (
         freshness.last_refresh.map(rfc3339),
         next_refresh.map(rfc3339),

@@ -83,7 +83,7 @@ pub struct DatasetFreshness {
     /// When the last successful refresh completed.
     pub last_refresh: Option<std::time::SystemTime>,
     /// When the next scheduled refresh is due; stays at that time, in the past,
-    /// until a refresh completes.
+    /// until a refresh succeeds.
     pub next_refresh: Option<std::time::SystemTime>,
 }
 
@@ -95,6 +95,8 @@ pub struct RuntimeStatus {
     ever_ready_components: Arc<RwLock<HashSet<String>>>,
     /// When each dataset was last refreshed and is next due, by dataset name.
     dataset_freshness: Arc<RwLock<HashMap<String, DatasetFreshness>>>,
+    /// The parent refresher that schedules each synchronized dataset.
+    dataset_refresh_sources: Arc<RwLock<HashMap<TableReference, TableReference>>>,
     /// Tracks if the runtime is in the process of shutting down.
     is_shutdown: Arc<AtomicBool>,
     /// Controls how runtime readiness is computed.
@@ -115,6 +117,7 @@ impl Default for RuntimeStatus {
             statuses: Arc::new(RwLock::new(HashMap::new())),
             ever_ready_components: Arc::new(RwLock::new(HashSet::new())),
             dataset_freshness: Arc::new(RwLock::new(HashMap::new())),
+            dataset_refresh_sources: Arc::new(RwLock::new(HashMap::new())),
             is_shutdown: Arc::new(AtomicBool::new(false)),
             ready_state: Arc::new(RwLock::new(RuntimeReadyState::default())),
             shutdown_token: CancellationToken::new(),
@@ -219,9 +222,39 @@ impl RuntimeStatus {
         }
     }
 
+    /// Associates a synchronized dataset with the refresher that schedules it.
+    pub fn record_dataset_refresh_source(&self, child: &TableReference, parent: &TableReference) {
+        self.dataset_refresh_sources
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(child.clone(), parent.clone());
+    }
+
+    /// Resolves the active scheduler through synchronized parents. A cycle has
+    /// no authoritative scheduler and returns `None`.
+    #[must_use]
+    pub fn dataset_refresh_source(&self, dataset: &TableReference) -> Option<TableReference> {
+        let sources = self
+            .dataset_refresh_sources
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut source = dataset.clone();
+        for _ in 0..=sources.len() {
+            let Some(parent) = sources.get(&source) else {
+                return Some(source);
+            };
+            source = parent.clone();
+        }
+        None
+    }
+
     /// Forgets `dataset`'s refresh times, when it is unloaded, so a dataset later
     /// registered under the same name starts from its own.
     pub fn remove_dataset_freshness(&self, dataset: &TableReference) {
+        self.dataset_refresh_sources
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(dataset);
         self.dataset_freshness
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner)

@@ -71,6 +71,9 @@ struct UnreachableSource {
     primary_key: AtomicBool,
     extra_column: AtomicBool,
     reject_credentials: AtomicBool,
+    dynamic_reads: AtomicBool,
+    fail_scans: AtomicBool,
+    failed_scans: AtomicUsize,
 }
 
 impl UnreachableSource {
@@ -88,6 +91,9 @@ impl UnreachableSource {
             primary_key: AtomicBool::new(false),
             extra_column: AtomicBool::new(false),
             reject_credentials: AtomicBool::new(false),
+            dynamic_reads: AtomicBool::new(false),
+            fail_scans: AtomicBool::new(false),
+            failed_scans: AtomicUsize::new(0),
         })
     }
 
@@ -221,6 +227,42 @@ struct UnreachableSourceConnector {
     source: Arc<UnreachableSource>,
 }
 
+#[derive(Debug)]
+struct DynamicSourceTable {
+    source: Arc<UnreachableSource>,
+    schema: SchemaRef,
+}
+
+#[async_trait]
+impl TableProvider for DynamicSourceTable {
+    fn schema(&self) -> SchemaRef {
+        Arc::clone(&self.schema)
+    }
+
+    fn table_type(&self) -> datafusion::logical_expr::TableType {
+        datafusion::logical_expr::TableType::Base
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn datafusion::catalog::Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[datafusion::logical_expr::Expr],
+        limit: Option<usize>,
+    ) -> datafusion::common::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        if self.source.fail_scans.load(Ordering::SeqCst) {
+            self.source.failed_scans.fetch_add(1, Ordering::SeqCst);
+            return Err(datafusion::error::DataFusionError::Execution(
+                "injected source scan failure".to_string(),
+            ));
+        }
+        self.source
+            .table()?
+            .scan(state, projection, filters, limit)
+            .await
+    }
+}
+
 #[async_trait]
 impl DataConnector for UnreachableSourceConnector {
     fn as_any(&self) -> &dyn Any {
@@ -262,6 +304,12 @@ impl DataConnector for UnreachableSourceConnector {
         }
         if self.source.refuse_reads.load(Ordering::SeqCst) {
             self.source.attempt(ConnectorComponent::from(dataset))?;
+        }
+        if self.source.dynamic_reads.load(Ordering::SeqCst) {
+            return Ok(Arc::new(DynamicSourceTable {
+                source: Arc::clone(&self.source),
+                schema: self.source.schema(),
+            }));
         }
         let table =
             self.source
@@ -679,12 +727,15 @@ mod served_from_acceleration {
 
     /// `(SUM(v), COUNT(*))` of `orders`, or why the query failed.
     async fn query_sum_and_count(rt: &Arc<Runtime>) -> Result<(i64, i64), String> {
-        let batches = run_query(
-            rt,
-            "SELECT CAST(SUM(v) AS BIGINT) AS s, COUNT(*) AS n FROM orders",
-        )
-        .await
-        .map_err(|err| err.to_string())?;
+        query_table_sum_and_count(rt, "orders").await
+    }
+
+    async fn query_table_sum_and_count(
+        rt: &Arc<Runtime>,
+        table: &str,
+    ) -> Result<(i64, i64), String> {
+        let sql = format!("SELECT CAST(SUM(v) AS BIGINT) AS s, COUNT(*) AS n FROM {table}");
+        let batches = run_query(rt, &sql).await.map_err(|err| err.to_string())?;
         let batch = batches.first().ok_or("no batches")?;
         let sum = batch
             .column(0)
@@ -1265,6 +1316,233 @@ mod served_from_acceleration {
     async fn pending_cron_refresh_retains_its_due_time_without_jitter() -> Result<(), anyhow::Error>
     {
         assert_pending_cron_deadline("cron-no-jitter", false).await
+    }
+
+    /// A manual refresh replaces the interval timer's due time while its source is down.
+    #[tokio::test]
+    async fn manual_refresh_replaces_the_cancelled_interval_deadline() -> Result<(), anyhow::Error>
+    {
+        let _tracing = init_tracing(Some("integration=debug,runtime_table=debug,info"));
+        let fixture = Fixture::new("manual-interval-deadline").await?;
+        let source = &fixture.source;
+        let spec = || {
+            let mut dataset =
+                with_refresh_check_interval(fixture.dataset(ReadyState::OnLoad), "1h");
+            if let Some(acceleration) = dataset.acceleration.as_mut() {
+                acceleration.refresh_jitter_enabled = false;
+            }
+            dataset
+        };
+        seed(source, spec()).await?;
+        let (rt, loader) = restart_with_source_down(source, spec()).await;
+        assert!(served_from_acceleration(&rt, Duration::from_secs(10)).await);
+        let name = datafusion::common::TableReference::bare("orders");
+        assert!(
+            wait_until_true(Duration::from_secs(5), || async {
+                freshness(&rt)
+                    .await
+                    .1
+                    .is_some_and(|due| due > chrono::Utc::now())
+            })
+            .await,
+            "the interval timer is scheduled before the manual request"
+        );
+        let scheduled = freshness(&rt)
+            .await
+            .1
+            .ok_or_else(|| anyhow::anyhow!("the interval's initial deadline is present"))?;
+        rt.datafusion().refresh_table(&name, None).await?;
+        let manual_pending = wait_until_true(Duration::from_secs(3), || async {
+            freshness(&rt)
+                .await
+                .1
+                .is_some_and(|due| due <= chrono::Utc::now())
+        })
+        .await;
+        let pending_due = freshness(&rt).await.1;
+        eprintln!(
+            "manual refresh pending: cancelled_interval={scheduled} now={} api_due={pending_due:?}",
+            chrono::Utc::now()
+        );
+        source.bring_up();
+        let refreshed = refreshed_from_source(&rt).await;
+        let rescheduled = wait_until_true(Duration::from_secs(5), || async {
+            freshness(&rt)
+                .await
+                .1
+                .is_some_and(|due| due > chrono::Utc::now() + chrono::Duration::minutes(59))
+        })
+        .await;
+        eprintln!(
+            "manual refresh completed: refreshed={refreshed} api_due={:?} rows={:?}",
+            freshness(&rt).await.1,
+            sum_and_count(&rt).await
+        );
+        stop(rt, loader).await;
+        assert!(
+            manual_pending,
+            "the manual request replaces the cancelled interval deadline"
+        );
+        assert!(
+            refreshed,
+            "the pending manual refresh completes after source recovery"
+        );
+        assert!(
+            rescheduled,
+            "completion schedules the next interval deadline"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn failed_cron_refresh_retains_its_due_time() -> Result<(), anyhow::Error> {
+        let fixture = Fixture::new("failed-cron-deadline").await?;
+        let source = &fixture.source;
+        source
+            .dynamic_reads
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let spec = || {
+            let mut dataset =
+                with_refresh_cron(fixture.dataset(ReadyState::OnLoad), "*/10 * * * * *");
+            if let Some(acceleration) = dataset.acceleration.as_mut() {
+                acceleration.refresh_jitter_enabled = false;
+                acceleration.refresh_retry_enabled = false;
+            }
+            dataset
+        };
+        seed(source, spec()).await?;
+        source.set_value(2);
+        source
+            .fail_scans
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let (rt, loader) = start(spec()).await;
+        let failed = wait_until_true(Duration::from_secs(15), || async {
+            source
+                .failed_scans
+                .load(std::sync::atomic::Ordering::SeqCst)
+                > 0
+        })
+        .await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let due = freshness(&rt).await.1;
+        let retained = due.is_some_and(|due| due <= chrono::Utc::now());
+        eprintln!(
+            "failed cron: observed={failed} api_due={due:?} now={} rows={:?}",
+            chrono::Utc::now(),
+            sum_and_count(&rt).await
+        );
+        source
+            .fail_scans
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let recovered = refreshed_from_source(&rt).await;
+        eprintln!(
+            "cron recovered: refreshed={recovered} rows={:?}",
+            sum_and_count(&rt).await
+        );
+        stop(rt, loader).await;
+        assert!(failed, "the injected scan failure reaches the refresh task");
+        assert!(
+            retained,
+            "an unsuccessful cron refresh retains its due time"
+        );
+        assert!(recovered, "the next cron occurrence recovers the refresh");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn synchronized_child_uses_parent_refresh_deadline() -> Result<(), anyhow::Error> {
+        assert_synchronized_deadline("sync-child-deadline", false, Some("10m")).await
+    }
+
+    #[tokio::test]
+    async fn synchronized_child_uses_parent_cron_schedule() -> Result<(), anyhow::Error> {
+        assert_synchronized_deadline("sync-child-cron", true, Some("10m")).await
+    }
+
+    #[tokio::test]
+    async fn synchronized_child_without_own_schedule_uses_parent_deadline()
+    -> Result<(), anyhow::Error> {
+        assert_synchronized_deadline("sync-child-no-schedule", false, None).await
+    }
+
+    async fn assert_synchronized_deadline(
+        prefix: &'static str,
+        parent_cron: bool,
+        child_interval: Option<&str>,
+    ) -> Result<(), anyhow::Error> {
+        let fixture = Fixture::new(prefix).await?;
+        let source = &fixture.source;
+        source
+            .dynamic_reads
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        source.bring_up();
+        let mut parent = if parent_cron {
+            with_refresh_cron(fixture.dataset(ReadyState::OnLoad), "0 0 1 1 *")
+        } else {
+            with_refresh_check_interval(fixture.dataset(ReadyState::OnLoad), "1h")
+        };
+        if let Some(acceleration) = parent.acceleration.as_mut() {
+            acceleration.refresh_jitter_enabled = false;
+        }
+        let mut child = SpicepodDataset::new("localpod:orders", "child");
+        child.acceleration = Some(Acceleration {
+            enabled: true,
+            engine: Some("arrow".to_string()),
+            refresh_mode: Some(RefreshMode::Full),
+            refresh_check_interval: child_interval.map(str::to_string),
+            refresh_jitter_enabled: false,
+            ..Acceleration::default()
+        });
+        configure_test_datafusion();
+        let app = AppBuilder::new("sync_child_deadline")
+            .with_dataset(parent)
+            .with_dataset(child)
+            .build();
+        let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+        let loader = tokio::spawn({
+            let rt = Arc::clone(&rt);
+            async move { rt.load_components().await }
+        });
+        let loaded = wait_until_true(Duration::from_secs(30), || async {
+            query_table_sum_and_count(&rt, "child").await.ok() == Some((3, 3))
+                && dataset_status(&rt, "child") == Some(ComponentStatus::Ready)
+        })
+        .await;
+        anyhow::ensure!(loaded, "the synchronized child initially loads");
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        source.set_value(2);
+        rt.datafusion()
+            .refresh_table(&datafusion::common::TableReference::bare("orders"), None)
+            .await?;
+        let synchronized = wait_until_true(Duration::from_secs(30), || async {
+            query_table_sum_and_count(&rt, "child").await.ok() == Some((6, 3))
+                && freshness(&rt)
+                    .await
+                    .1
+                    .is_some_and(|due| due > chrono::Utc::now())
+        })
+        .await;
+        let infos = runtime::dataset_infos_with_status(&rt).await;
+        let parent_due = infos
+            .iter()
+            .find(|info| info.name == "orders")
+            .and_then(|info| info.next_refresh.clone());
+        let child_due = infos
+            .iter()
+            .find(|info| info.name == "child")
+            .and_then(|info| info.next_refresh.clone());
+        eprintln!(
+            "synchronized deadlines: synchronized={synchronized} parent={parent_due:?} child={child_due:?} child_rows={:?}",
+            query_table_sum_and_count(&rt, "child").await.ok()
+        );
+        stop(rt, loader).await;
+        assert!(synchronized, "the parent refresh updates the child rows");
+        assert!(parent_due.is_some(), "the parent interval is scheduled");
+        assert_eq!(
+            child_due, parent_due,
+            "the child follows its actual parent scheduler"
+        );
+        Ok(())
     }
 
     #[tokio::test]
