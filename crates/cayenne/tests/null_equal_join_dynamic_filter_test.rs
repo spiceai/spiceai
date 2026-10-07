@@ -17,10 +17,11 @@ limitations under the License.
 //! Null-equal joins and null-aware `NOT IN` must keep NULL keys when Cayenne
 //! `mode:file` pushes a hash-join min/max dynamic filter into the Vortex scan.
 //!
-//! A min/max bound is NULL, not true, for a NULL probe key. Vortex used to
-//! evaluate only that bound (it declines the companion `InList`), so
-//! `IS NOT DISTINCT FROM` dropped the NULL group and `NOT IN` crashed or
-//! dropped NULLs. Memory mode has no Vortex file scan and is the control.
+//! A min/max bound is NULL, not true, for a NULL probe key, so a scan that
+//! evaluated only the bound would drop the NULL group from
+//! `IS NOT DISTINCT FROM` and the NULL that makes `NOT IN` unknown. When the
+//! join needs those keys, the hash join adds `key IS NULL` as a disjunct of the
+//! filter it publishes. Memory mode has no Vortex file scan and is the control.
 
 #![expect(clippy::expect_used, reason = "tests use expect for assertion context")]
 
@@ -269,8 +270,9 @@ async fn file_mode_keeps_null_keys_under_dynamic_filters_impl(
         "precondition: the query must plan as a null-equal hash join:\n{plan}"
     );
     assert!(
-        plan.contains("DynamicFilter") && (plan.contains("IS NULL") || plan.contains("IsNull")),
-        "the pushed min/max dynamic filter must keep NULL keys (`pred OR col IS NULL`):\n{plan}"
+        plan.lines()
+            .any(|line| line.contains("file_type=vortex") && line.contains("DynamicFilter")),
+        "precondition: the hash join's dynamic filter must reach the Vortex scan:\n{plan}"
     );
 
     Ok(())

@@ -40,7 +40,6 @@ use vortex_utils::aliases::dash_map::DashMap;
 
 use super::VortexRuntimeAccessPlanProvider;
 use super::opener::VortexOpener;
-use super::opener::{contains_dynamic_filter, or_is_null_on_nullable_columns};
 use super::segment_cache::SharedSegmentCache;
 use crate::ProjectionPushdown;
 use crate::ScanConcurrency;
@@ -430,22 +429,6 @@ impl FileSource for VortexSource {
         let mut source = self.clone();
         source.target_partitions = Some(config.execution.target_partitions.max(1));
 
-        let file_schema = self.table_schema.file_schema();
-        // A min/max dynamic filter is NULL for a NULL key. Null-equal joins and
-        // null-aware anti joins need those keys, so OR `col IS NULL` onto every
-        // dynamic filter before file pruning and scan pushdown. Non-NULL values
-        // still have to satisfy the bound.
-        let filters: Vec<PhysicalExprRef> = filters
-            .into_iter()
-            .map(|expr| {
-                if contains_dynamic_filter(&expr) {
-                    or_is_null_on_nullable_columns(expr, file_schema)
-                } else {
-                    expr
-                }
-            })
-            .collect();
-
         // Every filter contributes to the file-pruning predicate used by `FilePruner`
         // to eliminate whole files via statistics / partition values.
         source.full_predicate = match source.full_predicate {
@@ -465,7 +448,7 @@ impl FileSource for VortexSource {
             .iter()
             .map(|expr| {
                 self.expression_convertor
-                    .can_be_pushed_down(expr, file_schema)
+                    .can_be_pushed_down(expr, self.table_schema.file_schema())
             })
             .collect();
 
