@@ -3276,7 +3276,7 @@ impl DataFusion {
             refresh = refresh.period(refresh_data_window);
         }
         refresh
-            .validate_time_format(dataset.name.to_string(), &refresh_schema)
+            .validate_time_format(&dataset.name.to_string(), &refresh_schema)
             .context(InvalidTimeColumnTimeFormatSnafu)?;
 
         // Apply initial partition filters before the refresher starts to avoid a race

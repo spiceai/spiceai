@@ -109,6 +109,54 @@ class CodeQlWorkflowTest(unittest.TestCase):
         self.assertNotIn("security-events", doc["permissions"])
         self.assertNotIn("security-events", analyze["permissions"])
 
+    def test_upload_excuses_only_a_deleted_merge_queue_ref(self):
+        import yaml
+
+        steps = yaml.safe_load(UPLOAD.read_text())["jobs"]["upload"]["steps"]
+        upload = next(step for step in steps if step["name"] == "Upload SARIF to code scanning")
+        self.assertIs(upload["continue-on-error"], True)
+        guard = next(
+            step for step in steps if step["name"] == "Fail unless the merge-queue ref is gone"
+        )
+        self.assertEqual(guard["if"], f"steps.{upload['id']}.outcome == 'failure'")
+
+        queue_ref = "refs/heads/gh-readonly-queue/trunk/pr-1-" + "a" * 40
+        cases = [
+            # (upload ref, stub `gh api` exit code, stub stderr, expected exit)
+            (queue_ref, 1, "gh: Not Found (HTTP 404)", 0),
+            (queue_ref, 0, "", 1),
+            (queue_ref, 1, "gh: Server Error (HTTP 502)", 1),
+            (queue_ref, 1, "error connecting to api.github.com", 1),
+            ("refs/heads/trunk", 1, "gh: Not Found (HTTP 404)", 1),
+            ("refs/heads/release/2.3", 1, "gh: Not Found (HTTP 404)", 1),
+        ]
+        for ref, gh_exit, gh_stderr, expected in cases:
+            with self.subTest(ref=ref, gh_stderr=gh_stderr):
+                self.assertEqual(_run_guard(guard["run"], ref, gh_exit, gh_stderr), expected)
+
+
+def _run_guard(script, upload_ref, gh_exit, gh_stderr):
+    import os
+    import subprocess
+    import tempfile
+
+    with tempfile.TemporaryDirectory() as tmp:
+        stub = Path(tmp) / "gh"
+        stub.write_text(
+            f"#!/usr/bin/env bash\nprintf '%s\\n' {gh_stderr!r} >&2\nexit {gh_exit}\n",
+            newline="\n",
+        )
+        stub.chmod(0o755)
+        env = dict(
+            os.environ,
+            PATH=f"{tmp}{os.pathsep}{os.environ['PATH']}",
+            GITHUB_REPOSITORY="spiceai/spiceai",
+            UPLOAD_REF=upload_ref,
+        )
+        return subprocess.run(
+            ["bash", "-c", script], env=env, capture_output=True, check=False
+        ).returncode
+
 
 if __name__ == "__main__":
     unittest.main()

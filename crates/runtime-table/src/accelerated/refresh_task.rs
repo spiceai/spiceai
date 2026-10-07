@@ -2190,7 +2190,11 @@ impl RefreshTask {
         .await;
 
         refresh
-            .validate_time_format(self.dataset_name.to_string(), &self.accelerator.schema())
+            .validate_time_format_inner(
+                &self.dataset_name.to_string(),
+                &self.accelerator.schema(),
+                false,
+            )
             .context(super::InvalidTimeColumnTimeFormatSnafu)?;
 
         let column = refresh
