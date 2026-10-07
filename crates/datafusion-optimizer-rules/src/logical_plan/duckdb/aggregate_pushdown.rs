@@ -14,20 +14,19 @@ pub(crate) const SPICE_ACCELERATOR_METADATA_KEY: &str = "spice.accelerator";
 pub(crate) const SPICE_OPT_DUCKDB_AGG_PUSHDOWN_KEY: &str =
     "spice.optimizer.duckdb_aggregate_pushdown";
 
-// https://duckdb.org/docs/stable/sql/functions/aggregates
-// https://datafusion.apache.org/user-guide/sql/aggregate_functions.html
 /// Whether this aggregate can be marked for `DuckDB` pushdown.
 ///
-/// The unparser drops an aggregate `ORDER BY`, so a pushed
-/// `string_agg(DISTINCT x, '|' ORDER BY x)` comes back unordered. An unordered
-/// `string_agg` is still in [`SUPPORTED_AGG_FUNCTIONS`] and still marks.
+/// The unparser renders a `WITHIN GROUP` ordering and drops every other
+/// aggregate `ORDER BY`, so a pushed `string_agg(DISTINCT x, '|' ORDER BY x)`
+/// comes back unordered. An aggregate in [`SUPPORTED_AGG_FUNCTIONS`] without an
+/// `ORDER BY` still marks.
 fn duckdb_aggregate_is_pushable(aggregate: &AggregateFunction) -> bool {
-    if !SUPPORTED_AGG_FUNCTIONS.contains(aggregate.func.name()) {
-        return false;
-    }
-    aggregate.func.name() != "string_agg" || aggregate.params.order_by.is_empty()
+    SUPPORTED_AGG_FUNCTIONS.contains(aggregate.func.name())
+        && (aggregate.params.order_by.is_empty() || aggregate.func.supports_within_group_clause())
 }
 
+// https://duckdb.org/docs/stable/sql/functions/aggregates
+// https://datafusion.apache.org/user-guide/sql/aggregate_functions.html
 static SUPPORTED_AGG_FUNCTIONS: LazyLock<HashSet<&str>> = LazyLock::new(|| {
     HashSet::from([
         // Basic aggregates

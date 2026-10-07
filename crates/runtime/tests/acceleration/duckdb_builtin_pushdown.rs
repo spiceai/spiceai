@@ -1457,12 +1457,13 @@ fn write_string_agg_source(path: &Path) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-/// `string_agg(DISTINCT … ORDER BY …)` is not pushed into `DuckDB`: the
-/// unparser drops the `ORDER BY`, so a federated call answers unordered.
-/// The query must still succeed locally and match the unaccelerated engine.
+/// An aggregate `ORDER BY` other than a `WITHIN GROUP` is not pushed into
+/// `DuckDB`: the unparser drops it, so a federated `string_agg` or `array_agg`
+/// answered in `DuckDB`'s own order (`[carol, alice, dave]`), and
+/// `first_value`/`last_value` reached `DuckDB` as functions it does not have.
+/// Each query must still succeed locally and match the unaccelerated engine.
 #[tokio::test]
-async fn duckdb_accelerated_ordered_string_agg_stays_local_and_agrees() -> Result<(), anyhow::Error>
-{
+async fn duckdb_accelerated_ordered_aggregates_stay_local_and_agree() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;
 
@@ -1482,37 +1483,88 @@ async fn duckdb_accelerated_ordered_string_agg_stays_local_and_agrees() -> Resul
             let rt = Arc::new(Runtime::builder().with_app(app).build().await);
             load_runtime_datasets(&rt, LOAD_TIMEOUT).await?;
 
-            let query = "SELECT string_agg(DISTINCT customer, '|' ORDER BY customer) AS customers \
-                         FROM {table} WHERE region = 'eu'";
-            let plan = to_pretty_display(
+            // Control: the same aggregate without an `ORDER BY` is still sent
+            // to DuckDB, so the negative assertions below are not vacuous.
+            let control = to_pretty_display(
                 &run_query(
                     &rt,
-                    &format!("EXPLAIN {}", query.replace("{table}", "accelerated")),
+                    "EXPLAIN SELECT string_agg(customer, '|') AS customers \
+                     FROM accelerated WHERE region = 'eu'",
                 )
                 .await?,
             )?
             .to_string();
-            let remote_sql = pushed_down_sql(&plan);
             assert!(
-                !remote_sql.contains("string_agg"),
-                "an ordered string_agg must not be sent to DuckDB; plan was:\n{plan}"
+                pushed_down_sql(&control).contains("string_agg("),
+                "an unordered string_agg must still be sent to DuckDB; plan was:\n{control}"
             );
 
-            let accelerated = run_query(&rt, &query.replace("{table}", "accelerated")).await?;
-            let local = run_query(&rt, &query.replace("{table}", "local")).await?;
-            let expected = [
-                "+------------------+",
-                "| customers        |",
-                "+------------------+",
-                "| alice|carol|dave |",
-                "+------------------+",
+            let cases: [(&str, &[&str], &[&str]); 3] = [
+                (
+                    "SELECT string_agg(DISTINCT customer, '|' ORDER BY customer) AS customers \
+                     FROM {table} WHERE region = 'eu'",
+                    &["string_agg"],
+                    &[
+                        "+------------------+",
+                        "| customers        |",
+                        "+------------------+",
+                        "| alice|carol|dave |",
+                        "+------------------+",
+                    ],
+                ),
+                (
+                    "SELECT array_agg(customer ORDER BY customer) AS customers \
+                     FROM {table} WHERE region = 'eu'",
+                    &["array_agg"],
+                    &[
+                        "+----------------------+",
+                        "| customers            |",
+                        "+----------------------+",
+                        "| [alice, carol, dave] |",
+                        "+----------------------+",
+                    ],
+                ),
+                (
+                    "SELECT first_value(customer ORDER BY customer) AS f, \
+                     last_value(customer ORDER BY id DESC) AS l \
+                     FROM {table} WHERE region = 'eu'",
+                    &["first_value", "last_value"],
+                    &[
+                        "+-------+-------+",
+                        "| f     | l     |",
+                        "+-------+-------+",
+                        "| alice | carol |",
+                        "+-------+-------+",
+                    ],
+                ),
             ];
-            assert_batches_eq!(expected, &accelerated);
-            assert_eq!(
-                to_pretty_display(&accelerated)?.to_string(),
-                to_pretty_display(&local)?.to_string(),
-                "DuckDB-accelerated ordered string_agg must agree with local evaluation"
-            );
+
+            for (query, functions, expected) in cases {
+                let plan = to_pretty_display(
+                    &run_query(
+                        &rt,
+                        &format!("EXPLAIN {}", query.replace("{table}", "accelerated")),
+                    )
+                    .await?,
+                )?
+                .to_string();
+                let remote_sql = pushed_down_sql(&plan);
+                for function in functions {
+                    assert!(
+                        !remote_sql.contains(function),
+                        "an ordered {function} must not be sent to DuckDB; plan was:\n{plan}"
+                    );
+                }
+
+                let accelerated = run_query(&rt, &query.replace("{table}", "accelerated")).await?;
+                let local = run_query(&rt, &query.replace("{table}", "local")).await?;
+                assert_batches_eq!(expected, &accelerated);
+                assert_eq!(
+                    to_pretty_display(&accelerated)?.to_string(),
+                    to_pretty_display(&local)?.to_string(),
+                    "DuckDB-accelerated `{query}` must agree with local evaluation"
+                );
+            }
 
             rt.shutdown().await;
             Ok(())

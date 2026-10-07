@@ -1207,14 +1207,22 @@ mod tests {
         datafusion::functions_aggregate::string_agg::string_agg(col("s"), lit("|"))
     }
 
-    /// `string_agg(... ORDER BY …)` is unparsed without the `ORDER BY`, so it
-    /// stays local on both `DuckDB` accessors. An unordered `string_agg` and
-    /// every other aggregate still federate. `approx_distinct` has no `DuckDB`
-    /// name and stays local.
+    /// An aggregate `ORDER BY` other than a `WITHIN GROUP` is unparsed without
+    /// the `ORDER BY`, so `string_agg`, `array_agg`, `first_value` and
+    /// `last_value` with one stay local on both `DuckDB` accessors. An unordered
+    /// `string_agg` and `percentile_cont`'s `WITHIN GROUP` still federate.
+    /// `approx_distinct` has no `DuckDB` name and stays local.
     #[test]
-    fn duckdb_keeps_ordered_string_agg_and_approx_distinct_local() {
+    fn duckdb_keeps_ordered_aggregates_and_approx_distinct_local() {
         use datafusion::functions_aggregate::approx_distinct::approx_distinct_udaf;
-        use datafusion::functions_aggregate::expr_fn::approx_distinct;
+        use datafusion::functions_aggregate::expr_fn::{
+            approx_distinct, array_agg, first_value, last_value, percentile_cont,
+        };
+        use datafusion::logical_expr::ExprFunctionExt as _;
+        let ordered_array_agg = array_agg(col("s"))
+            .order_by(vec![col("s").sort(true, true)])
+            .build()
+            .expect("ordered array_agg");
         for (route, support) in [
             ("duckdb", deny_spice_functions_for_duckdb_table_providers()),
             (
@@ -1222,9 +1230,23 @@ mod tests {
                 deny_spice_functions_for_duckdb_dialect_without_carve_out(),
             ),
         ] {
+            for ordered in [
+                ordered_string_agg(),
+                ordered_array_agg.clone(),
+                first_value(col("s"), vec![col("s").sort(true, true)]),
+                last_value(col("s"), vec![col("i").sort(false, true)]),
+            ] {
+                assert!(
+                    !pushes(&plan_text_aggregating(ordered.clone()), &support),
+                    "{ordered} must stay local on {route}: the unparser drops its ORDER BY"
+                );
+            }
             assert!(
-                !pushes(&plan_text_aggregating(ordered_string_agg()), &support),
-                "an ordered string_agg must stay local on {route}"
+                pushes(
+                    &plan_text_aggregating(percentile_cont(col("i").sort(true, false), lit(0.5))),
+                    &support
+                ),
+                "percentile_cont's WITHIN GROUP survives the unparser and must keep its {route} pushdown"
             );
             assert!(
                 !pushes(&plan_aggregating(approx_distinct(col("i"))), &support),

@@ -242,21 +242,23 @@ pub fn duckdb_can_translate(call: &ScalarFunction, scope: Option<&DFSchema>) -> 
 
 /// Whether this aggregate call can be handed to `DuckDB`.
 ///
-/// `string_agg(... ORDER BY …)` is refused because the unparser drops the
-/// aggregate `ORDER BY`, so a federated `string_agg(DISTINCT x, '|' ORDER BY x)`
-/// comes back unordered — and a memory accelerator and a file accelerator can
-/// disagree with each other. An unordered `string_agg` still federates.
+/// An aggregate `ORDER BY` is refused unless the function takes it as
+/// `WITHIN GROUP`. The unparser renders a `WITHIN GROUP` ordering and drops
+/// every other aggregate `ORDER BY`, so a federated
+/// `string_agg(DISTINCT x, '|' ORDER BY x)` or `array_agg(x ORDER BY y)` comes
+/// back in whatever order `DuckDB` produced, and a memory accelerator and a
+/// file accelerator can disagree with each other. An aggregate without an
+/// `ORDER BY` is unaffected.
 ///
 /// `approx_distinct` is refused because `DuckDB` has no function of that name
 /// (`approx_count_distinct` is a different `HyperLogLog`). Mapping the two would
 /// change the number; evaluating locally matches the unaccelerated engine.
 #[must_use]
 pub fn duckdb_can_translate_aggregate(call: &AggregateFunction) -> bool {
-    let name = call.func.name();
-    if name.eq_ignore_ascii_case("approx_distinct") {
+    if call.func.name().eq_ignore_ascii_case("approx_distinct") {
         return false;
     }
-    !name.eq_ignore_ascii_case("string_agg") || call.params.order_by.is_empty()
+    call.params.order_by.is_empty() || call.func.supports_within_group_clause()
 }
 
 /// Whether this window call can be handed to `DuckDB`.
