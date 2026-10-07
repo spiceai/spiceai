@@ -76,6 +76,7 @@ How the engine runs them:
 
 - `ai_if`, `ai_probability`, `ai_classify` and `ai_score` calls on the same `input`, `model` and `on_error` in one `SELECT` list or `WHERE` clause share one request per row. Each `ai_decide` call is its own request, asking all of its questions at once. Identical inputs in a batch are asked once.
 - In `WHERE`, every other predicate runs first; the model only sees rows that pass them.
+- A `LIMIT` stops requests only between input batches: each batch (up to 8,192 rows per partition) is answered whole before its rows reach the `LIMIT`. Narrow the rows with other predicates to bound what a query sends.
 - The functions work in `SELECT`, `WHERE`, `HAVING`, `ORDER BY`, `GROUP BY`, window functions, aggregate arguments (including `FILTER (WHERE ...)`), and inner-join conditions. An outer-join condition is refused with the rewrite to use.
 - They are never pushed down to a federated source or another engine.
 - Each batch of calls is recorded in `runtime.task_history` as an `ai_decide` task, and every model call in the model's `llm_*` metrics. The model's `max_concurrency` and `requests_per_minute_limit` apply.

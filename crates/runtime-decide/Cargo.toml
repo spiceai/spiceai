@@ -33,5 +33,9 @@ insta.workspace = true
 name = "planning"
 harness = false
 
+[[bench]]
+name = "execution"
+harness = false
+
 [lints]
 workspace = true

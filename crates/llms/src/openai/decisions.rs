@@ -124,6 +124,7 @@ impl OpenAiDecisions {
 
     fn error_for(&self, status: StatusCode, body: String) -> evaluate_api::Error {
         let model = self.name.clone();
+        let body = provider_message(body);
         match status {
             StatusCode::UNAUTHORIZED => evaluate_api::Error::AuthenticationFailed {
                 model,
@@ -156,6 +157,26 @@ impl OpenAiDecisions {
                 source: format!("HTTP {s}: {body}").into(),
             },
         }
+    }
+}
+
+/// The provider's message from an `OpenAI` error body (`{"error": {"message": ...}}`), or
+/// the body as it came when it is not one. `/v1/decisions` relays the message in its own
+/// error envelope, which would otherwise carry the provider's envelope as a JSON string.
+fn provider_message(body: String) -> String {
+    #[derive(serde::Deserialize)]
+    struct Envelope {
+        error: Detail,
+    }
+    #[derive(serde::Deserialize)]
+    struct Detail {
+        message: String,
+    }
+    match serde_json::from_str::<Envelope>(&body) {
+        Ok(Envelope {
+            error: Detail { message },
+        }) if !message.trim().is_empty() => message,
+        _ => body,
     }
 }
 
@@ -347,6 +368,33 @@ mod tests {
                 .expect_err("must fail");
             assert_eq!(err.to_string(), expected);
         }
+    }
+
+    /// `OpenAI`'s error envelope is read for its message, so the error `/v1/decisions`
+    /// relays is the provider's message rather than a JSON string.
+    #[tokio::test]
+    async fn an_openai_error_envelope_is_read_for_its_message() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/decisions"))
+            .respond_with(ResponseTemplate::new(401).set_body_json(json!({
+                "error": {
+                    "message": "Incorrect API key provided: sk-test.",
+                    "type": "invalid_request_error",
+                    "param": null,
+                    "code": "invalid_api_key"
+                }
+            })))
+            .mount(&server)
+            .await;
+        let err = client(&server)
+            .evaluate(request())
+            .await
+            .expect_err("must fail");
+        assert_eq!(
+            err.to_string(),
+            "Authentication failed for evaluation model 'luna': Incorrect API key provided: sk-test."
+        );
     }
 
     /// An answer outside the question's options is a wrong result, not a success.

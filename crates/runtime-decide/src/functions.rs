@@ -33,11 +33,13 @@ use crate::exec::Decider;
 use crate::output;
 use crate::{AI_CLASSIFY_NAME, AI_DECIDE_NAME, AI_IF_NAME, AI_PROBABILITY_NAME, AI_SCORE_NAME};
 
-/// Rows a decision function receives per invocation. `DataFusion` otherwise hands an
-/// async function whole input batches (8192 rows by default, more from some sources);
-/// a smaller slice bounds the requests in flight per call and the work a `LIMIT`
-/// discards.
-pub(crate) const ROWS_PER_INVOCATION: usize = 256;
+/// Rows a decision function receives per invocation. `DataFusion` slices each input
+/// batch into invocations of this size and runs them one after another, so every slice
+/// ends by waiting for its slowest request; a larger slice spends less of its time
+/// draining (`benches/execution.rs`), and this one still bounds the input text held per
+/// call. The size does not bound what a `LIMIT` discards: a whole input batch is
+/// answered before any of its rows move on.
+pub(crate) const ROWS_PER_INVOCATION: usize = 1024;
 
 /// Which decision function a call is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
