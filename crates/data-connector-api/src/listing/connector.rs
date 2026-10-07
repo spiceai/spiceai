@@ -209,7 +209,7 @@ impl LocationPruningListingTable {
 
         let mut files: Vec<PartitionedFile> = Vec::new();
         while let Some(meta) = file_stream.try_next().await? {
-            if !file_matches_extension(&meta.location, &self.listing_extension) {
+            if !listed_object_is_data_file(&meta, &self.listing_extension) {
                 continue;
             }
             files.push(self.partitioned_file_for_meta(meta)?);
@@ -525,8 +525,11 @@ impl TableProvider for LocationPruningListingTable {
                 }
             };
 
-            if self.uses_format_selected_listing()
-                && !file_matches_extension(&meta.location, &self.listing_extension)
+            // `ListingTable` never reads a zero-byte object (see
+            // [`listed_object_is_data_file`]), so a named one holds no rows.
+            if meta.size == 0
+                || (self.uses_format_selected_listing()
+                    && !file_matches_extension(&meta.location, &self.listing_extension))
             {
                 continue;
             }
@@ -2118,7 +2121,7 @@ async fn get_last_modified(
             found_extensions.insert(NO_EXTENSION_SENTINEL.to_string());
         }
 
-        if file_matches_extension(&file.location, extension) {
+        if listed_object_is_data_file(&file, extension) {
             if let Some(ref current) = last_modified_file {
                 if current.last_modified < file.last_modified {
                     last_modified_file = Some(file);
@@ -2199,7 +2202,7 @@ async fn verify_schema_source_path(
                 source: err.into(),
             })?
     {
-        if file_matches_extension(&file.location, extension) {
+        if listed_object_is_data_file(&file, extension) {
             return Ok(Some(file));
         }
 
@@ -2320,6 +2323,17 @@ pub fn file_matches_extension(location: &Path, extension: &str) -> bool {
     location.as_ref().ends_with(extension)
 }
 
+/// Whether a listed object is a data file the listing table reads for
+/// `extension`: non-empty, and named as [`file_matches_extension`] accepts.
+///
+/// `DataFusion`'s `ListingTable` skips zero-byte objects, so every listing Spice
+/// builds itself has to skip them too. An S3 folder marker (key `table/`, 0
+/// bytes) lists as `table`, an extensionless name a format-selected listing
+/// (`*.parquet`) would otherwise read as a Hive data object and fail on.
+fn listed_object_is_data_file(meta: &ObjectMeta, extension: &str) -> bool {
+    meta.size > 0 && file_matches_extension(&meta.location, extension)
+}
+
 /// List matching `ORC` objects and merge their footers. Used instead of
 /// [`ListingOptions::infer_schema`] on a collection so format-selected
 /// listings (`*.orc`) skip job-marker files and so a last-modified-only
@@ -2385,7 +2399,7 @@ async fn list_matching_listing_files(
     let mut file_stream = table_path.list_all_files(state, object_store, "").await?;
     let mut files = Vec::new();
     while let Some(file) = file_stream.try_next().await? {
-        if file_matches_extension(&file.location, extension) {
+        if listed_object_is_data_file(&file, extension) {
             files.push(file);
             if files.len() >= limit {
                 break;

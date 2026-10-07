@@ -25,6 +25,7 @@ http.workspace = true
 libnfs = { path = "../libnfs", optional = true }
 nix = { workspace = true, features = ["fs"], optional = true }
 object_store.workspace = true
+object_store_spawn = { path = "../object_store_spawn" }
 reqwest.workspace = true
 serde.workspace = true
 smb = { path = "../smb", optional = true }

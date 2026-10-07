@@ -655,12 +655,13 @@ impl RateController {
 }
 
 fn other_origin(e: &leased::Error) -> String {
-    use leased::Error::{ConflictExhausted, FailClosed, Read, Write};
+    use leased::Error::{ConflictExhausted, FailClosed, NewerStateVersion, Read, Write};
     match e {
         Read { origin, .. }
         | Write { origin, .. }
         | ConflictExhausted { origin }
-        | FailClosed { origin } => origin.clone(),
+        | FailClosed { origin }
+        | NewerStateVersion { origin, .. } => origin.clone(),
     }
 }
 
