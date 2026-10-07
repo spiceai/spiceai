@@ -98,11 +98,17 @@ impl RefreshSource for ConnectorRefreshSource {
 /// source still cannot be reached.
 const SOURCE_RETRY_REPORT_INTERVAL: std::time::Duration = std::time::Duration::from_mins(5);
 
+struct SourceFailureReport {
+    reported_at: std::time::Instant,
+    configuration_error: bool,
+}
+
 /// A [`RefreshSource`] for a dataset served from its existing acceleration while
 /// its source is unavailable, which reports the failed attempts to reach the
 /// source: the dataset's status is `Error`, with a message saying it is still
 /// served, until an attempt succeeds, and each failure is logged at most every
-/// [`SOURCE_RETRY_REPORT_INTERVAL`] — as an error for a configuration error
+/// [`SOURCE_RETRY_REPORT_INTERVAL`], except when a transient failure escalates to
+/// a configuration error. Reports are errors for a configuration error
 /// (rejected credentials, TLS), which no retry clears, and a warning otherwise.
 /// Queries keep being served from the acceleration either way.
 ///
@@ -112,27 +118,32 @@ pub(crate) struct ReportingRefreshSource {
     inner: Arc<dyn RefreshSource>,
     dataset: Arc<Dataset>,
     status: Arc<crate::status::RuntimeStatus>,
-    last_report: parking_lot::Mutex<Option<std::time::Instant>>,
+    last_report: parking_lot::Mutex<Option<SourceFailureReport>>,
     /// Whether the dataset's status is an `Error` this source set, to clear once the
     /// source is reached.
     status_is_error: std::sync::atomic::AtomicBool,
 }
 
 impl ReportingRefreshSource {
-    /// Wraps `inner`. `already_reported` is true when the failure that led to
-    /// serving the acceleration has just been logged, so the first retry failure
-    /// is not reported again immediately.
+    /// Wraps `inner`. `already_reported` retains the classification of a failure
+    /// just logged at registration, so the first retry does not repeat it unless
+    /// a transient failure escalates to a configuration error.
     pub(crate) fn new_arc(
         inner: Arc<dyn RefreshSource>,
         dataset: Arc<Dataset>,
         status: Arc<crate::status::RuntimeStatus>,
-        already_reported: bool,
+        already_reported: Option<bool>,
     ) -> Arc<dyn RefreshSource> {
         Arc::new(Self {
             inner,
             dataset,
             status,
-            last_report: parking_lot::Mutex::new(already_reported.then(std::time::Instant::now)),
+            last_report: parking_lot::Mutex::new(already_reported.map(|configuration_error| {
+                SourceFailureReport {
+                    reported_at: std::time::Instant::now(),
+                    configuration_error,
+                }
+            })),
             status_is_error: std::sync::atomic::AtomicBool::new(false),
         })
     }
@@ -152,7 +163,7 @@ impl ReportingRefreshSource {
         );
         self.status_is_error
             .store(true, std::sync::atomic::Ordering::Release);
-        if self.due() {
+        if self.due(configuration_error) {
             if configuration_error {
                 tracing::error!("{message}");
             } else {
@@ -173,12 +184,18 @@ impl ReportingRefreshSource {
     }
 
     /// Whether a report is due, recording it if so.
-    fn due(&self) -> bool {
+    fn due(&self, configuration_error: bool) -> bool {
         let mut last_report = self.last_report.lock();
-        if last_report.is_some_and(|last| last.elapsed() < SOURCE_RETRY_REPORT_INTERVAL) {
+        if last_report.as_ref().is_some_and(|last| {
+            last.reported_at.elapsed() < SOURCE_RETRY_REPORT_INTERVAL
+                && (!configuration_error || last.configuration_error)
+        }) {
             return false;
         }
-        *last_report = Some(std::time::Instant::now());
+        *last_report = Some(SourceFailureReport {
+            reported_at: std::time::Instant::now(),
+            configuration_error,
+        });
         true
     }
 }

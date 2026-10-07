@@ -2071,4 +2071,75 @@ mod served_from_acceleration {
         assert_eq!(rows, Some((6, 3)));
         Ok(())
     }
+
+    /// A source error that escalates from a connection failure to rejected
+    /// credentials is reported immediately while the acceleration keeps serving.
+    #[tokio::test]
+    async fn a_configuration_error_is_logged_after_a_transient_source_failure()
+    -> Result<(), anyhow::Error> {
+        let fixture = Fixture::new("escalating-source-error").await?;
+        let source = &fixture.source;
+        source.refuse_reads_instead_of_connecting();
+        let spec = || fixture.dataset(ReadyState::OnLoad);
+        seed(source, spec()).await?;
+
+        let log_path = fixture.dir.path().join("source-errors.log");
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_writer(std::sync::Mutex::new(std::fs::File::create(&log_path)?))
+            .finish();
+        let _tracing = tracing::subscriber::set_default(subscriber);
+        let (rt, loader) = restart_with_source_down(source, spec()).await;
+        let served = served_from_acceleration(&rt, Duration::from_secs(10)).await;
+        let warned = wait_until_true(Duration::from_secs(10), || async {
+            std::fs::read_to_string(&log_path).is_ok_and(|logs| {
+                logs.lines().any(|line| {
+                    line.contains("WARN")
+                        && line.contains("Serving data from the existing acceleration")
+                })
+            })
+        })
+        .await;
+        source.reject_credentials();
+        let configuration_status = wait_until_true(Duration::from_secs(10), || async {
+            matches!(dataset_status(&rt, "orders"), Some(ComponentStatus::Error(Some(message))) if message.contains("configuration is fixed"))
+        })
+        .await;
+        let error_reported = wait_until_true(Duration::from_secs(3), || async {
+            std::fs::read_to_string(&log_path).is_ok_and(|logs| {
+                logs.lines().any(|line| {
+                    line.contains("ERROR")
+                        && line
+                            .contains("cannot connect to its source because of its configuration")
+                })
+            })
+        })
+        .await;
+        let rows = sum_and_count(&rt).await;
+        stop(rt, loader).await;
+        let logs = std::fs::read_to_string(&log_path)?;
+        for line in logs.lines().filter(|line| {
+            line.contains("Serving data from the existing acceleration")
+                || line.contains("configuration is fixed")
+        }) {
+            eprintln!("source error log: {line}");
+        }
+        eprintln!(
+            "source error escalation: served={served} warned={warned} configuration_status={configuration_status} error_reported={error_reported} rows={rows:?}"
+        );
+        assert!(
+            served && warned,
+            "transient failure is reported while acceleration serves"
+        );
+        assert!(
+            configuration_status,
+            "rejected credentials must update status"
+        );
+        assert!(
+            error_reported,
+            "escalated configuration error must bypass the transient warning throttle"
+        );
+        assert_eq!(rows, Some((3, 3)));
+        Ok(())
+    }
 }

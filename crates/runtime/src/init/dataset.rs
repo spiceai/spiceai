@@ -1231,7 +1231,13 @@ impl Runtime {
                 ConnectorRefreshSource::new_arc(Arc::clone(data_connector), Arc::clone(&ds)),
                 Arc::clone(&ds),
                 Arc::clone(&self.status),
-                matches!(reason, SourceUnavailable::Failed { .. }),
+                match reason {
+                    SourceUnavailable::Failed {
+                        configuration_error,
+                        ..
+                    } => Some(*configuration_error),
+                    SourceUnavailable::NotContacted => None,
+                },
             ),
             checkpoint_schema,
             self.status.shutdown_token(),
