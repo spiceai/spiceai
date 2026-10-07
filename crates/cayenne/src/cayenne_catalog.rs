@@ -1136,7 +1136,7 @@ impl CayenneCatalog {
         // cold store. No inline payload: a graduation's content is the cold files
         // registered below, and the overwrite clear correctly drops the warm
         // tier's inline corpus along with everything else keyed on the old snapshot.
-        self.commit_overwrite_in_txn(txn, table_id, new_snapshot_id, None)
+        self.commit_overwrite_in_txn(txn, table_id, new_snapshot_id, None, &[])
             .await?;
         // One statement per file rather than `execute_many`: each row carries
         // a statistics blob and a primary-key bloom of up to
@@ -1178,6 +1178,7 @@ impl CayenneCatalog {
         table_id: &str,
         new_snapshot_id: &str,
         inlined: Option<&InlinedData>,
+        delete_files: &[crate::metadata::DeleteFile],
     ) -> CatalogResult<()> {
         for (name, value) in [("table_id", table_id), ("new_snapshot_id", new_snapshot_id)] {
             if uuid::Uuid::parse_str(value).is_err() {
@@ -1237,6 +1238,13 @@ impl CayenneCatalog {
                         .to_string(),
                     source: Box::new(e),
                 })?;
+        }
+
+        // The position deletes that hide the copies later copies superseded, after
+        // the batch above cleared the previous snapshot's.
+        for chunk in delete_files.chunks(32_000 / 10) {
+            let (sql, params) = Self::build_insert_delete_files_chunk_sql(chunk);
+            txn.execute(ExecuteParams { sql: &sql, params }).await?;
         }
         Ok(())
     }
@@ -3673,6 +3681,7 @@ impl MetadataCatalog for CayenneCatalog {
         table_id: &str,
         new_snapshot_id: &str,
         inlined: Option<&InlinedData>,
+        delete_files: &[crate::metadata::DeleteFile],
     ) -> CatalogResult<()> {
         // Same retry-on-conflict shape as commit_compaction; the only
         // additional work happens inside the transaction via
@@ -3695,7 +3704,7 @@ impl MetadataCatalog for CayenneCatalog {
             })?;
 
             match self
-                .commit_overwrite_in_txn(&mut *tx, table_id, new_snapshot_id, inlined)
+                .commit_overwrite_in_txn(&mut *tx, table_id, new_snapshot_id, inlined, delete_files)
                 .await
             {
                 Ok(()) => match tx.commit().await {
@@ -9379,7 +9388,7 @@ mod tests {
 
         let before = catalog.metastore_query_count();
         let result = catalog
-            .commit_overwrite(&table_id, &uuid::Uuid::now_v7().to_string(), None)
+            .commit_overwrite(&table_id, &uuid::Uuid::now_v7().to_string(), None, &[])
             .await;
         violations.extend(statement_conflict_violation(
             "commit_overwrite",

@@ -3100,8 +3100,9 @@ mod function_support_tests {
     /// Regression test for #14482 on the ADBC routes: a `duckdb`, `postgresql`
     /// or `mysql` driver reaches an engine that rounds a fractional-to-integer
     /// cast `DataFusion` truncates, so the cast must stay local through the
-    /// dataset factory and the catalog factory alike; `sqlite` truncates like
-    /// `DataFusion` and keeps the pushdown.
+    /// dataset factory and the catalog factory alike. `sqlite` keeps it local
+    /// too, under the `SQLite` gate: it saturates a float past `i64` where
+    /// `DataFusion` refuses it.
     #[tokio::test]
     async fn a_fractional_to_integer_cast_stays_local_on_every_adbc_driver_that_rounds() {
         use datafusion::prelude::cast;
@@ -3126,10 +3127,54 @@ mod function_support_tests {
             );
         }
         assert!(
-            federates("sqlite", rounding()).await
-                && federates_via_catalog("sqlite", rounding()).await,
-            "SQLite truncates {} as DataFusion does, so the pushdown is kept",
+            !federates("sqlite", rounding()).await
+                && !federates_via_catalog("sqlite", rounding()).await,
+            "the SQLite gate keeps {} local on both ADBC routes",
             rounding()
+        );
+    }
+
+    /// Regression test for #14753 and #14754: the generic dialect renders a
+    /// timestamp or date literal as `CAST('…' AS TIMESTAMP)`, which `SQLite`
+    /// evaluates to the year as an integer — so a filter against it selected
+    /// every row — and an interval as `INTERVAL '1 HOURS'`, which `SQLite`
+    /// cannot parse. Each must stay local through the dataset factory and the
+    /// catalog factory alike, while a plain comparison keeps federating.
+    #[tokio::test]
+    async fn a_temporal_value_stays_local_on_the_sqlite_driver() {
+        use datafusion::prelude::cast;
+        use datafusion::scalar::ScalarValue;
+        let timestamp = cast(
+            lit("2026-01-30 23:00:00"),
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+        );
+        let shapes = [
+            ("a timestamp literal", col("val").gt_eq(timestamp.clone())),
+            (
+                "a date literal",
+                col("val").gt_eq(cast(lit("2026-01-31"), DataType::Date32)),
+            ),
+            (
+                "timestamp minus interval",
+                col("val")
+                    .gt_eq(timestamp - lit(ScalarValue::new_interval_mdn(0, 0, 3_600_000_000_000))),
+            ),
+        ];
+        for (what, expr) in shapes {
+            assert!(
+                !federates("sqlite", expr.clone()).await,
+                "{what} must stay local on the dataset route: {expr}"
+            );
+            assert!(
+                !federates_via_catalog("sqlite", expr.clone()).await,
+                "{what} must stay local on the catalog route: {expr}"
+            );
+        }
+        let plain = col("val").gt_eq(lit("2026-01-31"));
+        assert!(
+            federates("sqlite", plain.clone()).await
+                && federates_via_catalog("sqlite", plain.clone()).await,
+            "{plain} must keep federating"
         );
     }
 

@@ -59,7 +59,7 @@ use data_accelerator_api::snapshots::{
 use data_accelerator_api::spice_data_base_path;
 use data_accelerator_api::{
     AccelerationSource, AcceleratorEngineRegistry, BootstrapStatus, DataAccelerator,
-    get_primary_keys_from_constraints, upsert_dedup,
+    get_primary_keys_from_constraints,
 };
 use runtime_acceleration::Engine;
 use runtime_acceleration::OnSchemaChange;
@@ -3353,15 +3353,11 @@ impl DataAccelerator for CayenneAccelerator {
         acceleration: &spicepod::acceleration::Acceleration,
         unset_refresh_mode: runtime_acceleration::acceleration::RefreshMode,
     ) -> Option<data_accelerator_api::SpicepodWriteProfile> {
-        // The contract is `None` unless the acceleration names this engine. The runtime
+        // The contract is `None` unless the acceleration uses this engine. The runtime
         // enumerates Cayenne accelerations before asking, so this is the implementation
         // holding up its own end: another consumer would otherwise get a confident
         // Cayenne classification for a DuckDB or Arrow acceleration.
-        if !acceleration
-            .engine
-            .as_deref()
-            .is_some_and(|engine| engine.eq_ignore_ascii_case("cayenne"))
-        {
+        if !acceleration.engine_name().eq_ignore_ascii_case("cayenne") {
             return None;
         }
 
@@ -3955,13 +3951,9 @@ impl DataAccelerator for CayenneAccelerator {
 
         // If partitioning is requested, wrap with PartitionTableProvider
         if partition_by.is_empty() {
-            // Non-partitioned table - wrap in PolyTableProvider for proper deletion/retention support
-            // Wrap with upsert deduplication if needed based on on_conflict settings
-            let write_provider = upsert_dedup::wrap_with_upsert_dedup_if_needed(
-                cayenne_table,
-                &cmd.options,
-                cmd.constraints.clone(),
-            );
+            // Non-partitioned table - wrap in PolyTableProvider for proper deletion/retention support.
+            // Cayenne resolves the keys every write repeats per `on_conflict` itself.
+            let write_provider: Arc<dyn TableProvider> = cayenne_table;
 
             let mut schema_metadata = HashMap::new();
             schema_metadata.insert(
@@ -4141,12 +4133,8 @@ impl DataAccelerator for CayenneAccelerator {
             let partition_provider =
                 Arc::new(partition_provider.with_insert_strategy(insert_strategy));
 
-            // Wrap with upsert deduplication if needed based on on_conflict settings
-            let write_provider = upsert_dedup::wrap_with_upsert_dedup_if_needed(
-                partition_provider,
-                &cmd.options,
-                cmd.constraints.clone(),
-            );
+            // Each partition resolves the keys its writes repeat per `on_conflict`.
+            let write_provider: Arc<dyn TableProvider> = partition_provider;
 
             let mut schema_metadata = HashMap::new();
             schema_metadata.insert(
@@ -5339,9 +5327,14 @@ mod tests {
                 .is_some(),
             "the engine name is matched the way the runtime matches it: case-insensitively"
         );
+        assert!(
+            accelerator
+                .spicepod_write_profile(&named(None), RefreshMode::Full)
+                .is_some(),
+            "an acceleration that names no engine uses Cayenne, the default engine"
+        );
 
-        // `None` is the default Arrow engine, not an unspecified Cayenne one.
-        for other in [Some("duckdb"), Some("arrow"), Some("sqlite"), None] {
+        for other in [Some("duckdb"), Some("arrow"), Some("sqlite")] {
             assert!(
                 accelerator
                     .spicepod_write_profile(&named(other), RefreshMode::Full)

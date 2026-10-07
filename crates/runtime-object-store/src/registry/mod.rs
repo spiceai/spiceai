@@ -29,10 +29,8 @@ use datafusion::{
         runtime_env::{RuntimeEnv, RuntimeEnvBuilder},
     },
 };
-use object_store::{
-    ClientOptions, ObjectStore, aws::AmazonS3Builder, client::SpawnedReqwestConnector,
-    http::HttpBuilder,
-};
+use object_store::{ClientOptions, ObjectStore, aws::AmazonS3Builder, http::HttpBuilder};
+use object_store_spawn::SpawnedReqwestConnector;
 use tokio::runtime::Handle;
 use url::{Url, form_urlencoded::parse};
 

@@ -21,6 +21,7 @@ fundu.workspace = true
 iceberg.workspace = true
 iceberg-storage-opendal.workspace = true
 object_store.workspace = true
+object_store_spawn = { path = "../object_store_spawn" }
 reqwest.workspace = true
 reqsign-core.workspace = true
 secrecy.workspace = true

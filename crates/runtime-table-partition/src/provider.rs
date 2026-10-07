@@ -713,17 +713,29 @@ impl DeletionSink for PartitionedUpdateSink {
         &self,
         _context: Arc<TaskContext>,
     ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-        let mut total_updated = 0u64;
+        let mut plans = Vec::with_capacity(self.partitions.len());
         for partition in &self.partitions {
-            let plan = partition
-                .table_provider
-                .update(
-                    &self.session_state,
-                    self.assignments.clone(),
-                    self.filters.clone(),
-                )
-                .await?;
+            plans.push(
+                partition
+                    .table_provider
+                    .update(
+                        &self.session_state,
+                        self.assignments.clone(),
+                        self.filters.clone(),
+                    )
+                    .await?,
+            );
+        }
+        // Check every partition's updated rows before writing any, so an UPDATE a
+        // partition refuses changes no partition.
+        for plan in &plans {
+            if let Some(update) = plan.downcast_ref::<data_components::update::UpdateExec>() {
+                update.prepare(Arc::clone(&self.task_ctx)).await?;
+            }
+        }
 
+        let mut total_updated = 0u64;
+        for plan in plans {
             let results = collect(plan, Arc::clone(&self.task_ctx)).await?;
 
             for batch in results {

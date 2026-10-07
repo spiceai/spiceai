@@ -937,7 +937,7 @@ impl GithubRestClient {
 
         if let Some(response_json) = response_json.as_ref() {
             error_checker(&response_headers, response_json).map_err(|e| {
-                if let graphql::Error::RateLimited { message } = e {
+                if let graphql::Error::RateLimited { message, .. } = e {
                     Error::RateLimited { message }
                 } else {
                     Error::GithubApiError { source: e.into() }
@@ -1001,7 +1001,7 @@ impl GithubRestClient {
 
         if let Some(response_json) = response_json.as_ref() {
             error_checker(&response_headers, response_json).map_err(|e| {
-                if let graphql::Error::RateLimited { message } = e {
+                if let graphql::Error::RateLimited { message, .. } = e {
                     Error::RateLimited { message }
                 } else {
                     Error::GithubApiError { source: e.into() }
@@ -1136,7 +1136,7 @@ impl GithubRestClient {
 
         if let Some(response_json) = response_json.as_ref() {
             error_checker(&response_headers, response_json).map_err(|e| {
-                if let graphql::Error::RateLimited { message } = e {
+                if let graphql::Error::RateLimited { message, .. } = e {
                     Error::RateLimited { message }
                 } else {
                     Error::GithubApiError { source: e.into() }
@@ -1208,7 +1208,7 @@ impl GithubRestClient {
 
                 if let Some(response_json) = response_json.as_ref() {
                     error_checker(&response_headers, response_json).map_err(|e| {
-                        if let graphql::Error::RateLimited { message } = e {
+                        if let graphql::Error::RateLimited { message, .. } = e {
                             Error::RateLimited { message }
                         } else {
                             Error::GithubApiError { source: e.into() }
@@ -1303,7 +1303,7 @@ impl GithubRestClient {
 
             if let Some(response_json) = response_json.as_ref() {
                 error_checker(&response_headers, response_json).map_err(|e| {
-                    if let graphql::Error::RateLimited { message } = e {
+                    if let graphql::Error::RateLimited { message, .. } = e {
                         Error::RateLimited { message }
                     } else {
                         Error::GithubApiError { source: e.into() }
@@ -1463,7 +1463,7 @@ impl GithubRestClient {
 
                 if let Some(response_json) = response_json.as_ref() {
                     error_checker(&response_headers, response_json).map_err(|e| {
-                        if let graphql::Error::RateLimited { message } = e {
+                        if let graphql::Error::RateLimited { message, .. } = e {
                             Error::RateLimited { message }
                         } else {
                             Error::GithubApiError { source: e.into() }
@@ -1836,7 +1836,7 @@ impl GithubRestClient {
 
                 if let Some(response_json) = response_json.as_ref() {
                     error_checker(&response_headers, response_json).map_err(|e| {
-                        if let graphql::Error::RateLimited { message } = e {
+                        if let graphql::Error::RateLimited { message, .. } = e {
                             Error::RateLimited { message }
                         } else {
                             Error::GithubApiError { source: e.into() }
@@ -2101,6 +2101,7 @@ pub fn error_checker(
         // A secondary rate limit was exceeded
         return Err(graphql::Error::RateLimited {
             message: "GitHub API rate limit exceeded. Consider reducing dataset 'max_concurrent_requests' or runtime.source_rate_control.github_concurrent_connections_limit in your spicepod to avoid rate limits. See: https://spiceai.org/docs/components/data-connectors/github".to_string(),
+            retry_after: graphql::response::retry_after_from_headers(headers),
         });
     }
 
@@ -2114,6 +2115,7 @@ pub fn error_checker(
         if ratelimit_remaining == 0 {
             return Err(graphql::Error::RateLimited {
                 message: "GitHub API rate limit exceeded. Consider reducing dataset 'max_concurrent_requests' or runtime.source_rate_control.github_concurrent_connections_limit in your spicepod to avoid rate limits. See: https://spiceai.org/docs/components/data-connectors/github".to_string(),
+                retry_after: graphql::response::retry_after_from_headers(headers),
             });
         }
     }

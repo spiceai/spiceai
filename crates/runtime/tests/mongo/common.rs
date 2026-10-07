@@ -50,7 +50,10 @@ pub fn make_mongodb_dataset(path: &str, name: &str, port: u16, accelerated: bool
     ]);
     dataset.params = Some(DatasetParams::from_string_map(params));
     if accelerated {
-        dataset.acceleration = Some(Acceleration::default());
+        dataset.acceleration = Some(Acceleration {
+            engine: Some("arrow".to_string()),
+            ..Acceleration::default()
+        });
     }
     dataset
 }
