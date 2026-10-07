@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -21,6 +21,10 @@ limitations under the License.
 //! writes to `runtime.state.location`. These tests run two replicas
 //! against the same `file://` state location and assert that the combined
 //! throughput stays within the cluster budget.
+//!
+//! This lives in its own test binary so the sign-off gate (`make nextest`) can
+//! run it without loading the `integration` binary, whose debug build on macOS
+//! is too large for dyld to map the shared cache beside it.
 
 use std::{num::NonZeroU32, path::Path, sync::Arc, time::Duration};
 
