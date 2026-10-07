@@ -236,6 +236,21 @@ impl ClusterHarness {
         }
     }
 
+    /// Task slots (`vcores`) each registered executor advertised to the scheduler,
+    /// as the scheduler's executor registry records them.
+    pub async fn executor_advertised_slots(&self) -> Result<Vec<u32>, anyhow::Error> {
+        let mut slots: Vec<u32> = self
+            .executor_manager
+            .get_executors_state()
+            .await
+            .map_err(|e| anyhow::Error::msg(e.to_string()))?
+            .into_iter()
+            .map(|(metadata, _, _)| metadata.specification.vcores)
+            .collect();
+        slots.sort_unstable();
+        Ok(slots)
+    }
+
     /// Run a SQL query through the scheduler and collect all result batches.
     pub async fn query(&self, sql: &str) -> Result<Vec<RecordBatch>, anyhow::Error> {
         QueryBuilder::new(sql, self.scheduler.datafusion())

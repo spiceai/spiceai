@@ -115,7 +115,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [candle-rotary](#candle-and-its-kernel-crates) | `e12f91a6c8beec5373ccec91a5ccad80619cf065` | `main` |
 | [clickhouse-rs](#clickhouse-rs) | `7e98394f44cfa33919ebc5a92c06d5bddba708bf` | tag `0.2.2` |
 | [datafusion](#datafusion) | `02550cf9462b9f56506b6b1cd07eabf08c46e200` | `spiceai-55` |
-| [datafusion-ballista](#datafusion-ballista) | `1665669db1390b09728627c4f5110bf3797f931d` | `spiceai-55` |
+| [datafusion-ballista](#datafusion-ballista) | `1665669db1390b09728627c4f5110bf3797f931d` | `peasee/executor-task-slots` (spiceai/datafusion-ballista#75, based on `spiceai-55`; repin to the `spiceai-55` merge commit once it merges) |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `9ca84a39760d7728bdeb5eac8480a3f9ee8422be` | `spiceai-55` |
 | [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `465926a30443ebfbbc95366b6f0277bff80a8ba9` | `spiceai-55` |
 | [delta-kernel-rs](#delta-kernel-rs) | `16ac28606464d742b6837de4a51f41011c3f6dc0` | `spiceai-0.27` |
@@ -315,7 +315,9 @@ path (`parquet/src/util/push_buffers.rs` and its callers), in
 
 Upstream [apache/datafusion-ballista](https://github.com/apache/datafusion-ballista),
 branch `spiceai-55` (upstream's `55.0.0-rc1` tag, merged into the previous line through
-spiceai/datafusion-ballista#73 and #68). The fork carries its own inventory, `SPICE_FORK_CHANGES.md`.
+spiceai/datafusion-ballista#73 and #68). The pin is currently the head of spiceai/datafusion-ballista#75
+(branch `peasee/executor-task-slots`, based on `spiceai-55`), which adds the `Executor::with_task_runner_threads`
+override; repin to the `spiceai-55` merge commit once it merges. The fork carries its own inventory, `SPICE_FORK_CHANGES.md`.
 Upstream adopted several of the patches below in that merge; those rows are kept,
 marked upstreamed, because the guard still pins the behaviour and a later upstream
 change could move it.

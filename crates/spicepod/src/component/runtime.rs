@@ -1443,8 +1443,7 @@ pub struct Executor {
     pub task_slots: Option<u64>,
 }
 
-const EXECUTOR_TASK_SLOTS_DOCS: &str =
-    "https://spiceai.org/docs/reference/spicepod/runtime#runtimeexecutortask_slots";
+const EXECUTOR_TASK_SLOTS_DOCS: &str = "https://spiceai.org/docs/reference/spicepod/runtime";
 
 /// Validate `runtime.executor.task_slots`: the scheduler protocol carries the slot
 /// count as a `u32`, and an executor with zero slots would never accept work.
@@ -2653,7 +2652,7 @@ datasets:
 
     #[test]
     fn test_executor_task_slots_rejects_out_of_range() {
-        let tail = "Set it to the number of tasks each executor should run at once, or remove it to use each executor's CPU cores. See: https://spiceai.org/docs/reference/spicepod/runtime#runtimeexecutortask_slots";
+        let tail = "Set it to the number of tasks each executor should run at once, or remove it to use each executor's CPU cores. See: https://spiceai.org/docs/reference/spicepod/runtime";
         for (text, bound) in [("0", "at least 1"), ("4294967296", "at most 4294967295")] {
             let err = parse_executor_runtime(&format!("executor:\n  task_slots: {text}"))
                 .expect_err("out-of-range task_slots must fail to parse");
