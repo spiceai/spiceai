@@ -25,8 +25,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use object_store::aws::AmazonS3Builder;
-use object_store::client::SpawnedReqwestConnector;
 use object_store::{ClientOptions, ObjectStore};
+use object_store_spawn::SpawnedReqwestConnector;
 use secrecy::{ExposeSecret, SecretString};
 use snafu::prelude::*;
 use tokio::runtime::Handle;

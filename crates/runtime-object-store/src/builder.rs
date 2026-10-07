@@ -38,8 +38,9 @@ use std::{collections::HashMap, sync::Arc};
 use datafusion::error::DataFusionError;
 use object_store::{
     ClientOptions, ObjectStore, RetryConfig, azure::MicrosoftAzureBuilder,
-    client::SpawnedReqwestConnector, gcp::GoogleCloudStorageBuilder,
+    gcp::GoogleCloudStorageBuilder,
 };
+use object_store_spawn::SpawnedReqwestConnector;
 use tokio::runtime::Handle;
 use url::Url;
 
