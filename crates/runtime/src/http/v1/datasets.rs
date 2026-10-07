@@ -199,6 +199,17 @@ fn dataset_infos(
     datasets: &[Arc<Dataset>],
     include_status: bool,
 ) -> Vec<DatasetResponseItem> {
+    let datasets_by_name = if include_status {
+        let mut by_name = HashMap::with_capacity(datasets.len());
+        for dataset in datasets {
+            by_name
+                .entry(dataset.name.clone())
+                .or_insert(dataset.as_ref());
+        }
+        by_name
+    } else {
+        HashMap::new()
+    };
     datasets
         .iter()
         .map(|d| {
@@ -221,7 +232,7 @@ fn dataset_infos(
                 .as_ref()
                 .and_then(|s| s.error_message().map(String::from));
             let (last_refresh, next_refresh) = if include_status {
-                dataset_freshness(df, d, datasets)
+                dataset_freshness(df, d, &datasets_by_name)
             } else {
                 (None, None)
             };
@@ -249,7 +260,7 @@ fn dataset_infos(
 fn dataset_freshness(
     df: &DataFusion,
     ds: &Dataset,
-    datasets: &[Arc<Dataset>],
+    datasets: &HashMap<TableReference, &Dataset>,
 ) -> (Option<String>, Option<String>) {
     let Some(_) = ds.acceleration.as_ref().filter(|a| a.enabled) else {
         return (None, None);
@@ -259,7 +270,7 @@ fn dataset_freshness(
         .runtime_status()
         .dataset_refresh_source(&ds.name)
         .and_then(|source| {
-            let source_dataset = datasets.iter().find(|dataset| dataset.name == source)?;
+            let source_dataset = datasets.get(&source)?;
             let acceleration = source_dataset.acceleration.as_ref().filter(|a| a.enabled)?;
             let scheduled = acceleration.refresh_check_interval.is_some()
                 || acceleration.refresh_cron.is_some();

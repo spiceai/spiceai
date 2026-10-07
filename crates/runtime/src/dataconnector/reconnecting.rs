@@ -141,7 +141,19 @@ impl ReconnectingConnector {
     ) -> Result<&Arc<dyn DataConnector>, DataConnectorError> {
         let connector = self
             .inner
-            .get_or_try_init(|| (self.build)())
+            .get_or_try_init(|| async {
+                let connector = (self.build)().await?;
+                // A source read triggers deferred initialization. Forward through
+                // the connector behind the placeholder to verify source access.
+                let connector = match connector
+                    .as_any()
+                    .downcast_ref::<super::deferred::DeferredConnector>()
+                {
+                    Some(deferred) => deferred.source(),
+                    None => connector,
+                };
+                Ok::<_, crate::Error>(connector)
+            })
             .await
             .map_err(|err| self.build_error(dataset, err))?;
 

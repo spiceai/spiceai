@@ -71,6 +71,7 @@ struct UnreachableSource {
     primary_key: AtomicBool,
     extra_column: AtomicBool,
     reject_credentials: AtomicBool,
+    on_trigger: AtomicBool,
     dynamic_reads: AtomicBool,
     fail_scans: AtomicBool,
     failed_scans: AtomicUsize,
@@ -91,6 +92,7 @@ impl UnreachableSource {
             primary_key: AtomicBool::new(false),
             extra_column: AtomicBool::new(false),
             reject_credentials: AtomicBool::new(false),
+            on_trigger: AtomicBool::new(false),
             dynamic_reads: AtomicBool::new(false),
             fail_scans: AtomicBool::new(false),
             failed_scans: AtomicUsize::new(0),
@@ -290,6 +292,14 @@ impl DataConnector for UnreachableSourceConnector {
                         })
                 }),
         )
+    }
+
+    fn initialization(&self) -> runtime::component::ComponentInitialization {
+        if self.source.on_trigger.load(Ordering::SeqCst) {
+            runtime::component::ComponentInitialization::OnTrigger
+        } else {
+            runtime::component::ComponentInitialization::default()
+        }
     }
 
     async fn read_provider(
@@ -1542,6 +1552,125 @@ mod served_from_acceleration {
             child_due, parent_due,
             "the child follows its actual parent scheduler"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "Run explicitly to collect freshness API latency samples"]
+    async fn dataset_freshness_lookup_scaling() -> Result<(), anyhow::Error> {
+        let fixture = Fixture::new("freshness-lookup-scaling").await?;
+        for count in [1_000, 10_000] {
+            let mut app = AppBuilder::new("freshness_lookup_scaling");
+            for index in 0..count {
+                let mut dataset = SpicepodDataset::new(
+                    format!("{}://orders", fixture.source.prefix),
+                    format!("orders_{index}"),
+                );
+                dataset.acceleration = Some(Acceleration {
+                    enabled: true,
+                    engine: Some("arrow".to_string()),
+                    refresh_check_interval: Some("1h".to_string()),
+                    ..Acceleration::default()
+                });
+                app = app.with_dataset(dataset);
+            }
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app.build()).build().await);
+            let due = std::time::SystemTime::now() + Duration::from_secs(3600);
+            let mut expected = HashMap::with_capacity(count);
+            for index in 0..count {
+                let name = datafusion::common::TableReference::bare(format!("orders_{index}"));
+                let next = due + Duration::from_secs(u64::try_from(index)?);
+                rt.status().record_dataset_next_refresh(&name, next);
+                expected.insert(
+                    name.to_quoted_string(),
+                    chrono::DateTime::<chrono::Utc>::from(next)
+                        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                );
+            }
+            // Exercise the same response builder as `/v1/datasets?status=true`.
+            // No providers need loading to list configured datasets and freshness.
+            let warmup = runtime::dataset_infos_with_status(&rt).await;
+            assert_eq!(warmup.len(), count);
+            assert!(
+                warmup
+                    .iter()
+                    .all(|item| item.next_refresh.as_ref() == expected.get(&item.name))
+            );
+            let mut samples = Vec::with_capacity(200);
+            for _ in 0..200 {
+                let started = std::time::Instant::now();
+                let infos = runtime::dataset_infos_with_status(&rt).await;
+                samples.push(started.elapsed());
+                assert_eq!(infos.len(), count);
+                assert!(
+                    infos
+                        .iter()
+                        .all(|item| item.next_refresh.as_ref() == expected.get(&item.name))
+                );
+            }
+            let artifact =
+                std::env::temp_dir().join(format!("spice-freshness-lookup-{count}.json"));
+            std::fs::write(
+                &artifact,
+                serde_json::to_vec_pretty(&serde_json::json!({
+                    "datasets": count,
+                    "samples_us": samples.iter().map(std::time::Duration::as_micros).collect::<Vec<_>>(),
+                    "response": &warmup,
+                    "expected_next_refresh": &expected,
+                }))?,
+            )?;
+            eprintln!("freshness lookup artifact: {}", artifact.display());
+            samples.sort_unstable();
+            let p99 = samples[197];
+            eprintln!(
+                "freshness lookup benchmark: datasets={count} samples={} p99_us={} rows={}",
+                samples.len(),
+                p99.as_micros(),
+                warmup.len()
+            );
+            rt.shutdown().await;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn on_trigger_source_refreshes_existing_acceleration_after_recovery()
+    -> Result<(), anyhow::Error> {
+        let fixture = Fixture::new("on-trigger-source-recovery").await?;
+        let source = &fixture.source;
+        let dataset = fixture.dataset(ReadyState::OnSchemaResolved);
+        seed(source, dataset.clone()).await?;
+        source.refuse_reads_instead_of_connecting();
+        source
+            .on_trigger
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        source.reads.store(0, std::sync::atomic::Ordering::SeqCst);
+        let (rt, loader) = restart_with_source_down(source, dataset).await;
+        let served = served_from_acceleration(&rt, Duration::from_secs(10)).await;
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        let ready_while_source_down = rt.status().is_ready();
+        let reads_while_source_down = source.reads();
+        source.bring_up();
+        let refreshed = refreshed_from_source(&rt).await;
+        let rows = sum_and_count(&rt).await;
+        eprintln!(
+            "on-trigger recovery: served={served} ready_while_source_down={ready_while_source_down} source_reads={reads_while_source_down} refreshed={refreshed} rows={rows:?}"
+        );
+        stop(rt, loader).await;
+        assert!(
+            served,
+            "the existing acceleration serves during deferred authentication"
+        );
+        assert!(
+            !ready_while_source_down,
+            "schema-resolved readiness waits for the real source"
+        );
+        assert!(
+            refreshed,
+            "source recovery refreshes through the on-trigger connector"
+        );
+        assert_eq!(rows, Some((6, 3)));
         Ok(())
     }
 
