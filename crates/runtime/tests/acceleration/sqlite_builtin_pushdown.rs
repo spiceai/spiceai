@@ -352,3 +352,115 @@ async fn sqlite_accelerator_evaluates_unfaithful_builtins_locally() -> Result<()
         })
         .await
 }
+
+/// TPC-H Q2's shape: a correlated scalar subquery over the `partsupp` table,
+/// held above a join whose `part` side carries a `LIKE` `SQLite` cannot run
+/// faithfully, so only part of the join federates.
+fn write_part_and_partsupp_sources(part: &Path, partsupp: &Path) -> Result<(), anyhow::Error> {
+    std::fs::write(
+        part,
+        "p_partkey,p_type\n\
+         1,LARGE BRASS\n\
+         2,SMALL COPPER\n\
+         3,ECONOMY BRASS\n\
+         4,large brass\n",
+    )?;
+    std::fs::write(
+        partsupp,
+        "ps_partkey,ps_suppkey,ps_supplycost\n\
+         1,10,5.0\n\
+         1,11,3.0\n\
+         2,12,7.0\n\
+         3,13,9.0\n\
+         3,14,9.0\n\
+         4,15,1.0\n",
+    )?;
+    Ok(())
+}
+
+/// Regression test for the federation analyzer federating a correlated scalar
+/// subquery on its own once the query around it does not federate whole. The
+/// subquery's outer reference names `part`, which the statement it was federated
+/// as never scans, and `DataFusion` refused the plan with "Correlated scalar
+/// subquery must be aggregated to return at most one row" — TPC-H Q2 on a
+/// `SQLite` accelerator, which returns 100 rows unaccelerated. The correlation
+/// now stays with the query that binds it, and the answer matches local
+/// evaluation, including the case-sensitive `LIKE` that skips `large brass`.
+#[tokio::test]
+async fn sqlite_accelerator_answers_a_correlated_subquery_above_a_partly_federated_join()
+-> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let dir = tempfile::tempdir()?;
+            let part = dir.path().join("part.csv");
+            let partsupp = dir.path().join("partsupp.csv");
+            write_part_and_partsupp_sources(&part, &partsupp)?;
+            let part = format!("file://{}", part.display());
+            let partsupp = format!("file://{}", partsupp.display());
+
+            let app = AppBuilder::new("sqlite_correlated_subquery_above_partial_join")
+                .with_dataset(sqlite_accelerated(&part, "part"))
+                .with_dataset(sqlite_accelerated(&partsupp, "partsupp"))
+                .with_dataset(unaccelerated(&part, "part_local"))
+                .with_dataset(unaccelerated(&partsupp, "partsupp_local"))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            load_runtime_datasets(&rt, LOAD_TIMEOUT).await?;
+
+            let query = "SELECT p.p_partkey, ps.ps_suppkey, ps.ps_supplycost \
+                         FROM {part} p JOIN {partsupp} ps ON p.p_partkey = ps.ps_partkey \
+                         WHERE p.p_type LIKE '%BRASS' \
+                           AND ps.ps_supplycost = ( \
+                             SELECT min(ps2.ps_supplycost) FROM {partsupp} ps2 \
+                             WHERE ps2.ps_partkey = p.p_partkey) \
+                         ORDER BY p.p_partkey, ps.ps_suppkey";
+            let accelerated_query = query
+                .replace("{part}", "part")
+                .replace("{partsupp}", "partsupp");
+            let local_query = query
+                .replace("{part}", "part_local")
+                .replace("{partsupp}", "partsupp_local");
+
+            let plan =
+                to_pretty_display(&run_query(&rt, &format!("EXPLAIN {accelerated_query}")).await?)?
+                    .to_string();
+            let remote_sql = pushed_down_sql(&plan);
+            assert!(
+                !remote_sql.is_empty(),
+                "the scans must still be federated to SQLite; plan was:\n{plan}"
+            );
+            assert!(
+                !remote_sql.contains("LIKE"),
+                "SQLite LIKE folds ASCII case and must stay local; the SQL sent was:\n{remote_sql}"
+            );
+
+            let accelerated = run_query(&rt, &accelerated_query).await?;
+            let local = run_query(&rt, &local_query).await?;
+            assert_batches_eq!(
+                [
+                    "+-----------+------------+---------------+",
+                    "| p_partkey | ps_suppkey | ps_supplycost |",
+                    "+-----------+------------+---------------+",
+                    "| 1         | 11         | 3.0           |",
+                    "| 3         | 13         | 9.0           |",
+                    "| 3         | 14         | 9.0           |",
+                    "+-----------+------------+---------------+",
+                ],
+                &accelerated
+            );
+            assert_eq!(
+                to_pretty_display(&accelerated)?.to_string(),
+                to_pretty_display(&local)?.to_string(),
+                "the SQLite-accelerated answer must agree with local evaluation"
+            );
+
+            rt.shutdown().await;
+            Ok(())
+        })
+        .await
+}
