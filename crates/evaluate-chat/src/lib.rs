@@ -245,10 +245,7 @@ impl Evaluate for ChatEvaluator {
 
         // Every attempt is billed, so usage is the total across them. A count some
         // attempt did not report makes the total unknown rather than too low.
-        let mut usage = Some(Usage {
-            input_tokens: 0,
-            output_tokens: 0,
-        });
+        let mut usage = Some(Usage::default());
         let mut corrective_retries = 0;
         loop {
             let response = self
@@ -267,6 +264,7 @@ impl Evaluate for ChatEvaluator {
                 (Some(total), Some(reported)) => Some(Usage {
                     input_tokens: total.input_tokens + u64::from(reported.prompt_tokens),
                     output_tokens: total.output_tokens + u64::from(reported.completion_tokens),
+                    ..Usage::default()
                 }),
                 _ => None,
             };
@@ -498,7 +496,8 @@ mod tests {
             response.usage,
             Some(Usage {
                 input_tokens: 100,
-                output_tokens: 20
+                output_tokens: 20,
+                ..Usage::default()
             })
         );
         assert_eq!(
@@ -559,7 +558,8 @@ mod tests {
             response.usage,
             Some(Usage {
                 input_tokens: 200,
-                output_tokens: 40
+                output_tokens: 40,
+                ..Usage::default()
             }),
             "usage totals every attempt"
         );

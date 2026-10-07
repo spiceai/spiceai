@@ -274,6 +274,7 @@ mod tests {
                 usage: Some(Usage {
                     input_tokens: 10,
                     output_tokens: 2,
+                    ..Usage::default()
                 }),
             })
         }

@@ -417,7 +417,7 @@ pub struct EvaluateRequest {
 }
 
 /// Token usage reported by the provider.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct Usage {
     /// Defaulted: the provider may report one count without the other, and a partial
@@ -426,6 +426,18 @@ pub struct Usage {
     pub input_tokens: u64,
     #[serde(default)]
     pub output_tokens: u64,
+    /// Input tokens served from the provider's prompt cache, when it reports them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_tokens: Option<u64>,
+    /// Input tokens written to the provider's prompt cache, when it reports them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<u64>,
+    /// Output tokens spent on reasoning, when the provider reports them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
+    /// The provider's own total, when it reports one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u64>,
 }
 
 /// A typed answer returned for one question.

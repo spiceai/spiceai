@@ -314,7 +314,7 @@ mod tests {
                     "damaged": {"type": "noul", "noul": 0.95},
                     "team": {"type": "choice", "choice": "support", "probabilities": {"billing": 0.1, "support": 0.9}, "confidence": 0.8}
                 },
-                "usage": {"input_tokens": 42, "output_tokens": 0}
+                "usage": {"input_tokens": 42, "output_tokens": 0, "cached_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0, "total_tokens": 42}
             })
         );
     }

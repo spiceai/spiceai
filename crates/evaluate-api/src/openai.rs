@@ -629,10 +629,17 @@ impl SystemOneRequest {
             answers,
             usage: response.usage.map(|usage| DecisionUsage {
                 input_tokens: usage.input_tokens,
-                input_tokens_details: InputTokensDetails::default(),
+                input_tokens_details: InputTokensDetails {
+                    cached_tokens: usage.cached_tokens.unwrap_or_default(),
+                    cache_write_tokens: usage.cache_write_tokens.unwrap_or_default(),
+                },
                 output_tokens: usage.output_tokens,
-                output_tokens_details: OutputTokensDetails::default(),
-                total_tokens: usage.input_tokens.saturating_add(usage.output_tokens),
+                output_tokens_details: OutputTokensDetails {
+                    reasoning_tokens: usage.reasoning_tokens.unwrap_or_default(),
+                },
+                total_tokens: usage
+                    .total_tokens
+                    .unwrap_or_else(|| usage.input_tokens.saturating_add(usage.output_tokens)),
             }),
         })
     }
@@ -880,6 +887,11 @@ pub fn decision_response_to_system_one(
         usage: response.usage.map(|usage| Usage {
             input_tokens: usage.input_tokens,
             output_tokens: usage.output_tokens,
+            cached_tokens: Some(usage.input_tokens_details.cached_tokens),
+            cache_write_tokens: Some(usage.input_tokens_details.cache_write_tokens),
+            reasoning_tokens: Some(usage.output_tokens_details.reasoning_tokens),
+            // OpenAI always reports a total; a missing one reads as 0 and is left to the sum.
+            total_tokens: Some(usage.total_tokens).filter(|total| *total > 0),
         }),
     })
 }
@@ -985,6 +997,7 @@ mod tests {
                 usage: Some(Usage {
                     input_tokens: 40,
                     output_tokens: 2,
+                    ..Usage::default()
                 }),
             })
             .expect("maps back");
@@ -1146,9 +1159,45 @@ mod tests {
                     "severity": {"type": "score", "score": 0.9, "legend": {"0": "Cosmetic", "1": {"label": "Blocked", "description": "Cannot proceed"}}, "probabilities": {"0": 0.1, "1": 0.9}, "confidence": 0.8},
                     "team": {"type": "refusal"}
                 },
-                "usage": {"input_tokens": 42, "output_tokens": 3}
+                "usage": {"input_tokens": 42, "output_tokens": 3, "cached_tokens": 0, "cache_write_tokens": 0, "reasoning_tokens": 0, "total_tokens": 45}
             })
         );
+    }
+
+    /// The breakdown an `OpenAI` decision model reports reaches a `/v1/decisions` caller
+    /// unchanged, rather than as zeros.
+    #[test]
+    fn openai_usage_details_survive_the_round_trip() {
+        let asked: EvaluateRequest = serde_json::from_value(json!({
+            "model": "luna", "state": "x",
+            "questions": {"a": {"type": "noul", "instructions": "A?"}}
+        }))
+        .expect("request");
+        let usage = json!({
+            "input_tokens": 120,
+            "input_tokens_details": {"cached_tokens": 17, "cache_write_tokens": 3},
+            "output_tokens": 9,
+            "output_tokens_details": {"reasoning_tokens": 6},
+            "total_tokens": 129
+        });
+        let upstream: DecisionResponse = serde_json::from_value(json!({
+            "model": "gpt-6-luna",
+            "answers": [{"type": "predicate", "name": "a", "probability": 0.7}],
+            "usage": usage
+        }))
+        .expect("openai response");
+        let system_one = decision_response_to_system_one(&asked, upstream).expect("reads back");
+
+        let served = request(json!({
+            "model": "luna", "input": "x",
+            "questions": [{"type": "predicate", "name": "a", "instructions": "A?"}]
+        }))
+        .to_system_one()
+        .expect("translates");
+        let mut answered = system_one;
+        answered.answers = BTreeMap::from([("q000".to_string(), Answer::Noul { noul: 0.7 })]);
+        let response = served.decision_response(answered).expect("maps back");
+        assert_eq!(serde_json::to_value(&response.usage).expect("usage"), usage);
     }
 
     #[test]
