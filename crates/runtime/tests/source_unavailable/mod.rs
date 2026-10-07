@@ -592,6 +592,7 @@ mod served_from_acceleration {
 
     use app::AppBuilder;
     use arrow::array::Int64Array;
+    use arrow_tools::metadata_keys::ACCELERATION_PRIMARY_KEY_METADATA_KEY;
     use runtime::{Runtime, status::ComponentStatus};
     use spicepod::{
         acceleration::{Acceleration, Mode, RefreshMode},
@@ -919,7 +920,7 @@ mod served_from_acceleration {
         let spec = || with_declared_columns(fixture.dataset(ReadyState::OnRegistration));
         // Build the acceleration the way a previous run would have. Seeding with the
         // deferred spec itself would not do: under `on_registration` a query is answered
-        // by the source before the acceleration has loaded.
+        // by the source before the acceleration has initial_load_complete.
         seed(source, fixture.dataset(ReadyState::OnLoad)).await?;
         let attempts_before_restart = source.connect_attempts();
 
@@ -1291,7 +1292,7 @@ mod served_from_acceleration {
         assert!(served_from_acceleration(&rt, Duration::from_secs(10)).await);
         let name = datafusion::common::TableReference::bare("orders");
         let now = std::time::SystemTime::now();
-        let old_refresh = now - Duration::from_secs(400 * 24 * 60 * 60);
+        let old_refresh = now - Duration::from_hours(9600);
         rt.status().record_dataset_last_refresh(&name, old_refresh);
         rt.status().clear_dataset_next_refresh(&name);
         let (Some(last_refresh), Some(next_refresh)) = freshness(&rt).await else {
@@ -1513,12 +1514,15 @@ mod served_from_acceleration {
             let rt = Arc::clone(&rt);
             async move { rt.load_components().await }
         });
-        let loaded = wait_until_true(Duration::from_secs(30), || async {
+        let initial_load_complete = wait_until_true(Duration::from_secs(30), || async {
             query_table_sum_and_count(&rt, "child").await.ok() == Some((3, 3))
                 && dataset_status(&rt, "child") == Some(ComponentStatus::Ready)
         })
         .await;
-        anyhow::ensure!(loaded, "the synchronized child initially loads");
+        anyhow::ensure!(
+            initial_load_complete,
+            "the synchronized child initially loads"
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
         source.set_value(2);
         rt.datafusion()
@@ -1566,7 +1570,7 @@ mod served_from_acceleration {
         }
         let (rt, loader) = start(dataset).await;
         let name = datafusion::common::TableReference::bare("orders");
-        let loaded = wait_until_true(Duration::from_secs(30), || async {
+        let initial_load_complete = wait_until_true(Duration::from_secs(30), || async {
             sum_and_count(&rt).await == Some((3, 3))
                 && rt.status().dataset_freshness(&name).last_refresh.is_some()
         })
@@ -1589,7 +1593,10 @@ mod served_from_acceleration {
         }
         let rows = sum_and_count(&rt).await;
         stop(rt, loader).await;
-        assert!(loaded, "the 100 ms schedule refreshes a real acceleration");
+        assert!(
+            initial_load_complete,
+            "the 100 ms schedule refreshes a real acceleration"
+        );
         let (recorded, api) = observation
             .ok_or_else(|| anyhow::anyhow!("a stable scheduled freshness snapshot is available"))?;
         let expected = (
@@ -1704,12 +1711,12 @@ mod served_from_acceleration {
         let served = served_from_acceleration(&rt, Duration::from_secs(10)).await;
         tokio::time::sleep(Duration::from_secs(1)).await;
         let ready_while_source_down = rt.status().is_ready();
-        let reads_while_source_down = source.reads();
+        let source_read_count = source.reads();
         source.bring_up();
         let refreshed = refreshed_from_source(&rt).await;
         let rows = sum_and_count(&rt).await;
         eprintln!(
-            "on-trigger recovery: served={served} ready_while_source_down={ready_while_source_down} source_reads={reads_while_source_down} refreshed={refreshed} rows={rows:?}"
+            "on-trigger recovery: served={served} ready_while_source_down={ready_while_source_down} source_reads={source_read_count} refreshed={refreshed} rows={rows:?}"
         );
         stop(rt, loader).await;
         assert!(
@@ -1925,6 +1932,143 @@ mod served_from_acceleration {
             dataset_status(&rt, "orders")
         );
         stop(rt, loader).await;
+        Ok(())
+    }
+
+    async fn open_checkpoint(
+        rt: &Arc<Runtime>,
+        spec: SpicepodDataset,
+    ) -> Result<Arc<dyn runtime_acceleration::dataset_checkpoint::DatasetCheckpointer>, anyhow::Error>
+    {
+        let app_ref = rt.app();
+        let app = app_ref.read().await;
+        let app = app.as_ref().expect("runtime has its configured app");
+        let dataset = runtime::component::dataset::builder::DatasetBuilder::try_from(spec)?
+            .with_app(Arc::clone(app))
+            .with_runtime(Arc::clone(rt))
+            .build()?;
+        runtime::dataaccelerator::spice_sys::dataset_checkpointer(
+            &dataset,
+            rt.accelerator_engine_registry(),
+            runtime_acceleration::sidecar::OpenOption::OpenExisting,
+            runtime_acceleration::snapshot::SnapshotBehavior::Disabled,
+        )
+        .await
+        .map_err(|error| anyhow::anyhow!("opening checkpoint: {error}"))
+    }
+
+    /// A checkpoint without primary-key metadata waits for its source once, then
+    /// a successful refresh records the key for subsequent source-down starts.
+    #[tokio::test]
+    async fn a_legacy_keyed_checkpoint_is_upgraded_before_serving_without_its_source()
+    -> Result<(), anyhow::Error> {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+        let fixture = Fixture::new("legacy-keyed-checkpoint").await?;
+        fixture.source.report_primary_key();
+        let source = &fixture.source;
+        source.bring_up();
+        let spec = || fixture.dataset(ReadyState::OnLoad);
+        let (rt, loader) = start(spec()).await;
+        assert!(served_from_acceleration(&rt, Duration::from_secs(30)).await);
+
+        let checkpoint = open_checkpoint(&rt, spec()).await?;
+        let recorded = wait_until_true(Duration::from_secs(10), || async {
+            checkpoint.get_schema().await.ok().flatten().is_some()
+        })
+        .await;
+        stop(rt, loader).await;
+        assert!(recorded, "seed refresh must persist its schema checkpoint");
+        let schema = checkpoint
+            .get_schema()
+            .await
+            .map_err(|error| anyhow::anyhow!("reading checkpoint: {error}"))?
+            .expect("seeded checkpoint has a schema");
+        let mut metadata = schema.metadata().clone();
+        assert!(
+            metadata
+                .remove(ACCELERATION_PRIMARY_KEY_METADATA_KEY)
+                .is_some()
+        );
+        let legacy = Arc::new(schema.as_ref().clone().with_metadata(metadata));
+        checkpoint
+            .set_schema(&legacy)
+            .await
+            .map_err(|error| anyhow::anyhow!("writing legacy checkpoint: {error}"))?;
+
+        let persisted_legacy = checkpoint
+            .get_schema()
+            .await
+            .map_err(|error| anyhow::anyhow!("reading legacy checkpoint: {error}"))?
+            .expect("legacy checkpoint has a schema");
+        assert!(
+            !persisted_legacy
+                .metadata()
+                .contains_key(ACCELERATION_PRIMARY_KEY_METADATA_KEY)
+        );
+
+        drop(checkpoint);
+        let attempts = source.connect_attempts();
+        let (rt, loader) = restart_with_source_down(source, spec()).await;
+        let attempted = wait_until_true(Duration::from_secs(10), || async {
+            source.connect_attempts() > attempts
+                && matches!(
+                    dataset_status(&rt, "orders"),
+                    Some(ComponentStatus::Error(_))
+                )
+        })
+        .await;
+        let rows_while_down = sum_and_count(&rt).await;
+        let ready_while_down = rt.status().is_ready();
+        eprintln!(
+            "legacy checkpoint: attempted={attempted} ready={ready_while_down} rows={rows_while_down:?}"
+        );
+        assert!(attempted, "legacy restart must attempt its source");
+        assert!(!ready_while_down, "legacy checkpoint waits for the source");
+        assert_eq!(rows_while_down, None);
+
+        source.bring_up();
+        let refreshed = refreshed_from_source(&rt).await;
+        let checkpoint = open_checkpoint(&rt, spec()).await?;
+        let upgraded = wait_until_true(Duration::from_secs(10), || async {
+            checkpoint
+                .get_schema()
+                .await
+                .ok()
+                .flatten()
+                .is_some_and(|schema| {
+                    schema
+                        .metadata()
+                        .get(ACCELERATION_PRIMARY_KEY_METADATA_KEY)
+                        .is_some_and(|key| key == r#"["id"]"#)
+                })
+        })
+        .await;
+        eprintln!(
+            "legacy upgrade: refreshed={refreshed} upgraded={upgraded} rows={:?} checkpoint={:?}",
+            sum_and_count(&rt).await,
+            checkpoint
+                .get_schema()
+                .await
+                .map(|schema| schema.map(|schema| schema.metadata().clone()))
+        );
+        stop(rt, loader).await;
+        assert!(refreshed, "source recovery must refresh the keyed table");
+        assert!(upgraded, "successful refresh must record the primary key");
+
+        source.take_down();
+        let (rt, loader) = start(spec()).await;
+        let served = wait_until_true(Duration::from_secs(10), || async {
+            sum_and_count(&rt).await == Some((6, 3)) && rt.status().is_ready()
+        })
+        .await;
+        let rows = sum_and_count(&rt).await;
+        eprintln!("upgraded checkpoint: served={served} rows={rows:?}");
+        stop(rt, loader).await;
+        assert!(
+            served,
+            "upgraded checkpoint serves while its source is down"
+        );
+        assert_eq!(rows, Some((6, 3)));
         Ok(())
     }
 }
