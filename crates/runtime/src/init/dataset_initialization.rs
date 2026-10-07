@@ -217,14 +217,21 @@ impl DatasetInitialization {
             }
 
             (ConnectorSource::Lazy(builder), SchemaSource::Known { schema }) => {
-                let connector = match builder().await {
-                    Ok(connector) => connector,
-                    Err(source) => {
-                        return Err(report_deferred_failure(
-                            &runtime,
-                            &dataset,
-                            RuntimeError::UnableToInitializeDataConnector { source },
-                        ));
+                // A deferred dataset whose existing acceleration can serve it answers
+                // its first query from that acceleration rather than connecting to the
+                // source first; the source is connected in the background.
+                let connector = if Runtime::serves_existing_acceleration(&dataset).await {
+                    Runtime::reconnecting_connector(&dataset)
+                } else {
+                    match builder().await {
+                        Ok(connector) => connector,
+                        Err(source) => {
+                            return Err(report_deferred_failure(
+                                &runtime,
+                                &dataset,
+                                RuntimeError::UnableToInitializeDataConnector { source },
+                            ));
+                        }
                     }
                 };
 
