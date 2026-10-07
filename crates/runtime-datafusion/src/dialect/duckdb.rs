@@ -591,6 +591,89 @@ pub(crate) fn encode_to_lowercase_hex(
     }
 }
 
+/// The order-sensitive aggregates [`ordered_aggregate_to_sql`] renders, as
+/// `DataFusion` names them, with the `DuckDB` aggregate each one becomes.
+///
+/// `DuckDB`'s `first_value` and `last_value` are window functions only. Its `first`
+/// and `last` aggregates return the first and last value in the order given, null
+/// or not, which is `DataFusion`'s default (`RESPECT NULLS`) answer.
+const ORDERED_AGGREGATES: &[(&str, &str)] = &[
+    ("string_agg", "string_agg"),
+    ("array_agg", "array_agg"),
+    ("first_value", "first"),
+    ("last_value", "last"),
+];
+
+/// Whether [`ordered_aggregate_to_sql`] renders the argument-list `ORDER BY` of the
+/// aggregate `DataFusion` calls `name`.
+pub(crate) fn renders_aggregate_order_by(name: &str) -> bool {
+    ORDERED_AGGREGATES
+        .iter()
+        .any(|(datafusion_name, _)| *datafusion_name == name)
+}
+
+/// Renders an aggregate's argument-list `ORDER BY` inside the `DuckDB` call.
+///
+/// The unparser renders an aggregate `ORDER BY` only as `WITHIN GROUP` and drops
+/// every other one, so `array_agg(x ORDER BY y)` reaches `DuckDB` as `array_agg(x)`
+/// and comes back in whatever order `DuckDB` produced. `DuckDB` takes the ordering
+/// inside the call, as `DataFusion` does, so these aggregates keep both their
+/// pushdown and their order. Any other aggregate, or one without an `ORDER BY`, is
+/// `Ok(None)` and keeps the default rendering; `duckdb_can_translate_aggregate`
+/// does not federate a default rendering that would drop an ordering.
+pub(crate) fn ordered_aggregate_to_sql(
+    unparser: &datafusion::sql::unparser::Unparser,
+    func_name: &str,
+    args: &[Expr],
+    distinct: bool,
+    filter: Option<&Expr>,
+    order_by: &[datafusion::logical_expr::SortExpr],
+) -> Result<Option<ast::Expr>, DataFusionError> {
+    let Some((_, duckdb_name)) = ORDERED_AGGREGATES
+        .iter()
+        .find(|(datafusion_name, _)| *datafusion_name == func_name)
+    else {
+        return Ok(None);
+    };
+    if order_by.is_empty() {
+        return Ok(None);
+    }
+
+    let args: Vec<FunctionArg> = args
+        .iter()
+        .map(|arg| {
+            Ok::<FunctionArg, DataFusionError>(FunctionArg::Unnamed(FunctionArgExpr::Expr(
+                unparser.expr_to_sql(arg)?,
+            )))
+        })
+        .try_collect()?;
+    let order_by: Vec<ast::OrderByExpr> = order_by
+        .iter()
+        .map(|sort| unparser.sort_to_sql(sort))
+        .try_collect()?;
+    let filter = filter
+        .map(|predicate| unparser.expr_to_sql(predicate))
+        .transpose()?
+        .map(Box::new);
+
+    Ok(Some(ast::Expr::Function(Function {
+        name: ObjectName(vec![ast::ObjectNamePart::Identifier(Ident::new(
+            *duckdb_name,
+        ))]),
+        args: ast::FunctionArguments::List(ast::FunctionArgumentList {
+            duplicate_treatment: distinct.then_some(ast::DuplicateTreatment::Distinct),
+            args,
+            clauses: vec![ast::FunctionArgumentClause::OrderBy(order_by)],
+        }),
+        filter,
+        null_treatment: None,
+        over: None,
+        within_group: vec![],
+        parameters: ast::FunctionArguments::None,
+        uses_odbc_syntax: false,
+    })))
+}
+
 /// Whether `encoding` is the string literal `hex`.
 ///
 /// `DataFusion` matches the format case-sensitively (`"hex"` only), so a
@@ -1559,6 +1642,62 @@ mod tests {
                 "unexpected error: {error}"
             );
         }
+    }
+
+    /// `DuckDB` takes an aggregate `ORDER BY` inside the call, as `DataFusion` does,
+    /// and the default rendering drops it. Through the whole dialect, so a rendering
+    /// that is written but never installed fails here: each call keeps its ordering,
+    /// `DISTINCT` and `FILTER`, and `first_value`/`last_value` take `DuckDB`'s
+    /// aggregate names.
+    #[test]
+    fn ordered_aggregates_render_their_order_by_inside_the_duckdb_call() {
+        use datafusion::functions_aggregate::expr_fn::{array_agg, first_value, last_value};
+        use datafusion::functions_aggregate::string_agg::string_agg;
+        use datafusion::logical_expr::ExprFunctionExt as _;
+
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let cases = [
+            (
+                string_agg(col("t.s"), lit("|"))
+                    .distinct()
+                    .order_by(vec![col("t.s").sort(true, false)])
+                    .build()
+                    .expect("ordered distinct string_agg"),
+                r#"string_agg(DISTINCT "t"."s", '|' ORDER BY "t"."s" ASC NULLS LAST)"#,
+            ),
+            (
+                array_agg(col("t.i"))
+                    .order_by(vec![col("t.i").sort(false, true)])
+                    .filter(col("t.i").gt(lit(1)))
+                    .build()
+                    .expect("ordered filtered array_agg"),
+                r#"array_agg("t"."i" ORDER BY "t"."i" DESC NULLS FIRST) FILTER (WHERE ("t"."i" > 1))"#,
+            ),
+            (
+                first_value(col("t.s"), vec![col("t.i").sort(true, false)]),
+                r#"first("t"."s" ORDER BY "t"."i" ASC NULLS LAST)"#,
+            ),
+            (
+                last_value(col("t.s"), vec![col("t.i").sort(false, true)]),
+                r#"last("t"."s" ORDER BY "t"."i" DESC NULLS FIRST)"#,
+            ),
+        ];
+        for (call, expected) in cases {
+            let rendered = unparser
+                .expr_to_sql(&call)
+                .expect("an ordered aggregate unparses for DuckDB");
+            assert_eq!(rendered.to_string(), expected, "rendering of {call}");
+        }
+
+        assert_eq!(
+            unparser
+                .expr_to_sql(&array_agg(col("t.i")))
+                .expect("array_agg unparses for DuckDB")
+                .to_string(),
+            r#"array_agg("t"."i")"#,
+            "an aggregate without an ORDER BY keeps the default rendering"
+        );
     }
 
     /// The whole `encode(sha256(x), 'hex')` call, so a handler that is written

@@ -1207,22 +1207,32 @@ mod tests {
         datafusion::functions_aggregate::string_agg::string_agg(col("s"), lit("|"))
     }
 
-    /// An aggregate `ORDER BY` other than a `WITHIN GROUP` is unparsed without
-    /// the `ORDER BY`, so `string_agg`, `array_agg`, `first_value` and
-    /// `last_value` with one stay local on both `DuckDB` accessors. An unordered
-    /// `string_agg` and `percentile_cont`'s `WITHIN GROUP` still federate.
-    /// `approx_distinct` has no `DuckDB` name and stays local.
+    /// An aggregate `ORDER BY` federates to `DuckDB` only where the dialect renders
+    /// it: `string_agg`, `array_agg`, `first_value` and `last_value` take it inside
+    /// the call, and `percentile_cont` as `WITHIN GROUP`. Any other ordered aggregate
+    /// would lose its ordering in the unparser, and `IGNORE NULLS` is never rendered,
+    /// so both stay local on both `DuckDB` accessors. `approx_distinct` has no
+    /// `DuckDB` name and stays local.
     #[test]
-    fn duckdb_keeps_ordered_aggregates_and_approx_distinct_local() {
+    fn duckdb_federates_the_ordered_aggregates_it_renders_and_keeps_the_rest_local() {
         use datafusion::functions_aggregate::approx_distinct::approx_distinct_udaf;
         use datafusion::functions_aggregate::expr_fn::{
-            approx_distinct, array_agg, first_value, last_value, percentile_cont,
+            approx_distinct, array_agg, first_value, last_value, percentile_cont, sum,
         };
         use datafusion::logical_expr::ExprFunctionExt as _;
+        use datafusion::logical_expr::expr::NullTreatment;
         let ordered_array_agg = array_agg(col("s"))
             .order_by(vec![col("s").sort(true, true)])
             .build()
             .expect("ordered array_agg");
+        let ordered_sum = sum(col("i"))
+            .order_by(vec![col("i").sort(true, true)])
+            .build()
+            .expect("ordered sum");
+        let first_value_ignoring_nulls = first_value(col("s"), vec![col("i").sort(true, true)])
+            .null_treatment(NullTreatment::IgnoreNulls)
+            .build()
+            .expect("first_value IGNORE NULLS");
         for (route, support) in [
             ("duckdb", deny_spice_functions_for_duckdb_table_providers()),
             (
@@ -1230,24 +1240,25 @@ mod tests {
                 deny_spice_functions_for_duckdb_dialect_without_carve_out(),
             ),
         ] {
-            for ordered in [
+            for rendered in [
                 ordered_string_agg(),
                 ordered_array_agg.clone(),
                 first_value(col("s"), vec![col("s").sort(true, true)]),
                 last_value(col("s"), vec![col("i").sort(false, true)]),
+                percentile_cont(col("i").sort(true, false), lit(0.5)),
+                unordered_string_agg(),
             ] {
                 assert!(
-                    !pushes(&plan_text_aggregating(ordered.clone()), &support),
-                    "{ordered} must stay local on {route}: the unparser drops its ORDER BY"
+                    pushes(&plan_text_aggregating(rendered.clone()), &support),
+                    "{rendered} renders its ordering for DuckDB and must keep its {route} pushdown"
                 );
             }
-            assert!(
-                pushes(
-                    &plan_text_aggregating(percentile_cont(col("i").sort(true, false), lit(0.5))),
-                    &support
-                ),
-                "percentile_cont's WITHIN GROUP survives the unparser and must keep its {route} pushdown"
-            );
+            for dropped in [ordered_sum.clone(), first_value_ignoring_nulls.clone()] {
+                assert!(
+                    !pushes(&plan_text_aggregating(dropped.clone()), &support),
+                    "{dropped} would lose its ordering or IGNORE NULLS and must stay local on {route}"
+                );
+            }
             assert!(
                 !pushes(&plan_aggregating(approx_distinct(col("i"))), &support),
                 "approx_distinct must stay local on {route}"
@@ -1255,10 +1266,6 @@ mod tests {
             assert!(
                 !pushes(&plan_windowing(approx_distinct_udaf(), "i"), &support),
                 "a windowed approx_distinct must stay local on {route}"
-            );
-            assert!(
-                pushes(&plan_text_aggregating(unordered_string_agg()), &support),
-                "an unordered string_agg must keep its {route} pushdown"
             );
         }
     }

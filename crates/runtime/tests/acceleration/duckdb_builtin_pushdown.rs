@@ -1457,13 +1457,15 @@ fn write_string_agg_source(path: &Path) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-/// An aggregate `ORDER BY` other than a `WITHIN GROUP` is not pushed into
-/// `DuckDB`: the unparser drops it, so a federated `string_agg` or `array_agg`
-/// answered in `DuckDB`'s own order (`[carol, alice, dave]`), and
-/// `first_value`/`last_value` reached `DuckDB` as functions it does not have.
-/// Each query must still succeed locally and match the unaccelerated engine.
+/// `DuckDB` takes an aggregate `ORDER BY` inside the call. The unparser drops it,
+/// so a federated `string_agg` or `array_agg` answered in `DuckDB`'s own order
+/// (`[carol, alice, dave]`) and `first_value`/`last_value` reached `DuckDB` as
+/// functions it does not have. The dialect now renders the ordering inside the
+/// call (`first`/`last` for those two), so each is pushed down with its ordering and
+/// agrees with the unaccelerated engine. An ordered aggregate it does not render,
+/// `nth_value`, stays local and agrees too.
 #[tokio::test]
-async fn duckdb_accelerated_ordered_aggregates_stay_local_and_agree() -> Result<(), anyhow::Error> {
+async fn duckdb_accelerated_ordered_aggregates_push_down_and_agree() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
     register_test_connectors().await;
 
@@ -1483,27 +1485,15 @@ async fn duckdb_accelerated_ordered_aggregates_stay_local_and_agree() -> Result<
             let rt = Arc::new(Runtime::builder().with_app(app).build().await);
             load_runtime_datasets(&rt, LOAD_TIMEOUT).await?;
 
-            // Control: the same aggregate without an `ORDER BY` is still sent
-            // to DuckDB, so the negative assertions below are not vacuous.
-            let control = to_pretty_display(
-                &run_query(
-                    &rt,
-                    "EXPLAIN SELECT string_agg(customer, '|') AS customers \
-                     FROM accelerated WHERE region = 'eu'",
-                )
-                .await?,
-            )?
-            .to_string();
-            assert!(
-                pushed_down_sql(&control).contains("string_agg("),
-                "an unordered string_agg must still be sent to DuckDB; plan was:\n{control}"
-            );
-
-            let cases: [(&str, &[&str], &[&str]); 3] = [
+            // (query, SQL the federated scan must contain, SQL it must not contain, rows)
+            let cases: [(&str, &[&str], &[&str], &[&str]); 4] = [
                 (
                     "SELECT string_agg(DISTINCT customer, '|' ORDER BY customer) AS customers \
                      FROM {table} WHERE region = 'eu'",
-                    &["string_agg"],
+                    &[
+                        r#"string_agg(DISTINCT "accelerated"."customer", '|' ORDER BY "accelerated"."customer""#,
+                    ],
+                    &[],
                     &[
                         "+------------------+",
                         "| customers        |",
@@ -1515,7 +1505,8 @@ async fn duckdb_accelerated_ordered_aggregates_stay_local_and_agree() -> Result<
                 (
                     "SELECT array_agg(customer ORDER BY customer) AS customers \
                      FROM {table} WHERE region = 'eu'",
-                    &["array_agg"],
+                    &[r#"array_agg("accelerated"."customer" ORDER BY "accelerated"."customer""#],
+                    &[],
                     &[
                         "+----------------------+",
                         "| customers            |",
@@ -1528,6 +1519,10 @@ async fn duckdb_accelerated_ordered_aggregates_stay_local_and_agree() -> Result<
                     "SELECT first_value(customer ORDER BY customer) AS f, \
                      last_value(customer ORDER BY id DESC) AS l \
                      FROM {table} WHERE region = 'eu'",
+                    &[
+                        r#"first("accelerated"."customer" ORDER BY "accelerated"."customer""#,
+                        r#"last("accelerated"."customer" ORDER BY "accelerated"."id" DESC"#,
+                    ],
                     &["first_value", "last_value"],
                     &[
                         "+-------+-------+",
@@ -1537,9 +1532,16 @@ async fn duckdb_accelerated_ordered_aggregates_stay_local_and_agree() -> Result<
                         "+-------+-------+",
                     ],
                 ),
+                (
+                    "SELECT nth_value(customer, 2 ORDER BY customer) AS n \
+                     FROM {table} WHERE region = 'eu'",
+                    &[],
+                    &["nth_value"],
+                    &["+-------+", "| n     |", "+-------+", "| carol |", "+-------+"],
+                ),
             ];
 
-            for (query, functions, expected) in cases {
+            for (query, pushed, kept_local, expected) in cases {
                 let plan = to_pretty_display(
                     &run_query(
                         &rt,
@@ -1549,10 +1551,20 @@ async fn duckdb_accelerated_ordered_aggregates_stay_local_and_agree() -> Result<
                 )?
                 .to_string();
                 let remote_sql = pushed_down_sql(&plan);
-                for function in functions {
+                assert!(
+                    !remote_sql.is_empty(),
+                    "the scan under `{query}` must still be federated to DuckDB; plan was:\n{plan}"
+                );
+                for rendering in pushed {
+                    assert!(
+                        remote_sql.contains(rendering),
+                        "`{query}` must reach DuckDB as {rendering}; the SQL sent was:\n{remote_sql}"
+                    );
+                }
+                for function in kept_local {
                     assert!(
                         !remote_sql.contains(function),
-                        "an ordered {function} must not be sent to DuckDB; plan was:\n{plan}"
+                        "{function} must not be sent to DuckDB; the SQL sent was:\n{remote_sql}"
                     );
                 }
 

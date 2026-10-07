@@ -19,7 +19,9 @@ use std::sync::{Arc, LazyLock};
 use arrow_schema::DataType;
 use datafusion::common::DFSchema;
 use datafusion::logical_expr::ExprSchemable as _;
-use datafusion::logical_expr::expr::{AggregateFunction, ScalarFunction, WindowFunction};
+use datafusion::logical_expr::expr::{
+    AggregateFunction, NullTreatment, ScalarFunction, WindowFunction,
+};
 use datafusion::logical_expr::{Cast, Expr, TryCast};
 use datafusion::sql::unparser::Unparser;
 use datafusion::sql::unparser::dialect::{Dialect, DuckDBDialect, ScalarFnToSqlHandler};
@@ -29,6 +31,7 @@ use runtime_datafusion_udfs::inner_product::INNER_PRODUCT_UDF_NAME;
 
 mod bigquery;
 mod duckdb;
+mod duckdb_dialect;
 mod re2;
 
 pub use bigquery::SpiceBigQueryDialect;
@@ -176,15 +179,19 @@ pub fn duckdb_native_function_names() -> Vec<&'static str> {
 }
 
 /// Creates a new instance of the `DuckDB` dialect with support for Spice
-/// internal UDFs ([`duckdb_scalar_overrides`]) and for the `DataFusion`
-/// built-ins `DuckDB` spells differently ([`duckdb_builtin_scalar_overrides`]).
+/// internal UDFs ([`duckdb_scalar_overrides`]), for the `DataFusion` built-ins
+/// `DuckDB` spells differently ([`duckdb_builtin_scalar_overrides`]), and for the
+/// ordered aggregates whose `ORDER BY` `DuckDB` takes inside the call
+/// ([`duckdb::ordered_aggregate_to_sql`]).
 #[must_use]
 pub fn new_duckdb_dialect() -> Arc<dyn Dialect> {
     let overrides = duckdb_scalar_overrides()
         .into_iter()
         .chain(duckdb_builtin_scalar_overrides())
         .collect();
-    let dialect = DuckDBDialect::new().with_custom_scalar_overrides(overrides);
+    let dialect = duckdb_dialect::SpiceDuckDBDialect::new(
+        DuckDBDialect::new().with_custom_scalar_overrides(overrides),
+    );
 
     Arc::new(dialect) as Arc<dyn Dialect>
 }
@@ -242,23 +249,31 @@ pub fn duckdb_can_translate(call: &ScalarFunction, scope: Option<&DFSchema>) -> 
 
 /// Whether this aggregate call can be handed to `DuckDB`.
 ///
-/// An aggregate `ORDER BY` is refused unless the function takes it as
-/// `WITHIN GROUP`. The unparser renders a `WITHIN GROUP` ordering and drops
-/// every other aggregate `ORDER BY`, so a federated
-/// `string_agg(DISTINCT x, '|' ORDER BY x)` or `array_agg(x ORDER BY y)` comes
-/// back in whatever order `DuckDB` produced, and a memory accelerator and a
-/// file accelerator can disagree with each other. An aggregate without an
-/// `ORDER BY` is unaffected.
+/// An aggregate `ORDER BY` federates only where it reaches `DuckDB`: as
+/// `WITHIN GROUP`, which the unparser renders, or inside the call for the
+/// aggregates [`duckdb::ordered_aggregate_to_sql`] renders (`string_agg`,
+/// `array_agg`, `first_value`, `last_value`). The unparser drops every other
+/// aggregate `ORDER BY`, so the call would come back in whatever order `DuckDB`
+/// produced, and a memory accelerator and a file accelerator could disagree with
+/// each other. An aggregate without an `ORDER BY` is unaffected.
+///
+/// `IGNORE NULLS` is refused because the unparser never renders it, so the call
+/// would reach `DuckDB` respecting nulls.
 ///
 /// `approx_distinct` is refused because `DuckDB` has no function of that name
 /// (`approx_count_distinct` is a different `HyperLogLog`). Mapping the two would
 /// change the number; evaluating locally matches the unaccelerated engine.
 #[must_use]
 pub fn duckdb_can_translate_aggregate(call: &AggregateFunction) -> bool {
-    if call.func.name().eq_ignore_ascii_case("approx_distinct") {
+    let name = call.func.name();
+    if name.eq_ignore_ascii_case("approx_distinct")
+        || matches!(call.params.null_treatment, Some(NullTreatment::IgnoreNulls))
+    {
         return false;
     }
-    call.params.order_by.is_empty() || call.func.supports_within_group_clause()
+    call.params.order_by.is_empty()
+        || call.func.supports_within_group_clause()
+        || duckdb::renders_aggregate_order_by(name)
 }
 
 /// Whether this window call can be handed to `DuckDB`.
