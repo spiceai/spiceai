@@ -40,6 +40,7 @@ dependencies = [
  "itertools 0.14.0",
  "linkme",
  "object_store 0.13.2",
+ "object_store_spawn",
  "opentelemetry",
  "parking_lot",
  "paste",
@@ -1799,6 +1800,7 @@ dependencies = [
  "iceberg",
  "iceberg-storage-opendal",
  "object_store 0.13.2",
+ "object_store_spawn",
  "reqsign-core",
  "reqwest 0.13.4",
  "secrecy",
@@ -4801,6 +4803,7 @@ dependencies = [
  "tracing",
  "url",
  "util",
+ "wiremock",
  "zip 8.6.0",
 ]
 
@@ -10016,9 +10019,9 @@ dependencies = [
 
 [[package]]
 name = "hickory-net"
-version = "0.26.1"
+version = "0.26.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e2295ed2f9c31e471e1428a8f88a3f0e1f4b27c15049592138d1eebe9c35b183"
+checksum = "084e7bd6a377435d568f652153e571b50970d7ccc1d1eeec0519f834632287e1"
 dependencies = [
  "async-trait",
  "cfg-if",
@@ -10040,9 +10043,9 @@ dependencies = [
 
 [[package]]
 name = "hickory-proto"
-version = "0.26.1"
+version = "0.26.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0bab31817bfb44672a252e97fe81cd0c18d1b2cf892108922f6818820df8c643"
+checksum = "7e2da0694c15b44c6f68a6b05e0233617008c54080e31d6eb848d858a9c5b38d"
 dependencies = [
  "data-encoding",
  "idna",
@@ -10060,9 +10063,9 @@ dependencies = [
 
 [[package]]
 name = "hickory-resolver"
-version = "0.26.1"
+version = "0.26.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f0d58d28879ceecde6607729660c2667a081ccdc082e082675042793960f178c"
+checksum = "0e4f9f4603319422d482738f3f6fe5aac03157fdbfed1cd85a3ff45adb09072f"
 dependencies = [
  "cfg-if",
  "futures-util",
@@ -14054,6 +14057,18 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid 1.23.2",
+]
+
+[[package]]
+name = "object_store_spawn"
+version = "2.4.0-unstable"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "http-body 1.0.1",
+ "object_store 0.13.2",
+ "snafu",
+ "tokio",
 ]
 
 [[package]]
@@ -18135,6 +18150,7 @@ dependencies = [
  "libnfs",
  "nix 0.30.1",
  "object_store 0.13.2",
+ "object_store_spawn",
  "reqwest 0.13.4",
  "serde",
  "serde_json",
@@ -18221,16 +18237,19 @@ dependencies = [
 name = "runtime-rate-control"
 version = "2.4.0-unstable"
 dependencies = [
+ "async-trait",
  "futures",
  "governor",
  "object_store 0.13.2",
  "object_store_occ",
  "rand 0.10.1",
  "serde",
+ "serde_json",
  "snafu",
  "tempfile",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

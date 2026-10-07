@@ -60,6 +60,7 @@ zip = "8.3.0"
 runtime = { path = "../../runtime" }
 runtime-secrets = { path = "../../runtime-secrets", default-features = false }
 spicepod = { path = "../../spicepod" }
+wiremock = "0.6"
 
 [features]
 default = []
