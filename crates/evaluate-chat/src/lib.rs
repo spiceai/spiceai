@@ -46,8 +46,8 @@ use async_openai::error::OpenAIError;
 use async_openai::types::chat::{
     ChatCompletionRequestAssistantMessage, ChatCompletionRequestMessage,
     ChatCompletionRequestSystemMessage, ChatCompletionRequestUserMessage,
-    CreateChatCompletionRequest, CreateChatCompletionResponse, FinishReason, ResponseFormat,
-    ResponseFormatJsonSchema,
+    CreateChatCompletionRequest, CreateChatCompletionResponse, FinishReason, ReasoningEffort,
+    ResponseFormat, ResponseFormatJsonSchema,
 };
 use async_trait::async_trait;
 use chat_api::Chat;
@@ -234,7 +234,10 @@ impl Evaluate for ChatEvaluator {
     async fn evaluate(&self, request: EvaluateRequest) -> Result<EvaluateResponse> {
         self.ensure_answerable(&request)?;
         let EvaluateRequest {
-            state, questions, ..
+            state,
+            questions,
+            reasoning_effort,
+            ..
         } = request;
         let ChatEvaluatorOptions {
             answer_mode,
@@ -277,16 +280,20 @@ impl Evaluate for ChatEvaluator {
         let mut corrective_retries = 0;
         loop {
             let _permit = self.rate_permit().await?;
+            let mut completion = CreateChatCompletionRequest {
+                model: self.name.clone(),
+                messages: messages.clone(),
+                // Always set, so a `response_format` default configured on the chat
+                // model cannot replace the one this evaluation needs.
+                response_format: Some(response_format.clone()),
+                ..Default::default()
+            };
+            if let Some(effort) = reasoning_effort {
+                completion.reasoning_effort = Some(chat_reasoning_effort(effort));
+            }
             let response = self
                 .chat
-                .chat_request(CreateChatCompletionRequest {
-                    model: self.name.clone(),
-                    messages: messages.clone(),
-                    // Always set, so a `response_format` default configured on the chat
-                    // model cannot replace the one this evaluation needs.
-                    response_format: Some(response_format.clone()),
-                    ..Default::default()
-                })
+                .chat_request(completion)
                 .await
                 .map_err(|e| chat_error(&self.name, e))?;
             usage = match (usage, response.usage.as_ref()) {
@@ -398,6 +405,17 @@ fn chat_error(model: &str, error: OpenAIError) -> Error {
             model,
             source: Box::new(other),
         },
+    }
+}
+
+fn chat_reasoning_effort(effort: evaluate_api::ReasoningEffort) -> ReasoningEffort {
+    match effort {
+        evaluate_api::ReasoningEffort::None => ReasoningEffort::None,
+        evaluate_api::ReasoningEffort::Minimal => ReasoningEffort::Minimal,
+        evaluate_api::ReasoningEffort::Low => ReasoningEffort::Low,
+        evaluate_api::ReasoningEffort::Medium => ReasoningEffort::Medium,
+        evaluate_api::ReasoningEffort::High => ReasoningEffort::High,
+        evaluate_api::ReasoningEffort::Xhigh => ReasoningEffort::Xhigh,
     }
 }
 
@@ -514,6 +532,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sends_reasoning_effort_when_the_request_sets_one() {
+        let chat = ScriptedChat::new([Ok(reply(&valid_answers()))]);
+        let evaluator = evaluator(&chat);
+        let mut request = request();
+        request.reasoning_effort = Some(evaluate_api::ReasoningEffort::Low);
+
+        evaluator.evaluate(request).await.expect("evaluation");
+
+        let sent = chat
+            .requests()
+            .into_iter()
+            .next()
+            .expect("one request");
+        assert_eq!(sent.reasoning_effort, Some(ReasoningEffort::Low));
+    }
+
+    #[tokio::test]
     async fn answers_every_question_from_one_reply() {
         let chat = ScriptedChat::new([Ok(reply(&valid_answers()))]);
         let evaluator = evaluator(&chat);
@@ -554,6 +589,10 @@ mod tests {
         assert!(
             sent.tools.is_none(),
             "an evaluation offers the model no tools"
+        );
+        assert!(
+            sent.reasoning_effort.is_none(),
+            "an unset effort stays unset so the model setting applies"
         );
         let [system, document] = sent.messages.as_slice() else {
             panic!(
