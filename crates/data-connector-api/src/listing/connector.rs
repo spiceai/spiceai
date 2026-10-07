@@ -4439,6 +4439,115 @@ mod tests {
         );
     }
 
+    /// The `_location` fast path in `scan` applies only `_location` and
+    /// `_last_modified`, so every other predicate in the same query must stay a
+    /// residual filter. The inner listing reports a partition predicate `Exact`,
+    /// which would otherwise drop it from the plan and return rows the query
+    /// excluded; `_size` and data-column predicates are covered here too so the
+    /// guard still holds if the inner listing starts reporting them `Exact`.
+    #[tokio::test]
+    async fn location_fast_path_keeps_other_predicates_as_residual_filters() {
+        use datafusion::parquet::arrow::ArrowWriter;
+        use tempfile::TempDir;
+
+        let temp_dir = TempDir::new().expect("create temp dir");
+        let partition_dir = temp_dir.path().join("day=2025-01-01");
+        std::fs::create_dir_all(&partition_dir).expect("create partition dir");
+
+        let file_schema = Arc::new(Schema::new(vec![Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            true,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&file_schema),
+            vec![Arc::new(arrow::array::Int64Array::from(vec![1, 2, 3]))],
+        )
+        .expect("create batch");
+        let parquet_path = partition_dir.join("data.parquet");
+        let file = std::fs::File::create(&parquet_path).expect("create parquet file");
+        let mut writer =
+            ArrowWriter::try_new(file, Arc::clone(&file_schema), None).expect("create writer");
+        writer.write(&batch).expect("write batch");
+        writer.close().expect("close writer");
+        let file_size = std::fs::metadata(&parquet_path)
+            .expect("parquet file metadata")
+            .len();
+
+        let ctx = SessionContext::new();
+        // `Url::from_directory_path` spells the file URL the way the running
+        // platform needs (`file:///tmp/x/` on Unix, `file:///C:/...` on Windows);
+        // formatting the path by hand yields `file://C:/...`, whose `C:` parses
+        // as the URL host, so the listing matches nothing.
+        let store_url = Url::from_directory_path(temp_dir.path()).expect("directory url");
+        let table_url = store_url.to_string();
+        let table_path = ListingTableUrl::parse(&table_url).expect("parse listing url");
+        ctx.runtime_env().register_object_store(
+            &store_url,
+            Arc::new(object_store::local::LocalFileSystem::new()),
+        );
+
+        // The object path is absolute, so `_location` is the store root plus it.
+        let options = ListingOptions::new(Arc::new(ParquetFormat::default()))
+            .with_file_extension(".parquet")
+            .with_table_partition_cols(vec![("day".to_string(), arrow_schema::DataType::Utf8)])
+            .with_metadata_cols(vec![
+                datafusion_datasource::metadata::MetadataColumn::Location(Some("file:///".into())),
+                datafusion_datasource::metadata::MetadataColumn::Size,
+            ]);
+        let listing = ListingTable::try_new(
+            ListingTableConfig::new(table_path.clone())
+                .with_listing_options(options)
+                .with_schema(Arc::clone(&file_schema)),
+        )
+        .expect("create listing table");
+        let provider = LocationPruningListingTable::new(
+            Arc::new(listing),
+            ctx.runtime_env()
+                .object_store(&table_path)
+                .expect("object store"),
+            table_path,
+            file_schema,
+            ".parquet",
+        );
+        ctx.register_table("t", Arc::new(provider))
+            .expect("register table");
+
+        let location = Url::from_file_path(&parquet_path)
+            .expect("file url")
+            .to_string();
+        let count = async |predicate: String| -> usize {
+            let sql = format!("SELECT id FROM t WHERE _location = '{location}' AND {predicate}");
+            ctx.sql(&sql)
+                .await
+                .expect("plan query")
+                .collect()
+                .await
+                .expect("collect query")
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum()
+        };
+
+        assert_eq!(count(format!("_size = {file_size}")).await, 3);
+        assert_eq!(
+            count(format!("_size = {}", file_size + 1)).await,
+            0,
+            "a `_size` predicate the file does not satisfy must remove its rows"
+        );
+        assert_eq!(count("day = '2025-01-01'".to_string()).await, 3);
+        assert_eq!(
+            count("day = '2099-12-31'".to_string()).await,
+            0,
+            "a partition predicate the file does not satisfy must remove its rows"
+        );
+        assert_eq!(
+            count("id > 1".to_string()).await,
+            2,
+            "a data-column predicate must still filter rows"
+        );
+    }
+
     #[tokio::test]
     async fn test_listing_table_metadata_columns_are_applied() {
         let mut dataset = DatasetSpec::new("s3://bucket/prefix/", TableReference::bare("test"));
