@@ -167,6 +167,10 @@ fn pushed_down_sql(plan: &str) -> String {
         .join("\n")
 }
 
+/// A query, the SQL its federated scan must contain, the SQL it must not
+/// contain, and the rows it returns.
+type PushdownCase<'a> = (&'a str, &'a [&'a str], &'a [&'a str], &'a [&'a str]);
+
 fn duckdb_accelerated(from: &str, name: &str) -> Dataset {
     let mut dataset = Dataset::new(from, name);
     dataset.params = Some(Params::from_string_map(
@@ -1492,8 +1496,7 @@ async fn duckdb_accelerated_ordered_aggregates_push_down_and_agree() -> Result<(
             let rt = Arc::new(Runtime::builder().with_app(app).build().await);
             load_runtime_datasets(&rt, LOAD_TIMEOUT).await?;
 
-            // (query, SQL the federated scan must contain, SQL it must not contain, rows)
-            let cases: [(&str, &[&str], &[&str], &[&str]); 4] = [
+            let cases: [PushdownCase; 4] = [
                 (
                     "SELECT string_agg(DISTINCT customer, '|' ORDER BY customer) AS customers \
                      FROM {table} WHERE region = 'eu'",
