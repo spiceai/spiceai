@@ -117,6 +117,22 @@ mod test {
             "CAST(timestamp AS Timestamp(ns)) > TimestampNanosecond(1620000000000000000, None)",
         );
         test(
+            Field::new(
+                "timestamp",
+                DataType::Timestamp(TimeUnit::Second, None),
+                false,
+            ),
+            TimeFormat::ISO8601,
+            1_620_000_000_000_000_000,
+            "CAST(timestamp AS Timestamp(ns)) > TimestampNanosecond(1620000000000000000, None)",
+        );
+        test(
+            Field::new("timestamp", DataType::Date32, false),
+            TimeFormat::ISO8601,
+            1_620_000_000_000_000_000,
+            "CAST(timestamp AS Timestamp(ns)) > TimestampNanosecond(1620000000000000000, None)",
+        );
+        test(
             Field::new("timestamp", DataType::Utf8, false),
             TimeFormat::UnixSeconds,
             1_620_000_000_000_000_000,
