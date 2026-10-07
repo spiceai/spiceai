@@ -28,6 +28,7 @@ use datafusion::physical_plan::{DisplayAs, DisplayFormatType, SendableRecordBatc
 use datafusion_common::Result as DFResult;
 use datafusion_execution::TaskContext;
 use datafusion_expr::dml::InsertOp;
+use datafusion_table_providers::util::retriable_error::check_and_mark_retriable_error;
 use futures::StreamExt;
 
 use runtime_datafusion::extension::request_context::resolve_request_context;
@@ -144,15 +145,19 @@ impl DataSink for CayenneDataSink {
         context: &Arc<TaskContext>,
     ) -> DFResult<u64> {
         // Normalize incoming batches to the table schema (e.g. CDC nullability mismatches)
-        // causing Vortex assertion failures.
+        // causing Vortex assertion failures. An error from the input stream is the source
+        // failing mid-read, so it is marked retriable for the refresh to retry, as the
+        // other accelerators' sinks do.
         let target_schema = Arc::clone(&self.schema);
         let normalized = Box::pin(RecordBatchStreamAdapter::new(
             Arc::clone(&target_schema),
             data.map(move |batch_result| {
-                batch_result.and_then(|batch| {
-                    arrow_tools::record_batch::try_cast_to(batch, Arc::clone(&target_schema))
-                        .map_err(Into::into)
-                })
+                batch_result
+                    .map_err(check_and_mark_retriable_error)
+                    .and_then(|batch| {
+                        arrow_tools::record_batch::try_cast_to(batch, Arc::clone(&target_schema))
+                            .map_err(Into::into)
+                    })
             }),
         ));
 
