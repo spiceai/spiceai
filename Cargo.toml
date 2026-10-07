@@ -45,6 +45,7 @@ members = [
     "crates/evaluate-chat",
     "crates/ns_lookup",
     "crates/object_store_occ",
+    "crates/object_store_spawn",
     "crates/otel-arrow",
     "crates/podswatcher",
     "crates/cayenne",
