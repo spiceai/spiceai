@@ -1882,25 +1882,27 @@ mod tests {
             spans: Spans::new(),
         });
 
-        for field in ["dow", "DOW", "Dow"] {
-            let call = Expr::ScalarFunction(ScalarFunction::new_udf(
-                datafusion::functions::datetime::date_part(),
-                vec![lit(field), ts.clone()],
-            ));
-            let rendered = unparser
-                .expr_to_sql(&call)
-                .expect("date_part unparses for DuckDB")
-                .to_string();
-            assert!(
-                !rendered.contains("+ 1") && !rendered.contains("+1"),
-                "DuckDB date_part('{field}') must not shift Sunday to 1: {rendered}"
-            );
-            let lower = rendered.to_lowercase();
-            assert!(
-                lower.contains("date_part") || lower.contains("dow"),
-                "expected a weekday extraction for '{field}', got {rendered}"
-            );
-        }
+        let rendered: Vec<String> = ["dow", "DOW", "Dow"]
+            .into_iter()
+            .map(|field| {
+                let call = Expr::ScalarFunction(ScalarFunction::new_udf(
+                    datafusion::functions::datetime::date_part(),
+                    vec![lit(field), ts.clone()],
+                ));
+                unparser
+                    .expr_to_sql(&call)
+                    .expect("date_part unparses for DuckDB")
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            rendered,
+            [
+                r#"date_part('dow', "t"."ts")"#,
+                r#"date_part('DOW', "t"."ts")"#,
+                r#"date_part('Dow', "t"."ts")"#,
+            ],
+        );
     }
 
     /// The premise the rewrite rests on, pinned against the function the
