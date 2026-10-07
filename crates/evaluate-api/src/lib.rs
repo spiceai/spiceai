@@ -437,6 +437,20 @@ fn nonempty_answer_map() -> utoipa::openapi::schema::Object {
     nonempty_map_of("Answer")
 }
 
+/// How much a chat model reasons before it answers.
+/// Wire values match `reasoning_effort`. `max` is not a value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+}
+
 /// A System One evaluation request, as providers receive it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
@@ -453,6 +467,11 @@ pub struct EvaluateRequest {
     /// `OpenAI` decision models. It is never serialized, so other providers never see it.
     #[serde(skip)]
     pub safety_identifier: Option<String>,
+    /// Effort for a chat evaluator. Skipped in serde so a provider never receives it.
+    /// The OpenAI Decisions API has no effort field.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 /// Token usage reported by the provider.

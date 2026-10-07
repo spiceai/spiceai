@@ -67,6 +67,10 @@ pub struct DecisionRequest {
     /// decision models.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub safety_identifier: Option<String>,
+    /// How much a chat model reasons before it answers. Omitted keeps the model setting.
+    /// Not forwarded to an OpenAI decision model: that API has no effort field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<crate::ReasoningEffort>,
 }
 
 /// The evidence every question is answered from.
@@ -384,6 +388,7 @@ impl DecisionRequest {
                 state,
                 questions,
                 safety_identifier: self.safety_identifier.clone(),
+                reasoning_effort: self.reasoning_effort,
             },
             asked,
         })
@@ -843,6 +848,8 @@ pub fn system_one_to_decision_request(
         input,
         questions,
         safety_identifier: request.safety_identifier.clone(),
+        // The OpenAI Decisions API has no effort field.
+        reasoning_effort: None,
     })
 }
 
