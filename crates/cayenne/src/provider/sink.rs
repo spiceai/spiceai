@@ -25,10 +25,13 @@ use datafusion::datasource::sink::DataSink;
 use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, SendableRecordBatchStream};
+use datafusion_common::DataFusionError;
 use datafusion_common::Result as DFResult;
 use datafusion_execution::TaskContext;
 use datafusion_expr::dml::InsertOp;
-use datafusion_table_providers::util::retriable_error::check_and_mark_retriable_error;
+use datafusion_table_providers::util::retriable_error::{
+    RetriableError, check_and_mark_retriable_error,
+};
 use futures::{StreamExt, TryStreamExt};
 
 use runtime_datafusion::extension::request_context::resolve_request_context;
@@ -159,7 +162,8 @@ impl DataSink for CayenneDataSink {
         // Normalize incoming batches to the table schema (e.g. CDC nullability mismatches)
         // causing Vortex assertion failures. An error from the input stream is the source
         // failing mid-read, so it is marked retriable for the refresh to retry, as the
-        // other accelerators' sinks do.
+        // other accelerators' sinks do. A segmented append removes the mark once it has
+        // published a segment.
         let target_schema = Arc::clone(&self.schema);
         let normalized = Box::pin(RecordBatchStreamAdapter::new(
             Arc::clone(&target_schema),
@@ -455,7 +459,10 @@ impl CayenneDataSink {
     /// durability and crash recovery per segment are unchanged. On a
     /// mid-stream error, segments already published stay published — the same
     /// visible state as if the client had sent them as separate requests;
-    /// PK on-conflict handling keeps whole-payload retries convergent.
+    /// PK on-conflict handling keeps whole-payload retries convergent. Once a
+    /// segment is published, an input error is not retriable: a refresh retries
+    /// by reading its source again from the start, which would append the
+    /// published rows a second time.
     ///
     /// The size cap bounds buffered memory per active stream (segments are
     /// buffered before writing): the configured target file size, clamped to
@@ -505,7 +512,14 @@ impl CayenneDataSink {
                             deadline = Some(tokio::time::Instant::now() + interval);
                         }
                     }
-                    Some(Err(e)) => return Err(e.into()),
+                    Some(Err(e)) => {
+                        let e = if segments == 0 {
+                            e
+                        } else {
+                            without_retriable_mark(e)
+                        };
+                        return Err(e.into());
+                    }
                     None => {
                         stream_ended = true;
                         break;
@@ -650,6 +664,20 @@ impl CayenneDataSink {
     }
 }
 
+/// `error` without the retriable mark [`check_and_mark_retriable_error`] adds.
+fn without_retriable_mark(error: DataFusionError) -> DataFusionError {
+    match error {
+        DataFusionError::External(inner) => match inner.downcast::<RetriableError>() {
+            Ok(marked) => match *marked {
+                RetriableError::DataRetrievalError { source } => source,
+                RetriableError::DataWriteError { source } => DataFusionError::External(source),
+            },
+            Err(inner) => DataFusionError::External(inner),
+        },
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -661,9 +689,11 @@ mod tests {
     use datafusion::datasource::sink::DataSink;
     use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
     use datafusion::prelude::SessionContext;
+    use datafusion_common::DataFusionError;
     use datafusion_expr::dml::InsertOp;
     use datafusion_table_providers::util::column_reference::ColumnReference;
     use datafusion_table_providers::util::on_conflict::OnConflict;
+    use datafusion_table_providers::util::retriable_error::is_retriable_error;
     use tokio::sync::Notify;
 
     use super::CayenneDataSink;
@@ -867,6 +897,128 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn keyed_append_waits_for_stream_end() {
         assert_segment_visibility(true).await;
+    }
+
+    /// A refresh retries a retriable error by reading its source again from the start.
+    /// That is safe until a segmented append publishes a segment; after it, a retry would
+    /// append the published rows a second time, so the error must not be retriable.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn segmented_append_input_error_is_retriable_only_before_a_segment_publishes() {
+        let ctx = SessionContext::new();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("path"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("path"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir");
+        let connection_string = format!("sqlite://{metadata_dir}/cayenne.db");
+        let catalog = Arc::new(CayenneCatalog::new(connection_string).expect("catalog"))
+            as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog init");
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let vortex_config = VortexConfig {
+            stream_publish_interval_ms: 100,
+            ..VortexConfig::default()
+        };
+        let context = CayenneContext::new(&vortex_config, ctx.runtime_env(), "seg_err");
+        let sink_context = Arc::clone(&context);
+        let options = CreateTableOptions {
+            table_name: "seg_err".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: data_dir,
+            partition_column: None,
+            vortex_config,
+        };
+        let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
+            .with_context(context)
+            .create(options)
+            .await
+            .expect("table created");
+        // A stored row, so the appends below take the segmented path.
+        append_rows(
+            &provider,
+            &sink_context,
+            &schema,
+            &ctx,
+            vec![int64_batch(&schema, vec![100])],
+        )
+        .await
+        .expect("seed");
+        let sink = || {
+            CayenneDataSink::new(
+                provider.clone_for_write(),
+                InsertOp::Append,
+                Arc::clone(&schema),
+                Arc::clone(&sink_context),
+            )
+        };
+        let source_error = || DataFusionError::Execution("source connection closed".to_string());
+
+        // The input fails before any segment is published: nothing is visible, so the
+        // refresh may retry.
+        let failing = futures::stream::iter(vec![Err(source_error())]);
+        let stream = Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&schema), failing));
+        let error = sink()
+            .write_all(stream, &ctx.task_ctx())
+            .await
+            .expect_err("the input failed");
+        assert!(
+            is_retriable_error(&error),
+            "an error before any segment publishes is retriable: {error}"
+        );
+        assert_eq!(
+            visible_rows(&ctx, &provider).await,
+            1,
+            "nothing was appended"
+        );
+
+        // The input fails after the first segment is published.
+        let published = Arc::new(Notify::new());
+        let published_for_stream = Arc::clone(&published);
+        let stream_schema = Arc::clone(&schema);
+        let batches = futures::stream::unfold(0_i64, move |i| {
+            let published = Arc::clone(&published_for_stream);
+            let schema = Arc::clone(&stream_schema);
+            async move {
+                match i {
+                    0 => Some((Ok(int64_batch(&schema, vec![1, 2])), 1)),
+                    1 => {
+                        published.notified().await;
+                        Some((Err(source_error()), 2))
+                    }
+                    _ => None,
+                }
+            }
+        });
+        let stream = Box::pin(RecordBatchStreamAdapter::new(Arc::clone(&schema), batches));
+        let sink = sink();
+        let task_ctx = ctx.task_ctx();
+        let write = tokio::spawn(async move { sink.write_all(stream, &task_ctx).await });
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+        while visible_rows(&ctx, &provider).await != 3 {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the first segment was not published while the stream was open"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        published.notify_one();
+        let error = write.await.expect("join").expect_err("the input failed");
+        assert!(
+            !is_retriable_error(&error),
+            "an error after a segment publishes is not retriable: {error}"
+        );
+        assert_eq!(
+            error.to_string(),
+            "Execution error: source connection closed",
+            "the source error is reported unchanged"
+        );
+        assert_eq!(
+            visible_rows(&ctx, &provider).await,
+            3,
+            "the published segment stays visible"
+        );
     }
 
     async fn assert_segment_visibility(keyed: bool) {
