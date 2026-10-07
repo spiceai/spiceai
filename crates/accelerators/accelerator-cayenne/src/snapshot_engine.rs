@@ -1900,7 +1900,12 @@ mod tests {
             .map(|e| (e.archive_path, e.bytes))
             .collect();
         let tar = tmp.path().join("snapshot.tar");
-        archive_directories_to_file_with_plan(&dirs, &tar, &skip, &extras)
+        let optional_files: Vec<_> = plan
+            .optional_files
+            .into_iter()
+            .map(|file| (file.source, file.archive_path))
+            .collect();
+        archive_directories_to_file_with_plan(&dirs, &tar, &skip, &extras, &optional_files)
             .await
             .expect("archive");
         assert!(orphans.iter().all(|path| path.exists()));
