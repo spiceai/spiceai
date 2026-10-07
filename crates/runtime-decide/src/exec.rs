@@ -243,8 +243,8 @@ impl Decider {
         }
         if let Some(failure) = first_failure {
             tracing::warn!(
-                "{function}: model '{model_name}' could not answer {failed} of {} distinct inputs, so their rows return NULL (`on_error => 'null'`). First cause: {failure}",
-                answers.len()
+                "{}",
+                null_rows_warning(function, &model_name, failed, answers.len(), &failure)
             );
         }
         let declined_inputs = answers
@@ -264,6 +264,22 @@ impl Decider {
             .map(|request| request.and_then(|index| answers[index].clone()))
             .collect())
     }
+}
+
+/// The warning for rows that return NULL under `on_error => 'null'`. Logs persist, so the
+/// cause is the redacted text: a provider's response body can carry the input or a
+/// secret.
+fn null_rows_warning(
+    function: &str,
+    model: &str,
+    failed: usize,
+    distinct: usize,
+    first: &Failure,
+) -> String {
+    format!(
+        "{function}: model '{model}' could not answer {failed} of {distinct} distinct inputs, so their rows return NULL (`on_error => 'null'`). First cause: {}",
+        first.telemetry()
+    )
 }
 
 /// One distinct input's answers, or why it has none, by its index among the inputs.
@@ -419,6 +435,19 @@ fn json_states(input: &ArrayRef) -> Result<Vec<Option<EvaluateState>>> {
 mod tests {
     use super::*;
     use arrow::array::{Int64Array, StringArray, StructArray};
+
+    /// Logs persist, so the warning carries the redacted cause, not the provider's body.
+    #[test]
+    fn the_null_rows_warning_omits_the_provider_body() {
+        let failure = Failure::Model(EvaluateError::AuthenticationFailed {
+            model: "luna".to_string(),
+            message: "Incorrect API key provided: sk-live-secret".to_string(),
+        });
+        assert_eq!(
+            null_rows_warning("ai_if", "luna", 3, 8, &failure),
+            "ai_if: model 'luna' could not answer 3 of 8 distinct inputs, so their rows return NULL (`on_error => 'null'`). First cause: Evaluation of model 'luna' failed: authentication failed"
+        );
+    }
 
     #[test]
     fn inputs_become_state_by_type() {

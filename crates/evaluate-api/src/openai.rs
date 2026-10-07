@@ -709,24 +709,49 @@ fn score_legend(criteria: &[NonNullEntry]) -> BTreeMap<String, EntryType> {
         .collect()
 }
 
+/// The answer to a question that needs no model: a choice with a single option, which
+/// is that option with all the probability. `OpenAI` asks a choice of at least two
+/// options, so such a question is answered here rather than sent. `None` for any other
+/// question.
+fn foregone_answer(question: &Question) -> Option<Answer> {
+    let Question::Choice { criteria, .. } = question else {
+        return None;
+    };
+    if criteria.len() != 1 {
+        return None;
+    }
+    let option = criteria.keys().next()?;
+    Some(Answer::Choice {
+        choice: option.clone(),
+        probabilities: BTreeMap::from([(option.clone(), 1.0)]),
+        confidence: 1.0,
+    })
+}
+
 /// Builds the `OpenAI` decision request that asks `request`'s questions of `model`,
 /// naming each question by its System One id so its answer can be matched back, and
-/// forwarding the request's `safety_identifier`.
+/// forwarding the request's `safety_identifier`. A choice with a single option is left
+/// out, and [`decision_response_to_system_one`] answers it; when every question is one,
+/// the returned request has no questions and needs no call.
 ///
 /// # Errors
 ///
 /// Returns [`InvalidDecisionRequest`] for a question `OpenAI` cannot ask: a choice
-/// with fewer than two options, or more than 200 questions.
+/// with no options or more than 255, or more than 200 questions.
 pub fn system_one_to_decision_request(
     request: &EvaluateRequest,
     model: &str,
 ) -> Result<DecisionRequest, InvalidDecisionRequest> {
-    if request.questions.len() > MAX_QUESTIONS {
+    let asked = request
+        .questions
+        .values()
+        .filter(|question| foregone_answer(question).is_none())
+        .count();
+    if asked > MAX_QUESTIONS {
         return Err(InvalidDecisionRequest::new(
             "questions",
             format!(
-                "OpenAI decision models answer at most {MAX_QUESTIONS} questions per request; this request has {}.",
-                request.questions.len()
+                "OpenAI decision models answer at most {MAX_QUESTIONS} questions per request; this request has {asked}.",
             ),
         ));
     }
@@ -739,8 +764,11 @@ pub fn system_one_to_decision_request(
         }
     };
 
-    let mut questions = Vec::with_capacity(request.questions.len());
+    let mut questions = Vec::with_capacity(asked);
     for (id, question) in &request.questions {
+        if foregone_answer(question).is_some() {
+            continue;
+        }
         let name = Some(id.clone());
         questions.push(match question {
             Question::Noul {
@@ -841,7 +869,11 @@ pub fn decision_response_to_system_one(
         let Some(id) = name else {
             return Err("an answer has no name, so it cannot be matched to its question".into());
         };
-        let Some(question) = request.questions.get(&id) else {
+        let Some(question) = request
+            .questions
+            .get(&id)
+            .filter(|question| foregone_answer(question).is_none())
+        else {
             return Err(format!("an answer names '{id}', which was not asked"));
         };
         let translated = match answer {
@@ -915,6 +947,11 @@ pub fn decision_response_to_system_one(
         };
         if answers.insert(id.clone(), translated).is_some() {
             return Err(format!("question '{id}' was answered more than once"));
+        }
+    }
+    for (id, question) in &request.questions {
+        if let Some(answer) = foregone_answer(question) {
+            answers.insert(id.clone(), answer);
         }
     }
 
@@ -1138,6 +1175,59 @@ mod tests {
                 {"value": "maybe", "probability": 0.1}
             ], "confidence": 0.4}]})
         );
+    }
+
+    /// `OpenAI` asks a choice of at least two options. A single-option choice has one
+    /// possible answer, so it is answered here, and only the rest are sent.
+    #[test]
+    fn a_single_option_choice_is_answered_without_the_model() {
+        let request: EvaluateRequest = serde_json::from_value(json!({
+            "model": "luna",
+            "state": "x",
+            "questions": {
+                "only": {"type": "choice", "instructions": "Which?", "criteria": {"billing": null}},
+                "urgent": {"type": "noul", "instructions": "Urgent?"}
+            }
+        }))
+        .expect("request");
+        let upstream = system_one_to_decision_request(&request, "gpt-6-luna").expect("builds");
+        assert_eq!(
+            serde_json::to_value(&upstream.questions).expect("serializes"),
+            json!([{"type": "predicate", "name": "urgent", "instructions": "Urgent?"}])
+        );
+
+        let answered = decision_response_to_system_one(
+            &request,
+            serde_json::from_value(json!({
+                "model": "gpt-6-luna",
+                "answers": [{"type": "predicate", "name": "urgent", "probability": 0.7}]
+            }))
+            .expect("response"),
+        )
+        .expect("maps back");
+        assert_eq!(
+            serde_json::to_value(&answered.answers).expect("serializes"),
+            json!({
+                "only": {"type": "choice", "choice": "billing", "probabilities": {"billing": 1.0}, "confidence": 1.0},
+                "urgent": {"type": "noul", "noul": 0.7}
+            })
+        );
+        crate::check_answers("luna", &request.questions, &answered).expect("a valid answer");
+
+        // The model is never asked a question it was not sent.
+        let err = decision_response_to_system_one(
+            &request,
+            serde_json::from_value(json!({
+                "model": "gpt-6-luna",
+                "answers": [
+                    {"type": "predicate", "name": "urgent", "probability": 0.7},
+                    {"type": "choice", "name": "only", "choice": "billing", "probabilities": [{"value": "billing", "probability": 1.0}], "confidence": 1.0}
+                ]
+            }))
+            .expect("response"),
+        )
+        .expect_err("an answer to an unsent question");
+        assert_eq!(err, "an answer names 'only', which was not asked");
     }
 
     #[test]

@@ -26,7 +26,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use evaluate_api::openai::{
-    DecisionResponse, decision_response_to_system_one, system_one_to_decision_request,
+    DecisionRequest, DecisionResponse, decision_response_to_system_one,
+    system_one_to_decision_request,
 };
 use evaluate_api::{Evaluate, EvaluateRequest, EvaluateResponse, Result};
 use reqwest::{Client, RequestBuilder, StatusCode};
@@ -192,40 +193,16 @@ impl Evaluate for OpenAiDecisions {
                 message: e.message,
             }
         })?;
-
-        let _permit = self.rate_controller.acquire().await.map_err(|e| {
-            evaluate_api::Error::RatePermitFailed {
-                model: self.name.clone(),
-                source: Box::new(e),
+        let decision = if body.questions.is_empty() {
+            // Every question has a foregone answer (a single-option choice): no call.
+            DecisionResponse {
+                model: self.model_id.clone(),
+                answers: Vec::new(),
+                usage: None,
             }
-        })?;
-
-        let response = self
-            .authorized(self.client.post(format!("{}/decisions", self.endpoint)))
-            .json(&body)
-            .send()
-            .await
-            .map_err(|e| evaluate_api::Error::ServiceUnavailable {
-                model: self.name.clone(),
-                message: e.to_string(),
-            })?;
-        let status = response.status();
-        let text = response
-            .text()
-            .await
-            .map_err(|e| evaluate_api::Error::ModelCallFailed {
-                model: self.name.clone(),
-                source: Box::new(e),
-            })?;
-        if status != StatusCode::OK {
-            return Err(self.error_for(status, text));
-        }
-
-        let decision: DecisionResponse =
-            serde_json::from_str(&text).map_err(|e| evaluate_api::Error::UnparseableResponse {
-                model: self.name.clone(),
-                response: format!("{e}; body={text}"),
-            })?;
+        } else {
+            self.ask(&body).await?
+        };
         let answered = decision_response_to_system_one(&request, decision).map_err(|detail| {
             evaluate_api::Error::UnparseableResponse {
                 model: self.name.clone(),
@@ -266,6 +243,44 @@ impl Evaluate for OpenAiDecisions {
 
     fn is_decision_model(&self) -> bool {
         true
+    }
+}
+
+impl OpenAiDecisions {
+    /// Sends `body` to `POST {endpoint}/decisions` under a rate-limit permit.
+    async fn ask(&self, body: &DecisionRequest) -> Result<DecisionResponse> {
+        let _permit = self.rate_controller.acquire().await.map_err(|e| {
+            evaluate_api::Error::RatePermitFailed {
+                model: self.name.clone(),
+                source: Box::new(e),
+            }
+        })?;
+
+        let response = self
+            .authorized(self.client.post(format!("{}/decisions", self.endpoint)))
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| evaluate_api::Error::ServiceUnavailable {
+                model: self.name.clone(),
+                message: e.to_string(),
+            })?;
+        let status = response.status();
+        let text = response
+            .text()
+            .await
+            .map_err(|e| evaluate_api::Error::ModelCallFailed {
+                model: self.name.clone(),
+                source: Box::new(e),
+            })?;
+        if status != StatusCode::OK {
+            return Err(self.error_for(status, text));
+        }
+
+        serde_json::from_str(&text).map_err(|e| evaluate_api::Error::UnparseableResponse {
+            model: self.name.clone(),
+            response: format!("{e}; body={text}"),
+        })
     }
 }
 
@@ -397,6 +412,34 @@ mod tests {
         assert_eq!(
             err.to_string(),
             "Authentication failed for evaluation model 'luna': Incorrect API key provided: sk-test."
+        );
+    }
+
+    /// A request whose only question is a single-option choice has its answer already,
+    /// so nothing is sent.
+    #[tokio::test]
+    async fn a_foregone_answer_needs_no_call() {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/decisions"))
+            .respond_with(ResponseTemplate::new(500))
+            .expect(0)
+            .mount(&server)
+            .await;
+        let request: EvaluateRequest = serde_json::from_value(json!({
+            "model": "luna",
+            "state": "x",
+            "questions": {"only": {"type": "choice", "instructions": "Which?", "criteria": {"billing": null}}}
+        }))
+        .expect("request");
+
+        let answered = client(&server).evaluate(request).await.expect("answers");
+        assert_eq!(
+            serde_json::to_value(&answered).expect("serializes"),
+            json!({
+                "model": "gpt-6-luna",
+                "answers": {"only": {"type": "choice", "choice": "billing", "probabilities": {"billing": 1.0}, "confidence": 1.0}}
+            })
         );
     }
 
