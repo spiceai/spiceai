@@ -330,6 +330,11 @@ pub enum Error {
     AcceleratedWriteBackWithoutReplication { dataset_name: String },
 
     #[snafu(display(
+        "Dataset '{dataset_name}' sets `acceleration.write_mode: acceleration` and refreshes by `changes` (set by `refresh_mode` or by its connector's default), but the source's changes would overwrite writes kept only in the acceleration, so the dataset cannot load. Use `write_mode: write_through` or `write_back` with a change stream, or another `refresh_mode`. See: https://spiceai.org/docs/reference/spicepod/datasets#accelerationwrite_mode"
+    ))]
+    AccelerationWriteModeWithChanges { dataset_name: String },
+
+    #[snafu(display(
         "An accelerated table for {dataset_name} was configured with 'refresh_mode = changes', but the data connector doesn't support a changes stream."
     ))]
     AcceleratedTableInvalidChanges { dataset_name: String },
