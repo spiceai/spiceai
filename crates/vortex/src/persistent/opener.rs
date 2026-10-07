@@ -859,7 +859,8 @@ fn collect_vortex_pushdown_conjunct(
     // `DynamicFilter OR col IS NULL` so EXPLAIN and `FilePruner` keep NULL keys
     // that a min/max bound would drop. Flatten that OR here: unwrap the
     // `DynamicFilter` (skipping its `InList` membership) and ignore the `IS NULL`
-    // leaves — each min/max conjunct is re-OR'd with `IS NULL` below.
+    // leaves — each min/max conjunct is re-OR'd with `IS NULL` below. Any other
+    // OR holding a dynamic filter is declined.
     if !from_dynamic_filter && contains_dynamic_filter(&expr) && is_or_expr(&expr) {
         return collect_or_wrapped_dynamic_filter(expr_convertor, expr, schema, conjuncts);
     }
@@ -907,44 +908,55 @@ fn collect_vortex_pushdown_conjunct(
     Ok(())
 }
 
+/// Pushes the bounds of the `DynamicFilter OR col IS NULL` that
+/// `try_pushdown_filters` plans, and declines any other OR that holds a
+/// dynamic filter.
+///
+/// Each bound is pushed as `bound OR col IS NULL`, which stands in for the OR
+/// only when it holds exactly one `DynamicFilter` and every other disjunct is
+/// `IS NULL` on a column that filter reads. Pushing each filter of `D1 OR D2`
+/// would AND them, and swapping an `IS NULL` on another column for the bound's
+/// own would drop the rows it keeps. Declining costs only pruning: the join
+/// still refines every row the scan returns.
 fn collect_or_wrapped_dynamic_filter(
     expr_convertor: &dyn ExpressionConvertor,
     expr: PhysicalExprRef,
     schema: &Schema,
     conjuncts: &mut PushdownConjuncts,
 ) -> DFResult<()> {
-    let mut leaves = Vec::new();
-    flatten_or_leaves(&expr, &mut leaves);
-
-    let mut dynamic_leaves = Vec::new();
-    for leaf in leaves {
-        if leaf
-            .downcast_ref::<df_expr::DynamicFilterPhysicalExpr>()
-            .is_some()
-        {
-            dynamic_leaves.push(leaf);
-            continue;
-        }
-        if leaf.downcast_ref::<df_expr::IsNullExpr>().is_some() {
-            continue;
-        }
+    let Some(dynamic_filter) = or_wrapped_dynamic_filter(&expr) else {
         tracing::debug!(
             filter = ?expr,
-            "Skipping an OR-wrapped dynamic filter with an unexpected disjunct"
+            "Skipping an OR that holds a dynamic filter but is not one dynamic filter OR'd with IS NULL on its own columns"
         );
         conjuncts.skipped_dynamic.push(expr);
         return Ok(());
-    }
+    };
+    collect_vortex_pushdown_conjunct(expr_convertor, dynamic_filter, schema, false, conjuncts)
+}
 
-    if dynamic_leaves.is_empty() {
-        conjuncts.skipped_dynamic.push(expr);
-        return Ok(());
-    }
+/// The `DynamicFilter` of `expr` when `expr` is exactly
+/// `DynamicFilter OR col IS NULL [OR col IS NULL …]` and every `col` is a
+/// column that filter reads. `None` for any other shape.
+fn or_wrapped_dynamic_filter(expr: &PhysicalExprRef) -> Option<PhysicalExprRef> {
+    let mut leaves = Vec::new();
+    flatten_or_leaves(expr, &mut leaves);
+    let (dynamic_filters, null_checks): (Vec<_>, Vec<_>) = leaves.into_iter().partition(|leaf| {
+        leaf.downcast_ref::<df_expr::DynamicFilterPhysicalExpr>()
+            .is_some()
+    });
+    let [dynamic_filter] = <[PhysicalExprRef; 1]>::try_from(dynamic_filters).ok()?;
 
-    for dynamic_leaf in dynamic_leaves {
-        collect_vortex_pushdown_conjunct(expr_convertor, dynamic_leaf, schema, false, conjuncts)?;
-    }
-    Ok(())
+    let mut filter_columns = BTreeSet::new();
+    collect_column_names(&dynamic_filter, &mut filter_columns);
+    null_checks
+        .iter()
+        .all(|leaf| {
+            leaf.downcast_ref::<df_expr::IsNullExpr>()
+                .and_then(|is_null| is_null.arg().downcast_ref::<df_expr::Column>())
+                .is_some_and(|column| filter_columns.contains(column.name()))
+        })
+        .then_some(dynamic_filter)
 }
 
 fn is_or_expr(expr: &PhysicalExprRef) -> bool {
@@ -2734,5 +2746,164 @@ mod tests {
             "a non-nullable column has no NULL keys to keep: {wrapped}"
         );
         assert_eq!(wrapped.to_string(), dynamic.to_string());
+    }
+
+    /// A dynamic filter on `name` (column `index` of the scanned file) whose
+    /// current value is `lo <= name AND name <= hi`.
+    fn bounds_dynamic_filter(name: &str, index: usize, lo: i32, hi: i32) -> PhysicalExprRef {
+        let column = Arc::new(df_expr::Column::new(name, index)) as PhysicalExprRef;
+        let bound = |op, value| {
+            Arc::new(df_expr::BinaryExpr::new(
+                Arc::clone(&column),
+                op,
+                Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(value)))),
+            )) as PhysicalExprRef
+        };
+        let bounds = Arc::new(df_expr::BinaryExpr::new(
+            bound(Operator::GtEq, lo),
+            Operator::And,
+            bound(Operator::LtEq, hi),
+        )) as PhysicalExprRef;
+        let dynamic_filter = Arc::new(df_expr::DynamicFilterPhysicalExpr::new(
+            vec![Arc::clone(&column)],
+            Arc::new(df_expr::Literal::new(ScalarValue::Boolean(Some(true)))),
+        ));
+        dynamic_filter
+            .update(bounds)
+            .expect("dynamic filter update should succeed");
+        dynamic_filter as PhysicalExprRef
+    }
+
+    /// `(a, b)` rows for `a` bounded to `3..=7` and `b` to `30..=70`: each
+    /// bound alone, both, neither, and a NULL in each column.
+    fn dynamic_or_batch() -> RecordBatch {
+        record_batch!(
+            (
+                "a",
+                Int32,
+                vec![Some(5), Some(100), Some(5), Some(100), None, Some(100)]
+            ),
+            (
+                "b",
+                Int32,
+                vec![Some(100), Some(50), Some(50), Some(100), Some(100), None]
+            )
+        )
+        .expect("dynamic-filter OR test batch should build")
+    }
+
+    fn sorted_rows(batches: &[RecordBatch]) -> Vec<(Option<i32>, Option<i32>)> {
+        let mut rows = Vec::new();
+        for batch in batches {
+            let column = |name: &str| {
+                batch
+                    .column_by_name(name)
+                    .expect("scanned batch should have the column")
+                    .as_primitive::<datafusion::arrow::datatypes::Int32Type>()
+                    .clone()
+            };
+            rows.extend(column("a").iter().zip(column("b").iter()));
+        }
+        rows.sort_unstable();
+        rows
+    }
+
+    /// The rows a Vortex scan returns under `filter`, and the rows `filter`
+    /// keeps when DataFusion evaluates it over the same data unscanned.
+    async fn scanned_and_kept_rows(
+        filter: PhysicalExprRef,
+    ) -> anyhow::Result<(
+        Vec<(Option<i32>, Option<i32>)>,
+        Vec<(Option<i32>, Option<i32>)>,
+    )> {
+        let batch = dynamic_or_batch();
+        let schema = batch.schema();
+        let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let file_path = "/path/dynamic-or.vortex";
+        let data_size =
+            write_arrow_to_vortex(Arc::clone(&object_store), file_path, batch.clone()).await?;
+
+        let mut opener = make_test_opener(
+            object_store,
+            Arc::clone(&schema),
+            ProjectionExprs::from_indices(&[0, 1], &schema),
+        );
+        opener.filter = Some(Arc::clone(&filter));
+        let scanned = opener
+            .open(PartitionedFile::new(file_path.to_string(), data_size))?
+            .await?
+            .try_collect::<Vec<_>>()
+            .await?;
+
+        let mask = filter.evaluate(&batch)?.into_array(batch.num_rows())?;
+        let kept = datafusion::arrow::compute::filter_record_batch(&batch, mask.as_boolean())?;
+        Ok((sorted_rows(&scanned), sorted_rows(&[kept])))
+    }
+
+    #[tokio::test]
+    async fn or_of_two_dynamic_filters_is_not_pushed_as_their_and() -> anyhow::Result<()> {
+        let schema = dynamic_or_batch().schema();
+        let either = Arc::new(df_expr::BinaryExpr::new(
+            bounds_dynamic_filter("a", 0, 3, 7),
+            Operator::Or,
+            bounds_dynamic_filter("b", 1, 30, 70),
+        )) as PhysicalExprRef;
+        // What `try_pushdown_filters` plans for it:
+        // `(D(a) OR D(b)) OR (a IS NULL OR b IS NULL)`.
+        let filter = or_is_null_on_nullable_columns(either, &schema);
+
+        let (scanned, kept) = scanned_and_kept_rows(filter).await?;
+        assert_eq!(
+            kept,
+            vec![
+                (None, Some(100)),
+                (Some(5), Some(50)),
+                (Some(5), Some(100)),
+                (Some(100), None),
+                (Some(100), Some(50)),
+            ]
+        );
+        // Pushing each dynamic disjunct would AND them and keep only (5, 50).
+        // The scan has to decline the OR and leave every row for the join.
+        assert_eq!(scanned, sorted_rows(&[dynamic_or_batch()]));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn is_null_on_a_column_the_dynamic_filter_does_not_read_is_not_dropped()
+    -> anyhow::Result<()> {
+        let b_is_null = Arc::new(df_expr::IsNullExpr::new(Arc::new(df_expr::Column::new(
+            "b", 1,
+        )))) as PhysicalExprRef;
+        let filter = Arc::new(df_expr::BinaryExpr::new(
+            bounds_dynamic_filter("a", 0, 3, 7),
+            Operator::Or,
+            b_is_null,
+        )) as PhysicalExprRef;
+
+        let (scanned, kept) = scanned_and_kept_rows(filter).await?;
+        assert_eq!(
+            kept,
+            vec![(Some(5), Some(50)), (Some(5), Some(100)), (Some(100), None)]
+        );
+        // Re-OR-ing `a IS NULL` in place of `b IS NULL` would drop (100, NULL).
+        assert_eq!(scanned, sorted_rows(&[dynamic_or_batch()]));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn planned_dynamic_filter_or_is_null_still_filters_the_scan() -> anyhow::Result<()> {
+        let schema = dynamic_or_batch().schema();
+        // Exactly what `try_pushdown_filters` plans: `D(a) OR a IS NULL`.
+        let filter = or_is_null_on_nullable_columns(bounds_dynamic_filter("a", 0, 3, 7), &schema);
+
+        let (scanned, kept) = scanned_and_kept_rows(filter).await?;
+        let expected = vec![(None, Some(100)), (Some(5), Some(50)), (Some(5), Some(100))];
+        assert_eq!(kept, expected);
+        assert_eq!(
+            scanned, expected,
+            "the bound and its NULL keys must still reach the scan"
+        );
+        Ok(())
     }
 }
