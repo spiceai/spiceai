@@ -186,7 +186,7 @@ async fn file_connector_partition_only_scan_uses_listing() -> Result<(), anyhow:
         .await
 }
 
-/// DataFusion folds a projection above a scan into the scan, aliases included,
+/// `DataFusion` folds a projection above a scan into the scan, aliases included,
 /// so `SELECT value AS p` over a table partitioned by `p` scans a field named
 /// `p` that holds the data column's values. The partition-only rewrite must
 /// not answer it from the listing, which would return the partition values.
