@@ -1161,6 +1161,27 @@ fn open_no_follow(root: &Path, path: &Path) -> std::io::Result<Option<std::fs::F
             let error = std::io::Error::last_os_error();
             return match error.raw_os_error() {
                 Some(libc::ELOOP | libc::ENOTDIR) => Ok(None),
+                _ if components.peek().is_none() => {
+                    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+                    // SAFETY: the pinned parent descriptor, NUL-terminated name,
+                    // and output storage remain valid throughout the call.
+                    let result = unsafe {
+                        libc::fstatat(
+                            parent.as_raw_fd(),
+                            name.as_ptr(),
+                            metadata.as_mut_ptr(),
+                            libc::AT_SYMLINK_NOFOLLOW,
+                        )
+                    };
+                    // SAFETY: a successful fstatat initializes the stat output.
+                    if result == 0
+                        && unsafe { metadata.assume_init() }.st_mode & libc::S_IFMT != libc::S_IFREG
+                    {
+                        Ok(None)
+                    } else {
+                        Err(error)
+                    }
+                }
                 _ => Err(error),
             };
         }
