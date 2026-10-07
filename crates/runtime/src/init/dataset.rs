@@ -172,13 +172,13 @@ pub(crate) fn warn_about_acceleration_block(
 /// Publish `dataset_acceleration_rows_superseded` at `0` for each reason a
 /// refresh of `ds` can report, so the series exist before the first one. A
 /// dataset whose refreshes report none gets no series.
-fn seed_superseded_rows(ds: &Dataset) {
+fn seed_superseded_rows(ds: &Dataset, data_connector: &dyn DataConnector) {
     use util::session_state::SupersededReason;
 
     let Some(acceleration) = ds.acceleration.as_ref().filter(|a| a.enabled) else {
         return;
     };
-    let refresh_mode = acceleration.refresh_mode.unwrap_or(RefreshMode::Full);
+    let refresh_mode = data_connector.resolve_refresh_mode(acceleration.refresh_mode);
     let reasons: &[SupersededReason] = match cayenne_key_rule(ds, acceleration, refresh_mode) {
         Some(KeyRule::NewestByTime(_)) => &[SupersededReason::Older, SupersededReason::Arrival],
         Some(KeyRule::LastArrival) => &[SupersededReason::Arrival],
@@ -1460,7 +1460,7 @@ impl Runtime {
                 if !replaces_snapshot_reader {
                     metrics::datasets::COUNT.add(1, &[KeyValue::new("engine", engine)]);
                 }
-                seed_superseded_rows(&ds);
+                seed_superseded_rows(&ds, data_connector.as_ref());
 
                 if let Some(message) = schema_change_failure {
                     self.status.update_dataset(
