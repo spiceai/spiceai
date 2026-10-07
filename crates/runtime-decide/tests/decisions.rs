@@ -42,6 +42,8 @@ use tokio::sync::RwLock;
 struct Mock {
     decision: bool,
     fail_when_contains: Option<&'static str>,
+    /// Declines every choice question about a text containing this.
+    decline_choices_when_contains: Option<&'static str>,
     requests: Mutex<Vec<EvaluateRequest>>,
 }
 
@@ -61,6 +63,14 @@ impl Mock {
         Arc::new(Self {
             decision: true,
             fail_when_contains: Some(text),
+            ..Self::default()
+        })
+    }
+
+    fn declining_choices_on(text: &'static str) -> Arc<Self> {
+        Arc::new(Self {
+            decision: true,
+            decline_choices_when_contains: Some(text),
             ..Self::default()
         })
     }
@@ -113,6 +123,13 @@ impl Evaluate for Mock {
                         0.1
                     },
                 },
+                Question::Choice { .. }
+                    if self
+                        .decline_choices_when_contains
+                        .is_some_and(|declined| text.contains(declined)) =>
+                {
+                    Answer::Refusal {}
+                }
                 Question::Choice { criteria, .. } => {
                     let labels: Vec<&String> = criteria.keys().collect();
                     let chosen = labels
@@ -568,6 +585,80 @@ async fn named_options_are_never_confused() {
     assert_eq!(
         run_err(&ctx, "SELECT ai_if(body, model => 'jev') FROM tickets").await,
         "Error during planning: ai_if: missing required argument `condition`. Usage: ai_if(input, condition[, model => 'name'][, on_error => 'fail' | 'null'])"
+    );
+}
+
+/// A refusal answers one question. Calls that share a request keep their own answers
+/// under `on_error => 'null'`, and by default the refusal stops the query.
+#[tokio::test]
+async fn a_declined_question_is_null_and_the_shared_answers_stand() {
+    let jev = Mock::declining_choices_on("technical");
+    let ctx = session(vec![("jev", Arc::clone(&jev))], tickets(4, 1));
+
+    assert_eq!(
+        run(
+            &ctx,
+            "SELECT id, ai_if(body, 'refund', on_error => 'null') AS refund, \
+             ai_classify(body, ['billing', 'technical'], on_error => 'null') AS team \
+             FROM tickets ORDER BY id",
+        )
+        .await,
+        "+----+--------+---------+\n| id | refund | team    |\n+----+--------+---------+\n| 0  | true   | billing |\n| 1  | false  |         |\n| 2  | true   | billing |\n| 3  | false  | billing |\n+----+--------+---------+"
+    );
+    assert_eq!(jev.requests().len(), 4, "one shared request per row");
+
+    assert_eq!(
+        run_err(
+            &ctx,
+            "SELECT ai_classify(body, ['billing', 'technical']) FROM tickets"
+        )
+        .await,
+        "Execution error: ai_classify: model 'jev' could not answer a row, so the query stopped. Cause: the model declined to answer 'ai_classify_0'. Retry the query, or pass `on_error => 'null'` to return NULL for rows the model cannot answer."
+    );
+}
+
+/// A decision moved out of a join key keeps the join's NULL semantics: on
+/// `IS NOT DISTINCT FROM`, a NULL answer matches a NULL key.
+#[tokio::test]
+async fn a_decision_join_key_keeps_null_matching() {
+    let jev = Mock::decision_model();
+    let ctx = session(vec![("jev", Arc::clone(&jev))], tickets(1, 1));
+    let notes = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("body", DataType::Utf8, true),
+        ])),
+        vec![
+            Arc::new(Int64Array::from(vec![0, 1, 2])),
+            Arc::new(StringArray::from(vec![
+                Some("a billing question"),
+                None,
+                Some("a technical issue"),
+            ])),
+        ],
+    )
+    .expect("notes batch");
+    ctx.register_batch("notes", notes).expect("register notes");
+    let teams = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("team", DataType::Utf8, true)])),
+        vec![Arc::new(StringArray::from(vec![
+            Some("billing"),
+            None,
+            Some("technical"),
+        ]))],
+    )
+    .expect("teams batch");
+    ctx.register_batch("teams", teams).expect("register teams");
+
+    assert_eq!(
+        run(
+            &ctx,
+            "SELECT n.id, t.team FROM notes n JOIN teams t \
+             ON ai_classify(n.body, ['billing', 'technical']) IS NOT DISTINCT FROM t.team \
+             ORDER BY n.id",
+        )
+        .await,
+        "+----+-----------+\n| id | team      |\n+----+-----------+\n| 0  | billing   |\n| 1  |           |\n| 2  | technical |\n+----+-----------+"
     );
 }
 

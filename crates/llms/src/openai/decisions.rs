@@ -34,14 +34,17 @@ use runtime_rate_control::RateController;
 
 use crate::provider::create_http_client;
 
-/// The model id prefix of `OpenAI`'s decision models.
-const DECISION_MODEL_PREFIX: &str = "gpt-6-luna";
+/// The model id of `OpenAI`'s decision model; a dated snapshot appends `-<suffix>`.
+const DECISION_MODEL_ID: &str = "gpt-6-luna";
 
 /// Whether an `OpenAI` model id names a decision model, which answers decisions and not
-/// chat completions.
+/// chat completions: `gpt-6-luna`, or a snapshot such as `gpt-6-luna-2026-10-01`, but
+/// not an unrelated id that merely starts the same way, such as `gpt-6-lunar`.
 #[must_use]
 pub fn is_decision_model_id(model_id: &str) -> bool {
-    model_id.starts_with(DECISION_MODEL_PREFIX)
+    model_id
+        .strip_prefix(DECISION_MODEL_ID)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('-'))
 }
 
 /// An `OpenAI` decision model implementing [`Evaluate`].
@@ -428,5 +431,7 @@ mod tests {
         assert!(is_decision_model_id("gpt-6-luna"));
         assert!(is_decision_model_id("gpt-6-luna-2026-10-01"));
         assert!(!is_decision_model_id("gpt-4o-mini"));
+        assert!(!is_decision_model_id("gpt-6-lunar"));
+        assert!(!is_decision_model_id("gpt-6-lunatic-preview"));
     }
 }

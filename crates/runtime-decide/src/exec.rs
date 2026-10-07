@@ -198,7 +198,17 @@ impl Decider {
                         safety_identifier: None,
                     };
                     Arc::clone(&context).scope(async move {
-                        let result = ask(model.as_ref(), request).await;
+                        // A refusal answers one question. Under `on_error => 'null'` only
+                        // that question's value is NULL, so the calls that share the
+                        // request keep their answers; otherwise it stops the query.
+                        let result = ask(model.as_ref(), request).await.and_then(|answers| {
+                            match (on_error, declined(&answers)) {
+                                (OnError::Fail, Some(question)) => Err(Failure::Refused {
+                                    question: question.clone(),
+                                }),
+                                _ => Ok(answers),
+                            }
+                        });
                         match (result, on_error) {
                             (Ok(answers), _) => Ok((index, Ok(answers))),
                             (Err(failure), OnError::Null) => Ok((index, Err(failure))),
@@ -234,6 +244,17 @@ impl Decider {
         if let Some(failure) = first_failure {
             tracing::warn!(
                 "{function}: model '{model_name}' could not answer {failed} of {} distinct inputs, so their rows return NULL (`on_error => 'null'`). First cause: {failure}",
+                answers.len()
+            );
+        }
+        let declined_inputs = answers
+            .iter()
+            .flatten()
+            .filter(|row| declined(row).is_some())
+            .count();
+        if declined_inputs > 0 {
+            tracing::warn!(
+                "{function}: model '{model_name}' declined to answer a question for {declined_inputs} of {} distinct inputs, so those answers are NULL (`on_error => 'null'`).",
                 answers.len()
             );
         }
@@ -308,16 +329,14 @@ async fn ask(
             Err(error) => return Err(Failure::Model(error)),
         }
     };
-    if let Some((question, _)) = response
-        .answers
-        .iter()
-        .find(|(_, answer)| matches!(answer, Answer::Refusal {}))
-    {
-        return Err(Failure::Refused {
-            question: question.clone(),
-        });
-    }
     Ok(response.answers)
+}
+
+/// The first question the model declined to answer, if any.
+fn declined(answers: &BTreeMap<String, Answer>) -> Option<&String> {
+    answers
+        .iter()
+        .find_map(|(question, answer)| matches!(answer, Answer::Refusal {}).then_some(question))
 }
 
 /// Each row's input as System One state: text as text, a struct or map as a JSON

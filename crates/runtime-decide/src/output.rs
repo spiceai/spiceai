@@ -206,13 +206,18 @@ fn typed_values<T>(
     rows.iter()
         .map(|row| match row {
             None => Ok(None),
-            Some(answers) => {
-                if let Some(Some(v)) = answers.get(TYPED_QUESTION_ID).map(&value) {
-                    Ok(Some(v))
-                } else {
+            Some(answers) => match answers.get(TYPED_QUESTION_ID) {
+                Some(Answer::Refusal {}) => Ok(None),
+                Some(answer) => match value(answer) {
+                    Some(v) => Ok(Some(v)),
+                    None => {
+                        internal_err!("the model's answer does not match the question it was asked")
+                    }
+                },
+                None => {
                     internal_err!("the model's answer does not match the question it was asked")
                 }
-            }
+            },
         })
         .collect()
 }
@@ -227,10 +232,13 @@ fn decision_array(questions: &BTreeMap<String, Question>, rows: &[RowAnswers]) -
         };
         let mut object = Map::new();
         for (id, question) in questions {
-            let Some(answer) = answers.get(id) else {
-                return exec_err!("the model returned no answer for question '{id}'");
+            let value = match answers.get(id) {
+                // Declined under `on_error => 'null'`: this answer is NULL, the rest stand.
+                Some(Answer::Refusal {}) => Value::Null,
+                Some(answer) => answer_json(id, question, answer)?,
+                None => return exec_err!("the model returned no answer for question '{id}'"),
             };
-            object.insert(id.clone(), answer_json(id, question, answer)?);
+            object.insert(id.clone(), value);
         }
         values.push(json!({ "v": object }));
     }

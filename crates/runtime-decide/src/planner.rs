@@ -43,7 +43,7 @@ use std::sync::Arc;
 
 use datafusion::common::alias::AliasGenerator;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
-use datafusion::common::{Column, DFSchemaRef, DataFusionError, Result, plan_err};
+use datafusion::common::{Column, DFSchemaRef, DataFusionError, NullEquality, Result, plan_err};
 use datafusion::functions::core::expr_fn::get_field;
 use datafusion::logical_expr::expr::ScalarFunction;
 use datafusion::logical_expr::expr_rewriter::NamePreserver;
@@ -51,7 +51,7 @@ use datafusion::logical_expr::logical_plan::{
     Aggregate, Filter, Join, JoinType, LogicalPlan, Projection, Sort, Window,
 };
 use datafusion::logical_expr::utils::{conjunction, split_conjunction_owned};
-use datafusion::logical_expr::{Expr, SortExpr, lit};
+use datafusion::logical_expr::{Expr, Operator, SortExpr, binary_expr, lit};
 use datafusion::optimizer::{OptimizerConfig, OptimizerRule};
 use evaluate_api::Question;
 
@@ -333,7 +333,14 @@ impl DecisionPlacement {
         let mut keys = Vec::with_capacity(on.len());
         for (left_key, right_key) in on {
             if self.has_call(&left_key) || self.has_call(&right_key) {
-                moved.push(left_key.eq(right_key));
+                // A moved key keeps the join's NULL semantics: a join on
+                // `IS NOT DISTINCT FROM` matches a NULL key to a NULL key.
+                moved.push(match null_equality {
+                    NullEquality::NullEqualsNothing => left_key.eq(right_key),
+                    NullEquality::NullEqualsNull => {
+                        binary_expr(left_key, Operator::IsNotDistinctFrom, right_key)
+                    }
+                });
             } else {
                 keys.push((left_key, right_key));
             }
