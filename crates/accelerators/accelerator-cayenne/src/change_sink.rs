@@ -342,7 +342,6 @@ impl ChangeSinkBackend for CayenneChangeSinkBackend {
                 append_validations,
             } => {
                 let batches = if self.table.is_memory_resident_mode()
-                    && self.table.constraints().is_none_or(|keys| keys.is_empty())
                     && batches.iter().any(|batch| batch.num_rows() > 0)
                 {
                     let target = self.context.table.schema();

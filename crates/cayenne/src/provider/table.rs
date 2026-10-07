@@ -31012,14 +31012,15 @@ impl CayenneTableProvider {
         Ok(())
     }
 
-    /// Refuse a keyless permanent-memory append that cannot fit before any
-    /// provider planning or replacement deletion runs. `incoming_bytes` must
-    /// include every normalized input chunk's retained Arrow allocation.
+    /// Refuse a permanent-memory append that cannot fit before any provider
+    /// planning or replacement deletion runs. `incoming_bytes` must include every
+    /// normalized input chunk's retained Arrow allocation. Keyed input counts in
+    /// full: the write buffers its raw input against the same limit before it
+    /// resolves primary-key conflicts.
     ///
     /// This is a rejection preflight, not a capacity reservation. A successful
     /// return does not guarantee that subsequent execution can fit; that write
-    /// must still enforce its limit under its own write-lock hold. Keyed writes
-    /// are not checked because conflict handling can reduce their input.
+    /// must still enforce its limit under its own write-lock hold.
     ///
     /// Replacement filters must be stable predicates over the table schema. A
     /// replacement with matching resident rows proceeds to normal execution:
@@ -31037,7 +31038,7 @@ impl CayenneTableProvider {
         incoming_bytes: u64,
         replacement_filters: Option<&[Expr]>,
     ) -> Result<()> {
-        if !self.is_memory_resident_mode() || !self.pk_column_indices.is_empty() {
+        if !self.is_memory_resident_mode() {
             return Ok(());
         }
         let _guard = self.write_lock.lock().await;
@@ -46477,7 +46478,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn memory_append_preflight_does_not_guess_conflict_reductions() {
+    async fn memory_append_preflight_counts_a_keyed_writes_raw_input() {
         let ctx = SessionContext::new();
         let duplicated = int64_id_batch(&[0; 1000]);
         let cap = duplicated.get_array_memory_size() as u64 / 2;
@@ -46494,11 +46495,27 @@ mod tests {
         )
         .await;
         insert_batch_with_context(&ctx, &provider, int64_id_batch(&[0])).await;
-        provider
-            .preflight_memory_append(duplicated.get_array_memory_size() as u64, None)
+        // Keys that would collapse to one row do not make the raw input fit:
+        // the preflight refuses what the write itself refuses.
+        assert!(matches!(
+            provider
+                .preflight_memory_append(duplicated.get_array_memory_size() as u64, None)
+                .await,
+            Err(Error::MemTierLimitExceeded { .. }),
+        ));
+        let input = MemorySourceConfig::try_new_exec(
+            &[vec![duplicated.clone()]],
+            duplicated.schema(),
+            None,
+        )
+        .expect("input plan");
+        let insert = provider
+            .insert_into(&ctx.state(), input, InsertOp::Append)
             .await
-            .expect("raw input bytes cannot decide a keyed write's capacity");
-        insert_batch_with_context(&ctx, &provider, duplicated).await;
+            .expect("append plan");
+        collect(insert, ctx.task_ctx())
+            .await
+            .expect_err("the write buffers the raw input against the limit");
         assert_eq!(scan_sorted_ids(&provider).await, vec![0]);
     }
 
