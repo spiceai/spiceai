@@ -109,7 +109,9 @@ async fn create_bucket(client: &aws_sdk_s3::Client) -> Result<(), anyhow::Error>
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
-    Err(anyhow::anyhow!("failed to create bucket {BUCKET}: {last_error}"))
+    Err(anyhow::anyhow!(
+        "failed to create bucket {BUCKET}: {last_error}"
+    ))
 }
 
 async fn put_object(
