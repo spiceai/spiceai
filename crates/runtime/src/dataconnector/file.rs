@@ -41,6 +41,9 @@ use super::{
     ParameterSpec, Parameters, listing::ListingTableConnector,
 };
 
+/// Connector name for the local file connector, as it appears in a dataset's `from: file:...`.
+pub const FILE_DATACONNECTOR: &str = "file";
+
 #[derive(Debug)]
 pub struct File {
     params: Parameters,
@@ -87,7 +90,7 @@ impl DataConnectorFactory for FileFactory {
     }
 
     fn prefix(&self) -> &'static str {
-        "file"
+        FILE_DATACONNECTOR
     }
 
     fn parameters(&self) -> &'static [ParameterSpec] {
