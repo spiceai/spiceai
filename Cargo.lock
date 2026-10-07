@@ -18221,16 +18221,19 @@ dependencies = [
 name = "runtime-rate-control"
 version = "2.4.0-unstable"
 dependencies = [
+ "async-trait",
  "futures",
  "governor",
  "object_store 0.13.2",
  "object_store_occ",
  "rand 0.10.1",
  "serde",
+ "serde_json",
  "snafu",
  "tempfile",
  "tokio",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

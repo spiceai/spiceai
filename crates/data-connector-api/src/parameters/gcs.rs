@@ -14,6 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use runtime_parameters::Parameters;
 use snafu::prelude::*;
 use tonic::async_trait;
 
@@ -36,53 +37,60 @@ impl Validator for GcsAuthValidator {
     type Error = Error;
 
     async fn validate(&self, params: &mut ConnectorParams) -> Result<(), Error> {
-        // Check for each authentication method
-        let has_service_account_path = params
-            .parameters
-            .get("service_account_path")
-            .expose()
-            .ok()
-            .is_some();
-        let has_service_account_key = params
-            .parameters
-            .get("service_account_key")
-            .expose()
-            .ok()
-            .is_some();
-
-        // skip_signature must be explicitly "true" to count as an auth method
-        let has_skip_signature = params
-            .parameters
-            .get("skip_signature")
-            .expose()
-            .ok()
-            .is_some_and(|v| v.eq_ignore_ascii_case("true"));
-
-        // application_default_credentials must be explicitly "true" to count as an auth method
-        let has_application_default_credentials = params
-            .parameters
-            .get("application_default_credentials")
-            .expose()
-            .ok()
-            .is_some_and(|v| v.eq_ignore_ascii_case("true"));
-
-        // Count active authentication methods
-        let auth_method_count = [
-            has_service_account_path,
-            has_service_account_key,
-            has_skip_signature,
-            has_application_default_credentials,
-        ]
-        .iter()
-        .filter(|&&b| b)
-        .count();
-
-        if auth_method_count > 1 {
-            return Err(Error::MultipleAuthMethods);
-        }
-
-        Ok(())
+        validate_auth(&params.parameters)
     }
+}
+
+/// Ensures at most one GCS authentication method is set in `parameters`. Their keys
+/// carry no `gcs_` prefix (`service_account_path`, `skip_signature`, ...), as
+/// [`Parameters`] built for the `gcs` prefix stores them.
+///
+/// # Errors
+///
+/// Returns [`Error::MultipleAuthMethods`] when more than one method is set.
+pub fn validate_auth(parameters: &Parameters) -> Result<(), Error> {
+    // Check for each authentication method
+    let has_service_account_path = parameters
+        .get("service_account_path")
+        .expose()
+        .ok()
+        .is_some();
+    let has_service_account_key = parameters
+        .get("service_account_key")
+        .expose()
+        .ok()
+        .is_some();
+
+    // skip_signature must be explicitly "true" to count as an auth method
+    let has_skip_signature = parameters
+        .get("skip_signature")
+        .expose()
+        .ok()
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+
+    // application_default_credentials must be explicitly "true" to count as an auth method
+    let has_application_default_credentials = parameters
+        .get("application_default_credentials")
+        .expose()
+        .ok()
+        .is_some_and(|v| v.eq_ignore_ascii_case("true"));
+
+    // Count active authentication methods
+    let auth_method_count = [
+        has_service_account_path,
+        has_service_account_key,
+        has_skip_signature,
+        has_application_default_credentials,
+    ]
+    .iter()
+    .filter(|&&b| b)
+    .count();
+
+    if auth_method_count > 1 {
+        return Err(Error::MultipleAuthMethods);
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
