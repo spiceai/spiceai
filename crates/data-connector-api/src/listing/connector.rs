@@ -728,6 +728,10 @@ fn extract_location_predicates(filters: &[datafusion_expr::Expr]) -> Option<Vec<
         return None;
     }
 
+    // Drop repeated literals (order preserved) so a file is never scanned twice.
+    let mut seen = std::collections::HashSet::new();
+    values.retain(|v| seen.insert(v.clone()));
+
     if values.is_empty() {
         None
     } else {
@@ -5770,6 +5774,26 @@ mod tests {
             assert!(!plan.contains("EmptyExec"), "new.csv matches: {plan}");
             assert!(plan.contains("new.csv"), "{plan}");
             assert!(!plan.contains("old.csv"), "old.csv is pruned: {plan}");
+            // old.csv and new.csv are each head()ed once; a repeated candidate would add a third.
+            assert_eq!(store.heads(), 2, "each candidate is head()ed once");
+        }
+
+        // Repeated literals must not scan the same object twice.
+        #[tokio::test]
+        async fn case2e_repeated_location_literals_head_the_object_once() {
+            for predicate in [
+                format!("_location = '{NEW_LOC}' AND _location = '{NEW_LOC}'"),
+                format!("_location IN ('{NEW_LOC}', '{NEW_LOC}')"),
+            ] {
+                let store = MatrixStore::new(vec![new_meta()], true);
+                let plan = plan_of(
+                    Arc::clone(&store),
+                    &format!("SELECT other_col FROM t WHERE {predicate}"),
+                )
+                .await;
+                assert!(!plan.contains("EmptyExec"), "new.csv matches: {plan}");
+                assert_eq!(store.heads(), 1, "`{predicate}` heads new.csv once");
+            }
         }
 
         // Case 3: `_location = X AND other_col = 'foo'` — no LIST, scans, and the data
