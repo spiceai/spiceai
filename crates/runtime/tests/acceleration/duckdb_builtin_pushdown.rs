@@ -155,7 +155,14 @@ fn write_digest_source(path: &Path) -> Result<(), anyhow::Error> {
 fn pushed_down_sql(plan: &str) -> String {
     plan.split("base_sql=")
         .skip(1)
-        .map(|tail| tail.split('\n').next().unwrap_or_default().to_string())
+        .map(|tail| {
+            // The rest of the plan's table row: drop the cell padding and border.
+            tail.split('\n')
+                .next()
+                .unwrap_or_default()
+                .trim_end_matches(|c: char| c == '|' || c.is_whitespace())
+                .to_string()
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -1704,6 +1711,57 @@ async fn duckdb_accelerated_approx_distinct_stays_local_and_agrees() -> Result<(
                 "DuckDB-accelerated approx_distinct must agree with local evaluation"
             );
             assert_batches_eq!(["+---+", "| n |", "+---+", "| 4 |", "+---+",], &accelerated);
+
+            rt.shutdown().await;
+            Ok(())
+        })
+        .await
+}
+
+/// An aggregate over a constant federates a scan with no column, which the
+/// unparser renders as `SELECT 1 FROM …` because `DuckDB` has no empty select
+/// list. Until spiceai/datafusion-federation#91 the federation executor asked
+/// `DuckDB` for that statement under a zero-field schema, and the scan failed
+/// with "Unexpected number of columns. Expected: 0, Found: 1".
+#[tokio::test]
+async fn duckdb_accelerator_answers_an_aggregate_over_a_constant() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let dir = tempfile::tempdir()?;
+            let csv = dir.path().join("names.csv");
+            write_csv_source(&csv)?;
+            let from = format!("file://{}", csv.display());
+
+            let app = AppBuilder::new("duckdb_constant_only_aggregate")
+                .with_dataset(duckdb_accelerated(&from, "accelerated"))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            load_runtime_datasets(&rt, LOAD_TIMEOUT).await?;
+
+            // `approx_distinct` stays local on `DuckDB`, so the scan under it
+            // federates with no column.
+            assert_batches_eq!(
+                ["+---+", "| a |", "+---+", "| 1 |", "+---+"],
+                &run_query(&rt, "SELECT approx_distinct(1) AS a FROM accelerated").await?
+            );
+            let plan = to_pretty_display(
+                &run_query(
+                    &rt,
+                    "EXPLAIN SELECT approx_distinct(1) AS a FROM accelerated",
+                )
+                .await?,
+            )?
+            .to_string();
+            assert_eq!(
+                pushed_down_sql(&plan),
+                r#"SELECT 1 FROM "accelerated""#,
+                "plan:\n{plan}"
+            );
 
             rt.shutdown().await;
             Ok(())

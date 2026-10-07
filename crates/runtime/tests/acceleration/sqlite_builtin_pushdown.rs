@@ -55,7 +55,14 @@ fn write_orders_source(path: &Path) -> Result<(), anyhow::Error> {
 fn pushed_down_sql(plan: &str) -> String {
     plan.split("base_sql=")
         .skip(1)
-        .map(|tail| tail.split('\n').next().unwrap_or_default().to_string())
+        .map(|tail| {
+            // The rest of the plan's table row: drop the cell padding and border.
+            tail.split('\n')
+                .next()
+                .unwrap_or_default()
+                .trim_end_matches(|c: char| c == '|' || c.is_whitespace())
+                .to_string()
+        })
         .collect::<Vec<_>>()
         .join("\n")
 }
@@ -138,9 +145,9 @@ async fn sqlite_accelerator_evaluates_unfaithful_builtins_locally() -> Result<()
                     Some("concat("),
                 ),
                 (
-                    // Keep `id` in the projection: a constant-only SELECT over
-                    // the accelerator is an empty federated scan, and the
-                    // SQLite row decoder panics on a zero-field schema.
+                    // A constant-only SELECT federates a scan with no column;
+                    // `sqlite_accelerator_answers_a_constant_only_select`
+                    // covers that shape.
                     "SELECT id, concat(CAST(NULL AS VARCHAR), CAST(NULL AS VARCHAR)) AS c \
                      FROM {table} WHERE id = 1",
                     Some("concat("),
@@ -476,6 +483,62 @@ async fn sqlite_accelerator_answers_a_correlated_subquery_above_a_partly_federat
                 to_pretty_display(&accelerated)?.to_string(),
                 to_pretty_display(&local)?.to_string(),
                 "the SQLite-accelerated answer must agree with local evaluation"
+            );
+
+            rt.shutdown().await;
+            Ok(())
+        })
+        .await
+}
+
+/// A projection of constants only federates a scan with no column, which the
+/// unparser renders as `SELECT 1 FROM …` because `SQLite` has no empty select
+/// list. Until spiceai/datafusion-federation#91 the federation executor asked
+/// `SQLite` for that statement under a zero-field schema: the row decoder
+/// panicked indexing past it, and the dataset answered no query after that.
+#[tokio::test]
+async fn sqlite_accelerator_answers_a_constant_only_select() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let dir = tempfile::tempdir()?;
+            let csv = dir.path().join("orders.csv");
+            write_orders_source(&csv)?;
+            let from = format!("file://{}", csv.display());
+
+            let app = AppBuilder::new("sqlite_constant_only_select")
+                .with_dataset(sqlite_accelerated(&from, "accelerated"))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            load_runtime_datasets(&rt, LOAD_TIMEOUT).await?;
+
+            // `upper` stays local (`SQLite`'s folds only ASCII), so the scan
+            // under it federates with no column.
+            assert_batches_eq!(
+                [
+                    "+---+", "| u |", "+---+", "| A |", "| A |", "| A |", "| A |", "+---+",
+                ],
+                &run_query(&rt, "SELECT upper('a') AS u FROM accelerated").await?
+            );
+            // The dataset still answers afterwards.
+            assert_batches_eq!(
+                [
+                    "+----+", "| id |", "+----+", "| 1  |", "| 2  |", "| 3  |", "| 4  |", "+----+",
+                ],
+                &run_query(&rt, "SELECT id FROM accelerated ORDER BY id").await?
+            );
+            let plan = to_pretty_display(
+                &run_query(&rt, "EXPLAIN SELECT upper('a') AS u FROM accelerated").await?,
+            )?
+            .to_string();
+            assert_eq!(
+                pushed_down_sql(&plan),
+                "SELECT 1 FROM `accelerated`",
+                "plan:\n{plan}"
             );
 
             rt.shutdown().await;
