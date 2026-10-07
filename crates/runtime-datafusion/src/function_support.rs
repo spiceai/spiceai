@@ -265,8 +265,8 @@ pub fn expression_support_for_engine(engine: &str) -> Option<ExpressionSupport> 
 ///   fails with `no such function` or, for `date_trunc`, a cast of the
 ///   truncated `'2026-01'` text back into a timestamp.
 ///
-/// Aggregates (`median`, `approx_distinct`, `string_agg`) and `LIKE` /
-/// `ILIKE` are not names the scalar deny-list can see; they are refused by
+/// Aggregates ([`SQLITE_UNTRANSLATABLE_AGGREGATES`]) and `LIKE` / `ILIKE` are
+/// not names the scalar deny-list can see; they are refused by
 /// [`sqlite_can_translate_aggregate`] and [`sqlite_can_evaluate_expression`].
 pub const SQLITE_DENIED_BUILTINS: &[&str] = &[
     crate::dialect::BTRIM_NAME,
@@ -296,8 +296,8 @@ pub const SQLITE_DENIED_BUILTINS: &[&str] = &[
 /// the right rows, which is the trade the deny-list exists to make.
 ///
 /// Casts and `LIKE`/`ILIKE` are gated by [`sqlite_can_evaluate_expression`].
-/// Aggregates `SQLite` cannot evaluate (`median`, `approx_distinct`,
-/// `string_agg`) are gated by [`sqlite_can_translate_aggregate`].
+/// Aggregates and windows `SQLite` cannot evaluate are gated by
+/// [`sqlite_can_translate_aggregate`] and [`sqlite_can_translate_window`].
 #[must_use]
 pub fn deny_spice_functions_for_sqlite_table_providers() -> FunctionSupport {
     FunctionSupportBuilder::new()
@@ -308,30 +308,47 @@ pub fn deny_spice_functions_for_sqlite_table_providers() -> FunctionSupport {
         .with_window_call_support(Arc::new(sqlite_can_translate_window))
 }
 
-/// Whether this aggregate call can be handed to `SQLite`.
+/// Aggregates `SQLite` has no aggregate of. A federated call fails the query.
 ///
-/// `SQLite` has no `median`, no `approx_distinct` and no `string_agg`
-/// (`group_concat` is not a faithful stand-in: it has no `DISTINCT`/`ORDER BY`
-/// contract matching `DataFusion`). A federated call fails with
-/// `no such function`.
+/// `median`, `approx_distinct`, `string_agg` and `array_agg` fail with
+/// `no such function` (`group_concat` is not a faithful stand-in for
+/// `string_agg`: it has no `DISTINCT`/`ORDER BY` contract matching
+/// `DataFusion`). `first_value`, `last_value` and `nth_value` are window
+/// functions only in `SQLite`, so as an aggregate they fail with
+/// `misuse of window function`.
+const SQLITE_UNTRANSLATABLE_AGGREGATES: &[&str] = &[
+    "median",
+    "approx_distinct",
+    "string_agg",
+    "array_agg",
+    "first_value",
+    "last_value",
+    "nth_value",
+];
+
+/// The same names written as a window, less `first_value`, `last_value` and
+/// `nth_value`, which `SQLite` runs as window functions.
+const SQLITE_UNTRANSLATABLE_WINDOWS: &[&str] =
+    &["median", "approx_distinct", "string_agg", "array_agg"];
+
+/// Whether this aggregate call can be handed to `SQLite`: not one of
+/// [`SQLITE_UNTRANSLATABLE_AGGREGATES`].
 #[must_use]
 pub fn sqlite_can_translate_aggregate(
     call: &datafusion::logical_expr::expr::AggregateFunction,
 ) -> bool {
-    !sqlite_untranslatable_aggregate(call.func.name())
+    !names_one_of(call.func.name(), SQLITE_UNTRANSLATABLE_AGGREGATES)
 }
 
-/// Whether this window call can be handed to `SQLite`.
-///
-/// The same names [`sqlite_can_translate_aggregate`] refuses, written as a
-/// window: `SQLite` has no function of those names in either position.
+/// Whether this window call can be handed to `SQLite`: not one of
+/// [`SQLITE_UNTRANSLATABLE_WINDOWS`].
 #[must_use]
 pub fn sqlite_can_translate_window(call: &datafusion::logical_expr::expr::WindowFunction) -> bool {
-    !sqlite_untranslatable_aggregate(call.fun.name())
+    !names_one_of(call.fun.name(), SQLITE_UNTRANSLATABLE_WINDOWS)
 }
 
-fn sqlite_untranslatable_aggregate(name: &str) -> bool {
-    ["median", "approx_distinct", "string_agg"]
+fn names_one_of(name: &str, denied: &[&str]) -> bool {
+    denied
         .iter()
         .any(|denied| name.eq_ignore_ascii_case(denied))
 }
@@ -1196,7 +1213,11 @@ mod tests {
             regexp_count, regexp_instr, regexp_like, regexp_match, regexp_replace,
         };
         use datafusion::functions_aggregate::approx_distinct::approx_distinct_udaf;
-        use datafusion::functions_aggregate::expr_fn::{approx_distinct, median};
+        use datafusion::functions_aggregate::array_agg::array_agg_udaf;
+        use datafusion::functions_aggregate::expr_fn::{
+            approx_distinct, array_agg, first_value, last_value, median, nth_value,
+        };
+        use datafusion::functions_aggregate::first_last::{first_value_udaf, last_value_udaf};
         use datafusion::functions_aggregate::median::median_udaf;
         let support = deny_spice_functions_for_sqlite_table_providers();
         let month = Expr::Literal(ScalarValue::Utf8(Some("month".into())), None);
@@ -1236,7 +1257,16 @@ mod tests {
             );
         }
 
-        for refused in [median(col("i")), approx_distinct(col("i"))] {
+        // `SQLite` has no aggregate of these names; `first_value`, `last_value`
+        // and `nth_value` exist only as window functions there.
+        for refused in [
+            median(col("i")),
+            approx_distinct(col("i")),
+            array_agg(col("i")),
+            first_value(col("i"), vec![]),
+            last_value(col("i"), vec![]),
+            nth_value(col("i"), 2, vec![col("i").sort(true, false)]),
+        ] {
             assert!(
                 !pushes(&plan_aggregating(refused.clone()), &support),
                 "{refused} must stay local on SQLite"
@@ -1248,11 +1278,18 @@ mod tests {
                 "{refused} must stay local on SQLite"
             );
         }
-        for refused in [median_udaf(), approx_distinct_udaf()] {
+        for refused in [median_udaf(), approx_distinct_udaf(), array_agg_udaf()] {
             assert!(
                 !pushes(&plan_windowing(Arc::clone(&refused), "i"), &support),
                 "a windowed {} must stay local on SQLite",
                 refused.name()
+            );
+        }
+        for window in [first_value_udaf(), last_value_udaf()] {
+            assert!(
+                pushes(&plan_windowing(Arc::clone(&window), "i"), &support),
+                "SQLite runs {} as a window function, so the window must keep its pushdown",
+                window.name()
             );
         }
         assert!(

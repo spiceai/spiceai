@@ -222,6 +222,25 @@ async fn sqlite_accelerator_evaluates_unfaithful_builtins_locally() -> Result<()
                      FROM {table} WHERE region = 'eu'",
                     Some("string_agg("),
                 ),
+                // `SQLite` has no `array_agg`, and `first_value`, `last_value`
+                // and `nth_value` only as window functions: each aggregate
+                // failed remotely.
+                (
+                    "SELECT array_agg(customer ORDER BY id) AS a FROM {table}",
+                    Some("array_agg("),
+                ),
+                (
+                    "SELECT first_value(customer ORDER BY id) AS f FROM {table}",
+                    Some("first_value("),
+                ),
+                (
+                    "SELECT last_value(customer ORDER BY id) AS l FROM {table}",
+                    Some("last_value("),
+                ),
+                (
+                    "SELECT nth_value(customer, 2 ORDER BY id) AS n FROM {table}",
+                    Some("nth_value("),
+                ),
             ];
 
             for (sql, forbidden) in cases {
