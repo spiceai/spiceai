@@ -905,6 +905,85 @@ async fn dynamic_filter_batch_probes_the_lookup_index() {
     println!("composite lookup-index counters: {composite_before:?} -> {composite_after:?}");
 }
 
+/// A fully indexed miss plans an empty scan and sizes an absent-key join at
+/// zero rows even though no per-file access-plan provider is needed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn indexed_miss_has_zero_scan_and_join_statistics() {
+    use datafusion::physical_plan::{StatisticsArgs, StatisticsContext, collect, displayable};
+    use datafusion::prelude::{col, lit};
+    use datafusion_common::stats::Precision;
+
+    const TABLE: &str = "svc_indexed_miss_stats";
+    let fixture = common::TestFixture::new(common::BackendType::Sqlite)
+        .await
+        .expect("fixture");
+    let runtime_env = Arc::new(RuntimeEnv::default());
+    let indexed = build_table(&fixture, TABLE, &INDEX_KEYS, runtime_env).await;
+    insert(&indexed, TABLE, service_rows(0, ROWS)).await;
+    wait_for_index(&indexed, TABLE).await;
+    let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(4));
+    ctx.register_table(TABLE, Arc::clone(&indexed) as Arc<dyn TableProvider>)
+        .expect("register indexed table");
+    let filters = vec![
+        col("\"TenantId\"").eq(lit(MISSING_ACCOUNT)),
+        col("\"ServiceId\"").eq(lit(MISSING_APPLICATION)),
+    ];
+    let before = counters(&indexed);
+    let scan = indexed
+        .scan(&ctx.state(), None, &filters, None)
+        .await
+        .expect("absent-key scan");
+    let after = counters(&indexed);
+    assert_eq!(after.full - before.full, 1, "must probe full coverage");
+    assert_eq!(after.candidate_rows - before.candidate_rows, 0);
+    let scan_stats = StatisticsContext::new()
+        .compute(scan.as_ref(), &StatisticsArgs::new())
+        .expect("empty scan statistics");
+    assert_eq!(scan_stats.num_rows, Precision::Exact(0));
+    let scan_display = displayable(scan.as_ref()).indent(true).to_string();
+    assert!(scan_display.contains("EmptyExec"), "{scan_display}");
+    assert!(
+        collect(scan, ctx.task_ctx())
+            .await
+            .expect("empty scan")
+            .is_empty()
+    );
+
+    let sql = format!(
+        "SELECT s.\"AutoId\" FROM {TABLE} s INNER JOIN {TABLE} b \
+         ON s.\"AutoId\" = b.\"AutoId\" \
+         WHERE b.\"TenantId\" = '{MISSING_ACCOUNT}' \
+         AND b.\"ServiceId\" = '{MISSING_APPLICATION}'"
+    );
+    let join = ctx
+        .sql(&sql)
+        .await
+        .expect("absent-key join")
+        .create_physical_plan()
+        .await
+        .expect("absent-key join plan");
+    let join_stats = StatisticsContext::new()
+        .compute(join.as_ref(), &StatisticsArgs::new())
+        .expect("empty join statistics");
+    assert_eq!(join_stats.num_rows.get_value(), Some(&0));
+    let join_display = displayable(join.as_ref()).indent(true).to_string();
+    assert!(
+        !join_display.contains("mode=Partitioned"),
+        "an absent indexed build must not require a partitioned join:\n{join_display}"
+    );
+    assert!(
+        collect(join, ctx.task_ctx())
+            .await
+            .expect("empty join")
+            .is_empty()
+    );
+    println!(
+        "fully covered absent key: scan rows={:?}, join rows={:?}; \
+         counters={before:?} -> {after:?}\n{scan_display}\n{join_display}",
+        scan_stats.num_rows, join_stats.num_rows
+    );
+}
+
 /// Runtime file restriction skips covered non-candidates while preserving
 /// every uncovered file and the rows it holds.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
