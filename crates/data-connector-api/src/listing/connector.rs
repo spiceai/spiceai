@@ -4785,12 +4785,17 @@ mod tests {
         use datafusion::logical_expr::TableProviderFilterPushDown;
         use datafusion::physical_plan::ExecutionPlan;
         use datafusion_expr::{col, lit};
+        use std::fmt::Write;
 
         fn scanned_files(plan: &Arc<dyn ExecutionPlan>) -> usize {
             if let Some(scan) = plan.downcast_ref::<DataSourceExec>()
                 && let Some(config) = scan.data_source().downcast_ref::<FileScanConfig>()
             {
-                return config.file_groups.iter().map(|group| group.len()).sum();
+                return config
+                    .file_groups
+                    .iter()
+                    .map(datafusion_datasource::file_groups::FileGroup::len)
+                    .sum();
             }
             plan.children()
                 .iter()
@@ -4801,7 +4806,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         // Three one-row files and one fifty-row file, told apart by `_size`.
         for (name, rows) in [("a", 1), ("b", 1), ("c", 1), ("d", 50)] {
-            let content: String = (0..rows).map(|n| format!("{{\"id\": {n}}}\n")).collect();
+            let content = (0..rows).fold(String::new(), |mut content, n| {
+                writeln!(content, "{{\"id\": {n}}}").expect("write to a String");
+                content
+            });
             std::fs::write(dir.path().join(format!("{name}.json")), content)
                 .expect("write json file");
         }
