@@ -337,7 +337,23 @@ impl CayenneTransaction {
         // The read-only participants are validated; only their held write_locks
         // matter now, so drop the `TxnTable`s and keep the guards.
         drop(participants);
-        let mut staged_iter = staged.into_iter();
+        // A statement that staged no rows has nothing to publish: no snapshot,
+        // and no deletions, which only incoming rows make.
+        let mut staged_with_rows = Vec::with_capacity(staged.len());
+        for stage in staged {
+            if stage.publishes_nothing() {
+                if let Err(e) = stage.rollback().await {
+                    tracing::warn!("transaction: staged rollback cleanup failed: {e}");
+                }
+            } else {
+                staged_with_rows.push(stage);
+            }
+        }
+        if staged_with_rows.is_empty() {
+            drop(write_guards);
+            return Ok(TransactionCommit::empty());
+        }
+        let mut staged_iter = staged_with_rows.into_iter();
         let mut prepared: Vec<PreparedTxnCommit> = Vec::new();
         while let Some(stage) = staged_iter.next() {
             match stage.prepare_commit().await {
@@ -388,12 +404,17 @@ impl CayenneTransaction {
         }
 
         // Fuse every table's durable publish into one transaction; commit or none.
-        if let Err(e) = commit_fused(catalog, &mut prepared).await {
-            drop(fence_guards);
-            drop(visibility_guards);
-            drop(write_guards);
-            rollback_prepared(prepared).await;
-            return Err(e);
+        match commit_fused(catalog, &mut prepared).await {
+            Ok(()) => {}
+            Err(FusedFailure::Uncommitted(e)) => {
+                drop(fence_guards);
+                drop(visibility_guards);
+                drop(write_guards);
+                rollback_prepared(prepared).await;
+                return Err(e);
+            }
+            // The catalog may reference the staged files: keep them.
+            Err(FusedFailure::Unknown(e)) => return Err(e),
         }
 
         // 5. Flip in-memory visibility under the held fences. The durable write
@@ -419,14 +440,31 @@ impl CayenneTransaction {
     }
 }
 
+/// A fused commit that failed: never committed, so its staged files may go, or
+/// of unknown outcome, so they stay.
+enum FusedFailure {
+    Uncommitted(Error),
+    Unknown(Error),
+}
+
 /// Fuse every prepared table's durable publish into one `MetastoreTransaction`.
 /// Bounded retry on a busy backend; an `apply` failure is terminal (the whole
 /// multi-table commit aborts). On success every table is durable together.
-async fn commit_fused(catalog: &CayenneCatalog, prepared: &mut [PreparedTxnCommit]) -> Result<()> {
+async fn commit_fused(
+    catalog: &CayenneCatalog,
+    prepared: &mut [PreparedTxnCommit],
+) -> std::result::Result<(), FusedFailure> {
     use turso_shared::{DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS, retry_backoff_delay};
 
+    let first_table = prepared
+        .first()
+        .map(|pc| pc.table_id().to_string())
+        .unwrap_or_default();
     for attempt in 1..=DEFAULT_CONCURRENT_WRITE_MAX_ATTEMPTS {
-        let mut txn = catalog.begin_transaction().await?;
+        let mut txn = catalog
+            .begin_transaction()
+            .await
+            .map_err(|e| FusedFailure::Uncommitted(e.into()))?;
         let mut apply_err = None;
         for pc in prepared.iter_mut() {
             if let Err(e) = pc.apply_in_txn(catalog, txn.as_mut()).await {
@@ -436,9 +474,9 @@ async fn commit_fused(catalog: &CayenneCatalog, prepared: &mut [PreparedTxnCommi
         }
         if let Some(e) = apply_err {
             let _ = txn.rollback().await;
-            return Err(Error::from(e));
+            return Err(FusedFailure::Uncommitted(Error::from(e)));
         }
-        match txn.commit().await {
+        match super::append_commit::commit_transaction(txn, &first_table).await {
             Ok(()) => {
                 // Durably committed — disarm each publish's abort cleanup so its
                 // `Drop` does not delete the now-live deletion-vector files.
@@ -457,12 +495,70 @@ async fn commit_fused(catalog: &CayenneCatalog, prepared: &mut [PreparedTxnCommi
                 );
                 tokio::time::sleep(retry_backoff_delay(attempt)).await;
             }
-            Err(e) => return Err(Error::from(e)),
+            Err(e) => return resolve_failed_fused_commit(catalog, prepared, Error::from(e)).await,
         }
     }
-    Err(Error::WriteConflict {
+    Err(FusedFailure::Uncommitted(Error::WriteConflict {
         table: "<transaction>".to_string(),
-    })
+    }))
+}
+
+/// A COMMIT that reports a failure may still have committed. Every table's
+/// staged snapshot sequence commits with the rest of the shared transaction,
+/// so they are read back before anything is discarded: all present, the
+/// transaction stands; none, it never happened; otherwise the staged files are
+/// kept and each table refuses writes until it is reloaded.
+async fn resolve_failed_fused_commit(
+    catalog: &CayenneCatalog,
+    prepared: &mut [PreparedTxnCommit],
+    error: Error,
+) -> std::result::Result<(), FusedFailure> {
+    let mut committed = 0;
+    let mut unreadable = None;
+    for pc in prepared.iter() {
+        match super::append_commit::snapshot_sequence(catalog, pc.table_id(), pc.snapshot_id())
+            .await
+        {
+            Ok(Some(sequence)) if sequence == pc.snapshot_sequence() => committed += 1,
+            Ok(_) => {}
+            Err(read_error) => {
+                unreadable = Some(read_error);
+                break;
+            }
+        }
+    }
+    match unreadable {
+        None if committed == prepared.len() => {
+            tracing::warn!(
+                "The metastore reported that a transaction failed to commit, but it did commit, so it is published. Cause: {error}"
+            );
+            for pc in prepared.iter_mut() {
+                pc.mark_committed();
+            }
+            Ok(())
+        }
+        None if committed == 0 => Err(FusedFailure::Uncommitted(error)),
+        _ => {
+            for pc in prepared.iter_mut() {
+                pc.retain_after_unknown_outcome();
+            }
+            let read_back = unreadable.map_or_else(
+                || {
+                    format!(
+                        "{committed} of {} tables read back as committed",
+                        prepared.len()
+                    )
+                },
+                |read_error| format!("reading back whether it committed failed too ({read_error})"),
+            );
+            Err(FusedFailure::Unknown(Error::IncompleteWrite {
+                table: "<transaction>".to_string(),
+                message: format!(
+                    "a transaction's commit failed ({error}), and {read_back}. Its files are kept, and writes to its tables are refused until they are reloaded from their catalog. Restart Spice to reload them"
+                ),
+            }))
+        }
+    }
 }
 
 /// Roll back staged-but-unprepared writes: remove each staged snapshot directory.

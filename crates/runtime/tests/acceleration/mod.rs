@@ -35,6 +35,8 @@ mod cayenne_append_timestamptz;
 mod cayenne_maintained_aggregates;
 #[cfg(not(target_os = "windows"))]
 mod cayenne_memory;
+#[cfg(not(target_os = "windows"))]
+mod cayenne_on_conflict_batches;
 #[cfg(feature = "duckdb")]
 mod checkpoint_duckdb;
 #[cfg(feature = "postgres-accel")]
@@ -60,6 +62,8 @@ mod on_conflict;
 #[cfg(feature = "sqlite")]
 mod sqlite_builtin_pushdown;
 
+#[cfg(not(target_os = "windows"))]
+mod newest_by_time;
 #[cfg(not(target_os = "windows"))]
 mod on_conflict_cayenne;
 #[cfg(feature = "duckdb")]

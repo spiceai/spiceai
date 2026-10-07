@@ -114,7 +114,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [candle-layer-norm](#candle-and-its-kernel-crates) | `dfdbfbb953ceeb0366e5e3b69f2933204309d3dd` | `main` |
 | [candle-rotary](#candle-and-its-kernel-crates) | `e12f91a6c8beec5373ccec91a5ccad80619cf065` | `main` |
 | [clickhouse-rs](#clickhouse-rs) | `7e98394f44cfa33919ebc5a92c06d5bddba708bf` | tag `0.2.2` |
-| [datafusion](#datafusion) | `02550cf9462b9f56506b6b1cd07eabf08c46e200` | `spiceai-55` |
+| [datafusion](#datafusion) | `d3cfeacf97faf8be847210c8826a6361fc88437c` | `spiceai-55` |
 | [datafusion-ballista](#datafusion-ballista) | `a7c4c58502a16e2181a26fdb8e937ee005807e5e` | `spiceai-55` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `95b8d664f499a20d7ebf81c4839bf5b675135989` | `spiceai-55` (TEMPORARY: spiceai/datafusion-federation#90) |
 | [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `c1454eef45c3d8442a398cee139389a7f0feab65` | `spiceai-55` (TEMPORARY: spiceai/datafusion-table-providers#85) |
@@ -197,11 +197,21 @@ row here. Its behaviour is covered where the code lives, by
 ## datafusion
 
 Upstream [apache/datafusion](https://github.com/apache/datafusion), branch
-`spiceai-55-patches` (upstream `55.1.0` merged into the previous line). The branch
-also carries upstream's own `[branch-52]` … `[branch-55]` backports; those are
-upstream commits and are not Spice patches. Every row below was re-confirmed present
-at the pinned revision except the Spark `concat` row, whose behaviour upstream
-adopted in 55; the last three rows are new with this line. Fixes cherry-picked from upstream `main` ahead of any release are listed
+`spiceai-55` (upstream `55.2.0-rc1` merged into the previous line in
+spiceai/datafusion#248) and spiceai/datafusion#249, which carries three
+`spiceai-54` patches onto 55. On top of #249 come #240, the metadata-column listing
+pruning that #229 carried on `spiceai-54`, and #251, which gives a file that holds no
+rows no partition-column bounds; the pin is #251's merge commit. Neither changes a
+manifest. #240 threads its metadata filters through the listing calls in
+`catalog-listing`'s `table.rs` and `helpers.rs`, next to the metadata-column rows'
+code, and removes no line of it. The branch also carries
+upstream's own `[branch-52]` … `[branch-55]` backports; those are upstream commits
+and are not Spice patches. The `55.2.0-rc1` merge changed no Spice patch: outside
+`Cargo.lock`, its diff from the previous pin is upstream's `55.1.0...55.2.0-rc1`
+diff hunk for hunk, except `datafusion-spark`'s `quote.rs`, which the fork's backport
+had already made identical to `55.2.0-rc1`'s, so that backport's row is dropped
+(upstream carries the fix as apache/datafusion#25277). #249 adds the four
+rows after the `Date32` one. Fixes cherry-picked from upstream `main` ahead of any release are listed
 below like Spice patches: a re-cut onto a release that already has one drops its row,
 and a re-cut onto one that does not has to carry it.
 
@@ -273,9 +283,13 @@ is the same shape as the loss these guards exist to catch ([#13625](https://gith
 | Eager aggregation reads its statistics through DataFusion 55's `StatisticsContext` (`plan_statistics` in `eager_aggregation.rs`, made in the DataFusion 55 merge) | 55 deprecates `partition_statistics`, and `FilterExec` no longer derives its statistics through it, so a rule still calling it sees no row counts, its cost gate never passes, and the rule silently stops firing. Same rows, lost pushdown — and spiced enables the rule by default. This is how the port first went wrong: the fork's own `eager_aggregation` tests caught the rule not firing | silent (perf) | `crates/runtime/src/datafusion/builder.rs::eager_aggregation_pushes_an_aggregate_below_a_join` — its push side reaches the join through a `FilterExec`, so it fails with `plan_statistics` reverted to `partition_statistics` (measured: the rule declines and no aggregate is planned below the join). In the fork, the 24 `eager_aggregation` tests |
 | Inner and outer join statistics drop each input's `sum_value` (`estimate_join_cardinality` in `datafusion/physical-plan/src/joins/utils.rs`, commit `006f3d21`; upstream `55.1.0` and `main` both carry the input sums through) | DataFusion 55's `AggregateStatistics` answers a bare `SUM(col)` from exact statistics, so `SUM` over an inner or outer join returns the whole input table's sum: `SUM(t.value)` over `t JOIN d … WHERE d.region = 'NA'` answered 209612800, the sum of all of `t`, instead of 806400 | silent (wrong data) | `crates/cayenne/tests/result_correctness_vs_duckdb_test.rs::micro_bench_shapes_full_result_parity_vs_duckdb` (its `micro_join_filter` shape), and the SQLite and TPC-DS/ClickBench parity tests beside it; in the fork, `joins::utils::tests::test_inner_and_outer_joins_drop_input_sums` |
 | Unparser: a `Date32` literal's cast is spelled with the dialect's date type (spiceai/datafusion#237 on `spiceai-54`, carried onto 55 as `fc84f2d1`, spiceai/datafusion#242) | `SQLite` reads `CAST('1994-01-01' AS DATE)` as the number `1994`, so a date range pushed to `SQLite` compares text against a number and matches no row | silent (wrong data) | `crates/data_components/src/federation.rs::tests::a_date_range_unparsed_for_sqlite_keeps_the_rows_it_selects` (with `--features sqlite` it runs the SQL on `SQLite` and counts the rows) |
-| Listing prunes files by metadata-column predicates (`_last_modified`, `_size`, `_location`) before opening them and reports those filters `Exact` (spiceai/datafusion#229 on `spiceai-54`: `135916ca4`, `cf7ddaaec`, `4cf679211`) | Metadata filters stay `Inexact` and are applied above the scan, so every file in the listing is opened: the same rows, at the cost of reading files the filter would have skipped | not carried | none — not carried on 55: nothing in this repo fails without it, so it waits for a guard before it is ported (spiceai/datafusion#240) |
+| Unparser: a join that is another join's right input stays a parenthesised joined table on that join's right, and a LEFT JOIN folds a filter from inside it into its own `ON` (spiceai/datafusion#233 on `spiceai-54`, carried onto 55 as `2288d1a46`, spiceai/datafusion#249) | `a ⋈ (b ⋈ c)` is linearised as `FROM a INNER JOIN c ON b.id = c.id INNER JOIN b ON a.id = b.id`, naming `b` before it is in scope: `PostgreSQL`, `DuckDB` and `SQLite` refuse the statement, and an engine that binds lazily runs a different join tree ([#14373](https://github.com/spiceai/spiceai/issues/14373)) | silent (query failure, or wrong data) | `crates/data_components/src/federation.rs::tests::a_join_that_is_another_joins_right_input_stays_on_its_right` (with `--features sqlite` it runs the SQL on `SQLite` and compares the rows with `DataFusion`'s for the same plan) |
+| Unparser: a `Limit` that is a join input is derived under its scan's own name, whatever the enclosing `SELECT` carries (spiceai/datafusion#234 on `spiceai-54`, carried onto 55 as `917b07021`, spiceai/datafusion#249) | Without a `WHERE` or a projection above the join, the input's `LIMIT` lands on the enclosing query and bounds the join's output instead of that input: `b FULL JOIN (c LIMIT 1)` over `b = {1, 2}`, `c = {1}` returns 1 row where the plan returns 2 ([#14375](https://github.com/spiceai/spiceai/issues/14375)) | silent (wrong data) | `…::a_limit_on_a_join_input_bounds_that_input_rather_than_the_join` (with `--features sqlite`, as above) |
+| The file metadata cache drops an evicted entry's hit counter with it (spiceai/datafusion#245 on `spiceai-54`, for [#12952](https://github.com/spiceai/spiceai/issues/12952)). Upstreamed: 55's single generic `DefaultCache` (apache/datafusion#22613) already prunes its hit map in `evict_entries`, so 55 carries no patch — only #245's regression test, ported as `b4c5b52b4` in spiceai/datafusion#249. The guard stays because it pins the behaviour, not the patch | The cache Cayenne's Vortex footers are read through keeps a `(Path, usize)` counter for every file it ever cached, outside its own memory accounting. Cayenne writes each refresh and compaction under fresh paths, so the map grows for the life of the process — 7.6 MiB to 27.0 MiB of unaccounted heap over 10,000 refreshes at a constant 1,600 live entries, as #245 measured on 54 | silent (memory) | `crates/cayenne/tests/footer_cache_hit_counter_test.rs` |
+| Unparser: the join arms' bookkeeping lives in helper methods, outside `select_to_sql_recursively_inner`'s frame (`cbda233a6`, spiceai/datafusion#249; made on the 55 line to carry #233 and #234, no `spiceai-54` counterpart) | Each level of the unparser's plan walk takes a bigger frame in an unoptimised build — 135,136 B instead of 117,696 B, against 120,576 B before #233 and #234 — so the fork's own `roundtrip_statement` needs 2,112 KiB of stack instead of 1,984 KiB and overflows a 2 MiB test thread, with or without `recursive_protection`. Release builds were not measured | silent (stack overflow, unoptimised builds) | **GAP** — see [Open gaps](#open-gaps): this repo runs tests on 8 MiB threads, so no test here sees the difference deterministically |
+| Listing prunes files by metadata-column predicates (`_last_modified`, `_size`, `_location`) before opening them and reports those filters `Exact` (spiceai/datafusion#229 on `spiceai-54`; ported to `spiceai-55` as spiceai/datafusion#240) | Metadata filters stay `Inexact` and are applied above the scan, so every file in the listing is opened: the same rows, at the cost of reading files the filter would have skipped. The listing connector prunes by `_last_modified` itself (#14264), so a Spice dataset only reads more files; a `ListingTable` built without the connector loses the pruning entirely | silent (perf) | `crates/data-connector-api/src/listing/connector.rs::listing_table_prunes_files_by_a_metadata_column_predicate`, which builds the `ListingTable` without the connector |
+| A file that holds no rows gets no `min`/`max` for its partition columns (spiceai/datafusion#251; upstream `main` still gives it the partition value as an exact bound) | `MIN`/`MAX` of a partition column is answered from the listing's statistics with the value of a partition whose files hold no rows: `max(p)` is `'99'` for a `p=99` directory holding one empty file, where the rows give `'3'`. Upstream `datafusion-python` 54.1.0 with `collect_statistics` answers the same | silent (wrong data) | `crates/data-connector-api/src/listing/connector.rs::max_of_a_partition_column_skips_a_partition_holding_only_an_empty_file` |
 | Unparser: `rescope_projection_over_projection` — a projection over an unaliased derived projection is rescoped rather than left naming qualifiers the derived table hides (made in the DataFusion 55 merge; upstream `55.1.0`, `branch-55` and `main` all lack it) | The unparser emits an unaliased `FROM (SELECT … FROM products AS p LEFT JOIN …)` whose outer `SELECT` still references `"p"."…"`, which the remote engine refuses — DuckDB with "Referenced table p not found" — so the federated query fails ([apache/datafusion#22961](https://github.com/apache/datafusion/issues/22961)'s query). Upstream's own `optimized_duckdb_unparse_preserves_derived_table_scope` passes on the broken output | silent (query failure) | `crates/data_components/src/federation.rs::a_projection_over_a_derived_projection_reads_only_relations_in_scope` unparses the shape in every federation dialect and asserts the outer `SELECT` qualifies no column by a relation the derived table hides — for unique outputs, read by name, and for the same-named pair, merged — that the volatile merge is refused, and, when built with `duckdb`, that `DuckDB` binds the statement. In the fork, `plan_to_sql.rs::test_projection_over_projection_merges_same_named_columns` (the #22961 regression test), `::test_projection_over_projection_reads_unique_columns_by_name` and `::test_projection_over_projection_same_named_columns_over_volatile_is_refused` |
-| `datafusion-spark` `quote.rs` imports its expression types from `datafusion_expr` rather than `datafusion::logical_expr` (commits `4524751d`, `4085e114`; a backport — `55.1.0` has the broken import, upstream `branch-55` and `main` the fixed one) | `datafusion-spark` does not compile with its `core` feature off, which is how this workspace builds it | build | compile-guarded by every crate here that depends on `datafusion-spark` (`crates/runtime`, `crates/runtime-datafusion`, `crates/accelerators/accelerator-duckdb`) |
 | Backport of apache/datafusion#24817: an aggregate builds a dynamic filter only when every aggregate in it can contribute one | The filter is built from the plain-column `MIN`/`MAX` aggregates alone and prunes the rows that decide an expression aggregate beside them, so `MIN(c + 1)` is computed from a subset of the rows | silent (wrong data) | `crates/cayenne/tests/datafusion_dynamic_filter_backports_test.rs::an_aggregate_dynamic_filter_keeps_rows_an_expression_aggregate_needs` |
 | Backport of apache/datafusion#25259, applied over #24428, which it is written against: a filter pushed through an operator has its columns mapped by position, not by name | A join or `TopK` dynamic filter pushed below an operator whose output holds two columns of one name (nested joins, a filter or projection over a join, a `GROUP BY`) lands on the wrong one: the join loses its matches, or `ORDER BY … LIMIT` returns the wrong row | silent (wrong data) | `…::a_join_dynamic_filter_maps_same_named_columns_by_position`, `…::a_topk_dynamic_filter_maps_same_named_columns_by_position` |
 | Backport of apache/datafusion#24248: bitwise `XOR` simplification keeps NULL | `(a # b) # a` is folded to `b` and `a # a` to `0`, so a NULL `a` answers a number | silent (wrong data) | `…::xor_simplification_keeps_null` |
@@ -658,7 +672,7 @@ patch is a build failure, so no behaviour guard applies.
 
 ## Open gaps
 
-**26 rows above are marked GAP** — they have no repo-side guard. Every one of them
+**27 rows above are marked GAP** — they have no repo-side guard. Every one of them
 is accounted for below; `scripts/check_fork_patches.py` fails if that count and this
 sentence disagree, so the list cannot quietly fall behind the tables.
 
@@ -732,3 +746,17 @@ without becoming a flaky timing test:
     `snowflake-rs` streaming batches (memory, not latency — but see the
     `snowflake-rs` note above: it is blocked with the rest of that fork);
     `async-openai` retry-after handling.
+
+**Unoptimised builds only.** No query answers anything differently; what is lost
+is stack headroom in a debug build (release builds were not measured):
+
+11. `datafusion` join-arm helper refactor (`cbda233a6`, spiceai/datafusion#249) —
+    it keeps the unparser's opt-level-0 frame from growing with #233 and #234, which
+    without it push the fork's `roundtrip_statement` past the 2 MiB default test
+    thread (it needs 2,112 KiB without the refactor, 1,984 KiB with it). This repo's
+    tests run on 8 MiB threads (`RUST_MIN_STACK` in `.cargo/config.toml`), so a test
+    here would not reach that limit, and one sized to the fork's 2 MiB thread would fail
+    on any unrelated frame growth instead. At a re-cut, re-run the fork's
+    `cargo test -p datafusion-sql --test sql_integration -- roundtrip_statement` at
+    the default stack: an overflow there means the refactor was dropped or the frame
+    grew again.
