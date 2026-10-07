@@ -98,6 +98,13 @@ pub enum Error {
         "`snapshots.location` '{location}' is not a valid URL, so snapshot notifications cannot be matched to it. Use a location like 's3://my-bucket/spice/snapshots/'. See: {SNAPSHOTS_DOCS}"
     ))]
     InvalidLocation { location: String },
+
+    #[snafu(display(
+        "`snapshots.params` is invalid, so the snapshot location's S3 event notifications cannot be set up. Cause: {source}. Fix the parameter and restart. See: {SNAPSHOTS_DOCS}"
+    ))]
+    InvalidParams {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -173,7 +180,9 @@ impl NotificationConfig {
         else {
             return Ok(None);
         };
-        let params = super::build_s3_parameters(secrets, Some(&raw_params)).await;
+        let params = super::build_s3_parameters(secrets, Some(&raw_params))
+            .await
+            .context(InvalidParamsSnafu)?;
         let queue_url = params
             .get(QUEUE_URL_PARAM)
             .expose()
@@ -1295,6 +1304,29 @@ mod tests {
                 secret_key: "secret".to_string(),
                 session_token: None,
             }
+        );
+    }
+
+    /// An invalid parameter is reported as itself. Falling back to the default parameters
+    /// would also drop `s3_queue_url` and report it as empty.
+    #[tokio::test]
+    async fn resolve_reports_an_invalid_parameter() {
+        let invalid = resolve(&snapshots(
+            "s3://my-bucket/snapshots/",
+            &[("s3_queue_url", QUEUE_URL), ("s3_auth", "public")],
+        ))
+        .await
+        .err()
+        .expect("`s3_auth: public` is not a valid snapshot auth mode");
+        assert!(matches!(invalid, Error::InvalidParams { .. }), "{invalid}");
+        let message = invalid.to_string();
+        assert!(
+            message.contains("s3_auth"),
+            "names the parameter: {message}"
+        );
+        assert!(
+            !message.contains(QUEUE_URL),
+            "keeps the queue URL out: {message}"
         );
     }
 
