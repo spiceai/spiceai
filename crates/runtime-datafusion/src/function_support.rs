@@ -263,8 +263,11 @@ pub fn bigquery_can_evaluate_expression(expr: &Expr, schema: Option<&DFSchema>) 
 /// into an integer, which these engines round where `DataFusion` truncates)
 /// out of the pushdown on that route too; without it the same statement
 /// answered differently through ADBC or ODBC than through the engine's own
-/// connector (issue #14482). `None` for an engine with no such shape, or one
-/// this crate has no gate for, which keeps the plain policy.
+/// connector (issue #14482). `SQLite` is keyed for a different reason: it has
+/// no date, time or interval types, so its gate also keeps every temporal value
+/// local ([`sqlite_driver_can_evaluate_expression`]). `None` for an engine with
+/// no such shape, or one this crate has no gate for, which keeps the plain
+/// policy.
 #[must_use]
 pub fn expression_support_for_engine(engine: &str) -> Option<ExpressionSupport> {
     match engine {
@@ -274,6 +277,7 @@ pub fn expression_support_for_engine(engine: &str) -> Option<ExpressionSupport> 
             Some(Arc::new(crate::dialect::postgres_can_evaluate_expression))
         }
         "mysql" => Some(Arc::new(crate::dialect::mysql_can_evaluate_expression)),
+        "sqlite" => Some(Arc::new(sqlite_driver_can_evaluate_expression)),
         // Documented to round a fractional value cast into an integer, like the
         // engines above; the gate costs them only the cast's pushdown.
         "snowflake" | "athena" => Some(Arc::new(crate::dialect::integer_cast_is_renderable)),
@@ -349,6 +353,33 @@ pub fn sqlite_can_evaluate_expression(expr: &Expr, schema: Option<&DFSchema>) ->
                 .is_ok_and(|from| sqlite_cast_is_faithful(&from, to))
         }
         _ => true,
+    }
+}
+
+/// Whether `SQLite` evaluates this expression node the way `DataFusion` does
+/// when the SQL reaches it through a generic driver — an ADBC `sqlite` driver,
+/// or an ODBC `SQLite` profile — rather than through Spice's own `SQLite`
+/// connector.
+///
+/// Everything [`sqlite_can_evaluate_expression`] refuses, for the same reasons,
+/// and every date, time, timestamp, duration or interval value besides. `SQLite`
+/// has none of those types. The ADBC route unparses with the generic dialect,
+/// which renders `TIMESTAMP '2026-01-30 23:00:00'` as
+/// `CAST('2026-01-30 23:00:00' AS TIMESTAMP)`: `SQLite` gives that cast NUMERIC
+/// affinity and answers the integer `2026`, and since every text value compares
+/// greater than every number, a filter against it selects every row (issue
+/// #14753). A `DATE` literal becomes `2026` the same way, so the canonical date
+/// literal [`sqlite_can_evaluate_expression`] admits — safe only where the
+/// `SQLite` dialect renders it as text — is refused here. An interval renders as
+/// `INTERVAL '1 HOURS'`, which `SQLite` cannot parse (issue #14754). Each of
+/// these stays local, where `DataFusion` evaluates it over the values the driver
+/// returns.
+#[must_use]
+pub fn sqlite_driver_can_evaluate_expression(expr: &Expr, schema: Option<&DFSchema>) -> bool {
+    match expr {
+        Expr::Literal(value, _) => !value.data_type().is_temporal(),
+        Expr::Cast(cast) if cast.field.data_type().is_temporal() => false,
+        _ => sqlite_can_evaluate_expression(expr, schema),
     }
 }
 
@@ -1342,11 +1373,64 @@ mod tests {
                 "{engine} evaluates {harmless} as DataFusion does, so its gate must let it federate"
             );
         }
-        for engine in ["sqlite", "databricks", "flightsql", "unknown"] {
+        for engine in ["databricks", "flightsql", "unknown"] {
             assert!(
                 expression_support_for_engine(engine).is_none(),
                 "{engine} has no gate: it truncates like DataFusion, or no policy exists for it"
             );
+        }
+    }
+
+    /// Regression test for #14753 and #14754: through a generic driver,
+    /// `SQLite` reads a date or timestamp literal as the number its year
+    /// parses to and cannot parse an interval, so every temporal value stays
+    /// local — including the canonical date literal the `SQLite` connector's
+    /// own dialect renders faithfully — while the plain comparisons around
+    /// them keep federating.
+    #[test]
+    fn the_sqlite_driver_gate_keeps_every_temporal_value_local() {
+        let gate = expression_support_for_engine("sqlite")
+            .expect("SQLite reached through a driver needs a gate");
+        let timestamp_literal = cast(
+            lit("2026-01-30 23:00:00"),
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+        );
+        let date_literal = cast(lit("2026-01-31"), DataType::Date32);
+        let refused = [
+            ("a string cast into a timestamp (#14753)", timestamp_literal),
+            ("a canonical string cast into a date", date_literal),
+            (
+                "a timestamp value",
+                lit(ScalarValue::TimestampNanosecond(
+                    Some(1_769_814_000_000_000_000),
+                    None,
+                )),
+            ),
+            ("a date value", lit(ScalarValue::Date32(Some(20_484)))),
+            (
+                "an interval (#14754)",
+                lit(ScalarValue::new_interval_mdn(0, 0, 3_600_000_000_000)),
+            ),
+            ("a TRY_CAST", try_cast(col("v"), DataType::Int64)),
+        ];
+        let schema = DFSchema::try_from(Schema::new(vec![
+            Field::new("v", DataType::Utf8, true),
+            Field::new("n", DataType::Int32, true),
+        ]))
+        .expect("build the test schema");
+        for (what, expr) in refused {
+            assert!(
+                !gate(&expr, Some(&schema)),
+                "{what} must stay local: {expr}"
+            );
+        }
+        for expr in [
+            col("v"),
+            lit("2026-01-31"),
+            lit(1_i64),
+            cast(col("n"), DataType::Int64),
+        ] {
+            assert!(gate(&expr, Some(&schema)), "{expr} must still federate");
         }
     }
 
