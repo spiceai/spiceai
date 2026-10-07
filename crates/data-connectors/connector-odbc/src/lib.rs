@@ -423,7 +423,7 @@ mod test {
             assert!(
                 contains_unsupported_functions(&plan_projecting(rounding.clone()), &support)
                     .expect("the support check must not error"),
-                "the {profile:?} profile rounds {rounding}, so its policy must keep it local"
+                "the {profile:?} profile does not evaluate {rounding} as DataFusion does, so its policy must keep it local"
             );
         }
         for profile in [ODBCProfile::Databricks, ODBCProfile::Unknown] {
@@ -434,20 +434,40 @@ mod test {
                 "the {profile:?} profile evaluates {rounding} as DataFusion does, so the pushdown is kept"
             );
         }
-        // Regression test for #14753 and #14754 on the ODBC route: `SQLite` has
-        // no date, time or interval types, so the profile keeps a timestamp
-        // literal and an interval local.
+        assert_eq!(
+            SQLDialectParam::new("postgresql").0,
+            "postgresql",
+            "the sql_dialect parameter is the engine name the gate keys on"
+        );
+    }
+
+    /// Regression test for #14753 and #14754 on the ODBC route: `SQLite` has
+    /// no date, time or interval types, so the `SQLite` profile keeps a
+    /// timestamp literal, a date literal and an interval local, while a plain
+    /// literal still pushes down.
+    #[test]
+    fn a_temporal_value_stays_local_on_the_odbc_sqlite_profile() {
+        use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder};
+        use datafusion::prelude::lit;
+        use datafusion::scalar::ScalarValue;
+        use datafusion_table_providers::util::supported_functions::contains_unsupported_functions;
+
+        fn plan_projecting(expr: datafusion::prelude::Expr) -> LogicalPlan {
+            LogicalPlanBuilder::values(vec![vec![lit(1_i64)]])
+                .expect("values")
+                .project(vec![expr])
+                .expect("project")
+                .build()
+                .expect("build plan")
+        }
         let sqlite = function_support_for_engine(ODBCProfile::Sqlite.engine());
         for temporal in [
             cast(
                 lit("2026-01-30 23:00:00"),
                 DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Nanosecond, None),
             ),
-            lit(datafusion::scalar::ScalarValue::new_interval_mdn(
-                0,
-                0,
-                3_600_000_000_000,
-            )),
+            cast(lit("2026-01-31"), DataType::Date32),
+            lit(ScalarValue::new_interval_mdn(0, 0, 3_600_000_000_000)),
         ] {
             assert!(
                 contains_unsupported_functions(&plan_projecting(temporal.clone()), &sqlite)
@@ -459,11 +479,6 @@ mod test {
             !contains_unsupported_functions(&plan_projecting(lit(1_i64)), &sqlite)
                 .expect("the support check must not error"),
             "the Sqlite profile must still push down a plain literal"
-        );
-        assert_eq!(
-            SQLDialectParam::new("postgresql").0,
-            "postgresql",
-            "the sql_dialect parameter is the engine name the gate keys on"
         );
     }
 
