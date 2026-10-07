@@ -315,12 +315,10 @@ impl SnapshotRefreshFixture {
 
         let mut dataset = Dataset::new(self.source_from_uri(), DATASET_NAME);
         dataset.params = Some(Params::from_string_map(Self::dataset_params()));
-        // Mark the reader dataset as `read_write` with a non-empty
-        // `on_conflict` map so the runtime's access gate accepts the dataset
-        // (read_write requires either replication or on_conflict). The
-        // on_conflict configuration itself is never exercised because the
-        // refresh_mode: snapshot rejection inside `AcceleratedTable::insert_into`
-        // fires before any write reaches the accelerator.
+        // Mark the reader dataset as `read_write` with `write_mode: acceleration`
+        // so the runtime accepts a file source that cannot take writes. No write
+        // reaches the accelerator: the refresh_mode: snapshot rejection inside
+        // `AcceleratedTable::insert_into` fires first.
         dataset.access = AccessMode::ReadWrite;
         let mut on_conflict = HashMap::new();
         on_conflict.insert("id".to_string(), OnConflictBehavior::Upsert);
@@ -337,6 +335,7 @@ impl SnapshotRefreshFixture {
             snapshots: SnapshotBehavior::Enabled,
             primary_key: Some("id".to_string()),
             on_conflict,
+            write_mode: spicepod::acceleration::WriteMode::Acceleration,
             ..Acceleration::default()
         });
         dataset

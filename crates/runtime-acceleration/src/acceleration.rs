@@ -923,6 +923,22 @@ impl Acceleration {
         }
     }
 
+    /// Whether a refresh keeps the newest version of each key by the dataset's
+    /// `time_column` rather than the last to arrive: a Cayenne acceleration with a
+    /// time column, refreshed `full` or `append` (#14576). A change stream applies
+    /// changes in order. The refresh still keeps the last arrival when its table has
+    /// no primary key, its key holds the time column, or the rows it reads lack it.
+    #[must_use]
+    pub fn orders_versions_by_time(
+        &self,
+        time_column: Option<&str>,
+        refresh_mode: RefreshMode,
+    ) -> bool {
+        self.engine == Engine::Cayenne
+            && time_column.is_some()
+            && matches!(refresh_mode, RefreshMode::Full | RefreshMode::Append)
+    }
+
     /// Returns the `UpsertOptions` if the `on_conflict` behavior is `Upsert`.
     /// Returns `UpsertOptions::default()` if no `on_conflict` is set.
     #[must_use]
