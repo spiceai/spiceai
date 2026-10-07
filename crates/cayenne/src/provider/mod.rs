@@ -2290,8 +2290,55 @@ mod tests {
     /// Live scale widening must drop persisted min/max so a leftover unscaled
     /// bound cannot prune the matching row (123.45 at scale 2 becoming 1.2345
     /// at scale 4).
-    #[tokio::test]
+    #[tokio::test(flavor = "current_thread")]
     async fn schema_evolution_live_decimal_scale_change_drops_statistics() {
+        decimal_scale_statistics_publication(false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn schema_evolution_live_decimal_scale_change_fences_in_flight_statistics() {
+        decimal_scale_statistics_publication(true).await;
+    }
+
+    async fn decimal_scale_statistics_publication(in_flight: bool) {
+        async fn assert_decimal_rows(provider: Arc<CayenneTableProvider>, phase: &str) {
+            let ctx = SessionContext::new();
+            ctx.register_table("decimal_rows", provider)
+                .expect("register rows");
+            for sql in [
+                "SELECT id, amount FROM decimal_rows",
+                "SELECT id, amount FROM decimal_rows WHERE amount = CAST(123.45 AS DECIMAL(14,4))",
+            ] {
+                let batches = ctx
+                    .sql(sql)
+                    .await
+                    .expect("plan decimal rows")
+                    .collect()
+                    .await
+                    .expect("collect decimal rows");
+                let mut actual = Vec::new();
+                for batch in &batches {
+                    assert_eq!(batch.column(0).null_count(), 0, "{phase}: non-NULL key");
+                    assert_eq!(batch.column(1).null_count(), 0, "{phase}: non-NULL amount");
+                    assert_eq!(batch.column(1).data_type(), &DataType::Decimal128(14, 4));
+                    let ids = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("id array");
+                    let amounts = batch
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<Decimal128Array>()
+                        .expect("amount array");
+                    for row in 0..batch.num_rows() {
+                        actual.push((ids.value(row), amounts.value(row)));
+                    }
+                }
+                assert_eq!(actual, vec![(1, 1_234_500_i128)], "{phase}: {sql}");
+                eprintln!("DECIMAL_ROWS {phase} {sql}: {actual:?}");
+            }
+        }
         let temp_dir = TempDir::new().expect("temp dir");
         let db_path = temp_dir.path().join("cayenne_evolution_decimal_scale.db");
         let connection_string = format!("sqlite://{}", db_path.to_string_lossy());
@@ -2335,8 +2382,20 @@ mod tests {
             vec![Arc::new(Int64Array::from(vec![1_i64])), Arc::new(amount)],
         )
         .expect("to build batch");
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *provider.test_pre_maintenance_statistics_hook.lock() = Some(Box::new(move || {
+            Box::pin(async move {
+                let _ = entered_tx.send(());
+                let _ = release_rx.await;
+            })
+        }));
         insert_batch(&provider, batch).await;
 
+        tokio::time::timeout(std::time::Duration::from_secs(30), entered_rx)
+            .await
+            .expect("maintenance must capture the original write")
+            .expect("maintenance reports capture");
         catalog
             .upsert_table_statistics(&crate::metadata::TableStatistics {
                 table_id: table_metadata.table_id.clone(),
@@ -2369,17 +2428,101 @@ mod tests {
             "Decimal128(10,2) -> Decimal128(14,4) must be a scale change"
         );
 
+        if in_flight {
+            // Flush the inline corpus before parking a publisher that owns the
+            // persistence mutex; evolution's checkpoints must be no-ops here.
+            assert_eq!(
+                provider
+                    .checkpoint_inlined_data()
+                    .await
+                    .expect("checkpoint inline"),
+                1
+            );
+            let (publishing_tx, publishing_rx) = tokio::sync::oneshot::channel();
+            let (publish_tx, publish_rx) = tokio::sync::oneshot::channel();
+            *provider.test_statistics_publish_hook.lock() = Some(Box::new(move || {
+                Box::pin(async move {
+                    let _ = publishing_tx.send(());
+                    let _ = publish_rx.await;
+                })
+            }));
+            release_tx.send(()).expect("release queued maintenance");
+            tokio::time::timeout(std::time::Duration::from_secs(30), publishing_rx)
+                .await
+                .expect("publisher must reach persistence")
+                .expect("publisher reports entry");
+            let (evolving_tx, evolving_rx) = tokio::sync::oneshot::channel();
+            let acquired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            *provider.test_schema_statistics_lock_probe.lock() =
+                Some((evolving_tx, Arc::clone(&acquired)));
+            let evolving_provider = Arc::clone(&provider);
+            let evolving_plan = plan.clone();
+            let evolution =
+                tokio::spawn(
+                    async move { evolving_provider.evolve_schema_live(&evolving_plan).await },
+                );
+            tokio::time::timeout(std::time::Duration::from_secs(30), evolving_rx)
+                .await
+                .expect("evolution must reach statistics fence")
+                .expect("evolution reports entry");
+            // These tests use Tokio's current-thread runtime. Evolution signals
+            // immediately before acquiring the mutex, so it has polled that
+            // acquisition before this task resumes. Removing the mutex would
+            // set this flag in the same poll, rather than waiting on publication.
+            assert!(
+                !acquired.load(std::sync::atomic::Ordering::SeqCst),
+                "schema publication must wait for the in-flight statistics publisher"
+            );
+            publish_tx.send(()).expect("release in-flight publisher");
+            evolution
+                .await
+                .expect("evolution task")
+                .expect("live schema evolution");
+            assert!(
+                acquired.load(std::sync::atomic::Ordering::SeqCst),
+                "evolution acquires the fence after the publisher commits"
+            );
+        } else {
+            provider
+                .evolve_schema_live(&plan)
+                .await
+                .expect("live schema evolution");
+            release_tx.send(()).expect("release old-schema maintenance");
+        }
         provider
-            .evolve_schema_live(&plan)
+            .drain_in_flight_maintenance()
             .await
-            .expect("live schema evolution");
+            .expect("drain old-schema maintenance");
+        let persisted = catalog
+            .get_table_statistics(&table_metadata.table_id)
+            .await
+            .expect("read stats");
+        if let Some(stats) = &persisted {
+            for schema in [stored_schema.as_ref(), plan.evolved_schema.as_ref()] {
+                let decoded =
+                    crate::stats::deserialize_file_statistics(&stats.statistics_blob, schema);
+                eprintln!(
+                    "DECIMAL_BOUNDS schema={schema:?} decoded={:?}",
+                    decoded.map(|f| crate::stats::file_statistics_to_df(
+                        &f,
+                        schema,
+                        stats.num_rows
+                    ))
+                );
+            }
+        }
+        assert_decimal_rows(Arc::clone(&provider), "live").await;
+        let catalog_trait: Arc<dyn MetadataCatalog> =
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>;
+        let reopened = Arc::new(
+            CayenneTableProvider::new(table_name, catalog_trait, ctx.runtime_env())
+                .await
+                .expect("reopen decimal table"),
+        );
+        assert_decimal_rows(reopened, "reopened").await;
 
         assert!(
-            catalog
-                .get_table_statistics(&table_metadata.table_id)
-                .await
-                .expect("read table stats")
-                .is_none(),
+            persisted.is_none(),
             "live scale change must drop the table aggregate blob"
         );
         assert!(

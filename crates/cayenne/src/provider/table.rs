@@ -1753,6 +1753,11 @@ impl ScanViewCache {
 /// and `CayenneTableProvider::test_post_catalog_commit_hook`.
 #[cfg(test)]
 type TestPrePublishHook = Box<dyn FnOnce() -> futures::future::BoxFuture<'static, ()> + Send>;
+#[cfg(test)]
+type TestSchemaStatisticsLockProbe = (
+    tokio::sync::oneshot::Sender<()>,
+    Arc<std::sync::atomic::AtomicBool>,
+);
 
 /// Test-only mid-sweep hook: an async callback fired after the orphaned-DV
 /// sweep's fenced eligibility capture and before it unlinks anything. See
@@ -1989,6 +1994,16 @@ pub struct CayenneTableProvider {
     /// sweep holds a now-stale floor. Consumed on first fire.
     #[cfg(test)]
     test_post_capture_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
+    /// One-shot pause after maintenance captures statistics, before persistence.
+    #[cfg(test)]
+    pub(crate) test_pre_maintenance_statistics_hook: Arc<ParkingMutex<Option<TestPrePublishHook>>>,
+    /// One-shot pause while holding the statistics publication mutex.
+    #[cfg(test)]
+    pub(crate) test_statistics_publish_hook: Arc<ParkingMutex<Option<TestPrePublishHook>>>,
+    /// Reports arrival at the schema statistics fence and its acquisition.
+    #[cfg(test)]
+    pub(crate) test_schema_statistics_lock_probe:
+        Arc<ParkingMutex<Option<TestSchemaStatisticsLockProbe>>>,
     /// Test-only seam fired after a demand-cache `capture_raw_scan_input` returns
     /// and before `scan_input_version` is sampled to stamp the capture. A write
     /// in this window used to tag stale rows with the post-write version; the
@@ -5596,6 +5611,23 @@ impl CayenneTableProvider {
         // Step 4: publish.
         {
             let _fence = self.listing_fence.write().await;
+            // A statistics publisher must finish before invalidation, or observe
+            // the evolved schema before accepting its accumulated bounds.
+            #[cfg(test)]
+            let lock_probe =
+                self.test_schema_statistics_lock_probe
+                    .lock()
+                    .take()
+                    .map(|(entered, acquired)| {
+                        let _ = entered.send(());
+                        acquired
+                    });
+            let _stats_persistence_guard = self.table_statistics_persistence_lock.lock().await;
+            #[cfg(test)]
+            if let Some(acquired) = lock_probe {
+                acquired.store(true, Ordering::SeqCst);
+            }
+
             let drop_decimal_stats = plan.changes_decimal_scale();
             if drop_decimal_stats {
                 self.catalog
@@ -9433,6 +9465,12 @@ impl CayenneTableProvider {
             #[cfg(test)]
             test_post_capture_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
+            test_pre_maintenance_statistics_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
+            test_statistics_publish_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
+            test_schema_statistics_lock_probe: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
             test_post_scan_input_capture_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
             test_post_scan_view_selection_hook: Arc::new(ParkingMutex::new(None)),
@@ -11635,6 +11673,14 @@ impl CayenneTableProvider {
             test_post_catalog_commit_hook: Arc::clone(&self.test_post_catalog_commit_hook),
             #[cfg(test)]
             test_post_capture_hook: Arc::clone(&self.test_post_capture_hook),
+            #[cfg(test)]
+            test_pre_maintenance_statistics_hook: Arc::clone(
+                &self.test_pre_maintenance_statistics_hook,
+            ),
+            #[cfg(test)]
+            test_statistics_publish_hook: Arc::clone(&self.test_statistics_publish_hook),
+            #[cfg(test)]
+            test_schema_statistics_lock_probe: Arc::clone(&self.test_schema_statistics_lock_probe),
             #[cfg(test)]
             test_post_scan_input_capture_hook: Arc::clone(&self.test_post_scan_input_capture_hook),
             #[cfg(test)]
@@ -21104,6 +21150,13 @@ impl CayenneTableProvider {
     ) -> CatalogResult<()> {
         let had_stats = state.stats.is_some();
         if let Some(stats) = state.stats {
+            #[cfg(test)]
+            {
+                let hook = self.test_pre_maintenance_statistics_hook.lock().take();
+                if let Some(hook) = hook {
+                    hook().await;
+                }
+            }
             // The net live-row delta (inserts minus supersedes/deletes) was
             // accumulated alongside the coalesced stats. Retention deletes below
             // are not yet netted here (TPC-H has none); compaction's `Set` reset
@@ -28866,6 +28919,11 @@ impl CayenneTableProvider {
         num_rows_update: RowCountUpdate,
         replace_aggregate: bool,
     ) -> bool {
+        if accumulator.schema() != self.table_schema().as_ref() {
+            return self.abandon_table_stats_update(
+                "the accumulated statistics describe a different logical schema",
+            );
+        }
         let Some((new_blob, _new_rows)) = accumulator.to_file_statistics_blob_with_row_count()
         else {
             // A zero-row accumulator abandons nothing, so the cached exactness
@@ -28959,6 +29017,13 @@ impl CayenneTableProvider {
             num_rows_exact,
         };
 
+        #[cfg(test)]
+        {
+            let hook = self.test_statistics_publish_hook.lock().take();
+            if let Some(hook) = hook {
+                hook().await;
+            }
+        }
         if let Err(e) = self.catalog.upsert_table_statistics(&stats).await {
             return self.abandon_table_stats_update(&format!(
                 "the statistics record could not be written: {e}"
@@ -43432,6 +43497,70 @@ mod tests {
         const PAYLOAD_BYTES: usize = 4096;
         const NEW_KEY: i64 = 1_000_000;
 
+        struct ReleaseOnDrop(Arc<tokio::sync::Notify>);
+        impl Drop for ReleaseOnDrop {
+            fn drop(&mut self) {
+                self.0.notify_one();
+            }
+        }
+        async fn assert_all_rows(provider: &CayenneTableProvider, phase: &str) {
+            let ctx = SessionContext::new();
+            ctx.register_table("rows", Arc::new(provider.clone_for_write()))
+                .expect("register diagnostic table");
+            let rows = ctx
+                .sql("SELECT id, payload FROM rows ORDER BY id")
+                .await
+                .expect("plan ordered rows")
+                .collect()
+                .await
+                .expect("collect ordered rows");
+            let mut ordinal = 0_i64;
+            for batch in rows {
+                assert_eq!(
+                    batch.column(0).null_count(),
+                    0,
+                    "input keys must remain non-NULL"
+                );
+                assert_eq!(
+                    batch.column(1).null_count(),
+                    0,
+                    "input values must remain non-NULL"
+                );
+                let ids = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("ids");
+                let payloads = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<arrow::array::StringArray>()
+                    .expect("payloads");
+                for row in 0..batch.num_rows() {
+                    let id = if ordinal == 2 * LARGE_RUN_ROWS {
+                        NEW_KEY
+                    } else {
+                        ordinal
+                    };
+                    assert_eq!(ids.value(row), id, "{phase}: ordered key {ordinal}");
+                    let expected = if id == 0 {
+                        "updated".to_string()
+                    } else if id == NEW_KEY {
+                        "new".to_string()
+                    } else {
+                        format!("{id:08}_{}", entropy_payload(id, PAYLOAD_BYTES))
+                    };
+                    assert_eq!(
+                        payloads.value(row),
+                        expected,
+                        "{phase}: payload for key {id}"
+                    );
+                    ordinal += 1;
+                }
+            }
+            assert_eq!(ordinal, 2 * LARGE_RUN_ROWS + 1);
+        }
+
         let ctx = SessionContext::new();
         let schema: SchemaRef = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
@@ -43493,6 +43622,7 @@ mod tests {
                  would not exercise a small merge under a larger one"
             );
         }
+        park_post_write_compaction(&provider).await;
         drop(setup_guard);
 
         // Runs while the large merge is parked after its CAS.
@@ -43506,6 +43636,18 @@ mod tests {
             let schema = Arc::clone(&schema);
             *provider.test_pre_publish_hook.lock() = Some(Box::new(move || {
                 Box::pin(async move {
+                    let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+                    let release = Arc::new(tokio::sync::Notify::new());
+                    let release_guard = ReleaseOnDrop(Arc::clone(&release));
+                    let release_hook = Arc::clone(&release);
+                    *provider_in_hook.test_pre_publish_hook.lock() = Some(Box::new(move || {
+                        Box::pin(async move {
+                            entered_tx
+                                .send(())
+                                .expect("report competing merge after CAS");
+                            release_hook.notified().await;
+                        })
+                    }));
                     // Upsert a key the large merge is rewriting, then add a key.
                     insert_batch(
                         &provider_in_hook,
@@ -43517,21 +43659,62 @@ mod tests {
                         id_name_batch(&schema, &[NEW_KEY], &["new"]),
                     )
                     .await;
+                    let competitor = provider_in_hook.clone_for_write();
+                    let competing_task = tokio::spawn(async move {
+                        competitor
+                            .compact_protected_snapshots_subset(usize::MAX)
+                            .await
+                    });
+                    tokio::time::timeout(std::time::Duration::from_secs(30), entered_rx)
+                        .await
+                        .expect("competing merge reaches publication barrier within 30s")
+                        .expect("competing merge reports entry");
                     let fresh = provider_in_hook
                         .protected_snapshot_ids()
                         .difference(&large_runs)
                         .count();
-                    // A write-driven pass may already have merged them.
-                    if fresh >= 2 {
-                        let merged = provider_in_hook
-                            .compact_protected_snapshots_subset(usize::MAX)
-                            .await
-                            .expect("small-tier merge must not error");
+                    assert_eq!(
+                        fresh, 2,
+                        "both small inputs remain in the scan view while claimed"
+                    );
+                    assert_eq!(
+                        provider_in_hook
+                            .protected_merge_claims
+                            .lock()
+                            .view()
+                            .min_tier(),
+                        Some(0)
+                    );
+                    assert!(
+                        provider_in_hook.compaction_lock.try_read().is_ok(),
+                        "large merge permits another shared lock"
+                    );
+                    let merged = provider_in_hook
+                        .compact_protected_snapshots_subset(usize::MAX)
+                        .await
+                        .expect("explicit attempt");
+                    drop(release_guard);
+                    competing_task
+                        .await
+                        .expect("competing task join")
+                        .expect("competing task result");
+                    assert!(
+                        !merged,
+                        "claimed small inputs must decline the competing attempt"
+                    );
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                    while provider_in_hook
+                        .protected_snapshot_ids()
+                        .difference(&large_runs)
+                        .count()
+                        != 1
+                    {
                         assert!(
-                            merged,
-                            "the small-tier merge must run while the large merge is in \
-                             flight, not decline on the compaction lock"
+                            std::time::Instant::now() < deadline,
+                            "competing small merge must publish one output; protected={:?}",
+                            provider_in_hook.protected_snapshot_ids()
                         );
+                        tokio::task::yield_now().await;
                     }
                     let protected = provider_in_hook.protected_snapshot_ids();
                     assert!(
@@ -43545,6 +43728,7 @@ mod tests {
                         1,
                         "the fresh runs must merge while the large merge is in flight: {outputs:?}"
                     );
+                    assert_all_rows(&provider_in_hook, "large parked, small committed").await;
                     *small_output.lock() = outputs.into_iter().next();
                     small_merged.store(true, Ordering::SeqCst);
                 })
@@ -43577,6 +43761,7 @@ mod tests {
             "both merges must release their claims"
         );
 
+        assert_all_rows(&provider, "both committed").await;
         // Every key once, the upsert wins, and the new key is visible.
         ctx.register_table(
             "small_tier_under_large_merge",
