@@ -40,7 +40,11 @@ use opentelemetry::KeyValue;
 use runtime_api_types::v1::ComponentType;
 use runtime_metrics::component::{MetricSpec, MetricType, MetricsProvider, ObserveMetricCallback};
 use runtime_parameters::{ParameterSpec, Parameters};
-use runtime_rate_control::{JitterConfig, RateController, RateControllerMetrics};
+pub use runtime_rate_control::AdaptiveRateControl;
+use runtime_rate_control::{
+    AdaptiveRateControlError, DEFAULT_ADAPTIVE_FAILURE_THRESHOLD, JitterConfig,
+    LeasedBucketMetrics, RateController, RateControllerMetrics,
+};
 use tokio::sync::RwLock;
 use url::Url;
 
@@ -51,6 +55,9 @@ const RUNTIME_REQUESTS_PER_SECOND_LIMIT: &str = "http_requests_per_second_limit"
 const RUNTIME_REQUESTS_PER_MINUTE_LIMIT: &str = "http_requests_per_minute_limit";
 const RUNTIME_RATE_CONTROL_JITTER_MIN: &str = "http_rate_control_jitter_min";
 const RUNTIME_RATE_CONTROL_JITTER_MAX: &str = "http_rate_control_jitter_max";
+const RUNTIME_RATE_CONTROL_FAILURE_THRESHOLD: &str = "http_rate_control_failure_threshold";
+const RUNTIME_RATE_CONTROL_WINDOW: &str = "http_rate_control_window";
+const RUNTIME_RATE_CONTROL_ACQUIRE_TIMEOUT: &str = "http_rate_control_acquire_timeout";
 
 /// Every `http_*` rate-control key this module reads from `runtime.params`.
 /// Exposed as the authoritative list for this family; the startup unknown-param
@@ -63,6 +70,9 @@ pub const HTTP_RATE_CONTROL_RUNTIME_PARAMS: &[&str] = &[
     RUNTIME_REQUESTS_PER_MINUTE_LIMIT,
     RUNTIME_RATE_CONTROL_JITTER_MIN,
     RUNTIME_RATE_CONTROL_JITTER_MAX,
+    RUNTIME_RATE_CONTROL_FAILURE_THRESHOLD,
+    RUNTIME_RATE_CONTROL_WINDOW,
+    RUNTIME_RATE_CONTROL_ACQUIRE_TIMEOUT,
 ];
 const MIN_PERSISTED_INSTANCE_TTL: Duration = Duration::from_secs(5);
 
@@ -132,16 +142,53 @@ pub fn global_registry() -> Arc<HttpRateControlRegistry> {
     Arc::clone(&GLOBAL_HTTP_RATE_CONTROL_REGISTRY)
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+/// One origin's rate control: the configured limits, and how adaptive control
+/// scales them down while the origin fails.
+///
+/// Rate control is always adaptive. On a healthy origin, or with a connector
+/// that reports no request outcomes, adaptive control applies the configured
+/// limits unchanged. With no configured limit there is nothing to scale.
+#[derive(Clone, Debug, PartialEq)]
 pub struct HttpRateControlConfig {
     pub max_concurrent_requests: Option<usize>,
     pub requests_per_second: Option<NonZeroU32>,
     pub requests_per_minute: Option<NonZeroU32>,
     pub jitter_min: Duration,
     pub jitter_max: Duration,
+    /// The adaptive tuning: the failure threshold and the reaction window.
+    pub adaptive: AdaptiveRateControl,
+    /// Upper bound on how long a request waits to acquire rate-control capacity
+    /// before failing instead of waiting indefinitely. `None` = wait
+    /// indefinitely. `Some(ZERO)` is normalized to `None` at build time.
+    pub acquire_timeout: Option<Duration>,
 }
 
 impl HttpRateControlConfig {
+    /// A config with no limits and no jitter, and the default adaptive tuning
+    /// (inert, because there is no limit to scale). The state a limiter starts
+    /// in before any parameter is applied.
+    #[must_use]
+    pub fn disabled() -> Self {
+        Self {
+            max_concurrent_requests: None,
+            requests_per_second: None,
+            requests_per_minute: None,
+            jitter_min: Duration::ZERO,
+            jitter_max: Duration::ZERO,
+            adaptive: AdaptiveRateControl::default(),
+            acquire_timeout: None,
+        }
+    }
+
+    /// Fill the acquire-timeout bound from the connector's request timeouts when
+    /// the user set no explicit `rate_control_acquire_timeout`. A parsed explicit
+    /// `0` (`Some(ZERO)`) is left untouched so it still disables the bound.
+    pub fn apply_default_acquire_timeout(&mut self, client_timeout: Duration) {
+        if self.acquire_timeout.is_none() {
+            self.acquire_timeout = Some(default_acquire_timeout(client_timeout));
+        }
+    }
+
     #[must_use]
     pub fn is_enabled(&self) -> bool {
         self.max_concurrent_requests.is_some()
@@ -149,6 +196,15 @@ impl HttpRateControlConfig {
             || self.requests_per_minute.is_some()
             || !self.jitter_min.is_zero()
             || !self.jitter_max.is_zero()
+    }
+
+    /// Whether the origin defines any rate limit for adaptive control to scale.
+    /// Without one, adaptive control is a no-op.
+    #[must_use]
+    pub fn has_limit(&self) -> bool {
+        self.max_concurrent_requests.is_some()
+            || self.requests_per_second.is_some()
+            || self.requests_per_minute.is_some()
     }
 }
 
@@ -307,6 +363,66 @@ impl HttpRateControlMetrics {
             .unwrap_or_default()
     }
 
+    /// The fraction of the configured limits currently admitted, in `[0, 1]`:
+    /// `1` means "admit everything", lower means the origin is throttled. `None`
+    /// when the origin has no limit to adapt, and in cluster rate control until
+    /// the first window is leased. Single-node rate control reads it live, so it
+    /// reflects window decay between scrapes; cluster rate control reports the
+    /// value the shared state fixed for the last leased window.
+    #[must_use]
+    pub fn adaptive_admission_ratio(&self) -> Option<f64> {
+        self.rate_controller
+            .read()
+            .ok()
+            .and_then(|controller| {
+                controller
+                    .as_ref()
+                    .and_then(|controller| controller.admission_coefficient())
+            })
+            .map(|coefficient| coefficient.clamp(0.0, 1.0))
+    }
+
+    /// Requests adaptive rate control has throttled, or `None` when the origin's
+    /// limits do not adapt — a throttle that cannot happen reports no series
+    /// rather than a `0` that reads as a healthy origin.
+    #[must_use]
+    pub fn adaptive_throttled_total(&self) -> Option<u64> {
+        let adaptive_enabled = self
+            .rate_controller
+            .read()
+            .ok()
+            .and_then(|controller| {
+                controller
+                    .as_ref()
+                    .map(|controller| controller.admission_coefficient().is_some())
+            })
+            .unwrap_or(false);
+        adaptive_enabled
+            .then(|| self.rate_controller_metric(RateControllerMetrics::adaptive_throttled_total))
+    }
+
+    /// One value per leased bucket, as `(limiter_key, value)` pairs. Empty
+    /// unless cluster rate control is active: an origin whose limits are local
+    /// leases nothing, and reports no series rather than a row of zeros.
+    fn leased_bucket_metric(
+        &self,
+        observe_metric: impl Fn(&LeasedBucketMetrics) -> u64,
+    ) -> Vec<(String, u64)> {
+        self.rate_controller
+            .read()
+            .ok()
+            .map(|controller| {
+                controller.as_ref().map_or_else(Vec::new, |controller| {
+                    controller
+                        .leased_bucket_metrics()
+                        .into_iter()
+                        .map(|(limiter, metrics)| (limiter, observe_metric(&metrics)))
+                        .collect()
+                })
+            })
+            .unwrap_or_default()
+    }
+
     fn rate_controller_metric(
         &self,
         observe_metric: impl FnOnce(&RateControllerMetrics) -> u64,
@@ -416,6 +532,42 @@ pub const HTTP_RATE_CONTROL_METRIC_SPECS: &[MetricSpec] = &[
     .description("Current remaining HTTP Retry-After or RateLimit reset cooldown for this upstream origin")
     .unit("ms")
     .auto_register(),
+    MetricSpec::new("rate_control_lease_granted", MetricType::ObservableGaugeU64)
+        .description("Tokens this instance holds in the current cluster rate-control window, per limiter")
+        .auto_register(),
+    MetricSpec::new(
+        "rate_control_cluster_budget_remaining",
+        MetricType::ObservableGaugeU64,
+    )
+    .description("Tokens of the current cluster rate-control window not yet leased by any instance, per limiter")
+    .auto_register(),
+    MetricSpec::new(
+        "rate_control_lease_refresh_errors_total",
+        MetricType::ObservableCounterU64,
+    )
+    .description("Total failures to read or write the shared cluster rate-control state, per limiter")
+    .auto_register(),
+    MetricSpec::new(
+        "rate_control_fail_closed_total",
+        MetricType::ObservableCounterU64,
+    )
+    .description("Total HTTP requests refused because the cluster rate-control store was unreachable and this instance's lease had expired, per limiter")
+    .auto_register(),
+    // TODO(#14136): honor server-advertised RateLimit/RateLimit-Policy headers
+    // (the IETF advertised-quota headers) here, alongside the reset-hint metrics
+    // above, once that separate work lands.
+    MetricSpec::new(
+        "rate_control_adaptive_admission_ratio",
+        MetricType::ObservableGaugeF64,
+    )
+    .description("Fraction of the configured HTTP rate limits currently admitted for this upstream origin (1 = admit all); absent when no limit is configured, and with cluster rate control until the first window is leased")
+    .auto_register(),
+    MetricSpec::new(
+        "rate_control_adaptive_throttled_total",
+        MetricType::ObservableCounterU64,
+    )
+    .description("Total HTTP requests adaptive rate control throttled for this upstream origin (charged an above-normal weight because the origin was failing); 0 while the origin has stayed healthy and always 0 with cluster rate control, which lowers the shared budget instead of charging a heavier weight; absent when no limit is configured")
+    .auto_register(),
 ];
 
 #[derive(Debug, Clone)]
@@ -488,6 +640,51 @@ impl MetricsProvider for HttpRateControlMetricsProvider {
             }};
         }
 
+        // For a metric that does not apply to this origin: observe nothing, so
+        // the series is absent rather than a constant `0`.
+        macro_rules! observe_optional_metric {
+            ($value:expr) => {{
+                Some(ObserveMetricCallback::U64(Box::new(move |observer| {
+                    if should_observe_metrics(metric_source.as_ref())
+                        && let Some(value) = $value
+                    {
+                        observer.observe(value, &attributes);
+                    }
+                })))
+            }};
+        }
+
+        // One series per leased bucket. Cluster rate control leases the
+        // per-second and per-minute quotas separately, and they throttle
+        // independently, so a single value for the origin would hide which
+        // limit is binding.
+        macro_rules! observe_per_limiter_metric {
+            ($observe_metric:expr) => {{
+                Some(ObserveMetricCallback::U64(Box::new(move |observer| {
+                    if !should_observe_metrics(metric_source.as_ref()) {
+                        return;
+                    }
+                    for (limiter, value) in metrics.leased_bucket_metric($observe_metric) {
+                        let mut series = attributes.clone();
+                        series.push(KeyValue::new("limiter", limiter));
+                        observer.observe(value, &series);
+                    }
+                })))
+            }};
+        }
+
+        macro_rules! observe_optional_f64_metric {
+            ($value:expr) => {{
+                Some(ObserveMetricCallback::F64(Box::new(move |observer| {
+                    if should_observe_metrics(metric_source.as_ref())
+                        && let Some(value) = $value
+                    {
+                        observer.observe(value, &attributes);
+                    }
+                })))
+            }};
+        }
+
         match metric.name {
             "inflight_operations" => observe_metric!(
                 metrics.rate_controller_metric(RateControllerMetrics::inflight_permits)
@@ -531,6 +728,24 @@ impl MetricsProvider for HttpRateControlMetricsProvider {
             "rate_limit_retry_after_remaining_ms" => observe_metric!(
                 metrics.rate_limiter_metric(HttpRateLimiterMetrics::retry_after_remaining_ms)
             ),
+            "rate_control_adaptive_admission_ratio" => {
+                observe_optional_f64_metric!(metrics.adaptive_admission_ratio())
+            }
+            "rate_control_adaptive_throttled_total" => {
+                observe_optional_metric!(metrics.adaptive_throttled_total())
+            }
+            "rate_control_lease_granted" => {
+                observe_per_limiter_metric!(LeasedBucketMetrics::lease_granted)
+            }
+            "rate_control_cluster_budget_remaining" => {
+                observe_per_limiter_metric!(LeasedBucketMetrics::cluster_budget_remaining)
+            }
+            "rate_control_lease_refresh_errors_total" => {
+                observe_per_limiter_metric!(LeasedBucketMetrics::lease_refresh_errors_total)
+            }
+            "rate_control_fail_closed_total" => {
+                observe_per_limiter_metric!(LeasedBucketMetrics::fail_closed_total)
+            }
             _ => None,
         }
     }
@@ -541,7 +756,7 @@ fn should_observe_metrics(metric_source: Option<&HttpRateControlMetricSource>) -
 }
 
 #[must_use]
-pub fn parameter_specs() -> [ParameterSpec; 5] {
+pub fn parameter_specs() -> [ParameterSpec; 8] {
     [
         ParameterSpec::runtime("max_concurrent_requests")
             .description("Maximum number of concurrent HTTP requests to the same upstream origin. Overrides runtime.params.http_max_concurrent_requests when set. If both are unset, connector-level concurrency limiting is disabled."),
@@ -553,18 +768,64 @@ pub fn parameter_specs() -> [ParameterSpec; 5] {
             .description("Minimum random delay added before HTTP requests when rate control is active. Overrides runtime.params.http_rate_control_jitter_min when set. Accepts durations such as '5ms' or '0ms'. Defaults to 5ms when a request-rate limit is configured, otherwise 0ms."),
         ParameterSpec::runtime("rate_control_jitter_max")
             .description("Maximum random delay added before HTTP requests when rate control is active. Overrides runtime.params.http_rate_control_jitter_max when set. Accepts durations such as '10ms' or '0ms'. Defaults to 10ms when a request-rate limit is configured, otherwise 0ms."),
+        ParameterSpec::runtime("rate_control_acquire_timeout")
+            .description("Maximum time a request waits to acquire HTTP rate-control capacity (a concurrency slot and the per-second/minute quota) before failing instead of waiting indefinitely. Accepts durations such as '30s' or '500ms'. Defaults to the connector's `client_timeout`. '0' disables the bound. Overrides runtime.params.http_rate_control_acquire_timeout when set."),
+        ParameterSpec::runtime("rate_control_failure_threshold")
+            .description("The upstream error rate above which adaptive rate control begins throttling, as a percentage like '25%' or a fraction like '0.25'. Below this error rate the configured limits are used unchanged; above it, admission is scaled down in proportion to the success rate, always within the configured limits. With runtime.state.location set, every instance derives the same admission from the shared state, so the cluster backs off together; cluster rate control scales requests_per_second_limit and requests_per_minute_limit only, never the instance-local max_concurrent_requests. Overrides runtime.params.http_rate_control_failure_threshold when set. Defaults to 10%."),
+        ParameterSpec::runtime("rate_control_window")
+            .description("The reaction and recovery window for adaptive rate control, as a duration such as '10s' — the half-life over which request outcomes decay. A shorter window reacts to and recovers from failures faster; a longer one is smoother and slower. Overrides runtime.params.http_rate_control_window when set. Defaults to 10s, or to runtime.source_rate_control.refresh_interval when cluster rate control is in use (runtime.state.location is set), where the shared state records outcomes one window at a time and a value shorter than one refresh_interval is raised to one."),
     ]
 }
 
 /// Resolve a component's rate-control configuration from its own parameters,
 /// falling back to the matching `runtime.params` key.
 ///
+/// For connectors that declare every parameter in [`parameter_specs`] and report
+/// request outcomes, so adaptive rate control can take effect.
+///
+/// # Errors
+/// Returns an invalid-configuration error when a `max_concurrent_requests`,
+/// `requests_per_second_limit` or `requests_per_minute_limit` value does not
+/// parse as a non-zero integer, a `rate_control_jitter_min` /
+/// `rate_control_jitter_max` / `rate_control_acquire_timeout` value does not
+/// parse as a duration, or a `rate_control_failure_threshold` /
+/// `rate_control_window` value is invalid.
+pub fn resolve_config_for_component<S: BuildHasher>(
+    params: &Parameters,
+    runtime_params: Option<&HashMap<String, String, S>>,
+    connector_component: &ConnectorComponent,
+    dataconnector: &'static str,
+) -> DataConnectorResult<HttpRateControlConfig> {
+    Ok(HttpRateControlConfig {
+        adaptive: resolve_adaptive_rate_control(
+            params,
+            runtime_params,
+            connector_component,
+            dataconnector,
+        )?,
+        ..resolve_limits_for_component(params, runtime_params, connector_component, dataconnector)?
+    })
+}
+
+/// Resolve the limits (concurrency, request rate, jitter) and the acquire
+/// timeout of a component's rate-control configuration; the adaptive tuning
+/// takes its defaults.
+///
+/// For connectors that do not yet report request outcomes and so declare only
+/// the limit, jitter and acquire-timeout parameters of [`parameter_specs`].
+/// Their adaptive controller never sees a failure, so it applies the configured
+/// limits unchanged and its tuning has no effect. The
+/// `rate_control_failure_threshold` and `rate_control_window` parameters are
+/// not read: such a connector does not declare them, and looking up an
+/// undeclared parameter panics.
+///
 /// # Errors
 /// Returns an invalid-configuration error when a `max_concurrent_requests`,
 /// `requests_per_second_limit` or `requests_per_minute_limit` value does not
 /// parse as a non-zero integer, or a `rate_control_jitter_min` /
-/// `rate_control_jitter_max` value does not parse as a duration.
-pub fn resolve_config_for_component<S: BuildHasher>(
+/// `rate_control_jitter_max` / `rate_control_acquire_timeout` value does not
+/// parse as a duration.
+pub fn resolve_limits_for_component<S: BuildHasher>(
     params: &Parameters,
     runtime_params: Option<&HashMap<String, String, S>>,
     connector_component: &ConnectorComponent,
@@ -597,6 +858,15 @@ pub fn resolve_config_for_component<S: BuildHasher>(
         )?,
         jitter_min: Duration::ZERO,
         jitter_max: Duration::ZERO,
+        adaptive: AdaptiveRateControl::default(),
+        acquire_timeout: parse_optional_duration_param(
+            params,
+            runtime_params,
+            connector_component,
+            dataconnector,
+            "rate_control_acquire_timeout",
+            RUNTIME_RATE_CONTROL_ACQUIRE_TIMEOUT,
+        )?,
     };
 
     with_jitter(
@@ -606,6 +876,81 @@ pub fn resolve_config_for_component<S: BuildHasher>(
         dataconnector,
         config,
     )
+}
+
+/// Resolve the two adaptive tuning parameters. Each one falls back to its
+/// matching `runtime.params.http_*` default.
+///
+/// The tuning parameters are `rate_control_failure_threshold` (the error rate
+/// above which throttling begins, as a percentage or a fraction, default 10%)
+/// and `rate_control_window` (the reaction/recovery decay half-life, default
+/// 10s).
+///
+/// # Errors
+/// Returns an invalid-configuration error for a failure threshold that is not an
+/// error rate between 0 and 1, or a window that is not a positive, finite
+/// duration.
+fn resolve_adaptive_rate_control<S: BuildHasher>(
+    params: &Parameters,
+    runtime_params: Option<&HashMap<String, String, S>>,
+    connector_component: &ConnectorComponent,
+    dataconnector: &'static str,
+) -> DataConnectorResult<AdaptiveRateControl> {
+    let failure_threshold = parse_optional_failure_threshold_param(
+        params,
+        runtime_params,
+        connector_component,
+        dataconnector,
+    )?
+    .unwrap_or(DEFAULT_ADAPTIVE_FAILURE_THRESHOLD);
+    // Left as `None` when unset so single-node and cluster rate control can
+    // each apply their own default: a single node decays over
+    // `DEFAULT_ADAPTIVE_WINDOW`, a cluster over one
+    // `refresh_interval`, which is the shortest half-life its shared state can
+    // express.
+    let window = parse_optional_duration_param(
+        params,
+        runtime_params,
+        connector_component,
+        dataconnector,
+        "rate_control_window",
+        RUNTIME_RATE_CONTROL_WINDOW,
+    )?;
+
+    match window {
+        Some(window) => AdaptiveRateControl::new(failure_threshold, window),
+        None => AdaptiveRateControl::with_default_window(failure_threshold),
+    }
+    .map_err(|error| {
+        let (param_name, runtime_param_name, detail) = match error {
+            AdaptiveRateControlError::FailureThresholdInvalid { failure_threshold } => (
+                "rate_control_failure_threshold",
+                RUNTIME_RATE_CONTROL_FAILURE_THRESHOLD,
+                format!(
+                    "the failure threshold must be an error rate above 0% and below 100%, but got {:.0}%. It is the error rate above which throttling begins. Use a value such as '25%' or '0.25'.",
+                    failure_threshold * 100.0
+                ),
+            ),
+            AdaptiveRateControlError::WindowInvalid { .. } => (
+                "rate_control_window",
+                RUNTIME_RATE_CONTROL_WINDOW,
+                "the window must be a positive, finite duration such as '10s'. A shorter window reacts and recovers faster.".to_string(),
+            ),
+        };
+        let display_name = runtime_or_dataset_param_name(
+            params,
+            runtime_params,
+            param_name,
+            runtime_param_name,
+        );
+        DataConnectorError::InvalidConfigurationNoSource {
+            dataconnector: dataconnector.to_string(),
+            connector_component: connector_component.clone(),
+            message: format!(
+                "The '{display_name}' parameter is invalid: {detail} See: https://spiceai.org/docs/components/data-connectors/https"
+            ),
+        }
+    })
 }
 
 impl HttpRateControlRegistry {
@@ -691,6 +1036,22 @@ impl HttpRateControlRegistry {
     }
 
     pub async fn shared_rate_limiter(&self, base_url: &Url) -> Arc<HttpRateLimiter> {
+        self.shared_rate_limiter_for_config(base_url, &HttpRateControlConfig::disabled())
+            .await
+    }
+
+    /// The per-origin rate limiter, built on first use. This limiter handles only
+    /// server-advertised cooldowns (`Retry-After` / `RateLimit` reset headers);
+    /// the origin's configured limits and their adaptive scaling are enforced by
+    /// the separate [`RateController`]. One origin gets one limiter.
+    ///
+    /// `_config` is retained for call-site symmetry with the controller
+    /// reservation path; the limiter itself no longer depends on it.
+    pub async fn shared_rate_limiter_for_config(
+        &self,
+        base_url: &Url,
+        _config: &HttpRateControlConfig,
+    ) -> Arc<HttpRateLimiter> {
         let key = rate_control_key(base_url);
         let rate_limiters = self.rate_limiters.read().await;
         if let Some(rate_limiter) = rate_limiters.get(&key) {
@@ -702,7 +1063,7 @@ impl HttpRateControlRegistry {
         Arc::clone(
             rate_limiters
                 .entry(key)
-                .or_insert_with(|| Arc::new(HttpRateLimiter::new())),
+                .or_insert_with(|| Arc::new(HttpRateLimiter::default())),
         )
     }
 
@@ -921,8 +1282,10 @@ fn build_shared_rate_controller(
             controller: None,
         };
     }
+    warn_about_inert_cluster_settings(origin_key, config, persisted_state);
 
     let mut builder = RateController::builder()
+        .with_origin(origin_key)
         .with_jitter(JitterConfig::new(config.jitter_min, config.jitter_max));
     if let Some(persisted_state) = persisted_state {
         builder = builder.with_object_store_persistence_for_instance(
@@ -949,11 +1312,52 @@ fn build_shared_rate_controller(
             Quota::per_minute(requests_per_minute),
         );
     }
+    // With no configured limit there is nothing to scale. A persisted (cluster)
+    // controller gives the settings to its leased buckets, which scale the
+    // cluster request-rate budget, not the local concurrency limit.
+    if config.has_limit() {
+        builder = builder.with_adaptive(config.adaptive, origin_key);
+    }
+    // A zero timeout means "no bound" (wait indefinitely), matching the param
+    // docs. It is the only spelling for that: parsing rejects 'inf'.
+    if let Some(acquire_timeout) = config.acquire_timeout
+        && !acquire_timeout.is_zero()
+    {
+        builder = builder.with_acquire_timeout(acquire_timeout);
+    }
 
     SharedRateController {
         config: config.clone(),
         controller: Some(builder.build()),
     }
+}
+
+/// Warn about a cluster rate-control setting that will not do what it looks like
+/// it does for this origin.
+///
+/// Cluster rate control leases the per-second and per-minute request quotas
+/// through object storage. `max_concurrent_requests` is a local semaphore that
+/// is never leased, so an origin limited only by concurrency builds no leased
+/// bucket: `runtime.state.location` has no effect on it, and neither does
+/// cluster adaptation, which throttles by scaling the leased budget.
+///
+/// Called from controller construction, so it is reported once per origin rather
+/// than once per component registered against it.
+fn warn_about_inert_cluster_settings(
+    origin: &str,
+    config: &HttpRateControlConfig,
+    persisted_state: Option<&HttpRateControlPersistedState>,
+) {
+    if persisted_state.is_none()
+        || config.requests_per_second.is_some()
+        || config.requests_per_minute.is_some()
+    {
+        return;
+    }
+
+    tracing::warn!(
+        "Cluster rate control is set for origin '{origin}', but no request-rate limit is set. Cluster rate control at `runtime.state.location` applies to `requests_per_second_limit` and `requests_per_minute_limit` only. `max_concurrent_requests` stays local to each instance. See: https://spiceai.org/docs/reference/spicepod/runtime#runtimesource_rate_control"
+    );
 }
 
 fn resolve_existing_controller(
@@ -1066,6 +1470,73 @@ fn parse_optional_nonzero_usize_param<S: BuildHasher>(
     Ok(Some(value))
 }
 
+/// Parse the optional `rate_control_failure_threshold` (an error rate),
+/// falling back to its `runtime.params.http_*` default, into a fraction.
+///
+/// Accepts either a percentage like `25%` or a bare fraction like `0.25`. Range
+/// validation (`(0, 1)`) is left to [`AdaptiveRateControl::new`]; this only
+/// rejects a value that is neither a percentage nor a number.
+fn parse_optional_failure_threshold_param<S: BuildHasher>(
+    params: &Parameters,
+    runtime_params: Option<&HashMap<String, String, S>>,
+    connector_component: &ConnectorComponent,
+    dataconnector: &'static str,
+) -> DataConnectorResult<Option<f64>> {
+    let parameter_name = "rate_control_failure_threshold";
+    let (raw_value, display_name) =
+        if let Some(raw_value) = params.get(parameter_name).expose().ok() {
+            (raw_value, params.user_param(parameter_name).to_string())
+        } else if let Some(raw_value) = runtime_params
+            .and_then(|runtime_params| runtime_params.get(RUNTIME_RATE_CONTROL_FAILURE_THRESHOLD))
+            .map(String::as_str)
+        {
+            (
+                raw_value,
+                format!("runtime.params.{RUNTIME_RATE_CONTROL_FAILURE_THRESHOLD}"),
+            )
+        } else {
+            return Ok(None);
+        };
+
+    let trimmed = raw_value.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+
+    // `25%` -> 0.25; a bare `0.25` -> 0.25. A bare `25` parses to 25.0 and is
+    // rejected downstream as out of range, guiding the user to `25%`.
+    let parsed = if let Some(percent) = trimmed.strip_suffix('%') {
+        percent.trim().parse::<f64>().map(|value| value / 100.0)
+    } else {
+        trimmed.parse::<f64>()
+    };
+
+    parsed
+        .map(Some)
+        .map_err(|source| DataConnectorError::InvalidConfiguration {
+            dataconnector: dataconnector.to_string(),
+            message: format!(
+                "The '{display_name}' parameter must be an error rate as a percentage like '25%' or a fraction like '0.25'."
+            ),
+            connector_component: connector_component.clone(),
+            source: source.into(),
+        })
+}
+
+/// Default bound for the permit-acquire wait when `rate_control_acquire_timeout`
+/// is unset: the connector's own `client_timeout`. The acquire happens once per
+/// request attempt, so a queued request should wait for a slot about as long as
+/// one in-flight request can take (a concurrency slot frees, or a governor token
+/// refills, on that timescale); waiting longer means the holder is stuck and
+/// failing fast is correct. Scales automatically when the user raises
+/// `client_timeout` for a slow origin. Bounds the otherwise-unbounded permit
+/// wait (#14348). `client_timeout` already includes the connect phase, so
+/// `connect_timeout` is deliberately not added.
+#[must_use]
+pub fn default_acquire_timeout(client_timeout: Duration) -> Duration {
+    client_timeout
+}
+
 fn parse_optional_duration_param<S: BuildHasher>(
     params: &Parameters,
     runtime_params: Option<&HashMap<String, String, S>>,
@@ -1094,7 +1565,7 @@ fn parse_optional_duration_param<S: BuildHasher>(
         return Ok(None);
     }
 
-    fundu::parse_duration(trimmed).map(Some).map_err(|source| {
+    let value = fundu::parse_duration(trimmed).map_err(|source| {
         DataConnectorError::InvalidConfiguration {
             dataconnector: dataconnector.to_string(),
             message: format!(
@@ -1103,7 +1574,21 @@ fn parse_optional_duration_param<S: BuildHasher>(
             connector_component: connector_component.clone(),
             source: source.into(),
         }
-    })
+    })?;
+
+    // `fundu` parses 'inf'/'infinity' into a saturated duration. Refuse it, so
+    // '0' stays the one spelling for "no bound".
+    if value == Duration::MAX {
+        return Err(DataConnectorError::InvalidConfigurationNoSource {
+            dataconnector: dataconnector.to_string(),
+            message: format!(
+                "The '{display_name}' parameter must be a finite duration such as '10ms' or '1s'. Use '0' for no limit."
+            ),
+            connector_component: connector_component.clone(),
+        });
+    }
+
+    Ok(Some(value))
 }
 
 fn with_jitter<S: BuildHasher>(
@@ -1250,7 +1735,7 @@ fn conflicting_config_error<T>(
         dataconnector: dataconnector.to_string(),
         connector_component: connector_component.clone(),
         message: format!(
-            "Multiple HTTP-based components target {key} with different rate-control settings. Use the same max_concurrent_requests, requests_per_second_limit, requests_per_minute_limit, rate_control_jitter_min, and rate_control_jitter_max values for components sharing an origin."
+            "Multiple HTTP-based components target {key} with different rate-control settings. Use the same max_concurrent_requests, requests_per_second_limit, requests_per_minute_limit, rate_control_jitter_min, rate_control_jitter_max, rate_control_acquire_timeout, rate_control_failure_threshold and rate_control_window values for components sharing an origin."
         ),
     })
 }
@@ -1272,6 +1757,111 @@ fn persisted_instance_ttl(refresh_interval: Duration) -> Duration {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::num::NonZeroU32;
+    use std::sync::Arc;
+
+    fn rps_config(requests_per_second: u32) -> HttpRateControlConfig {
+        HttpRateControlConfig {
+            requests_per_second: NonZeroU32::new(requests_per_second),
+            ..HttpRateControlConfig::disabled()
+        }
+    }
+
+    #[test]
+    fn has_limit_reflects_any_configured_limit() {
+        let mut config = HttpRateControlConfig::disabled();
+        assert!(!config.has_limit());
+
+        config.jitter_max = Duration::from_millis(10);
+        assert!(!config.has_limit(), "jitter is not a limit");
+
+        config.requests_per_second = NonZeroU32::new(5);
+        assert!(config.has_limit());
+    }
+
+    /// Every origin with a configured limit adapts. An origin with only jitter
+    /// has nothing to scale, and an origin with nothing configured has no
+    /// controller at all.
+    #[test]
+    fn limits_adapt_only_when_a_limit_is_configured() {
+        let origin = "https://adaptive-wiring.example.com:443";
+
+        let limited = build_shared_rate_controller(origin, "spicepod", &rps_config(10), None);
+        let controller = limited
+            .controller
+            .expect("a limited origin has a controller");
+        assert_eq!(controller.admission_coefficient(), Some(1.0));
+
+        let jitter_only = HttpRateControlConfig {
+            jitter_max: Duration::from_millis(10),
+            ..HttpRateControlConfig::disabled()
+        };
+        let jitter_only = build_shared_rate_controller(origin, "spicepod", &jitter_only, None);
+        let controller = jitter_only
+            .controller
+            .expect("a jitter-only origin has a controller");
+        assert_eq!(controller.admission_coefficient(), None);
+
+        let disabled = build_shared_rate_controller(
+            origin,
+            "spicepod",
+            &HttpRateControlConfig::disabled(),
+            None,
+        );
+        assert!(disabled.controller.is_none());
+    }
+
+    /// A connector that reports no request outcomes leaves the controller at
+    /// full admission: every request is charged the healthy weight, so the
+    /// configured limits apply unchanged and nothing is throttled.
+    #[tokio::test]
+    async fn without_reported_outcomes_the_configured_limits_apply_unchanged() {
+        let shared = build_shared_rate_controller(
+            "https://no-outcomes.example.com:443",
+            "spicepod",
+            &rps_config(1_000),
+            None,
+        );
+        let controller = shared
+            .controller
+            .expect("a limited origin has a controller");
+
+        for _ in 0..20 {
+            drop(controller.acquire().await.expect("acquire should succeed"));
+        }
+
+        assert_eq!(controller.admission_coefficient(), Some(1.0));
+        assert_eq!(controller.metrics().adaptive_throttled_total(), 0);
+        assert_eq!(controller.metrics().permits_acquired_total(), 20);
+    }
+
+    /// A persisted controller adapts through its leased cluster buckets: once a
+    /// window is leased it reports the coefficient the shared state fixed, which
+    /// is full admission for an origin with no recorded failures.
+    #[tokio::test]
+    async fn cluster_controller_adapts() {
+        let persisted_state = HttpRateControlPersistedState {
+            store: Arc::new(object_store::memory::InMemory::new()),
+            base_prefix: String::new(),
+            refresh_interval: Duration::from_secs(1),
+            instance_id: "instance".to_string(),
+            instance_ttl: Duration::from_secs(5),
+        };
+        let shared = build_shared_rate_controller(
+            "https://cluster.example.com:443",
+            "spicepod",
+            &rps_config(10),
+            Some(&persisted_state),
+        );
+        let controller = shared
+            .controller
+            .expect("a limited origin has a controller");
+        controller
+            .refresh_and_persist_state_snapshot()
+            .await
+            .expect("lease the first window");
+        assert_eq!(controller.admission_coefficient(), Some(1.0));
+    }
 
     #[test]
     fn rate_control_state_object_key_uses_spicepod_and_origin_without_scheme() {
@@ -1286,6 +1876,34 @@ mod tests {
         assert_eq!(hash.len(), 16);
         assert!(hash.chars().all(|character| character.is_ascii_hexdigit()));
         assert!(!object_key.contains("https"));
+    }
+
+    /// The adaptive metrics report no value (so no series) for a controller
+    /// without adaptive control, and real values — `0` throttled up front — for
+    /// one with it.
+    #[test]
+    fn adaptive_metrics_are_absent_without_adaptive_control() {
+        let quota = Quota::per_second(NonZeroU32::new(10).expect("non-zero test quota"));
+        let metrics = HttpRateControlMetrics::default();
+        assert_eq!(metrics.adaptive_admission_ratio(), None);
+        assert_eq!(metrics.adaptive_throttled_total(), None);
+
+        let non_adaptive_controller = RateController::builder().add_quota(quota).build();
+        metrics.set_rate_controller(Some(&non_adaptive_controller));
+        assert_eq!(metrics.adaptive_admission_ratio(), None);
+        assert_eq!(metrics.adaptive_throttled_total(), None);
+
+        let adaptive_controller = RateController::builder()
+            .add_quota(quota)
+            .with_adaptive(
+                AdaptiveRateControl::new(0.1, runtime_rate_control::DEFAULT_ADAPTIVE_WINDOW)
+                    .expect("valid adaptive control"),
+                "https://adaptive-metrics.example.com",
+            )
+            .build();
+        metrics.set_rate_controller(Some(&adaptive_controller));
+        assert_eq!(metrics.adaptive_admission_ratio(), Some(1.0));
+        assert_eq!(metrics.adaptive_throttled_total(), Some(0));
     }
 
     #[test]
