@@ -1564,13 +1564,7 @@ fn cayenne_accelerations(
             (converted, RefreshMode::Changes)
         }))
         .filter_map(|(accel, unset)| accel.map(|accel| (accel, unset)))
-        .filter(|(accel, _)| {
-            accel.enabled
-                && accel
-                    .engine
-                    .as_deref()
-                    .is_some_and(|engine| engine.eq_ignore_ascii_case("cayenne"))
-        })
+        .filter(|(accel, _)| accel.enabled && accel.engine_name().eq_ignore_ascii_case("cayenne"))
         .filter_map(|(accel, unset)| {
             // The engine classifies; this only enumerates. Filtered rather than
             // defaulted: a build with no Cayenne engine linked declares no Cayenne
@@ -2447,15 +2441,15 @@ mod test {
         ]);
         assert_eq!(inputs.num_unset_instances, 1);
 
-        // A non-DuckDB (Arrow) accelerated dataset is ignored.
-        let mut arrow_ds = Dataset::new("dummy:source", "arrow");
-        arrow_ds.acceleration = Some(Acceleration {
+        // A non-DuckDB (default engine) accelerated dataset is ignored.
+        let mut default_engine_ds = Dataset::new("dummy:source", "default_engine");
+        default_engine_ds.acceleration = Some(Acceleration {
             enabled: true,
             engine: None,
             mode: Mode::Memory,
             ..Acceleration::default()
         });
-        let inputs = inputs_for(vec![arrow_ds]);
+        let inputs = inputs_for(vec![default_engine_ds]);
         assert_eq!(inputs.num_unset_instances, 0);
         assert_eq!(inputs.num_explicit_instances, 0);
 
@@ -2579,6 +2573,17 @@ mod test {
 
         // Engine matching stays case-insensitive on the view arm too.
         assert!(configured(vec![], vec![view_with("Cayenne", true)]));
+
+        // An acceleration that names no engine uses Cayenne, the default engine.
+        let unnamed = spicepod::acceleration::Acceleration {
+            engine: None,
+            ..cayenne_test_accel("cayenne", true)
+        };
+        assert!(configured(
+            vec![cayenne_test_dataset("ds", unnamed.clone())],
+            vec![]
+        ));
+        assert!(configured(vec![], vec![cayenne_test_view("v", unnamed)]));
 
         // A disabled Cayenne acceleration is not configured — on either kind.
         assert!(!configured(vec![], vec![view_with("cayenne", false)]));
@@ -3515,8 +3520,8 @@ mod test {
         );
 
         // A disabled or non-DuckDB view creates no instance.
-        let arrow_view = duckdb_view_with(
-            "arrow_summary",
+        let default_engine_view = duckdb_view_with(
+            "default_engine_summary",
             Acceleration {
                 enabled: true,
                 engine: None,
@@ -3531,7 +3536,10 @@ mod test {
         disabled.enabled = false;
         let disabled_view = duckdb_view_with("disabled_summary", disabled);
         let unaccelerated_view = View::new("plain_summary".to_string()).with_sql("SELECT 1");
-        let inputs = budget_inputs_for(vec![], vec![arrow_view, disabled_view, unaccelerated_view]);
+        let inputs = budget_inputs_for(
+            vec![],
+            vec![default_engine_view, disabled_view, unaccelerated_view],
+        );
         assert_eq!(inputs.num_unset_instances, 0);
         assert_eq!(inputs.num_explicit_instances, 0);
     }

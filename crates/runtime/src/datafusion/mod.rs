@@ -26,7 +26,10 @@ use crate::accelerated::snapshots::{SnapshotRefreshState, reload_on_snapshot_not
 use crate::accelerated::{
     self, AcceleratedTableBuilderError, SnapshotCreateTrigger, SnapshotCreationConfig,
 };
-use crate::accelerated::{AcceleratedTable, Retention, refresh::Refresh};
+use crate::accelerated::{
+    AcceleratedTable, Retention,
+    refresh::{Refresh, VersionsByTime},
+};
 use crate::catalogconnector::deferred::DeferredCatalogProvider;
 use crate::component::access::AccessMode;
 use crate::component::dataset::acceleration::{Acceleration, Engine, Mode, RefreshMode};
@@ -275,7 +278,7 @@ pub enum Error {
     UnableToGetWriteBackDeliverer { source: DataConnectorError },
 
     #[snafu(display(
-        "Table {table_name} was marked as read_write, but the underlying provider only supports reads."
+        "Dataset '{table_name}' sets `access: read_write`, but its source connector only supports reads, so the dataset cannot load. Set `acceleration.write_mode: acceleration` to keep its writes in the acceleration, or set `access: read`. See: https://spiceai.org/docs/reference/spicepod/datasets#accelerationwrite_mode"
     ))]
     WriteProviderNotImplemented { table_name: String },
 
@@ -651,7 +654,7 @@ enum AcceleratedWriteMode {
 }
 
 /// Decide where an accelerated dataset's writes should go, given its source connector,
-/// access mode, `on_conflict`/CDC configuration, and configured write mode.
+/// access mode, and configured write mode.
 ///
 /// The `sink` connector is special: it discards writes and disables refresh, so its
 /// accelerator is never fed by a refresh cycle. Routing sink writes through the default
@@ -661,15 +664,8 @@ enum AcceleratedWriteMode {
 fn select_accelerated_write_mode(
     source: &str,
     allows_write: bool,
-    has_on_conflict: bool,
-    has_changes_refresh: bool,
     configured_write_mode: spicepod::acceleration::WriteMode,
 ) -> AcceleratedWriteMode {
-    // on_conflict without CDC means the source may be read-only; writes go to the accelerator.
-    if has_on_conflict && !has_changes_refresh {
-        return AcceleratedWriteMode::AcceleratorOnly;
-    }
-
     if !allows_write {
         return AcceleratedWriteMode::WriteThrough;
     }
@@ -681,6 +677,7 @@ fn select_accelerated_write_mode(
     match configured_write_mode {
         spicepod::acceleration::WriteMode::WriteBack => AcceleratedWriteMode::WriteBack,
         spicepod::acceleration::WriteMode::WriteThrough => AcceleratedWriteMode::WriteThrough,
+        spicepod::acceleration::WriteMode::Acceleration => AcceleratedWriteMode::AcceleratorOnly,
     }
 }
 
@@ -2731,7 +2728,9 @@ impl DataFusion {
             .fail()?;
         }
 
-        let StreamingDataUpdate { data, update_type } = streaming_update;
+        let StreamingDataUpdate {
+            data, update_type, ..
+        } = streaming_update;
         let update_schema = data.schema();
         let broadcast_table_reference = self.normalize_table_reference(table_reference.clone());
 
@@ -2940,24 +2939,13 @@ impl DataFusion {
     ) -> Result<AcceleratedTable> {
         tracing::trace!("Creating accelerated table {dataset:?}");
 
-        // For accelerated tables with on_conflict configured, the source doesn't need
-        // to support writes - writes go to the accelerated table only.
-        // Only require a read-write source when replication is enabled and no on_conflict
-        // is configured (writes need to go back to the source).
-        let has_on_conflict = dataset
-            .acceleration
-            .as_ref()
-            .is_some_and(|acc| !acc.on_conflict.is_empty());
-        // When refresh_mode is `changes` (CDC), on_conflict provides WAL UPDATE upsert routing
-        // only — it does not imply accelerator-only writes. Writes should reach the federated
-        // source per write_mode. Without CDC, on_conflict means the source may be read-only and
-        // writes are directed to the accelerator only.
-        let has_changes_refresh = dataset.acceleration.as_ref().is_some_and(|acc| {
-            acc.refresh_mode
-                .is_some_and(|m| matches!(m, RefreshMode::Changes))
-        });
-        let needs_source_writes =
-            dataset.access().allows_write() && (!has_on_conflict || has_changes_refresh);
+        // A writable dataset writes through its source (or, for write-back, back to
+        // it), so the source must accept writes, unless its writes stay in the
+        // acceleration.
+        let needs_source_writes = dataset.access().allows_write()
+            && dataset.acceleration.as_ref().is_none_or(|acc| {
+                acc.write_mode != spicepod::acceleration::WriteMode::Acceleration
+            });
 
         let source_table_provider = if needs_source_writes {
             let read_write_provider = source
@@ -3230,6 +3218,26 @@ impl DataFusion {
         if let Some(append_overlap) = acceleration_settings.refresh_append_overlap {
             refresh = refresh.append_overlap(append_overlap);
         }
+        refresh = refresh.versions_by_time(
+            acceleration_settings
+                .orders_versions_by_time(dataset.time_column.as_deref(), refresh_mode)
+                .then(|| {
+                    VersionsByTime {
+                        // An unpartitioned Cayenne table resolves a full refresh's repeated
+                        // keys as it writes them, ordered by the row versions the refresh
+                        // supplies: in file mode after writing, in memory mode over the
+                        // buffered write. Only file mode does so for an append into an
+                        // empty table.
+                        versions_resolved_after_write: acceleration_settings.engine
+                            == Engine::Cayenne
+                            && acceleration_settings.partition_by.is_empty(),
+                        appends_resolved_after_write: acceleration_settings.engine
+                            == Engine::Cayenne
+                            && acceleration_settings.mode == Mode::File
+                            && acceleration_settings.partition_by.is_empty(),
+                    }
+                }),
+        );
         if let Some(caching_ttl) = acceleration_settings.caching_ttl {
             refresh = refresh.caching_ttl(caching_ttl);
         }
@@ -3241,7 +3249,7 @@ impl DataFusion {
             refresh = refresh.period(refresh_data_window);
         }
         refresh
-            .validate_time_format(dataset.name.to_string(), &refresh_schema)
+            .validate_time_format(&dataset.name.to_string(), &refresh_schema)
             .context(InvalidTimeColumnTimeFormatSnafu)?;
 
         // Apply initial partition filters before the refresher starts to avoid a race
@@ -3534,6 +3542,8 @@ impl DataFusion {
             accelerated_table_builder.with_resource_monitor(resource_monitor.clone());
         }
 
+        accelerated_table_builder.with_query_runtime_env(self.ctx.runtime_env());
+
         if let Some(metrics) = &self.metrics {
             accelerated_table_builder.metrics(metrics.clone());
         }
@@ -3595,14 +3605,9 @@ impl DataFusion {
                 .await;
         }
 
-        // on_conflict forces accelerator-only writes when CDC is not in use. With CDC
-        // (refresh_mode: changes), on_conflict is for WAL UPDATE upsert routing only and
-        // does not override the write destination — writes follow write_mode instead.
         match select_accelerated_write_mode(
             dataset.source(),
             dataset.access().allows_write(),
-            has_on_conflict,
-            has_changes_refresh,
             acceleration_settings.write_mode,
         ) {
             AcceleratedWriteMode::AcceleratorOnly => {
@@ -6239,11 +6244,29 @@ mod tests {
             spicepod::acceleration::WriteMode::WriteBack,
         ] {
             assert_eq!(
-                select_accelerated_write_mode(SINK_DATACONNECTOR, true, false, false, configured),
+                select_accelerated_write_mode(SINK_DATACONNECTOR, true, configured),
                 AcceleratedWriteMode::AcceleratorOnly,
                 "accelerated sink dataset (configured={configured:?}) must write accelerator-only"
             );
         }
+    }
+
+    #[test]
+    fn a_read_only_source_names_write_mode_acceleration() {
+        assert_eq!(
+            Error::WriteProviderNotImplemented {
+                table_name: "orders".to_string(),
+            }
+            .to_string(),
+            "Dataset 'orders' sets `access: read_write`, but its source connector only supports reads, so the dataset cannot load. Set `acceleration.write_mode: acceleration` to keep its writes in the acceleration, or set `access: read`. See: https://spiceai.org/docs/reference/spicepod/datasets#accelerationwrite_mode"
+        );
+        assert_eq!(
+            crate::Error::AccelerationWriteModeWithChanges {
+                dataset_name: "orders".to_string(),
+            }
+            .to_string(),
+            "Dataset 'orders' sets `acceleration.write_mode: acceleration` and refreshes by `changes` (set by `refresh_mode` or by its connector's default), but the source's changes would overwrite writes kept only in the acceleration, so the dataset cannot load. Use `write_mode: write_through` or `write_back` with a change stream, or another `refresh_mode`. See: https://spiceai.org/docs/reference/spicepod/datasets#accelerationwrite_mode"
+        );
     }
 
     #[test]
@@ -6253,8 +6276,6 @@ mod tests {
             select_accelerated_write_mode(
                 "postgres",
                 true,
-                false,
-                false,
                 spicepod::acceleration::WriteMode::WriteThrough,
             ),
             AcceleratedWriteMode::WriteThrough,
@@ -6263,42 +6284,25 @@ mod tests {
             select_accelerated_write_mode(
                 "postgres",
                 true,
-                false,
-                false,
                 spicepod::acceleration::WriteMode::WriteBack,
             ),
             AcceleratedWriteMode::WriteBack,
         );
 
-        // on_conflict without CDC forces accelerator-only regardless of source.
+        // `write_mode: acceleration` keeps writes in the acceleration, whatever the source.
         assert_eq!(
             select_accelerated_write_mode(
-                "postgres",
+                "file",
                 true,
-                true,
-                false,
-                spicepod::acceleration::WriteMode::WriteThrough,
+                spicepod::acceleration::WriteMode::Acceleration,
             ),
             AcceleratedWriteMode::AcceleratorOnly,
-        );
-        // on_conflict *with* CDC does not force accelerator-only.
-        assert_eq!(
-            select_accelerated_write_mode(
-                "postgres",
-                true,
-                true,
-                true,
-                spicepod::acceleration::WriteMode::WriteThrough,
-            ),
-            AcceleratedWriteMode::WriteThrough,
         );
 
         // A read-only dataset stays WriteThrough even for a sink source (no writes routed).
         assert_eq!(
             select_accelerated_write_mode(
                 SINK_DATACONNECTOR,
-                false,
-                false,
                 false,
                 spicepod::acceleration::WriteMode::WriteThrough,
             ),

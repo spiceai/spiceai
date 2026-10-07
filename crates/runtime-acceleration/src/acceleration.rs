@@ -923,6 +923,22 @@ impl Acceleration {
         }
     }
 
+    /// Whether a refresh keeps the newest version of each key by the dataset's
+    /// `time_column` rather than the last to arrive: a Cayenne acceleration with a
+    /// time column, refreshed `full` or `append` (#14576). A change stream applies
+    /// changes in order. The refresh still keeps the last arrival when its table has
+    /// no primary key, its key holds the time column, or the rows it reads lack it.
+    #[must_use]
+    pub fn orders_versions_by_time(
+        &self,
+        time_column: Option<&str>,
+        refresh_mode: RefreshMode,
+    ) -> bool {
+        self.engine == Engine::Cayenne
+            && time_column.is_some()
+            && matches!(refresh_mode, RefreshMode::Full | RefreshMode::Append)
+    }
+
     /// Returns the `UpsertOptions` if the `on_conflict` behavior is `Upsert`.
     /// Returns `UpsertOptions::default()` if no `on_conflict` is set.
     #[must_use]
@@ -987,7 +1003,10 @@ impl TryFrom<spicepod_acceleration::Acceleration> for Acceleration {
 
         let mut params = acceleration.params.clone();
 
-        let engine_str = acceleration.engine.as_deref().unwrap_or("arrow");
+        let engine_str = acceleration
+            .engine
+            .as_deref()
+            .unwrap_or(spicepod_acceleration::DEFAULT_ENGINE);
         let engine = match Engine::try_from(engine_str).map_err(|_| {
             ParseError::AcceleratorEngineNotAvailable {
                 name: engine_str.to_string(),
@@ -1849,8 +1868,35 @@ mod tests {
     }
 
     #[test]
+    fn an_acceleration_without_an_engine_uses_the_default_engine() {
+        let parsed = Acceleration::try_from(spicepod_acceleration::Acceleration::default())
+            .expect("acceleration should parse");
+        assert_eq!(parsed.engine, Engine::default());
+        #[cfg(not(windows))]
+        assert_eq!(parsed.engine, Engine::Cayenne);
+        #[cfg(windows)]
+        assert_eq!(parsed.engine, Engine::Arrow);
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn a_partitioned_acceleration_without_an_engine_uses_cayenne() {
+        let acceleration = spicepod_acceleration::Acceleration {
+            partition_by: vec![PartitionedBy {
+                name: "bucket".to_string(),
+                expression: "bucket(4, id)".to_string(),
+            }],
+            ..Default::default()
+        };
+
+        let parsed = Acceleration::try_from(acceleration).expect("acceleration should parse");
+        assert_eq!(parsed.engine, Engine::Cayenne);
+    }
+
+    #[test]
     fn test_hash_index_param_is_ignored() {
         let acceleration = spicepod_acceleration::Acceleration {
+            engine: Some("arrow".to_string()),
             params: Some(Params::from_string_map(HashMap::from([(
                 "hash_index".to_string(),
                 "enabled".to_string(),

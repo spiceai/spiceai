@@ -32,7 +32,7 @@ use runtime::{
         access::AccessMode,
         dataset::{
             TimeFormat,
-            acceleration::{Acceleration, RefreshMode},
+            acceleration::{Acceleration, Engine, RefreshMode},
             builder::DatasetBuilder,
             replication::Replication,
         },
@@ -195,7 +195,10 @@ impl SpiceExtension {
             runtime.status(),
             metrics_table_reference.clone(),
             from.as_str(),
-            Acceleration::default(),
+            Acceleration {
+                engine: Engine::Arrow,
+                ..Acceleration::default()
+            },
             refresh,
             retention,
             runtime.secrets(),

@@ -26,6 +26,7 @@ libnfs = { path = "../libnfs", optional = true }
 nix = { workspace = true, features = ["fs"], optional = true }
 object_store.workspace = true
 object_store_occ = { path = "../object_store_occ", optional = true }
+object_store_spawn = { path = "../object_store_spawn" }
 reqwest.workspace = true
 runtime-parameters = { path = "../runtime-parameters", optional = true }
 # Secret stores are opted into by the binary; this crate only needs the `Secrets` type.

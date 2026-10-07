@@ -28,8 +28,8 @@ use tokio::runtime::Handle;
 use tokio::sync::RwLock;
 use url::Url;
 
-use crate::build_azure_object_store;
 use crate::registry::SpiceObjectStoreRegistry;
+use crate::{build_azure_object_store, build_gcs_object_store};
 
 static S3_PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
     vec![
@@ -45,6 +45,24 @@ static S3_PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
             .secret(),
         ParameterSpec::runtime("client_timeout").description("The timeout setting for S3 client."),
         ParameterSpec::runtime("allow_http").description("Allow HTTP protocol for S3 endpoint."),
+    ]
+});
+
+/// The GCS data connector's object-store parameters, so a `gs://` location takes the
+/// same names (`gcs_skip_signature`, `gcs_service_account_path`, ...).
+static GCS_PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
+    vec![
+        ParameterSpec::component("service_account_path").secret(),
+        ParameterSpec::component("service_account_key").secret(),
+        ParameterSpec::component("application_default_credentials").is_boolean(),
+        ParameterSpec::component("skip_signature").is_boolean(),
+        ParameterSpec::component("max_retries"),
+        ParameterSpec::component("retry_timeout"),
+        ParameterSpec::component("backoff_initial_duration"),
+        ParameterSpec::component("backoff_max_duration"),
+        ParameterSpec::component("backoff_base"),
+        ParameterSpec::runtime("client_timeout"),
+        ParameterSpec::runtime("allow_http").is_boolean(),
     ]
 });
 
@@ -77,10 +95,24 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    #[snafu(display("Failed to validate GCS parameters for {usage}: {source}"))]
+    GcsParameterValidation {
+        usage: &'static str,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     #[snafu(display(
         "Failed to parse {usage} file location {location}: URL is not a local file path"
     ))]
     InvalidFileLocation {
+        usage: &'static str,
+        location: String,
+    },
+
+    #[snafu(display(
+        "Failed to parse {usage} location {location}: a Google Cloud Storage location needs a bucket, as in gs://bucket/path"
+    ))]
+    InvalidGcsLocation {
         usage: &'static str,
         location: String,
     },
@@ -177,6 +209,17 @@ pub async fn build_object_store(
             usage,
             location: url.to_string(),
         })?
+    } else if matches!(url.scheme(), "gs" | "gcs") {
+        let bucket = url.host_str().ok_or_else(|| Error::InvalidGcsLocation {
+            usage,
+            location: url.to_string(),
+        })?;
+        let params = params.map(Params::as_string_map);
+        let gcs_params = build_gcs_parameters(secrets, params.as_ref(), usage).await?;
+        build_gcs_object_store(bucket, &gcs_params, io_runtime).context(ObjectStoreInitSnafu {
+            usage,
+            location: url.to_string(),
+        })?
     } else {
         let registry = SpiceObjectStoreRegistry::new(io_runtime);
         datafusion::execution::object_store::ObjectStoreRegistry::get_store(&registry, &url)
@@ -210,6 +253,62 @@ async fn build_s3_parameters(
         }
         None => Ok(default_params()),
     }
+}
+
+/// Resolves a `gs://` location's `params`, given under the GCS data connector's
+/// names, to the names [`build_gcs_object_store`] reads.
+async fn build_gcs_parameters(
+    secrets: Arc<RwLock<Secrets>>,
+    params: Option<&HashMap<String, String>>,
+    usage: &'static str,
+) -> Result<HashMap<String, String>> {
+    let Some(params) = params else {
+        return Ok(HashMap::new());
+    };
+    let secret_params = get_params_with_secrets(Arc::clone(&secrets), params).await;
+    let params = Parameters::try_new(
+        usage,
+        secret_params.into_iter().collect(),
+        "gcs",
+        secrets,
+        &GCS_PARAMETERS,
+    )
+    .await
+    .map_err(|source| Error::GcsParameterValidation { usage, source })?;
+    validate_gcs_auth(&params).map_err(|message| Error::GcsParameterValidation {
+        usage,
+        source: message.into(),
+    })?;
+    Ok(params
+        .to_secret_map()
+        .into_iter()
+        .map(|(key, value)| (key, value.expose_secret().to_string()))
+        .collect())
+}
+
+/// Same contract as the GCS data connector (`data_connector_api::parameters::gcs`, which
+/// this crate cannot depend on): `build_gcs_object_store` uses only one authentication
+/// method, so a second one would be silently ignored.
+fn validate_gcs_auth(params: &Parameters) -> Result<(), &'static str> {
+    let is_true = |key: &str| {
+        params
+            .get(key)
+            .expose()
+            .ok()
+            .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+    };
+    let methods = [
+        params.get("service_account_path").expose().ok().is_some(),
+        params.get("service_account_key").expose().ok().is_some(),
+        is_true("skip_signature"),
+        is_true("application_default_credentials"),
+    ];
+    if methods.into_iter().filter(|&set| set).count() > 1 {
+        return Err(
+            "Multiple authentication methods were provided. Specify only one of the following: gcs_service_account_path, gcs_service_account_key, gcs_application_default_credentials, or gcs_skip_signature. For details, visit: https://spiceai.org/docs/components/data-connectors/gcs#auth",
+        );
+    }
+    Ok(())
 }
 
 async fn build_secret_resolved_parameters(
@@ -460,6 +559,78 @@ mod tests {
         assert!(result.is_ok(), "abfs state store should build: {result:?}");
         let (_, prefix) = result.expect("abfs state store should build");
         assert_eq!(prefix, "");
+    }
+
+    /// A `gs://` location honors the GCS data connector's parameter names (and keeps
+    /// its path as the prefix) instead of building a store from the environment alone.
+    #[tokio::test]
+    async fn build_object_store_accepts_gcs_location_with_params() {
+        let params = Params::from_string_map(HashMap::from([(
+            "gcs_skip_signature".to_string(),
+            "true".to_string(),
+        )]));
+
+        let (store, prefix) = build_object_store(
+            secrets(),
+            Handle::current(),
+            "gs://state-bucket/runtime/rate-control/",
+            Some(&params),
+            "test state",
+        )
+        .await
+        .expect("gcs state store should build");
+        assert_eq!(prefix, "runtime/rate-control");
+        // The store has no accessor for its signing mode; its `Debug` output carries
+        // the configuration it was built with.
+        assert!(
+            format!("{store:?}").contains("skip_signature: true"),
+            "`gcs_skip_signature: true` must build an unsigned store: {store:?}"
+        );
+
+        let invalid = build_object_store(
+            secrets(),
+            Handle::current(),
+            "gs://state-bucket/",
+            Some(&Params::from_string_map(HashMap::from([(
+                "gcs_skip_signature".to_string(),
+                "not-a-bool".to_string(),
+            )]))),
+            "test state",
+        )
+        .await
+        .expect_err("an invalid GCS parameter is reported, not ignored");
+        assert_eq!(
+            invalid.to_string(),
+            "Failed to validate GCS parameters for test state: Invalid configuration for test state. 'gcs_skip_signature' parameter must be one of: true, false. Found not-a-bool."
+        );
+    }
+
+    /// A `gs://` location takes one authentication method, as the GCS data connector
+    /// does: with `gcs_skip_signature: true` the store would silently ignore a key.
+    #[tokio::test]
+    async fn build_object_store_rejects_gcs_location_with_two_auth_methods() {
+        let params = Params::from_string_map(HashMap::from([
+            ("gcs_skip_signature".to_string(), "true".to_string()),
+            (
+                "gcs_service_account_key".to_string(),
+                r#"{"client_email": "state@example.com", "private_key": "", "private_key_id": ""}"#
+                    .to_string(),
+            ),
+        ]));
+
+        let err = build_object_store(
+            secrets(),
+            Handle::current(),
+            "gs://state-bucket/runtime/rate-control/",
+            Some(&params),
+            "test state",
+        )
+        .await
+        .expect_err("two GCS authentication methods are reported, not resolved silently");
+        assert_eq!(
+            err.to_string(),
+            "Failed to validate GCS parameters for test state: Multiple authentication methods were provided. Specify only one of the following: gcs_service_account_path, gcs_service_account_key, gcs_application_default_credentials, or gcs_skip_signature. For details, visit: https://spiceai.org/docs/components/data-connectors/gcs#auth"
+        );
     }
 
     #[tokio::test]
