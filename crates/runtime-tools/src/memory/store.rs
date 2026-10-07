@@ -135,7 +135,7 @@ impl SpiceModelTool for StoreMemoryTool {
         // Auth gate before table lookup so RO rejection does not depend on app
         // wiring and is covered by unit tests without a live memory dataset.
         if current_principal_requires_read_only().await {
-            return Err("API key does not allow write access (read-only SQL context)".into());
+            return Err("Failed to store memories: the API key on this request does not allow write access. Retry with a read-write API key (a `runtime.auth.api-key.keys` entry ending in `:rw`). See https://spiceai.org/docs/api/auth".into());
         }
         let table_name = memory_table_name(&self.app).await?;
         let result: Result<Value, Box<dyn std::error::Error + Send + Sync>> = async {
@@ -378,9 +378,9 @@ mod tests {
                     .expect_err("RO principal must reject store_memory")
             })
             .await;
-        assert!(
-            err.to_string().contains("read-only"),
-            "RO rejection must mention read-only; got {err}"
+        assert_eq!(
+            err.to_string(),
+            "Failed to store memories: the API key on this request does not allow write access. Retry with a read-write API key (a `runtime.auth.api-key.keys` entry ending in `:rw`). See https://spiceai.org/docs/api/auth"
         );
         assert_eq!(
             engine.write_calls(),

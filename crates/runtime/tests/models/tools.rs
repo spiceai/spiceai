@@ -48,8 +48,7 @@ mod mcp {
     const READ_ONLY_SQL_REJECTION: &str = "Query execution failed: External error: Failed to execute query: Error during planning: Insert Into operations are not allowed in read-only SQL context.";
 
     /// The `store_memory` tool's error for a read-only API key.
-    const READ_ONLY_STORE_MEMORY_REJECTION: &str =
-        "API key does not allow write access (read-only SQL context)";
+    const READ_ONLY_STORE_MEMORY_REJECTION: &str = "Failed to store memories: the API key on this request does not allow write access. Retry with a read-write API key (a `runtime.auth.api-key.keys` entry ending in `:rw`). See https://spiceai.org/docs/api/auth";
 
     /// Test that spiced can run a stdio MCP server.
     #[tokio::test]
