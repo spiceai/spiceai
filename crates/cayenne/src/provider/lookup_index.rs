@@ -1583,49 +1583,84 @@ impl LookupIndexState {
         // A failed load leaves syncing off for this open, as if the table did
         // not persist: its files are indexed in the background, and the runs
         // stay where they are for the next open.
-        let (runs, bytes) = match persisted_runs.load().await {
-            Ok(loaded) => loaded,
-            Err(error) => {
-                tracing::debug!(table = %self.table_name, %error, "Secondary index runs were not loaded, and are not persisted until the table reopens");
-                return;
-            }
-        };
         let live: HashSet<&str> = live.iter().map(|path| file_name(path)).collect();
         *self.live_files.lock() = Some(Arc::new(
             live.iter().map(|&name| name.to_string()).collect(),
         ));
-        let added: usize = runs.iter().flatten().map(IndexRun::heap_bytes).sum();
-        let loaded: usize = runs.iter().map(Vec::len).sum();
+        let mut loaded = match persisted_runs.load(Some(&self.account)).await {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                if matches!(error, PersistedReadError::BudgetRefused) {
+                    self.report_refusal();
+                }
+                self.report_coverage();
+                tracing::debug!(table = %self.table_name, %error, "Secondary index runs were not loaded, and are not persisted until the table reopens");
+                return;
+            }
+        };
+        let loaded_count: usize = loaded.runs.iter().map(Vec::len).sum();
         {
             let publishing = self.publish_lock.lock();
-            let fits = self.charge(self.run_bytes().saturating_add(added));
-            if fits {
-                for (shape, runs) in self.shapes.load().iter().zip(runs) {
-                    shape.index.publish_visible(runs, &live);
+            // Publishing can temporarily duplicate the existing run metadata.
+            // Reserve that scratch before changing any visible view.
+            let Some(scratch) = self.run_bytes().checked_mul(8) else {
+                self.report_refusal();
+                return;
+            };
+            let Some(reservation) = loaded.reservation.as_mut() else {
+                self.report_refusal();
+                return;
+            };
+            let Some(peak) = reservation.bytes().checked_add(scratch) else {
+                self.report_refusal();
+                return;
+            };
+            if !reservation.try_resize(peak) {
+                self.report_refusal();
+                return;
+            }
+            let Some(reservation) = loaded.reservation.take() else {
+                self.report_refusal();
+                return;
+            };
+            let transferred = {
+                let mut held = self.reservation.lock();
+                if let Some(held) = held.as_mut() {
+                    held.absorb(reservation)
+                } else {
+                    *held = Some(reservation);
+                    Ok(())
                 }
-                self.charge(self.run_bytes());
+            };
+            if let Err(reservation) = transferred {
+                loaded.reservation = Some(reservation);
+                self.report_refusal();
+                return;
+            }
+            for (shape, runs) in self.shapes.load().iter().zip(loaded.runs) {
+                shape.index.publish_visible(runs, &live);
             }
             // From here every change to the runs is persisted, and the first
             // sync removes the persisted runs of files that are gone.
             persisted_runs.loaded.store(true, Ordering::Release);
             self.repin();
+            // Encoded buffers, decode scratch and replaced local views are
+            // gone. Each decode bound includes its run and table-filter share,
+            // and existing resident bytes retain extra publication headroom,
+            // so settling to the published bytes only shrinks the charge.
+            let settled = self.charge(self.run_bytes());
+            debug_assert!(settled, "published runs fit their admitted decode bounds");
             drop(publishing);
-            // Coverage is known from here, so publish it even when the pool
-            // refused the loaded runs: every file then reads as uncovered.
             self.report_coverage();
-            if !fits {
-                self.report_refusal();
-                return;
-            }
         }
-        if loaded > 0 {
+        if loaded_count > 0 {
             // A file counts as covered once every key's runs hold it.
             let view = self.published();
             let covered = live.iter().filter(|file| view.covers(file)).count();
             tracing::info!(
                 table = %self.table_name,
                 "{}",
-                persisted_runs_loaded_message(&self.table_name, bytes, covered, live.len())
+                persisted_runs_loaded_message(&self.table_name, loaded.bytes, covered, live.len())
             );
         }
     }
@@ -2517,6 +2552,31 @@ pub(crate) struct PersistedRuns {
     syncing: AtomicBool,
 }
 
+/// Field order keeps decoded runs charged until their allocations are freed.
+struct LoadedRuns {
+    runs: Vec<Vec<IndexRun>>,
+    bytes: u64,
+    reservation: Option<LookupIndexReservation>,
+}
+
+#[derive(Debug, snafu::Snafu)]
+enum PersistedReadError {
+    #[snafu(display("The query memory pool refused persisted secondary index runs"))]
+    BudgetRefused,
+    #[snafu(display("Persisted index loading stopped: {message}"))]
+    Interrupted { message: String },
+    #[snafu(display("{message}"))]
+    Unreadable { message: String },
+}
+
+impl PersistedReadError {
+    fn unreadable(message: impl Into<String>) -> Self {
+        Self::Unreadable {
+            message: message.into(),
+        }
+    }
+}
+
 impl PersistedRuns {
     fn new(
         table_name: String,
@@ -2550,7 +2610,7 @@ impl PersistedRuns {
         root: object_store::path::Path,
     ) {
         let runs = Self::new(table_name, store, catalog, table_id, root, Vec::new());
-        if let Err(error) = runs.load().await {
+        if let Err(error) = runs.load(None).await {
             tracing::debug!(table = %runs.table_name, %error, "Persisted secondary index runs of removed indexes were not deleted; the next open retries");
         }
     }
@@ -2660,14 +2720,28 @@ impl PersistedRuns {
     /// by a write that stopped before registering it, is deleted. An error
     /// when the registered runs cannot be listed: nothing is loaded, and
     /// nothing may be synced, since every run would then look unwanted.
-    async fn load(&self) -> Result<(Vec<Vec<IndexRun>>, u64), String> {
-        let mut all: Vec<Vec<IndexRun>> = self.keys.iter().map(|_| Vec::new()).collect();
-        let mut bytes = 0_u64;
+    async fn load(
+        &self,
+        account: Option<&Arc<CayenneMemoryAccount>>,
+    ) -> Result<LoadedRuns, PersistedReadError> {
+        let reservation = match account {
+            Some(account) => Some(
+                account
+                    .try_reserve_lookup_index(0)
+                    .ok_or(PersistedReadError::BudgetRefused)?,
+            ),
+            None => None,
+        };
+        let mut loaded = LoadedRuns {
+            runs: self.keys.iter().map(|_| Vec::new()).collect(),
+            bytes: 0,
+            reservation,
+        };
         let registered = self
             .catalog
             .list_index_runs(&self.table_id)
             .await
-            .map_err(|e| format!("list persisted runs: {e}"))?;
+            .map_err(|e| PersistedReadError::unreadable(format!("list persisted runs: {e}")))?;
         // A run whose removal failed may still be registered, so the orphan
         // sweep must retain its file even when the run is not loaded.
         let mut kept: HashSet<object_store::path::Path> = HashSet::new();
@@ -2681,11 +2755,32 @@ impl PersistedRuns {
                 }
                 continue;
             };
-            match self.read(&path).await {
-                Ok(run) => {
+            let account = account.ok_or_else(|| {
+                PersistedReadError::unreadable("No memory account for persisted index loading")
+            })?;
+            match self.read(&path, account).await {
+                Ok((run, size_bytes, reservation)) => {
+                    let Some(held) = loaded.reservation.as_mut() else {
+                        drop(run);
+                        drop(reservation);
+                        return Err(PersistedReadError::BudgetRefused);
+                    };
+                    if let Err(reservation) = held.absorb(reservation) {
+                        drop(run);
+                        drop(reservation);
+                        return Err(PersistedReadError::BudgetRefused);
+                    }
                     kept.insert(path);
-                    bytes = bytes.saturating_add(record.size_bytes);
-                    all[slot].push(run);
+                    loaded.bytes = loaded.bytes.saturating_add(size_bytes);
+                    loaded.runs[slot].push(run);
+                }
+                Err(
+                    error @ (PersistedReadError::BudgetRefused
+                    | PersistedReadError::Interrupted { .. }),
+                ) => {
+                    // Valid runs remain registered and syncing stays disabled.
+                    // Drop all newly decoded runs without sweeping their files.
+                    return Err(error);
                 }
                 Err(error) => {
                     tracing::debug!(table = %self.table_name, run_file = %path, %error, "Deleting a persisted secondary index run that cannot be read; its files are indexed again");
@@ -2697,21 +2792,122 @@ impl PersistedRuns {
             }
         }
         self.delete_unregistered(&kept).await;
-        Ok((all, bytes))
+        Ok(loaded)
     }
 
-    async fn read(&self, path: &object_store::path::Path) -> Result<IndexRun, String> {
-        let bytes = self
-            .store
-            .get(path)
+    async fn read(
+        &self,
+        path: &object_store::path::Path,
+        account: &Arc<CayenneMemoryAccount>,
+    ) -> Result<(IndexRun, u64, LookupIndexReservation), PersistedReadError> {
+        let store = Arc::clone(&self.store);
+        let path = path.clone();
+        let account = Arc::clone(account);
+        // Dropping the caller's future leaves this task running. Its buffers
+        // retain their reservations until the read and decode actually finish.
+        tokio::spawn(async move {
+            use futures::TryStreamExt;
+            let result = store
+                .get(&path)
+                .await
+                .map_err(|error| PersistedReadError::unreadable(error.to_string()))?;
+            if result.range.start != 0 || result.range.end != result.meta.size {
+                return Err(PersistedReadError::unreadable("incomplete object range"));
+            }
+            let size_bytes = result.meta.size;
+            let size =
+                usize::try_from(size_bytes).map_err(|_| PersistedReadError::BudgetRefused)?;
+            // A collected buffer can coexist with the stream's current chunk.
+            let read_bytes = size
+                .checked_mul(2)
+                .and_then(|size| size.checked_add(8192))
+                .ok_or(PersistedReadError::BudgetRefused)?;
+            let reservation = account
+                .try_reserve_lookup_index(read_bytes)
+                .ok_or(PersistedReadError::BudgetRefused)?;
+            let admitted = match result.payload {
+                object_store::GetResultPayload::File(mut file, _) => {
+                    // The blocking read owns the guard too: runtime shutdown
+                    // can cancel its waiter without stopping this closure.
+                    tokio::task::spawn_blocking(move || {
+                        use std::io::{Read, Seek, SeekFrom};
+                        file.seek(SeekFrom::Start(0))
+                            .map_err(|error| PersistedReadError::unreadable(error.to_string()))?;
+                        let mut bytes = vec![0; size];
+                        file.read_exact(&mut bytes)
+                            .map_err(|error| PersistedReadError::unreadable(error.to_string()))?;
+                        let mut extra = [0_u8];
+                        if file
+                            .read(&mut extra)
+                            .map_err(|error| PersistedReadError::unreadable(error.to_string()))?
+                            != 0
+                        {
+                            return Err(PersistedReadError::unreadable(
+                                "object grew while reading",
+                            ));
+                        }
+                        Ok((bytes, reservation))
+                    })
+                    .await
+                    .map_err(|error| PersistedReadError::Interrupted {
+                        message: error.to_string(),
+                    })??
+                }
+                object_store::GetResultPayload::Stream(mut stream) => {
+                    let mut bytes = Vec::with_capacity(size);
+                    while let Some(chunk) = stream
+                        .try_next()
+                        .await
+                        .map_err(|error| PersistedReadError::unreadable(error.to_string()))?
+                    {
+                        if chunk.len() > size.saturating_sub(bytes.len()) {
+                            return Err(PersistedReadError::unreadable(
+                                "object grew while reading",
+                            ));
+                        }
+                        bytes.extend_from_slice(&chunk);
+                    }
+                    if bytes.len() != size {
+                        return Err(PersistedReadError::unreadable("incomplete object body"));
+                    }
+                    (bytes, reservation)
+                }
+            };
+            tokio::task::spawn_blocking(move || {
+                // Capture the tuple whole, including when a queued closure is
+                // dropped before it runs: bytes must drop before their guard.
+                let mut admitted = admitted;
+                let decoded = IndexRun::decode_memory_bound(&admitted.0)
+                    .map_err(|error| PersistedReadError::unreadable(error.to_string()))?;
+                let peak = admitted
+                    .0
+                    .capacity()
+                    .checked_add(decoded)
+                    .ok_or(PersistedReadError::BudgetRefused)?;
+                if !admitted.1.try_resize(peak) {
+                    return Err(PersistedReadError::BudgetRefused);
+                }
+                let run = IndexRun::from_bytes(&admitted.0)
+                    .map_err(|error| PersistedReadError::unreadable(error.to_string()))?;
+                drop(admitted.0);
+                // Decoder scratch is gone. Keep only resident bytes and the
+                // run's share of publication headroom while later runs load.
+                let publish = run
+                    .publication_memory_bound()
+                    .map_err(|error| PersistedReadError::unreadable(error.to_string()))?;
+                debug_assert!(publish <= decoded, "publication fits decode headroom");
+                admitted.1.try_resize(publish);
+                Ok((run, size_bytes, admitted.1))
+            })
             .await
-            .map_err(|e| e.to_string())?
-            .bytes()
-            .await
-            .map_err(|e| e.to_string())?;
-        tokio::task::spawn_blocking(move || IndexRun::from_bytes(&bytes).map_err(|e| e.to_string()))
-            .await
-            .map_err(|e| e.to_string())?
+            .map_err(|error| PersistedReadError::Interrupted {
+                message: error.to_string(),
+            })?
+        })
+        .await
+        .map_err(|error| PersistedReadError::Interrupted {
+            message: error.to_string(),
+        })?
     }
 
     /// Deletes every file under the root that `kept` does not list. Runs only

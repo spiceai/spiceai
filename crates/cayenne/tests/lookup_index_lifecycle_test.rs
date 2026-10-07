@@ -1093,6 +1093,11 @@ async fn reopened_disjoint_index_runs_report_no_fully_covered_files() {
         .with_max_level(tracing::Level::INFO)
         .with_writer(move || writer.clone())
         .finish();
+    // tracing-core's single-dispatcher callsite cache consults the registering
+    // thread's default subscriber. Other tests can register the shared load
+    // event without this subscriber; a second dispatcher makes interest depend
+    // on all registered subscribers instead.
+    let _callsite_dispatch = tracing::Dispatch::new(tracing_subscriber::fmt().finish());
     let reopened = open_configured(
         &fixture,
         env,
@@ -1275,6 +1280,180 @@ async fn a_failed_load_of_the_persisted_runs_deletes_none_of_them() {
     );
     lookup(&next, name, 7).await;
     lookup(&next, name, rows_i64 * 2 + 7).await;
+}
+
+/// Refusing persisted runs preserves them for an open with a larger budget.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn persisted_runs_refused_by_the_pool_remain_registered() {
+    let fixture = common::TestFixture::new(common::BackendType::Sqlite)
+        .await
+        .expect("fixture");
+    let name = "persisted_memory_refusal";
+    let config = || VortexConfig {
+        target_vortex_file_size_mb: 1,
+        ..VortexConfig::default()
+    };
+    let table = open_configured(
+        &fixture,
+        Arc::new(RuntimeEnv::default()),
+        name,
+        &[&KEY],
+        config(),
+        IndexPersistence::Enabled,
+    )
+    .await;
+    overwrite(&table, vec![rows(0, 20_000)]).await;
+    wait_for_persisted_runs(&fixture, name, 1).await;
+    drop(table);
+    let before = registered_runs(&fixture, name).await;
+    let mut paths = Vec::new();
+    run_files(&fixture.data_path, &mut paths);
+    let files: Vec<_> = paths
+        .into_iter()
+        .map(|path| {
+            let bytes = std::fs::read(&path).expect("read persisted run");
+            (path, bytes)
+        })
+        .collect();
+    let (env, pool) = runtime_with_pool(128 * 1024);
+    let reopened = open_configured(
+        &fixture,
+        env,
+        name,
+        &[&KEY],
+        config(),
+        IndexPersistence::Enabled,
+    )
+    .await;
+    assert_eq!(counters(&reopened).index_bytes, 0);
+    // Opening schedules the first sync. Give it time to finish before checking
+    // that budget refusal did not turn valid runs into unwanted files.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let after = registered_runs(&fixture, name).await;
+    println!(
+        "persisted memory refusal: registered_before={} registered_after={} pool_reserved={} limit={}",
+        before.len(),
+        after.len(),
+        pool.reserved(),
+        128 * 1024
+    );
+    assert_eq!(after, before, "budget refusal must retain runs");
+    for (path, bytes) in &files {
+        assert_eq!(std::fs::read(path).expect("retained persisted run"), *bytes);
+    }
+    lookup(&reopened, name, 7).await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(registered_runs(&fixture, name).await, before);
+    for (path, bytes) in &files {
+        assert_eq!(
+            std::fs::read(path).expect("run retained after lookup"),
+            *bytes
+        );
+    }
+    drop(reopened);
+    let next = open_configured(
+        &fixture,
+        Arc::new(RuntimeEnv::default()),
+        name,
+        &[&KEY],
+        config(),
+        IndexPersistence::Enabled,
+    )
+    .await;
+    let verification = next
+        .verify_lookup_index_against_read_back()
+        .await
+        .expect("verify");
+    println!("after budget refusal and reopen: {verification:?}");
+    assert!(verification.agrees(), "{verification:?}");
+    assert_eq!(verification.uncovered_files, 0);
+    lookup(&next, name, 7).await;
+}
+
+/// A valid empty persisted frame completes loading and leaves data uncovered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn an_empty_persisted_run_completes_loading() {
+    let fixture = common::TestFixture::new(common::BackendType::Sqlite)
+        .await
+        .expect("fixture");
+    let env = Arc::new(RuntimeEnv::default());
+    let name = "empty_persisted_run";
+    let table = open_configured(
+        &fixture,
+        Arc::clone(&env),
+        name,
+        &[&KEY],
+        VortexConfig::default(),
+        IndexPersistence::Enabled,
+    )
+    .await;
+    overwrite(&table, vec![rows(0, 20_000)]).await;
+    wait_for_persisted_runs(&fixture, name, 1).await;
+    drop(table);
+    let mut paths = Vec::new();
+    run_files(&fixture.data_path, &mut paths);
+    let original_path = paths.first().expect("persisted run");
+    let original = std::fs::read(original_path).expect("run bytes");
+    // Preserve the frame and encoder, with no files, rows, words or postings.
+    let mut empty = original[..20].to_vec();
+    empty.extend_from_slice(&0_u32.to_le_bytes());
+    empty.extend_from_slice(&[0_u8; 24]);
+    let checksum = hash_index::hash_key_bytes_oneshot(&empty);
+    empty.extend_from_slice(&checksum.to_le_bytes());
+    let decoded = key_index::tiered::IndexRun::from_bytes(&empty).expect("valid empty run");
+    println!(
+        "empty persisted bounds: decode={} publication={}",
+        key_index::tiered::IndexRun::decode_memory_bound(&empty).expect("decode bound"),
+        decoded
+            .publication_memory_bound()
+            .expect("publication bound")
+    );
+    let empty_name = format!(
+        "{:016x}.run",
+        hash_index::hash_key_bytes(&[&0_u64.to_le_bytes()])
+    );
+    let empty_path = original_path.with_file_name(&empty_name);
+    std::fs::write(&empty_path, &empty).expect("write empty frame");
+    let metastore = rusqlite::Connection::open(fixture.db_path()).expect("metastore");
+    assert_eq!(
+        metastore
+            .execute(
+                "UPDATE cayenne_index_run SET run_name = ?1, row_count = 0, size_bytes = ?2",
+                rusqlite::params![
+                    empty_name,
+                    i64::try_from(empty.len()).expect("frame size fits")
+                ]
+            )
+            .expect("register empty frame"),
+        1
+    );
+    std::fs::remove_file(original_path).expect("remove replaced run");
+    drop(metastore);
+    let reopened = open_configured(
+        &fixture,
+        env,
+        name,
+        &[&KEY],
+        VortexConfig::default(),
+        IndexPersistence::Enabled,
+    )
+    .await;
+    poll_until(
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+        async || {
+            let remaining = registered_runs(&fixture, name).await.len();
+            if remaining == 0 {
+                Ok(())
+            } else {
+                Err(remaining)
+            }
+        },
+        |remaining| format!("empty run loading did not finish: {remaining} registrations remain"),
+    )
+    .await;
+    assert_eq!(counters(&reopened).index_bytes, 0);
+    lookup(&reopened, name, 7).await;
 }
 
 /// Relaxing a key column from `NOT NULL` to nullable is an in-place schema
