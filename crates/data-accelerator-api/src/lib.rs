@@ -696,7 +696,7 @@ pub trait DataAccelerator: Send + Sync {
     }
 
     /// How this engine's writes accumulate for `acceleration`, or `None` when the engine
-    /// is not the one that acceleration names.
+    /// is not the one that acceleration uses.
     ///
     /// `unset_refresh_mode` is what an absent `refresh_mode` resolves to for the source's
     /// connector, which the caller resolves because only it knows the `from:` value (see
