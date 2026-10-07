@@ -24,6 +24,7 @@ limitations under the License.
 use std::fmt::Debug;
 use std::sync::Arc;
 
+use async_openai::config::OPENAI_API_BASE;
 use async_trait::async_trait;
 use evaluate_api::openai::{
     DecisionRequest, DecisionResponse, decision_response_to_system_one,
@@ -48,6 +49,13 @@ pub fn is_decision_model_id(model_id: &str) -> bool {
         .is_some_and(|rest| rest.is_empty() || rest.starts_with('-'))
 }
 
+/// Whether `endpoint` is `OpenAI`'s own API, which needs an API key. An
+/// OpenAI-compatible endpoint, such as a gateway, may not, as with `OpenAI` chat models.
+#[must_use]
+pub fn requires_api_key(endpoint: &str) -> bool {
+    endpoint.trim_end_matches('/') == OPENAI_API_BASE
+}
+
 /// An `OpenAI` decision model implementing [`Evaluate`].
 pub struct OpenAiDecisions {
     client: Client,
@@ -57,7 +65,8 @@ pub struct OpenAiDecisions {
     name: String,
     /// Upstream model id, such as `gpt-6-luna`.
     model_id: String,
-    api_key: String,
+    /// Sent as a bearer token; an OpenAI-compatible endpoint may take none.
+    api_key: Option<String>,
     org_id: Option<String>,
     project_id: Option<String>,
     rate_controller: Arc<RateController>,
@@ -74,7 +83,8 @@ impl Debug for OpenAiDecisions {
 }
 
 impl OpenAiDecisions {
-    /// Builds a client for the decision model `model_id` at `endpoint`.
+    /// Builds a client for the decision model `model_id` at `endpoint`, authorized with
+    /// `api_key` when there is one.
     ///
     /// # Errors
     ///
@@ -84,7 +94,7 @@ impl OpenAiDecisions {
         name: impl Into<String>,
         model_id: impl Into<String>,
         endpoint: impl Into<String>,
-        api_key: impl Into<String>,
+        api_key: Option<String>,
     ) -> Result<Self> {
         let name = name.into();
         let client = create_http_client().ok_or(evaluate_api::Error::HttpClientCreationFailed {
@@ -95,7 +105,7 @@ impl OpenAiDecisions {
             endpoint: endpoint.into().trim_end_matches('/').to_string(),
             name,
             model_id: model_id.into(),
-            api_key: api_key.into(),
+            api_key,
             org_id: None,
             project_id: None,
             rate_controller: RateController::builder().build(),
@@ -116,7 +126,10 @@ impl OpenAiDecisions {
     }
 
     fn authorized(&self, request: RequestBuilder) -> RequestBuilder {
-        let mut request = request.bearer_auth(&self.api_key);
+        let mut request = match &self.api_key {
+            Some(api_key) => request.bearer_auth(api_key),
+            None => request,
+        };
         if let Some(org_id) = &self.org_id {
             request = request.header("OpenAI-Organization", org_id);
         }
@@ -310,7 +323,7 @@ mod tests {
             "luna",
             "gpt-6-luna",
             format!("{}/v1", server.uri()),
-            "sk-test",
+            Some("sk-test".to_string()),
         )
         .expect("client")
         .with_organization(Some("org-1".into()), None)
@@ -440,6 +453,43 @@ mod tests {
                 "model": "gpt-6-luna",
                 "answers": {"only": {"type": "choice", "choice": "billing", "probabilities": {"billing": 1.0}, "confidence": 1.0}}
             })
+        );
+    }
+
+    /// An OpenAI-compatible endpoint configured without a key is called without an
+    /// `Authorization` header, as `OpenAI` chat models are; `OpenAI`'s own API needs one.
+    #[tokio::test]
+    async fn a_keyless_endpoint_is_called_without_authorization() {
+        assert!(requires_api_key("https://api.openai.com/v1/"));
+        assert!(!requires_api_key("http://localhost:4000/v1"));
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/decisions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model": "gpt-6-luna",
+                "answers": [
+                    {"type": "predicate", "name": "damaged", "probability": 0.95},
+                    {"type": "choice", "name": "team", "choice": "support", "probabilities": [{"value": "billing", "probability": 0.1}, {"value": "support", "probability": 0.9}], "confidence": 0.8}
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let keyless =
+            OpenAiDecisions::try_new("luna", "gpt-6-luna", format!("{}/v1", server.uri()), None)
+                .expect("client");
+
+        keyless.evaluate(request()).await.expect("answers");
+        let received = server.received_requests().await.expect("recorded requests");
+        let headers: Vec<&str> = received[0]
+            .headers
+            .keys()
+            .map(reqwest::header::HeaderName::as_str)
+            .collect();
+        assert!(
+            !headers.contains(&"authorization"),
+            "no Authorization header without a key: {headers:?}"
         );
     }
 

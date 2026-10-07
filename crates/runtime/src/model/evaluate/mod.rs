@@ -127,10 +127,13 @@ async fn openai_decisions(
     let api_key = typed
         .api_key
         .as_ref()
-        .map(|key| key.expose_secret().to_string())
-        .ok_or_else(|| LlmError::FailedToLoadModel {
+        .map(|key| key.expose_secret().to_string());
+    // OpenAI's own API needs a key; an OpenAI-compatible endpoint may not, as with chat.
+    if api_key.is_none() && llms::openai::decisions::requires_api_key(&typed.endpoint) {
+        return Err(LlmError::FailedToLoadModel {
             source: "No OpenAI API key provided. Set the `openai_api_key` param, or export OPENAI_API_KEY. See: https://spiceai.org/docs/components/models".into(),
-        })?;
+        });
+    }
     let model_id = component.get_model_id().unwrap_or_default();
     let rate_controller = build_model_rate_controller(component, params);
     let client =
