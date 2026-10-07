@@ -46,13 +46,14 @@ pub struct AnthropicModelLister {
     api_key: SecretString,
     api_base: String,
     api_version: String,
+    workspace_id: Option<String>,
 }
 
 impl AnthropicModelLister {
     /// Creates a new model lister from parameters.
     ///
     /// Required parameter: `anthropic_api_key`
-    /// Optional parameters: `anthropic_api_base`, `anthropic_api_version`
+    /// Optional parameters: `anthropic_api_base`, `anthropic_api_version`, `anthropic_workspace_id`
     pub fn from_params(params: &HashMap<String, SecretString>) -> ListModelsResult<Self> {
         let api_key = get_required_param(params, "anthropic_api_key")?.clone();
         let api_base = params
@@ -63,10 +64,15 @@ impl AnthropicModelLister {
             |s| s.expose_secret().to_string(),
         );
 
+        let workspace_id = params
+            .get("anthropic_workspace_id")
+            .map(|s| s.expose_secret().to_string());
+
         Ok(Self {
             api_key,
             api_base,
             api_version,
+            workspace_id,
         })
     }
 
@@ -81,6 +87,7 @@ impl AnthropicModelLister {
             api_key,
             api_base: api_base.unwrap_or_else(|| API_BASE.to_string()),
             api_version: api_version.unwrap_or_else(|| API_VERSION.to_string()),
+            workspace_id: None,
         }
     }
 }
@@ -99,10 +106,14 @@ impl ListModels for AnthropicModelLister {
 
         let url = format!("{}/models", self.api_base.trim_end_matches('/'));
 
-        let response = client
+        let mut request = client
             .get(&url)
             .header("x-api-key", self.api_key.expose_secret())
-            .header("anthropic-version", &self.api_version)
+            .header("anthropic-version", &self.api_version);
+        if let Some(workspace_id) = &self.workspace_id {
+            request = request.header("anthropic-workspace-id", workspace_id);
+        }
+        let response = request
             .send()
             .await
             .map_err(|e| ListModelsError::NetworkError {

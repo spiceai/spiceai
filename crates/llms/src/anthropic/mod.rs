@@ -90,6 +90,25 @@ impl Anthropic {
     }
 }
 
+impl Anthropic {
+    /// Sends the `anthropic-workspace-id` header, which Anthropic requires for API keys that are
+    /// not scoped to a single workspace. `None` leaves the client unchanged.
+    pub fn with_workspace_id(mut self, workspace_id: Option<&str>) -> Result<Self, OpenAIError> {
+        let Some(workspace_id) = workspace_id else {
+            return Ok(self);
+        };
+        let value = HeaderValue::from_str(workspace_id)
+            .map_err(|e| OpenAIError::InvalidArgument(e.to_string()))?;
+        let cfg = self
+            .client
+            .config()
+            .clone()
+            .with_header_value("anthropic-workspace-id", value);
+        self.client = Client::with_config(cfg);
+        Ok(self)
+    }
+}
+
 const ANTHROPIC_DOCS: &str = "https://spiceai.org/docs/components/models/anthropic";
 
 /// Replaces the message of a `not_found_error` with one that names the model and the parameter to
