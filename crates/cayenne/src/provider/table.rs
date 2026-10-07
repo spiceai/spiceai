@@ -34846,6 +34846,10 @@ impl CayenneTableProvider {
             if uncovered {
                 self.shared_handle().request_runtime_lookup_index_build();
             }
+            let indexed_candidate_rows = explain
+                .candidate_rows
+                .filter(|_| !uncovered)
+                .and_then(|rows| usize::try_from(rows).ok());
             partitioned_file_lists = restricted_files;
             lookup_plan_provider = provider;
             if let Some(slot) = lookup_index_explain {
@@ -34855,6 +34859,17 @@ impl CayenneTableProvider {
                 // A row selection makes the footer row count an upper bound,
                 // so exact-aggregate optimizations must not read it as live.
                 statistics = statistics.to_inexact();
+                if let Some(candidate_rows) = indexed_candidate_rows {
+                    // Indexed positions bound the selected rows. Deletes and
+                    // residual predicates can remove candidates, so this count
+                    // remains inexact. Whole-file byte counts do not describe
+                    // a row selection and would distort join sizing.
+                    statistics.num_rows = DFPrecision::Inexact(candidate_rows);
+                    statistics.total_byte_size = DFPrecision::Absent;
+                    for column in &mut statistics.column_statistics {
+                        column.byte_size = DFPrecision::Absent;
+                    }
+                }
             }
         }
 
@@ -34986,30 +35001,34 @@ impl CayenneTableProvider {
         // can inspect a completed hash-join dynamic filter and batch-probe the
         // same snapshot index. Unsupported or oversized filters simply return no
         // runtime plan and keep the ordinary scan path.
-        let runtime_lookup_provider: Option<Arc<dyn VortexRuntimeAccessPlanProvider>> = self
-            .lookup_index
-            .as_ref()
-            .filter(|_| allow_runtime_lookup && lookup_plan_provider.is_none())
-            .zip(pinned_lookup_index.clone())
-            .map(|(index, pinned)| {
-                let request_build = self.weak_self.get().cloned().map(|weak| {
-                    Arc::new(move || {
-                        if let Some(provider) = weak.upgrade() {
-                            provider.request_runtime_lookup_index_build();
-                        }
-                    }) as Arc<dyn Fn() + Send + Sync>
+        let runtime_lookup: Option<Arc<super::lookup_index::DynamicLookupAccessPlanProvider>> =
+            self.lookup_index
+                .as_ref()
+                .filter(|_| allow_runtime_lookup && lookup_plan_provider.is_none())
+                .zip(pinned_lookup_index.clone())
+                .map(|(index, pinned)| {
+                    let request_build = self.weak_self.get().cloned().map(|weak| {
+                        Arc::new(move || {
+                            if let Some(provider) = weak.upgrade() {
+                                provider.request_runtime_lookup_index_build();
+                            }
+                        }) as Arc<dyn Fn() + Send + Sync>
+                    });
+                    Arc::new(super::lookup_index::DynamicLookupAccessPlanProvider::new(
+                        Arc::clone(index),
+                        pinned,
+                        partitioned_file_lists
+                            .iter()
+                            .flat_map(FileGroup::iter)
+                            .map(|file| file.object_meta.clone())
+                            .collect(),
+                        request_build,
+                    ))
                 });
-                Arc::new(super::lookup_index::DynamicLookupAccessPlanProvider::new(
-                    Arc::clone(index),
-                    pinned,
-                    partitioned_file_lists
-                        .iter()
-                        .flat_map(FileGroup::iter)
-                        .map(|file| file.object_meta.clone())
-                        .collect(),
-                    request_build,
-                )) as Arc<dyn VortexRuntimeAccessPlanProvider>
-            });
+        let runtime_lookup_provider: Option<Arc<dyn VortexRuntimeAccessPlanProvider>> =
+            runtime_lookup
+                .as_ref()
+                .map(|provider| Arc::clone(provider) as Arc<dyn VortexRuntimeAccessPlanProvider>);
         // Runtime lookup filters are populated only while a hash join executes.
         // Preserve the base scan's exact statistics here so an indexed table can
         // still use metadata-only aggregates when no runtime filter is present.
@@ -35055,7 +35074,7 @@ impl CayenneTableProvider {
             None
         };
 
-        plan_format
+        let plan = plan_format
             .create_physical_plan(
                 state,
                 FileScanConfigBuilder::new(table_url.object_store(), file_source)
@@ -35068,7 +35087,15 @@ impl CayenneTableProvider {
                     .with_output_partitioning(output_partitioning)
                     .build(),
             )
-            .await
+            .await?;
+        // A scan a hash join's keys can narrow lists its files only when it
+        // starts, once those keys are known.
+        Ok(match runtime_lookup {
+            Some(provider) => Arc::new(
+                super::runtime_restricted_scan::RuntimeRestrictedScanExec::new(plan, provider),
+            ),
+            None => plan,
+        })
     }
 
     /// Build the cold object-store tier scan branch, or `Ok(None)` when the cold
