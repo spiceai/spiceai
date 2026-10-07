@@ -294,6 +294,8 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | `postgres` | Attached [PostgreSQL][postgres] (Spice.ai Enterprise) | Release Candidate | N/A |
 | `sqlite`   | Embedded [SQLite][sqlite]         | Release Candidate | `memory`, `file` |
 
+An acceleration with no `engine` uses `cayenne`, or `arrow` on Windows.
+
 [arrow]: https://spiceai.org/docs/components/data-accelerators/arrow
 [cayenne]: https://spiceai.org/docs/components/data-accelerators/cayenne
 [duckdb]: https://spiceai.org/docs/components/data-accelerators/duckdb
@@ -501,9 +503,9 @@ dependencies:
 The `spiceai/quickstart` Spicepod will add a `taxi_trips` data table to the runtime which is now available to query by SQL.
 
 ```bash
-2026-09-25T22:41:46.090331Z  INFO runtime::init::dataset: Dataset taxi_trips registered (s3://spiceai-demo-datasets/taxi_trips/2024/), acceleration (arrow), results cache enabled. duration_ms=0
-2026-09-25T22:41:46.091619Z  INFO runtime_table::accelerated::refresh_task: Loading data for dataset taxi_trips
-2026-09-25T22:41:57.252645Z  INFO runtime_table::accelerated::refresh_task: Loaded 2,964,624 rows (399.38 MiB) for dataset taxi_trips in 11s 161ms.
+2026-10-07T04:34:55.981490Z  INFO runtime::init::dataset: Dataset taxi_trips registered (s3://spiceai-demo-datasets/taxi_trips/2024/), acceleration (cayenne), results cache enabled. duration_ms=120
+2026-10-07T04:34:55.982876Z  INFO runtime_table::accelerated::refresh_task: Loading data for dataset taxi_trips
+2026-10-07T04:35:23.020467Z  INFO runtime_table::accelerated::refresh_task: Loaded 2,964,624 rows (398.60 MiB) for dataset taxi_trips in 27s 37ms.
 ```
 
 **Step 4.** Start the Spice SQL REPL:

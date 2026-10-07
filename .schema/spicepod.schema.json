@@ -3122,6 +3122,7 @@
           "default": "auto"
         },
         "engine": {
+          "description": "The acceleration engine. Defaults to `cayenne`, or to `arrow` on Windows, where\nCayenne is not available.",
           "type": [
             "string",
             "null"
@@ -3190,7 +3191,7 @@
           ]
         },
         "params": {
-          "description": "Configuration parameters for the acceleration engine. The available parameters depend on the engine type specified in 'engine' (default: arrow). Available engines: arrow, cayenne, duckdb, postgres, sqlite, turso.",
+          "description": "Configuration parameters for the acceleration engine. The available parameters depend on the engine type specified in 'engine' (default: cayenne). Available engines: arrow, cayenne, duckdb, postgres, sqlite, turso.",
           "anyOf": [
             {
               "$ref": "#/$defs/Params"
@@ -3466,7 +3467,7 @@
               "params": {
                 "anyOf": [
                   {
-                    "$ref": "#/$defs/ArrowAcceleratorParams"
+                    "$ref": "#/$defs/CayenneAcceleratorParams"
                   },
                   {
                     "type": "null"
