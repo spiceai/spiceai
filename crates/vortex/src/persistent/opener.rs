@@ -830,6 +830,19 @@ struct PushdownConjuncts {
     skipped_dynamic: Vec<PhysicalExprRef>,
 }
 
+/// Where a conjunct handed to `collect_vortex_pushdown_conjunct` came from.
+#[derive(Clone, Copy)]
+enum ConjunctSource<'a> {
+    /// A conjunct of the scan predicate itself.
+    Predicate,
+    /// A conjunct of a dynamic filter's current value. `null_guard` is
+    /// `col IS NULL OR …` over every nullable column the filter reads, or
+    /// `None` when it reads none.
+    DynamicFilter {
+        null_guard: Option<&'a PhysicalExprRef>,
+    },
+}
+
 fn split_vortex_pushdown_conjuncts(
     expr_convertor: &dyn ExpressionConvertor,
     expr: &PhysicalExprRef,
@@ -842,7 +855,13 @@ fn split_vortex_pushdown_conjuncts(
     };
 
     for conjunct in split_conjunction(expr).into_iter().cloned() {
-        collect_vortex_pushdown_conjunct(expr_convertor, conjunct, schema, false, &mut conjuncts)?;
+        collect_vortex_pushdown_conjunct(
+            expr_convertor,
+            conjunct,
+            schema,
+            ConjunctSource::Predicate,
+            &mut conjuncts,
+        )?;
     }
 
     Ok(conjuncts)
@@ -852,15 +871,17 @@ fn collect_vortex_pushdown_conjunct(
     expr_convertor: &dyn ExpressionConvertor,
     expr: PhysicalExprRef,
     schema: &Schema,
-    from_dynamic_filter: bool,
+    source: ConjunctSource<'_>,
     conjuncts: &mut PushdownConjuncts,
 ) -> DFResult<()> {
+    let from_dynamic_filter = matches!(source, ConjunctSource::DynamicFilter { .. });
+
     // `try_pushdown_filters` wraps a hash-join dynamic filter as
     // `DynamicFilter OR col IS NULL` so EXPLAIN and `FilePruner` keep NULL keys
     // that a min/max bound would drop. Flatten that OR here: unwrap the
     // `DynamicFilter` (skipping its `InList` membership) and ignore the `IS NULL`
-    // leaves — each min/max conjunct is re-OR'd with `IS NULL` below. Any other
-    // OR holding a dynamic filter is declined.
+    // leaves — each min/max conjunct is re-OR'd with the filter's NULL guard
+    // below. Any other OR holding a dynamic filter is declined.
     if !from_dynamic_filter && contains_dynamic_filter(&expr) && is_or_expr(&expr) {
         return collect_or_wrapped_dynamic_filter(expr_convertor, expr, schema, conjuncts);
     }
@@ -874,8 +895,12 @@ fn collect_vortex_pushdown_conjunct(
                 return Ok(());
             }
         };
+        let null_guard = nullable_columns_null_guard(&expr, schema);
+        let source = ConjunctSource::DynamicFilter {
+            null_guard: null_guard.as_ref(),
+        };
         for conjunct in split_conjunction(&current).into_iter().cloned() {
-            collect_vortex_pushdown_conjunct(expr_convertor, conjunct, schema, true, conjuncts)?;
+            collect_vortex_pushdown_conjunct(expr_convertor, conjunct, schema, source, conjuncts)?;
         }
         return Ok(());
     }
@@ -889,14 +914,22 @@ fn collect_vortex_pushdown_conjunct(
     }
 
     if expr_convertor.can_be_pushed_down(&expr, schema) {
-        let pushed = if from_dynamic_filter {
+        let pushed = match source {
             // A min/max bound is NULL, not true, for a NULL key. Null-equal joins
             // (`IS NOT DISTINCT FROM`) and null-aware anti joins (`NOT IN`) need
-            // those keys; `pred OR col IS NULL` keeps them without changing the
-            // bound for any non-NULL value.
-            or_is_null_on_nullable_columns(expr, schema)
-        } else {
-            expr
+            // those keys. OR-ing the filter's whole guard onto every bound keeps a
+            // row with a NULL in any key column, as the planned
+            // `DynamicFilter OR col IS NULL` does; a guard on the bound's own
+            // column alone would let another key's bound drop that row. A row
+            // without NULL keys still has to satisfy every bound.
+            ConjunctSource::DynamicFilter {
+                null_guard: Some(null_guard),
+            } => Arc::new(df_expr::BinaryExpr::new(
+                expr,
+                Operator::Or,
+                Arc::clone(null_guard),
+            )) as PhysicalExprRef,
+            ConjunctSource::DynamicFilter { null_guard: None } | ConjunctSource::Predicate => expr,
         };
         conjuncts.pushed.push(pushed);
     } else if from_dynamic_filter || contains_dynamic_filter(&expr) {
@@ -912,12 +945,13 @@ fn collect_vortex_pushdown_conjunct(
 /// `try_pushdown_filters` plans, and declines any other OR that holds a
 /// dynamic filter.
 ///
-/// Each bound is pushed as `bound OR col IS NULL`, which stands in for the OR
-/// only when it holds exactly one `DynamicFilter` and every other disjunct is
-/// `IS NULL` on a column that filter reads. Pushing each filter of `D1 OR D2`
-/// would AND them, and swapping an `IS NULL` on another column for the bound's
-/// own would drop the rows it keeps. Declining costs only pruning: the join
-/// still refines every row the scan returns.
+/// Each bound is pushed OR'd with `IS NULL` on every nullable column the filter
+/// reads, which stands in for the OR only when it holds exactly one
+/// `DynamicFilter` and every other disjunct is `IS NULL` on a column that
+/// filter reads. Pushing each filter of `D1 OR D2` would AND them, and
+/// dropping an `IS NULL` on another column would drop the rows it keeps.
+/// Declining costs only pruning: the join still refines every row the scan
+/// returns.
 fn collect_or_wrapped_dynamic_filter(
     expr_convertor: &dyn ExpressionConvertor,
     expr: PhysicalExprRef,
@@ -932,7 +966,13 @@ fn collect_or_wrapped_dynamic_filter(
         conjuncts.skipped_dynamic.push(expr);
         return Ok(());
     };
-    collect_vortex_pushdown_conjunct(expr_convertor, dynamic_filter, schema, false, conjuncts)
+    collect_vortex_pushdown_conjunct(
+        expr_convertor,
+        dynamic_filter,
+        schema,
+        ConjunctSource::Predicate,
+        conjuncts,
+    )
 }
 
 /// The `DynamicFilter` of `expr` when `expr` is exactly
@@ -984,8 +1024,17 @@ pub(crate) fn or_is_null_on_nullable_columns(
     expr: PhysicalExprRef,
     schema: &Schema,
 ) -> PhysicalExprRef {
+    match nullable_columns_null_guard(&expr, schema) {
+        Some(null_guard) => Arc::new(df_expr::BinaryExpr::new(expr, Operator::Or, null_guard)),
+        None => expr,
+    }
+}
+
+/// `col IS NULL OR …` over every nullable column `expr` reads, or `None` when
+/// it reads none.
+fn nullable_columns_null_guard(expr: &PhysicalExprRef, schema: &Schema) -> Option<PhysicalExprRef> {
     let mut names = BTreeSet::new();
-    collect_column_names(&expr, &mut names);
+    collect_column_names(expr, &mut names);
 
     let mut is_nulls = Vec::new();
     for name in names {
@@ -1002,13 +1051,9 @@ pub(crate) fn or_is_null_on_nullable_columns(
         is_nulls.push(Arc::new(df_expr::IsNullExpr::new(column)) as PhysicalExprRef);
     }
 
-    let Some(null_check) = is_nulls.into_iter().reduce(|left, right| {
+    is_nulls.into_iter().reduce(|left, right| {
         Arc::new(df_expr::BinaryExpr::new(left, Operator::Or, right)) as PhysicalExprRef
-    }) else {
-        return expr;
-    };
-
-    Arc::new(df_expr::BinaryExpr::new(expr, Operator::Or, null_check))
+    })
 }
 
 fn collect_column_names(expr: &PhysicalExprRef, names: &mut BTreeSet<String>) {
@@ -2748,28 +2793,39 @@ mod tests {
         assert_eq!(wrapped.to_string(), dynamic.to_string());
     }
 
-    /// A dynamic filter on `name` (column `index` of the scanned file) whose
-    /// current value is `lo <= name AND name <= hi`.
-    fn bounds_dynamic_filter(name: &str, index: usize, lo: i32, hi: i32) -> PhysicalExprRef {
-        let column = Arc::new(df_expr::Column::new(name, index)) as PhysicalExprRef;
-        let bound = |op, value| {
-            Arc::new(df_expr::BinaryExpr::new(
-                Arc::clone(&column),
-                op,
-                Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(value)))),
-            )) as PhysicalExprRef
-        };
-        let bounds = Arc::new(df_expr::BinaryExpr::new(
-            bound(Operator::GtEq, lo),
-            Operator::And,
-            bound(Operator::LtEq, hi),
-        )) as PhysicalExprRef;
+    /// A dynamic filter over the columns of `bounds`, each `(name, index, lo,
+    /// hi)` naming a column at `index` of the scanned file. Its current value
+    /// is `lo <= name AND name <= hi` for every column, as a hash join builds
+    /// it for its keys.
+    fn bounds_dynamic_filter(bounds: &[(&str, usize, i32, i32)]) -> PhysicalExprRef {
+        let columns: Vec<PhysicalExprRef> = bounds
+            .iter()
+            .map(|&(name, index, _, _)| {
+                Arc::new(df_expr::Column::new(name, index)) as PhysicalExprRef
+            })
+            .collect();
+        let current = bounds
+            .iter()
+            .zip(&columns)
+            .flat_map(|(&(_, _, lo, hi), column)| {
+                [(Operator::GtEq, lo), (Operator::LtEq, hi)].map(|(op, value)| {
+                    Arc::new(df_expr::BinaryExpr::new(
+                        Arc::clone(column),
+                        op,
+                        Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(value)))),
+                    )) as PhysicalExprRef
+                })
+            })
+            .reduce(|left, right| {
+                Arc::new(df_expr::BinaryExpr::new(left, Operator::And, right)) as PhysicalExprRef
+            })
+            .expect("a dynamic filter needs at least one bound");
         let dynamic_filter = Arc::new(df_expr::DynamicFilterPhysicalExpr::new(
-            vec![Arc::clone(&column)],
+            columns,
             Arc::new(df_expr::Literal::new(ScalarValue::Boolean(Some(true)))),
         ));
         dynamic_filter
-            .update(bounds)
+            .update(current)
             .expect("dynamic filter update should succeed");
         dynamic_filter as PhysicalExprRef
     }
@@ -2844,9 +2900,9 @@ mod tests {
     async fn or_of_two_dynamic_filters_is_not_pushed_as_their_and() -> anyhow::Result<()> {
         let schema = dynamic_or_batch().schema();
         let either = Arc::new(df_expr::BinaryExpr::new(
-            bounds_dynamic_filter("a", 0, 3, 7),
+            bounds_dynamic_filter(&[("a", 0, 3, 7)]),
             Operator::Or,
-            bounds_dynamic_filter("b", 1, 30, 70),
+            bounds_dynamic_filter(&[("b", 1, 30, 70)]),
         )) as PhysicalExprRef;
         // What `try_pushdown_filters` plans for it:
         // `(D(a) OR D(b)) OR (a IS NULL OR b IS NULL)`.
@@ -2876,7 +2932,7 @@ mod tests {
             "b", 1,
         )))) as PhysicalExprRef;
         let filter = Arc::new(df_expr::BinaryExpr::new(
-            bounds_dynamic_filter("a", 0, 3, 7),
+            bounds_dynamic_filter(&[("a", 0, 3, 7)]),
             Operator::Or,
             b_is_null,
         )) as PhysicalExprRef;
@@ -2895,7 +2951,8 @@ mod tests {
     async fn planned_dynamic_filter_or_is_null_still_filters_the_scan() -> anyhow::Result<()> {
         let schema = dynamic_or_batch().schema();
         // Exactly what `try_pushdown_filters` plans: `D(a) OR a IS NULL`.
-        let filter = or_is_null_on_nullable_columns(bounds_dynamic_filter("a", 0, 3, 7), &schema);
+        let filter =
+            or_is_null_on_nullable_columns(bounds_dynamic_filter(&[("a", 0, 3, 7)]), &schema);
 
         let (scanned, kept) = scanned_and_kept_rows(filter).await?;
         let expected = vec![(None, Some(100)), (Some(5), Some(50)), (Some(5), Some(100))];
@@ -2904,6 +2961,25 @@ mod tests {
             scanned, expected,
             "the bound and its NULL keys must still reach the scan"
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn multi_column_dynamic_filter_keeps_a_row_with_any_null_key() -> anyhow::Result<()> {
+        let schema = dynamic_or_batch().schema();
+        // What `try_pushdown_filters` plans for a two-key hash join:
+        // `D(a, b) OR (a IS NULL OR b IS NULL)`.
+        let filter = or_is_null_on_nullable_columns(
+            bounds_dynamic_filter(&[("a", 0, 3, 7), ("b", 1, 30, 70)]),
+            &schema,
+        );
+
+        let (scanned, kept) = scanned_and_kept_rows(filter).await?;
+        let expected = vec![(None, Some(100)), (Some(5), Some(50)), (Some(100), None)];
+        assert_eq!(kept, expected);
+        // A bound guarded only by its own column drops (NULL, 100) on `b` and
+        // (100, NULL) on `a`.
+        assert_eq!(scanned, expected);
         Ok(())
     }
 }
