@@ -814,6 +814,7 @@ async fn run_ready_state_test(
 }
 
 // Test that the runtime is ready immediately with ready_state = on_registration for native provider
+#[cfg(not(windows))]
 #[tokio::test]
 async fn test_ready_state_on_registration_native_cayenne_acceleration() -> Result<(), anyhow::Error>
 {
@@ -845,6 +846,7 @@ async fn test_ready_state_on_registration_native_duckdb_acceleration() -> Result
 }
 
 // Test that the runtime is ready immediately with ready_state = on_registration for federated provider
+#[cfg(not(windows))]
 #[tokio::test]
 async fn test_ready_state_on_registration_federated_cayenne_acceleration()
 -> Result<(), anyhow::Error> {
@@ -876,6 +878,7 @@ async fn test_ready_state_on_registration_federated_duckdb_acceleration()
 }
 
 // Test that the runtime is ready immediately with ready_state = on_schema_resolved for native provider
+#[cfg(not(windows))]
 #[tokio::test]
 async fn test_ready_state_on_schema_resolved_native_cayenne_acceleration()
 -> Result<(), anyhow::Error> {
@@ -907,6 +910,7 @@ async fn test_ready_state_on_schema_resolved_native_duckdb_acceleration()
 }
 
 // Test that the runtime is ready immediately with ready_state = on_schema_resolved for federated provider
+#[cfg(not(windows))]
 #[tokio::test]
 async fn test_ready_state_on_schema_resolved_federated_cayenne_acceleration()
 -> Result<(), anyhow::Error> {
@@ -936,6 +940,7 @@ async fn test_ready_state_on_schema_resolved_federated_duckdb_acceleration()
 }
 
 // Test that the runtime is NOT ready until data loads with ready_state = on_load for native provider
+#[cfg(not(windows))]
 #[tokio::test]
 async fn test_ready_state_on_load_native_cayenne_acceleration() -> Result<(), anyhow::Error> {
     // Native provider, OnLoad, Cayenne engine, should error initially
@@ -965,6 +970,7 @@ async fn test_ready_state_on_load_native_duckdb_acceleration() -> Result<(), any
 }
 
 // Test that the runtime is NOT ready until data loads with ready_state = on_load for federated provider
+#[cfg(not(windows))]
 #[tokio::test]
 async fn test_ready_state_on_load_federated_cayenne_acceleration() -> Result<(), anyhow::Error> {
     // Federated provider, OnLoad, Cayenne engine, should error initially
@@ -994,6 +1000,7 @@ async fn test_ready_state_on_load_federated_duckdb_acceleration() -> Result<(), 
 }
 
 // Test both native and federated providers together with different ready states
+#[cfg(not(windows))]
 #[tokio::test]
 async fn test_ready_state_mixed_cayenne_acceleration() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));

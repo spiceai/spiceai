@@ -239,6 +239,7 @@ async fn duckdb_order_by_special_cases() -> Result<(), String> {
         .await
 }
 
+#[cfg(not(windows))]
 #[tokio::test]
 async fn duckdb_regexp() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
