@@ -427,11 +427,28 @@ fn instructions_entry(instructions: &str) -> NullableEntry {
 }
 
 /// The System One key for a choice value: its text, with booleans as `true`/`false`.
-fn choice_key(value: &ChoiceValue) -> String {
+/// With `typed`, a string is keyed by its JSON form (`"true"`), which no boolean and no
+/// other string shares.
+fn choice_key(value: &ChoiceValue, typed: bool) -> String {
     match value {
         ChoiceValue::Bool(b) => b.to_string(),
+        ChoiceValue::String(s) if typed => Value::String(s.clone()).to_string(),
         ChoiceValue::String(s) => s.clone(),
     }
+}
+
+/// Whether a boolean option and a string option have the same text, as `true` and
+/// `"true"` do. `OpenAI` treats them as different values, but their keys as text match.
+fn boolean_and_string_share_text(choices: &[ChoiceOption]) -> bool {
+    [true, false].into_iter().any(|flag| {
+        let text = if flag { "true" } else { "false" };
+        choices
+            .iter()
+            .any(|option| option.value == ChoiceValue::Bool(flag))
+            && choices
+                .iter()
+                .any(|option| matches!(&option.value, ChoiceValue::String(s) if s == text))
+    })
 }
 
 fn translate_question(
@@ -462,10 +479,13 @@ fn translate_question(
                     ),
                 ));
             }
+            // Keys stay text so a model reads the options as written, unless that would
+            // merge two distinct values.
+            let typed = boolean_and_string_share_text(choices);
             let mut criteria = BTreeMap::new();
             let mut options = Vec::with_capacity(choices.len());
             for option in choices {
-                let key = choice_key(&option.value);
+                let key = choice_key(&option.value, typed);
                 let description = option
                     .description
                     .as_ref()
@@ -1071,6 +1091,55 @@ mod tests {
         );
     }
 
+    /// `OpenAI` choice values are typed, so `true` and `"true"` are two options: both
+    /// reach the model as different options and come back with their own probability.
+    #[test]
+    fn a_boolean_and_a_string_with_the_same_text_are_different_choices() {
+        let req = request(json!({
+            "model": "jev",
+            "input": "x",
+            "questions": [{"type": "choice", "instructions": "Which?", "choices": [
+                {"value": true}, {"value": "true"}, {"value": "maybe"}
+            ]}]
+        }));
+        let translated = req.to_system_one().expect("translates");
+        let Some(Question::Choice { criteria, .. }) = translated.request.questions.get("q000")
+        else {
+            panic!("expected a choice question");
+        };
+        assert_eq!(
+            criteria.keys().map(String::as_str).collect::<Vec<_>>(),
+            [r#""maybe""#, r#""true""#, "true"]
+        );
+
+        let upstream = system_one_to_decision_request(&translated.request, "gpt-6-luna")
+            .expect("builds the upstream request");
+        assert_eq!(
+            serde_json::to_value(&upstream.questions).expect("serializes")[0]["choices"],
+            json!([{"value": "\"maybe\""}, {"value": "\"true\""}, {"value": "true"}])
+        );
+
+        let answers: BTreeMap<String, Answer> = serde_json::from_value(json!({
+            "q000": {"type": "choice", "choice": "\"true\"", "probabilities": {"true": 0.3, "\"true\"": 0.6, "\"maybe\"": 0.1}, "confidence": 0.4}
+        }))
+        .expect("answers");
+        let response = translated
+            .decision_response(EvaluateResponse {
+                model: "jev".into(),
+                answers,
+                usage: None,
+            })
+            .expect("maps back");
+        assert_eq!(
+            serde_json::to_value(&response).expect("serializes"),
+            json!({"model": "jev", "answers": [{"type": "choice", "name": null, "choice": "true", "probabilities": [
+                {"value": true, "probability": 0.3},
+                {"value": "true", "probability": 0.6},
+                {"value": "maybe", "probability": 0.1}
+            ], "confidence": 0.4}]})
+        );
+    }
+
     #[test]
     fn limits_and_images_are_refused_with_the_field_named() {
         let cases = [
@@ -1084,6 +1153,10 @@ mod tests {
             ),
             (
                 json!({"model": "m", "input": "x", "questions": [{"type": "choice", "instructions": "i", "choices": [{"value": "a"}, {"value": "a"}]}]}),
+                "questions[0].choices",
+            ),
+            (
+                json!({"model": "m", "input": "x", "questions": [{"type": "choice", "instructions": "i", "choices": [{"value": true}, {"value": "true"}, {"value": "true"}]}]}),
                 "questions[0].choices",
             ),
             (
