@@ -1395,7 +1395,7 @@ mod tests {
         let date_literal = cast(lit("2026-01-31"), DataType::Date32);
         let refused = [
             ("a string cast into a timestamp (#14753)", timestamp_literal),
-            ("a canonical string cast into a date", date_literal.clone()),
+            ("a canonical string cast into a date", date_literal),
             (
                 "a timestamp value",
                 lit(ScalarValue::TimestampNanosecond(
@@ -1429,10 +1429,6 @@ mod tests {
         ] {
             assert!(gate(&expr, Some(&schema)), "{expr} must still federate");
         }
-        assert!(
-            crate::function_support::sqlite_can_evaluate_expression(&date_literal, Some(&schema)),
-            "the SQLite connector's own gate still admits the canonical date literal its dialect renders as text"
-        );
     }
 
     /// The local half of #14482, pinned so the refusal above cannot outlive

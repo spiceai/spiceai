@@ -3136,47 +3136,37 @@ mod function_support_tests {
     async fn a_temporal_value_stays_local_on_the_sqlite_driver() {
         use datafusion::prelude::cast;
         use datafusion::scalar::ScalarValue;
-        let timestamp = || {
-            cast(
-                lit("2026-01-30 23:00:00"),
-                DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
-            )
-        };
-        let shapes: [(&str, Box<dyn Fn() -> Expr>); 3] = [
-            (
-                "a timestamp literal",
-                Box::new(|| col("val").gt_eq(timestamp())),
-            ),
+        let timestamp = cast(
+            lit("2026-01-30 23:00:00"),
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+        );
+        let shapes = [
+            ("a timestamp literal", col("val").gt_eq(timestamp.clone())),
             (
                 "a date literal",
-                Box::new(|| col("val").gt_eq(cast(lit("2026-01-31"), DataType::Date32))),
+                col("val").gt_eq(cast(lit("2026-01-31"), DataType::Date32)),
             ),
             (
                 "timestamp minus interval",
-                Box::new(move || {
-                    col("val").gt_eq(
-                        timestamp() - lit(ScalarValue::new_interval_mdn(0, 0, 3_600_000_000_000)),
-                    )
-                }),
+                col("val")
+                    .gt_eq(timestamp - lit(ScalarValue::new_interval_mdn(0, 0, 3_600_000_000_000))),
             ),
         ];
-        for (what, expr) in &shapes {
+        for (what, expr) in shapes {
             assert!(
-                !federates("sqlite", expr()).await,
-                "{what} must stay local on the dataset route: {}",
-                expr()
+                !federates("sqlite", expr.clone()).await,
+                "{what} must stay local on the dataset route: {expr}"
             );
             assert!(
-                !federates_via_catalog("sqlite", expr()).await,
-                "{what} must stay local on the catalog route: {}",
-                expr()
+                !federates_via_catalog("sqlite", expr.clone()).await,
+                "{what} must stay local on the catalog route: {expr}"
             );
         }
-        let plain = || col("val").gt_eq(lit("2026-01-31"));
+        let plain = col("val").gt_eq(lit("2026-01-31"));
         assert!(
-            federates("sqlite", plain()).await && federates_via_catalog("sqlite", plain()).await,
-            "{} must keep federating",
-            plain()
+            federates("sqlite", plain.clone()).await
+                && federates_via_catalog("sqlite", plain.clone()).await,
+            "{plain} must keep federating"
         );
     }
 
