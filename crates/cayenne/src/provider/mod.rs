@@ -106,6 +106,7 @@ pub(crate) mod predicate_stats;
 pub(crate) mod protected_merge_claims;
 pub(crate) mod query_admission;
 pub(crate) mod retention;
+pub(crate) mod runtime_restricted_scan;
 pub(crate) mod scan;
 pub(crate) mod sink;
 pub(crate) mod staged_upsert;
