@@ -602,22 +602,24 @@ mod tests {
 
     #[test]
     fn assistant_tool_call_with_empty_content_has_no_text_block() {
-        let msg: ChatCompletionRequestMessage = serde_json::from_value(json!({
-            "role": "assistant",
-            "content": "",
-            "tool_calls": [{
-                "id": "call_1",
-                "type": "function",
-                "function": { "name": "sql", "arguments": "{}" }
-            }]
-        }))
-        .expect("assistant message should deserialize");
+        for content in [json!(""), json!([{ "type": "text", "text": "" }])] {
+            let msg: ChatCompletionRequestMessage = serde_json::from_value(json!({
+                "role": "assistant",
+                "content": content,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": { "name": "sql", "arguments": "{}" }
+                }]
+            }))
+            .expect("assistant message should deserialize");
 
-        let param = MessageParam::try_from(msg).expect("message should convert");
-        let value = serde_json::to_value(&param).expect("message should serialize");
-        let blocks = value["content"].as_array().expect("content is an array");
-        assert_eq!(blocks.len(), 1);
-        assert_eq!(blocks[0]["type"], "tool_use");
+            let param = MessageParam::try_from(msg).expect("message should convert");
+            let value = serde_json::to_value(&param).expect("message should serialize");
+            let blocks = value["content"].as_array().expect("content is an array");
+            assert_eq!(blocks.len(), 1, "content: {content}");
+            assert_eq!(blocks[0]["type"], "tool_use");
+        }
     }
 
     #[test]
