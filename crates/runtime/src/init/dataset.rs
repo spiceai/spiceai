@@ -2098,9 +2098,11 @@ impl Runtime {
             .fail()?;
         }
         // Writes kept only in the acceleration would be overwritten by the changes a
-        // change stream applies for the same keys.
+        // change stream applies for the same keys. The connector's default counts:
+        // a CDC source refreshes by changes when `refresh_mode` is omitted.
         if acceleration_settings.write_mode == spicepod::acceleration::WriteMode::Acceleration
-            && acceleration_settings.refresh_mode == Some(RefreshMode::Changes)
+            && data_connector.resolve_refresh_mode(acceleration_settings.refresh_mode)
+                == RefreshMode::Changes
         {
             crate::AccelerationWriteModeWithChangesSnafu {
                 dataset_name: ds.name.to_string(),
