@@ -844,7 +844,16 @@ pub fn decision_response_to_system_one(
                             "question '{id}': a probability is for a boolean, but its options are strings"
                         ));
                     };
-                    distribution.insert(value, entry.probability);
+                    // A repeated option would otherwise keep its last probability and
+                    // pass every later check.
+                    if distribution
+                        .insert(value.clone(), entry.probability)
+                        .is_some()
+                    {
+                        return Err(format!(
+                            "question '{id}': the probability of option '{value}' is given more than once"
+                        ));
+                    }
                 }
                 Answer::Choice {
                     choice,
@@ -863,10 +872,18 @@ pub fn decision_response_to_system_one(
                         "question '{id}' is not a score question, but its answer is a score"
                     ));
                 };
-                let distribution = probabilities
-                    .into_iter()
-                    .map(|entry| (entry.value.to_string(), entry.probability))
-                    .collect();
+                let mut distribution = BTreeMap::new();
+                for entry in probabilities {
+                    if distribution
+                        .insert(entry.value.to_string(), entry.probability)
+                        .is_some()
+                    {
+                        return Err(format!(
+                            "question '{id}': the probability of level {} is given more than once",
+                            entry.value
+                        ));
+                    }
+                }
                 Answer::Score {
                     score,
                     legend: score_legend(criteria),
@@ -1198,6 +1215,60 @@ mod tests {
         answered.answers = BTreeMap::from([("q000".to_string(), Answer::Noul { noul: 0.7 })]);
         let response = served.decision_response(answered).expect("maps back");
         assert_eq!(serde_json::to_value(&response.usage).expect("usage"), usage);
+    }
+
+    /// A repeated probability entry is a malformed response: collected into a map, its
+    /// last value would replace the first and the distribution could still pass.
+    #[test]
+    fn a_repeated_probability_entry_is_an_error() {
+        let asked: EvaluateRequest = serde_json::from_value(json!({
+            "model": "luna", "state": "x",
+            "questions": {
+                "team": {"type": "choice", "criteria": {"billing": null, "technical": null}},
+                "tone": {"type": "score", "criteria": ["calm", "furious"]}
+            }
+        }))
+        .expect("request");
+        let cases = [
+            (
+                json!([
+                    {"type": "choice", "name": "team", "choice": "technical", "probabilities": [
+                        {"value": "billing", "probability": 0.4},
+                        {"value": "billing", "probability": 0.2},
+                        {"value": "technical", "probability": 0.8}
+                    ], "confidence": 0.6},
+                    {"type": "score", "name": "tone", "score": 1.0, "probabilities": [
+                        {"value": 0, "label": "calm", "probability": 0.0},
+                        {"value": 1, "label": "furious", "probability": 1.0}
+                    ], "confidence": 1.0}
+                ]),
+                "question 'team': the probability of option 'billing' is given more than once",
+            ),
+            (
+                json!([
+                    {"type": "choice", "name": "team", "choice": "technical", "probabilities": [
+                        {"value": "billing", "probability": 0.2},
+                        {"value": "technical", "probability": 0.8}
+                    ], "confidence": 0.6},
+                    {"type": "score", "name": "tone", "score": 1.0, "probabilities": [
+                        {"value": 1, "label": "furious", "probability": 0.5},
+                        {"value": 1, "label": "furious", "probability": 0.5}
+                    ], "confidence": 0.0}
+                ]),
+                "question 'tone': the probability of level 1 is given more than once",
+            ),
+        ];
+        for (answers, expected) in cases {
+            let response: DecisionResponse = serde_json::from_value(json!({
+                "model": "gpt-6-luna", "answers": answers,
+                "usage": {"input_tokens": 1, "output_tokens": 0}
+            }))
+            .expect("response");
+            assert_eq!(
+                decision_response_to_system_one(&asked, response).expect_err("malformed"),
+                expected
+            );
+        }
     }
 
     #[test]
