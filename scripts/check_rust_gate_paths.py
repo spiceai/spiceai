@@ -58,6 +58,10 @@ GATE_CONFIG_BASENAMES = (
     "layers.toml",
 )
 
+# Test fixtures and build inputs can have arbitrary extensions. Every tracked
+# file in a workspace source tree therefore participates in the Rust gate.
+WORKSPACE_SOURCE_TREES = ("crates/", "bin/", "tools/", "vendor/")
+
 # Rust inputs that are neither config files nor `.rs` sources, so there is
 # nothing to derive them from.
 RUST_SOURCE_PATHS = (
@@ -68,6 +72,7 @@ RUST_SOURCE_PATHS = (
     ".cargo/config.toml",
     # Holds every -Dclippy::… flag the gate enforces.
     "Makefile",
+    "version.txt",
     # `check_fork_patches.py` validates this file against `Cargo.lock`, so it is
     # an input the gate reads. Gated by name rather than derived: nothing in the
     # `lint-rust` recipe names it, only the guard it feeds. Left ungated, a
@@ -248,6 +253,10 @@ def derived_gate_paths(
     paths.update(imports(guards))
 
     paths.update(p for p in tracked if Path(p).name in GATE_CONFIG_BASENAMES)
+    paths.update(
+        p for p in tracked
+        if p.startswith(WORKSPACE_SOURCE_TREES) or p.endswith((".snap", ".proto"))
+    )
 
     return sorted(paths), notes
 

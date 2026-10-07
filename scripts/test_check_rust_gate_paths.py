@@ -131,6 +131,18 @@ check(
 
 print("rust_source_trees")
 
+fixture_paths = [
+    "crates/example/src/snapshots/query.snap",
+    "crates/example/tests/data/expected.custom",
+    "tools/example/fixtures/input.json",
+    "bin/spice/tests/expected.txt",
+    "vendor/example/schema.proto",
+    "fixtures/root.snap",
+]
+derived_inputs, _ = derived_gate_paths(fixture_paths)
+check("all workspace test inputs are derived regardless of extension",
+      sorted(p for p in derived_inputs if p in fixture_paths), sorted(fixture_paths))
+
 check(
     "tracked sources group by top-level directory",
     rust_source_trees(

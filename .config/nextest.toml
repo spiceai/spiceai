@@ -1,5 +1,5 @@
 [profile.default]
-retries = { backoff = "exponential", count = 5, delay = "2s", max-delay = "30s", jitter = true }
+retries = { backoff = "exponential", count = 3, delay = "2s", max-delay = "30s", jitter = true }
 fail-fast = false
 # Timeout for slow tests to prevent hung tests blocking CI
 slow-timeout = { period = "120s", terminate-after = 3 }
@@ -135,8 +135,8 @@ slow-timeout = { period = "120s", terminate-after = 12 }
 # because the ceiling is already above what the model predicts under the worst
 # contention measured plus headroom — the reason the other two moved. Something,
 # because this binary keeps the default retries: a genuine hang is killed once
-# per attempt, so every second added to the ceiling is spent six times over
-# (5 retries + the first try). Going to 12 would add 480s x 6 = 48 minutes to
+# per attempt, so every second added to the ceiling is spent four times over
+# (3 retries + the first try). Going to 12 would add 480s x 4 = 32 minutes to
 # the cost of catching one, on the binary least likely to need the room.
 #
 # The rule this follows is the one stated above: the ceiling is derived from the
@@ -179,7 +179,7 @@ slow-timeout = { period = "120s", terminate-after = 10 }
 # `retries = 0` for the same reason the convergence binaries have it: these
 # compare two engines' answers to the same SQL over the same data, so a mismatch
 # is deterministic and a retry cannot turn a real one into a pass — it only pays
-# the ~250s runtime up to five more times before reporting the failure it already
+# the ~250s runtime repeatedly before reporting the failure it already
 # had. The one genuinely environmental step, installing DuckDB's tpch/tpcds
 # extensions, is handled in the test: an unavailable fixture is reported as a
 # counted exclusion rather than a failure, so there is nothing here for a retry
