@@ -1248,6 +1248,15 @@ pub(crate) async fn initialize_cluster_scheduler_future(
     })))
 }
 
+/// Task slots an executor advertises: the `runtime.executor.task_slots` override if set,
+/// otherwise the CPU budget. The Spicepod validates the override into `1..=u32::MAX`; the
+/// CPU budget is at least one core, so the fallback only saturates on a machine with more
+/// than 4 billion of them.
+fn resolve_executor_task_slots(configured: Option<u64>, cpu_budget_slots: usize) -> u32 {
+    let slots = configured.unwrap_or_else(|| u64::try_from(cpu_budget_slots).unwrap_or(u64::MAX));
+    u32::try_from(slots).unwrap_or(u32::MAX)
+}
+
 /// Creates a Ballista executor, binds it to the `Runtime` handle, and returns its configured
 /// work loop as a future
 pub async fn initialize_cluster_executor(
@@ -1479,11 +1488,23 @@ pub async fn initialize_cluster_executor(
 
     let app_def = Arc::new(app_def);
 
-    // The CPU budget is always at least one core, so this only saturates on a
-    // machine with more than 4 billion of them.
-    let concurrent_tasks =
-        u32::try_from(cpu_budget::cpu_budget().cluster_executor_concurrent_tasks())
-            .unwrap_or(u32::MAX);
+    let configured_task_slots = app_def
+        .runtime
+        .executor
+        .as_ref()
+        .and_then(|executor| executor.task_slots);
+    let concurrent_tasks = resolve_executor_task_slots(
+        configured_task_slots,
+        cpu_budget::cpu_budget().cluster_executor_concurrent_tasks(),
+    );
+    match configured_task_slots {
+        Some(_) => tracing::info!(
+            "Executor task slots set to {concurrent_tasks} by `runtime.executor.task_slots`"
+        ),
+        None => tracing::info!(
+            "Executor task slots set to {concurrent_tasks} from the CPU budget, override with `runtime.executor.task_slots`"
+        ),
+    }
 
     let executor_meta = ExecutorRegistration {
         id: executor_id.clone(),
@@ -2580,6 +2601,25 @@ fn apply_distributed_execution_config(cfg: SessionConfig) -> SessionConfig {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn executor_task_slots_prefers_configured_value() {
+        assert_eq!(super::resolve_executor_task_slots(Some(32), 8), 32);
+        assert_eq!(super::resolve_executor_task_slots(Some(1), 8), 1);
+    }
+
+    #[test]
+    fn executor_task_slots_falls_back_to_cpu_budget() {
+        assert_eq!(super::resolve_executor_task_slots(None, 8), 8);
+    }
+
+    #[test]
+    fn executor_task_slots_saturates_at_u32_max() {
+        assert_eq!(
+            super::resolve_executor_task_slots(None, usize::MAX),
+            u32::MAX
+        );
+    }
+
     use super::ClusterTlsConfig;
     use bcder::{Mode, encode::Values, string::BitString};
     use bytes::Bytes;

@@ -111,6 +111,9 @@ pub struct Runtime {
     pub scheduler: Option<Scheduler>,
 
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor: Option<Executor>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_rate_control: Option<SourceRateControl>,
 
     #[serde(default, skip_serializing_if = "is_default")]
@@ -1418,6 +1421,32 @@ impl Scheduler {
     }
 }
 
+/// Cluster executor settings. Only applies when spiced runs as a cluster executor.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
+#[serde(deny_unknown_fields)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+pub struct Executor {
+    /// Number of tasks the executor advertises to the scheduler and runs concurrently.
+    /// Must be between 1 and 4294967295. Defaults to the executor's CPU cores as
+    /// resolved by `runtime.cpu`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[cfg_attr(feature = "schemars", schemars(range(min = 1)))]
+    pub task_slots: Option<u64>,
+}
+
+/// Validate `runtime.executor.task_slots`: the scheduler protocol carries the slot
+/// count as a `u32`, and an executor with zero slots would never accept work.
+fn validate_executor_task_slots(task_slots: u64) -> Result<(), String> {
+    if (1..=u64::from(u32::MAX)).contains(&task_slots) {
+        Ok(())
+    } else {
+        Err(format!(
+            "Invalid 'runtime.executor.task_slots' value {task_slots}: must be an integer between 1 and {}. Set it to the number of tasks the executor should run concurrently, or remove it to use the executor's CPU cores.",
+            u32::MAX
+        ))
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -1540,6 +1569,9 @@ pub struct RuntimeDeserializer {
     pub state: Option<RuntimeState>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scheduler: Option<Scheduler>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub executor: Option<Executor>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_rate_control: Option<SourceRateControl>,
     #[serde(default, skip_serializing_if = "is_default")]
@@ -1608,6 +1640,10 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
             crate::component::caching::validate_sql_results_warmup_config(sql_results)?;
         }
 
+        if let Some(task_slots) = deserializer.executor.as_ref().and_then(|e| e.task_slots) {
+            validate_executor_task_slots(task_slots)?;
+        }
+
         Ok(Runtime {
             caching,
             dataset_load_parallelism: deserializer.dataset_load_parallelism,
@@ -1633,6 +1669,7 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
             metrics: deserializer.metrics,
             state: deserializer.state,
             scheduler: deserializer.scheduler,
+            executor: deserializer.executor,
             source_rate_control: deserializer.source_rate_control,
             functions: deserializer.functions,
         })
@@ -2576,6 +2613,48 @@ datasets:
             result.is_err(),
             "unknown temporality value must fail to parse"
         );
+    }
+
+    fn parse_executor_runtime(yaml_str: &str) -> Result<Runtime, yaml::Error> {
+        yaml::from_str(yaml_str)
+    }
+
+    #[test]
+    fn test_executor_task_slots_unset_is_none() {
+        let runtime = parse_executor_runtime("executor: {}").expect("empty executor parses");
+        assert_eq!(runtime.executor, Some(Executor { task_slots: None }));
+        let runtime =
+            parse_executor_runtime("params: {}").expect("runtime without executor parses");
+        assert_eq!(runtime.executor, None);
+    }
+
+    #[test]
+    fn test_executor_task_slots_valid_values() {
+        for (text, expected) in [("1", 1), ("32", 32), ("4294967295", u64::from(u32::MAX))] {
+            let runtime = parse_executor_runtime(&format!("executor:\n  task_slots: {text}"))
+                .expect("in-range task_slots parses");
+            assert_eq!(runtime.executor.and_then(|e| e.task_slots), Some(expected));
+        }
+    }
+
+    #[test]
+    fn test_executor_task_slots_rejects_out_of_range() {
+        for text in ["0", "4294967296"] {
+            let err = parse_executor_runtime(&format!("executor:\n  task_slots: {text}"))
+                .expect_err("out-of-range task_slots must fail to parse");
+            let msg = err.to_string();
+            assert!(
+                msg.contains("runtime.executor.task_slots")
+                    && msg.contains("between 1 and 4294967295"),
+                "unexpected error: {msg}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_executor_rejects_unknown_field() {
+        let result = parse_executor_runtime("executor:\n  task_slot: 4");
+        assert!(result.is_err(), "unknown executor field must fail to parse");
     }
 
     #[test]
