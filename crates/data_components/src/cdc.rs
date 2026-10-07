@@ -375,6 +375,62 @@ pub struct LazyChangeBatch {
     /// it on an async task still occupies that worker for the build's duration —
     /// see the `build` doc — this just means the *lock* adds no await-blocking.)
     source: Mutex<Option<Box<dyn ChangeRows>>>,
+    /// Set by [`Self::prebuild`], which builds ahead of consumption. Boxed
+    /// so [`ChangeBatchError::Arrow`] is not laid out in every envelope —
+    /// an inline [`Prebuilt`] made the `ChangeSink` `Command::Apply` variant
+    /// trip `clippy::large_enum_variant`. See [`Prebuilt`].
+    prebuilt: Option<Box<Prebuilt>>,
+}
+
+/// What [`LazyChangeBatch::prebuild`] keeps from the source it consumed.
+struct Prebuilt {
+    /// The source's own answers to the no-build metadata queries. They keep
+    /// being served after the build, so every coalescing decision and metric
+    /// reads an envelope built ahead of consumption exactly as it would have
+    /// read it unbuilt, and a failed build loses none of them.
+    metadata: RowsMetadata,
+    /// The build's error, for [`LazyChangeBatch::into_built`] to return so the
+    /// consumer sees the error the build raised.
+    error: Option<ChangeBatchError>,
+}
+
+/// A [`ChangeRows`] source's answers to the no-build metadata queries.
+struct RowsMetadata {
+    is_empty: bool,
+    num_rows_hint: usize,
+    encoded_len: usize,
+    source_commit_ts_ms: Option<i64>,
+    is_heartbeat: bool,
+}
+
+impl RowsMetadata {
+    fn of(rows: &dyn ChangeRows) -> Self {
+        Self {
+            is_empty: rows.is_empty(),
+            num_rows_hint: rows.num_rows_hint(),
+            encoded_len: rows.encoded_len(),
+            source_commit_ts_ms: rows.source_commit_ts_ms(),
+            is_heartbeat: rows.is_heartbeat(),
+        }
+    }
+}
+
+/// An owned equivalent of a build error that has to stay with the batch: the
+/// same variant where its fields can be copied, else the same message.
+fn reported_again(error: &ChangeBatchError) -> ChangeBatchError {
+    match error {
+        ChangeBatchError::SchemaMismatch { detail, schema } => ChangeBatchError::SchemaMismatch {
+            detail: detail.clone(),
+            schema: Arc::clone(schema),
+        },
+        ChangeBatchError::DeferredBatchConsumed => ChangeBatchError::DeferredBatchConsumed,
+        ChangeBatchError::DeferredBuild { message } => ChangeBatchError::DeferredBuild {
+            message: message.clone(),
+        },
+        ChangeBatchError::Arrow { .. } => ChangeBatchError::DeferredBuild {
+            message: error.to_string(),
+        },
+    }
 }
 
 impl std::fmt::Debug for LazyChangeBatch {
@@ -392,6 +448,7 @@ impl LazyChangeBatch {
         Self {
             built: OnceLock::new(),
             source: Mutex::new(Some(source)),
+            prebuilt: None,
         }
     }
 
@@ -406,7 +463,35 @@ impl LazyChangeBatch {
         Self {
             built,
             source: Mutex::new(None),
+            prebuilt: None,
         }
+    }
+
+    /// Run the deferred build now, ahead of consumption. A built batch is
+    /// cached exactly as a first [`Self::get`] would cache it; a failure is
+    /// kept for [`Self::into_built`]. Either way the source's metadata is kept
+    /// (see [`Prebuilt`]). A no-op once built or consumed.
+    fn prebuild(&mut self) {
+        if self.built.get().is_some() {
+            return;
+        }
+        let Some(source) = self.source.get_mut().take() else {
+            return;
+        };
+        let metadata = RowsMetadata::of(source.as_ref());
+        let error = match source.build() {
+            Ok(batch) => {
+                let _ = self.built.set(batch);
+                None
+            }
+            // Keep the form both `get` and `into_built` will return: `get`
+            // clones via [`reported_again`], and an `Arrow` error cannot be
+            // cloned, so store that already-reported equivalent now. A
+            // borrowed lookup and a consuming one then cannot disagree on the
+            // variant for the same failed prebuild.
+            Err(e) => Some(reported_again(&e)),
+        };
+        self.prebuilt = Some(Box::new(Prebuilt { metadata, error }));
     }
 
     /// Return the built batch, running the deferred build on first access.
@@ -414,6 +499,9 @@ impl LazyChangeBatch {
     fn get(&self) -> Result<&ChangeBatch, ChangeBatchError> {
         if let Some(batch) = self.built.get() {
             return Ok(batch);
+        }
+        if let Some(error) = self.prebuilt.as_ref().and_then(|p| p.error.as_ref()) {
+            return Err(reported_again(error));
         }
         let mut source = self.source.lock();
         // Another caller may have built it while we waited on the lock.
@@ -450,6 +538,9 @@ impl LazyChangeBatch {
         if let Some(batch) = self.built.into_inner() {
             return Ok(batch);
         }
+        if let Some(error) = self.prebuilt.and_then(|p| p.error) {
+            return Err(error);
+        }
         let src = self
             .source
             .into_inner()
@@ -457,14 +548,18 @@ impl LazyChangeBatch {
         src.build()
     }
 
-    // No-build metadata accessors: read the built batch directly (lock-free) if
-    // present, else the not-yet-built source; the `default` covers the consumed
-    // state (post-failed-build). Kept as separate methods rather than a shared
+    // No-build metadata accessors: answer from what a build ahead of
+    // consumption kept, else the built batch directly (lock-free) if present,
+    // else the not-yet-built source; the `default` covers the consumed state
+    // (post-failed-build). Kept as separate methods rather than a shared
     // higher-order helper — the built and source branches borrow at different
     // lifetimes, which a single `FnOnce(&dyn ChangeRows)` helper can't satisfy.
 
     #[must_use]
     pub fn is_empty(&self) -> bool {
+        if let Some(prebuilt) = &self.prebuilt {
+            return prebuilt.metadata.is_empty;
+        }
         if let Some(b) = self.built.get() {
             return b.record.num_rows() == 0;
         }
@@ -481,6 +576,9 @@ impl LazyChangeBatch {
 
     #[must_use]
     pub fn num_rows_hint(&self) -> usize {
+        if let Some(prebuilt) = &self.prebuilt {
+            return prebuilt.metadata.num_rows_hint;
+        }
         if let Some(b) = self.built.get() {
             return b.record.num_rows();
         }
@@ -492,6 +590,9 @@ impl LazyChangeBatch {
 
     #[must_use]
     pub fn encoded_len(&self) -> usize {
+        if let Some(prebuilt) = &self.prebuilt {
+            return prebuilt.metadata.encoded_len;
+        }
         if let Some(b) = self.built.get() {
             return b.record.get_array_memory_size();
         }
@@ -503,6 +604,9 @@ impl LazyChangeBatch {
 
     #[must_use]
     pub fn source_commit_ts_ms(&self) -> Option<i64> {
+        if let Some(prebuilt) = &self.prebuilt {
+            return prebuilt.metadata.source_commit_ts_ms;
+        }
         if let Some(b) = self.built.get() {
             return b.source_commit_ts_ms();
         }
@@ -514,6 +618,9 @@ impl LazyChangeBatch {
 
     #[must_use]
     pub fn is_heartbeat(&self) -> bool {
+        if let Some(prebuilt) = &self.prebuilt {
+            return prebuilt.metadata.is_heartbeat;
+        }
         if let Some(b) = self.built.get() {
             return b.is_heartbeat();
         }
@@ -675,8 +782,14 @@ impl ChangeEnvelope {
 
     /// Whether the change batch is already built, so [`Self::into_parts`]
     /// resolves without running a deferred build.
-    fn is_materialized(&self) -> bool {
+    #[must_use]
+    pub fn is_materialized(&self) -> bool {
         self.change_batch.is_materialized()
+    }
+
+    /// Run a deferred build now; see [`prebuild_offloaded`].
+    fn prebuild(&mut self) {
+        self.change_batch.prebuild();
     }
 
     #[must_use]
@@ -817,6 +930,86 @@ pub async fn into_parts_offloaded_burst(
             .collect()
     })
     .await
+}
+
+/// Build a group of envelopes' deferred batches ahead of their consumption, on
+/// one blocking-pool handoff, and hand the group back in order.
+///
+/// For a reader that queues envelopes for a consumer still busy applying earlier
+/// ones: the build then overlaps that work instead of adding to it, and
+/// [`into_parts_offloaded_burst`] later finds the batches built. Each envelope
+/// keeps its build's outcome, so a failed build is returned by
+/// [`ChangeEnvelope::into_parts`] with the error it raised, and keeps answering
+/// the no-build metadata queries as its source did. A group with nothing to
+/// build comes back untouched, without the handoff.
+///
+/// If the blocking task itself fails, the group is replaced by one envelope
+/// whose build fails with the reason, so the consumer stops the dataset as it
+/// would for any failed build. The group's committers are dropped unacked, so
+/// the source re-streams its changes.
+pub async fn prebuild_offloaded(
+    mut items: Vec<Result<ChangeEnvelope, StreamError>>,
+) -> Vec<Result<ChangeEnvelope, StreamError>> {
+    let needs_build = items.iter().any(|item| {
+        item.as_ref()
+            .is_ok_and(|envelope| !envelope.is_materialized())
+    });
+    if !needs_build {
+        return items;
+    }
+    match tokio::task::spawn_blocking(move || {
+        for envelope in items.iter_mut().flatten() {
+            envelope.prebuild();
+        }
+        items
+    })
+    .await
+    {
+        Ok(items) => items,
+        Err(join_err) => vec![Ok(ChangeEnvelope::new_from_rows(
+            Box::new(NoOpCommitter),
+            Box::new(FailedBuild {
+                message: format!("deferred CDC batch build task failed: {join_err}"),
+            }),
+            false,
+        ))],
+    }
+}
+
+/// Stands in for a group whose build [`prebuild_offloaded`] lost: it is not
+/// empty and not a heartbeat, so the consumer cannot skip it, and its build
+/// fails with the reason.
+struct FailedBuild {
+    message: String,
+}
+
+impl ChangeRows for FailedBuild {
+    fn is_empty(&self) -> bool {
+        false
+    }
+
+    fn num_rows_hint(&self) -> usize {
+        0
+    }
+
+    fn encoded_len(&self) -> usize {
+        0
+    }
+
+    fn source_commit_ts_ms(&self) -> Option<i64> {
+        None
+    }
+
+    fn is_heartbeat(&self) -> bool {
+        false
+    }
+
+    fn build(self: Box<Self>) -> Result<ChangeBatch, ChangeBatchError> {
+        DeferredBuildSnafu {
+            message: self.message,
+        }
+        .fail()
+    }
 }
 
 /// A [`CommitChange`] implementation that does nothing. Useful when emitting
@@ -2001,6 +2194,7 @@ mod deferred_tests {
     //! empty batch) that converts to a `StreamError` for the dataset's stream.
     use super::*;
     use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::error::ArrowError;
     use arrow_array::Int32Array;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -2250,6 +2444,351 @@ mod deferred_tests {
             Err(err) => assert!(
                 matches!(err, ChangeBatchError::DeferredBuild { .. }),
                 "expected a typed DeferredBuild error, got {err:?}"
+            ),
+        }
+    }
+
+    // ----- build ahead of consumption -----
+
+    #[test]
+    fn prebuilt_stays_behind_a_pointer_so_the_arrow_error_is_not_in_every_envelope() {
+        // An inline `Option<Prebuilt>` on every `LazyChangeBatch` grew the
+        // ChangeSink `Command::Apply` variant past `clippy::large_enum_variant`
+        // (sign-off 37368765686). Boxing keeps unbuilt envelopes at the
+        // source-only size.
+        let lazy = std::mem::size_of::<LazyChangeBatch>();
+        let once = std::mem::size_of::<OnceLock<ChangeBatch>>();
+        let mutex = std::mem::size_of::<Mutex<Option<Box<dyn ChangeRows>>>>();
+        let boxed = std::mem::size_of::<Option<Box<Prebuilt>>>();
+        let inline = std::mem::size_of::<Option<Prebuilt>>();
+        assert!(
+            lazy <= once + mutex + boxed + 16,
+            "LazyChangeBatch is {lazy} bytes; boxed Prebuilt should keep it near {} \
+             (OnceLock {once} + Mutex {mutex} + pointer {boxed})",
+            once + mutex + boxed
+        );
+        assert!(
+            lazy < once + mutex + inline,
+            "LazyChangeBatch is {lazy} bytes; an inline Prebuilt would be at least {} \
+             and re-inflates Command::Apply",
+            once + mutex + inline
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn prebuilt_envelopes_reach_the_consumer_built_once_and_in_order() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let group: Vec<Result<ChangeEnvelope, StreamError>> = [1i32, 2, 3]
+            .into_iter()
+            .map(|rows| {
+                Ok(deferred(
+                    MockRows {
+                        result: Some(sample_batch(rows)),
+                        builds: Arc::clone(&builds),
+                        rows_hint: usize::try_from(rows).expect("positive row count"),
+                        empty: false,
+                        ts: None,
+                    },
+                    false,
+                ))
+            })
+            .collect();
+
+        let envelopes: Vec<ChangeEnvelope> = prebuild_offloaded(group)
+            .await
+            .into_iter()
+            .map(|item| item.expect("an envelope"))
+            .collect();
+        assert_eq!(builds.load(Ordering::SeqCst), 3);
+        assert!(envelopes.iter().all(ChangeEnvelope::is_materialized));
+
+        let parts = into_parts_offloaded_burst(envelopes)
+            .await
+            .expect("prebuilt burst resolves");
+        assert_eq!(
+            parts
+                .iter()
+                .map(|(_, batch, _, _)| batch.record.num_rows())
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3],
+            "group order must be preserved — committers pair with their batches"
+        );
+        assert_eq!(
+            builds.load(Ordering::SeqCst),
+            3,
+            "the consumer must not build a prebuilt envelope again"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_prebuilt_envelope_answers_metadata_as_its_source_did() {
+        // The source's hint (7) deliberately differs from the built batch's 3
+        // rows, and its encoded length (0) from the batch's Arrow size, so a
+        // metadata read served from the built batch would show.
+        let builds = Arc::new(AtomicUsize::new(0));
+        let group = vec![Ok(deferred(
+            MockRows {
+                result: Some(sample_batch(3)),
+                builds: Arc::clone(&builds),
+                rows_hint: 7,
+                empty: false,
+                ts: Some(42),
+            },
+            false,
+        ))];
+
+        let envelope = prebuild_offloaded(group)
+            .await
+            .pop()
+            .expect("one item back")
+            .expect("still an envelope");
+
+        assert!(envelope.is_materialized());
+        assert_eq!(envelope.num_rows_hint(), 7);
+        assert_eq!(envelope.encoded_len(), 0);
+        assert_eq!(envelope.source_commit_ts_ms(), Some(42));
+        assert!(!envelope.is_empty());
+        assert!(!envelope.is_heartbeat());
+        assert_eq!(
+            envelope
+                .change_batch()
+                .expect("built batch")
+                .record
+                .num_rows(),
+            3
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_prebuild_fails_the_consumer_with_the_build_error() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let group = vec![Ok(deferred(
+            MockRows {
+                result: None, // build fails
+                builds: Arc::clone(&builds),
+                rows_hint: 5,
+                empty: false,
+                ts: Some(42),
+            },
+            false,
+        ))];
+
+        let mut group = prebuild_offloaded(group).await;
+        let envelope = group
+            .pop()
+            .expect("one item back")
+            .expect("still an envelope");
+        assert!(group.is_empty());
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+        assert!(!envelope.is_materialized());
+        assert!(
+            !envelope.is_empty() && !envelope.is_heartbeat(),
+            "a failed envelope must not read as skippable"
+        );
+        assert_eq!(
+            (envelope.num_rows_hint(), envelope.source_commit_ts_ms()),
+            (5, Some(42)),
+            "a failed build keeps its source's metadata"
+        );
+        let borrowed = envelope
+            .change_batch()
+            .expect_err("a failed prebuild has no batch");
+        assert!(
+            matches!(
+                &borrowed,
+                ChangeBatchError::DeferredBuild { message } if message == "mock build failure"
+            ),
+            "expected the build's own error, not the consumed source, got {borrowed:?}"
+        );
+
+        match into_parts_offloaded_burst(vec![envelope]).await {
+            Ok(_) => panic!("a failed prebuild must fail the consumer"),
+            Err(err) => assert!(
+                matches!(
+                    &err,
+                    ChangeBatchError::DeferredBuild { message } if message == "mock build failure"
+                ),
+                "expected the build's own error, not the consumed source, got {err:?}"
+            ),
+        }
+        assert_eq!(builds.load(Ordering::SeqCst), 1, "no second build");
+    }
+
+    /// A [`ChangeRows`] whose build fails as [`ChangeBatchError::Arrow`], the
+    /// variant [`reported_again`] cannot clone by value.
+    struct ArrowFailingRows;
+
+    impl ChangeRows for ArrowFailingRows {
+        fn is_empty(&self) -> bool {
+            false
+        }
+        fn num_rows_hint(&self) -> usize {
+            1
+        }
+        fn encoded_len(&self) -> usize {
+            0
+        }
+        fn source_commit_ts_ms(&self) -> Option<i64> {
+            None
+        }
+        fn is_heartbeat(&self) -> bool {
+            false
+        }
+        fn build(self: Box<Self>) -> Result<ChangeBatch, ChangeBatchError> {
+            Err(ChangeBatchError::Arrow {
+                source: ArrowError::ExternalError(Box::new(std::io::Error::other(
+                    "synthetic arrow failure",
+                ))),
+            })
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_prebuild_arrow_failure_is_the_same_variant_on_borrow_and_consume() {
+        let group = vec![Ok(ChangeEnvelope::new_from_rows(
+            Box::new(NoOpCommitter),
+            Box::new(ArrowFailingRows),
+            false,
+        ))];
+        let mut group = prebuild_offloaded(group).await;
+        let envelope = group
+            .pop()
+            .expect("one item back")
+            .expect("still an envelope");
+        assert!(group.is_empty());
+
+        let borrowed = envelope
+            .change_batch()
+            .expect_err("a failed prebuild has no batch");
+        let ChangeBatchError::DeferredBuild {
+            message: borrowed_message,
+        } = &borrowed
+        else {
+            panic!("borrowed lookup must report DeferredBuild, got {borrowed:?}");
+        };
+        assert!(
+            borrowed_message.contains("synthetic arrow failure"),
+            "borrowed error must keep the build's cause, got {borrowed_message}"
+        );
+
+        match into_parts_offloaded_burst(vec![envelope]).await {
+            Ok(_) => panic!("a failed prebuild must fail the consumer"),
+            Err(err) => {
+                let ChangeBatchError::DeferredBuild { message } = &err else {
+                    panic!("consuming lookup must report the same DeferredBuild, got {err:?}");
+                };
+                assert_eq!(
+                    message, borrowed_message,
+                    "borrowed and consuming lookups must report the same error"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn prebuild_keeps_eager_envelopes_and_stream_errors_in_place() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let group = vec![
+            Ok(ChangeEnvelope::new(
+                Box::new(NoOpCommitter),
+                sample_batch(2),
+                false,
+            )),
+            Err(StreamError::External("transient".to_string())),
+            Ok(deferred(
+                MockRows {
+                    result: Some(sample_batch(3)),
+                    builds: Arc::clone(&builds),
+                    rows_hint: 3,
+                    empty: false,
+                    ts: None,
+                },
+                true,
+            )),
+        ];
+
+        let group = prebuild_offloaded(group).await;
+
+        assert_eq!(builds.load(Ordering::SeqCst), 1);
+        assert_eq!(group.len(), 3);
+        assert!(matches!(&group[1], Err(StreamError::External(m)) if m == "transient"));
+        assert_eq!(
+            group
+                .iter()
+                .filter_map(|item| item.as_ref().ok())
+                .map(|e| (e.num_rows_hint(), e.is_materialized(), e.is_dataset_ready()))
+                .collect::<Vec<_>>(),
+            vec![(2, true, false), (3, true, true)]
+        );
+    }
+
+    /// A [`ChangeRows`] whose build panics, to lose the blocking build task.
+    struct PanickingRows;
+
+    impl ChangeRows for PanickingRows {
+        fn is_empty(&self) -> bool {
+            false
+        }
+        fn num_rows_hint(&self) -> usize {
+            1
+        }
+        fn encoded_len(&self) -> usize {
+            0
+        }
+        fn source_commit_ts_ms(&self) -> Option<i64> {
+            None
+        }
+        fn is_heartbeat(&self) -> bool {
+            false
+        }
+        fn build(self: Box<Self>) -> Result<ChangeBatch, ChangeBatchError> {
+            panic!("build panicked");
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lost_prebuild_task_fails_the_consumer_instead_of_dropping_the_group() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let group = vec![
+            Ok(deferred(
+                MockRows {
+                    result: Some(sample_batch(1)),
+                    builds: Arc::clone(&builds),
+                    rows_hint: 1,
+                    empty: false,
+                    ts: None,
+                },
+                false,
+            )),
+            Ok(ChangeEnvelope::new_from_rows(
+                Box::new(NoOpCommitter),
+                Box::new(PanickingRows),
+                false,
+            )),
+        ];
+
+        let group = prebuild_offloaded(group).await;
+        assert_eq!(group.len(), 1, "the lost group is replaced by one envelope");
+        let envelopes: Vec<ChangeEnvelope> = group
+            .into_iter()
+            .map(|item| item.expect("an envelope"))
+            .collect();
+        assert!(
+            envelopes
+                .iter()
+                .all(|e| !e.is_no_op_heartbeat() && !e.is_empty()),
+            "the consumer must not be able to strip or skip it"
+        );
+
+        match into_parts_offloaded_burst(envelopes).await {
+            Ok(_) => panic!("a lost prebuild must fail the consumer"),
+            Err(err) => assert!(
+                matches!(
+                    &err,
+                    ChangeBatchError::DeferredBuild { message }
+                        if message.starts_with("deferred CDC batch build task failed")
+                ),
+                "expected the lost build's reason, got {err:?}"
             ),
         }
     }

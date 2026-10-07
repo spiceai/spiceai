@@ -23,7 +23,7 @@ use std::time::{Duration, Instant, SystemTime};
 use cache::Caching;
 use data_components::cdc::{self, ChangesStream};
 use datafusion::error::{DataFusionError, Result};
-use futures::StreamExt;
+use futures::{FutureExt, Stream, StreamExt};
 use runtime_acceleration::change_sink::batching::{CdcIngress, CoalescingLimits};
 use runtime_acceleration::change_sink::{
     ChangeBatch, DurabilityObserver, Recovery, StorageDurability, Submission, WriteOptions,
@@ -42,6 +42,77 @@ use crate::accelerated::refresh::Refresh;
 use crate::accelerated::refresh_completion::RefreshCompletion;
 
 type Committer = Box<dyn cdc::CommitChange + Send + Sync>;
+
+/// One item from a CDC change stream: a change envelope, or the stream error
+/// that stopped it.
+pub(super) type ChangeStreamItem = Result<cdc::ChangeEnvelope, cdc::StreamError>;
+
+/// A change stream item, or the panic that ended the source.
+pub(super) type SourceItem = std::thread::Result<ChangeStreamItem>;
+
+/// Most envelopes the consume loop takes from the source into one build group.
+pub(super) const PREBUILD_GROUP_MAX_ENVELOPES: usize = 1024;
+
+/// Most encoded bytes (`ChangeEnvelope::encoded_len`, the decode-free estimate)
+/// the consume loop takes into one build group, so one group's build stays short
+/// and the first envelope of a backlog is not held behind a large one.
+pub(super) const PREBUILD_GROUP_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+fn cdc_item_budget_bytes(item: &ChangeStreamItem) -> usize {
+    // `encoded_len` answers without forcing a build: a deferred envelope from a
+    // schema-aware estimate of its buffered wire size, and an envelope built
+    // ahead keeps answering with that same estimate.
+    item.as_ref().map_or(0, cdc::ChangeEnvelope::encoded_len)
+}
+
+/// `first` plus whatever else `stream` has ready right now, without waiting,
+/// as one [`cdc::prebuild_offloaded`] group of at most `max_envelopes`
+/// envelopes and [`PREBUILD_GROUP_MAX_BYTES`]; whether the stream ended while
+/// gathering; and the next source item, which must follow the group in source
+/// order: an envelope that would push the group over the byte budget, or the
+/// panic that ended the source.
+///
+/// The group grows only when `first` has a deferred batch to build, so an eager
+/// source's envelopes reach the sink one at a time, as they arrive. An envelope
+/// that alone exceeds the budget is still allowed when it is the only member of
+/// the group.
+pub(super) fn take_ready_group<S>(
+    first: ChangeStreamItem,
+    stream: &mut S,
+    max_envelopes: usize,
+) -> (Vec<ChangeStreamItem>, bool, Option<SourceItem>)
+where
+    S: Stream<Item = SourceItem> + Unpin,
+{
+    let needs_build = first
+        .as_ref()
+        .is_ok_and(|envelope| !envelope.is_materialized());
+    let mut bytes = cdc_item_budget_bytes(&first);
+    let mut group = vec![first];
+    if !needs_build {
+        return (group, false, None);
+    }
+    while group.len() < max_envelopes && bytes < PREBUILD_GROUP_MAX_BYTES {
+        match stream.next().now_or_never() {
+            Some(Some(Ok(item))) => {
+                let item_bytes = cdc_item_budget_bytes(&item);
+                // Check the combined size before appending. Two ready envelopes
+                // each under the budget must not form an over-budget group; the
+                // overflowing one starts the next group. An individually
+                // oversized envelope is allowed only when alone.
+                if bytes.saturating_add(item_bytes) > PREBUILD_GROUP_MAX_BYTES {
+                    return (group, false, Some(Ok(item)));
+                }
+                bytes = bytes.saturating_add(item_bytes);
+                group.push(item);
+            }
+            Some(Some(panic)) => return (group, false, Some(panic)),
+            Some(None) => return (group, true, None),
+            None => break,
+        }
+    }
+    (group, false, None)
+}
 
 /// Metadata only. Accepted row buffers belong exclusively to the sink owner.
 struct PendingSource {
@@ -81,14 +152,9 @@ async fn await_front(pending: &mut VecDeque<PendingSource>) -> Result<()> {
 }
 
 enum Event {
-    Source(
-        Option<
-            std::result::Result<
-                Result<cdc::ChangeEnvelope, cdc::StreamError>,
-                Box<dyn std::any::Any + Send>,
-            >,
-        >,
-    ),
+    Source(Option<SourceItem>),
+    /// An item the consume loop already took from the source and built ahead.
+    Built(ChangeStreamItem),
     Admission,
     Published(Result<()>),
 }
@@ -155,18 +221,26 @@ impl RefreshTask {
         let mut pending = VecDeque::new();
         let mut group = SourceGroup::default();
         let mut held: Option<cdc::ChangeEnvelope> = None;
+        let mut built: VecDeque<ChangeStreamItem> = VecDeque::new();
+        let mut carried: Option<SourceItem> = None;
         let mut source_ended = false;
         let mut received_timestamp = None;
         let mut metadata_flush_count = 0_u64;
-        // Bound source metadata as well as storage admission. No source data
-        // queue is created, and at most one unaccepted envelope is retained.
+        // Bound source metadata as well as storage admission. Unaccepted
+        // envelopes are one held envelope, or one group built ahead while the
+        // sink applies, which takes no more than this limit leaves room for.
         let metadata_limit = config
             .prefetch_buffer
             .max(1)
             .saturating_add(config.max_coalesced_envelopes.max(1));
 
         loop {
-            if source_ended && held.is_none() && pending.is_empty() {
+            if source_ended
+                && held.is_none()
+                && built.is_empty()
+                && carried.is_none()
+                && pending.is_empty()
+            {
                 break;
             }
             let retained = pending
@@ -263,6 +337,10 @@ impl RefreshTask {
                         }
                     }
                 }
+            } else if let Some(item) = built.pop_front() {
+                Event::Built(item)
+            } else if let Some(item) = carried.take() {
+                Event::Source(Some(item))
             } else if source_ended || retained >= metadata_limit {
                 Event::Published(await_front(&mut pending).await)
             } else {
@@ -275,6 +353,26 @@ impl RefreshTask {
                         Event::Source(item)
                     },
                 }
+            };
+            let event = match event {
+                // While the sink applies a burst, build the deferred rows of this
+                // envelope and of whatever else the source already has ready, so
+                // the build overlaps that apply instead of adding to the next one.
+                // An idle or lingering sink builds its burst in one handoff, so
+                // envelopes then go to it unbuilt.
+                Event::Source(Some(Ok(Ok(envelope))))
+                    if ingress.is_applying() && !envelope.is_materialized() =>
+                {
+                    let room = metadata_limit
+                        .saturating_sub(retained)
+                        .clamp(1, PREBUILD_GROUP_MAX_ENVELOPES);
+                    let (group, ended, next) = take_ready_group(Ok(envelope), &mut source, room);
+                    source_ended |= ended;
+                    carried = next;
+                    built.extend(cdc::prebuild_offloaded(group).await);
+                    continue;
+                }
+                event => event,
             };
             let result: Result<bool> = match event {
                 Event::Admission => {
@@ -335,11 +433,11 @@ impl RefreshTask {
                 Event::Source(Some(Err(_))) => Err(DataFusionError::Execution(
                     "CDC source stream panicked".into(),
                 )),
-                Event::Source(Some(Ok(Err(error)))) => {
+                Event::Source(Some(Ok(Err(error)))) | Event::Built(Err(error)) => {
                     self.consume_source_error(&mut context, &mut pending, &mut group, &error)
                         .await
                 }
-                Event::Source(Some(Ok(Ok(envelope)))) => {
+                Event::Source(Some(Ok(Ok(envelope)))) | Event::Built(Ok(envelope)) => {
                     if !envelope.is_heartbeat()
                         && let Some(timestamp) = envelope.source_commit_ts_ms()
                     {
@@ -385,6 +483,8 @@ impl RefreshTask {
         // belongs to the sink and does not depend on these observers.
         drop(pending);
         drop(held);
+        drop(built);
+        drop(carried);
         if let Some(observer) = &observer
             && let Some(message) =
                 flush_pending_source_commits(sink, observer, &dataset_name, &self.runtime_status)

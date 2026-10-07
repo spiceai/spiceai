@@ -2276,6 +2276,9 @@ fn handle_stream_error(err: &cdc::StreamError, dataset_name: &TableReference) ->
 
 #[cfg(test)]
 mod tests {
+    use super::ingress::{
+        PREBUILD_GROUP_MAX_BYTES, PREBUILD_GROUP_MAX_ENVELOPES, SourceItem, take_ready_group,
+    };
     use super::*;
     use arrow::array::{ArrayRef, Int32Array, ListArray, StringArray, StructArray};
     use arrow::datatypes::{DataType, Field, Schema};
@@ -2283,6 +2286,7 @@ mod tests {
     use data_components::arrow::write::MemTable;
     use data_components::cdc::changes_schema;
     use datafusion::datasource::TableProvider;
+    use futures::FutureExt;
     use spice_table::IndexLayer;
 
     use std::sync::Arc;
@@ -7267,5 +7271,534 @@ mod tests {
         assert!(result.is_ok(), "Non-null PK should succeed");
         let (str_val, _expr) = result.expect("already asserted Ok");
         assert_eq!(str_val, "42");
+    }
+
+    // ----- the reader's build groups -----
+
+    /// The consume loop's source: a change stream whose panic ends it as an item.
+    fn caught(stream: cdc::ChangesStream) -> impl futures::Stream<Item = SourceItem> + Unpin {
+        std::panic::AssertUnwindSafe(stream).catch_unwind()
+    }
+
+    /// A deferred [`cdc::ChangeRows`] that builds a one-row batch.
+    struct OneRow {
+        encoded_len: usize,
+    }
+
+    impl cdc::ChangeRows for OneRow {
+        fn is_empty(&self) -> bool {
+            false
+        }
+        fn num_rows_hint(&self) -> usize {
+            1
+        }
+        fn encoded_len(&self) -> usize {
+            self.encoded_len
+        }
+        fn source_commit_ts_ms(&self) -> Option<i64> {
+            None
+        }
+        fn is_heartbeat(&self) -> bool {
+            false
+        }
+        fn build(self: Box<Self>) -> Result<cdc::ChangeBatch, cdc::ChangeBatchError> {
+            let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+            let data = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int32Array::from(vec![1])) as ArrayRef],
+            )
+            .expect("one-row batch");
+            cdc::wrap_data_as_change_batch(&schema, &data)
+        }
+    }
+
+    fn deferred_envelope_of(encoded_len: usize) -> cdc::ChangeEnvelope {
+        cdc::ChangeEnvelope::new_from_rows(
+            Box::new(cdc::NoOpCommitter),
+            Box::new(OneRow { encoded_len }),
+            false,
+        )
+    }
+
+    fn deferred_envelope() -> cdc::ChangeEnvelope {
+        deferred_envelope_of(8)
+    }
+
+    fn eager_envelope() -> cdc::ChangeEnvelope {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let data = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![1])) as ArrayRef],
+        )
+        .expect("one-row batch");
+        cdc::ChangeEnvelope::new(
+            Box::new(cdc::NoOpCommitter),
+            cdc::wrap_data_as_change_batch(&schema, &data).expect("change batch"),
+            false,
+        )
+    }
+
+    #[test]
+    fn an_eager_envelope_is_not_held_for_a_build_group() {
+        let mut stream = caught(Box::pin(futures::stream::iter(vec![
+            Ok(deferred_envelope()),
+            Ok(deferred_envelope()),
+        ])));
+        let (group, ended, _overflow) = take_ready_group(
+            Ok(eager_envelope()),
+            &mut stream,
+            PREBUILD_GROUP_MAX_ENVELOPES,
+        );
+        assert_eq!(group.len(), 1);
+        assert!(!ended);
+    }
+
+    #[test]
+    fn a_build_group_takes_what_is_ready_and_reports_the_end_of_the_stream() {
+        let mut stream = caught(Box::pin(futures::stream::iter(vec![
+            Ok(deferred_envelope()),
+            Err(cdc::StreamError::External("transient".to_string())),
+            Ok(eager_envelope()),
+        ])));
+        let (group, ended, _overflow) = take_ready_group(
+            Ok(deferred_envelope()),
+            &mut stream,
+            PREBUILD_GROUP_MAX_ENVELOPES,
+        );
+        assert_eq!(group.len(), 4);
+        assert!(
+            group[2].is_err(),
+            "a stream error keeps its place in the group"
+        );
+        assert!(ended);
+    }
+
+    #[test]
+    fn a_build_group_stops_at_what_is_not_ready_yet() {
+        let ready = futures::stream::iter(vec![Ok(deferred_envelope()), Ok(deferred_envelope())]);
+        let mut stream = caught(Box::pin(ready.chain(futures::stream::pending())));
+        let (group, ended, _overflow) = take_ready_group(
+            Ok(deferred_envelope()),
+            &mut stream,
+            PREBUILD_GROUP_MAX_ENVELOPES,
+        );
+        assert_eq!(group.len(), 3);
+        assert!(!ended);
+    }
+
+    #[test]
+    fn a_build_group_takes_no_more_than_the_room_it_is_given() {
+        let mut stream = caught(Box::pin(futures::stream::iter(
+            (0..10).map(|_| Ok(deferred_envelope())),
+        )));
+        let (group, ended, _overflow) = take_ready_group(Ok(deferred_envelope()), &mut stream, 4);
+        assert_eq!(group.len(), 4);
+        assert!(!ended);
+    }
+
+    #[test]
+    fn a_build_group_stops_at_its_byte_budget() {
+        // Each envelope estimates a third of the budget: the group closes before
+        // appending an envelope that would push the combined size over the limit,
+        // and carries that envelope for the next group.
+        let third = PREBUILD_GROUP_MAX_BYTES / 3 + 1;
+        let mut stream = caught(Box::pin(futures::stream::iter(
+            (0..10).map(move |_| Ok(deferred_envelope_of(third))),
+        )));
+        let (group, ended, overflow) = take_ready_group(
+            Ok(deferred_envelope_of(third)),
+            &mut stream,
+            PREBUILD_GROUP_MAX_ENVELOPES,
+        );
+        assert_eq!(group.len(), 2);
+        assert!(
+            overflow.is_some(),
+            "third envelope is carried for the next group"
+        );
+        assert!(!ended);
+    }
+
+    #[test]
+    fn a_build_group_does_not_combine_two_near_limit_envelopes() {
+        // Two ready ~7 MiB envelopes must not form a 14 MiB group over the 8 MiB
+        // bound; the second is carried alone into the next group.
+        let near = 7 * 1024 * 1024;
+        let mut stream = caught(Box::pin(futures::stream::iter(vec![Ok(
+            deferred_envelope_of(near),
+        )])));
+        let (group, ended, overflow) = take_ready_group(
+            Ok(deferred_envelope_of(near)),
+            &mut stream,
+            PREBUILD_GROUP_MAX_ENVELOPES,
+        );
+        assert_eq!(group.len(), 1);
+        assert!(overflow.is_some());
+        assert!(!ended);
+        let (group2, ended2, overflow2) = take_ready_group(
+            overflow
+                .expect("carried")
+                .expect("an envelope, not a panic"),
+            &mut stream,
+            PREBUILD_GROUP_MAX_ENVELOPES,
+        );
+        assert_eq!(group2.len(), 1);
+        assert!(overflow2.is_none());
+        // The carried envelope alone is under the byte budget, so the second call
+        // polls the stream again and observes it is exhausted.
+        assert!(ended2);
+    }
+
+    #[test]
+    fn a_build_group_allows_an_individually_oversized_envelope_alone() {
+        let over = PREBUILD_GROUP_MAX_BYTES + 1;
+        let mut stream = caught(Box::pin(futures::stream::iter(vec![Ok(
+            deferred_envelope_of(8),
+        )])));
+        let (group, ended, overflow) = take_ready_group(
+            Ok(deferred_envelope_of(over)),
+            &mut stream,
+            PREBUILD_GROUP_MAX_ENVELOPES,
+        );
+        assert_eq!(group.len(), 1);
+        // `first` alone already meets the budget, so the loop does not poll; the
+        // follow-on stays in the stream for the next group.
+        assert!(overflow.is_none());
+        assert!(!ended);
+        assert!(stream.next().now_or_never().flatten().is_some());
+    }
+
+    /// What a deferred envelope's build does in the pipeline tests below.
+    #[derive(Clone, Copy)]
+    enum TestBuild {
+        Succeeds,
+        Fails,
+        Panics,
+    }
+
+    /// A deferred [`cdc::ChangeRows`] carrying one tracked row; counts its builds.
+    struct TrackedRows {
+        id: i32,
+        build: TestBuild,
+        builds: Arc<AtomicUsize>,
+    }
+
+    impl cdc::ChangeRows for TrackedRows {
+        fn is_empty(&self) -> bool {
+            false
+        }
+        fn num_rows_hint(&self) -> usize {
+            1
+        }
+        fn encoded_len(&self) -> usize {
+            8
+        }
+        fn source_commit_ts_ms(&self) -> Option<i64> {
+            None
+        }
+        fn is_heartbeat(&self) -> bool {
+            false
+        }
+        fn build(self: Box<Self>) -> Result<cdc::ChangeBatch, cdc::ChangeBatchError> {
+            self.builds.fetch_add(1, AtomicOrdering::SeqCst);
+            match self.build {
+                TestBuild::Succeeds => Ok(create_test_change_batch(
+                    vec!["c"],
+                    &[vec!["id"]],
+                    vec![self.id],
+                    vec![Some("row")],
+                )),
+                TestBuild::Fails => Err(cdc::ChangeBatchError::DeferredBuild {
+                    message: "test build failure".to_string(),
+                }),
+                TestBuild::Panics => panic!("test build panicked"),
+            }
+        }
+    }
+
+    fn make_deferred_tracked_envelope(
+        id: i32,
+        log: &Arc<CommitLog>,
+        builds: &Arc<AtomicUsize>,
+        build: TestBuild,
+    ) -> ChangeEnvelope {
+        ChangeEnvelope::new_from_rows(
+            Box::new(TrackingCommitter {
+                id,
+                log: Arc::clone(log),
+                outcome: Ok(()),
+            }),
+            Box::new(TrackedRows {
+                id,
+                build,
+                builds: Arc::clone(builds),
+            }),
+            false,
+        )
+    }
+
+    /// Holds the first `insert_into` until `builds` reaches `needed`, and records
+    /// whether it gave up waiting instead.
+    #[derive(Debug)]
+    struct FirstWriteHeldForBuilds {
+        inner: Arc<dyn TableProvider>,
+        builds: Arc<AtomicUsize>,
+        needed: usize,
+        writes_started: Arc<AtomicUsize>,
+        gave_up: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl TableProvider for FirstWriteHeldForBuilds {
+        fn schema(&self) -> arrow::datatypes::SchemaRef {
+            self.inner.schema()
+        }
+        fn table_type(&self) -> datafusion::datasource::TableType {
+            self.inner.table_type()
+        }
+        async fn scan(
+            &self,
+            state: &dyn Session,
+            projection: Option<&Vec<usize>>,
+            filters: &[Expr],
+            limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            self.inner.scan(state, projection, filters, limit).await
+        }
+        async fn insert_into(
+            &self,
+            state: &dyn Session,
+            input: Arc<dyn ExecutionPlan>,
+            insert_op: InsertOp,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            if self.writes_started.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while self.builds.load(AtomicOrdering::SeqCst) < self.needed {
+                    if std::time::Instant::now() > deadline {
+                        self.gave_up.store(true, AtomicOrdering::SeqCst);
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
+            self.inner.insert_into(state, input, insert_op).await
+        }
+    }
+
+    /// The deferred build of envelopes that arrive while a write is in flight
+    /// happens during that write, not after it: the first write is held until
+    /// the next two envelopes are built, which the apply loop could only do once
+    /// the write it is stuck in had finished.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_reader_builds_arriving_envelopes_while_a_write_is_in_flight() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let writes_started = Arc::new(AtomicUsize::new(0));
+        let gave_up = Arc::new(AtomicBool::new(false));
+        let provider = Arc::new(FirstWriteHeldForBuilds {
+            inner: make_mem_table() as Arc<dyn TableProvider>,
+            builds: Arc::clone(&builds),
+            needed: 3,
+            writes_started: Arc::clone(&writes_started),
+            gave_up: Arc::clone(&gave_up),
+        });
+        let task = make_refresh_task(provider as Arc<dyn TableProvider>);
+        let log = CommitLog::new();
+
+        let (source, stream) = futures::channel::mpsc::unbounded();
+        let stream: ChangesStream = stream.boxed();
+        source
+            .unbounded_send(Ok(make_deferred_tracked_envelope(
+                1,
+                &log,
+                &builds,
+                TestBuild::Succeeds,
+            )))
+            .expect("queue envelope 1");
+        let join = tokio::spawn(async move {
+            run_changes_stream_with_config(&task, test_cdc_config(0), stream).await
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while writes_started.load(AtomicOrdering::SeqCst) == 0 {
+            assert!(
+                std::time::Instant::now() <= deadline,
+                "the first write never started"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        for id in [2, 3] {
+            source
+                .unbounded_send(Ok(make_deferred_tracked_envelope(
+                    id,
+                    &log,
+                    &builds,
+                    TestBuild::Succeeds,
+                )))
+                .expect("queue envelope");
+        }
+        drop(source);
+
+        join.await
+            .expect("task join")
+            .expect("changes stream should succeed");
+        assert!(
+            !gave_up.load(AtomicOrdering::SeqCst),
+            "envelopes 2 and 3 were not built while the first write was in flight (builds: {})",
+            builds.load(AtomicOrdering::SeqCst)
+        );
+        assert_eq!(
+            builds.load(AtomicOrdering::SeqCst),
+            3,
+            "each envelope builds once"
+        );
+        assert_eq!(log.ids().await, vec![1, 2, 3]);
+    }
+
+    /// Run deferred envelopes with ids from 1 through the real reader and apply
+    /// loop: the first alone, then `later` while the first write is held, so the
+    /// reader builds them (the hold lasts until `later_builds` more builds have run,
+    /// and records whether it had to give up instead). Returns the committed ids,
+    /// the dataset status, and whether the hold gave up.
+    async fn run_with_later_envelopes_built_in_the_reader(
+        name: &str,
+        later: &[TestBuild],
+        later_builds: usize,
+    ) -> (Vec<i32>, Option<runtime_status::ComponentStatus>, bool) {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let writes_started = Arc::new(AtomicUsize::new(0));
+        let gave_up = Arc::new(AtomicBool::new(false));
+        let provider = Arc::new(FirstWriteHeldForBuilds {
+            inner: make_mem_table() as Arc<dyn TableProvider>,
+            builds: Arc::clone(&builds),
+            needed: 1 + later_builds,
+            writes_started: Arc::clone(&writes_started),
+            gave_up: Arc::clone(&gave_up),
+        });
+        let task = Arc::new(make_refresh_task_named(
+            name,
+            provider as Arc<dyn TableProvider>,
+        ));
+        let log = CommitLog::new();
+
+        let (source, stream) = futures::channel::mpsc::unbounded();
+        let stream: ChangesStream = stream.boxed();
+        source
+            .unbounded_send(Ok(make_deferred_tracked_envelope(
+                1,
+                &log,
+                &builds,
+                TestBuild::Succeeds,
+            )))
+            .expect("queue envelope 1");
+        let run_task = Arc::clone(&task);
+        let join = tokio::spawn(async move {
+            run_changes_stream_with_config(&run_task, test_cdc_config(0), stream).await
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while writes_started.load(AtomicOrdering::SeqCst) == 0 {
+            assert!(
+                std::time::Instant::now() <= deadline,
+                "the first write never started"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        for (id, kind) in (2..).zip(later) {
+            source
+                .unbounded_send(Ok(make_deferred_tracked_envelope(id, &log, &builds, *kind)))
+                .expect("queue envelope");
+        }
+        drop(source);
+        let _ = join.await.expect("task join");
+
+        let status = task
+            .runtime_status
+            .get_dataset_status(&TableReference::bare(name.to_string()));
+        (
+            log.ids().await,
+            status,
+            gave_up.load(AtomicOrdering::SeqCst),
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_deferred_build_stops_the_dataset_with_nothing_committed_from_it_on() {
+        // Envelopes 2–4 are built in the reader (all three builds run, the failing
+        // one included) while envelope 1's write is held.
+        let (committed, status, gave_up) = run_with_later_envelopes_built_in_the_reader(
+            "prebuild_failed_build",
+            &[TestBuild::Succeeds, TestBuild::Fails, TestBuild::Succeeds],
+            3,
+        )
+        .await;
+        assert!(!gave_up, "envelopes 2-4 must be built in the reader");
+        assert!(
+            committed.iter().all(|id| *id < 3),
+            "nothing at or after the failed envelope may commit, got {committed:?}"
+        );
+        let message = status
+            .as_ref()
+            .and_then(runtime_status::ComponentStatus::error_message)
+            .unwrap_or_default();
+        assert!(
+            message.contains("test build failure"),
+            "the dataset must fail with the build's own error, got {status:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lost_deferred_build_stops_the_dataset_with_nothing_committed_from_it_on() {
+        // Envelopes 2 and 3 reach the reader as one group while envelope 1's write
+        // is held; envelope 2's build panics, which loses the group's build task
+        // after that one build ran.
+        let (committed, status, gave_up) = run_with_later_envelopes_built_in_the_reader(
+            "prebuild_lost_build",
+            &[TestBuild::Panics, TestBuild::Succeeds],
+            1,
+        )
+        .await;
+        assert!(!gave_up, "envelope 2 must be built in the reader");
+        assert!(
+            committed.iter().all(|id| *id < 2),
+            "nothing at or after the lost build may commit, got {committed:?}"
+        );
+        let message = status
+            .as_ref()
+            .and_then(runtime_status::ComponentStatus::error_message)
+            .unwrap_or_default();
+        assert!(
+            message.contains("deferred CDC batch build task failed"),
+            "the dataset must fail with the lost build's reason, got {status:?}"
+        );
+    }
+
+    /// While the apply loop is idle the reader forwards deferred envelopes
+    /// unbuilt, and the apply loop builds them in its burst.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_idle_apply_loop_builds_its_burst_itself() {
+        let task = make_refresh_task_named(
+            "prebuild_idle_apply",
+            make_mem_table() as Arc<dyn TableProvider>,
+        );
+        let log = CommitLog::new();
+        let builds = Arc::new(AtomicUsize::new(0));
+        let items: Vec<Result<ChangeEnvelope, CdcStreamError>> = (1..=4)
+            .map(|id| {
+                Ok(make_deferred_tracked_envelope(
+                    id,
+                    &log,
+                    &builds,
+                    TestBuild::Succeeds,
+                ))
+            })
+            .collect();
+        run_changes_stream_with_config(&task, test_cdc_config(0), make_changes_stream(items))
+            .await
+            .expect("changes stream should succeed");
+        assert_eq!(
+            builds.load(AtomicOrdering::SeqCst),
+            4,
+            "each envelope builds once"
+        );
+        assert_eq!(log.ids().await, vec![1, 2, 3, 4]);
     }
 }
