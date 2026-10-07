@@ -485,6 +485,47 @@ async fn ai_decide_returns_every_answer() {
     assert_eq!(jev.requests().len(), 2);
 }
 
+/// `ai_decide` questions are checked when the query is planned, so a malformed one fails
+/// before any model call. The bounds are those of `TypeSafe`'s and Databricks' grammar:
+/// a choice of 1 to 255 non-empty labels, and a score of 2 to 10 levels.
+#[tokio::test]
+async fn ai_decide_questions_are_checked_when_the_query_is_planned() {
+    let jev = Mock::decision_model();
+    let ctx = session(vec![("jev", Arc::clone(&jev))], tickets(2, 1));
+
+    assert_eq!(
+        run_err(
+            &ctx,
+            r#"SELECT ai_decide(body, '{"tone": {"type": "score", "instructions": "How upset?", "criteria": ["calm"]}}') FROM tickets"#,
+        )
+        .await,
+        "Error during planning: ai_decide: `questions` is not a valid questions object: score criteria must contain between two and ten non-null levels at line 1 column 79. Each entry needs a `type` of 'noul', 'choice' or 'score', with `instructions` and, for choice and score, `criteria`."
+    );
+    assert_eq!(
+        run_err(
+            &ctx,
+            r#"SELECT ai_decide(body, '{"team": {"type": "choice", "instructions": "Which team?", "criteria": {"billing": null, "billing": "Payments"}}}') FROM tickets"#,
+        )
+        .await,
+        "Error during planning: ai_decide: `questions` is not a valid questions object: choice option 'billing' is listed more than once at line 1 column 113. Each entry needs a `type` of 'noul', 'choice' or 'score', with `instructions` and, for choice and score, `criteria`."
+    );
+    assert_eq!(
+        jev.requests().len(),
+        0,
+        "a query that fails planning calls no model"
+    );
+
+    assert_eq!(
+        run(
+            &ctx,
+            r#"SELECT id, ai_decide(body, '{"team": {"type": "choice", "instructions": "Which team?", "criteria": {"billing": null}}}')['team']['choice'] AS team FROM tickets ORDER BY id"#,
+        )
+        .await,
+        "+----+---------+\n| id | team    |\n+----+---------+\n| 0  | billing |\n| 1  | billing |\n+----+---------+"
+    );
+    assert_eq!(jev.requests().len(), 2);
+}
+
 #[tokio::test]
 async fn structured_input_is_sent_as_json() {
     let jev = Mock::decision_model();

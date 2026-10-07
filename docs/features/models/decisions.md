@@ -53,7 +53,7 @@ Arguments:
 - `condition`, `instructions`: constant text.
 - `labels`: a constant list of 2 to 255 labels, such as `['billing', 'technical']`, or a JSON object of label to description, such as `'{"billing": "Payments and refunds", "technical": null}'`. `ai_classify` also takes `instructions => '...'`. Include a fallback label such as `'other'` when no label may fit.
 - `levels`: a constant list of 2 to 10 level descriptions, lowest first.
-- `questions`: a constant JSON object of question id to question, the same grammar as TypeSafe's API and Databricks' `ai_decide`:
+- `questions`: a constant JSON object of question id to question, the same grammar as TypeSafe's API and Databricks' `ai_decide`. A `choice` maps 1 to 255 non-empty labels to descriptions (`null` when the label says it all), a `score` lists 2 to 10 levels, lowest first, and no question id or label may repeat:
 
   ```sql
   SELECT ai_decide(body, '{

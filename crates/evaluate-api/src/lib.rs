@@ -283,7 +283,9 @@ pub enum Question {
     Choice {
         #[serde(default, skip_serializing_if = "nullable_entry_is_absent")]
         instructions: NullableEntry,
-        /// Option id → description (`EntryType`, or JSON null).
+        /// Option id → description (`EntryType`, or JSON null). An option listed twice
+        /// is refused rather than merged.
+        #[serde(deserialize_with = "deserialize_choice_criteria")]
         criteria: BTreeMap<String, EntryType>,
     },
     /// Ordered rubric score. Answer is a probability-weighted value across levels.
@@ -319,6 +321,43 @@ pub struct NoulCriteria {
         rename = "false"
     )]
     pub false_meaning: NullableEntry,
+}
+
+/// Choice criteria, refusing an option listed twice: a JSON object keeps only the last
+/// value of a repeated key, which would silently merge two options into one.
+fn deserialize_choice_criteria<'de, D>(
+    deserializer: D,
+) -> std::result::Result<BTreeMap<String, EntryType>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct CriteriaVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for CriteriaVisitor {
+        type Value = BTreeMap<String, EntryType>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("an object of option to description")
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut entries: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            let mut criteria = BTreeMap::new();
+            while let Some((option, description)) = entries.next_entry::<String, EntryType>()? {
+                if criteria.contains_key(&option) {
+                    return Err(serde::de::Error::custom(format!(
+                        "choice option '{option}' is listed more than once"
+                    )));
+                }
+                criteria.insert(option, description);
+            }
+            Ok(criteria)
+        }
+    }
+
+    deserializer.deserialize_map(CriteriaVisitor)
 }
 
 fn deserialize_score_criteria<'de, D>(
@@ -683,6 +722,25 @@ mod tests {
         }))
         .expect("non-empty non-null");
         assert!(matches!(ok, Question::Score { criteria, .. } if criteria.len() == 2));
+    }
+
+    #[test]
+    fn choice_criteria_refuse_an_option_listed_twice() {
+        // Raw text: a `json!` object would already have merged the repeat.
+        let err = serde_json::from_str::<Question>(
+            r#"{"type": "choice", "criteria": {"billing": null, "billing": "Payments"}}"#,
+        )
+        .expect_err("a repeated option must fail");
+        assert_eq!(
+            err.to_string(),
+            "choice option 'billing' is listed more than once"
+        );
+
+        let ok: Question = serde_json::from_str(
+            r#"{"type": "choice", "criteria": {"billing": null, "technical": "Bugs"}}"#,
+        )
+        .expect("distinct options");
+        assert!(matches!(ok, Question::Choice { criteria, .. } if criteria.len() == 2));
     }
 
     #[test]

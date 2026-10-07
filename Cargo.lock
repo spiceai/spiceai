@@ -18101,6 +18101,7 @@ dependencies = [
  "runtime-request-context",
  "runtime-status",
  "runtime-udfs-api",
+ "serde",
  "serde_json",
  "tokio",
  "tracing",

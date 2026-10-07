@@ -25,11 +25,15 @@ limitations under the License.
 //! arguments through [`positions`], so neither has to guess.
 
 use std::collections::BTreeMap;
+use std::fmt;
+use std::marker::PhantomData;
 
 use arrow::array::{Array, AsArray};
 use datafusion::common::{DataFusionError, Result, ScalarValue, plan_datafusion_err, plan_err};
 use datafusion::logical_expr::{ColumnarValue, Expr, ScalarFunctionArgs};
 use evaluate_api::{EntryType, NonNullEntry, NullableEntry, Question};
+use serde::Deserialize;
+use serde::de::{Deserializer, MapAccess, SeqAccess, Visitor};
 use serde_json::{Map, Value};
 
 use crate::functions::Kind;
@@ -40,7 +44,8 @@ const PARAMETER_NAME_KEY: &str = "spice.parameter_name";
 /// Fewest and most labels `ai_classify` accepts.
 const MIN_LABELS: usize = 2;
 const MAX_LABELS: usize = 255;
-/// Fewest and most levels `ai_score` accepts.
+/// Fewest and most levels `ai_score` accepts, the bound `Question` enforces on an
+/// `ai_decide` score question.
 const MIN_LEVELS: usize = 2;
 const MAX_LEVELS: usize = 10;
 /// Most options a choice question in `ai_decide` may offer.
@@ -360,8 +365,8 @@ fn parse_labels(kind: Kind, text: &str) -> Result<Map<String, Value>> {
         }
         Ok(())
     };
-    match serde_json::from_str::<Value>(text).map_err(|_| invalid())? {
-        Value::Array(items) => {
+    match serde_json::from_str::<LabelsJson>(text).map_err(|_| invalid())? {
+        LabelsJson::List(items) => {
             for item in items {
                 let Value::String(label) = item else {
                     return Err(invalid());
@@ -369,7 +374,7 @@ fn parse_labels(kind: Kind, text: &str) -> Result<Map<String, Value>> {
                 add(label, Value::Null)?;
             }
         }
-        Value::Object(entries) => {
+        LabelsJson::Object(entries) => {
             for (label, description) in entries {
                 match description {
                     Value::String(_) | Value::Null => add(label, description)?,
@@ -377,7 +382,6 @@ fn parse_labels(kind: Kind, text: &str) -> Result<Map<String, Value>> {
                 }
             }
         }
-        _ => return Err(invalid()),
     }
     if !(MIN_LABELS..=MAX_LABELS).contains(&labels.len()) {
         return plan_err!(
@@ -420,33 +424,117 @@ fn parse_levels(kind: Kind, text: &str) -> Result<Vec<Value>> {
 /// `choice` or `score` question, the same grammar as `TypeSafe`'s API and Databricks'
 /// `ai_decide`.
 pub(crate) fn parse_questions(kind: Kind, text: &str) -> Result<BTreeMap<String, Question>> {
-    let questions: BTreeMap<String, Question> = serde_json::from_str(text).map_err(|e| {
+    let Entries(entries) = serde_json::from_str::<Entries<Question>>(text).map_err(|e| {
         plan_datafusion_err!(
             "{}: `questions` is not a valid questions object: {e}. Each entry needs a `type` of 'noul', 'choice' or 'score', with `instructions` and, for choice and score, `criteria`.",
             kind.name()
         )
     })?;
-    if questions.is_empty() {
+    if entries.is_empty() {
         return plan_err!(
             "{}: `questions` must contain at least one question.",
             kind.name()
         );
     }
-    for (id, question) in &questions {
+    let mut questions = BTreeMap::new();
+    for (id, question) in entries {
         if id.trim().is_empty() {
             return plan_err!("{}: a question id cannot be empty.", kind.name());
         }
-        if let Question::Choice { criteria, .. } = question
-            && (criteria.is_empty() || criteria.len() > MAX_CHOICE_OPTIONS)
-        {
+        if let Question::Choice { criteria, .. } = &question {
+            if criteria.is_empty() || criteria.len() > MAX_CHOICE_OPTIONS {
+                return plan_err!(
+                    "{}: choice question '{id}' must offer between 1 and {MAX_CHOICE_OPTIONS} options in `criteria`; it offers {}.",
+                    kind.name(),
+                    criteria.len()
+                );
+            }
+            if criteria.keys().any(|label| label.trim().is_empty()) {
+                return plan_err!(
+                    "{}: choice question '{id}' has an option with an empty label in `criteria`. Give every option a label.",
+                    kind.name()
+                );
+            }
+        }
+        if questions.contains_key(&id) {
             return plan_err!(
-                "{}: choice question '{id}' must offer between 1 and {MAX_CHOICE_OPTIONS} options in `criteria`; it offers {}.",
-                kind.name(),
-                criteria.len()
+                "{}: question '{id}' is listed more than once. Give each question its own id.",
+                kind.name()
             );
         }
+        questions.insert(id, question);
     }
     Ok(questions)
+}
+
+/// A JSON object's entries in document order, repeats included. A map would keep only
+/// the last value of a repeated key, silently dropping a question or a label.
+struct Entries<V>(Vec<(String, V)>);
+
+impl<'de, V: Deserialize<'de>> Deserialize<'de> for Entries<V> {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct EntriesVisitor<V>(PhantomData<V>);
+
+        impl<'de, V: Deserialize<'de>> Visitor<'de> for EntriesVisitor<V> {
+            type Value = Entries<V>;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a JSON object")
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<Entries<V>, A::Error> {
+                entries(map).map(Entries)
+            }
+        }
+
+        deserializer.deserialize_map(EntriesVisitor(PhantomData))
+    }
+}
+
+/// `labels` as written: a list, or an object's entries with any repeat kept, so that a
+/// repeated label is reported rather than collapsed.
+enum LabelsJson {
+    List(Vec<Value>),
+    Object(Vec<(String, Value)>),
+}
+
+impl<'de> Deserialize<'de> for LabelsJson {
+    fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct LabelsVisitor;
+
+        impl<'de> Visitor<'de> for LabelsVisitor {
+            type Value = LabelsJson;
+
+            fn expecting(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("a list of labels, or an object of label to description")
+            }
+
+            fn visit_seq<A: SeqAccess<'de>>(self, mut items: A) -> Result<LabelsJson, A::Error> {
+                let mut labels = Vec::with_capacity(items.size_hint().unwrap_or(0));
+                while let Some(label) = items.next_element()? {
+                    labels.push(label);
+                }
+                Ok(LabelsJson::List(labels))
+            }
+
+            fn visit_map<A: MapAccess<'de>>(self, map: A) -> Result<LabelsJson, A::Error> {
+                entries(map).map(LabelsJson::Object)
+            }
+        }
+
+        deserializer.deserialize_any(LabelsVisitor)
+    }
+}
+
+/// Every entry of a JSON object, in order, repeats included.
+fn entries<'de, V: Deserialize<'de>, A: MapAccess<'de>>(
+    mut map: A,
+) -> Result<Vec<(String, V)>, A::Error> {
+    let mut entries = Vec::with_capacity(map.size_hint().unwrap_or(0));
+    while let Some(entry) = map.next_entry()? {
+        entries.push(entry);
+    }
+    Ok(entries)
 }
 
 /// The questions of an `ai_decide` call from its `questions` argument, for its return
@@ -776,6 +864,61 @@ mod tests {
                 Kind::Decide,
                 vec![col("x"), lit("{}")],
                 "Error during planning: ai_decide: `questions` must contain at least one question.",
+            ),
+            (
+                Kind::Classify,
+                vec![col("x"), lit(r#"{"a": "First", "a": "Second", "b": null}"#)],
+                "Error during planning: ai_classify: label 'a' is listed more than once. List each label once.",
+            ),
+            (
+                Kind::Decide,
+                vec![
+                    col("x"),
+                    lit(
+                        r#"{"u": {"type": "noul", "instructions": "A?"}, "u": {"type": "noul", "instructions": "B?"}}"#,
+                    ),
+                ],
+                "Error during planning: ai_decide: question 'u' is listed more than once. Give each question its own id.",
+            ),
+            (
+                Kind::Decide,
+                vec![
+                    col("x"),
+                    lit(
+                        r#"{"c": {"type": "choice", "instructions": "Which?", "criteria": {"a": null, "a": "Again"}}}"#,
+                    ),
+                ],
+                "Error during planning: ai_decide: `questions` is not a valid questions object: choice option 'a' is listed more than once at line 1 column 90. Each entry needs a `type` of 'noul', 'choice' or 'score', with `instructions` and, for choice and score, `criteria`.",
+            ),
+            (
+                Kind::Decide,
+                vec![
+                    col("x"),
+                    lit(
+                        r#"{"c": {"type": "choice", "instructions": "Which?", "criteria": {" ": null, "b": null}}}"#,
+                    ),
+                ],
+                "Error during planning: ai_decide: choice question 'c' has an option with an empty label in `criteria`. Give every option a label.",
+            ),
+            (
+                Kind::Decide,
+                vec![
+                    col("x"),
+                    lit(
+                        r#"{"t": {"type": "score", "instructions": "How bad?", "criteria": ["one"]}}"#,
+                    ),
+                ],
+                "Error during planning: ai_decide: `questions` is not a valid questions object: score criteria must contain between two and ten non-null levels at line 1 column 73. Each entry needs a `type` of 'noul', 'choice' or 'score', with `instructions` and, for choice and score, `criteria`.",
+            ),
+            (
+                Kind::Decide,
+                vec![
+                    col("x"),
+                    lit(
+                        r#"{"t": {"type": "score", "instructions": "How bad?", "criteria": ["0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10"]}}"#,
+                    ),
+                ],
+                "Error during planning: ai_decide: `questions` is not a valid questions object: score criteria must contain between two and ten non-null levels at line 1 column 122. Each entry needs a `type` of 'noul', 'choice' or 'score', with `instructions` and, for choice and score, `criteria`.",
             ),
             (
                 Kind::If,

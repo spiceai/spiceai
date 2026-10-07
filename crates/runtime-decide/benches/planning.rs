@@ -14,12 +14,15 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! What the decision planner rules cost a query that calls no decision function.
+//! What the decision planner rules cost a query that calls no decision function, and
+//! what planning a query that calls them costs.
 //!
 //! Plans the `TPC-H` queries over empty `TPC-H` tables, through the analyzer and the
 //! optimizer, in a session with `DataFusion`'s rules alone and in one with the decision
 //! functions registered and the leaf-pushdown rules guarded. The difference is the
-//! overhead every ordinary query pays for the rules.
+//! overhead every ordinary query pays for the rules. A second group plans one query
+//! that calls `ai_decide` and `ai_classify` with JSON constants, which are checked and
+//! normalized while the query is planned.
 
 #![expect(clippy::expect_used, reason = "benchmark setup")]
 
@@ -143,7 +146,7 @@ fn register_tpch(ctx: &SessionContext) {
                 ("l_quantity", money.clone()),
                 ("l_extendedprice", money.clone()),
                 ("l_discount", money.clone()),
-                ("l_tax", money.clone()),
+                ("l_tax", money),
                 ("l_returnflag", Utf8),
                 ("l_linestatus", Utf8),
                 ("l_shipdate", Date32),
@@ -218,5 +221,28 @@ fn planning(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, planning);
+/// A query whose constants are parsed and checked when it is planned: an `ai_decide`
+/// with a choice, a noul and a score, and an `ai_classify` with labels as a JSON object.
+const DECISION_QUERY: &str = r#"SELECT
+    ai_decide(l_comment, '{
+        "team": {"type": "choice", "instructions": "Which team should handle this?",
+                 "criteria": {"billing": "Payments and payouts", "technical": "Bugs and outages",
+                              "account": "Login and access", "shipping": "Delivery", "other": null}},
+        "urgent": {"type": "noul", "instructions": "Does this convey urgency?"},
+        "tone": {"type": "score", "instructions": "How upset is the customer?",
+                 "criteria": ["calm", "annoyed", "furious"]}
+    }') AS d,
+    ai_classify(l_comment, '{"billing": "Payments", "technical": null, "other": null}') AS team
+FROM lineitem"#;
+
+fn decision_call_planning(c: &mut Criterion) {
+    let runtime = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let queries = [DECISION_QUERY.to_string()];
+    let ctx = session(true);
+    c.bench_function("decision_call_planning", |b| {
+        b.iter(|| runtime.block_on(plan_all(&ctx, &queries)));
+    });
+}
+
+criterion_group!(benches, planning, decision_call_planning);
 criterion_main!(benches);
