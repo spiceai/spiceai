@@ -263,8 +263,11 @@ pub fn bigquery_can_evaluate_expression(expr: &Expr, schema: Option<&DFSchema>) 
 /// into an integer, which these engines round where `DataFusion` truncates)
 /// out of the pushdown on that route too; without it the same statement
 /// answered differently through ADBC or ODBC than through the engine's own
-/// connector (issue #14482). `None` for an engine with no such shape, or one
-/// this crate has no gate for, which keeps the plain policy.
+/// connector (issue #14482). `SQLite` is keyed for a different reason: it has
+/// no date, time or interval types, so its gate also keeps every temporal value
+/// local ([`sqlite_driver_can_evaluate_expression`]). `None` for an engine with
+/// no such shape, or one this crate has no gate for, which keeps the plain
+/// policy.
 #[must_use]
 pub fn expression_support_for_engine(engine: &str) -> Option<ExpressionSupport> {
     match engine {
