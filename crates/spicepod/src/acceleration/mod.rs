@@ -497,6 +497,8 @@ pub struct Acceleration {
     #[serde(default)]
     pub refresh_on_startup: RefreshOnStartup,
 
+    /// The acceleration engine. Defaults to `cayenne`, or to `arrow` on Windows, where
+    /// Cayenne is not available.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub engine: Option<String>,
 
@@ -657,6 +659,10 @@ const fn default_true() -> bool {
     true
 }
 
+/// The engine an acceleration uses when it does not set `engine`. Cayenne is not built
+/// on Windows, so Windows uses Arrow.
+pub const DEFAULT_ENGINE: &str = if cfg!(windows) { "arrow" } else { "cayenne" };
+
 /// Fields an `enabled: false` block does not discard *because it is disabled*,
 /// and so must not be named by a warning whose remedy is "remove
 /// `enabled: false`": the switch itself, and `ready_state`.
@@ -669,6 +675,12 @@ const fn default_true() -> bool {
 const CONSUMED_WHEN_DISABLED: [&str; 2] = ["enabled", "ready_state"];
 
 impl Acceleration {
+    /// The configured `engine`, or [`DEFAULT_ENGINE`] when none is set.
+    #[must_use]
+    pub fn engine_name(&self) -> &str {
+        self.engine.as_deref().unwrap_or(DEFAULT_ENGINE)
+    }
+
     /// The acceleration fields this block sets that the runtime will ignore
     /// because `enabled: false` turns the whole block off, in the order they
     /// should be reported.

@@ -3353,15 +3353,11 @@ impl DataAccelerator for CayenneAccelerator {
         acceleration: &spicepod::acceleration::Acceleration,
         unset_refresh_mode: runtime_acceleration::acceleration::RefreshMode,
     ) -> Option<data_accelerator_api::SpicepodWriteProfile> {
-        // The contract is `None` unless the acceleration names this engine. The runtime
+        // The contract is `None` unless the acceleration uses this engine. The runtime
         // enumerates Cayenne accelerations before asking, so this is the implementation
         // holding up its own end: another consumer would otherwise get a confident
         // Cayenne classification for a DuckDB or Arrow acceleration.
-        if !acceleration
-            .engine
-            .as_deref()
-            .is_some_and(|engine| engine.eq_ignore_ascii_case("cayenne"))
-        {
+        if !acceleration.engine_name().eq_ignore_ascii_case("cayenne") {
             return None;
         }
 
@@ -5339,9 +5335,14 @@ mod tests {
                 .is_some(),
             "the engine name is matched the way the runtime matches it: case-insensitively"
         );
+        assert!(
+            accelerator
+                .spicepod_write_profile(&named(None), RefreshMode::Full)
+                .is_some(),
+            "an acceleration that names no engine uses Cayenne, the default engine"
+        );
 
-        // `None` is the default Arrow engine, not an unspecified Cayenne one.
-        for other in [Some("duckdb"), Some("arrow"), Some("sqlite"), None] {
+        for other in [Some("duckdb"), Some("arrow"), Some("sqlite")] {
             assert!(
                 accelerator
                     .spicepod_write_profile(&named(other), RefreshMode::Full)
