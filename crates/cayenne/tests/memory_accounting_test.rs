@@ -99,6 +99,20 @@ async fn insert_sql(ctx: &SessionContext, sql: &str) {
         .expect("collect");
 }
 
+/// The table's accounted bytes once they are positive. A write into an empty
+/// table records no keys; the primary-key index it leaves is built in the
+/// background after it, so the first insert's keyset arrives shortly after.
+async fn accounted_after_first_load(table: &CayenneTableProvider) -> usize {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let accounted = table.accounted_memory_bytes();
+        if accounted > 0 || std::time::Instant::now() >= deadline {
+            return accounted;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
 /// The reservation tracks keyset bytes after inserts and deletion-index bytes
 /// after upserts, and shrinks back to zero is observable on clear (exercised in
 /// the unit test); here we assert monotone growth through the write sequence.
@@ -135,7 +149,7 @@ async fn test_accounting_tracks_keyset_and_deletions_impl(
         "INSERT INTO mem_track VALUES (1,'a'),(2,'b'),(3,'c'),(4,'d'),(5,'e')",
     )
     .await;
-    let after_insert = table.accounted_memory_bytes();
+    let after_insert = accounted_after_first_load(&table).await;
     assert!(
         after_insert > 0,
         "the PK keyset must be accounted after inserts (got {after_insert})"
@@ -350,7 +364,7 @@ async fn test_accounting_tracks_inline_file_deletions_impl(
         "INSERT INTO mem_inline_delete VALUES (1,'a'),(2,'b'),(3,'c')",
     )
     .await;
-    let after_file_insert = table.accounted_memory_bytes();
+    let after_file_insert = accounted_after_first_load(&table).await;
     assert!(
         after_file_insert > 0,
         "file-backed insert should account the PK keyset"

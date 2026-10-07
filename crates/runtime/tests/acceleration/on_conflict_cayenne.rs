@@ -169,16 +169,15 @@ async fn test_cayenne_on_conflict_upsert() -> Result<(), anyhow::Error> {
         .await
 }
 
-/// Test Cayenne `on_conflict`: drop behavior
-///
-/// Verifies that when a row with the same primary key is inserted,
-/// the new row is dropped and the existing row is preserved.
+/// A table created with `on_conflict: drop` keeps the last version of a key like
+/// any table with a primary key (#14576): a row inserted for a stored key
+/// replaces it.
 ///
 /// This test creates a Cayenne table directly using the `CayenneTableProvider` API
 /// to test `on_conflict` behavior without going through the file connector refresh path.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 #[cfg(not(target_os = "windows"))]
-async fn test_cayenne_on_conflict_drop() -> Result<(), anyhow::Error> {
+async fn test_cayenne_on_conflict_drop_keeps_the_last_version() -> Result<(), anyhow::Error> {
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use cayenne::metadata::CreateTableOptions;
     use cayenne::{CayenneCatalog, CayenneTableProvider, MetadataCatalog};
@@ -257,7 +256,7 @@ async fn test_cayenne_on_conflict_drop() -> Result<(), anyhow::Error> {
             assert_eq!(result.len(), 1);
             assert_eq!(result[0].num_rows(), 1);
 
-            // Insert data with duplicate primary key (event_id = 2) - should drop new row
+            // Insert a new version of a stored key (event_id = 2): it replaces the stored row.
             ctx.sql(
                 "INSERT INTO events_drop (event_id, event_name, event_timestamp) \
                  VALUES (2, 'Password Reset', '2024-01-15 09:00:00')",
@@ -266,7 +265,7 @@ async fn test_cayenne_on_conflict_drop() -> Result<(), anyhow::Error> {
             .collect()
             .await?;
 
-            // Verify drop happened - event_id 2 should have original values
+            // event_id 2 now holds the version that arrived last.
             let result = ctx
                 .sql("SELECT event_name FROM events_drop WHERE event_id = 2")
                 .await?
@@ -274,15 +273,15 @@ async fn test_cayenne_on_conflict_drop() -> Result<(), anyhow::Error> {
                 .await?;
 
             let expected = [
-                "+-----------------+",
-                "| event_name      |",
-                "+-----------------+",
-                "| Password Change |",
-                "+-----------------+",
+                "+----------------+",
+                "| event_name     |",
+                "+----------------+",
+                "| Password Reset |",
+                "+----------------+",
             ];
             assert_batches_eq!(expected, &result);
 
-            // Verify total count is still 3 (drop, not insert)
+            // Still one row per key.
             let result = ctx
                 .sql("SELECT COUNT(*) as cnt FROM events_drop")
                 .await?
@@ -1100,6 +1099,7 @@ async fn test_cayenne_on_conflict_runtime_integration() -> Result<(), anyhow::Er
                 params: Some(Params::from_string_map(params)),
                 primary_key: Some("event_id".to_string()),
                 on_conflict,
+                write_mode: spicepod::acceleration::WriteMode::Acceleration,
                 ..Acceleration::default()
             });
 

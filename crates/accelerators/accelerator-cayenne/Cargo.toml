@@ -63,6 +63,7 @@ datafusion-datasource.workspace = true
 datafusion-expr.workspace = true
 fundu.workspace = true
 object_store.workspace = true
+object_store_spawn = { path = "../../object_store_spawn" }
 search = { path = "../../search" }
 serde_json.workspace = true
 spice-table = { path = "../../spice-table" }
