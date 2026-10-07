@@ -24,6 +24,11 @@ limitations under the License.
 //! - `AWS_S3_PREFIX`: Prefix within the bucket for test data
 //!
 //! AWS credentials are picked up from environment, profile, or instance metadata.
+//! Point the tests at an S3-compatible store (for example rustfs or `MinIO`) with
+//! `AWS_ENDPOINT` and `AWS_ALLOW_HTTP=true`.
+//!
+//! Without `AWS_S3_BUCKET` every test returns immediately, so the crate's unit tests can
+//! run in CI without S3 credentials.
 
 #![allow(clippy::expect_used)]
 
@@ -32,8 +37,12 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use object_store::ObjectStore;
 use object_store::ObjectStoreExt;
+use object_store::UpdateVersion;
 use object_store::aws::AmazonS3Builder;
-use object_store_occ::{InsertResult, ObjectState, UpdateResult, WriteResult};
+use object_store_occ::{
+    Attempt, ConditionalWriteError, ConflictRetry, Expected, InsertResult, ObjectState,
+    UpdateResult, WriteResult, conditional_put, probe_conditional_writes, retry_on_conflict,
+};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -43,16 +52,19 @@ struct TestRecord {
     data: String,
 }
 
-fn create_store() -> Arc<dyn ObjectStore> {
-    let bucket = std::env::var("AWS_S3_BUCKET")
-        .expect("AWS_S3_BUCKET environment variable must be set to run integration tests");
+/// The store under test, or `None` when `AWS_S3_BUCKET` is unset and the test should skip.
+fn create_store() -> Option<Arc<dyn ObjectStore>> {
+    let Ok(bucket) = std::env::var("AWS_S3_BUCKET") else {
+        eprintln!("AWS_S3_BUCKET is not set; skipping the S3 integration test");
+        return None;
+    };
 
     let store = AmazonS3Builder::from_env()
         .with_bucket_name(&bucket)
         .build()
         .expect("failed to build S3 store from environment");
 
-    Arc::new(store)
+    Some(Arc::new(store))
 }
 
 fn get_test_prefix() -> String {
@@ -71,7 +83,9 @@ fn get_test_prefix() -> String {
 
 #[tokio::test]
 async fn test_concurrent_insert_conflict() {
-    let store = create_store();
+    let Some(store) = create_store() else {
+        return;
+    };
     let prefix = get_test_prefix();
 
     // Two separate ObjectState instances simulating distributed writers
@@ -103,7 +117,9 @@ async fn test_concurrent_insert_conflict() {
 
 #[tokio::test]
 async fn test_concurrent_update_conflict() {
-    let store = create_store();
+    let Some(store) = create_store() else {
+        return;
+    };
     let prefix = get_test_prefix();
 
     let state1: ObjectState<TestRecord> =
@@ -162,7 +178,9 @@ async fn test_concurrent_update_conflict() {
 
 #[tokio::test]
 async fn test_insert_or_update_distributed() {
-    let store = create_store();
+    let Some(store) = create_store() else {
+        return;
+    };
     let prefix = get_test_prefix();
 
     let state1: ObjectState<TestRecord> =
@@ -206,7 +224,9 @@ async fn test_insert_or_update_distributed() {
 
 #[tokio::test]
 async fn test_refresh_sees_external_changes() {
-    let store = create_store();
+    let Some(store) = create_store() else {
+        return;
+    };
     let prefix = get_test_prefix();
 
     let state1: ObjectState<TestRecord> =
@@ -242,7 +262,9 @@ async fn test_refresh_sees_external_changes() {
 
 #[tokio::test]
 async fn test_list_keys_distributed() {
-    let store = create_store();
+    let Some(store) = create_store() else {
+        return;
+    };
     let prefix = get_test_prefix();
 
     let state1: ObjectState<TestRecord> =
@@ -271,7 +293,9 @@ async fn test_list_keys_distributed() {
 
 #[tokio::test]
 async fn test_sequential_updates_same_writer() {
-    let store = create_store();
+    let Some(store) = create_store() else {
+        return;
+    };
     let prefix = get_test_prefix();
 
     let state: ObjectState<TestRecord> =
@@ -308,7 +332,9 @@ async fn test_sequential_updates_same_writer() {
 
 #[tokio::test]
 async fn test_update_after_external_modification() {
-    let store = create_store();
+    let Some(store) = create_store() else {
+        return;
+    };
     let prefix = get_test_prefix();
 
     let state1: ObjectState<TestRecord> =
@@ -374,7 +400,9 @@ async fn test_update_after_external_modification() {
 
 #[tokio::test]
 async fn test_concurrent_async_writers() {
-    let store = create_store();
+    let Some(store) = create_store() else {
+        return;
+    };
     let prefix = get_test_prefix();
 
     // Create initial record
@@ -545,7 +573,9 @@ async fn write_with_retry(
 
 #[tokio::test]
 async fn test_concurrent_async_writers_with_retry() {
-    let store = create_store();
+    let Some(store) = create_store() else {
+        return;
+    };
     let prefix = get_test_prefix();
 
     // Create initial record
@@ -598,7 +628,9 @@ async fn test_concurrent_async_writers_with_retry() {
 /// This verifies S3's conditional write mechanism (If-Match headers) at the protocol level.
 #[tokio::test]
 async fn test_update_races_with_external_write() {
-    let store = create_store();
+    let Some(store) = create_store() else {
+        return;
+    };
     let prefix = get_test_prefix();
 
     let state: ObjectState<TestRecord> =
@@ -645,4 +677,141 @@ async fn test_update_races_with_external_write() {
         }
         other => panic!("Expected Conflict due to external write, got {other:?}"),
     }
+}
+
+/// The store must enforce both kinds of conditional write; state stored on it relies on that.
+#[tokio::test]
+async fn test_probe_reports_conditional_writes_enforced() {
+    let Some(store) = create_store() else {
+        return;
+    };
+    let prefix = object_store::path::Path::from(get_test_prefix());
+
+    let support = probe_conditional_writes(store.as_ref(), &prefix).await;
+    assert!(
+        support.is_enforced(),
+        "the store under test must enforce If-None-Match and If-Match: {support:?}"
+    );
+}
+
+/// `conditional_put` refuses a duplicate create and an update at a stale version, and never
+/// overwrites the winner.
+#[tokio::test]
+async fn test_conditional_put_conflicts_on_the_wire() {
+    let Some(store) = create_store() else {
+        return;
+    };
+    let path = object_store::path::Path::from(format!("{}conditional/doc.json", get_test_prefix()));
+
+    let first = conditional_put(store.as_ref(), &path, "v1".into(), &Expected::Absent)
+        .await
+        .expect("first create lands");
+    let duplicate = conditional_put(store.as_ref(), &path, "dup".into(), &Expected::Absent)
+        .await
+        .expect_err("duplicate create must conflict");
+    assert!(
+        matches!(duplicate, ConditionalWriteError::Conflict { .. }),
+        "{duplicate:?}"
+    );
+
+    let v1 = Expected::at_version(UpdateVersion::from(first)).expect("S3 returns an ETag");
+    conditional_put(store.as_ref(), &path, "v2".into(), &v1)
+        .await
+        .expect("update at the current version lands");
+    let stale = conditional_put(store.as_ref(), &path, "stale".into(), &v1)
+        .await
+        .expect_err("update at a stale version must conflict");
+    assert!(
+        matches!(stale, ConditionalWriteError::Conflict { .. }),
+        "{stale:?}"
+    );
+
+    let body = store
+        .get(&path)
+        .await
+        .expect("get")
+        .bytes()
+        .await
+        .expect("body");
+    assert_eq!(&body[..], b"v2", "the losing writes must not have landed");
+}
+
+/// Concurrent writers incrementing one counter through `retry_on_conflict` lose no increment.
+#[tokio::test]
+async fn test_retry_on_conflict_loses_no_concurrent_increment() {
+    let Some(store) = create_store() else {
+        return;
+    };
+    let path = object_store::path::Path::from(format!("{}counter/doc.json", get_test_prefix()));
+    let writers = 8;
+    let increments_per_writer = 5;
+    let policy = ConflictRetry {
+        max_attempts: 64,
+        ..ConflictRetry::default()
+    };
+
+    let mut tasks = Vec::new();
+    for _ in 0..writers {
+        let store = Arc::clone(&store);
+        let path = path.clone();
+        let policy = policy.clone();
+        tasks.push(tokio::spawn(async move {
+            for _ in 0..increments_per_writer {
+                retry_on_conflict(&policy, || async {
+                    let (value, expected) = match store.get(&path).await {
+                        Ok(result) => {
+                            let version = UpdateVersion {
+                                e_tag: result.meta.e_tag.clone(),
+                                version: result.meta.version.clone(),
+                            };
+                            let bytes = result.bytes().await.map_err(|e| e.to_string())?;
+                            let value: u64 = std::str::from_utf8(&bytes)
+                                .map_err(|e| e.to_string())?
+                                .parse()
+                                .map_err(|e: std::num::ParseIntError| e.to_string())?;
+                            let expected = Expected::at_version(version)
+                                .ok_or_else(|| "no ETag".to_string())?;
+                            (value, expected)
+                        }
+                        Err(object_store::Error::NotFound { .. }) => (0, Expected::Absent),
+                        Err(e) => return Err(e.to_string()),
+                    };
+                    match conditional_put(
+                        store.as_ref(),
+                        &path,
+                        (value + 1).to_string().into(),
+                        &expected,
+                    )
+                    .await
+                    {
+                        Ok(_) => Ok(Attempt::Done(())),
+                        Err(err) if err.is_conflict() => Ok(Attempt::Conflict),
+                        Err(err) => Err(err.to_string()),
+                    }
+                })
+                .await
+                .expect("increment lands within the retry budget");
+            }
+        }));
+    }
+    for task in tasks {
+        task.await.expect("writer task");
+    }
+
+    let body = store
+        .get(&path)
+        .await
+        .expect("get")
+        .bytes()
+        .await
+        .expect("body");
+    let total: u64 = std::str::from_utf8(&body)
+        .expect("utf8")
+        .parse()
+        .expect("number");
+    assert_eq!(
+        total,
+        u64::try_from(writers * increments_per_writer).expect("fits"),
+        "every increment must survive concurrent writers"
+    );
 }

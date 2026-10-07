@@ -177,6 +177,15 @@ pub enum Error {
         "Cluster rate-control budget exhausted for origin {origin}; persisted store is unavailable and last lease has expired"
     ))]
     FailClosed { origin: String },
+
+    #[snafu(display(
+        "The shared rate-control state for origin {origin} was written by a newer Spice version (state version {found}; this version understands {supported}), so this instance does not overwrite it. Upgrade this instance to match the others sharing the rate-control state location."
+    ))]
+    NewerStateVersion {
+        origin: String,
+        found: u32,
+        supported: u32,
+    },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -1387,16 +1396,36 @@ impl LeasedBucket {
         };
 
         for attempt in 0..MAX_LEASE_RETRIES {
-            // State written under a different schema is treated as empty: the
-            // reader cannot tell which fields it would misread.
-            let mut state = match self.read_state().await {
-                Ok(state) => state
-                    .filter(PersistedRateControlState::is_current_schema)
-                    .unwrap_or_else(|| PersistedRateControlState::fresh(window)),
+            let existing = match self.read_state().await {
+                Ok(state) => state,
                 Err(e) => {
                     self.note_failure();
                     return Err(e);
                 }
+            };
+            // State from a newer version holds leases this version cannot interpret;
+            // resetting it would wipe every newer peer's grants, and during a rolling
+            // upgrade the two versions would keep resetting each other and over-admit.
+            // State from an older version is replaced: its leases use a layout this
+            // version no longer reads. The warning waits for the write that replaces it,
+            // since a write that loses the race replaced nothing.
+            let (mut state, replaced_version) = match existing {
+                Some(state)
+                    if state.schema_version > PERSISTED_RATE_CONTROL_STATE_SCHEMA_VERSION =>
+                {
+                    self.note_failure();
+                    return Err(Error::NewerStateVersion {
+                        origin: self.config.origin.clone(),
+                        found: state.schema_version,
+                        supported: PERSISTED_RATE_CONTROL_STATE_SCHEMA_VERSION,
+                    });
+                }
+                Some(state) if !state.is_current_schema() => {
+                    let replaced = state.schema_version;
+                    (PersistedRateControlState::fresh(window), Some(replaced))
+                }
+                Some(state) => (state, None),
+                None => (PersistedRateControlState::fresh(window), None),
             };
             state.stamp(now, window);
 
@@ -1440,7 +1469,16 @@ impl LeasedBucket {
             let dirty = tail_published || current.dirty || next.dirty;
             if dirty {
                 match self.write_state(state).await {
-                    Ok(WriteOutcome::Written) => {}
+                    Ok(WriteOutcome::Written) => {
+                        if let Some(replaced_version) = replaced_version {
+                            tracing::warn!(
+                                origin = %self.config.origin,
+                                "Replacing shared rate-control state for origin {} written by an older Spice version (state version {}), so leases granted by instances still on that version are reset. Finish upgrading every instance that shares the rate-control state location.",
+                                self.config.origin,
+                                replaced_version
+                            );
+                        }
+                    }
                     Ok(WriteOutcome::Conflict) => {
                         self.metrics
                             .lease_acquire_conflicts_total
@@ -2874,6 +2912,351 @@ mod tests {
             burst_per_window: burst,
             adaptive: None,
         }
+    }
+
+    /// State written by a newer version is left alone: resetting it would wipe the
+    /// newer peers' grants, and two versions resetting each other over-admit.
+    #[tokio::test]
+    async fn state_from_a_newer_version_is_not_overwritten() {
+        use object_store::ObjectStoreExt;
+
+        let store = Arc::new(InMemory::new());
+        let mut config = config_for(10, "a", Duration::from_secs(1));
+        config.store = Arc::clone(&store) as Arc<dyn ObjectStore>;
+        let mut newer = PersistedRateControlState::fresh(Duration::from_millis(1_000));
+        newer.schema_version = PERSISTED_RATE_CONTROL_STATE_SCHEMA_VERSION + 1;
+        let path = object_store::path::Path::from("test/origin.json");
+        let bytes = serde_json::to_vec(&newer).expect("serialize");
+        store
+            .put(&path, bytes.clone().into())
+            .await
+            .expect("seed newer state");
+
+        let bucket = LeasedBucket::new(config);
+        let err = bucket
+            .refresh_lease()
+            .await
+            .expect_err("a newer state version must not be overwritten");
+        assert!(matches!(err, Error::NewerStateVersion { .. }), "{err}");
+
+        let stored = store
+            .get(&path)
+            .await
+            .expect("state still there")
+            .bytes()
+            .await
+            .expect("body");
+        assert_eq!(
+            stored.as_ref(),
+            bytes.as_slice(),
+            "the newer state is untouched"
+        );
+    }
+
+    /// Newer-version state is unavailable state: the lease granted before it appeared
+    /// is still honored, and once that lease expires `acquire` fails closed instead of
+    /// waiting on a lease that can never be renewed.
+    #[tokio::test]
+    async fn state_from_a_newer_version_fails_closed_once_the_current_lease_expires() {
+        use object_store::ObjectStoreExt;
+
+        let store = Arc::new(InMemory::new());
+        let mut config = config_for(10, "a", Duration::from_secs(1));
+        config.store = Arc::clone(&store) as Arc<dyn ObjectStore>;
+        let bucket = LeasedBucket::new(config);
+        bucket
+            .refresh_lease()
+            .await
+            .expect("lease from an empty state location");
+
+        // A newer instance rewrites the shared document after this one holds a lease.
+        let mut newer = PersistedRateControlState::fresh(Duration::from_millis(1_000));
+        newer.schema_version = PERSISTED_RATE_CONTROL_STATE_SCHEMA_VERSION + 1;
+        let path = object_store::path::Path::from("test/origin.json");
+        let bytes = serde_json::to_vec(&newer).expect("serialize");
+        store
+            .put(&path, bytes.clone().into())
+            .await
+            .expect("seed newer state");
+
+        let err = bucket
+            .refresh_lease()
+            .await
+            .expect_err("a newer state version must not be overwritten");
+        assert!(
+            matches!(
+                err,
+                Error::NewerStateVersion { found, supported, .. }
+                    if found == PERSISTED_RATE_CONTROL_STATE_SCHEMA_VERSION + 1
+                        && supported == PERSISTED_RATE_CONTROL_STATE_SCHEMA_VERSION
+            ),
+            "{err}"
+        );
+
+        // The lease covers the current and the next window, so this permit comes from
+        // it even if the window rolled since the first refresh.
+        bucket
+            .acquire()
+            .await
+            .expect("the lease granted before the newer state appeared is still honored");
+
+        // The lease expires when the wall clock passes its last window, so wait for
+        // that window to end: at most 2 s away with 1 s windows.
+        let window = Duration::from_secs(1);
+        let leased_through = bucket
+            .inner
+            .lock()
+            .await
+            .leased_through
+            .expect("a lease was granted");
+        assert!(
+            window_id_for(SystemTime::now(), window) <= leased_through,
+            "the lease must still cover the current window"
+        );
+        // A monotonic deadline bounds the wait even if the wall clock steps backwards.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while window_id_for(SystemTime::now(), window) <= leased_through {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the wall clock did not pass window {leased_through} within 5 s"
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let result = tokio::time::timeout(Duration::from_secs(5), bucket.acquire())
+            .await
+            .expect("acquire must fail closed after the lease expires, not wait for a renewal");
+        assert!(
+            matches!(&result, Err(Error::FailClosed { origin }) if origin == "https://example.com"),
+            "{result:?}"
+        );
+        assert_eq!(bucket.metrics.fail_closed_total(), 1);
+
+        let stored = store
+            .get(&path)
+            .await
+            .expect("state still there")
+            .bytes()
+            .await
+            .expect("body");
+        assert_eq!(
+            stored.as_ref(),
+            bytes.as_slice(),
+            "the newer state is untouched"
+        );
+    }
+
+    #[derive(Clone, Default)]
+    struct CapturedLogs(Arc<std::sync::Mutex<Vec<u8>>>);
+
+    impl std::io::Write for CapturedLogs {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .expect("log buffer lock")
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CapturedLogs {
+        type Writer = Self;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            self.clone()
+        }
+    }
+
+    impl CapturedLogs {
+        fn text(&self) -> String {
+            String::from_utf8_lossy(&self.0.lock().expect("log buffer lock")).into_owned()
+        }
+
+        fn subscriber(&self) -> impl tracing::Subscriber + Send + Sync + 'static {
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .without_time()
+                .with_writer(self.clone())
+                .finish()
+        }
+    }
+
+    /// Store on which an instance still on the older schema version rewrites the
+    /// shared document just before each conditional update, so every write this
+    /// instance attempts finds the document changed under it.
+    #[derive(Debug)]
+    struct OlderWriterBeforeEachUpdate {
+        inner: Arc<dyn ObjectStore>,
+        older: Vec<u8>,
+    }
+
+    impl std::fmt::Display for OlderWriterBeforeEachUpdate {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            write!(f, "OlderWriterBeforeEachUpdate")
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ObjectStore for OlderWriterBeforeEachUpdate {
+        async fn put_opts(
+            &self,
+            location: &object_store::path::Path,
+            payload: object_store::PutPayload,
+            opts: object_store::PutOptions,
+        ) -> object_store::Result<object_store::PutResult> {
+            if matches!(opts.mode, object_store::PutMode::Update(_)) {
+                self.inner
+                    .put_opts(
+                        location,
+                        self.older.clone().into(),
+                        object_store::PutOptions::from(object_store::PutMode::Overwrite),
+                    )
+                    .await?;
+            }
+            self.inner.put_opts(location, payload, opts).await
+        }
+        async fn put_multipart_opts(
+            &self,
+            location: &object_store::path::Path,
+            opts: object_store::PutMultipartOptions,
+        ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+            self.inner.put_multipart_opts(location, opts).await
+        }
+        async fn get_opts(
+            &self,
+            location: &object_store::path::Path,
+            options: object_store::GetOptions,
+        ) -> object_store::Result<object_store::GetResult> {
+            self.inner.get_opts(location, options).await
+        }
+        fn list(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+        {
+            self.inner.list(prefix)
+        }
+        fn delete_stream(
+            &self,
+            locations: futures::stream::BoxStream<
+                'static,
+                object_store::Result<object_store::path::Path>,
+            >,
+        ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+        {
+            self.inner.delete_stream(locations)
+        }
+        async fn list_with_delimiter(
+            &self,
+            prefix: Option<&object_store::path::Path>,
+        ) -> object_store::Result<object_store::ListResult> {
+            self.inner.list_with_delimiter(prefix).await
+        }
+        async fn copy_opts(
+            &self,
+            from: &object_store::path::Path,
+            to: &object_store::path::Path,
+            options: object_store::CopyOptions,
+        ) -> object_store::Result<()> {
+            self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// The warning that older-version state was replaced is logged only once the
+    /// replacement is written: a write that loses to an instance still on the older
+    /// version replaced nothing, so it must not tell the user the leases were reset.
+    #[tokio::test]
+    async fn older_state_version_is_reported_replaced_only_once_the_write_lands() {
+        use object_store::ObjectStoreExt;
+
+        let mut older = PersistedRateControlState::fresh(Duration::from_millis(1_000));
+        older.schema_version = PERSISTED_RATE_CONTROL_STATE_SCHEMA_VERSION - 1;
+        let older = serde_json::to_vec(&older).expect("serialize");
+        let path = object_store::path::Path::from("test/origin.json");
+        let replaced = format!(
+            "Replacing shared rate-control state for origin https://example.com written by an older Spice version (state version {}), so leases granted by instances still on that version are reset. Finish upgrading every instance that shares the rate-control state location.",
+            PERSISTED_RATE_CONTROL_STATE_SCHEMA_VERSION - 1
+        );
+
+        // Every write loses to the older instance, so nothing is replaced.
+        let contended = Arc::new(InMemory::new());
+        contended
+            .put(&path, older.clone().into())
+            .await
+            .expect("seed older state");
+        let mut config = config_for(10, "a", Duration::from_secs(1));
+        config.store = Arc::new(OlderWriterBeforeEachUpdate {
+            inner: Arc::clone(&contended) as Arc<dyn ObjectStore>,
+            older: older.clone(),
+        });
+        let logs = CapturedLogs::default();
+        let err = {
+            let _guard = tracing::subscriber::set_default(logs.subscriber());
+            LeasedBucket::new(config)
+                .refresh_lease()
+                .await
+                .expect_err("every write loses to the older instance")
+        };
+        assert!(matches!(err, Error::ConflictExhausted { .. }), "{err}");
+        let stored = contended
+            .get(&path)
+            .await
+            .expect("state")
+            .bytes()
+            .await
+            .expect("body");
+        assert_eq!(
+            stored.as_ref(),
+            older.as_slice(),
+            "the older state is still in place"
+        );
+        assert_eq!(
+            logs.text().matches(replaced.as_str()).count(),
+            0,
+            "{}",
+            logs.text()
+        );
+
+        // Uncontended, the replacement lands and the warning is logged once.
+        let store = Arc::new(InMemory::new());
+        store
+            .put(&path, older.clone().into())
+            .await
+            .expect("seed older state");
+        let mut config = config_for(10, "a", Duration::from_secs(1));
+        config.store = Arc::clone(&store) as Arc<dyn ObjectStore>;
+        let logs = CapturedLogs::default();
+        {
+            let _guard = tracing::subscriber::set_default(logs.subscriber());
+            LeasedBucket::new(config)
+                .refresh_lease()
+                .await
+                .expect("the replacement is written");
+        }
+        let stored: PersistedRateControlState = serde_json::from_slice(
+            &store
+                .get(&path)
+                .await
+                .expect("state")
+                .bytes()
+                .await
+                .expect("body"),
+        )
+        .expect("deserialize");
+        assert_eq!(
+            stored.schema_version,
+            PERSISTED_RATE_CONTROL_STATE_SCHEMA_VERSION
+        );
+        assert_eq!(
+            logs.text().matches(replaced.as_str()).count(),
+            1,
+            "{}",
+            logs.text()
+        );
     }
 
     #[tokio::test]

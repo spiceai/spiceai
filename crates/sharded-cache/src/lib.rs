@@ -321,6 +321,65 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
         self.evict_to_limit(shard_idx, Some(key));
     }
 
+    /// Insert `value`, or replace the resident, only when `admit` accepts the
+    /// current resident (`None` when the key is empty or expired).
+    ///
+    /// The decision and the write share the shard lock, so a slower result
+    /// cannot overwrite one the predicate has already rejected. A value heavier
+    /// than `max_weight` is refused without removing the resident — unlike
+    /// [`Self::insert`], which drops an uncacheable key.
+    pub fn insert_if<F>(&self, key: u64, value: V, weight: usize, admit: F) -> bool
+    where
+        F: FnOnce(Option<&V>) -> bool,
+    {
+        let weight = u64::try_from(weight).unwrap_or(u64::MAX);
+        if weight > self.max_weight {
+            return false;
+        }
+        let shard_idx = shard_index(key);
+        let displaced;
+        let mut expired: Vec<std::sync::Arc<V>> = Vec::new();
+        {
+            let _gate = self.invalidate_gate.read();
+            self.drain_touches_blocking(shard_idx);
+            let mut shard = self.shards[shard_idx].0.lock();
+            let now = Instant::now();
+            if !admit(shard.peek_live(key, now, self.ttl)) {
+                return false;
+            }
+            if matches!(self.policy, EvictionPolicy::TinyLfu) {
+                let before_window = shard.window_weight();
+                let before_protected = shard.protected_weight();
+                let (values, expired_weight) = shard.expire_older_than(now, self.ttl);
+                if expired_weight > 0 {
+                    self.sub_weight(expired_weight);
+                }
+                self.sync_segment_weights_after_removal(
+                    before_window,
+                    shard.window_weight(),
+                    before_protected,
+                    shard.protected_weight(),
+                );
+                expired = values;
+                shard.increment_sketch(key);
+            }
+
+            let (delta, replaced) = shard.insert(key, value, weight, now);
+            self.apply_delta(&delta);
+            drop(shard);
+            self.note_write();
+            displaced = replaced;
+            #[cfg(test)]
+            self.wait_after_publish();
+        }
+        drop(displaced);
+        for _ in expired.drain(..) {
+            L::on_evict(EvictionReason::Expired);
+        }
+        self.evict_to_limit(shard_idx, Some(key));
+        true
+    }
+
     /// Insert `value` under `key` only if admitting it needs no cache-wide work,
     /// and hand it back otherwise.
     ///

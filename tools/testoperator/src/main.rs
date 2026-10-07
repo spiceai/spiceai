@@ -28,8 +28,8 @@ mod stats;
 mod system_adapter;
 
 use args::{
-    Commands, DataConsistencyArgs, DatasetTestArgs, HtapArgs, LoadTestArgs, SchemaTestArgs,
-    TestCommands, TextToSqlArgs,
+    ColdStartArgs, Commands, DataConsistencyArgs, DatasetTestArgs, HtapArgs, LoadTestArgs,
+    SchemaTestArgs, TestCommands, TextToSqlArgs,
 };
 
 use crate::args::SearchTestArgs;
@@ -59,6 +59,7 @@ async fn main() -> anyhow::Result<()> {
             | TestCommands::Search(SearchTestArgs { common, .. })
             | TestCommands::TextToSql(TextToSqlArgs { common, .. })
             | TestCommands::Schema(SchemaTestArgs { common, .. })
+            | TestCommands::ColdStart(ColdStartArgs { common, .. })
             | TestCommands::DataConsistency(DataConsistencyArgs {
                 test_args: DatasetTestArgs { common, .. },
                 ..
@@ -111,6 +112,9 @@ async fn main() -> anyhow::Result<()> {
         }
         Commands::Run(TestCommands::Schema(args)) => {
             commands::schema::run(&args).await?;
+        }
+        Commands::Run(TestCommands::ColdStart(args)) => {
+            commands::cold_start::run(&args).await?;
         }
         Commands::Run(TestCommands::Htap(args)) => {
             // The HTAP run is the long-lived one an external harness watches

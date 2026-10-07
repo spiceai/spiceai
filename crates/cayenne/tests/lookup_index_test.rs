@@ -844,11 +844,286 @@ async fn dynamic_filter_batch_probes_the_lookup_index() {
         "a declined partitioned filter must not record candidate rows"
     );
 
+    // A fully covered index selection sizes the build by candidate rows,
+    // rather than by all rows in the files that contain those candidates.
+    let mut selective_config = SessionConfig::new().with_target_partitions(4);
+    selective_config
+        .options_mut()
+        .optimizer
+        .hash_join_single_partition_threshold = 1024;
+    selective_config
+        .options_mut()
+        .optimizer
+        .hash_join_single_partition_threshold_rows = 128;
+    let selective_ctx = SessionContext::new_with_config(selective_config);
+    selective_ctx
+        .register_table(
+            INDEXED_EVIDENCE,
+            Arc::clone(&indexed) as Arc<dyn TableProvider>,
+        )
+        .expect("register indexed table for selective join");
+    let selective_sql = format!(
+        "SELECT s.\"AutoId\" FROM {INDEXED_EVIDENCE} s \
+         INNER JOIN {INDEXED_EVIDENCE} b ON s.\"AutoId\" = b.\"AutoId\" \
+         WHERE b.\"TenantId\" = 'AC{:032x}' AND b.\"ServiceId\" = 'MG{:032x}'",
+        7 % ACCOUNTS,
+        7
+    );
+    let selective_plan = selective_ctx
+        .sql(&selective_sql)
+        .await
+        .expect("selective join dataframe")
+        .create_physical_plan()
+        .await
+        .expect("selective join physical plan");
+    let selective_display = datafusion::physical_plan::displayable(selective_plan.as_ref())
+        .indent(true)
+        .to_string();
+    assert!(
+        selective_display.contains("HashJoinExec: mode=CollectLeft"),
+        "the single-candidate build should use a collected hash join:\n{selective_display}"
+    );
+    let selective_rows =
+        datafusion::physical_plan::collect(Arc::clone(&selective_plan), selective_ctx.task_ctx())
+            .await
+            .expect("selective join execution");
+    assert_eq!(rendered(&selective_rows), vec!["7"]);
+    let repeated_rows = selective_ctx
+        .sql(&selective_sql)
+        .await
+        .expect("repeated selective join plan")
+        .collect()
+        .await
+        .expect("repeated selective join execution");
+    assert_eq!(rendered(&repeated_rows), vec!["7"]);
+
     println!("=== dynamic indexed join ===\n{plan}");
     println!("=== dynamic composite indexed join ===\n{composite_plan}");
     println!("=== partitioned dynamic fallback ===\n{partitioned_plan}");
+    println!("=== selective indexed build ===\n{selective_display}");
     println!("lookup-index counters: {before:?} -> {after:?}");
     println!("composite lookup-index counters: {composite_before:?} -> {composite_after:?}");
+}
+
+/// A fully indexed miss plans an empty scan and sizes an absent-key join at
+/// zero rows even though no per-file access-plan provider is needed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn indexed_miss_has_zero_scan_and_join_statistics() {
+    use datafusion::physical_plan::{StatisticsArgs, StatisticsContext, collect, displayable};
+    use datafusion::prelude::{col, lit};
+    use datafusion_common::stats::Precision;
+
+    const TABLE: &str = "svc_indexed_miss_stats";
+    let fixture = common::TestFixture::new(common::BackendType::Sqlite)
+        .await
+        .expect("fixture");
+    let runtime_env = Arc::new(RuntimeEnv::default());
+    let indexed = build_table(&fixture, TABLE, &INDEX_KEYS, runtime_env).await;
+    insert(&indexed, TABLE, service_rows(0, ROWS)).await;
+    wait_for_index(&indexed, TABLE).await;
+    let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(4));
+    ctx.register_table(TABLE, Arc::clone(&indexed) as Arc<dyn TableProvider>)
+        .expect("register indexed table");
+    let filters = vec![
+        col("\"TenantId\"").eq(lit(MISSING_ACCOUNT)),
+        col("\"ServiceId\"").eq(lit(MISSING_APPLICATION)),
+    ];
+    let before = counters(&indexed);
+    let scan = indexed
+        .scan(&ctx.state(), None, &filters, None)
+        .await
+        .expect("absent-key scan");
+    let after = counters(&indexed);
+    assert_eq!(after.full - before.full, 1, "must probe full coverage");
+    assert_eq!(after.candidate_rows - before.candidate_rows, 0);
+    let scan_stats = StatisticsContext::new()
+        .compute(scan.as_ref(), &StatisticsArgs::new())
+        .expect("empty scan statistics");
+    assert_eq!(scan_stats.num_rows, Precision::Exact(0));
+    let scan_display = displayable(scan.as_ref()).indent(true).to_string();
+    assert!(scan_display.contains("EmptyExec"), "{scan_display}");
+    assert!(
+        collect(scan, ctx.task_ctx())
+            .await
+            .expect("empty scan")
+            .is_empty()
+    );
+
+    let sql = format!(
+        "SELECT s.\"AutoId\" FROM {TABLE} s INNER JOIN {TABLE} b \
+         ON s.\"AutoId\" = b.\"AutoId\" \
+         WHERE b.\"TenantId\" = '{MISSING_ACCOUNT}' \
+         AND b.\"ServiceId\" = '{MISSING_APPLICATION}'"
+    );
+    let join = ctx
+        .sql(&sql)
+        .await
+        .expect("absent-key join")
+        .create_physical_plan()
+        .await
+        .expect("absent-key join plan");
+    let join_stats = StatisticsContext::new()
+        .compute(join.as_ref(), &StatisticsArgs::new())
+        .expect("empty join statistics");
+    assert_eq!(join_stats.num_rows.get_value(), Some(&0));
+    let join_display = displayable(join.as_ref()).indent(true).to_string();
+    assert!(
+        !join_display.contains("mode=Partitioned"),
+        "an absent indexed build must not require a partitioned join:\n{join_display}"
+    );
+    assert!(
+        collect(join, ctx.task_ctx())
+            .await
+            .expect("empty join")
+            .is_empty()
+    );
+    println!(
+        "fully covered absent key: scan rows={:?}, join rows={:?}; \
+         counters={before:?} -> {after:?}\n{scan_display}\n{join_display}",
+        scan_stats.num_rows, join_stats.num_rows
+    );
+}
+
+/// Runtime file restriction skips covered non-candidates while preserving
+/// every uncovered file and the rows it holds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn dynamic_filter_restricts_files_and_retains_uncovered_files() {
+    use datafusion::physical_plan::{ExecutionPlan, collect, displayable};
+    use datafusion_datasource::file_scan_config::FileScanConfig;
+    use datafusion_datasource::source::DataSourceExec;
+
+    fn planned_files(plan: &dyn ExecutionPlan) -> usize {
+        if let Some(config) = plan
+            .downcast_ref::<DataSourceExec>()
+            .and_then(|scan| scan.data_source().downcast_ref::<FileScanConfig>())
+        {
+            return config
+                .file_groups
+                .iter()
+                .map(|group| group.iter().count())
+                .sum();
+        }
+        plan.children()
+            .iter()
+            .map(|child| planned_files(child.as_ref()))
+            .sum()
+    }
+
+    fn scan_opened_files(plan: &dyn ExecutionPlan) -> Vec<usize> {
+        if plan
+            .downcast_ref::<DataSourceExec>()
+            .and_then(|scan| scan.data_source().downcast_ref::<FileScanConfig>())
+            .is_some()
+        {
+            return vec![
+                plan.metrics()
+                    .expect("file scan metrics")
+                    .sum_by_name("files_opened")
+                    .expect("opened file metric")
+                    .as_usize(),
+            ];
+        }
+        plan.children()
+            .iter()
+            .flat_map(|child| scan_opened_files(child.as_ref()))
+            .collect()
+    }
+
+    fn restricted_opened_files(plan: &dyn ExecutionPlan) -> Vec<usize> {
+        if plan.name() == "RuntimeRestrictedScanExec" {
+            // Unary operators within the wrapper need not forward file metrics.
+            return scan_opened_files(plan);
+        }
+        plan.children()
+            .iter()
+            .flat_map(|child| restricted_opened_files(child.as_ref()))
+            .collect()
+    }
+
+    const TABLE: &str = "svc_runtime_files";
+    let fixture = common::TestFixture::new(common::BackendType::Sqlite)
+        .await
+        .expect("fixture");
+    let runtime_env = Arc::new(RuntimeEnv::default());
+    let indexed = build_table(&fixture, TABLE, &INDEX_KEYS, Arc::clone(&runtime_env)).await;
+    insert(&indexed, TABLE, service_rows(0, ROWS)).await;
+    wait_for_index(&indexed, TABLE).await;
+    let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(4));
+    ctx.register_table(TABLE, Arc::clone(&indexed) as Arc<dyn TableProvider>)
+        .expect("register indexed table");
+    let sql = |keys: &str| {
+        format!(
+            "SELECT s.\"AutoId\" FROM (VALUES {keys}) k(key) \
+             INNER JOIN {TABLE} s ON k.key = s.\"AutoId\" ORDER BY s.\"AutoId\""
+        )
+    };
+    let full_plan = ctx
+        .sql(&sql("(7)"))
+        .await
+        .expect("fully covered join")
+        .create_physical_plan()
+        .await
+        .expect("fully covered physical plan");
+    let covered_files = planned_files(full_plan.as_ref());
+    assert!(
+        covered_files > 1,
+        "fixture must contain non-candidate files"
+    );
+    let rows = collect(Arc::clone(&full_plan), ctx.task_ctx())
+        .await
+        .expect("fully covered execution");
+    assert_eq!(rendered(&rows), vec!["7"]);
+    assert_eq!(restricted_opened_files(full_plan.as_ref()), vec![1]);
+    println!(
+        "full coverage: {covered_files} planned files, 1 opened; rows=7\n{}",
+        displayable(full_plan.as_ref()).indent(true)
+    );
+
+    // A writer without indexes publishes new data files without index runs.
+    // The reader retains its covered files and pins the mixed-coverage view;
+    // a rebuild requested during execution cannot alter that pinned view.
+    let writer = build_table(&fixture, TABLE, &[], runtime_env).await;
+    insert(&writer, TABLE, service_rows(80_000, ROWS)).await;
+    indexed
+        .refresh(&writer)
+        .await
+        .expect("refresh appended files");
+    let partial_plan = ctx
+        .sql(&sql("(7), (80007)"))
+        .await
+        .expect("partially covered join")
+        .create_physical_plan()
+        .await
+        .expect("partially covered physical plan");
+    let all_files = planned_files(partial_plan.as_ref());
+    let uncovered_files = all_files - covered_files;
+    assert!(uncovered_files > 0, "append must produce uncovered files");
+    let before = counters(&indexed);
+    let rows = collect(Arc::clone(&partial_plan), ctx.task_ctx())
+        .await
+        .expect("partially covered execution");
+    let after = counters(&indexed);
+    assert_eq!(rendered(&rows), vec!["7", "80007"]);
+    assert_eq!(
+        after.partial - before.partial,
+        1,
+        "must probe mixed coverage"
+    );
+    assert_eq!(
+        restricted_opened_files(partial_plan.as_ref()),
+        vec![1 + uncovered_files],
+        "open the covered candidate and every uncovered file"
+    );
+    assert!(
+        1 + uncovered_files < all_files,
+        "skip covered non-candidates"
+    );
+    println!(
+        "partial coverage: {covered_files} covered + {uncovered_files} uncovered, {} opened; \
+         rows=7,80007; counters={before:?} -> {after:?}\n{}",
+        1 + uncovered_files,
+        displayable(partial_plan.as_ref()).indent(true)
+    );
 }
 
 /// The write-time index must be indistinguishable from one built by reading the

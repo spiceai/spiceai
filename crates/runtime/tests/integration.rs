@@ -175,6 +175,7 @@ mod results_cache_warmup;
 #[cfg(all(unix, feature = "duckdb", feature = "postgres"))]
 mod retention;
 mod s3;
+mod s3_folder_marker;
 mod s3_location_pruning;
 mod s3_parquet_overwrite;
 #[cfg(any(
