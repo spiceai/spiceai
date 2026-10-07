@@ -578,6 +578,8 @@ impl Error {
                 // `time_column`/`time_format` disagree with the source schema.
                 | Self::InvalidTimeColumnTimeFormat { .. }
                 | Self::AppendRequiresTimeColumn { .. }
+                // `access: read_write` over a source that cannot take writes.
+                | Self::WriteProviderNotImplemented { .. }
                 // Refresh-mode and snapshot settings the selected engine or
                 // connector cannot serve.
                 | Self::InvalidCachingRefreshMode { .. }
