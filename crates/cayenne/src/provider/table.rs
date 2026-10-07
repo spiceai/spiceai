@@ -28690,7 +28690,7 @@ impl CayenneTableProvider {
     /// so a later `DELETE` retries it durably, which a cache-only flag cannot do.
     fn abandon_table_stats_update(&self, reason: &str) -> bool {
         tracing::warn!(
-            "Could not record the row count for table '{}', so queries against it now report an estimated row count instead of an exact one until the next write or DELETE re-establishes it. Cause: {reason}. See: https://spiceai.org/docs/components/data-accelerators/cayenne",
+            "Could not record row-count statistics for table '{}'. The maintained row count is not trusted as exact. Cause: {reason}. See: https://spiceai.org/docs/components/data-accelerators/cayenne",
             self.table_metadata.table_name
         );
         self.arm_row_count_taint_retry();

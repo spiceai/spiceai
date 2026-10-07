@@ -2301,13 +2301,20 @@ mod tests {
     }
 
     async fn decimal_scale_statistics_publication(in_flight: bool) {
-        async fn assert_decimal_rows(provider: Arc<CayenneTableProvider>, phase: &str) {
+        async fn assert_decimal_rows(
+            provider: Arc<CayenneTableProvider>,
+            phase: &str,
+            expected: &[(i64, i128)],
+        ) {
             let ctx = SessionContext::new();
             ctx.register_table("decimal_rows", provider)
                 .expect("register rows");
-            for sql in [
-                "SELECT id, amount FROM decimal_rows",
-                "SELECT id, amount FROM decimal_rows WHERE amount = CAST(123.45 AS DECIMAL(14,4))",
+            for (sql, expected) in [
+                ("SELECT id, amount FROM decimal_rows ORDER BY id", expected),
+                (
+                    "SELECT id, amount FROM decimal_rows WHERE amount = CAST(123.45 AS DECIMAL(14,4))",
+                    &[(1_i64, 1_234_500_i128)],
+                ),
             ] {
                 let batches = ctx
                     .sql(sql)
@@ -2335,9 +2342,48 @@ mod tests {
                         actual.push((ids.value(row), amounts.value(row)));
                     }
                 }
-                assert_eq!(actual, vec![(1, 1_234_500_i128)], "{phase}: {sql}");
+                assert_eq!(actual, expected, "{phase}: {sql}");
                 eprintln!("DECIMAL_ROWS {phase} {sql}: {actual:?}");
             }
+        }
+        async fn assert_truthful_count(
+            provider: &CayenneTableProvider,
+            catalog: &CayenneCatalog,
+            table_id: &str,
+            phase: &str,
+            expected: i64,
+        ) {
+            use datafusion_common::stats::Precision;
+
+            let persisted = catalog
+                .get_table_statistics(table_id)
+                .await
+                .expect("read row-count statistics");
+            if let Some(stats) = &persisted
+                && stats.num_rows_exact
+            {
+                assert_eq!(
+                    stats.num_rows, expected,
+                    "{phase}: persisted exact count must describe every live row"
+                );
+            }
+            let optimizer = provider.optimizer_table_statistics();
+            if let Some(stats) = &optimizer
+                && let Precision::Exact(rows) = stats.num_rows
+            {
+                assert_eq!(
+                    i64::try_from(rows).expect("count fits i64"),
+                    expected,
+                    "{phase}: optimizer exact count must describe every live row"
+                );
+            }
+            eprintln!(
+                "DECIMAL_COUNT {phase} actual={expected} persisted={:?} optimizer={:?}",
+                persisted
+                    .as_ref()
+                    .map(|stats| (stats.num_rows, stats.num_rows_exact)),
+                optimizer.map(|stats| stats.num_rows)
+            );
         }
         let temp_dir = TempDir::new().expect("temp dir");
         let db_path = temp_dir.path().join("cayenne_evolution_decimal_scale.db");
@@ -2511,7 +2557,7 @@ mod tests {
                 );
             }
         }
-        assert_decimal_rows(Arc::clone(&provider), "live").await;
+        assert_decimal_rows(Arc::clone(&provider), "live", &[(1, 1_234_500)]).await;
         let catalog_trait: Arc<dyn MetadataCatalog> =
             Arc::clone(&catalog) as Arc<dyn MetadataCatalog>;
         let reopened = Arc::new(
@@ -2519,7 +2565,7 @@ mod tests {
                 .await
                 .expect("reopen decimal table"),
         );
-        assert_decimal_rows(reopened, "reopened").await;
+        assert_decimal_rows(reopened, "reopened", &[(1, 1_234_500)]).await;
 
         assert!(
             persisted.is_none(),
@@ -2549,5 +2595,70 @@ mod tests {
             1,
             "a matching decimal predicate must not be pruned after the scale change"
         );
+
+        if !in_flight {
+            // Exercise later incremental updates without requiring them to repair
+            // an abandoned count. An exact count must always match real rows;
+            // conservative statistics and a correct future repair are both valid.
+            let amount = Decimal128Array::from(vec![2_345_600_i128])
+                .with_precision_and_scale(14, 4)
+                .expect("evolved decimal array");
+            let batch = RecordBatch::try_new(
+                Arc::clone(&plan.evolved_schema),
+                vec![Arc::new(Int64Array::from(vec![2_i64])), Arc::new(amount)],
+            )
+            .expect("evolved row batch");
+            insert_batch(&provider, batch).await;
+            provider
+                .drain_in_flight_maintenance()
+                .await
+                .expect("drain next write");
+            assert_decimal_rows(
+                Arc::clone(&provider),
+                "after next write",
+                &[(1, 1_234_500), (2, 2_345_600)],
+            )
+            .await;
+            assert_eq!(
+                query_count(&ctx, "SELECT COUNT(*) FROM evolution_decimal_scale").await,
+                2
+            );
+            assert_truthful_count(
+                &provider,
+                &catalog,
+                &table_metadata.table_id,
+                "after next write",
+                2,
+            )
+            .await;
+
+            let delete = provider
+                .delete_from(
+                    &ctx.state(),
+                    vec![datafusion_expr::col("id").eq(datafusion_expr::lit(2_i64))],
+                )
+                .await
+                .expect("plan filtered delete");
+            collect(delete, ctx.task_ctx())
+                .await
+                .expect("execute filtered delete");
+            provider
+                .drain_in_flight_maintenance()
+                .await
+                .expect("drain delete");
+            assert_decimal_rows(Arc::clone(&provider), "after delete", &[(1, 1_234_500)]).await;
+            assert_eq!(
+                query_count(&ctx, "SELECT COUNT(*) FROM evolution_decimal_scale").await,
+                1
+            );
+            assert_truthful_count(
+                &provider,
+                &catalog,
+                &table_metadata.table_id,
+                "after delete",
+                1,
+            )
+            .await;
+        }
     }
 }
