@@ -1282,7 +1282,14 @@ impl RefreshTask {
                 {
                     // Ordering versions by time replaces the exact-row dedupe: it is
                     // seeded with the stored keys and times from the same window start.
-                    Ok(data) if refresh.versions_by_time.is_some() => {
+                    // A refresh that keeps the last arrival still needs the dedupe, or
+                    // every append re-adds its whole overlap window.
+                    Ok(data)
+                        if refresh.versions_by_time.is_some()
+                            && self
+                                .version_ordering(refresh, &data.data.schema())
+                                .is_some() =>
+                    {
                         self.select_latest_by_time(refresh, data, timestamp).await
                     }
                     // Reuse `timestamp`: the dedupe must compare against the same mark the
@@ -1306,6 +1313,36 @@ impl RefreshTask {
         }
     }
 
+    /// The primary key and time column a refresh reading `incoming` orders versions by,
+    /// or `None` when it keeps the last arrival instead.
+    fn version_ordering(
+        &self,
+        refresh: &Refresh,
+        incoming: &SchemaRef,
+    ) -> Option<(Vec<String>, String)> {
+        // Without a time column to read, versions keep the order they arrive in.
+        let time_column = refresh
+            .time_column
+            .clone()
+            .filter(|column| incoming.field_with_name(column).is_ok())?;
+        let accelerator_schema = self.accelerator.schema();
+        let key_columns = self
+            .accelerator
+            .constraints()
+            .map_or_else(Vec::new, |constraints| {
+                data_accelerator_api::get_primary_keys_from_constraints(
+                    constraints,
+                    &accelerator_schema,
+                )
+            });
+        // A table without a primary key keeps every row, and one whose key holds the
+        // time column gives every version a key of its own.
+        if key_columns.is_empty() || key_columns.contains(&time_column) {
+            return None;
+        }
+        Some((key_columns, time_column))
+    }
+
     /// Keep the newest version of each key by `time_column`: pass on only rows newer
     /// than the version of their key already kept. When `window_start` is set (an
     /// append), the selector is
@@ -1325,29 +1362,12 @@ impl RefreshTask {
                     .unwrap_or_else(|| error.to_string()),
             })
         };
-        // Without a time column to read, versions keep the order they arrive in.
-        let Some(time_column) = refresh
-            .time_column
-            .clone()
-            .filter(|column| update.data.schema().field_with_name(column).is_ok())
+        let Some((key_columns, time_column)) =
+            self.version_ordering(refresh, &update.data.schema())
         else {
             return Ok(update);
         };
         let accelerator_schema = self.accelerator.schema();
-        let key_columns = self
-            .accelerator
-            .constraints()
-            .map_or_else(Vec::new, |constraints| {
-                data_accelerator_api::get_primary_keys_from_constraints(
-                    constraints,
-                    &accelerator_schema,
-                )
-            });
-        // A table without a primary key keeps every row, and one whose key holds the
-        // time column gives every version a key of its own.
-        if key_columns.is_empty() || key_columns.contains(&time_column) {
-            return Ok(update);
-        }
         // A synchronized child writes the same rows but cannot read their versions, so
         // a dataset with one resolves them here, before the rows reach either table.
         let dedup = refresh.versions_by_time.unwrap_or_default();
