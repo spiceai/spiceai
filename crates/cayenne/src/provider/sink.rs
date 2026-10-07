@@ -29,7 +29,7 @@ use datafusion_common::Result as DFResult;
 use datafusion_execution::TaskContext;
 use datafusion_expr::dml::InsertOp;
 use datafusion_table_providers::util::retriable_error::check_and_mark_retriable_error;
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 
 use runtime_datafusion::extension::request_context::resolve_request_context;
 
@@ -76,6 +76,15 @@ pub struct CayenneDataSink {
     /// Shared context containing configuration (file size, concurrency, sort columns, etc.)
     /// and cached resources (upload semaphore, Vortex format).
     context: Arc<CayenneContext>,
+}
+
+/// The error for an append that carries row versions but can't keep each key's greatest
+/// version: it is not a load into an empty table, so a stored copy of a key it writes
+/// would be superseded whatever its version.
+fn versioned_append_refused(table: &str) -> datafusion_common::DataFusionError {
+    datafusion_common::DataFusionError::Execution(format!(
+        "Cayenne table '{table}' holds rows, so this refresh's append cannot order a key's copies by version against them; the refresh was not applied and the next one resolves them before writing."
+    ))
 }
 
 impl CayenneDataSink {
@@ -144,6 +153,9 @@ impl DataSink for CayenneDataSink {
         data: SendableRecordBatchStream,
         context: &Arc<TaskContext>,
     ) -> DFResult<u64> {
+        self.table
+            .ensure_publication_outcome_known()
+            .map_err(datafusion_common::DataFusionError::from)?;
         // Normalize incoming batches to the table schema (e.g. CDC nullability mismatches)
         // causing Vortex assertion failures. An error from the input stream is the source
         // failing mid-read, so it is marked retriable for the refresh to retry, as the
@@ -180,6 +192,9 @@ impl DataSink for CayenneDataSink {
         // interleaves with a concurrent append.
         if self.table.is_memory_resident_mode() {
             let overwrite = self.overwrite == InsertOp::Overwrite;
+            if !overwrite && self.table.row_versions.is_some() {
+                return Err(versioned_append_refused(self.table.table_name()));
+            }
             let mut batches: Vec<arrow::record_batch::RecordBatch> = Vec::new();
             let mut incoming = arrow_tools::batch_bytes::RetainedBytes::new();
             // Acquire the write lock BEFORE draining so memory-mode writes are
@@ -189,35 +204,16 @@ impl DataSink for CayenneDataSink {
             // OOM) before either appends. Reads use `ArcSwap` (lock-free), so this only
             // serializes writers.
             //
-            // Taken before the stream is prepared, too: preparation snapshots the
-            // primary-key index the validation below decides conflicts against, and
-            // memory-mode writers are serialized on exactly this lock, so taking it
-            // first is what makes that snapshot current rather than one write stale.
-            // Nothing under `prepare_stream_for_insert` takes `write_lock`.
+            // Taken before preparation, too: preparation snapshots the primary-key
+            // index the validation below decides conflicts against, and memory-mode
+            // writers are serialized on exactly this lock, so taking it first keeps
+            // that snapshot current through validation and commit. The write's own
+            // repeated keys are resolved before validation sees them (an APPEND's
+            // validation then supersedes the resident rows its keys meet, as the
+            // appended segment's own tombstones; an OVERWRITE replaces the tier).
             let write_guard = self.table.write_lock().lock().await;
-
-            // An APPEND must run primary-key conflict detection, so `on_conflict`
-            // is honoured: the validation records which resident rows the incoming
-            // batch supersedes, and those become the appended segment's own
-            // tombstones — one pass over the data, superseding as it appends,
-            // rather than a separate delete. Without it a re-INSERT of an existing
-            // key left BOTH versions live under a declared primary key.
-            //
-            // An OVERWRITE (full refresh) replaces the tier wholesale, so there is
-            // nothing to supersede and no index to consult.
-            let (mut data, post_validation) = if overwrite {
-                (normalized as SendableRecordBatchStream, None)
-            } else {
-                let prepared = self
-                    .table
-                    .prepare_stream_for_insert(normalized)
-                    .await
-                    .map_err(datafusion_common::DataFusionError::from)?;
-                let post_validation = prepared.post_validation();
-                (prepared.stream, Some(post_validation))
-            };
-
-            while let Some(batch) = data.next().await {
+            let mut raw = normalized;
+            while let Some(batch) = raw.next().await {
                 let batch = batch?;
                 incoming.add(&batch);
                 let incoming_bytes = incoming.total();
@@ -232,8 +228,27 @@ impl DataSink for CayenneDataSink {
                     .map_err(datafusion_common::DataFusionError::from)?;
                 batches.push(batch);
             }
-            // Draining the prepared stream is what RAN the validation, so the
-            // conflict state is only complete now.
+            let batches = self
+                .table
+                .collapse_buffered_write(batches)
+                .map_err(datafusion_common::DataFusionError::from)?;
+            let (batches, post_validation) = if overwrite {
+                (batches, None)
+            } else {
+                let raw: SendableRecordBatchStream = Box::pin(RecordBatchStreamAdapter::new(
+                    Arc::clone(&self.schema),
+                    futures::stream::iter(batches.into_iter().map(Ok)),
+                ));
+                let prepared = self
+                    .table
+                    .prepare_stream_for_insert(raw)
+                    .await
+                    .map_err(datafusion_common::DataFusionError::from)?;
+                let state = prepared.post_validation();
+                let validated = prepared.stream.try_collect::<Vec<_>>().await?;
+                (validated, Some(state))
+            };
+            let incoming_bytes = arrow_tools::batch_bytes::RetainedBytes::of(&batches);
             let (deletions, validated_keys) = post_validation
                 .map(|state| {
                     let super::on_conflict::PostValidationState {
@@ -246,7 +261,7 @@ impl DataSink for CayenneDataSink {
 
             let rows = self
                 .table
-                .write_batches_memory_mode(batches, incoming.total(), overwrite, &deletions)
+                .write_batches_memory_mode(batches, incoming_bytes, overwrite, &deletions)
                 .await
                 .map_err(datafusion_common::DataFusionError::from)?;
 
@@ -272,9 +287,48 @@ impl DataSink for CayenneDataSink {
             self.write_all_overwrite(normalized, context)
                 .await
                 .map_err(Into::into)
+        } else if let Some(write_guard) = self.lock_for_first_load().await {
+            // A refresh appending into a table that holds no rows has nothing to
+            // check its keys against, so it is written as one append without the
+            // conflict check or the segments: segments would each check their
+            // keys against the rows the previous ones published, and the check
+            // holds every incoming key in memory. The keys the load repeats are
+            // still resolved after the write, and it publishes as any append does.
+            tracing::debug!(
+                table = self.table.table_name(),
+                "Writing the first load into an empty table as one append"
+            );
+            let rows = AppendMutationWriter::new(&self.table, &self.context, context)
+                .into_empty_table()
+                .write(normalized, write_guard)
+                .await?;
+            // The load recorded no primary-key index; warm the one the next
+            // refresh validates against now, rather than on that refresh's path.
+            let table = self.table.clone_for_write();
+            tokio::spawn(async move {
+                if let Err(error) = table.warm_pk_index().await {
+                    tracing::debug!(
+                        table = table.table_name(),
+                        %error,
+                        "Failed to build the primary-key index after a first load; the next append builds it"
+                    );
+                }
+            });
+            Ok(rows)
+        } else if self.table.row_versions.is_some() {
+            // Row versions order a key's copies only against the copies one write
+            // holds, which is every copy only in a load into an empty table; any
+            // other append would supersede a stored copy whatever its version.
+            Err(versioned_append_refused(self.table.table_name()))
         } else if let Some(interval) = self.context.stream_publish_interval()
+            && self.table.key_resolver()?.is_none()
             && !self.is_unkeyed_load_into_empty_table().await
         {
+            // A keyed conflict-policy write is one statement: validation must
+            // finish before any part is visible. An unkeyed load into an empty
+            // table is written as one append too (see
+            // `is_unkeyed_load_into_empty_table`). Other streams may publish in
+            // segments to bound latency.
             // Append path with bounded publish latency: cut the input stream
             // into age/size-bounded segments and run a complete
             // prepare→stage→publish write per segment, so rows on a long-lived
@@ -286,8 +340,8 @@ impl DataSink for CayenneDataSink {
         } else {
             // Append path: `write_all_append` uses the existing-staging helpers
             // that assume the caller already holds the write lock.
-            let _write_guard = self.table.write_lock().lock().await;
-            self.write_all_append(normalized, context)
+            let write_guard = self.table.write_lock_arc().lock_owned().await;
+            self.write_all_append(normalized, context, write_guard)
                 .await
                 .map_err(Into::into)
         }
@@ -461,6 +515,11 @@ impl CayenneDataSink {
             if segment.is_empty() {
                 continue;
             }
+            // The segment is one write, held in memory: resolve the keys its
+            // batches repeat before validation sees them. A key repeated across
+            // segments is a later write's upsert, which the next segment's
+            // validation resolves against the published one.
+            let segment = self.table.collapse_buffered_write(segment)?;
             segments += 1;
             let segment_stream: SendableRecordBatchStream =
                 Box::pin(RecordBatchStreamAdapter::new(
@@ -468,9 +527,11 @@ impl CayenneDataSink {
                     futures::stream::iter(segment.into_iter().map(Ok)),
                 ));
             let segment_start = std::time::Instant::now();
-            let _write_guard = self.table.write_lock().lock().await;
+            let write_guard = self.table.write_lock_arc().lock_owned().await;
             let lock_wait_ms = segment_start.elapsed().as_millis();
-            let segment_rows = self.write_all_append(segment_stream, context).await?;
+            let segment_rows = self
+                .write_all_append(segment_stream, context, write_guard)
+                .await?;
             total_rows += segment_rows;
             tracing::debug!(
                 table = self.table.table_name(),
@@ -491,6 +552,27 @@ impl CayenneDataSink {
             );
         }
         Ok(total_rows)
+    }
+
+    /// The write lock, held, when this append is a refresh's load into a table
+    /// that holds no rows, so it can skip the conflict check that finds nothing
+    /// to conflict with.
+    ///
+    /// The table must resolve repeated keys after the write (a primary key, an
+    /// `on_conflict`, no partition column) and have no retention filter, the
+    /// conditions under which an append takes that path; a keyed table also never
+    /// takes a staged append, so no staged publish can land beneath the load.
+    /// Emptiness is observed under the lock this returns, which the load holds
+    /// until it publishes.
+    async fn lock_for_first_load(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
+        if self.table.metadata().partition_column.is_some()
+            || self.table.has_retention_delete_filters()
+            || !matches!(self.table.key_resolver(), Ok(Some(_)))
+        {
+            return None;
+        }
+        let write_guard = self.table.write_lock_arc().lock_owned().await;
+        self.table.holds_no_rows().await.then_some(write_guard)
     }
 
     /// Append data from a record batch stream into the Cayenne table.
@@ -516,9 +598,10 @@ impl CayenneDataSink {
         &self,
         data: SendableRecordBatchStream,
         context: &Arc<TaskContext>,
+        write_guard: tokio::sync::OwnedMutexGuard<()>,
     ) -> super::Result<u64> {
         AppendMutationWriter::new(&self.table, &self.context, context)
-            .write(data)
+            .write(data, write_guard)
             .await
     }
 
@@ -597,12 +680,196 @@ mod tests {
         df.count().await.expect("count")
     }
 
-    /// The age-bounded segment cut: rows streamed on a still-open append stream
-    /// become queryable within ~`stream_publish_interval_ms`, without waiting
-    /// for the stream to end. Guards the events-mode ingest-to-queryable
-    /// latency fix (long-lived ADBC bulk-ingest streams).
+    fn keyed_batch(schema: &Arc<Schema>, rows: &[(i64, i64)]) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::clone(schema),
+            vec![
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|row| row.0).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|row| row.1).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .expect("keyed batch")
+    }
+
+    async fn keyed_rows(ctx: &SessionContext, provider: &CayenneTableProvider) -> Vec<(i64, i64)> {
+        let batches = ctx
+            .read_table(Arc::new(provider.clone_for_write()))
+            .expect("read table")
+            .collect()
+            .await
+            .expect("collect table");
+        let mut rows = Vec::new();
+        for batch in batches {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("ids");
+            let values = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("values");
+            for row in 0..batch.num_rows() {
+                rows.push((ids.value(row), values.value(row)));
+            }
+        }
+        rows.sort_unstable();
+        rows
+    }
+
+    async fn keyed_count_sql(ctx: &SessionContext, provider: &CayenneTableProvider) -> i64 {
+        ctx.deregister_table("buffered_keys").ok();
+        ctx.register_table("buffered_keys", Arc::new(provider.clone_for_write()))
+            .expect("register table for count");
+        let batches = ctx
+            .sql("SELECT COUNT(*) FROM buffered_keys")
+            .await
+            .expect("count query")
+            .collect()
+            .await
+            .expect("count result");
+        let batch = batches.first().expect("one count batch");
+        match datafusion_common::ScalarValue::try_from_array(batch.column(0).as_ref(), 0)
+            .expect("count scalar")
+        {
+            datafusion_common::ScalarValue::Int64(Some(count)) => count,
+            datafusion_common::ScalarValue::UInt64(Some(count)) => {
+                i64::try_from(count).expect("count fits i64")
+            }
+            other => panic!("unexpected count scalar: {other:?}"),
+        }
+    }
+
     #[tokio::test(flavor = "multi_thread")]
-    async fn stream_publish_interval_publishes_before_stream_end() {
+    async fn buffered_sink_writes_resolve_keys_before_validation() {
+        for memory_mode in [true, false] {
+            for overwrite in [true, false] {
+                // Whatever `on_conflict` the table stores, its writes keep each
+                // key's last copy.
+                for policy in [
+                    OnConflict::DoNothingAll,
+                    OnConflict::DoNothing(ColumnReference::new(vec!["id".to_string()])),
+                    OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()])),
+                ] {
+                    let ctx = SessionContext::new();
+                    let temp = tempfile::tempdir().expect("temp dir");
+                    let metadata_dir = temp.path().join("metadata");
+                    std::fs::create_dir_all(&metadata_dir).expect("metadata dir");
+                    let catalog = Arc::new(
+                        CayenneCatalog::new(format!(
+                            "sqlite://{}/cayenne.db",
+                            metadata_dir.display()
+                        ))
+                        .expect("catalog"),
+                    ) as Arc<dyn MetadataCatalog>;
+                    catalog.init().await.expect("catalog init");
+                    let schema = Arc::new(Schema::new(vec![
+                        Field::new("id", DataType::Int64, false),
+                        Field::new("value", DataType::Int64, false),
+                    ]));
+                    let config = VortexConfig {
+                        memory_mode,
+                        ..VortexConfig::default()
+                    };
+                    let context = CayenneContext::new(&config, ctx.runtime_env(), "buffered_keys");
+                    let provider =
+                        CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
+                            .with_context(Arc::clone(&context))
+                            .create(CreateTableOptions {
+                                table_name: "buffered_keys".to_string(),
+                                schema: Arc::clone(&schema),
+                                primary_key: vec!["id".to_string()],
+                                on_conflict: Some(policy.clone()),
+                                base_path: temp.path().join("data").display().to_string(),
+                                partition_column: None,
+                                vortex_config: config,
+                            })
+                            .await
+                            .expect("create table");
+                    let op = if overwrite {
+                        InsertOp::Overwrite
+                    } else {
+                        InsertOp::Append
+                    };
+                    append_rows(
+                        &provider,
+                        &context,
+                        &schema,
+                        &ctx,
+                        vec![keyed_batch(&schema, &[(9, 90)])],
+                    )
+                    .await
+                    .expect("seed row");
+                    let sink = CayenneDataSink::new(
+                        provider.clone_for_write(),
+                        op,
+                        Arc::clone(&schema),
+                        Arc::clone(&context),
+                    );
+                    let batches = vec![
+                        keyed_batch(&schema, &[(1, 10), (1, 30), (2, 20)]),
+                        keyed_batch(&schema, &[(1, 40)]),
+                    ];
+                    let stream = Box::pin(RecordBatchStreamAdapter::new(
+                        Arc::clone(&schema),
+                        futures::stream::iter(batches.into_iter().map(Ok)),
+                    ));
+                    sink.write_all(stream, &ctx.task_ctx())
+                        .await
+                        .expect("accepted write");
+                    let mut rows = vec![(1, 40), (2, 20)];
+                    if !overwrite {
+                        rows.push((9, 90));
+                    }
+                    assert_eq!(keyed_rows(&ctx, &provider).await, rows, "{policy:?}");
+                    assert_eq!(
+                        keyed_count_sql(&ctx, &provider).await,
+                        i64::try_from(rows.len()).expect("row count fits i64")
+                    );
+                    if !memory_mode {
+                        assert_eq!(
+                            provider.cached_inlined_row_count(),
+                            i64::try_from(rows.len()).expect("row count fits i64"),
+                            "the file-mode write used the inline tier"
+                        );
+                    }
+                    if !memory_mode {
+                        let before_reopen = keyed_rows(&ctx, &provider).await;
+                        let reopened = CayenneTableProviderBuilder::new(
+                            Arc::clone(&catalog),
+                            ctx.runtime_env(),
+                        )
+                        .with_context(Arc::clone(&context))
+                        .open("buffered_keys")
+                        .await
+                        .expect("reopen durable table");
+                        assert_eq!(keyed_rows(&ctx, &reopened).await, before_reopen);
+                        assert_eq!(
+                            keyed_count_sql(&ctx, &reopened).await,
+                            i64::try_from(before_reopen.len()).expect("row count fits i64")
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn unkeyed_stream_publish_interval_publishes_before_stream_end() {
+        assert_segment_visibility(false).await;
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn keyed_append_waits_for_stream_end() {
+        assert_segment_visibility(true).await;
+    }
+
+    async fn assert_segment_visibility(keyed: bool) {
         let ctx = SessionContext::new();
         let temp_dir = tempfile::tempdir().expect("temp dir");
         let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("path"));
@@ -623,10 +890,13 @@ mod tests {
         let options = CreateTableOptions {
             table_name: "seg_pub".to_string(),
             schema: Arc::clone(&schema),
-            primary_key: vec!["id".to_string()],
-            on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
-                "id".to_string(),
-            ]))),
+            primary_key: if keyed {
+                vec!["id".to_string()]
+            } else {
+                vec![]
+            },
+            on_conflict: keyed
+                .then(|| OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()]))),
             base_path: data_dir,
             partition_column: None,
             vortex_config,
@@ -636,11 +906,24 @@ mod tests {
             .create(options)
             .await
             .expect("table created");
+        // Exercise append validation against a stored row.
+        append_rows(
+            &provider,
+            &sink_context,
+            &schema,
+            &ctx,
+            vec![int64_batch(&schema, vec![100])],
+        )
+        .await
+        .expect("seed");
 
+        let first_consumed = Arc::new(Notify::new());
+        let consumed_for_stream = Arc::clone(&first_consumed);
         let release_second = Arc::new(Notify::new());
         let release_for_stream = Arc::clone(&release_second);
         let stream_schema = Arc::clone(&schema);
         let batches = futures::stream::unfold(0_i64, move |i| {
+            let consumed = Arc::clone(&consumed_for_stream);
             let release = Arc::clone(&release_for_stream);
             let schema = Arc::clone(&stream_schema);
             async move {
@@ -654,8 +937,7 @@ mod tests {
                         Some((Ok(batch), 1))
                     }
                     1 => {
-                        // Hold the stream open until the test observes the
-                        // first segment's rows.
+                        consumed.notify_one();
                         release.notified().await;
                         let batch = RecordBatch::try_new(
                             Arc::clone(&schema),
@@ -679,18 +961,32 @@ mod tests {
         let task_ctx = ctx.task_ctx();
         let write = tokio::spawn(async move { sink.write_all(stream, &task_ctx).await });
 
-        // Rows from the first batch must become visible while the stream is
-        // still open (the second batch is gated on `release_second`).
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
-        loop {
-            if visible_rows(&ctx, &provider).await == 2 {
-                break;
-            }
-            assert!(
-                std::time::Instant::now() < deadline,
-                "first segment was not published while the stream was open"
+        tokio::time::timeout(
+            std::time::Duration::from_secs(15),
+            first_consumed.notified(),
+        )
+        .await
+        .expect("the sink consumed the first input batch");
+        if keyed {
+            tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+            assert_eq!(
+                visible_rows(&ctx, &provider).await,
+                1,
+                "only prior data is visible"
             );
-            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            assert!(!write.is_finished(), "the statement is still reading input");
+        } else {
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                if visible_rows(&ctx, &provider).await == 3 {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "first segment was not published while the stream was open"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            }
         }
 
         release_second.notify_one();
@@ -698,7 +994,7 @@ mod tests {
         assert_eq!(written, 3, "all rows accounted across segments");
         assert_eq!(
             visible_rows(&ctx, &provider).await,
-            3,
+            4,
             "all rows visible after stream end"
         );
     }
