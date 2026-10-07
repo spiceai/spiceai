@@ -646,28 +646,18 @@ fn spice_request_context_from_http_parts(
     Some(ctx)
 }
 
-/// Fail-closed context used when MCP `tools/call` cannot recover an
-/// authenticated principal from the HTTP request Parts.
+/// The error for a `tools/call` whose authenticated principal cannot be
+/// recovered from the HTTP request Parts.
 ///
 /// `/v1/mcp` is gated by `require_auth_configured`, so reaching the handler
-/// without a principal means propagation failed (e.g. the rmcp session worker
-/// dropped request extensions). Treating that as auth-disabled would allow
-/// writes — the privilege-escalation bug this module fixes. Bind a synthetic
-/// read-only principal so write tools reject while read tools still run.
-fn mcp_fail_closed_read_only_context() -> Arc<SpiceRequestContext> {
-    use spicepod::component::runtime::ApiKey;
-
-    let ctx = Arc::new(SpiceRequestContext::builder(Protocol::Http).build());
-    let principal: AuthPrincipalRef = Arc::new(ApiKey::ReadOnly {
-        key: String::from("__mcp_principal_unavailable__"),
-    });
-    if let Err(err) = ctx.set_auth_principal(principal) {
-        tracing::warn!(
-            %err,
-            "Failed to bind fail-closed read-only principal for MCP tool call"
-        );
-    }
-    ctx
+/// without a principal means the request's identity did not reach the rmcp
+/// worker. The call is refused rather than run: with no principal the tool
+/// would run as if auth were disabled (writes allowed), and under a stand-in
+/// identity every such caller would share that identity's cache namespace.
+fn missing_principal_refusal(tool_name: &str) -> String {
+    format!(
+        "Failed to run MCP tool '{tool_name}': the credentials on its `/v1/mcp` request could not be resolved, so the call was refused and the tool did not run. Retry the request, and report it at https://github.com/spiceai/spiceai/issues if it keeps failing. See https://spiceai.org/docs/api/auth"
+    )
 }
 
 impl RuntimeServer {
@@ -817,22 +807,19 @@ impl ServerHandler for RuntimeServer {
         let tool_name = request.name.clone().into_owned();
         let arguments = request.arguments.clone();
         Box::pin(async move {
-            let run = self.call_tool_with_auth(request, tool_name.clone(), arguments);
-            let spice_ctx = spice_request_context_from_mcp(&context);
-            match spice_ctx.filter(|ctx| AuthRequestContext::auth_principal(ctx.as_ref()).is_some())
-            {
-                Some(ctx) => ctx.scope(run).await,
-                None => {
-                    // `/v1/mcp` requires `runtime.auth`. Missing principal means
-                    // propagation failed — fail closed as read-only, never as
-                    // auth-disabled (writes allowed).
-                    tracing::warn!(
-                        tool = %tool_name,
-                        "MCP tools/call for '{tool_name}' had no authenticated principal; treating this call as read-only so writes are refused. Retry with a valid API key (use a ':rw' key for writes). See https://spiceai.org/docs/api/auth and https://spiceai.org/docs/reference/runtime#auth"
-                    );
-                    mcp_fail_closed_read_only_context().scope(run).await
-                }
-            }
+            let spice_ctx = spice_request_context_from_mcp(&context)
+                .filter(|ctx| AuthRequestContext::auth_principal(ctx.as_ref()).is_some());
+            let Some(spice_ctx) = spice_ctx else {
+                // `/v1/mcp` requires `runtime.auth`, so a missing principal means
+                // the request's identity did not reach this worker. Refuse the
+                // call; see `missing_principal_refusal`.
+                let message = missing_principal_refusal(&tool_name);
+                tracing::error!(tool = %tool_name, "{message}");
+                return Err(McpError::internal_error(message, None));
+            };
+            spice_ctx
+                .scope(self.call_tool_with_auth(request, tool_name, arguments))
+                .await
         })
     }
 
@@ -4467,57 +4454,52 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn mcp_tools_call_without_principal_fails_closed_read_only() {
-        // /v1/mcp requires `runtime.auth` (`require_auth_configured`). Missing
-        // principal on Parts must not look like auth-disabled (writable).
-        let service = mcp_http_service(principal_probe_server());
-        let (status, json) =
-            post_tools_call_with_spice_ctx(&service, "principal_probe", None).await;
-        assert_eq!(status, http::StatusCode::OK, "unexpected status: {json}");
-        let payload: Value =
-            serde_json::from_str(&tool_result_text(&json)).expect("tool payload json");
+    /// Asserts that a `tools/call` of `tool` was refused for having no principal,
+    /// so the tool never ran.
+    fn assert_missing_principal_refusal(json: &Value, tool: &str) {
         assert_eq!(
-            payload.get("read_only"),
-            Some(&Value::Bool(true)),
-            "missing principal on MCP tools/call must fail closed as read-only; got {payload} from {json}"
+            json.pointer("/error/code").and_then(Value::as_i64),
+            Some(-32603),
+            "a tools/call without a principal must be refused; got {json}"
+        );
+        assert_eq!(
+            json.pointer("/error/message").and_then(Value::as_str),
+            Some(missing_principal_refusal(tool).as_str()),
+            "unexpected refusal; got {json}"
+        );
+    }
+
+    #[test]
+    fn missing_principal_refusal_names_the_tool_and_the_fix() {
+        assert_eq!(
+            missing_principal_refusal("sql"),
+            "Failed to run MCP tool 'sql': the credentials on its `/v1/mcp` request could not be resolved, so the call was refused and the tool did not run. Retry the request, and report it at https://github.com/spiceai/spiceai/issues if it keeps failing. See https://spiceai.org/docs/api/auth"
         );
     }
 
     #[tokio::test]
-    async fn mcp_tools_call_without_principal_rejects_writes() {
+    async fn mcp_tools_call_without_principal_is_refused() {
+        // /v1/mcp requires `runtime.auth` (`require_auth_configured`). A call with
+        // no principal on its Parts must run neither as auth-disabled (writable)
+        // nor under a stand-in identity: neither tool may run.
         let service = mcp_http_service(principal_probe_server());
-        let (status, json) = post_tools_call_with_spice_ctx(&service, "write_gated", None).await;
-        assert_eq!(
-            status,
-            http::StatusCode::OK,
-            "MCP returns 200 with error payload: {json}"
-        );
-        let is_error = json.pointer("/result/isError").and_then(Value::as_bool) == Some(true)
-            || json.get("error").is_some();
-        let text = json.to_string();
-        assert!(
-            is_error && text.contains("read-only"),
-            "missing principal must reject write_gated; got {json}"
-        );
+        for tool in ["principal_probe", "write_gated"] {
+            let (status, json) = post_tools_call_with_spice_ctx(&service, tool, None).await;
+            assert_eq!(status, http::StatusCode::OK, "unexpected status: {json}");
+            assert_missing_principal_refusal(&json, tool);
+        }
     }
 
     #[tokio::test]
-    async fn mcp_tools_call_context_without_principal_fails_closed() {
+    async fn mcp_tools_call_context_without_principal_is_refused() {
         // Concrete RequestContext present but no auth principal (auth layer
-        // skipped / principal never set) — still fail closed for MCP.
+        // skipped / principal never set): refused the same way.
         let service = mcp_http_service(principal_probe_server());
         let ctx = Arc::new(SpiceRequestContext::builder(Protocol::Http).build());
         let (status, json) =
             post_tools_call_with_spice_ctx(&service, "principal_probe", Some(ctx)).await;
         assert_eq!(status, http::StatusCode::OK, "unexpected status: {json}");
-        let payload: Value =
-            serde_json::from_str(&tool_result_text(&json)).expect("tool payload json");
-        assert_eq!(
-            payload.get("read_only"),
-            Some(&Value::Bool(true)),
-            "RequestContext without principal must fail closed as read-only; got {payload}"
-        );
+        assert_missing_principal_refusal(&json, "principal_probe");
     }
 
     #[tokio::test]
