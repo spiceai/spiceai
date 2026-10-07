@@ -229,11 +229,11 @@ async fn test_single_upsert_impl(
 }
 
 // =============================================================================
-// Test 3: DoNothing Conflict Behavior (Drop Conflicts)
+// Test 3: A table created with DoNothing keeps the last version too
 // =============================================================================
-test_with_backends!(test_do_nothing_drops_conflicts_impl);
+test_with_backends!(test_do_nothing_table_upserts_conflicts_impl);
 
-async fn test_do_nothing_drops_conflicts_impl(
+async fn test_do_nothing_table_upserts_conflicts_impl(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let schema = Arc::new(Schema::new(vec![
@@ -270,7 +270,8 @@ async fn test_do_nothing_drops_conflicts_impl(
         .collect()
         .await?;
 
-    // Try to insert conflicting row - should be dropped (DoNothing)
+    // A conflicting row replaces the stored one: a table with a primary key keeps
+    // the last version of each key, whatever `on_conflict` it was created with.
     ctx.sql("INSERT INTO do_nothing VALUES (1, 999), (3, 300)")
         .await?
         .collect()
@@ -285,7 +286,7 @@ async fn test_do_nothing_drops_conflicts_impl(
     assert_eq!(
         results[0].num_rows(),
         3,
-        "Should have 3 rows (id=1 conflict dropped, id=3 inserted)"
+        "Should have 3 rows (id=1 replaced, id=3 inserted)"
     );
 
     let values = results[0]
@@ -294,11 +295,10 @@ async fn test_do_nothing_drops_conflicts_impl(
         .downcast_ref::<Int64Array>()
         .expect("value column");
 
-    // id=1 should retain original value (conflict dropped)
     assert_eq!(
         values.value(0),
-        100,
-        "id=1 should retain original value 100"
+        999,
+        "id=1 should hold the incoming value 999"
     );
     assert_eq!(values.value(1), 200, "id=2 should be 200");
     assert_eq!(values.value(2), 300, "id=3 should be 300");

@@ -78,6 +78,7 @@ pub mod refresh_task_runner;
 pub mod retention;
 pub(crate) mod sink;
 pub mod snapshots;
+pub(crate) mod superseded;
 pub mod synchronized_table;
 pub mod timestamp_metrics_utils;
 pub mod write;
@@ -104,6 +105,12 @@ pub enum Error {
         format_datafusion_error(source)
     ))]
     FailedToRefreshDataset { source: DataFusionError },
+
+    /// A refresh the dataset's own configuration refused to apply. The message is the
+    /// complete cause, with its fix and docs link, so it is shown without the generic
+    /// data-connector advice `FailedToRefreshDataset` adds.
+    #[snafu(display("{message}"))]
+    RefreshNotApplied { message: String },
 
     #[snafu(display(
         "Failed to scan the dataset from the data connector: {}. Ensure the dataset configuration is valid, and try again.",
@@ -452,6 +459,10 @@ pub struct Builder {
     caching_max_size_bytes: Option<u64>,
     caching_max_items: Option<u64>,
     resource_monitor: Option<runtime_resources::ResourceMonitor>,
+    /// The runtime's query `RuntimeEnv`: its memory pool bounds what a refresh holds in
+    /// memory, and its disk manager is where the refresh spills. `None` uses an unbounded
+    /// default.
+    query_runtime_env: Option<Arc<datafusion::execution::runtime_env::RuntimeEnv>>,
     bootstrap_status: BootstrapStatus,
     /// Whether the acceleration uses S3 Express One Zone storage.
     is_s3_express_acceleration: bool,
@@ -511,6 +522,7 @@ impl Builder {
             caching_max_size_bytes: None,
             caching_max_items: None,
             resource_monitor: None,
+            query_runtime_env: None,
             bootstrap_status: BootstrapStatus::none(),
             acceleration_layout: None,
             is_s3_express_acceleration: false,
@@ -588,7 +600,7 @@ impl Builder {
     }
 
     /// Set to only write to the accelerator (not replicate to federated source).
-    /// This is used when `on_conflict` is configured - writes go only to the accelerator.
+    /// This is used for a source that discards writes (`sink`).
     pub fn write_to_accelerator_only(&mut self) -> &mut Self {
         self.write_to_accelerator_only = true;
         self
@@ -646,6 +658,16 @@ impl Builder {
         monitor: runtime_resources::ResourceMonitor,
     ) -> &mut Self {
         self.resource_monitor = Some(monitor);
+        self
+    }
+
+    /// Bound what a refresh holds in memory by the runtime's query memory pool, and spill
+    /// to its disk manager.
+    pub fn with_query_runtime_env(
+        &mut self,
+        runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+    ) -> &mut Self {
+        self.query_runtime_env = Some(runtime_env);
         self
     }
 
@@ -1013,6 +1035,10 @@ impl Builder {
 
         if let Some(ref resource_monitor) = self.resource_monitor {
             refresher.with_resource_monitor(resource_monitor.clone());
+        }
+
+        if let Some(ref runtime_env) = self.query_runtime_env {
+            refresher.with_query_runtime_env(Arc::clone(runtime_env));
         }
 
         refresher.with_s3_express_acceleration(self.is_s3_express_acceleration);
@@ -1462,8 +1488,8 @@ impl AcceleratedTable {
         self.write_mode.is_dual_write()
     }
 
-    /// Whether writes are directed to the local accelerator only (the
-    /// `on_conflict` / read-only-source case). Conditional-commit transactions
+    /// Whether writes are directed to the local accelerator only (a source
+    /// that discards writes, `sink`). Conditional-commit transactions
     /// require this: their staging + atomic publish live in the accelerator
     /// write path, which the write-through/write-back/dual-write modes bypass.
     #[must_use]
@@ -1990,7 +2016,14 @@ impl AcceleratedTable {
     /// accelerator accepts the write, and which refuses a write outside a
     /// transaction at execute time. Stamping there too would move the marker
     /// for a write its own validation went on to refuse.
-    fn guard_accelerator_write(&self, plan: Arc<dyn ExecutionPlan>) -> Arc<dyn ExecutionPlan> {
+    ///
+    /// `superseded` holds the rows the write does not keep, recorded with the
+    /// timestamp.
+    fn guard_accelerator_write(
+        &self,
+        plan: Arc<dyn ExecutionPlan>,
+        superseded: Option<Arc<util::session_state::SupersededRows>>,
+    ) -> Arc<dyn ExecutionPlan> {
         if !self.write_mode.reaches_accelerator() {
             return plan;
         }
@@ -2004,6 +2037,7 @@ impl AcceleratedTable {
             plan,
             Arc::clone(&self.accelerator_write_mutex),
             last_updated_at,
+            superseded,
             self.dataset_name.clone(),
         ))
     }
@@ -2164,13 +2198,27 @@ impl TableLayer for AcceleratedTable {
 
         self.stamp_unguarded_write();
 
+        let mut superseded = None;
         let plan = match &self.write_mode {
             WriteMode::AcceleratorOnly => {
-                // When on_conflict is configured, writes go only to the accelerator
-                // (the federated source may not support writes, e.g., file connector).
+                // Writes go only to the accelerator: its source discards them (`sink`).
+                // The accelerator counts the rows the statement does not keep into
+                // the session it runs on; they are recorded once the write completes.
+                let counting = state
+                    .as_any()
+                    .downcast_ref::<datafusion::execution::SessionState>()
+                    .map(|state| {
+                        let rows = Arc::new(util::session_state::SupersededRows::default());
+                        superseded = Some(Arc::clone(&rows));
+                        util::session_state::with_superseded_rows(state, rows)
+                    });
+                let session: &dyn Session = match &counting {
+                    Some(counting) => counting,
+                    None => state,
+                };
                 let accelerated_insert_plan = self
                     .accelerator
-                    .insert_into(state, input, overwrite)
+                    .insert_into(session, input, overwrite)
                     .await?;
                 self.refresher().set_initial_load_completed(true);
                 accelerated_insert_plan
@@ -2207,7 +2255,7 @@ impl TableLayer for AcceleratedTable {
             )?,
         };
 
-        Ok(self.guard_accelerator_write(plan))
+        Ok(self.guard_accelerator_write(plan, superseded))
     }
 
     async fn delete_from(
@@ -2254,7 +2302,7 @@ impl TableLayer for AcceleratedTable {
             }
         };
 
-        Ok(self.guard_accelerator_write(plan))
+        Ok(self.guard_accelerator_write(plan, None))
     }
 
     async fn update(
@@ -2307,7 +2355,7 @@ impl TableLayer for AcceleratedTable {
             }
         };
 
-        Ok(self.guard_accelerator_write(plan))
+        Ok(self.guard_accelerator_write(plan, None))
     }
 
     async fn truncate(
@@ -2347,7 +2395,7 @@ impl TableLayer for AcceleratedTable {
             }
         };
 
-        Ok(self.guard_accelerator_write(plan))
+        Ok(self.guard_accelerator_write(plan, None))
     }
 
     async fn scan_with_args<'a>(

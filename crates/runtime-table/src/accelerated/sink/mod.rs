@@ -29,6 +29,33 @@ use super::synchronized_table::SynchronizedTable;
 pub(crate) mod multi;
 pub(crate) mod table;
 
+/// What a refresh's write carries to the dataset's own table.
+#[derive(Debug, Default)]
+pub struct RefreshWrite {
+    /// Counts the rows the table receives but does not keep.
+    pub superseded: Option<Arc<util::session_state::SupersededRows>>,
+    /// Orders the copies of a key the write repeats by version, for
+    /// a refresh that orders versions by `time_column`.
+    pub row_versions: Option<Arc<dyn util::session_state::RowVersions>>,
+}
+
+impl RefreshWrite {
+    /// `state` carrying this write to the table it runs against.
+    pub(crate) fn state(
+        &self,
+        state: &datafusion::execution::SessionState,
+    ) -> datafusion::execution::SessionState {
+        let state = match &self.superseded {
+            Some(rows) => util::session_state::with_superseded_rows(state, Arc::clone(rows)),
+            None => state.clone(),
+        };
+        match &self.row_versions {
+            Some(versions) => util::session_state::with_row_versions(&state, Arc::clone(versions)),
+            None => state,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub enum AccelerationSink {
     Table(TableSink),
@@ -89,14 +116,23 @@ impl AccelerationSink {
         }
     }
 
+    /// Write `record_batch_stream` to the acceleration, carrying `write` to the
+    /// dataset's own table.
     pub async fn insert_into(
         &self,
         record_batch_stream: Pin<Box<dyn RecordBatchStream + Send>>,
         overwrite: InsertOp,
+        write: &RefreshWrite,
     ) -> Result<(), RetryError<crate::accelerated::Error>> {
         match self {
-            AccelerationSink::Table(sink) => sink.insert_into(record_batch_stream, overwrite).await,
-            AccelerationSink::Multi(sink) => sink.insert_into(record_batch_stream, overwrite).await,
+            AccelerationSink::Table(sink) => {
+                sink.insert_into(record_batch_stream, overwrite, write)
+                    .await
+            }
+            AccelerationSink::Multi(sink) => {
+                sink.insert_into(record_batch_stream, overwrite, write)
+                    .await
+            }
         }
     }
 }
