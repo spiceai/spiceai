@@ -59,7 +59,7 @@ fn responses_support_gate(model_id: &str, support: &ResponsesApiSupport) -> Opti
         ResponsesApiSupport::EvaluateOnly { provider } => {
             Some(openai_error_to_response(OpenAIError::ApiError(ApiError {
                 message: format!(
-                    "Model '{model_id}' uses provider '{provider}' which is evaluation-only and does not support the OpenAI Responses API or chat completions. Use POST /v1/evaluate instead."
+                    "Model '{model_id}' uses provider '{provider}' which is a decision model and does not support the OpenAI Responses API or chat completions. Use POST /v1/decisions, or the SQL decision functions such as ai_if, instead."
                 ),
                 r#type: Some("invalid_request_error".to_string()),
                 param: Some("model".to_string()),
@@ -537,7 +537,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn evaluate_only_provider_directs_to_evaluate() {
+    async fn evaluate_only_provider_directs_to_decisions() {
         let response = responses_support_gate(
             "jev_model",
             &ResponsesApiSupport::EvaluateOnly {
@@ -560,8 +560,8 @@ mod tests {
         assert_eq!(body_json["param"].as_str(), Some("model"));
         let message = body_json["message"].as_str().expect("message");
         assert!(
-            message.contains("/v1/evaluate"),
-            "message should direct callers to /v1/evaluate: {message}"
+            message.contains("/v1/decisions"),
+            "message should direct callers to /v1/decisions: {message}"
         );
         assert!(
             !message.contains("/v1/chat/completions"),

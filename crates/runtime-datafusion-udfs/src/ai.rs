@@ -203,6 +203,12 @@ impl ScalarUDFImpl for Ai {
 
 #[async_trait]
 impl AsyncScalarUDFImpl for Ai {
+    /// `DataFusion` otherwise hands an async function whole input batches (8192 rows by
+    /// default), which the batch cap below would reject.
+    fn ideal_batch_size(&self) -> Option<usize> {
+        Some(MAX_BATCH_SIZE)
+    }
+
     async fn invoke_async_with_args(
         &self,
         args: ScalarFunctionArgs,

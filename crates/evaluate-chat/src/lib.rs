@@ -17,7 +17,7 @@ limitations under the License.
 //! Answers System One evaluations with any chat model.
 //!
 //! [`ChatEvaluator`] implements [`Evaluate`] on top of a [`Chat`] model, so
-//! `POST /v1/evaluate` works with every chat model a Spicepod configures, not only
+//! `POST /v1/decisions` and the SQL decision functions work with every chat model a Spicepod configures, not only
 //! System One models such as `TypeSafe` Jev. Each evaluation:
 //!
 //! 1. builds a JSON schema from the typed questions (see `schema`), pinning every
@@ -315,6 +315,11 @@ impl Evaluate for ChatEvaluator {
                 source: Box::new(e),
             })
     }
+
+    /// A chat model answers through a prompt; it is not a decision model.
+    fn is_decision_model(&self) -> bool {
+        false
+    }
 }
 
 /// Maps a chat model's failure onto the evaluation error with the same meaning: a
@@ -324,7 +329,7 @@ impl Evaluate for ChatEvaluator {
 ///
 /// Discriminators live in `code` (OpenAI-shaped) or `type` (Anthropic type-only
 /// `ApiError`s such as `authentication_error` / `permission_error` /
-/// `rate_limit_error`). Both are matched so `/v1/evaluate` can return 401/403/429
+/// `rate_limit_error`). Both are matched so `/v1/decisions` can return 401/403/429
 /// instead of 500.
 fn chat_error(model: &str, error: OpenAIError) -> Error {
     let model = model.to_string();

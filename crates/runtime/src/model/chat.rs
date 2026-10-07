@@ -71,7 +71,7 @@ use runtime_tools::options::SpiceToolsOptions;
 
 pub type LLMChatCompletionsModelStore = HashMap<String, Arc<dyn Chat>>;
 
-/// A loaded chat model, both as `/v1/chat/completions` serves it and as `/v1/evaluate`
+/// A loaded chat model, both as `/v1/chat/completions` serves it and as `/v1/decisions`
 /// uses it.
 pub struct LoadedChatModel {
     /// The model with the runtime tools its Spicepod `tools` param enables.
@@ -82,7 +82,7 @@ pub struct LoadedChatModel {
 }
 
 impl LoadedChatModel {
-    /// The evaluator `/v1/evaluate` uses for this model, which the Spicepod names `name`.
+    /// The evaluator decisions use for this model, which the Spicepod names `name`.
     ///
     /// It calls the model without runtime tools: an evaluation's `state` is untrusted
     /// input and must not be able to steer a tool call.

@@ -25,6 +25,7 @@ use governor::Quota;
 use runtime_rate_control::{JitterConfig, RateController};
 
 pub mod chat;
+pub mod decisions;
 pub mod embed;
 pub mod list_models;
 pub mod responses;

@@ -19,7 +19,7 @@ limitations under the License.
 //! An evaluation model takes unstructured `state` plus a map of typed
 //! `questions` and returns structured `answers` (noul / choice / score) with
 //! probabilities. Implemented by provider crates and by `evaluate-chat`, which
-//! answers through any chat model; called by the runtime's `POST /v1/evaluate`
+//! answers through any chat model; called by the runtime's `POST /v1/decisions` and SQL decision functions
 //! endpoint — which never names a provider. [`check_answers`] holds every
 //! implementation's answers to the same invariants.
 //!
@@ -37,6 +37,7 @@ use serde_json::{Map, Value};
 use snafu::Snafu;
 
 mod check;
+pub mod openai;
 
 pub use check::{check_answers, is_probability, probability_sum_tolerance};
 
@@ -397,7 +398,7 @@ fn nonempty_answer_map() -> utoipa::openapi::schema::Object {
     nonempty_map_of("Answer")
 }
 
-/// Request body for `POST /v1/evaluate` and provider System One calls.
+/// A System One evaluation request, as providers receive it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct EvaluateRequest {
@@ -405,9 +406,7 @@ pub struct EvaluateRequest {
     pub model: String,
     /// State for the model to evaluate: string, object, or array.
     pub state: EvaluateState,
-    /// Questions keyed by caller-selected identifiers. At least one is required; the
-    /// `/v1/evaluate` handler enforces that so an empty map returns the endpoint's
-    /// documented 400 body rather than an extractor rejection.
+    /// Questions keyed by caller-selected identifiers. At least one is required.
     #[schemars(extend("minProperties" = 1))]
     #[cfg_attr(feature = "openapi", schema(schema_with = nonempty_question_map))]
     pub questions: BTreeMap<String, Question>,
@@ -444,6 +443,9 @@ pub enum Answer {
         probabilities: BTreeMap<String, f64>,
         confidence: f64,
     },
+    /// The model declined to answer this question. Only a model that can refuse
+    /// reports it (an `OpenAI` decision model); the other answers in the response stand.
+    Refusal {},
 }
 
 /// Response body for evaluation: typed answers plus provider metadata.
@@ -474,6 +476,14 @@ pub trait Evaluate: Send + Sync + Debug {
     /// No default: a wrapper that inherited one would silently skip the check of the
     /// model it wraps, so every implementation says what its health is.
     async fn health(&self) -> Result<()>;
+
+    /// Whether this is a dedicated decision model — one trained to answer typed
+    /// questions, such as `TypeSafe` Jev or an `OpenAI` decision model — rather than a chat
+    /// model answering through a prompt.
+    ///
+    /// SQL decision functions prefer the only decision model when no model is named.
+    /// No default: a wrapper must report the kind of the model it wraps.
+    fn is_decision_model(&self) -> bool;
 }
 
 #[cfg(test)]

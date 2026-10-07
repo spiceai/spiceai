@@ -2,9 +2,9 @@
 
 [TypeSafe Jev](https://typesafe.ai/blog/introducing-system-one-models-and-jev) is a **System One evaluation model**, not a chat LLM. It takes unstructured `state` plus typed questions and returns structured answers (noul / choice / score) with calibrated probabilities.
 
-Chat completions (`POST /v1/chat/completions`) are **not supported**. Use `POST /v1/evaluate`.
+Chat completions (`POST /v1/chat/completions`) are **not supported**. Ask decisions in SQL (`ai_if`, `ai_classify`, `ai_score`, `ai_decide`, ...) or with `POST /v1/decisions`.
 
-Chat models can answer `POST /v1/evaluate` too, with uncalibrated probabilities. See [Evaluate API](evaluate.md).
+Chat models can answer decisions too, with uncalibrated probabilities. See [Decisions](decisions.md).
 
 ## Spicepod
 
@@ -31,21 +31,20 @@ Optional `typesafe_endpoint` overrides the base URL (default `https://api.typesa
 
 Runtime rate controls such as `max_concurrency` and `requests_per_minute_limit` are supported (provider defaults apply when unset).
 
-## Evaluate API
+## Decisions
+
+```sql
+SELECT id FROM tickets WHERE ai_if(body, 'Does this convey urgency?', model => 'jev');
+```
 
 ```bash
-curl -X POST http://localhost:8090/v1/evaluate \
+curl -X POST http://localhost:8090/v1/decisions \
   -H 'Content-Type: application/json' \
   -d '{
     "model": "jev",
-    "state": "Help! My payouts have been failing for 3 days.",
-    "questions": {
-      "is_urgent": {
-        "type": "noul",
-        "instructions": "Does this convey urgency?"
-      }
-    }
+    "input": "Help! My payouts have been failing for 3 days.",
+    "questions": [{"type": "predicate", "name": "urgent", "instructions": "Does this convey urgency?"}]
   }'
 ```
 
-`instructions` (and structured criteria descriptions) accept a TypeSafe `EntryType`: string, object, array, or null. See the [TypeSafe advanced structure docs](https://docs.typesafe.ai/primitives/advanced) and the [API reference](https://docs.typesafe.ai/api).
+In `ai_decide`, `instructions` and criteria descriptions accept a TypeSafe `EntryType`: string, object, array, or null. See the [TypeSafe advanced structure docs](https://docs.typesafe.ai/primitives/advanced) and the [API reference](https://docs.typesafe.ai/api).

@@ -123,7 +123,7 @@ pub enum Error {
     UnsupportedTaskForModel { from: String, task: String },
 
     #[snafu(display(
-        "Model '{model}' is an evaluation model and does not support chat completions. Use POST /v1/evaluate with `state` and typed `questions` instead. See: https://spiceai.org/docs/components/models"
+        "Model '{model}' is a decision model and does not support chat completions. Use POST /v1/decisions, or the SQL decision functions such as ai_if, instead. See: https://spiceai.org/docs/components/models"
     ))]
     EvaluateOnlyModel { model: String },
 
@@ -627,7 +627,7 @@ mod tests {
         }
         .to_string();
         assert!(message.contains("'jev'"), "{message}");
-        assert!(message.contains("POST /v1/evaluate"), "{message}");
+        assert!(message.contains("POST /v1/decisions"), "{message}");
         assert!(
             message.contains("does not support chat completions"),
             "{message}"

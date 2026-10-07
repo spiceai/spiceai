@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! System One evaluation model loader (`TypeSafe` Jev). Chat models get their
+//! Decision model loader (`TypeSafe` Jev, `OpenAI` decision models). Chat models get their
 //! evaluator from [`super::LoadedChatModel::evaluator`].
 
 #![expect(clippy::implicit_hasher)]
@@ -26,6 +26,7 @@ use std::time::Instant;
 use async_trait::async_trait;
 use llms::chat::Error as LlmError;
 use llms::evaluate::{Evaluate, EvaluateRequest, EvaluateResponse, Result as EvaluateResult};
+use llms::openai::decisions::OpenAiDecisions;
 use llms::typesafe::TypeSafe;
 use opentelemetry::{Key, KeyValue, Value};
 use runtime_rate_control::RateController;
@@ -36,6 +37,7 @@ use tokio::sync::RwLock;
 
 use super::chat::typed_params;
 use super::metrics::{handle_metrics, handle_token_metrics};
+use super::params::openai::OpenAiModelParams;
 use super::params::typesafe::TypeSafeModelParams;
 use super::rate_limit::build_model_rate_controller;
 
@@ -43,8 +45,8 @@ pub use llms::evaluate::EvaluateModelStore;
 
 /// Construct an [`Evaluate`] model from a Spicepod model component.
 ///
-/// Only [`ModelSource::TypeSafe`] is supported today. Other sources should use
-/// chat / embeddings / responses loaders.
+/// Supports decision models: [`ModelSource::TypeSafe`] Jev and `OpenAI` decision models
+/// such as `gpt-6-luna`. Chat models answer decisions through their own evaluator.
 ///
 /// Returns the evaluation model and the rate controller that should also be
 /// registered in the runtime's model rate-controller map.
@@ -59,6 +61,7 @@ pub async fn try_to_evaluate_model(
 
     match source {
         ModelSource::TypeSafe => typesafe(component, params, secrets).await,
+        ModelSource::OpenAi => openai_decisions(component, params, secrets).await,
         other => Err(LlmError::UnsupportedTaskForModel {
             from: other.to_string(),
             task: "evaluate".to_string(),
@@ -111,6 +114,40 @@ async fn typesafe(
     Ok((Arc::new(metered) as Arc<dyn Evaluate>, rate_controller))
 }
 
+/// An `OpenAI` decision model (`from: openai:gpt-6-luna`), answering through `OpenAI`'s
+/// Decisions API with the same key, endpoint and organization params as `OpenAI` chat
+/// models.
+async fn openai_decisions(
+    component: &Model,
+    params: &HashMap<String, secrecy::SecretString>,
+    secrets: &Arc<RwLock<Secrets>>,
+) -> Result<(Arc<dyn Evaluate>, Arc<RateController>), LlmError> {
+    let typed: OpenAiModelParams =
+        typed_params(component, params, ModelSource::OpenAi, secrets).await?;
+    let api_key = typed
+        .api_key
+        .as_ref()
+        .map(|key| key.expose_secret().to_string())
+        .ok_or_else(|| LlmError::FailedToLoadModel {
+            source: "No OpenAI API key provided. Set the `openai_api_key` param, or export OPENAI_API_KEY. See: https://spiceai.org/docs/components/models".into(),
+        })?;
+    let model_id = component.get_model_id().unwrap_or_default();
+    let rate_controller = build_model_rate_controller(component, params);
+    let client =
+        OpenAiDecisions::try_new(component.name.clone(), model_id, typed.endpoint, api_key)
+            .map_err(|e| LlmError::FailedToLoadModel {
+                source: e.to_string().into(),
+            })?
+            .with_organization(typed.org_id, typed.project_id)
+            .with_rate_controller(Arc::clone(&rate_controller));
+
+    let metered = Metered {
+        name: component.name.clone(),
+        model: Arc::new(client),
+    };
+    Ok((Arc::new(metered) as Arc<dyn Evaluate>, rate_controller))
+}
+
 /// A System One model recorded in the LLM request, failure, duration and token metrics.
 ///
 /// Evaluations are inference, so they belong in the same series as chat and responses.
@@ -148,10 +185,65 @@ impl Evaluate for Metered {
     async fn health(&self) -> EvaluateResult<()> {
         self.model.health().await
     }
+
+    fn is_decision_model(&self) -> bool {
+        self.model.is_decision_model()
+    }
 }
 
-/// Whether this Spicepod model is an evaluation-only (non-chat) source.
+/// A chat model's evaluator, gated by the model's runtime rate controller, so its
+/// decisions share the model's `max_concurrency` and `requests_per_minute_limit` with
+/// `ai()`. A decision model's provider takes its own permit and is not wrapped.
+#[must_use]
+pub fn rate_limited(
+    name: &str,
+    model: Arc<dyn Evaluate>,
+    rate_controller: Arc<RateController>,
+) -> Arc<dyn Evaluate> {
+    Arc::new(RateLimited {
+        name: name.to_string(),
+        model,
+        rate_controller,
+    })
+}
+
+#[derive(Debug)]
+struct RateLimited {
+    name: String,
+    model: Arc<dyn Evaluate>,
+    rate_controller: Arc<RateController>,
+}
+
+#[async_trait]
+impl Evaluate for RateLimited {
+    async fn evaluate(&self, request: EvaluateRequest) -> EvaluateResult<EvaluateResponse> {
+        let _permit = self.rate_controller.acquire().await.map_err(|e| {
+            llms::evaluate::Error::RatePermitFailed {
+                model: self.name.clone(),
+                source: Box::new(e),
+            }
+        })?;
+        self.model.evaluate(request).await
+    }
+
+    async fn health(&self) -> EvaluateResult<()> {
+        self.model.health().await
+    }
+
+    fn is_decision_model(&self) -> bool {
+        self.model.is_decision_model()
+    }
+}
+
+/// Whether this Spicepod model is a decision model, which answers decisions and not
+/// chat: `TypeSafe` Jev, or an `OpenAI` decision model such as `gpt-6-luna`.
 #[must_use]
 pub fn is_evaluate_only(component: &Model) -> bool {
-    matches!(component.get_source(), Some(ModelSource::TypeSafe))
+    match component.get_source() {
+        Some(ModelSource::TypeSafe) => true,
+        Some(ModelSource::OpenAi) => component
+            .get_model_id()
+            .is_some_and(|id| llms::openai::decisions::is_decision_model_id(&id)),
+        _ => false,
+    }
 }

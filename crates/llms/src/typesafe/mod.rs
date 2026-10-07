@@ -242,6 +242,11 @@ impl Evaluate for TypeSafe {
         }
     }
 
+    /// Jev is a System One model: a decision model, not a chat model.
+    fn is_decision_model(&self) -> bool {
+        true
+    }
+
     async fn health(&self) -> Result<()> {
         let response = self
             .client
@@ -1310,7 +1315,7 @@ mod tests {
     }
 
     /// A refused TCP connect is a transport outage, not an unclassified provider
-    /// failure: `/v1/evaluate` maps `ServiceUnavailable` to HTTP 503.
+    /// failure: `/v1/decisions` maps `ServiceUnavailable` to HTTP 503.
     #[tokio::test]
     async fn evaluate_maps_transport_failure_to_unavailable() {
         let client = TypeSafe::try_new("jev", Some("jev-latest"), "key")
