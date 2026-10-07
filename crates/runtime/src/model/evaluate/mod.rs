@@ -191,50 +191,6 @@ impl Evaluate for Metered {
     }
 }
 
-/// A chat model's evaluator, gated by the model's runtime rate controller, so its
-/// decisions share the model's `max_concurrency` and `requests_per_minute_limit` with
-/// `ai()`. A decision model's provider takes its own permit and is not wrapped.
-#[must_use]
-pub fn rate_limited(
-    name: &str,
-    model: Arc<dyn Evaluate>,
-    rate_controller: Arc<RateController>,
-) -> Arc<dyn Evaluate> {
-    Arc::new(RateLimited {
-        name: name.to_string(),
-        model,
-        rate_controller,
-    })
-}
-
-#[derive(Debug)]
-struct RateLimited {
-    name: String,
-    model: Arc<dyn Evaluate>,
-    rate_controller: Arc<RateController>,
-}
-
-#[async_trait]
-impl Evaluate for RateLimited {
-    async fn evaluate(&self, request: EvaluateRequest) -> EvaluateResult<EvaluateResponse> {
-        let _permit = self.rate_controller.acquire().await.map_err(|e| {
-            llms::evaluate::Error::RatePermitFailed {
-                model: self.name.clone(),
-                source: Box::new(e),
-            }
-        })?;
-        self.model.evaluate(request).await
-    }
-
-    async fn health(&self) -> EvaluateResult<()> {
-        self.model.health().await
-    }
-
-    fn is_decision_model(&self) -> bool {
-        self.model.is_decision_model()
-    }
-}
-
 /// Whether this Spicepod model is a decision model, which answers decisions and not
 /// chat: `TypeSafe` Jev, or an `OpenAI` decision model such as `gpt-6-luna`.
 #[must_use]

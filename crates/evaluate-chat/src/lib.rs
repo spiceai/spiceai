@@ -54,6 +54,7 @@ use chat_api::Chat;
 use evaluate_api::{
     Error, Evaluate, EvaluateRequest, EvaluateResponse, Question, Result, Usage, check_answers,
 };
+use runtime_rate_control::{Permit, RateController};
 
 mod decode;
 mod prompt;
@@ -122,6 +123,9 @@ pub struct ChatEvaluator {
     name: String,
     chat: Arc<dyn Chat>,
     options: ChatEvaluatorOptions,
+    /// Taken for every request sent to the chat model, a corrective retry included, so
+    /// the model's `max_concurrency` and `requests_per_minute_limit` count each one.
+    rate_controller: Option<Arc<RateController>>,
 }
 
 impl Debug for ChatEvaluator {
@@ -141,13 +145,37 @@ impl ChatEvaluator {
             name: name.into(),
             chat,
             options: ChatEvaluatorOptions::default(),
+            rate_controller: None,
         }
+    }
+
+    /// Takes a permit from `rate_controller` for every request sent to the chat model.
+    #[must_use]
+    pub fn with_rate_controller(mut self, rate_controller: Arc<RateController>) -> Self {
+        self.rate_controller = Some(rate_controller);
+        self
     }
 
     #[must_use]
     pub fn with_options(mut self, options: ChatEvaluatorOptions) -> Self {
         self.options = options;
         self
+    }
+
+    /// Waits for the permit to send one request to the chat model; `None` when the
+    /// evaluator has no rate controller.
+    async fn rate_permit(&self) -> Result<Option<Permit>> {
+        let Some(rate_controller) = &self.rate_controller else {
+            return Ok(None);
+        };
+        rate_controller
+            .acquire()
+            .await
+            .map(Some)
+            .map_err(|e| Error::RatePermitFailed {
+                model: self.name.clone(),
+                source: Box::new(e),
+            })
     }
 
     fn ensure_answerable(&self, request: &EvaluateRequest) -> Result<()> {
@@ -248,6 +276,7 @@ impl Evaluate for ChatEvaluator {
         let mut usage = Some(Usage::default());
         let mut corrective_retries = 0;
         loop {
+            let _permit = self.rate_permit().await?;
             let response = self
                 .chat
                 .chat_request(CreateChatCompletionRequest {
@@ -577,6 +606,28 @@ mod tests {
             "The previous response did not match the required schema: question 'team': the probabilities sum to 1.200, but they must sum to 1\n\
              Return a single JSON object that matches the schema exactly, with no other text."
         );
+    }
+
+    /// A corrective retry is a second request to the provider, so it takes a second
+    /// permit and counts against `requests_per_minute_limit`.
+    #[tokio::test]
+    async fn every_request_takes_a_rate_permit() {
+        let malformed = json!({"answers": {
+            "is_urgent": 0.9,
+            "team": {"billing": 0.9, "technical": 0.3},
+            "tone": {"0": 0.1, "1": 0.6, "2": 0.3}
+        }});
+        let chat = ScriptedChat::new([Ok(reply(&malformed)), Ok(reply(&valid_answers()))]);
+        let rate_controller = RateController::builder().build();
+        let evaluator = evaluator(&chat).with_rate_controller(Arc::clone(&rate_controller));
+
+        evaluator
+            .evaluate(request())
+            .await
+            .expect("corrected evaluation");
+
+        assert_eq!(chat.requests().len(), 2);
+        assert_eq!(rate_controller.metrics().permits_acquired_total(), 2);
     }
 
     #[tokio::test]

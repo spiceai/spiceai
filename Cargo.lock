@@ -8377,6 +8377,7 @@ dependencies = [
  "chat-api",
  "evaluate-api",
  "insta",
+ "runtime-rate-control",
  "serde",
  "serde_json",
  "tokio",

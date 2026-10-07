@@ -30,6 +30,7 @@ async-openai.workspace = true
 async-trait.workspace = true
 chat-api = { path = "../chat-api" }
 evaluate-api = { path = "../evaluate-api" }
+runtime-rate-control = { path = "../runtime-rate-control" }
 serde.workspace = true
 serde_json.workspace = true
 
