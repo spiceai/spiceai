@@ -3063,11 +3063,13 @@ mod tests {
         if let Some(value) = param_header {
             builder = builder.header(format!("mcp-param-{param}"), value);
         }
-        let request = builder
-            .body(http_body_util::Full::new(bytes::Bytes::from(
-                body.to_string(),
-            )))
-            .expect("valid tools/call request");
+        let request = authenticated(
+            builder
+                .body(http_body_util::Full::new(bytes::Bytes::from(
+                    body.to_string(),
+                )))
+                .expect("valid tools/call request"),
+        );
         let response = service.handle(request).await;
         let status = response.status();
         let collected = http_body_util::BodyExt::collect(response.into_body())
@@ -3642,7 +3644,7 @@ mod tests {
                 body.to_string(),
             )))
             .expect("valid oversized tools/call request");
-        let response = service.handle(request).await;
+        let response = service.handle(authenticated(request)).await;
         let status = response.status();
         let collected = http_body_util::BodyExt::collect(response.into_body())
             .await
@@ -4062,11 +4064,13 @@ mod tests {
         if let Some(origin) = origin {
             builder = builder.header(http::header::ORIGIN, origin);
         }
-        let request = builder
-            .body(http_body_util::Full::new(bytes::Bytes::from(
-                body.to_string(),
-            )))
-            .expect("valid tools/call request");
+        let request = authenticated(
+            builder
+                .body(http_body_util::Full::new(bytes::Bytes::from(
+                    body.to_string(),
+                )))
+                .expect("valid tools/call request"),
+        );
         service.handle(request).await.status()
     }
 
@@ -4290,8 +4294,10 @@ mod tests {
         ctx
     }
 
-    fn http_parts_with_spice_ctx(ctx: Arc<SpiceRequestContext>) -> http::request::Parts {
-        let mut request = http::Request::new(());
+    /// Mirror HTTP `track_metrics` + `AuthLayer`: put the concrete context and its
+    /// principal on the request extensions, so rmcp injects them via Parts into
+    /// `call_tool`.
+    fn insert_spice_ctx<B>(request: &mut http::Request<B>, ctx: Arc<SpiceRequestContext>) {
         if let Some(principal) = AuthRequestContext::auth_principal(ctx.as_ref()) {
             request.extensions_mut().insert(Arc::clone(principal));
         }
@@ -4299,6 +4305,19 @@ mod tests {
             Arc::clone(&ctx) as Arc<dyn AuthRequestContext + Send + Sync>;
         request.extensions_mut().insert(auth_ctx);
         request.extensions_mut().insert(ctx);
+    }
+
+    /// `request` as a real `/v1/mcp` request reaches rmcp: authenticated, here
+    /// with a read-write API key. For tests of something other than auth, which
+    /// would otherwise be refused for having no principal.
+    fn authenticated<B>(mut request: http::Request<B>) -> http::Request<B> {
+        insert_spice_ctx(&mut request, spice_ctx_with_api_key("test-key:rw"));
+        request
+    }
+
+    fn http_parts_with_spice_ctx(ctx: Arc<SpiceRequestContext>) -> http::request::Parts {
+        let mut request = http::Request::new(());
+        insert_spice_ctx(&mut request, ctx);
         request.into_parts().0
     }
 
@@ -4387,15 +4406,7 @@ mod tests {
             )))
             .expect("valid tools/call request");
         if let Some(ctx) = spice_ctx {
-            // Mirror HTTP `track_metrics` + AuthLayer: concrete context and principal
-            // on request extensions so rmcp injects them via Parts into call_tool.
-            if let Some(principal) = AuthRequestContext::auth_principal(ctx.as_ref()) {
-                request.extensions_mut().insert(Arc::clone(principal));
-            }
-            let auth_ctx: Arc<dyn AuthRequestContext + Send + Sync> =
-                Arc::clone(&ctx) as Arc<dyn AuthRequestContext + Send + Sync>;
-            request.extensions_mut().insert(auth_ctx);
-            request.extensions_mut().insert(ctx);
+            insert_spice_ctx(&mut request, ctx);
         }
         let response = service.handle(request).await;
         let status = response.status();
@@ -4640,13 +4651,7 @@ mod tests {
             )))
             .expect("valid legacy tools/call request");
         if let Some(ctx) = spice_ctx {
-            if let Some(principal) = AuthRequestContext::auth_principal(ctx.as_ref()) {
-                request.extensions_mut().insert(Arc::clone(principal));
-            }
-            let auth_ctx: Arc<dyn AuthRequestContext + Send + Sync> =
-                Arc::clone(&ctx) as Arc<dyn AuthRequestContext + Send + Sync>;
-            request.extensions_mut().insert(auth_ctx);
-            request.extensions_mut().insert(ctx);
+            insert_spice_ctx(&mut request, ctx);
         }
         let response = service.handle(request).await;
         let status = response.status();
