@@ -2943,6 +2943,7 @@ fn is_permanent_dataset_failure(err: &Error) -> bool {
         // Dataset-level settings that contradict each other.
         | Error::FullTextSearchRequiresAcceleration { .. }
         | Error::AcceleratedWriteBackWithoutReplication { .. }
+        | Error::AccelerationWriteModeWithChanges { .. }
         // Durable write-back configurations that would acknowledge a write the
         // dataset cannot then deliver.
         | Error::DurableWriteBackWithRetention { .. }
@@ -4785,6 +4786,48 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
         );
     }
 
+    /// `access: read_write` over a source that only supports reads is a Spicepod
+    /// mistake no retry clears: it fails the load once, naming
+    /// `write_mode: acceleration`, instead of retrying for the life of the process.
+    #[tokio::test]
+    async fn a_read_write_dataset_over_a_read_only_source_fails_permanently() {
+        register_connector_factory("schema_only", Arc::new(SchemaOnlyConnectorFactory)).await;
+
+        let mut dataset =
+            spicepod::component::dataset::Dataset::new("schema_only:any", "read_only_source");
+        dataset.access = spicepod::component::access::AccessMode::ReadWrite;
+        dataset.acceleration = Some(spicepod::acceleration::Acceleration {
+            enabled: true,
+            ..spicepod::acceleration::Acceleration::default()
+        });
+
+        let app = app::AppBuilder::new("read_only_source")
+            .with_dataset(dataset.clone())
+            .build();
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+        let ds = DatasetBuilder::try_from(dataset)
+            .expect("valid dataset builder")
+            .with_app(Arc::new(app))
+            .with_runtime(Arc::clone(&runtime))
+            .build()
+            .expect("valid runtime dataset");
+
+        let err = runtime
+            .try_load_dataset_once(Arc::new(ds), BootstrapStatus::None, None)
+            .await
+            .expect_err("a read-only source should fail a read_write load");
+
+        assert!(
+            matches!(err, Error::PermanentDatasetFailure { .. }),
+            "expected a permanent failure, got: {err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("Set `acceleration.write_mode: acceleration`"),
+            "{err}"
+        );
+    }
+
     /// A `from:` no build of the runtime can resolve is settled at parse time,
     /// so it must not be retried either.
     #[tokio::test]
@@ -4882,6 +4925,14 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
         assert!(
             is_permanent_dataset_failure(&err),
             "full-text search without acceleration cannot resolve itself"
+        );
+        let err = crate::AccelerationWriteModeWithChangesSnafu {
+            dataset_name: "orders".to_string(),
+        }
+        .build();
+        assert!(
+            is_permanent_dataset_failure(&err),
+            "write_mode: acceleration with a change stream cannot resolve itself"
         );
     }
 
