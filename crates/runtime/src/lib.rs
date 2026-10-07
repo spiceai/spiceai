@@ -1599,7 +1599,19 @@ impl Runtime {
                     None,
                 )
             }
-            None => (None, None),
+            None => {
+                if self.read_app().await.is_some_and(|app| {
+                    app.runtime
+                        .executor
+                        .as_ref()
+                        .is_some_and(|e| e.task_slots.is_some())
+                }) {
+                    tracing::info!(
+                        "`runtime.executor.task_slots` is set but this spiced is not part of a cluster, so it has no effect."
+                    );
+                }
+                (None, None)
+            }
         };
 
         // Start Flight server

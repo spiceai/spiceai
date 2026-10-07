@@ -1421,30 +1421,44 @@ impl Scheduler {
     }
 }
 
-/// Cluster executor settings. Only applies when spiced runs as a cluster executor.
+/// Cluster executor settings. Only applies when spiced runs as a cluster executor or scheduler.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Default)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct Executor {
-    /// Number of tasks the executor advertises to the scheduler and runs concurrently.
+    /// Number of tasks an executor advertises to the scheduler and runs concurrently.
     /// Must be between 1 and 4294967295. Defaults to the executor's CPU cores as
     /// resolved by `runtime.cpu`.
+    ///
+    /// Precedence: the executor's own `runtime.executor.task_slots` (its Spicepod or
+    /// `--set-runtime`), then the scheduler's Spicepod, then the CPU cores. Slots above
+    /// the core count are meant for I/O-bound work. An executor's
+    /// `runtime.query.memory_limit` is shared across its slots, so more slots leave
+    /// less memory per task before spilling. Read when the executor starts.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    #[cfg_attr(feature = "schemars", schemars(range(min = 1)))]
+    #[cfg_attr(
+        feature = "schemars",
+        schemars(range(min = 1, max = 4_294_967_295_u64))
+    )]
     pub task_slots: Option<u64>,
 }
+
+const EXECUTOR_TASK_SLOTS_DOCS: &str =
+    "https://spiceai.org/docs/reference/spicepod/runtime#runtimeexecutortask_slots";
 
 /// Validate `runtime.executor.task_slots`: the scheduler protocol carries the slot
 /// count as a `u32`, and an executor with zero slots would never accept work.
 fn validate_executor_task_slots(task_slots: u64) -> Result<(), String> {
-    if (1..=u64::from(u32::MAX)).contains(&task_slots) {
-        Ok(())
+    let bound = if task_slots == 0 {
+        "at least 1".to_string()
+    } else if task_slots > u64::from(u32::MAX) {
+        format!("at most {}", u32::MAX)
     } else {
-        Err(format!(
-            "Invalid 'runtime.executor.task_slots' value {task_slots}: must be an integer between 1 and {}. Set it to the number of tasks the executor should run concurrently, or remove it to use the executor's CPU cores.",
-            u32::MAX
-        ))
-    }
+        return Ok(());
+    };
+    Err(format!(
+        "Invalid `runtime.executor.task_slots` value '{task_slots}': it must be {bound}. Set it to the number of tasks each executor should run at once, or remove it to use each executor's CPU cores. See: {EXECUTOR_TASK_SLOTS_DOCS}"
+    ))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -2639,14 +2653,16 @@ datasets:
 
     #[test]
     fn test_executor_task_slots_rejects_out_of_range() {
-        for text in ["0", "4294967296"] {
+        let tail = "Set it to the number of tasks each executor should run at once, or remove it to use each executor's CPU cores. See: https://spiceai.org/docs/reference/spicepod/runtime#runtimeexecutortask_slots";
+        for (text, bound) in [("0", "at least 1"), ("4294967296", "at most 4294967295")] {
             let err = parse_executor_runtime(&format!("executor:\n  task_slots: {text}"))
                 .expect_err("out-of-range task_slots must fail to parse");
-            let msg = err.to_string();
+            let expected = format!(
+                "Invalid `runtime.executor.task_slots` value '{text}': it must be {bound}. {tail}"
+            );
             assert!(
-                msg.contains("runtime.executor.task_slots")
-                    && msg.contains("between 1 and 4294967295"),
-                "unexpected error: {msg}"
+                err.to_string().contains(&expected),
+                "unexpected error: {err}"
             );
         }
     }

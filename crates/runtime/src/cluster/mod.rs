@@ -70,6 +70,7 @@ use std::collections::{HashMap, HashSet};
 use std::env;
 use std::io;
 use std::net::SocketAddr;
+use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -1139,6 +1140,12 @@ pub(crate) async fn initialize_cluster_scheduler_future(
         return Ok(None);
     };
 
+    if let Some(task_slots) = app.runtime.executor.as_ref().and_then(|e| e.task_slots) {
+        tracing::info!(
+            "Cluster executors will run up to {task_slots} tasks at once each (`runtime.executor.task_slots`), unless an executor sets its own value."
+        );
+    }
+
     if let Some(config) = app.runtime.resolved_scheduler() {
         if rt.partition_store().is_some() {
             // Validate all accelerated datasets/views have partition keys
@@ -1248,13 +1255,50 @@ pub(crate) async fn initialize_cluster_scheduler_future(
     })))
 }
 
-/// Task slots an executor advertises: the `runtime.executor.task_slots` override if set,
-/// otherwise the CPU budget. The Spicepod validates the override into `1..=u32::MAX`; the
-/// CPU budget is at least one core, so the fallback only saturates on a machine with more
-/// than 4 billion of them.
-fn resolve_executor_task_slots(configured: Option<u64>, cpu_budget_slots: usize) -> u32 {
-    let slots = configured.unwrap_or_else(|| u64::try_from(cpu_budget_slots).unwrap_or(u64::MAX));
-    u32::try_from(slots).unwrap_or(u32::MAX)
+/// Where an executor's task-slot count came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TaskSlotsSource {
+    /// `runtime.executor.task_slots` in the executor's own Spicepod or `--set-runtime`.
+    Executor,
+    /// `runtime.executor.task_slots` in the scheduler's Spicepod.
+    Scheduler,
+    /// The CPU budget.
+    CpuBudget,
+}
+
+/// Task slots an executor advertises: its own `runtime.executor.task_slots`, else the
+/// scheduler's, else the CPU budget. Both overrides are validated into `1..=u32::MAX` by
+/// the Spicepod; the CPU budget is at least one core, so the fallback only saturates on
+/// a machine with more than 4 billion of them.
+fn resolve_executor_task_slots(
+    local: Option<u64>,
+    scheduler: Option<u64>,
+    cpu_budget_slots: usize,
+) -> (u32, TaskSlotsSource) {
+    let (slots, source) = match (local, scheduler) {
+        (Some(slots), _) => (slots, TaskSlotsSource::Executor),
+        (None, Some(slots)) => (slots, TaskSlotsSource::Scheduler),
+        (None, None) => (
+            u64::try_from(cpu_budget_slots).unwrap_or(u64::MAX),
+            TaskSlotsSource::CpuBudget,
+        ),
+    };
+    (u32::try_from(slots).unwrap_or(u32::MAX), source)
+}
+
+/// The executor startup line stating how many task slots it runs and why.
+fn executor_task_slots_message(slots: u32, source: TaskSlotsSource, cpu_cores: usize) -> String {
+    match source {
+        TaskSlotsSource::Executor => format!(
+            "Executor task slots: {slots} (from `runtime.executor.task_slots` on this executor; this executor has {cpu_cores} CPU cores)"
+        ),
+        TaskSlotsSource::Scheduler => format!(
+            "Executor task slots: {slots} (from `runtime.executor.task_slots` in the scheduler's Spicepod; this executor has {cpu_cores} CPU cores)"
+        ),
+        TaskSlotsSource::CpuBudget => format!(
+            "Executor task slots: {slots} (from the CPU budget; set `runtime.executor.task_slots` to override)"
+        ),
+    }
 }
 
 /// Creates a Ballista executor, binds it to the `Runtime` handle, and returns its configured
@@ -1488,23 +1532,31 @@ pub async fn initialize_cluster_executor(
 
     let app_def = Arc::new(app_def);
 
-    let configured_task_slots = app_def
+    // The executor's own app is still in place here; `executor_bind_app` replaces it
+    // with the scheduler's.
+    let local_task_slots = rt
+        .read_app()
+        .await
+        .and_then(|app| app.runtime.executor.as_ref().and_then(|e| e.task_slots));
+    let scheduler_task_slots = app_def
         .runtime
         .executor
         .as_ref()
         .and_then(|executor| executor.task_slots);
-    let concurrent_tasks = resolve_executor_task_slots(
-        configured_task_slots,
-        cpu_budget::cpu_budget().cluster_executor_concurrent_tasks(),
+    let cpu_budget = cpu_budget::cpu_budget();
+    let (concurrent_tasks, task_slots_source) = resolve_executor_task_slots(
+        local_task_slots,
+        scheduler_task_slots,
+        cpu_budget.cluster_executor_concurrent_tasks(),
     );
-    match configured_task_slots {
-        Some(_) => tracing::info!(
-            "Executor task slots set to {concurrent_tasks} by `runtime.executor.task_slots`"
-        ),
-        None => tracing::info!(
-            "Executor task slots set to {concurrent_tasks} from the CPU budget, override with `runtime.executor.task_slots`"
-        ),
-    }
+    let cpu_cores = cpu_budget.cluster_executor_task_runner_threads();
+    tracing::info!(
+        task_slots = concurrent_tasks,
+        cpu_cores,
+        "{}",
+        executor_task_slots_message(concurrent_tasks, task_slots_source, cpu_cores)
+    );
+    let task_runner_threads = NonZeroUsize::new(cpu_cores).unwrap_or(NonZeroUsize::MIN);
 
     let executor_meta = ExecutorRegistration {
         id: executor_id.clone(),
@@ -1562,16 +1614,19 @@ pub async fn initialize_cluster_executor(
         u64::from(concurrent_tasks),
     );
 
-    let executor = Arc::new(Executor::new(
-        executor_meta,
-        &work_dir,
-        runtime_producer,
-        config_producer,
-        Arc::new(BallistaFunctionRegistry::default()),
-        Arc::new(metrics_collector),
-        concurrent_tasks as usize,
-        None,
-    ));
+    let executor = Arc::new(
+        Executor::new(
+            executor_meta,
+            &work_dir,
+            runtime_producer,
+            config_producer,
+            Arc::new(BallistaFunctionRegistry::default()),
+            Arc::new(metrics_collector),
+            concurrent_tasks as usize,
+            None,
+        )
+        .with_task_runner_threads(task_runner_threads),
+    );
 
     let codec: BallistaCodec<LogicalPlanNode, PhysicalPlanNode> = BallistaCodec::new(
         SpiceLogicalCodec::new_codec(),
@@ -2602,21 +2657,44 @@ fn apply_distributed_execution_config(cfg: SessionConfig) -> SessionConfig {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn executor_task_slots_prefers_configured_value() {
-        assert_eq!(super::resolve_executor_task_slots(Some(32), 8), 32);
-        assert_eq!(super::resolve_executor_task_slots(Some(1), 8), 1);
-    }
-
-    #[test]
-    fn executor_task_slots_falls_back_to_cpu_budget() {
-        assert_eq!(super::resolve_executor_task_slots(None, 8), 8);
+    fn executor_task_slots_precedence_is_executor_then_scheduler_then_cpu() {
+        use super::TaskSlotsSource::{CpuBudget, Executor, Scheduler};
+        assert_eq!(
+            super::resolve_executor_task_slots(Some(32), Some(16), 8),
+            (32, Executor)
+        );
+        assert_eq!(
+            super::resolve_executor_task_slots(None, Some(16), 8),
+            (16, Scheduler)
+        );
+        assert_eq!(
+            super::resolve_executor_task_slots(None, None, 8),
+            (8, CpuBudget)
+        );
     }
 
     #[test]
     fn executor_task_slots_saturates_at_u32_max() {
         assert_eq!(
-            super::resolve_executor_task_slots(None, usize::MAX),
+            super::resolve_executor_task_slots(None, None, usize::MAX).0,
             u32::MAX
+        );
+    }
+
+    #[test]
+    fn executor_task_slots_message_names_source() {
+        use super::TaskSlotsSource::{CpuBudget, Executor, Scheduler};
+        assert_eq!(
+            super::executor_task_slots_message(32, Executor, 8),
+            "Executor task slots: 32 (from `runtime.executor.task_slots` on this executor; this executor has 8 CPU cores)"
+        );
+        assert_eq!(
+            super::executor_task_slots_message(32, Scheduler, 8),
+            "Executor task slots: 32 (from `runtime.executor.task_slots` in the scheduler's Spicepod; this executor has 8 CPU cores)"
+        );
+        assert_eq!(
+            super::executor_task_slots_message(8, CpuBudget, 8),
+            "Executor task slots: 8 (from the CPU budget; set `runtime.executor.task_slots` to override)"
         );
     }
 

@@ -747,8 +747,8 @@ impl CpuBudget {
             ("embedding_pool_threads", self.embedding_pool_threads()),
             ("duckdb_threads", self.duckdb_threads()),
             (
-                "cluster_executor_concurrent_tasks",
-                self.cluster_executor_concurrent_tasks(),
+                "cluster_executor_task_runner_threads",
+                self.cluster_executor_task_runner_threads(),
             ),
         ]
     }
@@ -1250,9 +1250,18 @@ impl CpuBudget {
         self.cores
     }
 
-    /// Tasks a cluster executor advertises it can run concurrently.
+    /// Tasks a cluster executor advertises it can run concurrently, absent a
+    /// `runtime.executor.task_slots` override.
     #[must_use]
     pub const fn cluster_executor_concurrent_tasks(&self) -> usize {
+        self.cores
+    }
+
+    /// Worker threads of a cluster executor's task-runner pool. Sized from the
+    /// cores rather than the task slots, so raising `runtime.executor.task_slots`
+    /// for I/O-bound work does not add threads.
+    #[must_use]
+    pub const fn cluster_executor_task_runner_threads(&self) -> usize {
         self.cores
     }
 }
@@ -2683,7 +2692,7 @@ mod tests {
             "metastore_pool_connections",
             "embedding_pool_threads",
             "duckdb_threads",
-            "cluster_executor_concurrent_tasks",
+            "cluster_executor_task_runner_threads",
         ] {
             assert!(reported.contains(name), "{name} is not reported at startup");
         }
