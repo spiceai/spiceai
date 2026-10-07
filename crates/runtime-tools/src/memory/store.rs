@@ -24,6 +24,7 @@ use snafu::ResultExt;
 use std::{borrow::Cow, sync::Arc};
 use tracing_futures::Instrument;
 
+use crate::builtin::function_tool::current_principal_requires_read_only;
 use crate::utils::parameters;
 use app::App;
 use tokio::sync::RwLock;
@@ -133,6 +134,9 @@ impl SpiceModelTool for StoreMemoryTool {
         let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::store_memory", tool = self.name().to_string(), input = arg);
         let table_name = memory_table_name(&self.app).await?;
         let result: Result<Value, Box<dyn std::error::Error + Send + Sync>> = async {
+            if current_principal_requires_read_only().await {
+                return Err("API key does not allow write access (read-only SQL context)".into());
+            }
             let params: StoreMemoryParams = serde_json::from_str(arg).boxed()?;
             validate_store_memory_params(&params)?;
 
