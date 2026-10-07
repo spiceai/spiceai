@@ -646,10 +646,11 @@ impl ArrivalStream {
         let mut columns = versioned.batch.columns().to_vec();
         columns.push(Arc::new(versioned.times));
         let mut fields: Vec<FieldRef> = versioned.batch.schema().fields().iter().cloned().collect();
+        // A NULL time stays NULL (older than any time), so the column is nullable.
         fields.push(Arc::new(Field::new(
             VERSION_TIME_COLUMN,
             DataType::Int64,
-            false,
+            true,
         )));
         Ok(RecordBatch::try_new(
             Arc::new(Schema::new(fields)),
@@ -1085,7 +1086,7 @@ impl CayenneTableProvider {
             stored_fields.push(Arc::new(Field::new(
                 ORDER_TIME_COLUMN,
                 DataType::Int64,
-                false,
+                true,
             )));
         }
         fields.push(Arc::new(Field::new(
