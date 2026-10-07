@@ -54,6 +54,7 @@ use tokio::sync::Mutex;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::{RwLock, Semaphore};
 use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
 
 // The refresh-SQL types travel with their parser in `runtime-datafusion`: the
 // parser produces them, and it sits below `runtime` so connectors can call it.
@@ -702,6 +703,7 @@ pub struct Refresher {
     snapshot_config: Option<SnapshotCreationConfig>,
     snapshot_refresh_state: Option<crate::accelerated::snapshots::SnapshotRefreshState>,
     snapshot_task: Option<tokio::task::JoinHandle<()>>,
+    initial_snapshot: Option<InitialSnapshot>,
 
     initial_load_completed: Arc<AtomicBool>,
     disable_federation: bool,
@@ -779,6 +781,7 @@ impl Refresher {
             snapshot_config: None,
             snapshot_refresh_state: None,
             snapshot_task: None,
+            initial_snapshot: None,
             metrics: None,
             cpu_runtime,
             cdc_apply_runtime,
@@ -1214,14 +1217,19 @@ impl Refresher {
                 let last_updated_at_clone = Arc::clone(&self.last_updated_at);
                 let accelerator_clone = Arc::clone(&self.accelerator);
                 let refresh_clone = Arc::clone(&self.refresh);
+                let not_started = CancellationToken::new();
+                let start_gate = not_started.clone();
 
-                self.snapshot_task = Some(tokio::spawn(async move {
-                    // A shutdown before readiness means the initial load never
-                    // completed — checkpointing a partial accelerator would
-                    // publish it as a complete snapshot.
-                    if runtime_status_clone.wait_for_ready().await
-                        == runtime_status::WaitOutcome::ShuttingDown
-                    {
+                let task = tokio::spawn(async move {
+                    // A shutdown or drain before readiness means the initial
+                    // load never completed — checkpointing a partial
+                    // accelerator would publish it as a complete snapshot.
+                    let outcome = select! {
+                        biased;
+                        outcome = runtime_status_clone.wait_for_ready() => outcome,
+                        () = start_gate.cancelled() => return,
+                    };
+                    if outcome == runtime_status::WaitOutcome::ShuttingDown {
                         return;
                     }
                     if !bootstrap_status.is_bootstrapped() {
@@ -1251,7 +1259,11 @@ impl Refresher {
                     tracing::debug!(
                         "Refresh-based snapshot creation for {dataset_name_clone} starting after runtime ready"
                     );
-                }));
+                });
+                self.initial_snapshot = Some(InitialSnapshot {
+                    task: Some(task),
+                    not_started,
+                });
             }
         }
 
@@ -1428,6 +1440,11 @@ impl Refresher {
         tasks
     }
 
+    /// Transfer the initial-load snapshot to the table generation's drain owner.
+    pub(crate) fn take_initial_snapshot(&mut self) -> Option<InitialSnapshot> {
+        self.initial_snapshot.take()
+    }
+
     fn start_changes_stream(
         &mut self,
         changes_stream: ChangesStream,
@@ -1498,6 +1515,31 @@ impl Drop for Refresher {
         if let Some(task) = self.snapshot_task.take() {
             task.abort();
         }
+    }
+}
+
+/// The one-shot snapshot of the initial load. It stops if its owner goes away
+/// before the runtime is ready; once it has started, it runs to completion, so
+/// a drain waits for it rather than cutting a snapshot off part-way.
+pub(crate) struct InitialSnapshot {
+    task: Option<tokio::task::JoinHandle<()>>,
+    not_started: CancellationToken,
+}
+
+impl InitialSnapshot {
+    /// Stop the snapshot if it has not started, otherwise wait for it to finish.
+    pub(crate) async fn finish(mut self) -> Result<(), tokio::task::JoinError> {
+        self.not_started.cancel();
+        match self.task.take() {
+            Some(task) => task.await,
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for InitialSnapshot {
+    fn drop(&mut self) {
+        self.not_started.cancel();
     }
 }
 

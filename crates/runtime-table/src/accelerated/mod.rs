@@ -295,6 +295,7 @@ pub struct AcceleratedTable {
 
     // Async background tasks relevant to the accelerated table (i.e should be stopped when the table is dropped).
     pub handlers: parking_lot::Mutex<Vec<JoinHandle<()>>>,
+    initial_snapshot: parking_lot::Mutex<Option<refresh::InitialSnapshot>>,
     changes_drain: std::sync::OnceLock<runtime_acceleration::change_sink::Publication>,
     zero_results_action: ZeroResultsAction,
     ready_state: ReadyState,
@@ -1206,6 +1207,7 @@ impl Builder {
                 )
             };
         let mut handlers = refresher.take_background_tasks();
+        let initial_snapshot = refresher.take_initial_snapshot();
         let refresher = Arc::new(refresher);
         if let Some(refresh_handle) = refresh_handle {
             handlers.push(refresh_handle);
@@ -1367,6 +1369,7 @@ impl Builder {
             federated: self.federated,
             refresh_trigger,
             handlers: parking_lot::Mutex::new(handlers),
+            initial_snapshot: parking_lot::Mutex::new(initial_snapshot),
             changes_drain: std::sync::OnceLock::new(),
             zero_results_action: self.zero_results_action,
             ready_state: self.ready_state,
@@ -1444,6 +1447,7 @@ impl AcceleratedTable {
                 for handler in &handlers {
                     handler.abort();
                 }
+                let initial_snapshot = self.initial_snapshot.lock().take();
                 let dataset = self.dataset_name.clone();
                 let synchronized = (self.refresh_mode == RefreshMode::Caching)
                     .then(|| self.synchronized_with.clone())
@@ -1460,6 +1464,16 @@ impl AcceleratedTable {
                                 "Failed to stop change ingestion for dataset '{dataset}': {error}"
                             )));
                         }
+                    }
+                    // A started initial-load snapshot reads this generation's
+                    // storage, so it finishes before that storage closes.
+                    if let Some(snapshot) = initial_snapshot
+                        && let Err(error) = snapshot.finish().await
+                        && !error.is_cancelled()
+                    {
+                        producer_failure = Some(DataFusionError::Execution(format!(
+                            "The initial snapshot of dataset '{dataset}' failed: {error}"
+                        )));
                     }
                     if let Some(cache_work) = cache_work {
                         cache_work.wait().await;
