@@ -37,7 +37,7 @@ use datafusion::{
     common::TableReference, datasource::TableProvider, execution::runtime_env::RuntimeEnv,
 };
 use futures::future::BoxFuture;
-use tokio::sync::OnceCell;
+use tokio::sync::{Mutex, OnceCell};
 
 use super::{ConnectorComponent, ConnectorContext, DataConnector, DataConnectorError};
 use crate::component::ComponentInitialization;
@@ -108,8 +108,8 @@ pub struct ReconnectingConnector {
     build: ConnectorBuilder,
     inner: OnceCell<Arc<dyn DataConnector>>,
     /// Object stores the runtime asked to register before the real connector existed,
-    /// replayed once it is built.
-    pending_object_stores: parking_lot::Mutex<Vec<(DatasetSpec, Arc<RuntimeEnv>)>>,
+    /// replayed after construction and retained until registration succeeds.
+    pending_object_stores: Mutex<Vec<(DatasetSpec, Arc<RuntimeEnv>)>>,
 }
 
 impl ReconnectingConnector {
@@ -119,7 +119,7 @@ impl ReconnectingConnector {
             source_name: source_name.into(),
             build,
             inner: OnceCell::new(),
-            pending_object_stores: parking_lot::Mutex::new(Vec::new()),
+            pending_object_stores: Mutex::new(Vec::new()),
         }
     }
 
@@ -145,15 +145,12 @@ impl ReconnectingConnector {
             .await
             .map_err(|err| self.build_error(dataset, err))?;
 
-        let pending = std::mem::take(&mut *self.pending_object_stores.lock());
-        for (spec, runtime_env) in pending {
-            if let Err(err) = connector.register_object_stores(&spec, &runtime_env).await {
-                tracing::warn!(
-                    "Failed to register the object store for dataset '{}' ({}) after reconnecting to its source, so reading it from the source may fail. {err}",
-                    spec.name,
-                    self.source_name,
-                );
-            }
+        // Keep each registration queued while it is in flight, so an error or
+        // cancellation leaves it available for the next source connection attempt.
+        let mut pending = self.pending_object_stores.lock().await;
+        while let Some((spec, runtime_env)) = pending.last() {
+            connector.register_object_stores(spec, runtime_env).await?;
+            pending.pop();
         }
 
         Ok(connector)
@@ -317,7 +314,7 @@ impl DataConnector for ReconnectingConnector {
         // the built connector: either the store is queued before that drain, or the
         // connector is already visible here and the store is registered directly.
         let built = {
-            let mut pending = self.pending_object_stores.lock();
+            let mut pending = self.pending_object_stores.lock().await;
             let built = self.built().map(Arc::clone);
             if built.is_none() {
                 pending.push((dataset.clone(), Arc::clone(runtime_env)));

@@ -38,6 +38,7 @@ use data_connector_api::{
     DataConnectorFactory, NewDataConnectorResult,
 };
 use datafusion::datasource::{MemTable, TableProvider};
+use object_store::ObjectStoreExt;
 use runtime::{Runtime, component::dataset::DatasetSpec, dataconnector, status::ComponentStatus};
 use runtime_parameters::ParameterSpec;
 use spicepod::component::dataset::Dataset as SpicepodDataset;
@@ -226,6 +227,29 @@ impl DataConnector for UnreachableSourceConnector {
         self
     }
 
+    async fn metadata_provider(
+        &self,
+        dataset: &DatasetSpec,
+    ) -> Option<Result<Arc<dyn TableProvider>, DataConnectorError>> {
+        if !dataset.has_metadata_table {
+            return None;
+        }
+        Some(
+            self.source
+                .attempt(ConnectorComponent::from(dataset))
+                .and_then(|()| {
+                    self.source
+                        .table()
+                        .map(|table| Arc::new(table) as Arc<dyn TableProvider>)
+                        .map_err(|source| DataConnectorError::UnableToGetReadProvider {
+                            dataconnector: self.source.prefix.to_string(),
+                            connector_component: ConnectorComponent::from(dataset),
+                            source: Box::new(source),
+                        })
+                }),
+        )
+    }
+
     async fn read_provider(
         &self,
         _context: &dyn ConnectorContext,
@@ -300,6 +324,111 @@ impl DataConnectorFactory for UnreachableSourceFactory {
 
 fn dataset_status(rt: &Runtime, name: &str) -> Option<ComponentStatus> {
     rt.status().get_component_status(&format!("dataset:{name}"))
+}
+
+#[derive(Debug)]
+struct FlakyObjectStoreConnector {
+    attempts: AtomicUsize,
+    store_url: url::Url,
+}
+
+#[async_trait]
+impl DataConnector for FlakyObjectStoreConnector {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    async fn read_provider(
+        &self,
+        _context: &dyn ConnectorContext,
+        _dataset: &DatasetSpec,
+    ) -> Result<Arc<dyn TableProvider>, DataConnectorError> {
+        Ok(Arc::new(
+            MemTable::try_new(Arc::new(Schema::empty()), vec![vec![]])
+                .expect("empty source table is valid"),
+        ))
+    }
+
+    async fn register_object_stores(
+        &self,
+        dataset: &DatasetSpec,
+        runtime_env: &Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+    ) -> Result<(), DataConnectorError> {
+        if self.attempts.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(DataConnectorError::UnableToConnectInvalidHostOrPort {
+                dataconnector: "replay-test".to_string(),
+                connector_component: ConnectorComponent::from(dataset),
+                host: "127.0.0.1".to_string(),
+                port: "5432".to_string(),
+            });
+        }
+        runtime_env.register_object_store(
+            &self.store_url,
+            Arc::new(object_store::memory::InMemory::new()),
+        );
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn reconnecting_object_store_replay_recovers_after_registration_failure()
+-> Result<(), anyhow::Error> {
+    use runtime::dataconnector::reconnecting::{ConnectorBuilder, ReconnectingConnector};
+    let rt = Arc::new(Runtime::builder().build().await);
+    let dataset = runtime::component::dataset::builder::DatasetBuilder::try_new(
+        "replay-test://orders".into(),
+        "orders",
+    )?
+    .with_app(Arc::new(AppBuilder::new("object_store_replay").build()))
+    .with_runtime(Arc::clone(&rt))
+    .build()?;
+    let source = Arc::new(FlakyObjectStoreConnector {
+        attempts: AtomicUsize::new(0),
+        store_url: url::Url::parse("replay-test://store/")?,
+    });
+    let build: ConnectorBuilder = Arc::new({
+        let source = Arc::clone(&source);
+        move || {
+            let source = Arc::clone(&source);
+            Box::pin(async move { Ok(source as Arc<dyn DataConnector>) })
+        }
+    });
+    let wrapper = ReconnectingConnector::new("replay-test", build);
+    let runtime_env = rt.datafusion().ctx.runtime_env();
+    wrapper
+        .register_object_stores(&dataset, &runtime_env)
+        .await?;
+    let context =
+        runtime::dataconnector::parameters::RuntimeConnectorContext::for_dataset(&dataset);
+    let first = wrapper.read_provider(&context, &dataset).await;
+    let second = wrapper.read_provider(&context, &dataset).await;
+    let store = runtime_env.object_store(
+        datafusion::execution::object_store::ObjectStoreUrl::parse(source.store_url.as_str())?,
+    );
+    eprintln!(
+        "object store replay: first_failed={} second_succeeded={} attempts={} store_registered={}",
+        first.is_err(),
+        second.is_ok(),
+        source.attempts.load(Ordering::SeqCst),
+        store.is_ok()
+    );
+    assert!(
+        matches!(
+            first,
+            Err(DataConnectorError::UnableToConnectInvalidHostOrPort { .. })
+        ),
+        "the failed replay is propagated to the source retry loop"
+    );
+    second?;
+    let store = store?;
+    let path = object_store::path::Path::from("probe");
+    store.put(&path, "recovered".into()).await?;
+    assert_eq!(
+        store.get(&path).await?.bytes().await?.as_ref(),
+        b"recovered"
+    );
+    rt.shutdown().await;
+    Ok(())
 }
 
 /// Starts a runtime with one dataset on `source` while it is down, and asserts the
@@ -1136,6 +1265,57 @@ mod served_from_acceleration {
     async fn pending_cron_refresh_retains_its_due_time_without_jitter() -> Result<(), anyhow::Error>
     {
         assert_pending_cron_deadline("cron-no-jitter", false).await
+    }
+
+    #[tokio::test]
+    async fn metadata_enabled_acceleration_serves_while_source_is_down() -> Result<(), anyhow::Error>
+    {
+        let _tracing = init_tracing(Some("integration=debug,info"));
+        let fixture = Fixture::new("metadata-source-down").await?;
+        let source = &fixture.source;
+        let mut dataset = fixture.dataset(ReadyState::OnLoad);
+        dataset.has_metadata_table = Some(true);
+        seed(source, dataset.clone()).await?;
+        let (rt, loader) = restart_with_source_down(source, dataset).await;
+        let served = served_from_acceleration(&rt, Duration::from_secs(10)).await;
+        let ready = rt.status().is_ready();
+        eprintln!(
+            "metadata source down: served={served} ready={ready} rows={:?} status={:?} loader_finished={}",
+            sum_and_count(&rt).await,
+            dataset_status(&rt, "orders"),
+            loader.is_finished()
+        );
+        source.bring_up();
+        let refreshed = refreshed_from_source(&rt).await;
+        let metadata_registered = wait_until_true(Duration::from_secs(10), || async {
+            rt.datafusion()
+                .get_table(&datafusion::common::TableReference::partial(
+                    "metadata", "orders",
+                ))
+                .await
+                .is_some()
+        })
+        .await;
+        eprintln!(
+            "metadata source recovered: refreshed={refreshed} metadata_registered={metadata_registered} rows={:?} status={:?}",
+            sum_and_count(&rt).await,
+            dataset_status(&rt, "orders")
+        );
+        stop(rt, loader).await;
+        assert!(
+            served,
+            "existing acceleration serves without its metadata source"
+        );
+        assert!(refreshed, "source recovery refreshes the acceleration");
+        assert!(
+            ready,
+            "serving the existing acceleration satisfies on_load readiness"
+        );
+        assert!(
+            metadata_registered,
+            "metadata registers after source recovery"
+        );
+        Ok(())
     }
 
     /// A sampled zero jitter also retains the triggered refresh's due time.
