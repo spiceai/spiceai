@@ -49,9 +49,9 @@ use datafusion::physical_plan::ExecutionPlan;
 /// plain columns over a filter of column-against-constant comparisons over one table scan, with
 /// no join, aggregate, subquery, window, sort, union, distinct or limit anywhere.
 ///
-/// `EnforceDistribution` and `EnforceSorting` are here because the shape has no distribution or
-/// ordering requirement; that holds only while `LIMIT` stays excluded (a global limit needs a
-/// single input partition, which `EnforceDistribution` would provide). Rules that act on a scan
+/// `EnsureRequirements` is here because the shape has no distribution or ordering requirement;
+/// that holds only while `LIMIT` stays excluded (a global limit needs a single input partition,
+/// which `EnsureRequirements` would provide). Rules that act on a scan
 /// of a particular connector (`HttpParamsPushdown`, the `DuckDB` rules) and
 /// `propagate_empty_relation` (which shapes the plan of a contradictory predicate) are not here:
 /// they cost well under a microsecond and are not worth reasoning about per connector.
@@ -88,9 +88,8 @@ pub(crate) const SKIPPABLE_RULES: &[&str] = &[
     "join_selection",
     "eager_aggregation",
     "LimitedDistinctAggregation",
-    "EnforceDistribution",
+    "EnsureRequirements",
     "CombinePartialFinalAggregate",
-    "EnforceSorting",
     "OptimizeAggregateOrder",
     "WindowTopN",
     "LimitAggregation",
@@ -615,7 +614,7 @@ mod tests {
     #[tokio::test]
     async fn skipped_rules_still_run_outside_a_point_lookup() {
         let ctx = context();
-        // `EnforceDistribution` / `EnforceSorting` must still shape a query that needs them.
+        // `EnsureRequirements` must still shape a query that needs it.
         let sql = "SELECT region, count(*) FROM keyed GROUP BY region ORDER BY region";
         let plan = unoptimized(&ctx, sql).await;
         assert!(!is_point_lookup(&plan));

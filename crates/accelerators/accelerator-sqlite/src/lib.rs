@@ -575,12 +575,7 @@ impl DataAccelerator for SqliteAccelerator {
                 .iter()
                 .filter_map(|spicepod_ds| {
                     let acceleration = spicepod_ds.acceleration.as_ref()?;
-                    let engine_str = acceleration
-                        .engine
-                        .as_deref()
-                        .unwrap_or("arrow")
-                        .to_lowercase();
-                    if engine_str != "sqlite" {
+                    if !acceleration.engine_name().eq_ignore_ascii_case("sqlite") {
                         return None;
                     }
                     if !matches!(

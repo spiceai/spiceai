@@ -127,6 +127,7 @@ use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::joins::utils::JoinFilter;
 use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode, SortMergeJoinExec};
+use datafusion::physical_plan::limit::LocalLimitExec;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
 use datafusion::physical_plan::{
@@ -1104,6 +1105,15 @@ fn finish_sort_merge_rewrite(
     } else {
         join
     };
+    // `LimitPushdown` folds a `LIMIT` above a hash join into the join's `fetch`,
+    // and drops the limit node when nothing above the join merges partitions, so
+    // that `fetch` can be the only thing enforcing the `LIMIT`. `SortMergeJoinExec`
+    // has no `fetch`: cap each partition at the same count the hash join did, or
+    // a `LIMIT n` query returns every joined row.
+    let join = match hash_join.fetch() {
+        Some(fetch) => Arc::new(LocalLimitExec::new(join, fetch)) as Arc<dyn ExecutionPlan>,
+        None => join,
+    };
 
     tracing::debug!(
         join_type = ?hash_join.join_type(),
@@ -1302,7 +1312,11 @@ fn rewrite_partitioned_hash_join_to_collect_left(
         PartitionMode::CollectLeft,
         hash_join.null_equality(),
         hash_join.null_aware,
-    )?;
+    )?
+    // A `LIMIT` folded into the join's `fetch` may be the only limit in the plan.
+    .builder()
+    .with_fetch(hash_join.fetch())
+    .build()?;
     Ok(Some(Arc::new(join)))
 }
 
@@ -2286,6 +2300,7 @@ mod tests {
     use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
     use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
     use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode, SortMergeJoinExec};
+    use datafusion::physical_plan::limit::LocalLimitExec;
     use datafusion::physical_plan::projection::ProjectionExec;
     use datafusion::physical_plan::repartition::RepartitionExec;
     use datafusion::physical_plan::sorts::sort::SortExec;
@@ -5225,6 +5240,114 @@ mod tests {
             1,
             "CollectLeft build side must be one partition"
         );
+    }
+
+    /// `LimitPushdown` folds a `LIMIT` into a hash join's `fetch`. Where nothing
+    /// above the join merges partitions that `fetch` is the plan's only limit, so
+    /// a rewrite that drops it returns every joined row of a `LIMIT n` query.
+    #[test]
+    fn the_collect_left_rewrite_keeps_the_join_fetch() {
+        let left_schema = channel_schema("ss_item_sk", "ss_qty");
+        let right_schema = channel_schema("ws_item_sk", "ws_qty");
+        let left = hash_repartition(
+            crate::cte_materialization::test_cte_scan_exec("ss", Arc::clone(&left_schema)),
+            "ss_item_sk",
+            4,
+        );
+        let right = hash_repartition(
+            crate::cte_materialization::test_cte_scan_exec("ws", Arc::clone(&right_schema)),
+            "ws_item_sk",
+            4,
+        );
+        let join = Arc::new(
+            hash_join_with_join_type(
+                left,
+                right,
+                "ss_item_sk",
+                "ws_item_sk",
+                JoinType::Left,
+                NullEquality::NullEqualsNothing,
+            )
+            .builder()
+            .with_fetch(Some(7))
+            .build()
+            .expect("a hash join with a fetch should be valid"),
+        );
+        let config =
+            config_with_cayenne_optimizer(None, Some(0.125), Some(107 * 1024 * 1024 * 1024));
+
+        let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
+
+        let rewritten = optimized
+            .downcast_ref::<HashJoinExec>()
+            .expect("CTE-scan join must stay a hash join, not sort-merge");
+        assert_eq!(
+            *rewritten.partition_mode(),
+            PartitionMode::CollectLeft,
+            "precondition: the join must be rewritten to CollectLeft"
+        );
+        assert_eq!(
+            rewritten.fetch(),
+            Some(7),
+            "the rewritten join must keep the LIMIT folded into its fetch"
+        );
+    }
+
+    /// The sort-merge rewrite has no `fetch` to carry the folded `LIMIT` in, so
+    /// it must cap each partition with a `LocalLimitExec` instead.
+    #[test]
+    fn the_sort_merge_rewrite_keeps_the_join_fetch() {
+        let left_schema = channel_schema("ss_item_sk", "ss_ticket_number");
+        let right_schema = channel_schema("sr_item_sk", "sr_ticket_number");
+        let left = hash_repartition(
+            file_exec_with_statistics(
+                &left_schema,
+                "store_sales.parquet",
+                None,
+                Statistics::new_unknown(&left_schema),
+            ),
+            "ss_item_sk",
+            4,
+        );
+        let right = hash_repartition(
+            file_exec_with_statistics(
+                &right_schema,
+                "store_returns.parquet",
+                None,
+                Statistics::new_unknown(&right_schema),
+            ),
+            "sr_item_sk",
+            4,
+        );
+        let join = Arc::new(
+            hash_join_with_join_type(
+                left,
+                right,
+                "ss_item_sk",
+                "sr_item_sk",
+                JoinType::Left,
+                NullEquality::NullEqualsNothing,
+            )
+            .builder()
+            .with_fetch(Some(7))
+            .build()
+            .expect("a hash join with a fetch should be valid"),
+        );
+        let config =
+            config_with_cayenne_optimizer(None, Some(0.125), Some(107 * 1024 * 1024 * 1024));
+
+        let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
+
+        let limit = optimized
+            .downcast_ref::<LocalLimitExec>()
+            .unwrap_or_else(|| {
+                panic!(
+                    "the rewrite must keep the join's fetch as a per-partition limit:\n{}",
+                    displayable(optimized.as_ref()).indent(true)
+                )
+            });
+        assert_eq!(limit.fetch(), 7, "the limit must be the join's fetch");
+        assert_coalesced_oracle_file_scan_sort_merge(limit.input(), 4);
     }
 
     #[test]
