@@ -1286,9 +1286,7 @@ impl RefreshTask {
                     // every append re-adds its whole overlap window.
                     Ok(data)
                         if refresh.versions_by_time.is_some()
-                            && self
-                                .version_ordering(refresh, &data.data.schema())
-                                .is_some() =>
+                            && self.version_ordering(refresh).is_some() =>
                     {
                         self.select_latest_by_time(refresh, data, timestamp).await
                     }
@@ -1313,18 +1311,12 @@ impl RefreshTask {
         }
     }
 
-    /// The primary key and time column a refresh reading `incoming` orders versions by,
-    /// or `None` when it keeps the last arrival instead.
-    fn version_ordering(
-        &self,
-        refresh: &Refresh,
-        incoming: &SchemaRef,
-    ) -> Option<(Vec<String>, String)> {
-        // Without a time column to read, versions keep the order they arrive in.
-        let time_column = refresh
-            .time_column
-            .clone()
-            .filter(|column| incoming.field_with_name(column).is_ok())?;
+    /// The primary key and time column a refresh orders versions by, or `None` when it
+    /// keeps the last arrival instead. Rows that lack the time column fail the refresh
+    /// where the versions are read (`latest_by_time`), naming the column, rather than
+    /// switching the dataset to the last arrival.
+    fn version_ordering(&self, refresh: &Refresh) -> Option<(Vec<String>, String)> {
+        let time_column = refresh.time_column.clone()?;
         let accelerator_schema = self.accelerator.schema();
         let key_columns = self
             .accelerator
@@ -1362,9 +1354,7 @@ impl RefreshTask {
                     .unwrap_or_else(|| error.to_string()),
             })
         };
-        let Some((key_columns, time_column)) =
-            self.version_ordering(refresh, &update.data.schema())
-        else {
+        let Some((key_columns, time_column)) = self.version_ordering(refresh) else {
             return Ok(update);
         };
         let accelerator_schema = self.accelerator.schema();
