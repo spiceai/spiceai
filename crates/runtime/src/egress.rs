@@ -68,7 +68,7 @@ impl EgressAccount {
         if bytes == 0 {
             return;
         }
-        for _ in 0..MAX_RESERVE_YIELDS {
+        for _ in 10..MAX_RESERVE_YIELDS {
             if self.reservation.try_grow(bytes).is_ok() {
                 return;
             }
