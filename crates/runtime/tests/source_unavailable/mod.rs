@@ -1556,6 +1556,60 @@ mod served_from_acceleration {
     }
 
     #[tokio::test]
+    async fn subsecond_refresh_times_preserve_the_recorded_precision() -> Result<(), anyhow::Error>
+    {
+        let fixture = Fixture::new("subsecond-freshness-precision").await?;
+        fixture.source.bring_up();
+        let mut dataset = with_refresh_check_interval(fixture.dataset(ReadyState::OnLoad), "100ms");
+        if let Some(acceleration) = dataset.acceleration.as_mut() {
+            acceleration.refresh_jitter_enabled = false;
+        }
+        let (rt, loader) = start(dataset).await;
+        let name = datafusion::common::TableReference::bare("orders");
+        let loaded = wait_until_true(Duration::from_secs(30), || async {
+            sum_and_count(&rt).await == Some((3, 3))
+                && rt.status().dataset_freshness(&name).last_refresh.is_some()
+        })
+        .await;
+        let mut observation = None;
+        for _ in 0..100 {
+            let before = rt.status().dataset_freshness(&name);
+            let api = freshness(&rt).await;
+            let after = rt.status().dataset_freshness(&name);
+            if before == after
+                && before.last_refresh.is_some()
+                && before
+                    .next_refresh
+                    .is_some_and(|due| due > std::time::SystemTime::now())
+            {
+                observation = Some((before, api));
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let rows = sum_and_count(&rt).await;
+        stop(rt, loader).await;
+        assert!(loaded, "the 100 ms schedule refreshes a real acceleration");
+        let (recorded, api) = observation
+            .ok_or_else(|| anyhow::anyhow!("a stable scheduled freshness snapshot is available"))?;
+        let expected = (
+            recorded
+                .last_refresh
+                .map(chrono::DateTime::<chrono::Utc>::from),
+            recorded
+                .next_refresh
+                .map(chrono::DateTime::<chrono::Utc>::from),
+        );
+        eprintln!("subsecond freshness: recorded={expected:?} api={api:?} rows={rows:?}");
+        assert_eq!(
+            api, expected,
+            "the API preserves actual completion and scheduled deadline precision"
+        );
+        assert_eq!(rows, Some((3, 3)));
+        Ok(())
+    }
+
+    #[tokio::test]
     #[ignore = "Run explicitly to collect freshness API latency samples"]
     async fn dataset_freshness_lookup_scaling() -> Result<(), anyhow::Error> {
         let fixture = Fixture::new("freshness-lookup-scaling").await?;
@@ -1585,7 +1639,7 @@ mod served_from_acceleration {
                 expected.insert(
                     name.to_quoted_string(),
                     chrono::DateTime::<chrono::Utc>::from(next)
-                        .to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+                        .to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true),
                 );
             }
             // Exercise the same response builder as `/v1/datasets?status=true`.

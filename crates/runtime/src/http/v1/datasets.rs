@@ -291,7 +291,7 @@ fn dataset_freshness(
 }
 
 fn rfc3339(time: std::time::SystemTime) -> String {
-    chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    chrono::DateTime::<chrono::Utc>::from(time).to_rfc3339_opts(chrono::SecondsFormat::AutoSi, true)
 }
 
 #[derive(Debug, Serialize, Deserialize)]
