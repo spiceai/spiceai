@@ -512,13 +512,15 @@ pub fn deny_spice_functions_for_postgres_table_providers() -> FunctionSupport {
 #[cfg(test)]
 mod tests {
     use super::{
-        deny_spice_functions_for_bigquery_table_providers,
+        FunctionSupport, deny_spice_functions_for_bigquery_table_providers,
         deny_spice_functions_for_duckdb_dialect_without_carve_out,
         deny_spice_functions_for_duckdb_table_providers,
         deny_spice_functions_for_mysql_table_providers,
         deny_spice_functions_for_postgres_table_providers,
         deny_spice_functions_for_sqlite_table_providers, expression_support_for_engine,
     };
+    use std::sync::Arc;
+
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use datafusion::common::DFSchema;
     use datafusion::functions::core::expr_fn::{
