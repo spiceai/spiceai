@@ -71,6 +71,8 @@ limitations under the License.
 //! - [`constants`]: Staging-dir name, WAL filename, and other shared constants.
 //! - [`partitioned_wal`]: Cross-partition WAL for the partitioned-table
 //!   coordinator (feature-gated).
+pub(crate) mod append_commit;
+pub(crate) mod append_stage;
 pub(crate) mod clustering;
 pub(crate) mod cold_partition;
 pub(crate) mod column_stats;
@@ -87,6 +89,7 @@ pub(crate) mod file_digest;
 pub(crate) mod file_pruning;
 pub(crate) mod fsync_tier;
 pub(crate) mod inlined_cache;
+pub(crate) mod key_conflicts;
 pub(crate) mod lookup_index;
 pub(crate) mod maintenance;
 pub(crate) mod maintenance_metrics;
@@ -98,6 +101,7 @@ pub(crate) mod memory_account;
 pub(crate) mod mutation_writer;
 pub(crate) mod on_conflict;
 pub(crate) mod overwrite;
+pub(crate) mod overwrite_postpass;
 pub mod partitioned_wal;
 pub(crate) mod pk_index;
 pub(crate) mod pk_keyset_budget;
@@ -106,6 +110,7 @@ pub(crate) mod predicate_stats;
 pub(crate) mod protected_merge_claims;
 pub(crate) mod query_admission;
 pub(crate) mod retention;
+pub(crate) mod runtime_restricted_scan;
 pub(crate) mod scan;
 pub(crate) mod sink;
 pub(crate) mod staged_upsert;
@@ -117,6 +122,7 @@ pub(crate) mod transaction;
 pub(crate) mod tuning;
 #[cfg(test)]
 mod tuning_sim;
+pub(crate) mod update_keys;
 pub(crate) mod utils;
 pub(crate) mod vortex_format;
 pub(crate) mod wal_checksum;

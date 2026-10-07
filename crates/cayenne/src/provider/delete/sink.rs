@@ -491,6 +491,9 @@ pub struct CayenneDeletionSink {
     /// `None` when the caller already holds the write lock (e.g. retention filters applied
     /// during `write_all_append`).
     write_lock: Option<Arc<TokioMutex<()>>>,
+    /// Set once a write of the owning table could not learn whether its catalog
+    /// commit happened; the sink then refuses to run.
+    publication_outcome_unknown: Option<Arc<std::sync::atomic::AtomicBool>>,
     /// Shared in-memory sequence allocator (lever B2) of the owning
     /// `CayenneTableProvider`. The DML `DELETE` sink routes its sequence
     /// allocations through the SAME allocator as every other writer of this
@@ -576,11 +579,23 @@ impl CayenneDeletionSink {
             protected_snapshots,
             runtime_env,
             write_lock,
+            publication_outcome_unknown: None,
             seq_allocator,
             count_exact: false,
             scan_input_version: None,
             capture_locks: None,
         }
+    }
+
+    /// Refuse to run once `flag` is set: a write of the owning table could not
+    /// learn whether its catalog commit happened.
+    #[must_use]
+    pub(crate) fn with_publication_outcome_fence(
+        mut self,
+        flag: Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        self.publication_outcome_unknown = Some(flag);
+        self
     }
 
     /// Wire the owning table's capture locks, so the main listing is captured with the
@@ -1447,6 +1462,9 @@ impl DeletionSink for CayenneDeletionSink {
             Some(lock) => Some(lock.lock().await),
             None => None,
         };
+        if let Some(flag) = &self.publication_outcome_unknown {
+            super::super::table::ensure_outcome_known(flag, &self.table_metadata.table_name)?;
+        }
 
         let ctx = SessionContext::new_with_config_rt(
             util::session_state::session_config(),

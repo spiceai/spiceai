@@ -108,6 +108,10 @@ use util::{RetryError, retry};
 pub mod changes;
 #[cfg(test)]
 mod deletion;
+mod latest_by_time;
+
+/// The largest UTC offset a time may carry (+14:00), in nanoseconds.
+const MAX_UTC_OFFSET_NANOS: u128 = 14 * 3_600 * 1_000_000_000;
 
 // Reuse the single shared schema-evolution instrument rather than registering a
 // same-named counter under a second meter.
@@ -242,6 +246,10 @@ pub struct RefreshTaskBuilder {
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
     resource_monitor: Option<runtime_resources::ResourceMonitor>,
+    /// The runtime's query `RuntimeEnv`: its memory pool bounds what a refresh holds in
+    /// memory, and its disk manager is where the refresh spills. `None` uses an unbounded
+    /// default.
+    query_runtime_env: Option<Arc<datafusion::execution::runtime_env::RuntimeEnv>>,
     /// Mutex to protect concurrent access to the accelerator during cache/snapshot operations.
     accelerator_write_mutex: Arc<Mutex<()>>,
     on_stream_batch_process_callback: Option<StreamBatchProcessCallback>,
@@ -294,6 +302,7 @@ impl RefreshTaskBuilder {
             cpu_runtime: None,
             io_runtime,
             resource_monitor: None,
+            query_runtime_env: None,
             accelerator_write_mutex,
             on_stream_batch_process_callback: None,
             last_updated_at: Arc::new(AtomicI64::new(0)),
@@ -357,6 +366,15 @@ impl RefreshTaskBuilder {
         monitor: runtime_resources::ResourceMonitor,
     ) -> RefreshTaskBuilder {
         self.resource_monitor = Some(monitor);
+        self
+    }
+
+    #[must_use]
+    pub fn with_query_runtime_env(
+        mut self,
+        runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+    ) -> RefreshTaskBuilder {
+        self.query_runtime_env = Some(runtime_env);
         self
     }
 
@@ -490,6 +508,7 @@ impl RefreshTaskBuilder {
             cpu_runtime: self.cpu_runtime,
             io_runtime: self.io_runtime,
             resource_monitor: self.resource_monitor,
+            query_runtime_env: self.query_runtime_env,
             accelerator_write_mutex: self.accelerator_write_mutex,
             on_stream_batch_process_callback: self.on_stream_batch_process_callback,
             last_updated_at: self.last_updated_at,
@@ -523,9 +542,12 @@ pub(crate) struct DatasetMetricLabels {
 
 impl DatasetMetricLabels {
     pub(crate) fn new(dataset_name: &TableReference) -> Self {
-        let name: Arc<str> = Arc::from(dataset_name.to_string());
+        Self::from_name(&dataset_name.to_string())
+    }
+
+    pub(crate) fn from_name(dataset_name: &str) -> Self {
         Self {
-            dataset_only: [KeyValue::new("dataset", name)],
+            dataset_only: [KeyValue::new("dataset", Arc::<str>::from(dataset_name))],
         }
     }
 
@@ -560,6 +582,10 @@ pub struct RefreshTask {
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
     resource_monitor: Option<runtime_resources::ResourceMonitor>,
+    /// The runtime's query `RuntimeEnv`: its memory pool bounds what a refresh holds in
+    /// memory, and its disk manager is where the refresh spills. `None` uses an unbounded
+    /// default.
+    query_runtime_env: Option<Arc<datafusion::execution::runtime_env::RuntimeEnv>>,
     /// Mutex to protect concurrent access to the accelerator during cache/snapshot operations.
     accelerator_write_mutex: Arc<Mutex<()>>,
     on_stream_batch_process_callback: Option<StreamBatchProcessCallback>,
@@ -837,8 +863,15 @@ impl RefreshTask {
                 unreachable!("Refresh cannot be called when acceleration is disabled")
             }
             RefreshMode::Full => {
-                self.get_full_or_incremental_append_update(refresh, None)
+                match self
+                    .get_full_or_incremental_append_update(refresh, None)
                     .await
+                {
+                    Ok(update) if refresh.versions_by_time.is_some() => {
+                        self.select_latest_by_time(refresh, update, None).await
+                    }
+                    other => other,
+                }
             }
             RefreshMode::Append => self.get_incremental_append_update(refresh).await,
             RefreshMode::Changes => unreachable!("changes are handled upstream"),
@@ -1029,6 +1062,8 @@ impl RefreshTask {
         };
 
         let schema = Arc::clone(&data_update.data.schema());
+        let row_versions = data_update.row_versions.clone();
+        let counted_before_write = data_update.superseded.clone();
 
         let (notify_written_data_stat_available, mut on_written_data_stat_available) =
             oneshot::channel::<RefreshStat>();
@@ -1123,7 +1158,23 @@ impl RefreshTask {
         let sink = &*sink_lock;
 
         let _lock_guard = self.accelerator_write_mutex.lock().await;
-        if let Err(e) = sink.insert_into(record_batch_stream, overwrite).await {
+        // Ordering versions by time, the refresh may have counted the rows it did not
+        // keep before the write; then the table counts none of its own.
+        let (superseded, table_counts) = match counted_before_write {
+            Some(rows) => (rows, false),
+            None => (
+                Arc::new(util::session_state::SupersededRows::default()),
+                true,
+            ),
+        };
+        let write = super::sink::RefreshWrite {
+            superseded: table_counts.then(|| Arc::clone(&superseded)),
+            row_versions,
+        };
+        if let Err(e) = sink
+            .insert_into(record_batch_stream, overwrite, &write)
+            .await
+        {
             let error_message = format_datafusion_error(&e);
             self.set_refresh_status(
                 sql,
@@ -1146,6 +1197,10 @@ impl RefreshTask {
         } else {
             None
         };
+
+        // Rows the table did not keep, counted only once the write succeeded:
+        // a failed refresh changes nothing.
+        super::superseded::record(&self.dataset_metric_labels, &superseded);
 
         let refresh_stat = on_written_data_stat_available.try_recv().ok();
 
@@ -1272,6 +1327,18 @@ impl RefreshTask {
                     .get_full_or_incremental_append_update(refresh, timestamp)
                     .await
                 {
+                    // Ordering versions by time replaces the exact-row dedupe: it is
+                    // seeded with the stored keys and times from the same window start.
+                    // A refresh that keeps the last arrival still needs the dedupe, or
+                    // every append re-adds its whole overlap window.
+                    Ok(data)
+                        if refresh.versions_by_time.is_some()
+                            && self
+                                .version_ordering(refresh, &data.data.schema())
+                                .is_some() =>
+                    {
+                        self.select_latest_by_time(refresh, data, timestamp).await
+                    }
                     // Reuse `timestamp`: the dedupe must compare against the same mark the
                     // source filter just used, not a freshly read one (#12492).
                     Ok(data) => match self
@@ -1291,6 +1358,190 @@ impl RefreshTask {
                 Err(e)
             }
         }
+    }
+
+    /// The primary key and time column a refresh reading `incoming` orders versions by,
+    /// or `None` when it keeps the last arrival instead.
+    fn version_ordering(
+        &self,
+        refresh: &Refresh,
+        incoming: &SchemaRef,
+    ) -> Option<(Vec<String>, String)> {
+        // Without a time column to read, versions keep the order they arrive in.
+        let time_column = refresh
+            .time_column
+            .clone()
+            .filter(|column| incoming.field_with_name(column).is_ok())?;
+        let accelerator_schema = self.accelerator.schema();
+        let key_columns = self
+            .accelerator
+            .constraints()
+            .map_or_else(Vec::new, |constraints| {
+                data_accelerator_api::get_primary_keys_from_constraints(
+                    constraints,
+                    &accelerator_schema,
+                )
+            });
+        // A table without a primary key keeps every row, and one whose key holds the
+        // time column gives every version a key of its own.
+        if key_columns.is_empty() || key_columns.contains(&time_column) {
+            return None;
+        }
+        Some((key_columns, time_column))
+    }
+
+    /// Keep the newest version of each key by `time_column`: pass on only rows newer
+    /// than the version of their key already kept. When `window_start` is set (an
+    /// append), the selector is
+    /// first seeded with the keys and times the acceleration stores from that same window
+    /// start the source fetch used: any stored row newer than an incoming row is at or after
+    /// it, so nothing earlier needs reading.
+    async fn select_latest_by_time(
+        &self,
+        refresh: &Refresh,
+        update: StreamingDataUpdate,
+        window_start: Option<u128>,
+    ) -> Result<StreamingDataUpdate, RetryError<super::Error>> {
+        let dataset = self.dataset_name.to_string();
+        let not_applied = |error: &DataFusionError| {
+            RetryError::permanent(super::Error::RefreshNotApplied {
+                message: latest_by_time::not_applied_message(error)
+                    .unwrap_or_else(|| error.to_string()),
+            })
+        };
+        let Some((key_columns, time_column)) =
+            self.version_ordering(refresh, &update.data.schema())
+        else {
+            return Ok(update);
+        };
+        let accelerator_schema = self.accelerator.schema();
+        // A synchronized child writes the same rows but cannot read their versions, so
+        // a dataset with one resolves them here, before the rows reach either table.
+        let dedup = refresh.versions_by_time.unwrap_or_default();
+        // The accelerator orders a key's copies by version only against the copies one
+        // write holds: a write that replaces the table, or an append it loads into an
+        // empty table (which it confirms itself, refusing the append otherwise). An
+        // append with no high-water mark reads the whole source, so into an empty
+        // acceleration it is such a load; a retention filter keeps it off that path.
+        if dedup.versions_resolved_after_write
+            && window_start.is_none()
+            && self.sink.read().await.synchronized_tables().is_empty()
+            && match update.update_type {
+                UpdateType::Overwrite => true,
+                UpdateType::Append => {
+                    dedup.appends_resolved_after_write
+                        && refresh.write_retention_sql_delete_expr.is_none()
+                        && self.acceleration_is_empty().await?
+                }
+                UpdateType::Changes => false,
+            }
+        {
+            // The accelerator reads each row's version once as it writes it, fails
+            // the write on an unreadable time, and keeps each key's greatest
+            // version, so the rows go to it untouched.
+            let row_versions = latest_by_time::row_versions(
+                &dataset,
+                &update.data.schema(),
+                &key_columns,
+                time_column,
+                refresh.time_format,
+            )
+            .map_err(|e| not_applied(&e))?;
+            return Ok(update.with_row_versions(Some(row_versions)));
+        }
+        let mut selector = latest_by_time::LatestByTime::try_new(
+            &dataset,
+            &update.data.schema(),
+            key_columns.clone(),
+            time_column.clone(),
+            refresh.time_format,
+        )
+        .map_err(|e| not_applied(&e))?;
+        if let Some(runtime_env) = &self.query_runtime_env {
+            selector = selector.with_runtime_env(Arc::clone(runtime_env));
+        }
+
+        if let Some(value) = window_start
+            && let Some(filter_converter) = self.get_accelerator_filter_converter(refresh)
+        {
+            let federated_provider = self.federated.table_provider().await;
+            let ctx = Self::create_refresh_df_context(
+                federated_provider,
+                &self.dataset_name,
+                &self.accelerator,
+                self.disable_federation,
+                self.io_runtime.clone(),
+            )
+            .await;
+            // Every incoming column: a stored row's content hash tells a re-read of
+            // it from a correction with the same time.
+            let incoming = update.data.schema();
+            let columns: Vec<&str> = incoming
+                .fields()
+                .iter()
+                .map(|f| f.name().as_str())
+                .collect();
+            // A string time column is filtered by comparing strings, which misorders values
+            // with different UTC offsets; starting the read 14 hours (the largest offset)
+            // earlier can only add rows, which the selector then compares as instants. A
+            // window within 14 hours of 1970 has no earlier start (`value` cannot go below
+            // it), and a time such as `1969-12-31T23:30:00-01:00` sorts before any start
+            // string while being later than it, so every stored row is read instead.
+            let string_time = accelerator_schema
+                .field_with_name(&time_column)
+                .is_ok_and(|f| {
+                    matches!(
+                        f.data_type(),
+                        DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View
+                    )
+                });
+            let start = if string_time {
+                value.checked_sub(MAX_UTC_OFFSET_NANOS)
+            } else {
+                Some(value)
+            };
+            // Read when the write first pulls rows, which it does holding the
+            // accelerator write lock, so no write lands between the read and the
+            // write it decides.
+            let stored = accelerator_df(&Arc::clone(&self.accelerator), &ctx)
+                .and_then(|df| match start {
+                    Some(start) => df.filter(filter_converter.convert_high_water_mark(start)),
+                    None => Ok(df),
+                })
+                .and_then(|df| df.select_columns(&columns))
+                .map_err(find_datafusion_root)
+                .context(super::UnableToScanTableProviderSnafu)?;
+            return Ok(latest_by_time::select_latest_after_seeding(
+                selector, stored, update,
+            ));
+        }
+
+        Ok(latest_by_time::select_latest(selector, update))
+    }
+
+    /// Whether the acceleration holds no rows, read rather than inferred from a missing
+    /// high-water mark, which rows with a NULL time would also give.
+    async fn acceleration_is_empty(&self) -> Result<bool, RetryError<super::Error>> {
+        let federated_provider = self.federated.table_provider().await;
+        let ctx = Self::create_refresh_df_context(
+            federated_provider,
+            &self.dataset_name,
+            &self.accelerator,
+            self.disable_federation,
+            self.io_runtime.clone(),
+        )
+        .await;
+        let rows = accelerator_df(&Arc::clone(&self.accelerator), &ctx)
+            .and_then(|df| df.limit(0, Some(1)))
+            .map_err(find_datafusion_root)
+            .context(super::UnableToScanTableProviderSnafu)
+            .map_err(RetryError::permanent)?
+            .count()
+            .await
+            .map_err(find_datafusion_root)
+            .context(super::UnableToScanTableProviderSnafu)
+            .map_err(RetryError::permanent)?;
+        Ok(rows == 0)
     }
 
     async fn refresh_stale_cached_rows(
@@ -3119,6 +3370,11 @@ fn dedup_predicates(
 }
 
 pub(crate) fn retry_from_df_error(error: DataFusionError) -> RetryError<super::Error> {
+    // A refresh the dataset's configuration refused (e.g. a `time_column` value that
+    // cannot be read while ordering versions by time) carries its own complete cause.
+    if let Some(message) = latest_by_time::not_applied_message(&error) {
+        return RetryError::permanent(super::Error::RefreshNotApplied { message });
+    }
     if is_retriable_error(&error) || is_object_generation_changed_error(&error) {
         return RetryError::transient(super::Error::UnableToGetDataFromConnector {
             source: find_datafusion_root(error),

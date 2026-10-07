@@ -121,6 +121,7 @@ impl DataSink for CayennePartitionedOverwriteSink {
         // file writers; the session config drives that count to match the
         // rest of the query (see PR #10822).
         let target_partitions = context.session_config().target_partitions();
+        let superseded = util::session_state::superseded_rows(context.session_config());
 
         // Step 1: route each input batch to its partition's writer task.
         // On first-seen partition, spawn a `tokio::task` that calls
@@ -151,7 +152,11 @@ impl DataSink for CayennePartitionedOverwriteSink {
                     s.clone()
                 } else {
                     let (handle, tx) = self
-                        .prepare_new_provider_for_partition(partition_values, target_partitions)
+                        .prepare_new_provider_for_partition(
+                            partition_values,
+                            target_partitions,
+                            superseded.clone(),
+                        )
                         .await?;
                     senders.insert(partition_key.clone(), tx.clone());
                     handles.push(handle);
@@ -185,7 +190,11 @@ impl DataSink for CayennePartitionedOverwriteSink {
             };
             for partition_values in unreached {
                 match self
-                    .prepare_new_provider_for_partition(partition_values, target_partitions)
+                    .prepare_new_provider_for_partition(
+                        partition_values,
+                        target_partitions,
+                        superseded.clone(),
+                    )
                     .await
                 {
                     Ok((handle, sender)) => {
@@ -394,6 +403,7 @@ impl CayennePartitionedOverwriteSink {
         &self,
         partition_values: Vec<ScalarValue>,
         target_partitions: usize,
+        superseded: Option<Arc<util::session_state::SupersededRows>>,
     ) -> Result<
         (
             JoinHandle<cayenne::provider::Result<PreparedOverwrite>>,
@@ -412,7 +422,9 @@ impl CayennePartitionedOverwriteSink {
             )
         })?;
 
-        let cayenne_owned = cayenne.clone_for_write_operations();
+        let cayenne_owned = cayenne
+            .clone_for_write_operations()
+            .with_superseded_rows(superseded);
         let (tx, rx) = mpsc::channel::<datafusion::common::Result<RecordBatch>>(
             PARTITION_WRITER_CHANNEL_DEPTH,
         );

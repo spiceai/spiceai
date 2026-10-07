@@ -44,7 +44,7 @@ use crate::{
     UnableToLoadDatasetConnectorSnafu, UnknownDataConnectorSnafu,
     component::dataset::{
         Dataset,
-        acceleration::{Acceleration, DurableWriteBackKey, Mode, RefreshMode},
+        acceleration::{Acceleration, DurableWriteBackKey, Engine, Mode, RefreshMode},
         builder::DatasetBuilder,
     },
     component::{
@@ -165,6 +165,32 @@ pub(crate) fn warn_about_acceleration_block(
     let sets_deprecated_ready_state = acceleration.ready_state.is_some();
     if sets_deprecated_ready_state {
         tracing::warn!("{}", deprecated_ready_state_warning(component, name));
+    }
+}
+
+/// Publish `dataset_acceleration_rows_superseded` at `0` for each reason a
+/// refresh of `ds` can report, so the series exist before the first one. A
+/// dataset whose refreshes report none gets no series.
+fn seed_superseded_rows(ds: &Dataset, data_connector: &dyn DataConnector) {
+    use util::session_state::SupersededReason;
+
+    let Some(acceleration) = ds.acceleration.as_ref().filter(|a| a.enabled) else {
+        return;
+    };
+    let refresh_mode = data_connector.resolve_refresh_mode(acceleration.refresh_mode);
+    let reasons: &[SupersededReason] = match cayenne_key_rule(ds, acceleration, refresh_mode) {
+        Some(KeyRule::NewestByTime(_)) => &[SupersededReason::Older, SupersededReason::Arrival],
+        Some(KeyRule::LastArrival) => &[SupersededReason::Arrival],
+        Some(KeyRule::ChangeOrder) | None => return,
+    };
+    for reason in reasons {
+        metrics::acceleration::ROWS_SUPERSEDED.add(
+            0,
+            &[
+                KeyValue::new("dataset", ds.name.to_string()),
+                KeyValue::new("reason", reason.label()),
+            ],
+        );
     }
 }
 
@@ -1201,6 +1227,32 @@ impl Runtime {
             return Err(err);
         }
 
+        if let Some(acceleration) = ds.acceleration.as_ref().filter(|a| a.enabled) {
+            let refresh_mode = data_connector.resolve_refresh_mode(acceleration.refresh_mode);
+            let dataset_name = ds.name.to_string();
+            let rule = cayenne_key_rule(&ds, acceleration, refresh_mode);
+            if let (Some(rule), Some(key)) = (rule, acceleration.primary_key.as_ref()) {
+                tracing::info!("{}", key_rule_line(&dataset_name, key, rule));
+            }
+            if !acceleration.on_conflict.is_empty() {
+                let warning = if acceleration.engine == Engine::Cayenne {
+                    cayenne_on_conflict_warning(&dataset_name, acceleration, rule)
+                } else {
+                    deprecated_on_conflict_warning(&dataset_name)
+                };
+                tracing::warn!("{warning}");
+            }
+            if let Some(KeyRule::NewestByTime(time_column)) = rule
+                && refresh_mode == RefreshMode::Append
+                && acceleration.refresh_append_overlap.is_none()
+            {
+                tracing::warn!(
+                    "{}",
+                    newest_by_time_without_overlap_warning(&dataset_name, time_column)
+                );
+            }
+        }
+
         // A `drasi` block only takes effect through the change stream, so a
         // dataset without one forwards nothing. Silently publishing no changes
         // to a configured Drasi source is worse than refusing the dataset: the
@@ -1427,6 +1479,7 @@ impl Runtime {
                 if !replaces_snapshot_reader {
                     metrics::datasets::COUNT.add(1, &[KeyValue::new("engine", engine)]);
                 }
+                seed_superseded_rows(&ds, data_connector.as_ref());
 
                 if let Some(message) = schema_change_failure {
                     self.status.update_dataset(
@@ -2128,6 +2181,18 @@ impl Runtime {
             && !replicate
         {
             crate::AcceleratedWriteBackWithoutReplicationSnafu {
+                dataset_name: ds.name.to_string(),
+            }
+            .fail()?;
+        }
+        // Writes kept only in the acceleration would be overwritten by the changes a
+        // change stream applies for the same keys. The connector's default counts:
+        // a CDC source refreshes by changes when `refresh_mode` is omitted.
+        if acceleration_settings.write_mode == spicepod::acceleration::WriteMode::Acceleration
+            && data_connector.resolve_refresh_mode(acceleration_settings.refresh_mode)
+                == RefreshMode::Changes
+        {
+            crate::AccelerationWriteModeWithChangesSnafu {
                 dataset_name: ds.name.to_string(),
             }
             .fail()?;
@@ -2841,6 +2906,134 @@ async fn await_hot_reload_initial_refresh(
     .fail()
 }
 
+/// What a Cayenne dataset with a primary key keeps of a key it sees again.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyRule<'a> {
+    /// The newest version by this `time_column`, the later arrival on a tie.
+    NewestByTime(&'a str),
+    /// The version that arrived last.
+    LastArrival,
+    /// Each source change, applied in order.
+    ChangeOrder,
+}
+
+/// The rule a Cayenne dataset with a declared primary key applies to a repeated
+/// key; `None` for another engine or a dataset without one.
+fn cayenne_key_rule<'a>(
+    ds: &'a Dataset,
+    acceleration: &Acceleration,
+    refresh_mode: RefreshMode,
+) -> Option<KeyRule<'a>> {
+    let key = acceleration
+        .primary_key
+        .as_ref()
+        .filter(|_| acceleration.engine == Engine::Cayenne)?;
+    Some(key_rule(
+        acceleration,
+        key,
+        ds.time_column.as_deref(),
+        refresh_mode,
+    ))
+}
+
+/// The rule `acceleration`, keyed on `key`, applies to a repeated key; see
+/// `Acceleration::orders_versions_by_time`.
+fn key_rule<'a>(
+    acceleration: &Acceleration,
+    key: &datafusion_table_providers::util::column_reference::ColumnReference,
+    time_column: Option<&'a str>,
+    refresh_mode: RefreshMode,
+) -> KeyRule<'a> {
+    if refresh_mode == RefreshMode::Changes {
+        return KeyRule::ChangeOrder;
+    }
+    match time_column {
+        Some(time_column)
+            if acceleration.orders_versions_by_time(Some(time_column), refresh_mode)
+                && !key.iter().any(|column| column == time_column) =>
+        {
+            KeyRule::NewestByTime(time_column)
+        }
+        _ => KeyRule::LastArrival,
+    }
+}
+
+/// The line a Cayenne dataset with a primary key logs at load, stating the rule it
+/// keeps one row per key by (#14576).
+fn key_rule_line(
+    dataset_name: &str,
+    key: &datafusion_table_providers::util::column_reference::ColumnReference,
+    rule: KeyRule<'_>,
+) -> String {
+    match rule {
+        KeyRule::NewestByTime(time_column) => format!(
+            "Dataset '{dataset_name}' keeps one row per '{key}': the newest by '{time_column}', or the version that arrived last when times are equal."
+        ),
+        KeyRule::LastArrival => format!(
+            "Dataset '{dataset_name}' keeps one row per '{key}': the version that arrived last, which can differ between refreshes; set `time_column` for a reproducible result."
+        ),
+        KeyRule::ChangeOrder => format!(
+            "Dataset '{dataset_name}' keeps one row per '{key}', applying each source change in order."
+        ),
+    }
+}
+
+/// The `on_conflict` upsert value `options` stand for, as a Spicepod spells it.
+fn upsert_name(
+    options: &datafusion_table_providers::util::constraints::UpsertOptions,
+) -> &'static str {
+    if options.last_write_wins {
+        "upsert_dedup_by_row_id"
+    } else if options.remove_duplicates {
+        "upsert_dedup"
+    } else {
+        "upsert"
+    }
+}
+
+/// The warning for a Cayenne dataset that sets `on_conflict`, which it no longer
+/// reads, naming any change in which version of a key it keeps; `rule` is `None`
+/// when the dataset declares no primary key.
+fn cayenne_on_conflict_warning(
+    dataset_name: &str,
+    acceleration: &Acceleration,
+    rule: Option<KeyRule<'_>>,
+) -> String {
+    use crate::component::dataset::acceleration::OnConflictBehavior;
+    let kept = match rule {
+        Some(KeyRule::NewestByTime(time_column)) => format!("the newest by '{time_column}'"),
+        _ => "the last to arrive".to_string(),
+    };
+    let change = match (acceleration.on_conflict.values().next(), rule) {
+        (Some(OnConflictBehavior::Drop), Some(KeyRule::NewestByTime(_) | KeyRule::LastArrival)) => {
+            format!("; `drop` kept the first version of a key, and now {kept} is kept.")
+        }
+        (Some(OnConflictBehavior::Upsert(options)), Some(KeyRule::NewestByTime(_))) => format!(
+            "; `{}` did not order a key's versions by time, and now {kept} is kept.",
+            upsert_name(options)
+        ),
+        _ => ".".to_string(),
+    };
+    format!(
+        "Dataset '{dataset_name}' sets `acceleration.on_conflict`, which Cayenne no longer uses{change} Remove `on_conflict`. See: https://spiceai.org/docs/features/data-acceleration/constraints"
+    )
+}
+
+/// The warning for a dataset on another accelerator that sets `on_conflict`.
+fn deprecated_on_conflict_warning(dataset_name: &str) -> String {
+    format!(
+        "Dataset '{dataset_name}' sets `acceleration.on_conflict`, which is deprecated and removed in 3.0. Use `engine: cayenne` to keep one row per primary key without it."
+    )
+}
+
+/// Warning for an append that keeps the newest version of each key by `time_column`
+/// but has no `refresh_append_overlap`, so it never re-reads a late row.
+fn newest_by_time_without_overlap_warning(dataset_name: &str, time_column: &str) -> String {
+    format!(
+        "Dataset '{dataset_name}' keeps the newest version of each key by '{time_column}', but without `refresh_append_overlap` an append never re-reads late rows, so a late update is not loaded. Set `refresh_append_overlap` to how late rows can arrive. See: https://spiceai.org/docs/features/data-acceleration/constraints"
+    )
+}
+
 /// Returns `true` when a dataset load failure cannot be cleared by retrying it.
 ///
 /// `load_dataset` retries with unbounded backoff and only short-circuits on
@@ -3271,6 +3464,126 @@ fn with_localpod_dependents(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod key_rule {
+        use super::*;
+        use datafusion_table_providers::util::column_reference::ColumnReference;
+
+        fn acceleration(engine: &str, on_conflict: Option<&str>) -> Acceleration {
+            let mut spicepod = spicepod::acceleration::Acceleration {
+                engine: Some(engine.to_string()),
+                primary_key: Some("id".to_string()),
+                ..Default::default()
+            };
+            if let Some(value) = on_conflict {
+                spicepod.on_conflict.insert(
+                    "id".to_string(),
+                    serde_json::from_value(serde_json::Value::String(value.to_string()))
+                        .expect("an on_conflict value"),
+                );
+            }
+            Acceleration::try_from(spicepod).expect("valid acceleration")
+        }
+
+        fn id() -> ColumnReference {
+            ColumnReference::new(vec!["id".to_string()])
+        }
+
+        #[test]
+        fn the_rule_follows_the_time_column_and_refresh_mode() {
+            let cayenne = acceleration("cayenne", None);
+            for mode in [RefreshMode::Full, RefreshMode::Append] {
+                assert_eq!(
+                    key_rule(&cayenne, &id(), Some("updated_at"), mode),
+                    KeyRule::NewestByTime("updated_at")
+                );
+                assert_eq!(key_rule(&cayenne, &id(), None, mode), KeyRule::LastArrival);
+            }
+            assert_eq!(
+                key_rule(&cayenne, &id(), Some("updated_at"), RefreshMode::Changes),
+                KeyRule::ChangeOrder
+            );
+            // A key that holds the time column gives every version a key of its own.
+            let keyed_on_time = ColumnReference::new(vec!["id".to_string(), "at".to_string()]);
+            assert_eq!(
+                key_rule(&cayenne, &keyed_on_time, Some("at"), RefreshMode::Full),
+                KeyRule::LastArrival
+            );
+        }
+
+        #[test]
+        fn the_load_line_states_the_rule() {
+            assert_eq!(
+                key_rule_line("events", &id(), KeyRule::NewestByTime("updated_at")),
+                "Dataset 'events' keeps one row per 'id': the newest by 'updated_at', or the version that arrived last when times are equal."
+            );
+            assert_eq!(
+                key_rule_line("events", &id(), KeyRule::LastArrival),
+                "Dataset 'events' keeps one row per 'id': the version that arrived last, which can differ between refreshes; set `time_column` for a reproducible result."
+            );
+            assert_eq!(
+                key_rule_line("orders", &id(), KeyRule::ChangeOrder),
+                "Dataset 'orders' keeps one row per 'id', applying each source change in order."
+            );
+            let composite = ColumnReference::new(vec!["region".to_string(), "id".to_string()]);
+            assert_eq!(
+                key_rule_line("orders", &composite, KeyRule::LastArrival),
+                "Dataset 'orders' keeps one row per '(id, region)': the version that arrived last, which can differ between refreshes; set `time_column` for a reproducible result."
+            );
+        }
+
+        #[test]
+        fn the_cayenne_warning_names_what_changed() {
+            assert_eq!(
+                cayenne_on_conflict_warning(
+                    "events",
+                    &acceleration("cayenne", Some("drop")),
+                    Some(KeyRule::NewestByTime("updated_at")),
+                ),
+                "Dataset 'events' sets `acceleration.on_conflict`, which Cayenne no longer uses; `drop` kept the first version of a key, and now the newest by 'updated_at' is kept. Remove `on_conflict`. See: https://spiceai.org/docs/features/data-acceleration/constraints"
+            );
+            assert_eq!(
+                cayenne_on_conflict_warning(
+                    "events",
+                    &acceleration("cayenne", Some("drop")),
+                    Some(KeyRule::LastArrival),
+                ),
+                "Dataset 'events' sets `acceleration.on_conflict`, which Cayenne no longer uses; `drop` kept the first version of a key, and now the last to arrive is kept. Remove `on_conflict`. See: https://spiceai.org/docs/features/data-acceleration/constraints"
+            );
+            assert_eq!(
+                cayenne_on_conflict_warning(
+                    "events",
+                    &acceleration("cayenne", Some("upsert")),
+                    Some(KeyRule::NewestByTime("updated_at")),
+                ),
+                "Dataset 'events' sets `acceleration.on_conflict`, which Cayenne no longer uses; `upsert` did not order a key's versions by time, and now the newest by 'updated_at' is kept. Remove `on_conflict`. See: https://spiceai.org/docs/features/data-acceleration/constraints"
+            );
+            assert_eq!(
+                cayenne_on_conflict_warning(
+                    "events",
+                    &acceleration("cayenne", Some("upsert")),
+                    Some(KeyRule::LastArrival),
+                ),
+                "Dataset 'events' sets `acceleration.on_conflict`, which Cayenne no longer uses. Remove `on_conflict`. See: https://spiceai.org/docs/features/data-acceleration/constraints"
+            );
+        }
+
+        #[test]
+        fn other_engines_are_told_on_conflict_is_removed_in_3_0() {
+            assert_eq!(
+                deprecated_on_conflict_warning("orders"),
+                "Dataset 'orders' sets `acceleration.on_conflict`, which is deprecated and removed in 3.0. Use `engine: cayenne` to keep one row per primary key without it."
+            );
+        }
+    }
+
+    #[test]
+    fn the_no_overlap_warning_explains_what_is_never_fetched() {
+        assert_eq!(
+            newest_by_time_without_overlap_warning("events", "updated_at"),
+            "Dataset 'events' keeps the newest version of each key by 'updated_at', but without `refresh_append_overlap` an append never re-reads late rows, so a late update is not loaded. Set `refresh_append_overlap` to how late rows can arrive. See: https://spiceai.org/docs/features/data-acceleration/constraints"
+        );
+    }
 
     /// Every retention setting has to be recognised, whichever one the dataset
     /// carries: a prune can remove a row that was acknowledged to the writer and
