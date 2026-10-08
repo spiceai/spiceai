@@ -98,6 +98,7 @@ pub(crate) mod resource_starvation;
 /// acceleration's `indexes`), so a check can prove a query used row selection
 /// rather than silently falling back to an ordinary scan.
 pub mod lookup_index {
+    pub use crate::provider::IndexPersistence;
     pub use crate::provider::lookup_index::{LookupIndexCounters, LookupIndexVerification};
 }
 
@@ -124,7 +125,9 @@ pub use metastore::sqlite::{SqliteAutoVacuum, SqliteMetastoreConfig, set_sqlite_
 #[cfg(feature = "partition-table-provider")]
 pub use partition_creator::CayennePartitionCreator;
 pub use provider::RebuildableWrite;
-pub use provider::constants::{STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME};
+pub use provider::constants::{
+    LOOKUP_INDEX_DIR_NAME, STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME,
+};
 pub use provider::{
     CayenneCdcWrite, CayenneContext, CayenneStagedAppend, CayenneStagedUpsert,
     CayenneTableProvider, CayenneTableProviderBuilder, CayenneTransaction, EncodeBudgetSnapshot,

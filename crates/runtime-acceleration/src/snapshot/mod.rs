@@ -2175,6 +2175,11 @@ impl SnapshotManager {
             .into_iter()
             .map(|e| (e.archive_path, e.bytes))
             .collect();
+        let optional_files: Vec<(PathBuf, String)> = plan
+            .optional_files
+            .into_iter()
+            .map(|file| (file.source, file.archive_path))
+            .collect();
 
         // Step 1: Create a temporary tar archive of all directories
         let temp_archive_path = std::env::temp_dir().join(format!(
@@ -2189,6 +2194,7 @@ impl SnapshotManager {
             &temp_archive_path,
             &skip_paths,
             &extras,
+            &optional_files,
         )
         .await
         {
@@ -4845,6 +4851,7 @@ mod tests {
                 (data_dir, "data/".to_string()),
             ],
             &archive,
+            &[],
             &[],
             &[],
         )
