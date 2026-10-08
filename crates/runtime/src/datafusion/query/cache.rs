@@ -2751,6 +2751,48 @@ mod tests {
         );
     }
 
+    /// Both revalidations are still fresh — no table change — so this is the
+    /// admission that used an unconditional insert. The later resident must
+    /// stay.
+    #[tokio::test]
+    async fn test_swr_revalidation_keeps_a_newer_fresh_resident() {
+        let df = prepare_runtime(Some(sql_cache_config(Some("5m")))).await;
+        let cache_provider = df
+            .results_cache_provider()
+            .expect("results cache should be configured");
+        let (schema, batch) = one_row_batch();
+        let tables = Arc::new(HashSet::from([TableReference::bare("fresh_table")]));
+        let key = RawCacheKey::new(45);
+
+        let older = std::time::Instant::now();
+        tick().await;
+        let newer = std::time::Instant::now();
+
+        Query::cache_revalidation_result(
+            &df,
+            &key,
+            vec![batch.clone()],
+            Arc::clone(&schema),
+            Arc::clone(&tables),
+            newer,
+            None,
+        )
+        .await;
+        Query::cache_revalidation_result(&df, &key, vec![batch], schema, tables, older, None).await;
+        cache_provider.run_pending_tasks().await;
+
+        let (entry, validity) = cache_provider
+            .get_raw_key_with_validity(&key)
+            .await
+            .expect("cache access should succeed")
+            .expect("the newer result must still be cached");
+        assert_eq!(
+            entry.read_started_at, newer,
+            "a fresh admission must not replace a resident that began reading later"
+        );
+        assert_eq!(validity, cache::EntryValidity::Valid);
+    }
+
     /// Reports a fixed [`MetricsSet`], standing in for an `HttpExec` whose
     /// `HTTP_TRANSIENT_FAILURE_METRIC_NAME` counter was incremented by a
     /// fetch a narrow projection then excluded `response_status` from.

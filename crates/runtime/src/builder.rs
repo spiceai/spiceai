@@ -960,22 +960,24 @@ impl Default for RuntimeBuilder {
 )]
 async fn build_http_rate_control_registry(
     source_rate_control: Option<&SpicepodSourceRateControl>,
-    _runtime_state: Option<&spicepod::component::runtime::RuntimeState>,
+    runtime_state: Option<&spicepod::component::runtime::RuntimeState>,
     secrets: Arc<RwLock<Secrets>>,
     io_runtime: Handle,
 ) -> Arc<dataconnector::http_rate_control::HttpRateControlRegistry> {
-    let _ = (&secrets, &io_runtime);
-    if source_rate_control
-        .and_then(|config| config.state_location.as_ref())
-        .is_some()
-    {
-        tracing::warn!(
-            "Persisted HTTP governor rate-control state requires a Spice.ai Enterprise build. Falling back to in-memory HTTP rate-control state."
+    let _ = (source_rate_control, &secrets, &io_runtime);
+    // `runtime.state` also serves the scheduler and results-cache warmup, so
+    // setting it is not a request for cluster rate control: no warning.
+    if runtime_state.is_some() {
+        tracing::debug!(
+            "Cluster HTTP rate control requires a Spice.ai Enterprise build. HTTP rate limits apply to each instance on its own."
         );
     }
     Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default())
 }
 
+/// Persists HTTP rate-control state at `runtime.state.location`, so instances
+/// that share that location share each origin's request budget. Without
+/// `runtime.state`, rate control stays in memory.
 #[cfg(feature = "rate-control")]
 async fn build_http_rate_control_registry(
     source_rate_control: Option<&SpicepodSourceRateControl>,
@@ -983,23 +985,19 @@ async fn build_http_rate_control_registry(
     secrets: Arc<RwLock<Secrets>>,
     io_runtime: Handle,
 ) -> Arc<dataconnector::http_rate_control::HttpRateControlRegistry> {
-    let Some((state_location, params, refresh_interval, config_path)) =
-        resolved_rate_control_persist(source_rate_control, runtime_state)
-    else {
+    let Some(state) = runtime_state else {
         return Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default());
     };
 
-    let Some(refresh_interval) =
-        parse_rate_control_refresh_interval(&refresh_interval, config_path)
-    else {
+    let Some(refresh_interval) = rate_control_refresh_interval(source_rate_control) else {
         return Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default());
     };
 
     match crate::object_store_state::build_object_store(
         secrets,
         io_runtime,
-        &state_location,
-        params.as_ref(),
+        &state.location,
+        state.params.as_ref(),
         "rate-control state",
     )
     .await
@@ -1007,7 +1005,7 @@ async fn build_http_rate_control_registry(
         Ok((store, base_prefix)) => {
             tracing::info!(
                 "Initialized persisted HTTP governor rate-control state with location: {}",
-                state_location
+                state.location
             );
             let registry = Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::with_persisted_governor_state(
                 store,
@@ -1026,60 +1024,29 @@ async fn build_http_rate_control_registry(
     }
 }
 
+/// `runtime.source_rate_control.refresh_interval`, or its default when the
+/// section is absent. Logs and returns `None` when the value is not a positive
+/// duration.
 #[cfg(feature = "rate-control")]
-fn resolved_rate_control_persist(
+fn rate_control_refresh_interval(
     source_rate_control: Option<&SpicepodSourceRateControl>,
-    runtime_state: Option<&spicepod::component::runtime::RuntimeState>,
-) -> Option<(
-    String,
-    Option<spicepod::param::Params>,
-    String,
-    &'static str,
-)> {
-    if let Some(config) = source_rate_control {
-        if let Some(location) = config.state_location.clone() {
-            return Some((
-                location,
-                config.params.clone(),
-                config.refresh_interval.clone(),
-                "runtime.source_rate_control",
-            ));
-        }
-        if let Some(state) = runtime_state {
-            return Some((
-                state.location.clone(),
-                config.params.clone().or_else(|| state.params.clone()),
-                config.refresh_interval.clone(),
-                "runtime.state",
-            ));
-        }
-        return None;
-    }
-    runtime_state.map(|state| {
-        (
-            state.location.clone(),
-            state.params.clone(),
-            spicepod::component::runtime::default_rate_control_refresh_interval(),
-            "runtime.state",
-        )
-    })
-}
-
-#[cfg(feature = "rate-control")]
-fn parse_rate_control_refresh_interval(
-    refresh_interval: &str,
-    config_path: &str,
 ) -> Option<Duration> {
-    match fundu::parse_duration(refresh_interval) {
+    let refresh_interval = source_rate_control.map_or_else(
+        spicepod::component::runtime::default_rate_control_refresh_interval,
+        |config| config.refresh_interval.clone(),
+    );
+    match fundu::parse_duration(&refresh_interval) {
         Ok(parsed_refresh_interval) if parsed_refresh_interval.is_zero() => {
             tracing::error!(
-                "Invalid {config_path}.refresh_interval '{refresh_interval}': value must be greater than 0"
+                "Invalid runtime.source_rate_control.refresh_interval '{refresh_interval}': value must be greater than 0"
             );
             None
         }
         Ok(parsed_refresh_interval) => Some(parsed_refresh_interval),
         Err(error) => {
-            tracing::error!("Invalid {config_path}.refresh_interval '{refresh_interval}': {error}");
+            tracing::error!(
+                "Invalid runtime.source_rate_control.refresh_interval '{refresh_interval}': {error}"
+            );
             None
         }
     }
@@ -1615,13 +1582,7 @@ fn cayenne_accelerations(
             (converted, RefreshMode::Changes)
         }))
         .filter_map(|(accel, unset)| accel.map(|accel| (accel, unset)))
-        .filter(|(accel, _)| {
-            accel.enabled
-                && accel
-                    .engine
-                    .as_deref()
-                    .is_some_and(|engine| engine.eq_ignore_ascii_case("cayenne"))
-        })
+        .filter(|(accel, _)| accel.enabled && accel.engine_name().eq_ignore_ascii_case("cayenne"))
         .filter_map(|(accel, unset)| {
             // The engine classifies; this only enumerates. Filtered rather than
             // defaulted: a build with no Cayenne engine linked declares no Cayenne
@@ -2498,15 +2459,15 @@ mod test {
         ]);
         assert_eq!(inputs.num_unset_instances, 1);
 
-        // A non-DuckDB (Arrow) accelerated dataset is ignored.
-        let mut arrow_ds = Dataset::new("dummy:source", "arrow");
-        arrow_ds.acceleration = Some(Acceleration {
+        // A non-DuckDB (default engine) accelerated dataset is ignored.
+        let mut default_engine_ds = Dataset::new("dummy:source", "default_engine");
+        default_engine_ds.acceleration = Some(Acceleration {
             enabled: true,
             engine: None,
             mode: Mode::Memory,
             ..Acceleration::default()
         });
-        let inputs = inputs_for(vec![arrow_ds]);
+        let inputs = inputs_for(vec![default_engine_ds]);
         assert_eq!(inputs.num_unset_instances, 0);
         assert_eq!(inputs.num_explicit_instances, 0);
 
@@ -2630,6 +2591,17 @@ mod test {
 
         // Engine matching stays case-insensitive on the view arm too.
         assert!(configured(vec![], vec![view_with("Cayenne", true)]));
+
+        // An acceleration that names no engine uses Cayenne, the default engine.
+        let unnamed = spicepod::acceleration::Acceleration {
+            engine: None,
+            ..cayenne_test_accel("cayenne", true)
+        };
+        assert!(configured(
+            vec![cayenne_test_dataset("ds", unnamed.clone())],
+            vec![]
+        ));
+        assert!(configured(vec![], vec![cayenne_test_view("v", unnamed)]));
 
         // A disabled Cayenne acceleration is not configured — on either kind.
         assert!(!configured(vec![], vec![view_with("cayenne", false)]));
@@ -3566,8 +3538,8 @@ mod test {
         );
 
         // A disabled or non-DuckDB view creates no instance.
-        let arrow_view = duckdb_view_with(
-            "arrow_summary",
+        let default_engine_view = duckdb_view_with(
+            "default_engine_summary",
             Acceleration {
                 enabled: true,
                 engine: None,
@@ -3582,7 +3554,10 @@ mod test {
         disabled.enabled = false;
         let disabled_view = duckdb_view_with("disabled_summary", disabled);
         let unaccelerated_view = View::new("plain_summary".to_string()).with_sql("SELECT 1");
-        let inputs = budget_inputs_for(vec![], vec![arrow_view, disabled_view, unaccelerated_view]);
+        let inputs = budget_inputs_for(
+            vec![],
+            vec![default_engine_view, disabled_view, unaccelerated_view],
+        );
         assert_eq!(inputs.num_unset_instances, 0);
         assert_eq!(inputs.num_explicit_instances, 0);
     }

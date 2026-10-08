@@ -701,11 +701,15 @@ pub trait MetadataCatalog: Send + Sync {
     /// # Errors
     ///
     /// Returns an error if the transaction cannot be committed.
+    ///
+    /// `delete_files` are position deletion vectors on the new snapshot, hiding
+    /// the copies of keys its incoming data repeated across record batches.
     async fn commit_overwrite(
         &self,
         table_id: &str,
         new_snapshot_id: &str,
         inlined: Option<&InlinedData>,
+        delete_files: &[crate::metadata::DeleteFile],
     ) -> CatalogResult<()>;
 
     /// Add a partition to a table.

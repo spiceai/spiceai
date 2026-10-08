@@ -272,7 +272,7 @@ fn search_dataset_attributes(app: &App) -> Vec<KeyValue> {
     if let Some(engine) = ds
         .acceleration
         .as_ref()
-        .map(|acc| acc.engine.clone().unwrap_or("arrow".to_string()))
+        .map(|acc| acc.engine_name().to_string())
     {
         attributes.push(KeyValue::new("engine", engine));
     }

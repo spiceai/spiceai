@@ -50,7 +50,7 @@ use datafusion_table_providers::util::{
 type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
 
 test_with_backends!(a_null_predicate_keeps_its_row_impl);
-test_with_backends!(do_nothing_drops_the_incoming_row_impl);
+test_with_backends!(a_do_nothing_table_replaces_the_resident_row_impl);
 
 /// `value` is NULLABLE — the whole point of the first test.
 fn nullable_schema() -> Arc<Schema> {
@@ -185,9 +185,11 @@ async fn a_null_predicate_keeps_its_row_impl(fixture: common::TestFixture) -> Te
     Ok(())
 }
 
-/// `primary_key` with no `on_conflict` resolves to `DoNothingAll`: a re-delivered
-/// key leaves the RESIDENT row in place and drops the incoming one.
-async fn do_nothing_drops_the_incoming_row_impl(fixture: common::TestFixture) -> TestResult<()> {
+/// A table created with `DoNothingAll` keeps the last version of each key: a
+/// re-delivered key replaces the RESIDENT row.
+async fn a_do_nothing_table_replaces_the_resident_row_impl(
+    fixture: common::TestFixture,
+) -> TestResult<()> {
     let schema = name_schema();
     let (ctx, table) =
         memory_table(&fixture, "do_nothing", &schema, OnConflict::DoNothingAll).await?;
@@ -215,7 +217,7 @@ async fn do_nothing_drops_the_incoming_row_impl(fixture: common::TestFixture) ->
     assert_eq!(
         ids(&ctx, sql).await?,
         vec![1, 2, 3],
-        "the genuinely new key lands and the conflicting one is dropped, not duplicated"
+        "the genuinely new key lands and the conflicting one replaces, not duplicates"
     );
     let names = ctx
         .sql("SELECT name FROM do_nothing WHERE id = 2")
@@ -236,8 +238,8 @@ async fn do_nothing_drops_the_incoming_row_impl(fixture: common::TestFixture) ->
         })
         .expect("name column");
     assert_eq!(
-        name, "two",
-        "DoNothing keeps the RESIDENT row; the incoming one is discarded"
+        name, "two-again",
+        "the incoming row replaces the RESIDENT one"
     );
 
     Ok(())
