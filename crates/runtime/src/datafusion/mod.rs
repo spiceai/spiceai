@@ -3984,19 +3984,21 @@ impl DataFusion {
             acceleration_settings
                 .orders_versions_by_time(dataset.time_column.as_deref(), refresh_mode)
                 .then(|| {
+                    // An unpartitioned Cayenne table resolves a full refresh's repeated
+                    // keys as it writes them, ordered by the row versions the refresh
+                    // supplies: in file mode after writing, in memory mode over the
+                    // buffered write. Only file mode does so for an append into an empty
+                    // table, and only when `CayenneDataSink::lock_for_first_load` takes
+                    // the load, which it declines for a table with `retention_sql`.
+                    // Cayenne refuses an append with row versions that it does not take
+                    // that way, so this must not predict more than it accepts.
+                    let versions_resolved_after_write = acceleration_settings.engine
+                        == Engine::Cayenne
+                        && acceleration_settings.partition_by.is_empty();
                     VersionsByTime {
-                        // An unpartitioned Cayenne table resolves a full refresh's repeated
-                        // keys as it writes them, ordered by the row versions the refresh
-                        // supplies: in file mode after writing, in memory mode over the
-                        // buffered write. Only file mode does so for an append into an
-                        // empty table, and not when the table has `retention_sql`.
-                        versions_resolved_after_write: acceleration_settings.engine
-                            == Engine::Cayenne
-                            && acceleration_settings.partition_by.is_empty(),
-                        appends_resolved_after_write: acceleration_settings.engine
-                            == Engine::Cayenne
+                        versions_resolved_after_write,
+                        appends_resolved_after_write: versions_resolved_after_write
                             && acceleration_settings.mode == Mode::File
-                            && acceleration_settings.partition_by.is_empty()
                             && acceleration_settings.retention_sql.is_none(),
                     }
                 }),

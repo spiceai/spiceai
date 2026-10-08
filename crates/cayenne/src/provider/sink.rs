@@ -594,6 +594,11 @@ impl CayenneDataSink {
     /// takes a staged append, so no staged publish can land beneath the load.
     /// Emptiness is observed under the lock this returns, which the load holds
     /// until it publishes.
+    ///
+    /// A refresh gives such a load row versions only when the runtime predicts that
+    /// this takes it (where `runtime::datafusion` builds `VersionsByTime`), because
+    /// an append with row versions that this declines is refused. A condition added
+    /// here must be added to that prediction, or such a load fails every refresh.
     async fn lock_for_first_load(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
         if self.table.metadata().partition_column.is_some()
             || self.table.has_retention_delete_filters()

@@ -1411,9 +1411,9 @@ impl RefreshTask {
             return Ok(update);
         };
         let accelerator_schema = self.accelerator.schema();
+        let dedup = refresh.versions_by_time.unwrap_or_default();
         // A synchronized child writes the same rows but cannot read their versions, so
         // a dataset with one resolves them here, before the rows reach either table.
-        let dedup = refresh.versions_by_time.unwrap_or_default();
         // The accelerator orders a key's copies by version only against the copies one
         // write holds: a write that replaces the table, or an append it loads into an
         // empty table (which it confirms itself, refusing the append otherwise). An

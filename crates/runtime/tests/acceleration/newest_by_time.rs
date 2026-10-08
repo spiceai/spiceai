@@ -58,6 +58,11 @@ const TABLE: &str = "events";
 /// and enough of them (well over Cayenne's 4 MiB write buffer) that a load streams.
 const FILLER_KEYS: i64 = 300_000;
 
+/// One row for each filler key.
+fn filler() -> impl Iterator<Item = (i64, &'static str, &'static str)> {
+    (0..FILLER_KEYS).map(|i| (1_000 + i, "2026-01-01T00:00:00", "filler"))
+}
+
 fn modes() -> [Mode; 2] {
     [Mode::Memory, Mode::File]
 }
@@ -86,6 +91,7 @@ async fn load(
     load_with_retention(source, accel_dir, mode, refresh, None, label).await
 }
 
+/// [`load`], with `retention_sql` set on the acceleration.
 async fn load_with_retention(
     source: &Path,
     accel_dir: &Path,
@@ -120,8 +126,6 @@ async fn load_with_retention(
         params: (!params.is_empty()).then(|| Params::from_string_map(params)),
         primary_key: Some("id".to_string()),
         retention_sql: retention_sql.map(str::to_string),
-        retention_check_enabled: retention_sql.is_some(),
-        retention_check_interval: retention_sql.map(|_| "200ms".to_string()),
         ..Acceleration::default()
     });
 
@@ -180,7 +184,7 @@ async fn full_refresh_keeps_the_newest_version_of_each_key() {
                     (3, "2026-01-01T00:00:00", "id3-only"),
                     (5, "2026-01-04T00:00:00", "id5-tie-a"),
                 ];
-                a.extend((0..FILLER_KEYS).map(|i| (1_000 + i, "2026-01-01T00:00:00", "filler")));
+                a.extend(filler());
                 write(source.path(), "a.csv", &csv(&a));
                 write(
                     source.path(),
@@ -281,9 +285,9 @@ async fn append_refresh_keeps_a_stored_newer_version_and_takes_a_newer_one() {
         .await;
 }
 
-/// An append with `retention_sql` loads, and its retention check deletes the rows it
-/// matches after each key's newest version is chosen: a key whose newest version
-/// matches is gone, and an older version of it does not take its place.
+/// An append with `retention_sql` loads (regression test for #14876), and Cayenne
+/// deletes the rows it matches after each key's newest version is chosen: a key whose
+/// newest version matches is gone, and an older version of it does not take its place.
 #[tokio::test]
 async fn append_refresh_with_retention_sql_keeps_the_newest_version_of_each_key() {
     test_request_context()
@@ -299,7 +303,7 @@ async fn append_refresh_with_retention_sql_keeps_the_newest_version_of_each_key(
                     (3, "2026-01-01T00:00:00", "expired"),
                     (7, "2026-01-02T00:00:00", "id7-older"),
                 ];
-                a.extend((0..FILLER_KEYS).map(|i| (1_000 + i, "2026-01-01T00:00:00", "filler")));
+                a.extend(filler());
                 write(source.path(), "a.csv", &csv(&a));
                 write(
                     source.path(),
@@ -414,8 +418,7 @@ async fn a_null_time_column_is_the_oldest_version_in_a_streamed_write() {
                     (3, "", "null"),
                     (3, "2026-01-01T00:00:00", "timed"),
                 ];
-                source_rows
-                    .extend((0..FILLER_KEYS).map(|i| (1_000 + i, "2026-01-01T00:00:00", "filler")));
+                source_rows.extend(filler());
                 write(source.path(), "a.csv", &csv(&source_rows));
 
                 let (rt, ready) = load(
