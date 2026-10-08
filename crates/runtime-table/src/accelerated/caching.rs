@@ -3475,7 +3475,7 @@ mod tests {
                 "body predicate that sends no body",
                 vec![path.clone(), col("request_body").not_eq(lit("z"))],
                 &http,
-                get.clone(),
+                get,
             ),
             (
                 "path and body",
