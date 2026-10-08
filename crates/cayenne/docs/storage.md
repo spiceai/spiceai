@@ -425,7 +425,7 @@ CachedPkIndex
 
 ### J. Coordination, staging &amp; GC — *no payload*
 
-Locks (`write_lock`, `compaction_lock`, `seq_allocator` mutex), staging trackers (`staging_wal_present`, `staging_may_have_files`, `inflight_staging_appends`, `last_moved_snapshot_files`), compaction flags (`new_files_since_last_compaction`, `post_write_compaction_scheduled`, `position_compaction_skip_streak`), background tasks (`background_compactor`, `background_mem_tier_checkpointer` — `OnceLock`), and the in-flight-scan GC guards (`snapshot_scan_refs`, `snapshot_last_listed`, `retired_snapshot_dirs`) that keep a file alive until both retirement *and* the last scan that listed it have passed.
+Locks (`write_lock`, `compaction_lock`, `seq_allocator` mutex), staging trackers (`staging_wal_present`, `staging_may_have_files`, `inflight_staging_appends`, `last_moved_snapshot_files`), compaction flags (`new_files_since_last_compaction`, `post_write_compaction_state`, `position_compaction_skip_streak`), background tasks (`background_compactor`, `background_mem_tier_checkpointer` — `OnceLock`), and the in-flight-scan GC guards (`snapshot_scan_refs`, `snapshot_last_listed`, `retired_snapshot_dirs`) that keep a file alive until both retirement *and* the last scan that listed it have passed.
 
 ### K. Memory accounting
 

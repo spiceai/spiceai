@@ -37,7 +37,7 @@ use arrow::datatypes::{
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, TimeUnit};
 use datafusion_common::ScalarValue;
-use vortex::arrow::FromArrowType;
+use vortex::error::VortexResult;
 
 /// Joint accumulator state held under a single mutex so `update()` and
 /// `merge_from()` only pay one acquire per batch. `seeded[i]` is `true`
@@ -78,6 +78,10 @@ pub(crate) enum RowCountUpdate {
     /// the incremental deltas might accumulate. Re-establishes
     /// `num_rows_exact = true`.
     Set(i64),
+    /// Replace with a count that measured only part of the live rows, recorded
+    /// not exact. Used by a full rewrite whose commit retained a protected
+    /// snapshot it never read; see `persist_table_stats_after_snapshot_rewrite`.
+    Estimate(i64),
     /// Leave the count unchanged — rows moved, not added (e.g. the inline-data
     /// checkpoint flush, whose rows were already counted on insert). Preserves the
     /// existing `num_rows_exact`.
@@ -110,7 +114,11 @@ impl ColumnStatsAccumulator {
     /// for every NDV-tracked column. Used by every write that produces a
     /// persisted file (`write_to_snapshot`: checkpoint spills, staged appends,
     /// compaction, overwrite), where NDV is computed once at file birth.
-    pub(crate) fn new(schema: &arrow_schema::Schema) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a column whose Arrow type Vortex cannot represent.
+    pub(crate) fn new(schema: &arrow_schema::Schema) -> VortexResult<Self> {
         Self::new_with_ndv(schema, true)
     }
 
@@ -124,22 +132,22 @@ impl ColumnStatsAccumulator {
     /// synchronous CDC hot loop — whose rows are re-sketched for free when they
     /// later spill to a Vortex file at checkpoint. Min/max/null-count stats are
     /// maintained regardless of this flag.
-    pub(crate) fn new_with_ndv(schema: &arrow_schema::Schema, compute_ndv: bool) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a column whose Arrow type Vortex cannot represent.
+    pub(crate) fn new_with_ndv(
+        schema: &arrow_schema::Schema,
+        compute_ndv: bool,
+    ) -> VortexResult<Self> {
         let num_cols = schema.fields().len();
-        let dtypes: Vec<vortex::dtype::DType> = schema
+        // Converted the way the Vortex writer converts the table schema, so each
+        // column's statistics are typed like the column in the file.
+        let dtypes = schema
             .fields()
             .iter()
-            .map(|f| {
-                vortex::dtype::DType::from_arrow((
-                    f.data_type(),
-                    if f.is_nullable() {
-                        vortex::dtype::Nullability::Nullable
-                    } else {
-                        vortex::dtype::Nullability::NonNullable
-                    },
-                ))
-            })
-            .collect();
+            .map(|f| crate::stats::ARROW_SESSION.from_arrow_field(f))
+            .collect::<VortexResult<Vec<vortex::dtype::DType>>>()?;
         // NDV sketches only for NDV-tracked columns (integers, strings, temporal);
         // other columns get `None` so the write path skips them. When
         // `compute_ndv` is false every slot is `None`, so `update` folds nothing
@@ -152,7 +160,7 @@ impl ColumnStatsAccumulator {
                     .then(crate::hll::HyperLogLog::new)
             })
             .collect();
-        Self {
+        Ok(Self {
             state: std::sync::Mutex::new(ColumnStatsState {
                 columns: vec![vortex::array::stats::StatsSet::default(); num_cols],
                 seeded: vec![false; num_cols],
@@ -161,6 +169,30 @@ impl ColumnStatsAccumulator {
             dtypes,
             row_count: std::sync::atomic::AtomicI64::new(0),
             schema: schema.clone(),
+        })
+    }
+
+    /// An empty accumulator for the same schema that keeps NDV sketches for the
+    /// same columns as this one.
+    pub(crate) fn empty_like(&self) -> Self {
+        let num_cols = self.dtypes.len();
+        let ndv = match self.state.lock() {
+            Ok(state) => state
+                .ndv
+                .iter()
+                .map(|slot| slot.as_ref().map(|_| crate::hll::HyperLogLog::new()))
+                .collect(),
+            Err(_) => (0..num_cols).map(|_| None).collect(),
+        };
+        Self {
+            state: std::sync::Mutex::new(ColumnStatsState {
+                columns: vec![vortex::array::stats::StatsSet::default(); num_cols],
+                seeded: vec![false; num_cols],
+                ndv,
+            }),
+            dtypes: self.dtypes.clone(),
+            row_count: std::sync::atomic::AtomicI64::new(0),
+            schema: self.schema.clone(),
         }
     }
 
@@ -655,6 +687,29 @@ impl ColumnStatsAccumulator {
         }
 
         // Merge per-column NDV sketches (register-wise max).
+        Self::merge_ndv(&mut state, other_ndv);
+    }
+
+    /// Merge only `other`'s NDV sketches, leaving the row count and min/max/null
+    /// statistics as they are.
+    pub(crate) fn merge_ndv_from(&self, other: &Self) {
+        let other_ndv = {
+            let Ok(other_state) = other.state.lock() else {
+                tracing::warn!(
+                    "ColumnStatsAccumulator: mutex poisoned in merge_ndv_from(), skipping"
+                );
+                return;
+            };
+            other_state.ndv.clone()
+        };
+        let Ok(mut state) = self.state.lock() else {
+            tracing::warn!("ColumnStatsAccumulator: mutex poisoned in merge_ndv_from(), skipping");
+            return;
+        };
+        Self::merge_ndv(&mut state, other_ndv);
+    }
+
+    fn merge_ndv(state: &mut ColumnStatsState, other_ndv: Vec<Option<crate::hll::HyperLogLog>>) {
         for (idx, other_hll) in other_ndv.into_iter().enumerate() {
             let (Some(other_hll), Some(slot)) = (other_hll, state.ndv.get_mut(idx)) else {
                 continue;
@@ -698,8 +753,9 @@ impl ColumnStatsAccumulator {
             return None;
         };
 
-        let file_stats = crate::stats::build_file_statistics(state.columns.clone(), &self.schema);
-        match crate::stats::serialize_file_statistics(&file_stats) {
+        match crate::stats::build_file_statistics(state.columns.clone(), &self.schema)
+            .and_then(|file_stats| crate::stats::serialize_file_statistics(&file_stats))
+        {
             Ok(bytes) => Some((bytes, row_count)),
             Err(e) => {
                 tracing::warn!("Failed to serialize file statistics: {e}");
@@ -749,7 +805,7 @@ mod tests {
             Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, None), true),
             Field::new("amount", DataType::Float64, true),
         ]);
-        let acc = ColumnStatsAccumulator::new(&schema);
+        let acc = ColumnStatsAccumulator::new(&schema).expect("supported schema");
 
         // 100 distinct ids, 4 distinct names (each repeated 25x), 10 distinct
         // dates, 7 distinct timestamps, and floats (which must not get a sketch).
@@ -895,7 +951,7 @@ mod tests {
         assert_null_count_only(&stats.column_statistics[1], 1);
 
         // The persisted path still produces a blob for the table.
-        let acc = ColumnStatsAccumulator::new(&schema);
+        let acc = ColumnStatsAccumulator::new(&schema).expect("supported schema");
         acc.update(&batch);
         let (_, rows) = acc
             .to_file_statistics_blob_with_row_count()

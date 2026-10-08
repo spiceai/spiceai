@@ -26,7 +26,7 @@ limitations under the License.
 use std::sync::Arc;
 use std::{collections::HashMap, time::SystemTime};
 
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use snafu::prelude::*;
 
 use crate::cluster_state::{
@@ -39,7 +39,11 @@ use crate::metadata::{
 #[derive(Debug, Snafu)]
 pub enum Error {
     #[snafu(display("Failed to access partition metadata for table {table}: {source}"))]
-    MetadataAccess { table: String, source: MutateError },
+    MetadataAccess {
+        table: String,
+        #[snafu(source(from(MutateError, Box::new)))]
+        source: Box<MutateError>,
+    },
 
     #[snafu(display("Failed to get current time: {source}"))]
     SystemTime { source: std::time::SystemTimeError },
@@ -241,7 +245,7 @@ impl PartitionStore {
                 }
                 other => Error::MetadataAccess {
                     table: key,
-                    source: other,
+                    source: Box::new(other),
                 },
             })?;
         Ok(())
@@ -367,15 +371,15 @@ impl PartitionStore {
                 } else {
                     Err(Error::MetadataAccess {
                         table: String::from("<batch>"),
-                        source: MutateError::Conflict {
+                        source: Box::new(MutateError::Conflict {
                             message: "unexpected conflict from mutator".to_string(),
-                        },
+                        }),
                     })
                 }
             }
             Err(other) => Err(Error::MetadataAccess {
                 table: missing_key.map_or_else(|| String::from("<batch>"), |(t, _)| t),
-                source: other,
+                source: Box::new(other),
             }),
         }
     }
@@ -433,7 +437,7 @@ impl PartitionStore {
                 }
                 other => Error::MetadataAccess {
                     table: key_for_err,
-                    source: other,
+                    source: Box::new(other),
                 },
             })?;
         Ok(())
@@ -450,7 +454,7 @@ impl PartitionStore {
             Err(MutateError::ClusterDocMissing { .. }) => Ok(Vec::new()),
             Err(other) => Err(Error::MetadataAccess {
                 table: String::from("<list>"),
-                source: other,
+                source: Box::new(other),
             }),
         }
     }
@@ -465,7 +469,7 @@ impl PartitionStore {
             Ok(_) | Err(MutateError::ClusterDocMissing { .. }) => Ok(()),
             Err(other) => Err(Error::MetadataAccess {
                 table: String::from("<refresh>"),
-                source: other,
+                source: Box::new(other),
             }),
         }
     }
@@ -523,7 +527,7 @@ impl PartitionStore {
                 },
                 other => Error::MetadataAccess {
                     table: target_key.clone(),
-                    source: other,
+                    source: Box::new(other),
                 },
             })?;
         let _ = res;
@@ -531,7 +535,6 @@ impl PartitionStore {
     }
 }
 
-#[expect(clippy::result_large_err)]
 fn now_ms() -> Result<u128> {
     SystemTime::now()
         .duration_since(SystemTime::UNIX_EPOCH)

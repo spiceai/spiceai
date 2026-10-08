@@ -1,0 +1,83 @@
+---
+name: Object Store WAL E2E
+on:
+  pull_request:
+    paths:
+      - 'crates/object_store_occ/**'
+      - 'test/object_store_occ/**'
+      - '.github/workflows/object_store_wal.yml'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: object-store-wal-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  qualify:
+    name: WAL E2E differential (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            redis-image: redis:7.4.11-bookworm
+          - os: macos-latest
+            redis-image: ''
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    services:
+      redis:
+        # GitHub service containers require Linux. An empty image skips macOS.
+        image: ${{ matrix.redis-image }}
+        ports:
+          - 6379/tcp
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    env:
+      CARGO_INCREMENTAL: 0
+      RUSTC_WRAPPER: ''
+      RUSTC_WORKSPACE_WRAPPER: ''
+      SLATEDB_UNIFFI_RUNTIME_THREADS: 2
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/setup-rust
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.12'
+      - name: Install the independent test oracles
+        run: |
+          python -m pip install --only-binary=:all: -r test/object_store_occ/requirements.txt
+      - name: Test state protocol and cancellation
+        run: cargo test --locked --profile dev -p object_store_occ --lib --test state_store --test transactional_wal --test local_cancellation -- --nocapture
+      - name: Build the process worker
+        run: cargo build --locked --profile dev -p object_store_occ --example wal_test_driver
+      - name: Run process histories against SlateDB and Redis
+        if: runner.os == 'Linux'
+        env:
+          REDIS_PORT: ${{ job.services.redis.ports['6379'] }}
+        run: |
+          python test/object_store_occ/e2e.py --driver target/debug/examples/wal_test_driver --artifacts wal-e2e-artifacts --slatedb --redis-url "redis://127.0.0.1:${REDIS_PORT:?Redis service port missing}/0"
+      - name: Run process histories against SlateDB
+        if: runner.os == 'macOS'
+        run: python test/object_store_occ/e2e.py --driver target/debug/examples/wal_test_driver --artifacts wal-e2e-artifacts --slatedb
+      # Pull request and merge-queue checks keep no artifacts. To keep a failed
+      # history, dispatch this workflow on the branch.
+      - name: Retain histories and backing stores
+        if: always() && github.event_name != 'pull_request' && github.event_name != 'merge_group'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: wal-e2e-${{ matrix.os }}
+          path: wal-e2e-artifacts/
+          retention-days: 7

@@ -141,6 +141,8 @@ jobs:
           - 5432:5432
         env:
           POSTGRES_PASSWORD: ${{ secrets.TEST_POSTGRES_PASSWORD }}
+          # Byte-order collation, matching Spice; the image default (en_US.utf8) sorts strings case-insensitively.
+          POSTGRES_INITDB_ARGS: --locale=C --encoding=UTF8
         # --shm-size: postgres's default 64MB /dev/shm (Docker's own default)
         # is too small for parallel-worker queries against TPC-H/TPC-DS data;
         # several queries fail with "could not resize shared memory segment"

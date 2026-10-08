@@ -34,7 +34,7 @@ use data_components::{
     },
 };
 use datafusion::catalog::TableProvider;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 
 use crate::dataconnector::iceberg_cluster::IcebergClusterTableProvider;
 
@@ -875,7 +875,7 @@ pub(crate) fn build_opendal_operator(
         }
 
         let builder = config.into_builder();
-        Ok(Operator::new(builder)?.finish())
+        Ok(Operator::new(builder)?)
     } else if warehouse_url.starts_with("gs://") || warehouse_url.starts_with("gcs://") {
         let mut config = opendal::services::GcsConfig::default();
         let parsed = Url::parse(warehouse_url)?;
@@ -890,7 +890,7 @@ pub(crate) fn build_opendal_operator(
         }
 
         let builder = config.into_builder();
-        Ok(Operator::new(builder)?.finish())
+        Ok(Operator::new(builder)?)
     } else if warehouse_url.starts_with("file://") || warehouse_url.starts_with('/') {
         let mut config = opendal::services::FsConfig::default();
         if let Ok(parsed) = Url::parse(warehouse_url) {
@@ -900,7 +900,7 @@ pub(crate) fn build_opendal_operator(
             config.root = Some(warehouse_url.to_string());
         }
         let builder = config.into_builder();
-        Ok(Operator::new(builder)?.finish())
+        Ok(Operator::new(builder)?)
     } else {
         Err(format!("Unsupported scheme in warehouse URL: {warehouse_url}").into())
     }

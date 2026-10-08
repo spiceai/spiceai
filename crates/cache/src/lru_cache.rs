@@ -27,7 +27,7 @@ use crate::metrics::CacheMetrics;
 use crate::{CacheProvider, get_hash_builder};
 use async_trait::async_trait;
 use byte_unit::Byte;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use sharded_cache::{EvictionPolicy, NUM_SHARDS};
 use snafu::ResultExt;
 use spicepod::component::caching::{CacheConfig, CacheEngine, CachingPolicy};
@@ -318,6 +318,20 @@ impl<
         should_replace: &(dyn for<'v> Fn(&'v V) -> bool + Send + Sync),
     ) -> bool {
         self.backend.replace_if(*key, value, should_replace).await
+    }
+
+    async fn put_if(
+        &self,
+        key: &u64,
+        value: V,
+        weight: usize,
+        admit: &(dyn for<'v> Fn(Option<&'v V>) -> bool + Send + Sync),
+    ) -> bool {
+        let stored = self.backend.insert_if(*key, value, weight, admit);
+        if stored {
+            self.report_metrics_after_put().await;
+        }
+        stored
     }
 
     async fn invalidate_all(&self) {

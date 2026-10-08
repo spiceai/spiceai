@@ -16,6 +16,7 @@ limitations under the License.
 
 //!  [`EmptyHashJoinExecPhysicalOptimization`] removes redundant (empty result) [`HashJoinExec`] from [`ExecutionPlan`]s.
 
+use datafusion::physical_plan::{StatisticsArgs, StatisticsContext};
 use std::sync::Arc;
 
 use datafusion::{
@@ -94,7 +95,7 @@ impl PhysicalOptimizerRule for EmptyHashJoinExecPhysicalOptimization {
 }
 
 fn guaranteed_empty(plan: &Arc<dyn ExecutionPlan>) -> bool {
-    let Ok(stats) = plan.partition_statistics(None) else {
+    let Ok(stats) = StatisticsContext::new().compute(plan.as_ref(), &StatisticsArgs::new()) else {
         return false;
     };
     match stats.num_rows {

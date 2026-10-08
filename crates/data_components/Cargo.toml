@@ -37,9 +37,14 @@ dataformat-json = { path = "../dataformat-json" }
 datafusion.workspace = true
 datafusion-datasource.workspace = true
 datafusion-federation = { workspace = true }
-datafusion-table-providers = { workspace = true }
+# `federation` is always on: `crate::federation` needs the `impl SQLExecutor for
+# SqlTable` it gates, and the unparser guards in `src/federation.rs` must run in a
+# plain `cargo test -p data_components` (#13625). It adds no crate, since
+# `datafusion-federation` is already an unconditional dependency.
+datafusion-table-providers = { workspace = true, features = ["federation"] }
 db_connection_pool = { path = "../db_connection_pool" }
 delta_kernel = { workspace = true, optional = true }
+delta_kernel_default_engine = { workspace = true, optional = true }
 document_parse = { path = "../document_parse" }
 duckdb = { workspace = true, features = [
     "bundled",
@@ -85,6 +90,7 @@ regex.workspace = true
 reqwest.workspace = true
 runtime-checkpoint-api = { path = "../runtime-checkpoint-api" }
 runtime-rate-control = { path = "../runtime-rate-control" }
+runtime-udfs-api = { path = "../runtime-udfs-api" }
 runtime-request-context = { path = "../runtime-request-context" }
 rusqlite = { workspace = true, optional = true }
 elasticsearch = { path = "../elasticsearch", optional = true }
@@ -96,9 +102,9 @@ serde_json.workspace = true
 snafu.workspace = true
 spice-table = { path = "../spice-table" }
 snowflake-api = { workspace = true, optional = true }
-spark-connect-rs = { git = "https://github.com/spiceai/spark-connect-rs.git", rev = "5f7c2452d4202d7496abac0a6f2eaa4bef46a5ad", features = [
+spark-connect-rs = { git = "https://github.com/spiceai/spark-connect-rs.git", rev = "18ae9bd3ac5c447612f292e41bf348a5c6ed9b50", features = [
     "tls",
-], optional = true } # branch: spiceai-58
+], optional = true } # branch: spiceai-59-2
 telemetry = { path = "../telemetry" }
 tempfile.workspace = true
 tiberius = { workspace = true, optional = true }
@@ -134,18 +140,10 @@ rdkafka = { workspace = true, features = ["cmake-build"], optional = true }
 [features]
 bench = [] # Feature for benchmarking that exposes internal functions
 adbc = ["dep:adbc_core", "dep:adbc_driver_manager", "datafusion-table-providers/adbc-federation"]
-# Shared Spice federation deny-list wrapper (crate::federation). Requires the
-# upstream `impl SQLExecutor for SqlTable`, which is gated behind
-# `datafusion-table-providers/federation`.
-federation = ["datafusion-table-providers/federation"]
-databricks = [
-    "delta_lake",
-    "spark_connect",
-    "datafusion-table-providers/federation",
-]
+databricks = ["delta_lake", "spark_connect"]
 debezium = ["dep:rdkafka", "dep:apache-avro"]
 default = []
-delta_lake = ["dep:delta_kernel"]
+delta_lake = ["dep:delta_kernel", "dep:delta_kernel_default_engine"]
 elasticsearch = ["dep:elasticsearch"]
 duckdb = [
     "dep:duckdb",
@@ -175,17 +173,11 @@ postgres = [
     "dep:postgres-native-tls",
     "dep:postgres-protocol",
     "dep:connector-postgres-common",
-    "federation",
     "datafusion-table-providers/postgres",
     "datafusion-table-providers/postgres-federation",
 ]
 s3_vectors = ["dep:s3_vectors", "dep:s3_vectors_metadata_filter"]
-snowflake = [
-    "dep:snowflake-api",
-    "federation",
-    "datafusion-table-providers/federation",
-    "db_connection_pool/snowflake",
-]
+snowflake = ["dep:snowflake-api", "db_connection_pool/snowflake"]
 spark_connect = ["dep:spark-connect-rs"]
 sqlite = [
     "dep:rusqlite",

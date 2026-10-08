@@ -224,6 +224,7 @@ connector-postgres-common = "shared-utility"
 ansi_colors = "foundation"
 arrow_tools = "foundation"
 aws-sdk-credential-bridge = "foundation"
+backoff = "foundation"
 chunking = "foundation"
 # Shared by implementations outside this repo via a git dependency, so its
 # dependency closure has to stay small — foundation is also a budget here.
@@ -243,9 +244,11 @@ event_stream = "foundation"
 flight_client = "foundation"
 google-genai = "foundation"
 hash-index = "foundation"
+key-index = "foundation"
 libnfs = "foundation"
 ns_lookup = "foundation"
 object_store_occ = "foundation"
+object_store_spawn = "foundation"
 otel-arrow = "foundation"
 podswatcher = "foundation"
 repl = "foundation"
@@ -286,6 +289,7 @@ runtime-rate-control = "foundation"
 runtime-resources = "foundation"
 runtime-status = "foundation"
 sharded-cache = "foundation"
+s3-event-notifications = "foundation"
 s3_vectors = "foundation"
 s3_vectors_metadata_filter = "foundation"
 scheduler = "foundation"
@@ -306,7 +310,7 @@ yaml = "foundation"
 # tier, but listed here for clarity / auditability). Everything else defaults to
 # `shared-utility`:
 #   app, cache, cayenne, data-accelerator-api, data_components, datafusion-ddl,
-#   datafusion-optimizer-rules, llms, package, runtime-acceleration,
+#   datafusion-optimizer-rules, evaluate-chat, llms, package, runtime-acceleration,
 #   runtime-auth, runtime-cluster, runtime-datafusion, runtime-datafusion-udfs,
 #   runtime-drasi, runtime-parameters, runtime-request-context, runtime-search,
 #   runtime-secrets, runtime-table-partition, runtime-tools, search,

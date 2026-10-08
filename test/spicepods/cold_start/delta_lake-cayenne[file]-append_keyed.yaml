@@ -1,0 +1,22 @@
+version: v1
+kind: Spicepod
+name: delta_lake-cayenne[file]-append_keyed
+datasets:
+  - from: delta_lake:s3://benchmarks/cold_start/audit_events_3m/
+    name: audit_events
+    params:
+      delta_lake_aws_access_key_id: ${secrets:S3_KEY}
+      delta_lake_aws_secret_access_key: ${secrets:S3_SECRET}
+      delta_lake_aws_endpoint: ${secrets:S3_ENDPOINT}
+      delta_lake_aws_allow_http: true
+    time_column: emitted_at
+    time_format: timestamptz
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: append
+      refresh_check_interval: 1m
+      primary_key: id
+      on_conflict:
+        id: upsert

@@ -272,6 +272,17 @@ impl ExecutionPlan for DelayedExecutionPlan {
         self.inner.schema()
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.inner]
     }
@@ -562,19 +573,23 @@ async fn run_ready_state_test(
 
     register_slow_loading_providers().await;
 
-    let dataset_name = match (is_native, &ready_state, &engine) {
-        (true, ReadyState::OnRegistration, None) => "native_on_registration_arrow",
-        (true, ReadyState::OnRegistration, Some(_)) => "native_on_registration_duckdb",
-        (true, ReadyState::OnLoad, None) => "native_on_load_arrow",
-        (true, ReadyState::OnLoad, Some(_)) => "native_on_load_duckdb",
-        (true, ReadyState::OnSchemaResolved, None) => "native_on_schema_resolved_arrow",
-        (true, ReadyState::OnSchemaResolved, Some(_)) => "native_on_schema_resolved_duckdb",
-        (false, ReadyState::OnRegistration, None) => "federated_on_registration_arrow",
-        (false, ReadyState::OnRegistration, Some(_)) => "federated_on_registration_duckdb",
-        (false, ReadyState::OnLoad, None) => "federated_on_load_arrow",
-        (false, ReadyState::OnLoad, Some(_)) => "federated_on_load_duckdb",
-        (false, ReadyState::OnSchemaResolved, None) => "federated_on_schema_resolved_arrow",
-        (false, ReadyState::OnSchemaResolved, Some(_)) => "federated_on_schema_resolved_duckdb",
+    let dataset_name = match (is_native, &ready_state, engine.as_deref()) {
+        (true, ReadyState::OnRegistration, Some("cayenne")) => "native_on_registration_cayenne",
+        (true, ReadyState::OnRegistration, _) => "native_on_registration_duckdb",
+        (true, ReadyState::OnLoad, Some("cayenne")) => "native_on_load_cayenne",
+        (true, ReadyState::OnLoad, _) => "native_on_load_duckdb",
+        (true, ReadyState::OnSchemaResolved, Some("cayenne")) => {
+            "native_on_schema_resolved_cayenne"
+        }
+        (true, ReadyState::OnSchemaResolved, _) => "native_on_schema_resolved_duckdb",
+        (false, ReadyState::OnRegistration, Some("cayenne")) => "federated_on_registration_cayenne",
+        (false, ReadyState::OnRegistration, _) => "federated_on_registration_duckdb",
+        (false, ReadyState::OnLoad, Some("cayenne")) => "federated_on_load_cayenne",
+        (false, ReadyState::OnLoad, _) => "federated_on_load_duckdb",
+        (false, ReadyState::OnSchemaResolved, Some("cayenne")) => {
+            "federated_on_schema_resolved_cayenne"
+        }
+        (false, ReadyState::OnSchemaResolved, _) => "federated_on_schema_resolved_duckdb",
     };
 
     tracing::info!("Using dataset: {}", dataset_name);
@@ -799,15 +814,17 @@ async fn run_ready_state_test(
 }
 
 // Test that the runtime is ready immediately with ready_state = on_registration for native provider
+#[cfg(not(windows))]
 #[tokio::test]
-async fn test_ready_state_on_registration_native_arrow_acceleration() -> Result<(), anyhow::Error> {
-    // Native provider, OnRegistration, Arrow engine, should not error initially
+async fn test_ready_state_on_registration_native_cayenne_acceleration() -> Result<(), anyhow::Error>
+{
+    // Native provider, OnRegistration, Cayenne engine, should not error initially
     run_ready_state_test(
         true,
         ReadyState::OnRegistration,
-        None,
+        Some("cayenne".to_string()),
         false,
-        "test_ready_state_on_registration_native_arrow_acceleration",
+        "test_ready_state_on_registration_native_cayenne_acceleration",
     )
     .await
 }
@@ -829,16 +846,17 @@ async fn test_ready_state_on_registration_native_duckdb_acceleration() -> Result
 }
 
 // Test that the runtime is ready immediately with ready_state = on_registration for federated provider
+#[cfg(not(windows))]
 #[tokio::test]
-async fn test_ready_state_on_registration_federated_arrow_acceleration() -> Result<(), anyhow::Error>
-{
-    // Federated provider, OnRegistration, Arrow engine, should not error initially
+async fn test_ready_state_on_registration_federated_cayenne_acceleration()
+-> Result<(), anyhow::Error> {
+    // Federated provider, OnRegistration, Cayenne engine, should not error initially
     run_ready_state_test(
         false,
         ReadyState::OnRegistration,
-        None,
+        Some("cayenne".to_string()),
         false,
-        "test_ready_state_on_registration_federated_arrow_acceleration",
+        "test_ready_state_on_registration_federated_cayenne_acceleration",
     )
     .await
 }
@@ -860,17 +878,18 @@ async fn test_ready_state_on_registration_federated_duckdb_acceleration()
 }
 
 // Test that the runtime is ready immediately with ready_state = on_schema_resolved for native provider
+#[cfg(not(windows))]
 #[tokio::test]
-async fn test_ready_state_on_schema_resolved_native_arrow_acceleration() -> Result<(), anyhow::Error>
-{
-    // Native provider, OnSchemaResolved, Arrow engine: readiness triggers after the federated
+async fn test_ready_state_on_schema_resolved_native_cayenne_acceleration()
+-> Result<(), anyhow::Error> {
+    // Native provider, OnSchemaResolved, Cayenne engine: readiness triggers after the federated
     // source is accessible (schema resolvable) and queries fall back to the source during initial load.
     run_ready_state_test(
         true,
         ReadyState::OnSchemaResolved,
-        None,
+        Some("cayenne".to_string()),
         false,
-        "test_ready_state_on_schema_resolved_native_arrow_acceleration",
+        "test_ready_state_on_schema_resolved_native_cayenne_acceleration",
     )
     .await
 }
@@ -891,15 +910,16 @@ async fn test_ready_state_on_schema_resolved_native_duckdb_acceleration()
 }
 
 // Test that the runtime is ready immediately with ready_state = on_schema_resolved for federated provider
+#[cfg(not(windows))]
 #[tokio::test]
-async fn test_ready_state_on_schema_resolved_federated_arrow_acceleration()
+async fn test_ready_state_on_schema_resolved_federated_cayenne_acceleration()
 -> Result<(), anyhow::Error> {
     run_ready_state_test(
         false,
         ReadyState::OnSchemaResolved,
-        None,
+        Some("cayenne".to_string()),
         false,
-        "test_ready_state_on_schema_resolved_federated_arrow_acceleration",
+        "test_ready_state_on_schema_resolved_federated_cayenne_acceleration",
     )
     .await
 }
@@ -920,15 +940,16 @@ async fn test_ready_state_on_schema_resolved_federated_duckdb_acceleration()
 }
 
 // Test that the runtime is NOT ready until data loads with ready_state = on_load for native provider
+#[cfg(not(windows))]
 #[tokio::test]
-async fn test_ready_state_on_load_native_arrow_acceleration() -> Result<(), anyhow::Error> {
-    // Native provider, OnLoad, Arrow engine, should error initially
+async fn test_ready_state_on_load_native_cayenne_acceleration() -> Result<(), anyhow::Error> {
+    // Native provider, OnLoad, Cayenne engine, should error initially
     run_ready_state_test(
         true,
         ReadyState::OnLoad,
-        None,
+        Some("cayenne".to_string()),
         true,
-        "test_ready_state_on_load_native_arrow_acceleration",
+        "test_ready_state_on_load_native_cayenne_acceleration",
     )
     .await
 }
@@ -949,15 +970,16 @@ async fn test_ready_state_on_load_native_duckdb_acceleration() -> Result<(), any
 }
 
 // Test that the runtime is NOT ready until data loads with ready_state = on_load for federated provider
+#[cfg(not(windows))]
 #[tokio::test]
-async fn test_ready_state_on_load_federated_arrow_acceleration() -> Result<(), anyhow::Error> {
-    // Federated provider, OnLoad, Arrow engine, should error initially
+async fn test_ready_state_on_load_federated_cayenne_acceleration() -> Result<(), anyhow::Error> {
+    // Federated provider, OnLoad, Cayenne engine, should error initially
     run_ready_state_test(
         false,
         ReadyState::OnLoad,
-        None,
+        Some("cayenne".to_string()),
         true,
-        "test_ready_state_on_load_federated_arrow_acceleration",
+        "test_ready_state_on_load_federated_cayenne_acceleration",
     )
     .await
 }
@@ -978,8 +1000,9 @@ async fn test_ready_state_on_load_federated_duckdb_acceleration() -> Result<(), 
 }
 
 // Test both native and federated providers together with different ready states
+#[cfg(not(windows))]
 #[tokio::test]
-async fn test_ready_state_mixed_arrow_acceleration() -> Result<(), anyhow::Error> {
+async fn test_ready_state_mixed_cayenne_acceleration() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
     register_slow_loading_providers().await;
@@ -991,12 +1014,12 @@ async fn test_ready_state_mixed_arrow_acceleration() -> Result<(), anyhow::Error
                 .with_dataset(get_native_dataset(
                     "native_on_registration_mixed",
                     ReadyState::OnRegistration,
-                    None,
+                    Some("cayenne".to_string()),
                 ))
                 .with_dataset(get_federated_dataset(
                     "federated_on_load_mixed",
                     ReadyState::OnLoad,
-                    None,
+                    Some("cayenne".to_string()),
                 ))
                 .build();
 

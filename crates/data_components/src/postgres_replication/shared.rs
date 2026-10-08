@@ -129,7 +129,10 @@ limitations under the License.
 //!   the configured unclaimed-reservation grace (a table left in the publication by a
 //!   removed dataset) would pin WAL forever, so the table is dropped from the
 //!   publication — which is what makes releasing its floor safe — and logged at
-//!   ERROR.
+//!   ERROR. A publication that cannot drop it (`FOR ALL TABLES`, `FOR TABLES IN
+//!   SCHEMA`) has its hold released anyway, logged at WARN: a dataset that joins
+//!   the table later is rebuilt from the source, since the slot has acknowledged
+//!   past anything it recorded.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, AtomicUsize, Ordering};
@@ -490,8 +493,9 @@ struct MemberHandle {
     /// source-commit time is within this of now, so the dataset becomes Ready
     /// only once it has caught up to the source head.
     ready_lag: std::time::Duration,
-    /// Where this member's applied-LSN watermark is recorded. Only
-    /// [`run_applied_lsn_writer`] writes it, which is what keeps concurrent
+    /// Where this member's applied-LSN watermark is recorded. Producers never
+    /// write it directly: only [`write_published_positions`] does, serialized by
+    /// [`SharedSource::position_write_lock`], which is what keeps concurrent
     /// producers from landing out of order.
     applied_lsn_store: Arc<dyn AppliedLsnStore>,
     /// Wakes the applied-position writer when this member publishes a position.
@@ -1792,6 +1796,10 @@ struct SharedSource {
     dead: AtomicBool,
     /// Wakes [`run_applied_lsn_writer`] when a member publishes a position.
     watermark_notify: Arc<Notify>,
+    /// Serializes [`write_published_positions`] between the writer task and the
+    /// pump's final write, so a pass that read an older position cannot land after
+    /// a newer one.
+    position_write_lock: tokio::sync::Mutex<()>,
     /// Positions published by members that have since detached, which the writer's
     /// member sweep can no longer reach. See [`OrphanedPosition`].
     orphaned_positions: Mutex<Vec<OrphanedPosition>>,
@@ -1844,6 +1852,7 @@ impl SharedSource {
             restart_requested: AtomicBool::new(false),
             dead: AtomicBool::new(false),
             watermark_notify: Arc::new(Notify::new()),
+            position_write_lock: tokio::sync::Mutex::new(()),
             orphaned_positions: Mutex::new(Vec::new()),
             slot_created_fresh: AtomicBool::new(false),
             slot_generation: AtomicU64::new(0),
@@ -1977,17 +1986,24 @@ impl SharedSource {
             let (schema_name, table_name) = key.clone();
             let slot_name = self.key.slot_name.clone();
             tokio::spawn(async move {
-                if let Err(e) =
-                    slot::remove_table_from_publication(&params, &schema_name, &table_name).await
-                {
-                    tracing::warn!(
-                        table = %format!("{schema_name}.{table_name}"),
-                        slot = %slot_name,
-                        "failed to remove mid-snapshot table from the shared publication; \
-                         re-adding the dataset will resume WITHOUT a fresh snapshot — drop \
-                         the table from the publication manually before re-adding: {e}"
-                    );
-                }
+                let removal =
+                    slot::remove_table_from_publication(&params, &schema_name, &table_name).await;
+                let cause = match removal {
+                    Ok(slot::PublicationRemoval::Removed) => return,
+                    Ok(slot::PublicationRemoval::StillPublished) => {
+                        "the publication includes it through FOR ALL TABLES or FOR TABLES IN \
+                         SCHEMA, which cannot drop a single table"
+                            .to_string()
+                    }
+                    Err(e) => e.to_string(),
+                };
+                tracing::warn!(
+                    table = %format!("{schema_name}.{table_name}"),
+                    slot = %slot_name,
+                    "failed to remove mid-snapshot table from the shared publication; \
+                     re-adding the dataset will resume WITHOUT a fresh snapshot — drop \
+                     the table from the publication manually before re-adding: {cause}"
+                );
             });
         }
     }
@@ -2081,6 +2097,14 @@ impl SharedSource {
     /// second silent-loss path: an unpublished table produces no more changes,
     /// and if the dataset ever comes back, `table_added` sends it through the
     /// initial-snapshot path instead of a resume.
+    ///
+    /// A publication that includes the table without naming it (`FOR ALL
+    /// TABLES`, `FOR TABLES IN SCHEMA`) cannot drop it, and a hold kept until it
+    /// does would pin WAL for the life of the slot (#13032). There the floor is
+    /// released with the table still published, which is safe for a different
+    /// reason: the slot then acknowledges past anything a returning dataset
+    /// recorded, and `super::rebuild_cause` rebuilds it from the source rather
+    /// than resuming across the changes nobody consumed.
     fn release_unclaimed_reservations(self: &Arc<Self>, grace: std::time::Duration) {
         for key in self.take_expired_reservations(grace) {
             let params = self.params.clone();
@@ -2100,17 +2124,6 @@ impl SharedSource {
                 if source.member(&key).is_some() {
                     return;
                 }
-                tracing::error!(
-                    table = %format_member(&key),
-                    slot = %slot_name,
-                    publication = %publication,
-                    grace_secs,
-                    "no dataset subscribed to a published table on this shared slot within the \
-                     grace period; it was pinning WAL retention for every dataset on the slot, \
-                     so it is being dropped from the publication and the slot's acknowledgement \
-                     released. Re-adding a dataset for this table will take a fresh initial \
-                     snapshot"
-                );
                 let (schema_name, table_name) = key.clone();
                 match slot::remove_table_from_publication(&params, &schema_name, &table_name).await
                 {
@@ -2119,7 +2132,46 @@ impl SharedSource {
                     // keep arriving with no member to route them to, and acking
                     // past them would be the very loss this hold exists to
                     // prevent.
-                    Ok(()) => source.ack.release(&key),
+                    Ok(slot::PublicationRemoval::Removed) => {
+                        tracing::error!(
+                            table = %format_member(&key),
+                            slot = %slot_name,
+                            publication = %publication,
+                            grace_secs,
+                            "no dataset subscribed to a published table on this shared slot \
+                             within the grace period; it was pinning WAL retention for every \
+                             dataset on the slot, so it is being dropped from the publication \
+                             and the slot's acknowledgement released. Re-adding a dataset for \
+                             this table will take a fresh initial snapshot"
+                        );
+                        source.ack.release(&key);
+                    }
+                    // The publication includes the table without naming it
+                    // (`FOR ALL TABLES`, `FOR TABLES IN SCHEMA`), so no drop can
+                    // ever succeed and holding on would pin WAL for the life of
+                    // the slot. Release it anyway: a dataset that joins this
+                    // table later finds the slot acknowledged past its recorded
+                    // position and is rebuilt from the source
+                    // (`RebuildCause::AcknowledgedPast`), and one with no record
+                    // is loaded from the source — neither resumes over the
+                    // changes acknowledged here.
+                    Ok(slot::PublicationRemoval::StillPublished) => {
+                        let table = format_member(&key);
+                        tracing::warn!(
+                            table = %table,
+                            slot = %slot_name,
+                            publication = %publication,
+                            grace_secs,
+                            "{}",
+                            implicitly_published_release_message(
+                                &table,
+                                &slot_name,
+                                &publication,
+                                grace_secs,
+                            )
+                        );
+                        source.ack.release(&key);
+                    }
                     Err(e) => {
                         // Keep the hold and re-arm the grace period so the next
                         // sweep tries again, rather than leaving a table pinning
@@ -2157,6 +2209,24 @@ impl SharedSource {
 
 fn format_member(key: &MemberKey) -> String {
     format!("{}.{}", key.0, key.1)
+}
+
+/// Logged when an unclaimed hold is released on a table its publication cannot
+/// drop (see [`SharedSource::release_unclaimed_reservations`]).
+fn implicitly_published_release_message(
+    table: &str,
+    slot: &str,
+    publication: &str,
+    grace_secs: u64,
+) -> String {
+    format!(
+        "No dataset subscribed to table '{table}' on shared replication slot '{slot}' within \
+         {grace_secs}s, and publication '{publication}' includes it through `FOR ALL TABLES` or \
+         `FOR TABLES IN SCHEMA`, so it cannot be dropped from the publication; the slot stops \
+         holding WAL for it so retention does not grow without bound. A dataset added for this \
+         table later is reloaded from the source if the changes since it last ran are no longer \
+         retained. See: https://spiceai.org/docs/components/data-connectors/postgres"
+    )
 }
 
 /// Entry point: subscribe one dataset to its shared replication source.
@@ -2554,7 +2624,10 @@ async fn attach_member(
 
     if !source.pump_started.swap(true, Ordering::AcqRel) {
         let pump_source = Arc::clone(source);
-        tokio::spawn(run_pump(pump_source));
+        tokio::spawn(run_pump(
+            pump_source,
+            crate::cdc::ShutdownDrainGuard::hold(),
+        ));
         tokio::spawn(run_applied_lsn_writer(
             Arc::clone(source),
             params.watermark_flush_interval,
@@ -3021,16 +3094,18 @@ struct OrphanedPosition {
     write_back_registry: Option<Arc<XidRegistry>>,
 }
 
-/// The **only** writer of applied positions for a source.
+/// The background writer of applied positions for a source.
 ///
 /// Producers publish a position onto their member's [`AckSlot::pending`] with an
 /// atomic max and wake this task; it persists whatever the furthest published
-/// position is when it gets there. Two properties follow, and both matter:
+/// position is when it gets there. The pump's shutdown also writes, through the same
+/// [`write_published_positions`]. Two properties follow, and both matter:
 ///
 ///   * **No reordering.** [`AppliedLsnStore::save`] overwrites rather than taking a
-///     maximum, so concurrent writers could land out of order and move a recorded
+///     maximum, so concurrent writes could land out of order and move a recorded
 ///     position backwards — costing a rebuild that does not self-correct until the
-///     member advances past the lost value. One writer makes that unrepresentable.
+///     member advances past the lost value. Every write pass holds
+///     [`SharedSource::position_write_lock`], which makes that unrepresentable.
 ///   * **Coalescing.** Positions published while a write is in flight collapse into
 ///     that write's successor, so a busy member costs writes at the store's pace
 ///     rather than one per commit.
@@ -3096,10 +3171,14 @@ fn publish_idle_positions(source: &Arc<SharedSource>) {
 }
 
 /// Persist every member whose published position has moved past what is recorded,
-/// plus any left behind by a detached member. Called only from the writer task and
-/// from the pump's shutdown, which never run concurrently: the pump sets `dead`
-/// before its final flush, and the writer exits on seeing it.
+/// plus any left behind by a detached member. Called from the writer task and from
+/// the pump's shutdown. The pump sets `dead` before its final flush and the writer
+/// exits on seeing it, but a writer pass already inside a store write when the pump
+/// stops is still in flight, so every pass holds
+/// [`SharedSource::position_write_lock`]: a pass reads each position only after the
+/// previous pass has landed, and the pump's final write is the last to land.
 async fn write_published_positions(source: &Arc<SharedSource>) {
+    let _serialized = source.position_write_lock.lock().await;
     // An orphan has no member left for the next sweep to rediscover, so a failed
     // write has to be put back or the detached member's last position is lost to a
     // transient sidecar error. Extend rather than assign, so a detach racing this
@@ -3283,11 +3362,14 @@ enum Acquired {
     RecvError(pgwire_replication::PgWireError),
 }
 
-async fn run_pump(source: Arc<SharedSource>) {
-    // Captured at pump start: the pump stops when the epoch advances (this
-    // Runtime began shutting down); a pump started by a later Runtime in the
-    // same process captures the newer epoch and is unaffected.
-    let shutdown_epoch = crate::cdc::shutdown_epoch();
+async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::ShutdownDrainGuard) {
+    // Captured when the pump was spawned: the pump stops when the epoch advances
+    // (this Runtime began shutting down); a pump started by a later Runtime in
+    // the same process captures the newer epoch and is unaffected. The guard is
+    // held until this returns — on a runtime shutdown, after the final position
+    // write below — and the runtime waits for it before closing the
+    // accelerations that write goes into.
+    let shutdown_epoch = shutdown_drain.epoch();
     let params = source.params.clone();
     let slot_name = source.key.slot_name.clone();
     let publication_name = params.publication_name.clone();
@@ -3450,7 +3532,7 @@ async fn run_pump(source: Arc<SharedSource>) {
                     &e.to_string(),
                     backoff.current().as_millis(),
                 );
-                backoff.wait().await;
+                crate::cdc::until_shutdown(shutdown_epoch, backoff.wait()).await;
                 continue 'reconnect;
             }
             Err(e) => {
@@ -3575,18 +3657,27 @@ async fn run_pump(source: Arc<SharedSource>) {
                     let wait_for = eager_hold
                         .next_flush_in()
                         .map_or(RECV_POLL_INTERVAL, |eager| eager.min(RECV_POLL_INTERVAL));
-                    let polled = tokio::time::timeout(wait_for, client.recv()).await;
+                    let polled = tokio::select! {
+                        polled = tokio::time::timeout(wait_for, client.recv()) => Some(polled),
+                        // Wake for a shutdown as it is signalled, so the position
+                        // flush at the head of the loop runs now rather than at the
+                        // next poll — the runtime is waiting for it. `recv` is
+                        // cancel-safe (see above).
+                        () = crate::cdc::shutdown_signalled(shutdown_epoch) => None,
+                    };
                     input_us_acc = input_us_acc.saturating_add(
                         u64::try_from(recv_start.elapsed().as_micros()).unwrap_or(u64::MAX),
                     );
                     match polled {
-                        Err(_elapsed) => Acquired::Idle,
-                        Ok(Ok(Some(e))) => Acquired::Event(e),
+                        // The poll elapsed, or shutdown was signalled: either way
+                        // re-enter the loop, whose head checks the epoch.
+                        None | Some(Err(_)) => Acquired::Idle,
+                        Some(Ok(Ok(Some(e)))) => Acquired::Event(e),
                         // Server closed cleanly (e.g. orderly Postgres shutdown):
                         // treat like a transient drop and reconnect — the shared
                         // stream is meant to run for the process lifetime.
-                        Ok(Ok(None)) => Acquired::CleanClose,
-                        Ok(Err(e)) => Acquired::RecvError(e),
+                        Some(Ok(Ok(None))) => Acquired::CleanClose,
+                        Some(Ok(Err(e))) => Acquired::RecvError(e),
                     }
                 }
             };
@@ -3944,7 +4035,7 @@ async fn run_pump(source: Arc<SharedSource>) {
         // Mark the drop so the next successful connect can attribute the
         // disconnected duration (this wait + reconnect handshake).
         disconnect_at = Some(std::time::Instant::now());
-        backoff.wait().await;
+        crate::cdc::until_shutdown(shutdown_epoch, backoff.wait()).await;
     } // end 'reconnect
 
     // Fatal exit. Take the setup lock so no subscriber is mid-registration,
@@ -6440,6 +6531,31 @@ mod tests {
         );
     }
 
+    /// The only explanation an operator gets for a hold released on a table the
+    /// publication cannot drop, so it must name the table, slot and publication,
+    /// say why the drop was impossible and what a later dataset will do, and link
+    /// the docs.
+    #[test]
+    fn implicitly_published_release_message_names_the_resources_and_the_consequence() {
+        let message = implicitly_published_release_message("public.b", "spice_slot", "allpub", 300);
+        for needle in [
+            "table 'public.b'",
+            "slot 'spice_slot'",
+            "publication 'allpub'",
+            "within 300s",
+            "`FOR ALL TABLES`",
+            "`FOR TABLES IN SCHEMA`",
+            "reloaded from the source if the changes since it last ran are no longer retained",
+            "https://spiceai.org/docs/components/data-connectors/postgres",
+        ] {
+            assert!(message.contains(needle), "missing {needle:?} in: {message}");
+        }
+        assert!(
+            !message.contains('\n'),
+            "log messages stay on one line: {message}"
+        );
+    }
+
     /// A published table no dataset ever subscribes to would pin WAL for the
     /// whole slot forever. Releasing its hold (done only once the table is out
     /// of the publication) lets the floor advance again.
@@ -7532,6 +7648,104 @@ mod tests {
             t0.num_rows_hint(),
             1,
             "commits above the recorded position are delivered"
+        );
+    }
+
+    /// An [`AppliedLsnStore`] whose first `save` parks until released, so a test can
+    /// hold the background writer mid-write while another write runs.
+    #[derive(Default)]
+    struct GatedLsnStore {
+        stored: ParkingMutex<Option<u64>>,
+        gate_open: AtomicBool,
+        entered: Notify,
+        release: Notify,
+    }
+
+    #[async_trait]
+    impl AppliedLsnStore for GatedLsnStore {
+        async fn load(
+            &self,
+        ) -> std::result::Result<
+            crate::postgres_replication::RecordedPosition,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok(crate::postgres_replication::RecordedPosition::Absent)
+        }
+
+        async fn save(
+            &self,
+            applied: AppliedLsn,
+        ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            if !self.gate_open.swap(true, Ordering::AcqRel) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            *self.stored.lock() = Some(applied.lsn);
+            Ok(())
+        }
+
+        async fn clear(&self) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+    }
+
+    /// The pump's final write at shutdown must not be overtaken by a writer pass
+    /// that captured an older position before it (#14523): the runtime's shutdown
+    /// drain ends when the pump returns, so a stale save landing after it moves the
+    /// recorded position backwards and the next start rebuilds the acceleration.
+    #[tokio::test]
+    async fn final_position_write_is_not_overtaken_by_an_in_flight_writer_pass() {
+        let (source, _probes) = test_source_with_members(0);
+        let store = Arc::new(GatedLsnStore::default());
+        let member_key = key("t0");
+        let (sender, _rx) = member_mailbox(4);
+        lock(&source.members).insert(
+            member_key.clone(),
+            Arc::new(MemberHandle {
+                applied_lsn_store: Arc::clone(&store) as Arc<dyn AppliedLsnStore>,
+                watermark_notify: Arc::new(Notify::new()),
+                dataset_name: "ds0".into(),
+                schema: tiny_schema(),
+                primary_keys: vec![],
+                generated_columns: vec![],
+                policy: SchemaEvolutionPolicy::Block,
+                sender,
+                metrics: ReplicationMetricsCollector::new(),
+                ready_lag: crate::cdc::DEFAULT_READY_LAG,
+                write_back_registry: None,
+            }),
+        );
+        source.ack.register(&member_key, false);
+        let slot = source
+            .ack
+            .slot(&member_key)
+            .expect("member slot registered");
+
+        // The background writer captures 100 and parks inside the store.
+        slot.note_pending(100);
+        let writer = tokio::spawn({
+            let source = Arc::clone(&source);
+            async move { write_published_positions(&source).await }
+        });
+        store.entered.notified().await;
+
+        // The pump publishes 200 and runs its final write while the writer is parked.
+        slot.note_pending(200);
+        let final_write = tokio::spawn({
+            let source = Arc::clone(&source);
+            async move { write_published_positions(&source).await }
+        });
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        store.release.notify_one();
+        writer.await.expect("writer pass completes");
+        final_write.await.expect("final write completes");
+
+        assert_eq!(
+            *store.stored.lock(),
+            Some(200),
+            "the recorded position must be the newest published one, not an older value an in-flight writer pass landed afterwards"
         );
     }
 }

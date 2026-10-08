@@ -32,7 +32,6 @@ use runtime::Runtime;
 use tracing::instrument;
 
 const MSSQL_DOCKER_CONTAINER: &str = "runtime-integration-test-types-mssql";
-const MSSQL_PORT: u16 = 11433;
 
 #[instrument]
 async fn init_mssql_db(port: u16) -> Result<(), anyhow::Error> {
@@ -177,16 +176,17 @@ async fn mssql_integration_test() -> Result<(), String> {
     test_request_context()
         .scope(async {
             let running_container =
-                start_mssql_docker_container(MSSQL_DOCKER_CONTAINER, MSSQL_PORT)
+                start_mssql_docker_container(MSSQL_DOCKER_CONTAINER)
                     .await
                     .map_err(|e| {
                         tracing::error!("start_mssql_docker_container: {e}");
                         e.to_string()
                     })?;
+            let port = running_container.host_port(1433).map_err(|e| e.to_string())?;
             tracing::debug!("Container started");
             let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
             retry(retry_strategy, || async {
-                init_mssql_db(MSSQL_PORT)
+                init_mssql_db(port)
                     .await
                     .map_err(RetryError::transient)
             })
@@ -196,7 +196,7 @@ async fn mssql_integration_test() -> Result<(), String> {
                 e.to_string()
             })?;
             let app = AppBuilder::new("mssql_integration_test")
-                .with_dataset(make_mssql_dataset("test", "test", MSSQL_PORT))
+                .with_dataset(make_mssql_dataset("test", "test", port))
                 .build();
 
             configure_test_datafusion();
@@ -226,11 +226,11 @@ async fn mssql_integration_test() -> Result<(), String> {
                         let results = arrow::util::pretty::pretty_format_batches(&result_batches)
                             .expect("should pretty print result batch");
                         insta::with_settings!({
-                            description => format!("MSSQL Integration Test Results"),
+                            description => "MSSQL Integration Test Results",
                             omit_expression => true,
                             snapshot_path => "../snapshots"
                         }, {
-                            insta::assert_snapshot!(format!("mssql_integration_test_select"), results);
+                            insta::assert_snapshot!("mssql_integration_test_select", results);
                         });
                     })),
                 ),

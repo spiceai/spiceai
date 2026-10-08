@@ -18,8 +18,7 @@ use crate::odbcconn::ODBCDbConnectionPool;
 use async_trait::async_trait;
 use data_components::function_support::FunctionSupport;
 use datafusion::{
-    datasource::TableProvider,
-    sql::{TableReference, unparser::dialect::Dialect},
+    common::TableReference, datasource::TableProvider, sql::unparser::dialect::Dialect,
 };
 use datafusion_table_providers::sql::sql_provider_datafusion::{SqlTable, expr::Engine};
 use snafu::prelude::*;
@@ -95,6 +94,10 @@ where
         } else {
             table
         };
+        // The scan's own filter pushdown consults this policy too: when the
+        // federation analyzer refuses a plan, the filter falls back to the scan,
+        // and without it an expression the policy keeps local is pushed anyway.
+        let table = table.with_function_support(self.function_support.clone());
 
         let sql_table = Arc::new(table);
         let schema = sql_table.schema();

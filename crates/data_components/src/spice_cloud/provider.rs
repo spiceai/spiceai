@@ -22,8 +22,8 @@ use std::sync::Arc;
 use crate::catalog_filter::TableSelector;
 use async_trait::async_trait;
 use datafusion::catalog::{CatalogProvider, SchemaProvider, TableProvider};
+use datafusion::common::TableReference;
 use datafusion::error::Result as DFResult;
-use datafusion::sql::TableReference;
 use futures::future::try_join_all;
 use iceberg::{Catalog, NamespaceIdent};
 use snafu::prelude::*;
@@ -56,7 +56,8 @@ pub enum Error {
         "Failed to load the table '{table}'. {source} Report an issue on GitHub: https://github.com/spiceai/spiceai/issues"
     ))]
     LoadTable {
-        source: iceberg::Error,
+        #[snafu(source(from(iceberg::Error, Box::new)))]
+        source: Box<iceberg::Error>,
         table: String,
     },
 

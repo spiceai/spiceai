@@ -497,6 +497,7 @@ pub(crate) fn routes(
             .route("/v1/workers", get(v1::workers::get))
             .layer(Extension(rt.completion_llms()))
             .layer(Extension(rt.evaluate_models()))
+            .layer(Extension(rt.responses_api_support()))
             .layer(Extension(search))
             .layer(Extension(Arc::clone(&rt.embeds)))
             .layer(Extension(Arc::clone(&rt.workers)))
@@ -666,6 +667,10 @@ async fn track_metrics(
     let auth_request_context: Arc<dyn AuthRequestContext + Send + Sync> =
         Arc::clone(&request_context) as Arc<dyn AuthRequestContext + Send + Sync>;
     req.extensions_mut().insert(auth_request_context);
+    // Also store the concrete `RequestContext` so MCP `tools/call` (which
+    // runs on an rmcp session worker outside this task-local scope) can
+    // re-enter the authenticated principal before executing a tool.
+    req.extensions_mut().insert(Arc::clone(&request_context));
 
     let request_dimensions = request_context.to_dimensions();
 
