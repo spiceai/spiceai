@@ -184,6 +184,10 @@ files the gate itself reads**:
 
 - Every file under `crates/`, `bin/`, `tools/`, and `vendor/`, including test
   fixtures and build inputs; `*.rs`, `*.snap`, and `*.proto` elsewhere
+- Files outside those trees that a Rust source names by a relative path —
+  compiled in with `include_bytes!`/`include_str!` or opened by a test — such
+  as the `test/tls/` PEM files, one of which a `runtime-tls` unit test pins by
+  SHA-256
 - `Cargo.toml`, `Cargo.lock`, `rust-toolchain[.toml]`, `.cargo/`, and `version.txt`
 - `.ci/clippy.toml` (the config `make lint-rust` uses via `CLIPPY_CONF_DIR`) and
   the root `clippy.toml`; `[.]rustfmt.toml`
@@ -205,8 +209,9 @@ also gates integration and E2E, and it only has to *cover* the set). A path
 missing from all three lands on trunk having never been linted, built, or
 tested, so `make lint-rust` runs `scripts/check_rust_gate_paths.py`. It derives
 what must be gated from what the `lint-rust` recipe reads (including the
-`scripts/` modules its guards import), from the tracked config-file names, and
-from tracked sources, fixtures, and build inputs — rather than from a list
+`scripts/` modules its guards import), from the tracked config-file names, from
+tracked sources, fixtures, and build inputs, and from the `../` path literals in
+Rust sources that reach outside the source trees — rather than from a list
 someone has to remember — and fails when the three drift. Change them together.
 
 Deriving from the tracked sources is what catches a whole source *tree* going

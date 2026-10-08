@@ -423,6 +423,8 @@ for (const filename of [
   'vendor/library/schema.proto',
   'fixtures/result.snap',
   'version.txt',
+  'test/tls/spiced_cert.pem',
+  'test/spicepods/tpch/sf1/accelerated/postgres[catalog][changes].yaml',
 ]) {
   test(`test/build input ${filename} requires sign-off`, async () => {
     const result = await runScript({ script: noRustScript, files: [{ filename }] });
@@ -443,6 +445,14 @@ test('documentation outside source trees can still fast-track', async () => {
   const result = await runScript({
     script: noRustScript,
     files: [{ filename: 'docs/dev/example.md' }, { filename: 'README.md' }],
+  });
+  assert.equal(result.outputs.fast_track, 'true');
+});
+
+test('a test input no Rust source names can still fast-track', async () => {
+  const result = await runScript({
+    script: noRustScript,
+    files: [{ filename: 'test/spicepods/chbench/accelerated/mysql-cayenne[file]-adaptive.yaml' }],
   });
   assert.equal(result.outputs.fast_track, 'true');
 });

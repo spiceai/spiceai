@@ -109,6 +109,28 @@ cmd_signoff
         self.assertIn('left: "incorrect"', result.stdout)
         self.assertIn('right: "expected"', result.stdout)
 
+    def test_root_fixture_input_runs_the_failing_test(self):
+        # `crates/runtime-tls` embeds `test/tls/spiced_cert.pem`, outside every
+        # workspace tree. A branch changing only that file must still run the
+        # test that embeds it, so the trunk side carries the source and fixture.
+        self.run_ok("git", "checkout", "-q", "trunk")
+        self.write("test/tls/spiced_cert.pem", "expected\n")
+        self.write("crates/probe/src/lib.rs", '''#[test]
+fn certificate_matches() {
+    assert_eq!(include_str!("../../../test/tls/spiced_cert.pem").trim(), "expected");
+}
+''')
+        self.commit()
+        self.run_ok("git", "checkout", "-q", "-B", "change")
+        self.write("test/tls/spiced_cert.pem", "incorrect\n")
+        self.commit()
+        self.assertEqual(self.run_ok("git", "diff", "--name-only", "trunk", "HEAD"),
+                         "test/tls/spiced_cert.pem")
+        result = self.signoff()
+        self.assert_rejected(result)
+        self.assertIn('left: "incorrect"', result.stdout)
+        self.assertIn('right: "expected"', result.stdout)
+
     def test_rename_out_of_rust_source_runs_checks(self):
         self.run_ok("git", "mv", "crates/probe/src/lib.rs", "removed.txt")
         self.commit()
