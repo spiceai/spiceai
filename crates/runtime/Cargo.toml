@@ -474,10 +474,3 @@ workspace = true
 name = "result_correctness"
 path = "tests/result_correctness.rs"
 required-features = ["duckdb", "sqlite"]
-
-# One test in its own process: it counts the process's `task_runner` threads, so no
-# other cluster test may run an executor alongside it.
-[[test]]
-name = "cluster_task_runner_threads"
-path = "tests/cluster_task_runner_threads.rs"
-required-features = ["duckdb", "sqlite"]

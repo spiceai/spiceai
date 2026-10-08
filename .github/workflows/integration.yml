@@ -218,7 +218,6 @@ jobs:
             --test integration --test retention_oom --test integration_aws_sdk \
             --test integration_snapshot_refresh --test credential_provider \
             --test partition_table_provider --test hadoop_catalog_test \
-            --test cluster_task_runner_threads \
             --features ${FEAT} --archive-file integration_tests.tar.zst
 
           echo "--- archive size ---"
@@ -420,9 +419,9 @@ jobs:
           AWS_S3_VECTORS_SECRET: ${{ secrets.AWS_S3_VECTORS_SECRET }}
         run: |
           if [ -n "$SPICE_SECRET_SPICEAI_KEY" ]; then
-            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --partition '${{ matrix.partition }}' --archive-file ./integration_tests/integration_tests.tar.zst -E '(binary_id(=runtime::integration) | binary_id(=runtime::cluster_task_runner_threads)) - test(/^github::/)'
+            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --partition '${{ matrix.partition }}' --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=runtime::integration) - test(/^github::/)'
           else
-            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --partition '${{ matrix.partition }}' --archive-file ./integration_tests/integration_tests.tar.zst -E '(binary_id(=runtime::integration) | binary_id(=runtime::cluster_task_runner_threads)) - test(spiceai_integration_test) - test(/^github::/)'
+            INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --partition '${{ matrix.partition }}' --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=runtime::integration) - test(spiceai_integration_test) - test(/^github::/)'
           fi
 
       - name: Configure apt mirrors for the retention OOM test

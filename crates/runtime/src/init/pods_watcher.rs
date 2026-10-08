@@ -71,7 +71,6 @@ fn start_time_only_changes(
         metrics,
         state,
         scheduler,
-        executor,
         source_rate_control,
         drasi,
         functions: _,
@@ -151,11 +150,6 @@ fn start_time_only_changes(
             "runtime.scheduler",
             Process,
             *scheduler != current.scheduler,
-        ),
-        (
-            "runtime.executor",
-            Process,
-            !same_start_time_config(executor.as_ref(), current.executor.as_ref()),
         ),
         (
             "runtime.source_rate_control",

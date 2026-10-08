@@ -29,5 +29,4 @@ mod job_store;
 #[cfg(not(target_os = "windows"))]
 mod scheduler_failover;
 mod simple;
-mod task_slots;
 mod write_through_idle_timeout;

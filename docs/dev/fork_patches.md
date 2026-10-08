@@ -115,7 +115,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [candle-rotary](#candle-and-its-kernel-crates) | `e12f91a6c8beec5373ccec91a5ccad80619cf065` | `main` |
 | [clickhouse-rs](#clickhouse-rs) | `7e98394f44cfa33919ebc5a92c06d5bddba708bf` | tag `0.2.2` |
 | [datafusion](#datafusion) | `02550cf9462b9f56506b6b1cd07eabf08c46e200` | `spiceai-55` |
-| [datafusion-ballista](#datafusion-ballista) | `1665669db1390b09728627c4f5110bf3797f931d` | `peasee/executor-task-slots` (spiceai/datafusion-ballista#75, based on `spiceai-55`; repin to the `spiceai-55` merge commit once it merges) |
+| [datafusion-ballista](#datafusion-ballista) | `a7c4c58502a16e2181a26fdb8e937ee005807e5e` | `spiceai-55` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `9ca84a39760d7728bdeb5eac8480a3f9ee8422be` | `spiceai-55` |
 | [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `465926a30443ebfbbc95366b6f0277bff80a8ba9` | `spiceai-55` |
 | [delta-kernel-rs](#delta-kernel-rs) | `16ac28606464d742b6837de4a51f41011c3f6dc0` | `spiceai-0.27` |
@@ -315,9 +315,7 @@ path (`parquet/src/util/push_buffers.rs` and its callers), in
 
 Upstream [apache/datafusion-ballista](https://github.com/apache/datafusion-ballista),
 branch `spiceai-55` (upstream's `55.0.0-rc1` tag, merged into the previous line through
-spiceai/datafusion-ballista#73 and #68). The pin is currently the head of spiceai/datafusion-ballista#75
-(branch `peasee/executor-task-slots`, based on `spiceai-55`), which adds the `Executor::with_task_runner_threads`
-override; repin to the `spiceai-55` merge commit once it merges. The fork carries its own inventory, `SPICE_FORK_CHANGES.md`.
+spiceai/datafusion-ballista#73 and #68). The fork carries its own inventory, `SPICE_FORK_CHANGES.md`.
 Upstream adopted several of the patches below in that merge; those rows are kept,
 marked upstreamed, because the guard still pins the behaviour and a later upstream
 change could move it.
@@ -350,7 +348,6 @@ so the rows below name the contracts, not every commit.
 | Task statuses re-delivered after a failed `poll_work` (fork PR #57) | An executor that fails to deliver a batch of task statuses drops them, so the scheduler never learns those tasks finished and the stage waits on work that is already done | silent (hang) | **GAP** — needs a cluster and an induced `poll_work` failure |
 | Terminal job status persisted before the job leaves the active cache (fork PR #59; upstreamed as `persist_terminal_and_evict`, apache/datafusion-ballista#2037) | `succeed_job` removed the job from the active execution-graph cache before the `save_job` write completed, so a concurrent `get_job_status` fell through to the not-yet-updated shared state and answered a stale `Running`. The distributed query client polls on a 2s budget, so it reported a timeout for a query that had in fact succeeded | silent (a successful query reported as a timeout) | **GAP** — a race between a status poll and a save, so any test of it is a timing test; measured by the fork against the client's poll budget |
 | Stuck-query detection (fork PR #39) | A distributed query that stops making progress is not reported, so it has to be diagnosed by rerunning it | not carried | none — not carried. There is no watchdog or progress sampler at this pin or the previous one, and `SPICE_FORK_CHANGES.md` records the patch lost; restoring it would need a row with a guard |
-| Task-runner pool sized independently of vcores (fork PR #75): `Executor::with_task_runner_threads` / `task_runner_threads()` | Raising `runtime.executor.task_slots` above the CPU cores spawns one `task_runner` worker thread per slot per scheduler poller, oversubscribing the CPU | silent (perf) | `crates/runtime/tests/cluster_task_runner_threads.rs::task_runner_pool_is_sized_from_cpu_budget_not_task_slots` — runs in its own test binary (it counts the process's OS threads) with one scheduler and one executor at `runtime.executor.task_slots` = cores + 5, and asserts the process runs exactly `cluster_executor_task_runner_threads()` threads named `task_runner`, not one per slot. Dropping the `with_task_runner_threads` call in `crates/runtime/src/cluster/mod.rs` makes it fail with 27 threads against 22 expected (a 22-core host) |
 
 ## datafusion-federation and datafusion-table-providers
 
