@@ -49,7 +49,7 @@ FROM tickets;
 
 Arguments:
 
-- `input`: text, or a struct, map or list, which is sent as JSON — for example `named_struct('subject', subject, 'body', body)`. Other types are sent as text. A NULL `input` returns NULL without a model call.
+- `input`: text, or a struct, map or list, which is sent as JSON — for example `named_struct('subject', subject, 'body', body)`. Other types are sent as text, except binary, which is refused: cast it to text first, with `encode(col, 'hex')`, or `CAST(col AS VARCHAR)` for UTF-8 bytes. A NULL `input` returns NULL without a model call.
 - `condition`, `instructions`: constant text.
 - `labels`: a constant list of 2 to 255 labels, such as `['billing', 'technical']`, or a JSON object of label to description, such as `'{"billing": "Payments and refunds", "technical": null}'`. `ai_classify` also takes `instructions => '...'`. Include a fallback label such as `'other'` when no label may fit.
 - `levels`: a constant list of 2 to 10 level descriptions, lowest first.
@@ -74,7 +74,7 @@ Constants are checked when the query is planned, before any model is called.
 
 How the engine runs them:
 
-- `ai_if`, `ai_probability`, `ai_classify` and `ai_score` calls on the same `input`, `model` and `on_error` in one `SELECT` list or `WHERE` clause share one request per row. Each `ai_decide` call is its own request, asking all of its questions at once. Identical inputs are asked once within each slice of up to 1,024 rows.
+- In one `SELECT` list or `WHERE` clause, `ai_if`, `ai_probability`, `ai_classify` and `ai_score` calls on the same `input`, `model` and `on_error` share one request per row, and identical `ai_decide` calls share one request and one answer. Each distinct `ai_decide` call is its own request, asking all of its questions at once. Identical inputs are asked once within each slice of up to 1,024 rows.
 - In `WHERE`, every other predicate runs first; the model only sees rows that pass them.
 - A `LIMIT` stops requests only between input batches: each batch (up to 8,192 rows per partition) is answered whole before its rows reach the `LIMIT`. Narrow the rows with other predicates to bound what a query sends.
 - The functions work in `SELECT`, `WHERE`, `HAVING`, `ORDER BY`, `GROUP BY`, window functions, aggregate arguments (including `FILTER (WHERE ...)`), and inner-join conditions. An outer-join condition is refused with the rewrite to use.
@@ -118,7 +118,8 @@ curl -X POST http://localhost:8090/v1/decisions \
 
 - `questions`: 1 to 200 `predicate`, `choice` (2 to 255 `choices`) or `score` (2 to 10 `levels`, lowest first) questions. Answers come back in question order with each question's `name`, or `null` when it has none.
 - `input`: a string, or user messages with `input_text` parts. Image inputs return 400.
-- Unknown fields return 400, as OpenAI's schema allows none. Errors use OpenAI's envelope: `{"error": {"message", "type", "param", "code"}}`.
+- `reasoning_effort` (optional): `none`, `minimal`, `low`, `medium`, `high` or `xhigh`, passed to a chat model's completion request. Omitted keeps the model's setting. This is a Spice extension; OpenAI's Decisions API has no such field. A decision model returns 400 with `code` `unsupported_parameter`.
+- Any other field outside OpenAI's schema returns 400. Errors use OpenAI's envelope: `{"error": {"message", "type", "param", "code"}}`.
 - `usage` is omitted when the model did not report it.
 - Each request is recorded in `runtime.task_history` as an `ai_decision` task.
 
