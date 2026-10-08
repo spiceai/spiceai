@@ -4853,6 +4853,41 @@ dependencies = [
 ]
 
 [[package]]
+name = "connector-huggingface"
+version = "2.4.0-unstable"
+dependencies = [
+ "arrow",
+ "async-trait",
+ "axum",
+ "blake3",
+ "bytes",
+ "chrono",
+ "data-connector-api",
+ "datafusion",
+ "futures",
+ "glob",
+ "linkme",
+ "moka",
+ "object_store 0.13.2",
+ "parking_lot",
+ "parquet",
+ "percent-encoding",
+ "reqwest 0.13.4",
+ "runtime-component",
+ "runtime-datafusion",
+ "runtime-object-store",
+ "runtime-parameters",
+ "secrecy",
+ "serde",
+ "serde_json",
+ "snafu",
+ "tokio",
+ "tracing",
+ "url",
+ "util",
+]
+
+[[package]]
 name = "connector-imap"
 version = "2.4.0-unstable"
 dependencies = [
@@ -20284,6 +20319,7 @@ dependencies = [
  "connector-github",
  "connector-glue",
  "connector-graphql",
+ "connector-huggingface",
  "connector-imap",
  "connector-kafka",
  "connector-mongodb",
@@ -20412,6 +20448,7 @@ dependencies = [
  "connector-github",
  "connector-glue",
  "connector-graphql",
+ "connector-huggingface",
  "connector-imap",
  "connector-mongodb",
  "connector-mssql",

@@ -2044,6 +2044,51 @@ jobs:
         with:
           working-directory: test_app
 
+  hf_connector_live:
+    name: 'Test Hugging Face connector against the live Hub'
+    # Reads pinned commits of public datasets through the Hub and compares every answer
+    # with one recorded from DuckDB's own `hf://` reader (test/huggingface/check_live.py).
+    if: github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch'
+    runs-on: spiceai-dev-runners
+    needs:
+      - build
+    timeout-minutes: 20
+    concurrency:
+      group: huggingface-connector-live-hub
+      queue: max
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: download artifacts - build_linux_x86_64
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: build_linux_x86_64
+          path: ./build
+
+      - name: Install spice
+        uses: ./.github/actions/install-spice
+        with:
+          build-path: ./build
+
+      # Anonymous Hub requests share a per-IP quota across the runner pool; the token,
+      # when the secret is available, gives this job its own.
+      - name: Query live Hugging Face datasets and compare the answers
+        env:
+          HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
+        run: |
+          python3 test/huggingface/check_live.py --spiced "$(command -v spiced)" \
+            --artifacts hf-live-results
+
+      # Pull request and merge-queue checks keep no diagnostic artifacts.
+      - name: Upload Hugging Face test evidence
+        if: always() && github.event_name != 'pull_request' && github.event_name != 'merge_group'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: huggingface-connector-results
+          path: hf-live-results/
+
   mssql_connector_quickstart:
     name: 'Test MS SQL connector on ${{ matrix.target.name }}'
     # The Microsoft apt list below is the Ubuntu 24.04 repository. ubuntu-latest
@@ -2670,6 +2715,7 @@ jobs:
       - test_local_acceleration
       - test_results_caching
       - gh_connector_quickstart
+      - hf_connector_live
       - mssql_connector_quickstart
       - databricks_delta_catalog_connector_quickstart
       - graceful_shutdown_test_append

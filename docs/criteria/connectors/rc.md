@@ -30,6 +30,7 @@ All criteria must be met for the connector to be considered [RC](../definitions.
 | Glue                             | ✅          | @lukekim     |
 | GraphQL                          | ✅          | @peasee      |
 | HTTP/HTTPS                       | ✅          | @lukekim     |
+| Hugging Face                     | ➖          |              |
 | Iceberg                          | ✅          | @phillipleblanc |
 | IMAP                             | ➖          |              |
 | Kafka                            | ➖          |              |
