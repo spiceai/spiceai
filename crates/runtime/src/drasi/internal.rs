@@ -72,21 +72,18 @@ impl InternalForwarders {
         for table in &spec.tables {
             let table_ref = TableReference::partial(SPICE_RUNTIME_SCHEMA, table.name.clone());
             let name = table_ref.to_string();
-            let sink = std::sync::Arc::new(
-                super::build_sink(
-                    name.clone(),
-                    &spec.source_id,
-                    labels_for(table, &name),
-                    spec.transport,
-                    // Surfaced, not skipped: a runtime table has no replication
-                    // position to replay, so the dead-letter store is the only
-                    // thing that can retain a failed batch — and it only sees one
-                    // if the sink reports it.
-                    super::QUEUED_SINK_POLICY,
-                    spec.params.as_ref(),
-                )?
-                .for_runtime_table(),
-            );
+            let sink = super::build_sink(
+                name.clone(),
+                &spec.source_id,
+                labels_for(table, &name),
+                spec.transport,
+                // Surfaced, not skipped: a runtime table has no replication
+                // position to replay, so the dead-letter store is the only
+                // thing that can retain a failed batch — and it only sees one
+                // if the sink reports it.
+                super::QUEUED_SINK_POLICY,
+                spec.params.as_ref(),
+            )?;
 
             let store = super::open_dead_letter_store(&name).await;
 
@@ -120,12 +117,12 @@ impl InternalForwarders {
             return;
         };
 
-        let op_code = match operation_code(update_type) {
-            Some(op_code) => op_code,
-            None => {
-                // An overwrite replaces the table wholesale without naming the rows
-                // it removed, so it cannot be expressed as a set of Drasi element
-                // changes — the same limitation truncate has on the CDC path.
+        let op_code = match update_type {
+            UpdateType::Append | UpdateType::Changes => "u",
+            // An overwrite replaces the table wholesale without naming the rows
+            // it removed, so it cannot be expressed as a set of Drasi element
+            // changes — the same limitation truncate has on the CDC path.
+            UpdateType::Overwrite => {
                 forwarder.queue.dead_letter(
                     "an overwrite replaces the table without naming the rows it removes, which has no Drasi equivalent",
                 );
@@ -154,18 +151,6 @@ impl InternalForwarders {
                 .enqueue(QueuedBatch::uniform(op_code, &key, batch.clone(), None))
                 .await;
         }
-    }
-}
-
-/// The operation code used on the internal-table forwarding path.
-///
-/// `i` is an internal marker for runtime-table appends; it is distinct from
-/// Debezium's `c`, which Drasi forwarding maps to an upsert.
-fn operation_code(update_type: &UpdateType) -> Option<&'static str> {
-    match update_type {
-        UpdateType::Append => Some("i"),
-        UpdateType::Changes => Some("u"),
-        UpdateType::Overwrite => None,
     }
 }
 
@@ -288,29 +273,6 @@ mod tests {
 
     fn table_ref(name: &str) -> TableReference {
         TableReference::partial(SPICE_RUNTIME_SCHEMA, name)
-    }
-
-    #[test]
-    fn runtime_table_append_uses_insert_marker_not_cdc_create() {
-        let key = vec!["span_id".to_string()];
-        let append = QueuedBatch::uniform(
-            operation_code(&UpdateType::Append).expect("append has an operation"),
-            &key,
-            RecordBatch::try_new(
-                schema(),
-                vec![
-                    Arc::new(arrow::array::StringArray::from(vec!["trace"])),
-                    Arc::new(arrow::array::StringArray::from(vec!["span"])),
-                    Arc::new(arrow::array::StringArray::from(vec!["task"])),
-                ],
-            )
-            .expect("valid runtime-table batch"),
-            None,
-        );
-
-        assert_eq!(append.op_codes, vec!["i"]);
-        assert_eq!(operation_code(&UpdateType::Changes), Some("u"));
-        assert_eq!(operation_code(&UpdateType::Overwrite), None);
     }
 
     /// Only the tables an operator names are forwarded — `write_data` also

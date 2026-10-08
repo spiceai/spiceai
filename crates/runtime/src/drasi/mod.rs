@@ -66,7 +66,7 @@ pub(crate) async fn sink_for_dataset(
     spec: &DrasiSpec,
 ) -> runtime_drasi::Result<DeliveryMode> {
     let name = dataset.name.to_string();
-    let sink = Arc::new(build_sink(
+    let sink = build_sink(
         name.clone(),
         &spec.source_id,
         labels_for(dataset, spec),
@@ -88,7 +88,7 @@ pub(crate) async fn sink_for_dataset(
             spicepod::drasi::DrasiDelivery::Queued => QUEUED_SINK_POLICY,
         },
         spec.params.as_ref(),
-    )?);
+    )?;
 
     Ok(match spec.delivery {
         spicepod::drasi::DrasiDelivery::Acknowledged => DeliveryMode::Acknowledged(sink),
@@ -153,7 +153,7 @@ pub(crate) fn build_sink(
     transport: DrasiTransportSpec,
     on_delivery_error: OnDeliveryError,
     params: Option<&spicepod::param::Params>,
-) -> runtime_drasi::Result<DrasiSink> {
+) -> runtime_drasi::Result<Arc<DrasiSink>> {
     let params = params
         .map(spicepod::param::Params::as_string_map)
         .unwrap_or_default();
@@ -169,13 +169,13 @@ pub(crate) fn build_sink(
         },
     };
 
-    DrasiSink::try_new(DrasiSinkConfig {
+    Ok(Arc::new(DrasiSink::try_new(DrasiSinkConfig {
         dataset: component.clone(),
         source_id: source_id.to_string(),
         mapping: ElementMapping::new(component, labels),
         transport,
         on_delivery_error,
-    })
+    })?))
 }
 
 /// The node labels for `dataset`.

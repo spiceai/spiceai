@@ -42,10 +42,10 @@ pub enum ChangeOp {
 }
 
 impl ChangeOp {
-    /// Maps a CDC operation code onto a Drasi operation.
+    /// Maps a Debezium operation code onto a Drasi operation.
     ///
     /// Debezium creates (`c`), snapshot reads (`r`), and updates (`u`) become
-    /// updates. Runtime-table insert markers are not valid CDC operations.
+    /// updates.
     ///
     /// # Errors
     ///
@@ -285,18 +285,6 @@ mod tests {
         assert_eq!(ChangeOp::from_op_code("r"), Ok(ChangeOp::Update));
         assert_eq!(ChangeOp::from_op_code("u"), Ok(ChangeOp::Update));
         assert_eq!(ChangeOp::from_op_code("d"), Ok(ChangeOp::Delete));
-    }
-
-    #[test]
-    fn internal_runtime_table_insert_marker_is_not_a_cdc_operation() {
-        assert_eq!(ChangeOp::from_op_code("i"), Err("i"));
-    }
-
-    #[test]
-    fn platform_codes_remain_distinct_for_insert_update_and_delete() {
-        assert_eq!(ChangeOp::Insert.platform_code(), "i");
-        assert_eq!(ChangeOp::Update.platform_code(), "u");
-        assert_eq!(ChangeOp::Delete.platform_code(), "d");
     }
 
     /// Truncate deletes every row without naming any, so it cannot be forwarded
