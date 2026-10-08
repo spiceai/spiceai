@@ -26,7 +26,8 @@ limitations under the License.
 //!
 //! [`DecisionPlacement`] (an optimizer rule) lowers every call to `ai_decide` computed
 //! in a projection below the node that uses it. Typed calls on the same input and
-//! model in one node share one request per row (each `ai_decide` call is its own), a `WHERE` clause's other predicates run first,
+//! model in one node share one request per row (each distinct `ai_decide` call is its
+//! own, and identical ones share it), a `WHERE` clause's other predicates run first,
 //! and the functions work in `ORDER BY`, `GROUP BY`, window functions and inner-join
 //! conditions, where `DataFusion` cannot evaluate an async function.
 

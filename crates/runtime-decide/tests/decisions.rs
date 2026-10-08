@@ -395,6 +395,58 @@ async fn identical_inputs_are_asked_once() {
     assert_eq!(jev.requests().len(), 2, "two distinct non-NULL inputs");
 }
 
+/// Identical `ai_decide` calls in one node are one call, however the query reads them:
+/// one request per row, whose answer every occurrence reads. Distinct calls are
+/// separate requests.
+#[tokio::test]
+async fn identical_ai_decide_calls_share_one_request() {
+    let urgent = r#"'{"urgent": {"type": "noul", "instructions": "refund"}}'"#;
+    let team = r#"'{"team": {"type": "choice", "instructions": "Which team?", "criteria": {"billing": null, "technical": null}}}'"#;
+    let cases = [
+        (
+            format!(
+                "SELECT id, ai_decide(body, {urgent}) AS a, ai_decide(body, {urgent}) AS b FROM tickets ORDER BY id"
+            ),
+            "+----+------------------------------+------------------------------+\n| id | a                            | b                            |\n+----+------------------------------+------------------------------+\n| 0  | {urgent: {probability: 0.9}} | {urgent: {probability: 0.9}} |\n| 1  | {urgent: {probability: 0.1}} | {urgent: {probability: 0.1}} |\n+----+------------------------------+------------------------------+",
+            2,
+        ),
+        (
+            format!(
+                "SELECT id, ai_decide(body, {urgent})['urgent']['probability'] AS a, ai_decide(body, {urgent})['urgent']['probability'] AS b FROM tickets ORDER BY id"
+            ),
+            "+----+-----+-----+\n| id | a   | b   |\n+----+-----+-----+\n| 0  | 0.9 | 0.9 |\n| 1  | 0.1 | 0.1 |\n+----+-----+-----+",
+            2,
+        ),
+        (
+            format!(
+                "SELECT id, ai_decide(body, {urgent}) AS a, ai_decide(body, {urgent})['urgent']['probability'] AS b FROM tickets ORDER BY id"
+            ),
+            "+----+------------------------------+-----+\n| id | a                            | b   |\n+----+------------------------------+-----+\n| 0  | {urgent: {probability: 0.9}} | 0.9 |\n| 1  | {urgent: {probability: 0.1}} | 0.1 |\n+----+------------------------------+-----+",
+            2,
+        ),
+        (
+            format!(
+                "SELECT id FROM tickets WHERE ai_decide(body, {urgent})['urgent']['probability'] > 0.5 AND ai_decide(body, {urgent})['urgent']['probability'] > 0.2 ORDER BY id"
+            ),
+            "+----+\n| id |\n+----+\n| 0  |\n+----+",
+            2,
+        ),
+        (
+            format!(
+                "SELECT id, ai_decide(body, {urgent})['urgent']['probability'] AS a, ai_decide(body, {team})['team']['choice'] AS b FROM tickets ORDER BY id"
+            ),
+            "+----+-----+-----------+\n| id | a   | b         |\n+----+-----+-----------+\n| 0  | 0.9 | billing   |\n| 1  | 0.1 | technical |\n+----+-----+-----------+",
+            4,
+        ),
+    ];
+    for (sql, rows, requests) in cases {
+        let jev = Mock::decision_model();
+        let ctx = session(vec![("jev", Arc::clone(&jev))], tickets(2, 1));
+        assert_eq!(run(&ctx, &sql).await, rows, "{sql}");
+        assert_eq!(jev.requests().len(), requests, "{sql}");
+    }
+}
+
 /// `DataFusion` cannot run an async function in these clauses; the planner computes
 /// the decision below them.
 #[tokio::test]

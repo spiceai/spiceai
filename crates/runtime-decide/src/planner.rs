@@ -132,9 +132,12 @@ impl DecisionPlacement {
         }
     }
 
-    /// A projection whose only decision calls are whole `ai_decide` expressions over
-    /// call-free arguments is already in its final form.
+    /// A projection whose only decision calls are whole, distinct `ai_decide`
+    /// expressions over call-free arguments is already in its final form. Identical
+    /// calls are not: `DataFusion` would run each of them and read only the first, so
+    /// they are placed below as one call.
     fn is_placed(&self, projection: &Projection) -> bool {
+        let mut decides: Vec<&Expr> = Vec::new();
         projection.expr.iter().all(|expr| {
             let inner = match expr {
                 Expr::Alias(alias) => alias.expr.as_ref(),
@@ -144,7 +147,9 @@ impl DecisionPlacement {
                 Expr::ScalarFunction(function)
                     if call_kind(&self.functions, inner) == Some(Kind::Decide) =>
                 {
-                    !function.args.iter().any(|arg| self.has_call(arg))
+                    let distinct = !decides.contains(&inner);
+                    decides.push(inner);
+                    distinct && !function.args.iter().any(|arg| self.has_call(arg))
                 }
                 other => !self.has_call(other),
             }
@@ -372,7 +377,7 @@ impl DecisionPlacement {
 
     /// Adds a projection below a node that computes the decision calls in `exprs`:
     /// each distinct input and model gets one `ai_decide` call asking every question
-    /// the typed calls on it ask.
+    /// the typed calls on it ask, and identical calls are computed once.
     fn decide_below<'a>(
         &self,
         exprs: impl Iterator<Item = &'a Expr>,
