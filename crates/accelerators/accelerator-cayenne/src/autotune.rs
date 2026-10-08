@@ -683,16 +683,16 @@ mod tests {
     // ---- TuningMode -------------------------------------------------------
 
     #[test]
-    fn only_an_explicit_adaptive_value_enables_the_closed_loop() {
-        // Unset and `auto` are the same answer, and neither is flagged invalid.
+    fn only_an_explicit_enabled_value_enables_the_closed_loop() {
+        // Unset and `disabled` are the same answer, and neither is flagged invalid.
         assert_eq!(TuningMode::parse(None), (TuningMode::Auto, false));
         assert_eq!(
             TuningMode::parse(Some("disabled")),
             (TuningMode::Auto, false)
         );
-        // `adaptive` matches case-insensitively, ignoring surrounding whitespace.
+        // `enabled` matches case-insensitively, ignoring surrounding whitespace.
         assert_eq!(
-            TuningMode::parse(Some("  Adaptive ")),
+            TuningMode::parse(Some("  Enabled ")),
             (TuningMode::Adaptive, false)
         );
         // An unrecognized value is reported, and can NEVER enable adaptive.
@@ -700,6 +700,9 @@ mod tests {
             TuningMode::parse(Some("nonsense")),
             (TuningMode::Auto, true)
         );
+        // The retired `auto`/`adaptive` values are not recognized.
+        assert_eq!(TuningMode::parse(Some("adaptive")), (TuningMode::Auto, true));
+        assert_eq!(TuningMode::parse(Some("auto")), (TuningMode::Auto, true));
         assert!(!TuningMode::default().is_adaptive());
     }
 
