@@ -279,19 +279,21 @@ fn split_revision(after_at: &str) -> (&str, Option<&str>) {
     }
 }
 
-/// The length of a leading `refs/convert/<name>` or `refs/pr/<number>` ref, when the text
-/// starts with one that ends at a `/` or at the end of the text.
+/// The length of a leading `refs/convert/<name>` or `refs/pr/<number>` ref: the prefix and
+/// the one path segment after it, which a conversion names however a ref name may and a pull
+/// request numbers in digits.
 fn hub_ref_len(after_at: &str) -> Option<usize> {
-    type IsRefChar = fn(char) -> bool;
-    let hub_refs: [(&str, IsRefChar); 2] = [
-        ("refs/convert/", |c| c.is_ascii_alphanumeric() || c == '_'),
-        ("refs/pr/", |c| c.is_ascii_digit()),
+    type IsRefName = fn(&str) -> bool;
+    let hub_refs: [(&str, IsRefName); 2] = [
+        ("refs/convert/", |name| !name.is_empty()),
+        ("refs/pr/", |number| {
+            !number.is_empty() && number.bytes().all(|b| b.is_ascii_digit())
+        }),
     ];
-    hub_refs.iter().find_map(|(prefix, is_ref_char)| {
+    hub_refs.iter().find_map(|(prefix, is_ref_name)| {
         let tail = after_at.strip_prefix(prefix)?;
-        let end = tail.find(|c: char| !is_ref_char(c)).unwrap_or(tail.len());
-        (end > 0 && (end == tail.len() || tail[end..].starts_with('/')))
-            .then_some(prefix.len() + end)
+        let name = tail.split('/').next().unwrap_or_default();
+        is_ref_name(name).then_some(prefix.len() + name.len())
     })
 }
 
@@ -459,10 +461,19 @@ mod tests {
                 "hf://datasets/o/d@feature%2Fx/data.csv",
                 owned("o/d", "feature/x", "data.csv", false),
             ),
-            // `refs/convert/parquet-x` is not a Hub ref: the revision ends at the first `/`.
+            // A conversion ref's name may hold any ref-name characters.
             (
-                "hf://datasets/o/d@refs/convert/parquet-x/a.csv",
-                owned("o/d", "refs", "convert/parquet-x/a.csv", false),
+                "hf://datasets/o/d@refs/convert/my-model.v1.2/a.csv",
+                owned("o/d", "refs/convert/my-model.v1.2", "a.csv", false),
+            ),
+            (
+                "hf://datasets/o/d@refs/convert/duckdb",
+                owned("o/d", "refs/convert/duckdb", "", true),
+            ),
+            // A pull request is numbered: anything else after `refs/pr/` is a path.
+            (
+                "hf://datasets/o/d@refs/pr/x/a.csv",
+                owned("o/d", "refs", "pr/x/a.csv", false),
             ),
             // The path is literal.
             (
