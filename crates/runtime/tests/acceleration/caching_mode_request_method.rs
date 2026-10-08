@@ -406,3 +406,51 @@ async fn test_caching_mode_get_after_post_with_body() -> Result<(), anyhow::Erro
     shutdown.send(()).ok();
     result
 }
+
+/// A body predicate the connector cannot turn into a body — `<>` here — still
+/// sends a GET, so the cached answer must match the unaccelerated one rather
+/// than a cached POST that satisfies the predicate.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_caching_mode_get_with_non_body_predicate_after_post() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug"));
+    register_test_connectors().await;
+    let (shutdown, addr, counts) = start_origin().await;
+    let admin = admin_request_context();
+
+    let result = async {
+        let rt = start_runtime(&format!("http://{addr}"), "caching_post_then_not_eq").await?;
+
+        let post = run_sql(
+            &rt,
+            &admin,
+            "SELECT content FROM cached WHERE request_path = '/items' AND request_body = 'x'",
+        )
+        .await;
+        assert_eq!(contents(&post), vec!["post-response"]);
+        wait_for_cached_rows(&rt, &admin, "cached", 1).await;
+        let (get0, post0) = counts.snapshot();
+
+        let lookup = "WHERE request_path = '/items' AND request_body <> 'z'";
+        let direct = run_sql(&rt, &admin, &format!("SELECT content FROM direct {lookup}")).await;
+        assert_eq!(
+            contents(&direct),
+            vec!["get-response"],
+            "the predicate sends a GET"
+        );
+        let cached = run_sql(&rt, &admin, &format!("SELECT content FROM cached {lookup}")).await;
+        assert_eq!(
+            contents(&cached),
+            contents(&direct),
+            "the cached lookup must match the unaccelerated GET"
+        );
+        assert_eq!(
+            counts.snapshot(),
+            (get0 + 2, post0),
+            "both lookups reach the origin as a GET"
+        );
+        Ok(())
+    }
+    .await;
+    shutdown.send(()).ok();
+    result
+}
