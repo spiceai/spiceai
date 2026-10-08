@@ -36644,11 +36644,14 @@ impl CayenneTableProvider {
         };
         if let Some(persisted) = persisted
             && persisted.file_size_bytes == file_size_bytes
-            && let Some(statistics) = crate::stats::statistics_from_persisted_blob(
+            && let Some(restored) = crate::stats::restore_persisted_statistics(
                 &persisted.statistics_blob,
                 table_schema,
                 persisted.num_rows,
             )
+            // A blob written before NaN was accounted for has its float bounds
+            // ignored; re-inferring from the footer restores them.
+            && restored.accounts_for_nan
             // A blob written before per-column byte sizes were persisted carries none,
             // so serving it would report a different size for this file than the footer
             // does and leave `JoinSelection` picking a build side by which source
@@ -36656,8 +36659,9 @@ impl CayenneTableProvider {
             // which rewrites the blob with the sizes in it. A file whose footer carries
             // no statistics at all re-infers on first touch in each process and is then
             // held by `scan_file_statistics`.
-            && crate::stats::blob_carries_per_column_byte_sizes(&statistics)
+            && crate::stats::blob_carries_per_column_byte_sizes(&restored.statistics)
         {
+            let statistics = restored.statistics;
             self.scan_file_statistics.put(
                 &TableScopedPath {
                     table: None,
@@ -44805,25 +44809,80 @@ mod tests {
         );
     }
 
+    /// A float column holding a NaN has no bounds: `DataFusion` orders a NaN
+    /// like any other value, so bounds that left it out would prune rows it
+    /// matches (spiceai/spiceai#14719). Covers the typed `Float32`/`Float64` path
+    /// and the `ScalarValue` path `Float16` takes.
     #[test]
-    fn compute_column_stats_skips_float_nan_values() {
-        use arrow::array::Float64Array;
-        let array = Float64Array::from(vec![Some(f64::NAN), Some(5.0), None, Some(-2.0)]);
+    fn compute_column_stats_reports_no_bounds_for_a_float_column_holding_nan() {
+        use arrow::array::{Array, Float16Array, Float32Array, Float64Array};
+        use datafusion_common::stats::Precision;
+        type F16 = <arrow::datatypes::Float16Type as arrow::datatypes::ArrowPrimitiveType>::Native;
 
-        let stats = ColumnStatsAccumulator::compute_column_stats(&array);
+        let with_nan: [Arc<dyn Array>; 4] = [
+            Arc::new(Float64Array::from(vec![
+                Some(f64::NAN),
+                Some(5.0),
+                None,
+                Some(-2.0),
+            ])),
+            Arc::new(Float64Array::from(vec![
+                Some(5.0),
+                Some(-f64::NAN),
+                None,
+                Some(-2.0),
+            ])),
+            Arc::new(Float32Array::from(vec![
+                Some(5.0),
+                None,
+                Some(-2.0),
+                Some(f32::NAN),
+            ])),
+            Arc::new(Float16Array::from(vec![
+                Some(F16::from_f64(5.0)),
+                Some(F16::NAN),
+                None,
+                Some(F16::from_f64(-2.0)),
+            ])),
+        ];
+        for array in with_nan {
+            let stats = ColumnStatsAccumulator::compute_column_stats(array.as_ref());
+            assert_eq!(stats.null_count, Precision::Exact(1), "{array:?}");
+            assert_eq!(stats.min_value, Precision::Absent, "{array:?}");
+            assert_eq!(stats.max_value, Precision::Absent, "{array:?}");
+        }
 
-        assert_eq!(
-            stats.null_count,
-            datafusion_common::stats::Precision::Exact(1)
-        );
-        assert_eq!(
-            stats.min_value,
-            datafusion_common::stats::Precision::Exact(ScalarValue::Float64(Some(-2.0)))
-        );
-        assert_eq!(
-            stats.max_value,
-            datafusion_common::stats::Precision::Exact(ScalarValue::Float64(Some(5.0)))
-        );
+        let without_nan: [(Arc<dyn Array>, ScalarValue, ScalarValue); 3] = [
+            (
+                Arc::new(Float64Array::from(vec![
+                    Some(f64::INFINITY),
+                    None,
+                    Some(-2.0),
+                ])),
+                ScalarValue::Float64(Some(-2.0)),
+                ScalarValue::Float64(Some(f64::INFINITY)),
+            ),
+            (
+                Arc::new(Float32Array::from(vec![Some(5.0), None, Some(-2.0)])),
+                ScalarValue::Float32(Some(-2.0)),
+                ScalarValue::Float32(Some(5.0)),
+            ),
+            (
+                Arc::new(Float16Array::from(vec![
+                    Some(F16::from_f64(5.0)),
+                    None,
+                    Some(F16::from_f64(-2.0)),
+                ])),
+                ScalarValue::Float16(Some(F16::from_f64(-2.0))),
+                ScalarValue::Float16(Some(F16::from_f64(5.0))),
+            ),
+        ];
+        for (array, min, max) in without_nan {
+            let stats = ColumnStatsAccumulator::compute_column_stats(array.as_ref());
+            assert_eq!(stats.null_count, Precision::Exact(1), "{array:?}");
+            assert_eq!(stats.min_value, Precision::Exact(min), "{array:?}");
+            assert_eq!(stats.max_value, Precision::Exact(max), "{array:?}");
+        }
     }
 
     #[test]
