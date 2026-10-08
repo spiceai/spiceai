@@ -1101,7 +1101,7 @@ disarm_disk_watch() {
 # turn its checks into a dry run. Nextest's checked-in profile owns retries and
 # the empty-suite verdict; thread-count and output preferences remain usable.
 signoff_make() {
-  env -u MAKEFLAGS -u MFLAGS -u MAKEOVERRIDES -u MAKEFILES \
+  env -u MAKEFLAGS -u GNUMAKEFLAGS -u MFLAGS -u MAKEOVERRIDES -u MAKEFILES \
     -u NEXTEST_FLAG -u NEXTEST_FILTER_EXTRA -u NEXTEST_PROFILE \
     -u NEXTEST_RETRIES -u NEXTEST_NO_TESTS make "$@"
 }

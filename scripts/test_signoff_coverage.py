@@ -8,6 +8,7 @@ import json
 import os
 import re
 import shlex
+import shutil
 import subprocess
 import tempfile
 import unittest
@@ -24,7 +25,7 @@ class SignoffCoverageTest(unittest.TestCase):
         self.root = Path(self.temp.name)
         self.env = os.environ.copy()
         for name in (
-            "MAKEFLAGS", "MFLAGS", "MAKEOVERRIDES", "MAKEFILES", "RUSTC_WRAPPER",
+            "MAKEFLAGS", "GNUMAKEFLAGS", "MFLAGS", "MAKEOVERRIDES", "MAKEFILES", "RUSTC_WRAPPER",
             "RUSTC_WORKSPACE_WRAPPER", "CARGO_TARGET_DIR", "NEXTEST_PROFILE",
             "NEXTEST_RETRIES", "NEXTEST_NO_TESTS", "NEXTEST_FLAG", "NEXTEST_FILTER_EXTRA",
             "SIGNOFF_REMOTE_RUN", "SIGNOFF_STEP_BUDGET_MINUTES",
@@ -182,9 +183,20 @@ run_checks HEAD
     def test_make_dry_run_cannot_attest(self):
         self.write("crates/probe/src/lib.rs", "#[test] fn wrong_rows() { assert_eq!(2, 1); }\n")
         self.commit()
-        result = self.signoff({"MAKEFLAGS": "n"})
-        self.assert_rejected(result)
-        self.assertIn("wrong_rows ... FAILED", result.stdout)
+        # GNU make 4 also reads its flags from GNUMAKEFLAGS, but macOS ships
+        # make 3.81, which ignores it. Passing them on make's command line gives
+        # every host the 4.x behavior, so this case fails wherever it runs.
+        shim = self.root / "target/gnu-make/make"
+        self.write(str(shim.relative_to(self.root)),
+                   f'#!/bin/sh\nexec {shlex.quote(shutil.which("make"))} $GNUMAKEFLAGS "$@"\n')
+        shim.chmod(0o755)
+        gnu_make = {"PATH": f"{shim.parent}{os.pathsep}{self.env['PATH']}"}
+        for controls in ({"MAKEFLAGS": "n"}, {"GNUMAKEFLAGS": "-n"} | gnu_make):
+            with self.subTest(controls=sorted(controls)):
+                (self.root / "status").unlink(missing_ok=True)
+                result = self.signoff(controls)
+                self.assert_rejected(result)
+                self.assertIn("wrong_rows ... FAILED", result.stdout)
 
     def test_diff_error_cannot_skip_checks(self):
         self.write("crates/probe/src/lib.rs", "#[test] fn wrong_rows() { assert_eq!(2, 1); }\n")
