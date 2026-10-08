@@ -1235,26 +1235,39 @@ mod version_tests {
     fn test_runtime_source_rate_control_deserializes() {
         let yaml = r"
             source_rate_control:
-              state_location: file:///tmp/spice-source-rate-control
               refresh_interval: 15s
               github_concurrent_connections_limit: 5
-              params:
-                allow_http: true
         ";
         let runtime: Runtime = yaml::from_str(yaml).expect("Should parse Runtime");
         let source_rate_control = runtime
             .source_rate_control
             .expect("source_rate_control section should exist");
-        assert_eq!(
-            source_rate_control.state_location.as_deref(),
-            Some("file:///tmp/spice-source-rate-control")
-        );
         assert_eq!(source_rate_control.refresh_interval, "15s");
         assert_eq!(
             source_rate_control.github_concurrent_connections_limit,
             Some(5)
         );
-        assert!(source_rate_control.params.is_some());
+    }
+
+    /// Cluster rate control stores its state at `runtime.state.location`, so
+    /// `source_rate_control` has no location or object store params of its own.
+    #[test]
+    fn test_runtime_source_rate_control_rejects_its_own_state_location() {
+        for field in [
+            "state_location: file:///tmp/spice-source-rate-control",
+            "params:\n                allow_http: true",
+        ] {
+            let yaml = format!(
+                "
+            source_rate_control:
+              {field}
+        "
+            );
+            assert!(
+                yaml::from_str::<Runtime>(&yaml).is_err(),
+                "source_rate_control must reject `{field}`"
+            );
+        }
     }
 
     #[test]

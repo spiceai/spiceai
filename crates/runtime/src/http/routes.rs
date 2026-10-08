@@ -667,6 +667,10 @@ async fn track_metrics(
     let auth_request_context: Arc<dyn AuthRequestContext + Send + Sync> =
         Arc::clone(&request_context) as Arc<dyn AuthRequestContext + Send + Sync>;
     req.extensions_mut().insert(auth_request_context);
+    // Also store the concrete `RequestContext` so MCP `tools/call` (which
+    // runs on an rmcp session worker outside this task-local scope) can
+    // re-enter the authenticated principal before executing a tool.
+    req.extensions_mut().insert(Arc::clone(&request_context));
 
     let request_dimensions = request_context.to_dimensions();
 

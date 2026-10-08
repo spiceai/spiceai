@@ -158,7 +158,7 @@ impl FileOpener for VortexOpener {
         let reader =
             InstrumentedReadAt::new_with_labels(reader, metrics_registry.as_ref(), labels.clone());
 
-        let file_pruning_predicate = self.file_pruning_predicate.as_ref().map(Arc::clone);
+        let mut file_pruning_predicate = self.file_pruning_predicate.as_ref().map(Arc::clone);
         let expr_adapter_factory = Arc::clone(&self.expr_adapter_factory);
         let file_metadata_cache = self.file_metadata_cache.as_ref().map(Arc::clone);
         let segment_cache = self.segment_cache.as_ref().map(Arc::clone);
@@ -194,6 +194,12 @@ impl FileOpener for VortexOpener {
                 replace_columns_with_literals(Arc::clone(&expr), &literal_value_cols)
             })?;
             filter = filter
+                .map(|p| replace_columns_with_literals(p, &literal_value_cols))
+                .transpose()?;
+            // `FilePruner` evaluates its predicate against the file schema, which
+            // has no partition columns, so it expects them already folded to this
+            // file's values.
+            file_pruning_predicate = file_pruning_predicate
                 .map(|p| replace_columns_with_literals(p, &literal_value_cols))
                 .transpose()?;
         }
@@ -2423,5 +2429,120 @@ mod tests {
             "the InList membership conjunct is declined"
         );
         assert!(conjuncts.skipped_dynamic[0].is::<df_expr::InListExpr>());
+    }
+
+    /// A dynamic filter over the columns of `bounds`, each `(name, index, lo,
+    /// hi)` naming a column at `index` of the scanned table. Its current value
+    /// is `lo <= name AND name <= hi` for every column, as a hash join builds
+    /// it for its keys.
+    fn bounds_dynamic_filter(bounds: &[(&str, usize, i32, i32)]) -> PhysicalExprRef {
+        let columns: Vec<PhysicalExprRef> = bounds
+            .iter()
+            .map(|&(name, index, _, _)| {
+                Arc::new(df_expr::Column::new(name, index)) as PhysicalExprRef
+            })
+            .collect();
+        let current = bounds
+            .iter()
+            .zip(&columns)
+            .flat_map(|(&(_, _, lo, hi), column)| {
+                [(Operator::GtEq, lo), (Operator::LtEq, hi)].map(|(op, value)| {
+                    Arc::new(df_expr::BinaryExpr::new(
+                        Arc::clone(column),
+                        op,
+                        Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(value)))),
+                    )) as PhysicalExprRef
+                })
+            })
+            .reduce(|left, right| {
+                Arc::new(df_expr::BinaryExpr::new(left, Operator::And, right)) as PhysicalExprRef
+            })
+            .expect("a dynamic filter needs at least one bound");
+        let dynamic_filter = Arc::new(df_expr::DynamicFilterPhysicalExpr::new(
+            columns,
+            Arc::new(df_expr::Literal::new(ScalarValue::Boolean(Some(true)))),
+        ));
+        dynamic_filter
+            .update(current)
+            .expect("dynamic filter update should succeed");
+        dynamic_filter as PhysicalExprRef
+    }
+
+    /// A hash-join dynamic filter on a partition column, scanned through the
+    /// source `try_pushdown_filters` plans for it. `FilePruner` evaluates its
+    /// predicate against the file schema, which has no partition columns, so
+    /// the opener folds each file's partition value into it first. With file
+    /// statistics the pruner runs: it skips a file whose partition value the
+    /// bound excludes, and keeps a NULL partition, whose bound is unknown.
+    #[tokio::test]
+    async fn dynamic_filter_on_a_partition_column_prunes_by_partition_value() -> anyhow::Result<()>
+    {
+        use datafusion_common::config::ConfigOptions;
+        use datafusion_datasource::file::FileSource;
+        use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
+        use datafusion_execution::object_store::ObjectStoreUrl;
+
+        use crate::VortexSource;
+
+        let batch = record_batch!(("a", Int32, vec![Some(1), Some(2), Some(3)]))
+            .expect("partition test batch should build");
+        let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let file_path = "/path/partitioned.vortex";
+        let data_size =
+            write_arrow_to_vortex(Arc::clone(&object_store), file_path, batch.clone()).await?;
+        let table_schema = TableSchema::builder(batch.schema())
+            .with_table_partition_cols(vec![Arc::new(Field::new("part", DataType::Int32, true))])
+            .build();
+
+        // `part` follows the file's `a` in the table schema.
+        let planned = VortexSource::new(table_schema, SESSION.clone()).try_pushdown_filters(
+            vec![bounds_dynamic_filter(&[("part", 1, 3, 7)])],
+            &ConfigOptions::default(),
+        )?;
+        let source = planned
+            .updated_node
+            .expect("pushing a filter should update the source")
+            .with_batch_size(100);
+
+        let mut scanned = Vec::new();
+        for partition_value in [None, Some(5), Some(100)] {
+            for with_statistics in [false, true] {
+                let mut file = PartitionedFile::new(file_path.to_string(), data_size);
+                file.partition_values = vec![ScalarValue::Int32(partition_value)];
+                file.statistics = with_statistics
+                    .then(|| Arc::new(datafusion_common::Statistics::new_unknown(&batch.schema())));
+                let config = FileScanConfigBuilder::new(
+                    ObjectStoreUrl::parse("memory:///")?,
+                    Arc::clone(&source),
+                )
+                .with_file(file.clone())
+                .build();
+                let rows: usize = source
+                    .create_file_opener(Arc::clone(&object_store), &config, 0)?
+                    .open(file)?
+                    .await?
+                    .try_collect::<Vec<_>>()
+                    .await?
+                    .iter()
+                    .map(RecordBatch::num_rows)
+                    .sum();
+                scanned.push((partition_value, with_statistics, rows));
+            }
+        }
+
+        // Without statistics no pruner runs and the row filter leaves the file
+        // whole; with them only the partition outside `3..=7` is skipped.
+        assert_eq!(
+            scanned,
+            vec![
+                (None, false, 3),
+                (None, true, 3),
+                (Some(5), false, 3),
+                (Some(5), true, 3),
+                (Some(100), false, 3),
+                (Some(100), true, 0),
+            ]
+        );
+        Ok(())
     }
 }
