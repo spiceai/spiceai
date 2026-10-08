@@ -346,3 +346,63 @@ async fn test_caching_mode_get_after_explicit_empty_post() -> Result<(), anyhow:
     shutdown.send(()).ok();
     result
 }
+
+/// A POST with a body is cached; a later GET lookup on the same path must not
+/// be answered with it, since the unaccelerated dataset sends a GET there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_caching_mode_get_after_post_with_body() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug"));
+    register_test_connectors().await;
+    let (shutdown, addr, counts) = start_origin().await;
+    let admin = admin_request_context();
+
+    let result = async {
+        let rt = start_runtime(&format!("http://{addr}"), "caching_post_body_then_get").await?;
+        let (get0, post0) = counts.snapshot();
+
+        let post = run_sql(
+            &rt,
+            &admin,
+            "SELECT content FROM cached WHERE request_path = '/items' AND request_body = 'x'",
+        )
+        .await;
+        assert_eq!(contents(&post), vec!["post-response"]);
+        assert_eq!(counts.snapshot(), (get0, post0 + 1));
+        wait_for_cached_rows(&rt, &admin, "cached", 1).await;
+
+        let get = run_sql(
+            &rt,
+            &admin,
+            &format!("SELECT content FROM cached {GET_LOOKUP}"),
+        )
+        .await;
+        assert_eq!(
+            contents(&get),
+            vec!["get-response"],
+            "a GET lookup must not be served a cached POST response"
+        );
+        assert_eq!(
+            counts.snapshot(),
+            (get0 + 1, post0 + 1),
+            "the GET reaches the origin"
+        );
+
+        // The POST entry is still cached and still answers its own lookup.
+        let post_again = run_sql(
+            &rt,
+            &admin,
+            "SELECT content FROM cached WHERE request_path = '/items' AND request_body = 'x'",
+        )
+        .await;
+        assert_eq!(contents(&post_again), vec!["post-response"]);
+        assert_eq!(
+            counts.snapshot(),
+            (get0 + 1, post0 + 1),
+            "the POST is a cache hit"
+        );
+        Ok(())
+    }
+    .await;
+    shutdown.send(()).ok();
+    result
+}
