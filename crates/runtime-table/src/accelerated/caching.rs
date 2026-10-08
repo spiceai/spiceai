@@ -556,12 +556,17 @@ pub fn sends_explicit_empty_request_body(filters: &[Expr]) -> bool {
     HttpTableProvider::request_filter_values(filters, REQUEST_BODY_COLUMN).contains(&"")
 }
 
-/// The storage-only predicates that keep a lookup to the entries of the request
-/// it makes: one `<column> = ''` for each request-key column the cache stores
-/// and the lookup sends no value for. The HTTP connector stores a request made
-/// without a path, query or body with `''` in that column, so without the
-/// predicate a lookup that sends a GET with no query would match a POST or a
-/// query cached for the same path.
+/// The storage-only predicates that keep a lookup to the entries of the method
+/// it uses: `request_body = ''` when the lookup names a request but sends no
+/// body. The HTTP connector stores a GET with `request_body = ''` and a POST
+/// with its body, so without it a GET lookup would match a POST cached for the
+/// same path.
+///
+/// Only `request_body` identifies a cached request reliably: a paginated
+/// response stores each page's own path and query, but every page the
+/// request's body. Empty when the lookup names no request value at all, so
+/// filters only on other columns read across every cached entry, as an
+/// unfiltered scan does.
 ///
 /// Like the namespace predicate, they scope the accelerator read only; the
 /// source still receives the user's filters, so the request is unchanged.
@@ -570,14 +575,17 @@ pub fn request_identity_filters(
     filters: &[Expr],
     cache_schema: &arrow::datatypes::Schema,
 ) -> Vec<Expr> {
-    REQUEST_KEY_COLUMNS
+    let names_request = REQUEST_KEY_COLUMNS
         .into_iter()
-        .filter(|column| {
-            cache_schema.column_with_name(column).is_some()
-                && HttpTableProvider::request_filter_values(filters, column).is_empty()
-        })
-        .map(|column| col(column).eq(lit("")))
-        .collect()
+        .any(|column| !HttpTableProvider::request_filter_values(filters, column).is_empty());
+    if names_request
+        && cache_schema.column_with_name(REQUEST_BODY_COLUMN).is_some()
+        && HttpTableProvider::request_filter_values(filters, REQUEST_BODY_COLUMN).is_empty()
+    {
+        vec![col(REQUEST_BODY_COLUMN).eq(lit(""))]
+    } else {
+        Vec::new()
+    }
 }
 
 /// Maximum number of concurrent refresh requests
@@ -923,9 +931,8 @@ async fn flush_cache_writes(
             }
         };
         let mut filters = req.filters;
-        // An entry's replace must not delete the entries of other requests
-        // cached for the same path, so it carries the predicates its lookup
-        // reads by.
+        // A GET entry's replace must not delete the POST entries cached for
+        // the same path, so it carries the predicate its lookup reads by.
         if !filters.is_empty() {
             let identity = request_identity_filters(&filters, &storage_schema);
             filters.extend(identity);
@@ -2122,8 +2129,8 @@ impl CacheRefreshHelper {
             let stamped: Vec<RecordBatch> = out;
 
             let result = if is_expired {
-                // The child's entry is replaced the way the parent's is, so the
-                // entries of other requests it holds for the same path survive.
+                // The child's GET entry is replaced the way the parent's is, so
+                // the POST entries it holds for the same path survive.
                 let mut child_filters = filters.to_vec();
                 if !child_filters.is_empty() {
                     child_filters.extend(request_identity_filters(filters, &child_schema));
@@ -3443,59 +3450,50 @@ mod tests {
         }
     }
 
-    /// A lookup is pinned to `''` on every request-key column the cache
-    /// stores and the lookup sends no value for — including a column whose
-    /// only predicate sends none — and on nothing else.
+    /// A lookup that names a request but sends no body is pinned to GET
+    /// entries; a POST lookup, one that names no request value, or a cache
+    /// without the column, is not pinned.
     #[test]
-    fn request_identity_filters_pin_every_unsent_request_column() {
+    fn request_identity_filters_pin_get_lookups_to_get_entries() {
         let http = Schema::new(vec![
             Field::new("request_path", DataType::Utf8, true),
             Field::new("request_query", DataType::Utf8, true),
             Field::new("request_body", DataType::Utf8, true),
         ]);
-        let no_query = Schema::new(vec![
-            Field::new("request_path", DataType::Utf8, true),
-            Field::new("request_body", DataType::Utf8, true),
-        ]);
         let other = Schema::new(vec![Field::new("id", DataType::Int32, true)]);
-        let empty = |column: &str| col(column).eq(lit(""));
+        let get = vec![col("request_body").eq(lit(""))];
         let path = col("request_path").eq(lit("/items"));
         let cases: Vec<(&str, Vec<Expr>, &Schema, Vec<Expr>)> = vec![
+            ("path only", vec![path.clone()], &http, get.clone()),
             (
-                "path only",
-                vec![path.clone()],
+                "query only",
+                vec![col("request_query").eq(lit("q=a"))],
                 &http,
-                vec![empty("request_query"), empty("request_body")],
-            ),
-            (
-                "path and body",
-                vec![path.clone(), col("request_body").eq(lit("x"))],
-                &http,
-                vec![empty("request_query")],
-            ),
-            (
-                "path and query",
-                vec![path.clone(), col("request_query").eq(lit("q=a"))],
-                &http,
-                vec![empty("request_body")],
+                get.clone(),
             ),
             (
                 "body predicate that sends no body",
                 vec![path.clone(), col("request_body").not_eq(lit("z"))],
                 &http,
-                vec![empty("request_query"), empty("request_body")],
+                get.clone(),
             ),
             (
-                "no path filter",
-                vec![col("request_query").eq(lit("q=a"))],
+                "path and body",
+                vec![path.clone(), col("request_body").eq(lit("x"))],
                 &http,
-                vec![empty("request_path"), empty("request_body")],
+                vec![],
             ),
             (
-                "cache without request_query",
-                vec![path.clone()],
-                &no_query,
-                vec![empty("request_body")],
+                "no request value named",
+                vec![col("response_status").eq(lit(200_u16))],
+                &http,
+                vec![],
+            ),
+            (
+                "only a body predicate that sends no body",
+                vec![col("request_body").not_eq(lit("z"))],
+                &http,
+                vec![],
             ),
             ("not an HTTP cache", vec![path], &other, vec![]),
         ];

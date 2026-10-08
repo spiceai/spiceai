@@ -1758,9 +1758,9 @@ impl AcceleratedTable {
             )));
         }
 
-        // A lookup must not match entries cached for other requests to the
-        // same path — a POST, or another query. Without filters the scan lists
-        // the whole cache and makes no request, so nothing is pinned.
+        // A GET lookup must not match the POST entries cached for the same
+        // path. Without filters the scan lists the whole cache and makes no
+        // request, so nothing is pinned.
         let identity_filters: Vec<Expr> = if is_caching_mode && !filters.is_empty() {
             caching::request_identity_filters(filters, &self.accelerator.schema())
         } else {
