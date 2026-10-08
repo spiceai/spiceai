@@ -415,10 +415,13 @@ mod tests {
     /// `runtime.task_history` exporter takes a row's `error_message` from the
     /// first ERROR event on its span, so a failure without one reads as success.
     #[derive(Clone, Default)]
-    struct TaskHistoryErrors(Arc<Mutex<Vec<(Option<String>, String)>>>);
+    struct TaskHistoryErrors(Arc<Mutex<Vec<TaskHistoryError>>>);
+
+    /// The name of the span an ERROR event was recorded on, and its message.
+    type TaskHistoryError = (Option<String>, String);
 
     impl TaskHistoryErrors {
-        fn recorded(&self) -> Vec<(Option<String>, String)> {
+        fn recorded(&self) -> Vec<TaskHistoryError> {
             self.0.lock().expect("task_history errors lock").clone()
         }
     }

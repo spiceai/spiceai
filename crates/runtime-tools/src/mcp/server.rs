@@ -4682,7 +4682,7 @@ mod tests {
         let session_id = initialize_legacy_mcp_session(&service).await;
 
         let rw = spice_ctx_with_api_key("writer456:rw");
-        let (status_rw, json_rw) = post_legacy_tools_call_with_session(
+        let (write_status, write_json) = post_legacy_tools_call_with_session(
             &service,
             &session_id,
             "principal_probe",
@@ -4691,16 +4691,16 @@ mod tests {
         )
         .await;
         assert_eq!(
-            status_rw,
+            write_status,
             http::StatusCode::OK,
-            "RW tools/call on legacy session: {json_rw}"
+            "RW tools/call on legacy session: {write_json}"
         );
-        let payload_rw: Value =
-            serde_json::from_str(&tool_result_text(&json_rw)).expect("rw payload");
-        assert_eq!(payload_rw.get("read_only"), Some(&Value::Bool(false)));
+        let write_payload: Value =
+            serde_json::from_str(&tool_result_text(&write_json)).expect("rw payload");
+        assert_eq!(write_payload.get("read_only"), Some(&Value::Bool(false)));
 
         let ro = spice_ctx_with_api_key("topsecret123");
-        let (status_ro, json_ro) = post_legacy_tools_call_with_session(
+        let (read_status, read_json) = post_legacy_tools_call_with_session(
             &service,
             &session_id,
             "principal_probe",
@@ -4709,16 +4709,16 @@ mod tests {
         )
         .await;
         assert_eq!(
-            status_ro,
+            read_status,
             http::StatusCode::OK,
-            "RO tools/call on same legacy session: {json_ro}"
+            "RO tools/call on same legacy session: {read_json}"
         );
-        let payload_ro: Value =
-            serde_json::from_str(&tool_result_text(&json_ro)).expect("ro payload");
+        let read_payload: Value =
+            serde_json::from_str(&tool_result_text(&read_json)).expect("ro payload");
         assert_eq!(
-            payload_ro.get("read_only"),
+            read_payload.get("read_only"),
             Some(&Value::Bool(true)),
-            "same Mcp-Session-Id must still use the current request principal, not a prior session key; got {payload_ro} from {json_ro}"
+            "same Mcp-Session-Id must still use the current request principal, not a prior session key; got {read_payload} from {read_json}"
         );
     }
 }
