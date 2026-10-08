@@ -428,3 +428,5 @@ mod tests {
     }
 }
 // No-op line for sign-off measurement of #14860.
+#[must_use]
+pub fn signoff_14860_canary() -> u32 { "1".parse::<u32>().unwrap() }
