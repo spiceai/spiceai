@@ -491,7 +491,8 @@ async fn test_caching_mode_explicit_empty_post_with_reordered_columns() -> Resul
         let rows = run_sql(
             &rt,
             &admin,
-            &format!("SELECT content, request_path FROM cached {EMPTY_POST_LOOKUP}"),
+            "SELECT content, request_path FROM cached \
+             WHERE request_path = '/items' AND request_body = ''",
         )
         .await;
         assert_eq!(contents(&rows), vec!["post-response"]);
