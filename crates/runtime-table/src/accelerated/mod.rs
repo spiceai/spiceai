@@ -1754,6 +1754,15 @@ impl AcceleratedTable {
                 .await;
         }
 
+        // A lookup that sends a GET must not match the POST entries cached
+        // for the same path. Without filters the scan lists the whole cache
+        // and makes no request, so nothing is pinned.
+        let get_identity_filter: Option<Expr> = if is_caching_mode && !filters.is_empty() {
+            caching::get_request_identity_filter(filters, &self.accelerator.schema())
+        } else {
+            None
+        };
+
         // For caching mode, extend the accelerator scan projection to
         // include the storage-only columns the caching pipeline needs:
         // `_fetched_at` (freshness check inside
@@ -1771,14 +1780,6 @@ impl AcceleratedTable {
         // ds`) would push only the user's columns to the accelerator
         // and the FilterExec on top would fail with `No field named
         // __spice_cache_namespace`.
-        // A lookup that sends a GET must not match the POST entries cached
-        // for the same path. Without filters the scan lists the whole cache
-        // and makes no request, so nothing is pinned.
-        let get_identity_filter: Option<Expr> = if is_caching_mode && !filters.is_empty() {
-            caching::get_request_identity_filter(filters, &self.accelerator.schema())
-        } else {
-            None
-        };
         let mut extended_projection = if is_caching_mode {
             extend_projection_for_caching(projection, &self.accelerator.schema())
         } else {
