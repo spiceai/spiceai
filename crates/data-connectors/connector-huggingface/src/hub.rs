@@ -51,7 +51,8 @@ use crate::location::RepoId;
 
 /// The public Hugging Face Hub.
 pub const DEFAULT_ENDPOINT: &str = "https://huggingface.co";
-const DOCS_URL: &str = "https://spiceai.org/docs/components/data-connectors/huggingface";
+const DOCS_URL: &str =
+    "https://github.com/spiceai/spiceai/blob/trunk/docs/features/huggingface-connector.md";
 
 /// Attempts for one request, the first included.
 const MAX_ATTEMPTS: u32 = 5;

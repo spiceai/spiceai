@@ -49,17 +49,17 @@ const GLOB_START_CHARS: [char; 3] = ['*', '?', '['];
 #[derive(Debug, Snafu, PartialEq, Eq)]
 pub enum Error {
     #[snafu(display(
-        "Expected a location like 'hf://datasets/<owner>/<dataset>', but got {from:?}. See: https://spiceai.org/docs/components/data-connectors/huggingface"
+        "Expected a location like 'hf://datasets/<owner>/<dataset>', but got {from:?}. See: https://github.com/spiceai/spiceai/blob/trunk/docs/features/huggingface-connector.md"
     ))]
     NotAHuggingFaceLocation { from: String },
 
     #[snafu(display(
-        "{from:?} reads a Hugging Face {repo_type} repository, but only dataset repositories can be read. Use a location like 'hf://datasets/<owner>/<dataset>'. See: https://spiceai.org/docs/components/data-connectors/huggingface"
+        "{from:?} reads a Hugging Face {repo_type} repository, but only dataset repositories can be read. Use a location like 'hf://datasets/<owner>/<dataset>'. See: https://github.com/spiceai/spiceai/blob/trunk/docs/features/huggingface-connector.md"
     ))]
     UnsupportedRepoType { from: String, repo_type: String },
 
     #[snafu(display(
-        "{from:?} does not name a dataset repository. Use a location like 'hf://datasets/<owner>/<dataset>'{suggestion}. See: https://spiceai.org/docs/components/data-connectors/huggingface"
+        "{from:?} does not name a dataset repository. Use a location like 'hf://datasets/<owner>/<dataset>'{suggestion}. See: https://github.com/spiceai/spiceai/blob/trunk/docs/features/huggingface-connector.md"
     ))]
     MissingDatasetRepo { from: String, suggestion: String },
 
@@ -621,7 +621,7 @@ mod tests {
             DatasetLocation::parse("hf://stanfordnlp/imdb").expect_err("missing 'datasets/'");
         assert_eq!(
             error.to_string(),
-            "\"hf://stanfordnlp/imdb\" does not name a dataset repository. Use a location like 'hf://datasets/<owner>/<dataset>', for example 'hf://datasets/stanfordnlp/imdb'. See: https://spiceai.org/docs/components/data-connectors/huggingface"
+            "\"hf://stanfordnlp/imdb\" does not name a dataset repository. Use a location like 'hf://datasets/<owner>/<dataset>', for example 'hf://datasets/stanfordnlp/imdb'. See: https://github.com/spiceai/spiceai/blob/trunk/docs/features/huggingface-connector.md"
         );
         let error =
             DatasetLocation::parse("hf://datasets/o/d@a%0Ab").expect_err("a control character");

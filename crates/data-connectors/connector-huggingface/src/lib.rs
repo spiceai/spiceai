@@ -71,7 +71,8 @@ use data_connector_api::linkme;
 
 /// The name used to identify this connector in configuration: `from: hf://...`.
 pub const CONNECTOR_NAME: &str = "hf";
-const DOCS_URL: &str = "https://spiceai.org/docs/components/data-connectors/huggingface";
+const DOCS_URL: &str =
+    "https://github.com/spiceai/spiceai/blob/trunk/docs/features/huggingface-connector.md";
 
 /// File formats a dataset's format is inferred from, when neither the location nor
 /// `file_format` names one.

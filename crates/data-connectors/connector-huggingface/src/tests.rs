@@ -1204,14 +1204,14 @@ async fn a_folder_of_mixed_formats_asks_for_a_narrower_location() {
     let error = connector.table(&mixed).await.expect_err("two formats");
     assert_eq!(
         error.to_string(),
-        "Cannot setup the dataset t (hf) with an invalid configuration. 'data' in dataset 'o/mixed' holds files of more than one format (.csv, .parquet). Narrow `from` to one format's files, for example with a glob such as '*.parquet', or set `file_format`. See: https://spiceai.org/docs/components/data-connectors/huggingface"
+        "Cannot setup the dataset t (hf) with an invalid configuration. 'data' in dataset 'o/mixed' holds files of more than one format (.csv, .parquet). Narrow `from` to one format's files, for example with a glob such as '*.parquet', or set `file_format`. See: https://github.com/spiceai/spiceai/blob/trunk/docs/features/huggingface-connector.md"
     );
 
     let docs = DatasetSpec::new("hf://datasets/o/mixed/docs/", TableReference::bare("t"));
     let error = connector.table(&docs).await.expect_err("no data files");
     assert_eq!(
         error.to_string(),
-        "Cannot setup the dataset t (hf) with an invalid configuration. No Parquet, CSV, TSV, JSON or ORC files were found under 'docs' in dataset 'o/mixed' (found .md). Point `from` at the dataset's data files, or read the Hub's Parquet conversion of it with '@~parquet'. See: https://spiceai.org/docs/components/data-connectors/huggingface"
+        "Cannot setup the dataset t (hf) with an invalid configuration. No Parquet, CSV, TSV, JSON or ORC files were found under 'docs' in dataset 'o/mixed' (found .md). Point `from` at the dataset's data files, or read the Hub's Parquet conversion of it with '@~parquet'. See: https://github.com/spiceai/spiceai/blob/trunk/docs/features/huggingface-connector.md"
     );
 
     mock.commit("o/mixed", C2, vec![("data/raw", text("id\n1\n"))]);
@@ -1226,7 +1226,7 @@ async fn a_folder_of_mixed_formats_asks_for_a_narrower_location() {
             .await
             .expect_err("no extension")
             .to_string(),
-        "Cannot setup the dataset t (hf) with an invalid configuration. 'data/raw' in dataset 'o/mixed' has no file extension to infer its format from. Set `file_format` to parquet, csv, tsv, json, jsonl or orc. See: https://spiceai.org/docs/components/data-connectors/huggingface"
+        "Cannot setup the dataset t (hf) with an invalid configuration. 'data/raw' in dataset 'o/mixed' has no file extension to infer its format from. Set `file_format` to parquet, csv, tsv, json, jsonl or orc. See: https://github.com/spiceai/spiceai/blob/trunk/docs/features/huggingface-connector.md"
     );
     let folder = DatasetSpec::new(
         "hf://datasets/o/mixed@next/data/",
@@ -1238,7 +1238,7 @@ async fn a_folder_of_mixed_formats_asks_for_a_narrower_location() {
             .await
             .expect_err("no data files")
             .to_string(),
-        "Cannot setup the dataset t (hf) with an invalid configuration. No Parquet, CSV, TSV, JSON or ORC files were found under 'data' in dataset 'o/mixed' (found files without an extension). Point `from` at the dataset's data files, or read the Hub's Parquet conversion of it with '@~parquet'. See: https://spiceai.org/docs/components/data-connectors/huggingface"
+        "Cannot setup the dataset t (hf) with an invalid configuration. No Parquet, CSV, TSV, JSON or ORC files were found under 'data' in dataset 'o/mixed' (found files without an extension). Point `from` at the dataset's data files, or read the Hub's Parquet conversion of it with '@~parquet'. See: https://github.com/spiceai/spiceai/blob/trunk/docs/features/huggingface-connector.md"
     );
 
     // `file_format` settles it.
@@ -1278,7 +1278,7 @@ async fn registration_errors_name_the_dataset_and_the_fix() {
 
     assert_eq!(
         error("hf://datasets/o/missing").await,
-        "Cannot setup the dataset t (hf) with an invalid configuration. Hugging Face dataset 'o/missing' was not found or it is private: a private dataset needs `hf_token`. Check the owner and dataset name in `from`. See: https://spiceai.org/docs/components/data-connectors/huggingface"
+        "Cannot setup the dataset t (hf) with an invalid configuration. Hugging Face dataset 'o/missing' was not found or it is private: a private dataset needs `hf_token`. Check the owner and dataset name in `from`. See: https://github.com/spiceai/spiceai/blob/trunk/docs/features/huggingface-connector.md"
     );
     assert_eq!(
         error("hf://datasets/o/errors@nope").await,
@@ -1288,19 +1288,19 @@ async fn registration_errors_name_the_dataset_and_the_fix() {
     assert_eq!(
         error("hf://datasets/o/gated/a.parquet").await,
         format!(
-            "Insufficient permissions to access the dataset t (hf). Hugging Face dataset 'o/gated' is gated and no `hf_token` is set: accept its access conditions at {endpoint}/datasets/o/gated with the account `hf_token` belongs to. See: https://spiceai.org/docs/components/data-connectors/huggingface"
+            "Insufficient permissions to access the dataset t (hf). Hugging Face dataset 'o/gated' is gated and no `hf_token` is set: accept its access conditions at {endpoint}/datasets/o/gated with the account `hf_token` belongs to. See: https://github.com/spiceai/spiceai/blob/trunk/docs/features/huggingface-connector.md"
         )
     );
     // A gated folder: its tree is public, its files are not.
     assert_eq!(
         error("hf://datasets/o/gated/").await,
         format!(
-            "Insufficient permissions to access the dataset t (hf). Hugging Face dataset 'o/gated' is gated and no `hf_token` is set: accept its access conditions at {endpoint}/datasets/o/gated with the account `hf_token` belongs to. See: https://spiceai.org/docs/components/data-connectors/huggingface"
+            "Insufficient permissions to access the dataset t (hf). Hugging Face dataset 'o/gated' is gated and no `hf_token` is set: accept its access conditions at {endpoint}/datasets/o/gated with the account `hf_token` belongs to. See: https://github.com/spiceai/spiceai/blob/trunk/docs/features/huggingface-connector.md"
         )
     );
     assert_eq!(
         error("hf://datasets/o").await,
-        "Cannot setup the dataset t (hf) with an invalid configuration. \"hf://datasets/o\" does not name a dataset repository. Use a location like 'hf://datasets/<owner>/<dataset>', for example 'hf://datasets/o/<dataset>'. See: https://spiceai.org/docs/components/data-connectors/huggingface"
+        "Cannot setup the dataset t (hf) with an invalid configuration. \"hf://datasets/o\" does not name a dataset repository. Use a location like 'hf://datasets/<owner>/<dataset>', for example 'hf://datasets/o/<dataset>'. See: https://github.com/spiceai/spiceai/blob/trunk/docs/features/huggingface-connector.md"
     );
 }
 
@@ -1322,7 +1322,7 @@ async fn the_token_is_sent_to_the_hub_and_never_to_the_cdn() {
             .await
             .expect_err("no token")
             .to_string(),
-        "Cannot setup the dataset t (hf) with an invalid configuration. Hugging Face dataset 'o/private' was not found or it is private: a private dataset needs `hf_token`. Check the owner and dataset name in `from`. See: https://spiceai.org/docs/components/data-connectors/huggingface"
+        "Cannot setup the dataset t (hf) with an invalid configuration. Hugging Face dataset 'o/private' was not found or it is private: a private dataset needs `hf_token`. Check the owner and dataset name in `from`. See: https://github.com/spiceai/spiceai/blob/trunk/docs/features/huggingface-connector.md"
     );
 
     let wrong = connector(&mock, Some("hf_wrong"), &[]);
@@ -1332,7 +1332,7 @@ async fn the_token_is_sent_to_the_hub_and_never_to_the_cdn() {
             .await
             .expect_err("a wrong token")
             .to_string(),
-        "Insufficient permissions to access the dataset t (hf). The Hugging Face Hub rejected `hf_token` for dataset 'o/private' (HTTP 401). Check that the token is valid and grants read access to the dataset. See: https://spiceai.org/docs/components/data-connectors/huggingface"
+        "Insufficient permissions to access the dataset t (hf). The Hugging Face Hub rejected `hf_token` for dataset 'o/private' (HTTP 401). Check that the token is valid and grants read access to the dataset. See: https://github.com/spiceai/spiceai/blob/trunk/docs/features/huggingface-connector.md"
     );
 
     let authorized = connector(&mock, Some(TOKEN), &[]);
@@ -1721,7 +1721,7 @@ fn endpoints_must_be_https_unless_loopback() {
                 .expect_err(invalid)
                 .to_string(),
             format!(
-                "`hf_endpoint` {invalid:?} is not a valid endpoint: use an https:// URL such as 'https://huggingface.co' (http:// is accepted only for a loopback address). See: https://spiceai.org/docs/components/data-connectors/huggingface"
+                "`hf_endpoint` {invalid:?} is not a valid endpoint: use an https:// URL such as 'https://huggingface.co' (http:// is accepted only for a loopback address). See: https://github.com/spiceai/spiceai/blob/trunk/docs/features/huggingface-connector.md"
             ),
             "{invalid}"
         );
