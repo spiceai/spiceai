@@ -45,6 +45,7 @@ use spicepod::component::runtime::Runtime as SpicepodRuntime;
 use spicepod::component::runtime::RuntimeReadyState as SpicepodRuntimeReadyState;
 use spicepod::component::runtime::SourceRateControl as SpicepodSourceRateControl;
 use spicepod::component::runtime::TelemetryConfig;
+use spicepod::component::runtime::{RENAMED_RUNTIME_TUNING_PARAMS, renamed_runtime_param_warning};
 use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 use telemetry::metrics_reader::MetricsReader;
 use telemetry::timing::TimeMeasurement;
@@ -62,20 +63,17 @@ const CAYENNE_SORT_MERGE_MEMORY_POOL_FRACTION_PARAM: &str =
 const CAYENNE_FILTER_PROPAGATION_PARAM: &str = "cayenne_filter_propagation";
 const CAYENNE_OPTIMIZER_RULES_PARAM: &str = "cayenne_optimizer_rules";
 
-/// Goal-driven adaptive-tuning SLO setpoints, settable GLOBALLY here at
-/// `runtime.params` and overridden per-dataset via the matching
-/// `acceleration.params` key (see `accelerator_cayenne`). `cayenne_goal_qph`
-/// is the exception: QPH is a system-wide metric (a join spans datasets), so it
-/// is global-only and a per-dataset value is ignored. Declared here so the keys
-/// are part of the recognized `runtime.params` vocabulary and don't false-warn as
-/// unknown; the values are resolved (and validated) where the per-dataset Cayenne
-/// config is built. NOTE: `cayenne_goal_convergence_window` is deliberately NOT
-/// here — it paces HOW the loop chases these SLOs (a control-cadence/benchmarking
-/// knob), not a target outcome, so it stays a per-dataset advanced override.
-const CAYENNE_GOAL_REPLICATION_LAG_PARAM: &str = "cayenne_goal_replication_lag";
-const CAYENNE_GOAL_FRESHNESS_PARAM: &str = "cayenne_goal_freshness";
-const CAYENNE_GOAL_QUERY_LATENCY_PARAM: &str = "cayenne_goal_query_latency";
-const CAYENNE_GOAL_QPH_PARAM: &str = "cayenne_goal_qph";
+/// Runtime-wide adaptive-tuning parameters: the tuning mode and the SLO setpoints
+/// (`goal_*`) the closed loop steers toward. Declared here so the keys are part of the
+/// recognized `runtime.params` vocabulary and don't false-warn as unknown; the values
+/// are resolved (and validated) where the per-dataset Cayenne config is built, and
+/// `adaptive_tuning` is also validated when the Spicepod loads.
+const ADAPTIVE_TUNING_PARAM: &str = "adaptive_tuning";
+const GOAL_REPLICATION_LAG_PARAM: &str = "goal_replication_lag";
+const GOAL_FRESHNESS_PARAM: &str = "goal_freshness";
+const GOAL_QUERY_LATENCY_PARAM: &str = "goal_query_latency";
+const GOAL_CONVERGENCE_WINDOW_PARAM: &str = "goal_convergence_window";
+const GOAL_QPH_PARAM: &str = "goal_qph";
 
 /// Process-global `SQLite` metastore pragma tuning keys (cache, mmap, busy
 /// timeout, WAL autocheckpoint, `auto_vacuum`). Consumed once at startup in
@@ -123,10 +121,16 @@ const KNOWN_CAYENNE_RUNTIME_PARAMS: &[&str] = &[
     CAYENNE_METASTORE_WAL_TRUNCATE_THRESHOLD_MB_PARAM,
     CAYENNE_METASTORE_AUTO_VACUUM_PARAM,
     CAYENNE_METASTORE_INCREMENTAL_VACUUM_PAGES_PARAM,
-    CAYENNE_GOAL_REPLICATION_LAG_PARAM,
-    CAYENNE_GOAL_FRESHNESS_PARAM,
-    CAYENNE_GOAL_QUERY_LATENCY_PARAM,
-    CAYENNE_GOAL_QPH_PARAM,
+];
+
+/// Runtime-wide tuning keys, which carry no `cayenne_` prefix.
+const TUNING_RUNTIME_PARAMS: &[&str] = &[
+    ADAPTIVE_TUNING_PARAM,
+    GOAL_REPLICATION_LAG_PARAM,
+    GOAL_FRESHNESS_PARAM,
+    GOAL_QUERY_LATENCY_PARAM,
+    GOAL_CONVERGENCE_WINDOW_PARAM,
+    GOAL_QPH_PARAM,
 ];
 
 /// Recognized `runtime.params` keys that don't belong to a larger prefix
@@ -158,9 +162,11 @@ fn known_runtime_params() -> Vec<&'static str> {
             + crate::accelerated::refresh_task::changes::CDC_RUNTIME_PARAMS.len()
             + dataconnector::http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS.len()
             + crate::cluster::CLUSTER_GRPC_RUNTIME_PARAMS.len()
+            + TUNING_RUNTIME_PARAMS.len()
             + MISC_RUNTIME_PARAMS.len(),
     );
     known.extend_from_slice(KNOWN_CAYENNE_RUNTIME_PARAMS);
+    known.extend_from_slice(TUNING_RUNTIME_PARAMS);
     known.extend_from_slice(crate::accelerated::refresh_task::changes::CDC_RUNTIME_PARAMS);
     known.extend_from_slice(dataconnector::http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS);
     known.extend_from_slice(crate::cluster::CLUSTER_GRPC_RUNTIME_PARAMS);
@@ -1179,6 +1185,15 @@ fn warn_on_unknown_runtime_params(params: &HashMap<String, String>) {
     let known = known_runtime_params();
     for key in params.keys() {
         if known.contains(&key.as_str()) {
+            continue;
+        }
+        // A renamed key gets one message naming its replacement, not a second
+        // "not recognized" one.
+        if let Some((old, new)) = RENAMED_RUNTIME_TUNING_PARAMS
+            .iter()
+            .find(|(old, _)| *old == key.as_str())
+        {
+            tracing::warn!("{}", renamed_runtime_param_warning(old, new));
             continue;
         }
         if let Some(suggestion) = util::levenshtein::closest_match(key, &known) {
@@ -3618,6 +3633,7 @@ mod test {
             .iter()
             .chain(crate::accelerated::refresh_task::changes::CDC_RUNTIME_PARAMS)
             .chain(dataconnector::http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS)
+            .chain(TUNING_RUNTIME_PARAMS)
             .chain(MISC_RUNTIME_PARAMS);
         for key in family_keys {
             assert!(
@@ -3634,6 +3650,18 @@ mod test {
             known.len(),
             "duplicate keys in known_runtime_params()"
         );
+    }
+
+    #[test]
+    fn renamed_tuning_params_are_not_known_runtime_params() {
+        let known = known_runtime_params();
+        for (old, new) in RENAMED_RUNTIME_TUNING_PARAMS {
+            assert!(
+                !known.contains(old),
+                "`{old}` is no longer read, so it must not be recognized"
+            );
+            assert!(known.contains(new), "`{new}` must be recognized");
+        }
     }
 
     #[test]

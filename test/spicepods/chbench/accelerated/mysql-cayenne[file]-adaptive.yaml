@@ -4,7 +4,7 @@ name: mysql-cayenne[file]-adaptive
 
 # Adaptive-tuning variant of the non-tuned postgres-cayenne[file] baseline. Instead of either
 # the static `auto` derivation (the baseline) or a hand-pinned -cdc-tuned-* config, every Cayenne
-# table runs `cayenne_tuning: adaptive`: the runtime still warm-starts each knob from the detected
+# table runs under `runtime.params.adaptive_tuning: enabled`: the runtime still warm-starts each knob from the detected
 # host + inferred schema, then runs the closed-feedback loop that adapts those knobs over time
 # within the environment-derived [floor, ceiling] as the workload shifts.
 #
@@ -20,7 +20,7 @@ name: mysql-cayenne[file]-adaptive
 # Background compaction stays at the auto-derived (non-zero) default — the controller rides its
 # tick. No per-ACTUATOR knob value is set anywhere: an explicit knob would *pin* it under adaptive
 # (collapsing its tuning bounds to a point), so the un-pinned baseline gives the loop full freedom.
-# The `cayenne_goal_*` SLOs (set globally under `runtime.params`) are NOT actuator knobs — they
+# The `goal_*` SLOs (set under `runtime.params`) are NOT actuator knobs — they
 # are the high-level targets the closed loop converges toward (it still moves the un-pinned
 # actuators freely to hit them).
 #
@@ -88,18 +88,18 @@ runtime:
       enabled: false
   task_history:
     enabled: false
-  # Goal-driven adaptive SLOs, set GLOBALLY once here and inherited by every Cayenne
-  # dataset (override per-dataset via the same acceleration.params key). These are the
-  # high-level targets the closed loop converges toward — NOT actuator knobs.
-  # Replication-lag/freshness drive the CDC (changes) tables (inert on the full-refresh
-  # reference tables); query-latency (p99) applies to all. QPH is GLOBAL-ONLY: it is
-  # measured across all datasets (a query/join spans several, counted once), so it
-  # cannot be set per-dataset.
+  # `adaptive_tuning: enabled` and the `goal_*` SLOs are runtime-wide: they apply to every Cayenne
+  # dataset, with no per-dataset override. The goals are the high-level targets the closed
+  # loop converges toward — NOT actuator knobs. Replication-lag/freshness drive the CDC
+  # (changes) tables (inert on the full-refresh reference tables); query-latency (p99)
+  # applies to all. QPH is measured across all datasets (a query/join spans several,
+  # counted once).
   params:
-    cayenne_goal_replication_lag: '5s'
-    cayenne_goal_freshness: '30s'
-    cayenne_goal_query_latency: '10s'
-    cayenne_goal_qph: '5000'
+    adaptive_tuning: enabled
+    goal_replication_lag: '5s'
+    goal_freshness: '30s'
+    goal_query_latency: '10s'
+    goal_qph: '5000'
 
 datasets:
   # ---- TPC-C core tables (mutated by OLTP workload) ----
@@ -117,7 +117,6 @@ datasets:
       mode: file
       refresh_mode: changes
       params: &cayenne_params
-        cayenne_tuning: adaptive
         # In-memory CDC intra-apply sharding: 4 PK-hash shards validate+append in
         # parallel within one apply on the memory-tier (changes) tables. Inert on the
         # full-refresh reference tables that share this anchor (not CDC memory mode).
@@ -132,10 +131,8 @@ datasets:
         #    250 ms: 1 190 ms, 973 ms (+7.7 %)
         #      0 ms: one apply per transaction, half the query throughput
         cdc_max_coalesce_age_ms: '500'
-        # Goal-driven SLOs are set globally under `runtime.params` (above) and
-        # inherited by every dataset, so they are intentionally not repeated here.
-        # (A dataset that needed a sharper target would override the relevant
-        # cayenne_goal_* here; QPH is global-only and cannot be overridden.)
+        # `adaptive_tuning` and the goal-driven SLOs are runtime-wide, set under `runtime.params`
+        # (above); there is no per-dataset override.
 
   - from: mysql:district
     name: district

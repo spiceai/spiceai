@@ -16,6 +16,7 @@ runtime:
     cdc_max_coalesced_bytes: "134217728"
     cdc_max_coalesce_age_ms: "250"
     cdc_commit_timeout_ms: "60000"
+    adaptive_tuning: enabled
   caching:
     sql_results:
       enabled: false
@@ -38,7 +39,6 @@ datasets:
       on_conflict:
         _id: upsert
       params:
-        cayenne_tuning: adaptive
         cayenne_metastore: sqlite
         cayenne_force_view_types: "false"
         cayenne_deletion_mode: key
@@ -118,7 +118,6 @@ datasets:
       on_conflict:
         _id: upsert
       params:
-        cayenne_tuning: adaptive
         cayenne_metastore: sqlite
         cayenne_force_view_types: "false"
         cayenne_deletion_mode: key
@@ -177,7 +176,6 @@ datasets:
       on_conflict:
         _id: upsert
       params:
-        cayenne_tuning: adaptive
         cayenne_metastore: sqlite
         cayenne_force_view_types: "false"
         cayenne_deletion_mode: key
@@ -224,7 +222,6 @@ datasets:
       on_conflict:
         _id: upsert
       params:
-        cayenne_tuning: adaptive
         cayenne_metastore: sqlite
         cayenne_force_view_types: "false"
         cayenne_deletion_mode: key
@@ -280,7 +277,6 @@ datasets:
       on_conflict:
         _id: upsert
       params:
-        cayenne_tuning: adaptive
         cayenne_metastore: sqlite
         cayenne_force_view_types: "false"
         cayenne_deletion_mode: key
@@ -339,7 +335,6 @@ datasets:
       on_conflict:
         _id: upsert
       params:
-        cayenne_tuning: adaptive
         cayenne_metastore: sqlite
         cayenne_force_view_types: "false"
         cayenne_deletion_mode: key
@@ -392,7 +387,6 @@ datasets:
       on_conflict:
         _id: upsert
       params:
-        cayenne_tuning: adaptive
         cayenne_metastore: sqlite
         cayenne_force_view_types: "false"
         cayenne_deletion_mode: key
@@ -436,7 +430,6 @@ datasets:
       on_conflict:
         _id: upsert
       params:
-        cayenne_tuning: adaptive
         cayenne_metastore: sqlite
         cayenne_force_view_types: "false"
         cayenne_deletion_mode: key

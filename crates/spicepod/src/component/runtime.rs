@@ -530,6 +530,97 @@ impl Default for TelemetryConfig {
     }
 }
 
+/// Docs page for the `runtime.params` keys, linked from tuning diagnostics.
+pub const RUNTIME_PARAMS_DOCS_URL: &str = "https://spiceai.org/docs/reference/spicepod/runtime";
+
+/// Validate `runtime.params.adaptive_tuning`: `enabled` or `disabled`, ignoring case and
+/// surrounding whitespace. An unset parameter is valid (it means `disabled`).
+///
+/// # Errors
+///
+/// Returns a user-facing error naming the invalid value.
+pub fn validate_tuning_param<S: std::hash::BuildHasher>(
+    params: &HashMap<String, String, S>,
+) -> Result<(), String> {
+    let Some(value) = params.get("adaptive_tuning") else {
+        return Ok(());
+    };
+    let mode = value.trim();
+    if mode.eq_ignore_ascii_case("disabled") || mode.eq_ignore_ascii_case("enabled") {
+        return Ok(());
+    }
+    Err(invalid_tuning_message(mode))
+}
+
+/// Dataset acceleration parameters that moved to `runtime.params` and are no longer read.
+pub const RETIRED_DATASET_TUNING_PARAMS: &[&str] = &[
+    "cayenne_tuning",
+    "cayenne_goal_replication_lag",
+    "cayenne_goal_freshness",
+    "cayenne_goal_query_latency",
+    "cayenne_goal_convergence_window",
+];
+
+/// Catalog parameters that moved to `runtime.params` and are no longer read.
+pub const RETIRED_CATALOG_TUNING_PARAMS: &[&str] = &["cayenne_tuning"];
+
+/// `runtime.params` keys renamed without the `cayenne_` prefix, as `(old, new)`. The old
+/// names are no longer read.
+pub const RENAMED_RUNTIME_TUNING_PARAMS: &[(&str, &str)] = &[
+    ("cayenne_goal_replication_lag", "goal_replication_lag"),
+    ("cayenne_goal_freshness", "goal_freshness"),
+    ("cayenne_goal_query_latency", "goal_query_latency"),
+    ("cayenne_goal_convergence_window", "goal_convergence_window"),
+    ("cayenne_goal_qph", "goal_qph"),
+];
+
+/// One warning for each of `retired` that `params` still sets on a dataset or catalog.
+///
+/// `kind` is `"dataset"` or `"catalog"` and `name` the component's name. The result is
+/// ordered as `retired` is, so the log is stable.
+#[must_use]
+pub fn retired_tuning_param_warnings<S: std::hash::BuildHasher>(
+    kind: &str,
+    name: &str,
+    params: &HashMap<String, String, S>,
+    retired: &[&str],
+) -> Vec<String> {
+    retired
+        .iter()
+        .filter(|key| params.contains_key(**key))
+        .map(|key| {
+            let new_name = if *key == "cayenne_tuning" {
+                "adaptive_tuning"
+            } else {
+                key.strip_prefix("cayenne_").unwrap_or(key)
+            };
+            let mut subject = kind.to_string();
+            if let Some(first) = subject.get_mut(..1) {
+                first.make_ascii_uppercase();
+            }
+            format!(
+                "{subject} '{name}' sets `{key}`, which is no longer a {kind} parameter, so it has no effect. Set `runtime.params.{new_name}` instead. See: {RUNTIME_PARAMS_DOCS_URL}"
+            )
+        })
+        .collect()
+}
+
+/// The warning for a `runtime.params` key that was renamed to `new_name`.
+#[must_use]
+pub fn renamed_runtime_param_warning(old_name: &str, new_name: &str) -> String {
+    format!(
+        "`runtime.params.{old_name}` has been renamed, so it has no effect. Set `runtime.params.{new_name}` instead. See: {RUNTIME_PARAMS_DOCS_URL}"
+    )
+}
+
+/// The error for an unrecognized `runtime.params.adaptive_tuning` value.
+#[must_use]
+pub fn invalid_tuning_message(value: &str) -> String {
+    format!(
+        "Invalid `runtime.params.adaptive_tuning` value '{value}': expected `enabled` or `disabled`. See: {RUNTIME_PARAMS_DOCS_URL}"
+    )
+}
+
 /// Validate `runtime.telemetry.metric_prefix` against OpenTelemetry instrument
 /// name syntax so `{prefix}{instrument}` stays a valid metric name for OTLP
 /// and maps cleanly through Prometheus name sanitization.
@@ -1599,6 +1690,8 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
             crate::component::caching::validate_sql_results_warmup_config(sql_results)?;
         }
 
+        validate_tuning_param(&deserializer.params)?;
+
         Ok(Runtime {
             caching,
             dataset_load_parallelism: deserializer.dataset_load_parallelism,
@@ -2578,6 +2671,72 @@ datasets:
         ";
         let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(runtime.telemetry.metric_prefix, None);
+    }
+
+    #[test]
+    fn test_tuning_param_accepts_enabled_and_disabled() {
+        for value in ["disabled", "enabled", "ENABLED", " disabled "] {
+            let yaml = format!("params:\n  adaptive_tuning: \"{value}\"\n");
+            let runtime: Runtime = yaml::from_str(&yaml).expect("valid tuning must parse");
+            assert_eq!(
+                runtime.params.get("adaptive_tuning").map(String::as_str),
+                Some(value)
+            );
+        }
+        let runtime: Runtime = yaml::from_str("params: {}").expect("unset tuning must parse");
+        assert!(runtime.params.is_empty());
+    }
+
+    #[test]
+    fn test_tuning_param_invalid_value_fails_load() {
+        let error = yaml::from_str::<Runtime>("params:\n  adaptive_tuning: enablde\n")
+            .expect_err("an invalid tuning value must fail the load");
+        assert!(
+            error
+                .to_string()
+                .contains(&invalid_tuning_message("enablde")),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            invalid_tuning_message("enablde"),
+            "Invalid `runtime.params.adaptive_tuning` value 'enablde': expected `enabled` or `disabled`. See: https://spiceai.org/docs/reference/spicepod/runtime"
+        );
+    }
+
+    #[test]
+    fn test_retired_tuning_param_warning_text() {
+        let params = HashMap::from([("cayenne_tuning".to_string(), "enabled".to_string())]);
+        assert_eq!(
+            retired_tuning_param_warnings(
+                "dataset",
+                "orders",
+                &params,
+                RETIRED_DATASET_TUNING_PARAMS
+            ),
+            vec!["Dataset 'orders' sets `cayenne_tuning`, which is no longer a dataset parameter, so it has no effect. Set `runtime.params.adaptive_tuning` instead. See: https://spiceai.org/docs/reference/spicepod/runtime".to_string()]
+        );
+        let params = HashMap::from([("cayenne_tuning".to_string(), "disabled".to_string())]);
+        assert_eq!(
+            retired_tuning_param_warnings("catalog", "lake", &params, RETIRED_CATALOG_TUNING_PARAMS),
+            vec!["Catalog 'lake' sets `cayenne_tuning`, which is no longer a catalog parameter, so it has no effect. Set `runtime.params.adaptive_tuning` instead. See: https://spiceai.org/docs/reference/spicepod/runtime".to_string()]
+        );
+        assert!(
+            retired_tuning_param_warnings(
+                "dataset",
+                "orders",
+                &HashMap::new(),
+                RETIRED_DATASET_TUNING_PARAMS
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_renamed_runtime_param_warning_text() {
+        assert_eq!(
+            renamed_runtime_param_warning("cayenne_goal_freshness", "goal_freshness"),
+            "`runtime.params.cayenne_goal_freshness` has been renamed, so it has no effect. Set `runtime.params.goal_freshness` instead. See: https://spiceai.org/docs/reference/spicepod/runtime"
+        );
     }
 
     #[test]

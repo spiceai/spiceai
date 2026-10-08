@@ -564,22 +564,6 @@ impl Default for CayenneAccelerator {
 /// `fundu` for consistency with the other Spice duration knobs (e.g.
 /// `retention_period`). `None` when unset; a warning + `None` when present but
 /// unparseable.
-/// Resolve a `cayenne_goal_*` setpoint's raw string with global+override
-/// semantics: a per-dataset (`acceleration.params`) value OVERRIDES the
-/// runtime-level (`runtime.params`) global default. `None` when neither sets it —
-/// the legacy "no goal" case, where the controller stays on its signal-driven path.
-fn resolve_goal_raw<'a>(
-    acceleration: &'a Acceleration,
-    runtime_params: &'a std::collections::HashMap<String, String>,
-    key: &str,
-) -> Option<&'a str> {
-    acceleration
-        .params
-        .get(key)
-        .or_else(|| runtime_params.get(key))
-        .map(String::as_str)
-}
-
 /// Parse a goal duration setpoint (`5s`/`1m`/`250ms`) from its already-resolved
 /// raw value. `None` when unset; a warning + `None` when present but unparseable.
 /// `source_desc` names where the value applies, for the diagnostic.
@@ -2194,25 +2178,29 @@ impl CayenneAccelerator {
                 config.compaction_background_interval_ms,
             );
 
-            // Tuning mode (`cayenne_tuning`): `auto` derives the knobs statically
-            // from the detected environment + inferred schema; `adaptive` also runs
-            // the closed-feedback loop that moves them within the environment-derived
-            // [floor, ceiling]. `adaptive` is reached ONLY by asking for it here —
-            // unset, unrecognized, and every other signal (inferred schema, a
-            // configured `cayenne_goal_*`) resolve to `auto`. Independently of the
-            // mode, an explicit per-knob value overrides the derived one, and under
-            // `adaptive` it *pins* that knob so the loop leaves it alone.
-            let raw_tuning = acceleration
-                .params
-                .get("cayenne_tuning")
-                .map(String::as_str);
+            // Tuning mode (`runtime.params.adaptive_tuning`, runtime-wide): `disabled` derives the
+            // knobs statically from the detected environment + inferred schema;
+            // `enabled` also runs the closed-feedback loop that moves them within
+            // the environment-derived [floor, ceiling]. the closed loop is reached ONLY by
+            // asking for it there — unset and every other signal (inferred schema, a
+            // configured `goal_*`) resolve to `disabled`. Independently of the mode, an
+            // explicit per-knob value overrides the derived one, and when `enabled`
+            // it *pins* that knob so the loop leaves it alone.
+            let app = source.app();
+            let runtime_params = &app.runtime.params;
+            let raw_tuning = runtime_params.get("adaptive_tuning").map(String::as_str);
             let (tuning_mode, tuning_was_invalid) = autotune::TuningMode::parse(raw_tuning);
-            if tuning_was_invalid {
-                tracing::warn!(
-                    "Dataset '{table_name}' has an invalid `cayenne_tuning` value: '{}'. Expected 'auto' or 'adaptive'. Defaulting to 'auto'.",
-                    raw_tuning.unwrap_or_default().trim()
-                );
-            }
+            // `runtime.params.adaptive_tuning` is validated when the Spicepod loads; a runtime
+            // built programmatically skips that, so refuse the value here as well
+            // rather than quietly running a different mode than the one requested.
+            ensure!(
+                !tuning_was_invalid,
+                InvalidConfigurationSnafu {
+                    detail: spicepod::component::runtime::invalid_tuning_message(
+                        raw_tuning.unwrap_or_default().trim()
+                    )
+                }
+            );
             config.dynamic_tuning = tuning_mode.is_adaptive();
             // Inferred schema metadata SHARPENS the adaptive warm start (row_count/
             // table_bytes refine the memory sizing; inferred PK/index/sort metadata
@@ -2226,62 +2214,44 @@ impl CayenneAccelerator {
                 tracing::info!(
                     target: "spiced::acceleration::cayenne",
                     table = %table_name,
-                    "`cayenne_tuning: adaptive`: no inferred schema metadata available for this table (the source may not expose catalog metadata or the connection role lacks read access); starting from the hardware-derived config and adapting from observed ingest."
+                    "`runtime.params.adaptive_tuning` is `enabled`: no inferred schema metadata available for this table (the source may not expose catalog metadata or the connection role lacks read access); starting from the hardware-derived config and adapting from observed ingest."
                 );
             }
             // The closed-loop controller rides the per-table background compaction
             // task's tick; with that task disabled (interval == 0) it would never
-            // run (nor emit the autotune gauges), so adaptive falls back to auto.
+            // run (nor emit the autotune gauges), so adaptive falls back to static tuning.
             if config.dynamic_tuning && config.compaction_background_interval_ms == 0 {
                 tracing::warn!(
-                    "Dataset '{table_name}': `cayenne_tuning: adaptive` needs background compaction enabled (the controller runs on its tick), but cayenne_compaction_background_interval_ms is 0; falling back to 'auto'. Set a non-zero interval to enable adaptive tuning."
+                    "Dataset '{table_name}' cannot use adaptive tuning because `cayenne_compaction_background_interval_ms` is 0 and the tuner runs on the background compaction tick, so it uses static tuning even though `runtime.params.adaptive_tuning` is `enabled`. Set `cayenne_compaction_background_interval_ms` to a non-zero value to enable adaptive tuning for it."
                 );
                 config.dynamic_tuning = false;
             }
-            // Goal-driven tuning: parse the high-level SLO setpoints. Times are
-            // duration strings (`5s`/`1m`/`250ms`); QPH is a number. The goals
-            // steer the closed loop but never ENABLE it: `adaptive` is reached
-            // only by an explicit `cayenne_tuning: adaptive`, so a goal set
-            // without it is inert and warns below. Query latency is stored in ms.
-            // SLO setpoints resolve a GLOBAL default (`runtime.params`) with a
-            // per-dataset (`acceleration.params`) override: set an SLO once for the
-            // whole runtime and sharpen it per table where needed.
-            let app = source.app();
-            let runtime_params = &app.runtime.params;
-            config.goal_replication_lag_secs = parse_goal_duration_secs(
-                resolve_goal_raw(acceleration, runtime_params, "cayenne_goal_replication_lag"),
-                "cayenne_goal_replication_lag",
-                table_name,
-            );
-            config.goal_freshness_secs = parse_goal_duration_secs(
-                resolve_goal_raw(acceleration, runtime_params, "cayenne_goal_freshness"),
-                "cayenne_goal_freshness",
-                table_name,
-            );
-            config.goal_query_latency_ms = parse_goal_duration_secs(
-                resolve_goal_raw(acceleration, runtime_params, "cayenne_goal_query_latency"),
-                "cayenne_goal_query_latency",
-                table_name,
-            )
-            .map(|secs| secs * 1000.0);
+            // Goal-driven tuning: parse the high-level SLO setpoints from
+            // `runtime.params` (runtime-wide; there is no per-dataset override).
+            // Times are duration strings (`5s`/`1m`/`250ms`); QPH is a number. The
+            // goals steer the closed loop but never ENABLE it: `adaptive` is reached
+            // only by `runtime.params.adaptive_tuning: enabled`, so a goal set without it is
+            // inert and warns below. Query latency is stored in ms.
+            let goal_duration = |key: &str| {
+                parse_goal_duration_secs(
+                    runtime_params.get(key).map(String::as_str),
+                    key,
+                    "runtime.params",
+                )
+            };
+            config.goal_replication_lag_secs = goal_duration("goal_replication_lag");
+            config.goal_freshness_secs = goal_duration("goal_freshness");
+            config.goal_query_latency_ms =
+                goal_duration("goal_query_latency").map(|secs| secs * 1000.0);
             // The convergence window paces HOW the loop chases the SLOs (step
             // cadence = window / N), not a target outcome — a control/benchmarking
-            // knob with a sensible default. It stays a PER-DATASET advanced override
-            // and is intentionally NOT part of the global SLO surface.
-            config.goal_convergence_window_secs = parse_goal_duration_secs(
-                acceleration
-                    .params
-                    .get("cayenne_goal_convergence_window")
-                    .map(String::as_str),
-                "cayenne_goal_convergence_window",
-                table_name,
-            );
+            // knob with a sensible default.
+            config.goal_convergence_window_secs = goal_duration("goal_convergence_window");
             // QPH is a SYSTEM-WIDE metric — a query (e.g. a join) spans datasets and
-            // is counted once globally — so its goal is configured GLOBALLY only,
-            // under `runtime.params`. There is no per-dataset QPH goal.
+            // is counted once globally.
             config.goal_qph = parse_goal_f64(
-                runtime_params.get("cayenne_goal_qph").map(String::as_str),
-                "cayenne_goal_qph",
+                runtime_params.get("goal_qph").map(String::as_str),
+                "goal_qph",
                 "runtime.params",
             );
             let any_goal = config.goal_replication_lag_secs.is_some()
@@ -2298,7 +2268,7 @@ impl CayenneAccelerator {
                 tracing::warn!(
                     target: "spiced::acceleration::cayenne",
                     table = %table_name,
-                    "`cayenne_tuning: adaptive` is in preview; verify query correctness and performance before using it for production workloads"
+                    "`runtime.params.adaptive_tuning: enabled` is in preview; verify query correctness and performance before using it for production workloads"
                 );
             }
             config.pinned_tuning_actuators = cayenne::metadata::PinnedTuningActuators {
@@ -2357,13 +2327,24 @@ impl CayenneAccelerator {
             let fingerprint =
                 auto_tuned_config_fingerprint(table_name, &metastore_dir, &hw, workload, &config);
             if auto_tuned_config_is_newly_resolved(table_name, fingerprint) {
-                // A `cayenne_goal_*` SLO with the closed loop off does nothing, and
-                // it is easy to set one globally and assume it took effect.
+                // A retired dataset parameter is not read, so say so once rather
+                // than leave the operator assuming it took effect.
+                for warning in spicepod::component::runtime::retired_tuning_param_warnings(
+                    "dataset",
+                    table_name,
+                    &acceleration.params,
+                    spicepod::component::runtime::RETIRED_DATASET_TUNING_PARAMS,
+                ) {
+                    tracing::warn!(target: "spiced::acceleration::cayenne", "{warning}");
+                }
+
+                // A `goal_*` SLO with the closed loop off does nothing, and it is easy
+                // to set one and assume it took effect.
                 if goals_are_inert {
                     tracing::warn!(
                         target: "spiced::acceleration::cayenne",
                         table = %table_name,
-                        "`cayenne_goal_*` is set but adaptive tuning is off, so the goals are ignored (`cayenne_tuning` defaults to 'auto'). Set `cayenne_tuning: adaptive` on this dataset to enable goal-seeking."
+                        "`runtime.params.goal_*` is set but `runtime.params.adaptive_tuning` is `disabled`, so dataset '{table_name}' ignores the goals. Set `runtime.params.adaptive_tuning` to `enabled` to enable goal-seeking. See: https://spiceai.org/docs/reference/spicepod/runtime"
                     );
                 }
 
@@ -3254,21 +3235,14 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .description("Periodic background mem-tier checkpoint interval in milliseconds, in cdc_durability: memory mode only. The accelerator spawns a per-table background task that checkpoints the RAM tier every interval (mirroring the background compactor); this advances the deferred source slot ack on an idle or pure-upsert stream that never trips a delete/truncate event trigger or a write-path cap. Default 1000 (1 s). Set 0 to disable the periodic task."),
         ParameterSpec::component("cdc_mem_tier_shards")
             .description("Number of PK-hash shards the in-RAM CDC tier is partitioned into, in cdc_durability: memory mode only (non-partitioned, key-based merge-on-read tables). Each shard is an independent serial validate->append domain keyed by the RowConverter OwnedRow bytes, so disjoint keys validate and append in parallel within one apply (intra-apply fan-out) while a key's whole version history — upserts AND delete tombstones — stays confined to its one owning shard (last-writer-wins preserved). Checkpoints are always all-shards-atomic on a single source-position axis. Default 1 (the byte-identical serial path). Raise (e.g. 4) on update/insert-heavy CDC tables to lift the per-apply serialization ceiling."),
-        ParameterSpec::component("tuning")
-            .description("Auto-tuning mode. 'auto': derive the correct configuration values from the detected environment (cgroup-aware cores + memory, storage class) and the inferred schema (cardinality, row width, primary key) — no closed loop. 'adaptive': additionally run a per-table closed-feedback controller that measures the live CDC ingest rate, delete fraction, and arrival burstiness AND the runtime's whole-system response (apply latency vs offered load, read amplification that slows queries, cgroup-aware memory pressure) and adapts the inline-memtable flush caps, the in-memory CDC tier byte cap, compaction cadence/trigger, and write concurrency over time, within the environment-derived [floor, ceiling]. DEFAULT: 'auto'. Nothing else turns the closed loop on — 'adaptive' is entered only by setting it here, and a configured cayenne_goal_* SLO is ignored (with a warning) until you do. Schema inference is always attempted and sharpens the 'adaptive' warm-start (inferred cardinality/size) but is not required for it — without inferred metadata the controller relearns the row width from observed ingest and converges from the hardware-derived warm-start. In BOTH modes an explicit per-parameter value (e.g. cayenne_segment_cache_mb: 512) overrides the derived value; under 'adaptive' an explicitly-set actuator is pinned (the loop will not move it).")
-            .one_of(&["auto", "adaptive"])
-            .default("auto"),
-        ParameterSpec::component("goal_replication_lag")
-            .description("Goal-driven adaptive tuning: target end-to-end CDC replication lag as a duration (e.g. '5s'). Best set GLOBALLY at runtime.params (cayenne_goal_replication_lag) and overridden here per-dataset. Requires cayenne_tuning: adaptive — under the 'auto' default the goal is ignored. With the loop enabled, it converges toward this SLO in small, bounded steps."),
-        ParameterSpec::component("goal_freshness")
-            .description("Goal-driven adaptive tuning: target data freshness — age of the newest queryable data — as a duration (e.g. '30s'). Settable globally at runtime.params and overridden here per-dataset. Requires cayenne_tuning: adaptive."),
-        ParameterSpec::component("goal_query_latency")
-            .description("Goal-driven adaptive tuning: target p99 query latency on this table as a duration (e.g. '10s' or '250ms'). Settable globally at runtime.params and overridden here per-dataset. Requires cayenne_tuning: adaptive."),
-        // NOTE: there is no per-dataset `goal_qph` ParameterSpec — QPH is a
-        // system-wide metric (a query/join spans datasets), so its goal is
-        // configured globally only, under `runtime.params`.
-        ParameterSpec::component("goal_convergence_window")
-            .description("Advanced: the control-loop pacing window — the time budget over which the loop steps toward the configured cayenne_goal_* SLOs, as a duration (e.g. '1m'). Default 60s. This paces HOW fast the loop chases the goals, not a target outcome; it is a per-dataset knob, not part of the global SLO surface."),
+        // Retired: these moved to `runtime.params` (`adaptive_tuning`, `goal_*`). They stay listed
+        // only so `Parameters` drops them without a second, generic warning, and are left
+        // out of the published schema.
+        ParameterSpec::component("tuning").moved_to("runtime.params.adaptive_tuning"),
+        ParameterSpec::component("goal_replication_lag").moved_to("runtime.params.goal_replication_lag"),
+        ParameterSpec::component("goal_freshness").moved_to("runtime.params.goal_freshness"),
+        ParameterSpec::component("goal_query_latency").moved_to("runtime.params.goal_query_latency"),
+        ParameterSpec::component("goal_convergence_window").moved_to("runtime.params.goal_convergence_window"),
         ParameterSpec::runtime("cdc_prefetch_buffer")
             .description("Per-dataset override for the CDC source-reader prefetch channel depth (envelopes)."),
         ParameterSpec::runtime("cdc_max_coalesced_envelopes")
@@ -4716,55 +4690,6 @@ mod tests {
         config.pinned_tuning_actuators.write_concurrency = true;
         serialize_partition_child_writes(&mut config, "t");
         assert_eq!(config.write_concurrency, Some(1));
-    }
-
-    #[test]
-    fn resolve_goal_raw_global_default_then_per_dataset_override() {
-        use std::collections::HashMap;
-
-        // Global SLOs set once at runtime.params.
-        let global: HashMap<String, String> = [
-            ("cayenne_goal_freshness".to_string(), "10s".to_string()),
-            (
-                "cayenne_goal_replication_lag".to_string(),
-                "30s".to_string(),
-            ),
-        ]
-        .into_iter()
-        .collect();
-
-        // Dataset overrides freshness, inherits the global replication_lag, and
-        // sets a latency goal that the global doesn't have.
-        let accel = Acceleration {
-            params: [
-                ("cayenne_goal_freshness".to_string(), "2s".to_string()),
-                (
-                    "cayenne_goal_query_latency".to_string(),
-                    "250ms".to_string(),
-                ),
-            ]
-            .into_iter()
-            .collect(),
-            ..Default::default()
-        };
-
-        // Per-dataset value wins over the global default.
-        assert_eq!(
-            resolve_goal_raw(&accel, &global, "cayenne_goal_freshness"),
-            Some("2s")
-        );
-        // Unset on the dataset → inherits the global default.
-        assert_eq!(
-            resolve_goal_raw(&accel, &global, "cayenne_goal_replication_lag"),
-            Some("30s")
-        );
-        // Set only on the dataset (no global) → the dataset value.
-        assert_eq!(
-            resolve_goal_raw(&accel, &global, "cayenne_goal_query_latency"),
-            Some("250ms")
-        );
-        // Set nowhere → None (legacy "no goal"; controller stays signal-driven).
-        assert_eq!(resolve_goal_raw(&accel, &global, "cayenne_goal_qph"), None);
     }
 
     fn http_response_headers_field() -> Field {
@@ -7487,72 +7412,155 @@ mod tests {
         );
     }
 
-    /// `auto` is the tuning mode unless the operator asks for `adaptive` by name.
-    /// A `cayenne_goal_*` SLO — per-dataset or global — expresses a target, not a
-    /// choice of controller, so it must leave the closed loop off.
-    #[tokio::test]
-    async fn test_goals_do_not_enable_adaptive_tuning() {
+    /// A CDC dataset whose resolved config is read under the given `runtime.params`
+    /// and acceleration params.
+    async fn tuning_config(
+        name: &str,
+        runtime_params: &[(&str, &str)],
+        dataset_params: &[(&str, &str)],
+    ) -> Result<cayenne::metadata::VortexConfig> {
         let app = Arc::new(
             AppBuilder::new("test")
                 .with_runtime_params(
-                    [("cayenne_goal_replication_lag".to_string(), "5s".to_string())]
-                        .into_iter()
+                    runtime_params
+                        .iter()
+                        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
                         .collect(),
                 )
                 .build(),
         );
+        let mut dataset = TestAccelerationSource::new(name).with_app(app);
+        dataset.set_acceleration(Acceleration {
+            engine: Engine::Cayenne,
+            mode: Mode::File,
+            refresh_mode: Some(RefreshMode::Changes),
+            params: dataset_params
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+            ..Default::default()
+        });
+        CayenneAccelerator::get_vortex_config(name, &dataset).await
+    }
 
-        let cdc_dataset = |name: &str, params: Vec<(String, String)>| {
-            let mut dataset = TestAccelerationSource::new(name).with_app(Arc::clone(&app));
-            dataset.set_acceleration(Acceleration {
-                engine: Engine::Cayenne,
-                mode: Mode::File,
-                refresh_mode: Some(RefreshMode::Changes),
-                params: params.into_iter().collect(),
-                ..Default::default()
-            });
-            dataset
-        };
-
-        // Global goal only.
-        let global_goal = cdc_dataset("global_goal", vec![]);
-        let config = CayenneAccelerator::get_vortex_config("global_goal", &global_goal)
+    /// Adaptive tuning stays `disabled` unless `runtime.params.adaptive_tuning` is `enabled`. A `goal_*`
+    /// SLO expresses a target, not a choice of controller, so it must leave the closed
+    /// loop off.
+    #[tokio::test]
+    async fn test_goals_do_not_enable_adaptive_tuning() {
+        let config = tuning_config("global_goal", &[("goal_replication_lag", "5s")], &[])
             .await
             .expect("config should be valid");
         assert!(
             !config.dynamic_tuning,
-            "a global cayenne_goal_* must not turn on the closed loop"
+            "a runtime.params goal_* must not turn on the closed loop"
         );
         assert!(
             config.goal_replication_lag_secs.is_some(),
             "the goal is still parsed so an operator who enables adaptive gets it"
         );
 
-        // Global + per-dataset goals.
-        let dataset_goal = cdc_dataset(
-            "dataset_goal",
-            vec![("cayenne_goal_freshness".to_string(), "30s".to_string())],
-        );
-        let config = CayenneAccelerator::get_vortex_config("dataset_goal", &dataset_goal)
-            .await
-            .expect("config should be valid");
-        assert!(
-            !config.dynamic_tuning,
-            "a per-dataset cayenne_goal_* must not turn on the closed loop"
-        );
-
-        // Only the explicit mode does.
-        let adaptive = cdc_dataset(
+        let config = tuning_config(
             "adaptive",
-            vec![("cayenne_tuning".to_string(), "adaptive".to_string())],
-        );
-        let config = CayenneAccelerator::get_vortex_config("adaptive", &adaptive)
-            .await
-            .expect("config should be valid");
+            &[("adaptive_tuning", "enabled"), ("goal_freshness", "30s")],
+            &[],
+        )
+        .await
+        .expect("config should be valid");
         assert!(
             config.dynamic_tuning,
-            "`cayenne_tuning: adaptive` enables the closed loop"
+            "`runtime.params.adaptive_tuning: enabled` enables the closed loop"
         );
+        assert_eq!(config.goal_freshness_secs, Some(30.0));
+    }
+
+    /// The old per-dataset names are no longer read.
+    #[tokio::test]
+    async fn test_retired_dataset_tuning_params_are_not_applied() {
+        let config = tuning_config(
+            "retired",
+            &[],
+            &[
+                ("cayenne_tuning", "adaptive"),
+                ("cayenne_goal_freshness", "30s"),
+                ("cayenne_goal_convergence_window", "5s"),
+            ],
+        )
+        .await
+        .expect("config should be valid");
+        assert!(!config.dynamic_tuning, "`cayenne_tuning` must not be read");
+        assert_eq!(config.goal_freshness_secs, None);
+        assert_eq!(config.goal_convergence_window_secs, None);
+    }
+
+    /// The old global names are no longer read either.
+    #[tokio::test]
+    async fn test_renamed_runtime_goal_params_are_not_applied() {
+        let config = tuning_config(
+            "renamed",
+            &[
+                ("cayenne_goal_freshness", "30s"),
+                ("cayenne_goal_qph", "100"),
+            ],
+            &[],
+        )
+        .await
+        .expect("config should be valid");
+        assert_eq!(config.goal_freshness_secs, None);
+        assert_eq!(config.goal_qph, None);
+    }
+
+    #[tokio::test]
+    async fn test_goal_params_resolve_from_runtime_params() {
+        let config = tuning_config(
+            "goals",
+            &[
+                ("adaptive_tuning", "enabled"),
+                ("goal_replication_lag", "10s"),
+                ("goal_freshness", "5s"),
+                ("goal_query_latency", "250ms"),
+                ("goal_convergence_window", "2m"),
+                ("goal_qph", "5000"),
+            ],
+            &[],
+        )
+        .await
+        .expect("config should be valid");
+        assert_eq!(config.goal_replication_lag_secs, Some(10.0));
+        assert_eq!(config.goal_freshness_secs, Some(5.0));
+        assert_eq!(config.goal_query_latency_ms, Some(250.0));
+        assert_eq!(config.goal_convergence_window_secs, Some(120.0));
+        assert_eq!(config.goal_qph, Some(5000.0));
+    }
+
+    #[tokio::test]
+    async fn test_invalid_runtime_tuning_fails_the_dataset() {
+        let error = tuning_config("bad_tuning", &[("adaptive_tuning", "enablde")], &[])
+            .await
+            .expect_err("an invalid tuning value must not fall back to `auto`");
+        assert!(
+            error.to_string().contains(
+                "Invalid `runtime.params.adaptive_tuning` value 'enablde': expected `enabled` or `disabled`."
+            ),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn test_retired_tuning_specs_are_hidden_from_the_schema_and_dropped() {
+        for name in [
+            "tuning",
+            "goal_replication_lag",
+            "goal_freshness",
+            "goal_query_latency",
+            "goal_convergence_window",
+        ] {
+            let spec = PARAMETERS
+                .iter()
+                .find(|p| p.name == name)
+                .expect("retired spec should stay listed so it is dropped silently");
+            assert!(spec.is_retired(), "`{name}` must be retired");
+        }
     }
 
     #[tokio::test]

@@ -870,7 +870,7 @@ impl RunSummary {
     fn to_markdown(&self) -> String {
         use std::fmt::Write as _;
 
-        // Lag is scraped in ms; report seconds to match the `cayenne_goal_*` SLOs.
+        // Lag is scraped in ms; report seconds to match the `runtime.params.goal_*` SLOs.
         let lag_s = |ms: f64| format!("{:.2} s", ms / 1000.0);
 
         let mut out = String::new();

@@ -692,7 +692,7 @@ pub trait DataAccelerator: Send + Sync {
     /// Seeds this engine's adaptive-tuning knobs for a catalog, whose tables are
     /// configured before any of them exists.
     ///
-    /// `tuning` is the operator's raw `tuning` parameter, interpreted by the engine
+    /// `tuning` is the operator's raw `adaptive_tuning` parameter, interpreted by the engine
     /// because it owns the vocabulary; `data_path` and `metastore_path` are the
     /// directories to probe. A catalog has no schema inference, so the seed comes from
     /// the host alone — which is precisely why it must come from the engine, and why an
@@ -1260,7 +1260,7 @@ pub struct AdaptiveTuningSeeds {
 /// The outcome of asking an engine to seed adaptive tuning.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AdaptiveTuningOutcome {
-    /// The operator's `tuning` value was not one the engine recognizes. Reported rather
+    /// The operator's `adaptive_tuning` value was not one the engine recognizes. Reported rather
     /// than corrected so the caller can warn once and carry on with the default.
     pub tuning_value_invalid: bool,
     /// `None` when the operator did not ask for adaptive tuning, in which case the engine
