@@ -3484,6 +3484,12 @@ mod tests {
                 vec![],
             ),
             (
+                "headers only",
+                vec![col("request_headers").eq(lit(r#"{"x-test":"a"}"#))],
+                &http,
+                get.clone(),
+            ),
+            (
                 "no request value named",
                 vec![col("response_status").eq(lit(200_u16))],
                 &http,
