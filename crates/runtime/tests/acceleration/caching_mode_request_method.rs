@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use app::AppBuilder;
 use arrow::array::{Array, RecordBatch, StringArray};
-use axum::{Router, routing::get};
+use axum::{Router, extract::RawQuery, routing::get};
 use futures::TryStreamExt;
 use runtime::Runtime;
 use runtime_request_context::{Protocol, RequestContext, UserAgent};
@@ -515,6 +515,156 @@ async fn test_caching_mode_explicit_empty_post_with_reordered_columns() -> Resul
             counts.snapshot(),
             (get0, post0 + 1),
             "one POST to the origin"
+        );
+        Ok(())
+    }
+    .await;
+    shutdown.send(()).ok();
+    result
+}
+
+/// Serve `/pages` as a token-paginated JSON API: five items, two per page, the
+/// next page named by `cursor`. Counts every page request.
+async fn start_paginated_origin() -> (oneshot::Sender<()>, SocketAddr, Arc<AtomicUsize>) {
+    let requests = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&requests);
+    let (tx, rx) = oneshot::channel::<()>();
+    let app = Router::new().route(
+        "/pages",
+        get(move |RawQuery(query): RawQuery| {
+            counter.fetch_add(1, Ordering::SeqCst);
+            let page: usize = query
+                .as_deref()
+                .and_then(|q| q.strip_prefix("cursor="))
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(1);
+            let start = (page - 1) * 2;
+            let end = (start + 2).min(5);
+            let items: Vec<String> = (start..end)
+                .map(|i| format!("{{\"item\":\"item-{i}\"}}"))
+                .collect();
+            let next = if end < 5 {
+                (page + 1).to_string()
+            } else {
+                "null".to_string()
+            };
+            let body = format!("{{\"data\":[{}],\"next_cursor\":{next}}}", items.join(","));
+            async move { ([("content-type", "application/json")], body) }
+        }),
+    );
+    let listener = TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind paginated origin listener");
+    let addr = listener.local_addr().expect("paginated origin local_addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app)
+            .with_graceful_shutdown(async {
+                rx.await.ok();
+            })
+            .await
+            .unwrap_or_default();
+    });
+    (tx, addr, requests)
+}
+
+fn paginated_dataset(base_url: &str, name: &str, accelerated: bool) -> Dataset {
+    let mut dataset = Dataset::new(base_url, name);
+    dataset.params = Some(Params::from_string_map(
+        [
+            ("file_format", "json"),
+            ("allowed_request_paths", "/pages"),
+            ("max_retries", "0"),
+            ("pagination", "enabled"),
+            ("pagination_next_pointer", "/next_cursor"),
+            ("pagination_token_param", "cursor"),
+            ("pagination_data_pointer", "/data"),
+            ("pagination_max_pages", "10"),
+        ]
+        .into_iter()
+        .map(|(k, v)| (k.to_string(), v.to_string()))
+        .collect(),
+    ));
+    if accelerated {
+        dataset.acceleration = http_dataset(base_url, name, true).acceleration;
+    }
+    dataset
+}
+
+/// Every page of a paginated response is cached under the request body it was
+/// fetched with (none, for a GET), so a repeated GET lookup is served all of
+/// its pages from the cache, matching the unaccelerated dataset.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_caching_mode_paginated_get_serves_every_page() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug"));
+    register_test_connectors().await;
+    let (shutdown, addr, requests) = start_paginated_origin().await;
+    let admin = admin_request_context();
+
+    let result = async {
+        let base_url = format!("http://{addr}");
+        let mut app = AppBuilder::new("caching_paginated_get")
+            .with_dataset(paginated_dataset(&base_url, "cached_pages", true))
+            .with_dataset(paginated_dataset(&base_url, "direct_pages", false))
+            .build();
+        app.runtime
+            .caching
+            .sql_results
+            .get_or_insert_with(spicepod::component::caching::SQLResultsCacheConfig::default)
+            .enabled = false;
+        configure_test_datafusion();
+        let rt = Runtime::builder().with_app(app).build().await;
+        let load_rt = Arc::new(rt.clone());
+        tokio::select! {
+            () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+                return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
+            }
+            () = load_rt.load_components() => {}
+        }
+        runtime_ready_check(&rt).await;
+
+        let lookup = "WHERE request_path = '/pages' ORDER BY content";
+        let mut expected: Vec<String> = (0..5)
+            .map(|i| format!("{{\"item\":\"item-{i}\"}}"))
+            .collect();
+        expected.sort();
+
+        let direct = run_sql(
+            &rt,
+            &admin,
+            &format!("SELECT content FROM direct_pages {lookup}"),
+        )
+        .await;
+        assert_eq!(
+            contents(&direct),
+            expected,
+            "the unaccelerated dataset reads every page"
+        );
+
+        let cold = run_sql(
+            &rt,
+            &admin,
+            &format!("SELECT content FROM cached_pages {lookup}"),
+        )
+        .await;
+        assert_eq!(contents(&cold), expected, "a cold lookup reads every page");
+        wait_for_cached_rows(&rt, &admin, "cached_pages", 5).await;
+
+        let before_warm = requests.load(Ordering::SeqCst);
+        let warm = run_sql(
+            &rt,
+            &admin,
+            &format!("SELECT content FROM cached_pages {lookup}"),
+        )
+        .await;
+        assert_eq!(
+            contents(&warm),
+            expected,
+            "a warm lookup is served every page"
+        );
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            before_warm,
+            "the warm lookup is a cache hit"
         );
         Ok(())
     }
