@@ -73,12 +73,22 @@ impl fmt::Display for HuggingFaceStore {
 impl HuggingFaceStore {
     /// Reads `repo` with `hub` from now on.
     ///
-    /// The latest registration of a repository wins. Every registration first resolves the
-    /// dataset's revision with its own client, so the client that wins could read the
-    /// repository when it registered; and because every object path names a commit, any
-    /// client that can read the repository reads the same bytes.
+    /// Objects are addressed by repository and commit alone, so every dataset reading a
+    /// repository reads it with one client: the latest registered, so that a reloaded dataset's
+    /// new token takes effect — except that a client with a token is never replaced by one
+    /// without, for the same endpoint: a public read of a gated dataset must not take away the
+    /// token another dataset reads its files with. Every path names a commit, so any client that
+    /// can read the repository at the endpoint reads the same bytes.
     pub fn register(&self, repo: RepoId, hub: Arc<Hub>) {
-        self.hubs.write().insert(repo, hub);
+        let mut hubs = self.hubs.write();
+        if let Some(existing) = hubs.get(&repo)
+            && existing.is_authenticated()
+            && !hub.is_authenticated()
+            && existing.endpoint() == hub.endpoint()
+        {
+            return;
+        }
+        hubs.insert(repo, hub);
     }
 
     fn hub(&self, repo: &RepoId, location: &Path) -> object_store::Result<Arc<Hub>> {
@@ -300,19 +310,10 @@ impl ObjectStore for HuggingFaceStore {
         let Some(prefix) = prefix.cloned() else {
             return stream::once(async { Err(read_only("listing every dataset")) }).boxed();
         };
-        let hubs = self.hubs.read().clone();
+        let hub = target(&prefix).and_then(|target| self.hub(&target.repo, &prefix));
         stream::once(async move {
+            let hub = hub?;
             let Target { repo, commit, path } = target(&prefix)?;
-            let hub = hubs
-                .get(&repo)
-                .cloned()
-                .ok_or_else(|| object_store::Error::NotFound {
-                    path: prefix.to_string(),
-                    source: format!(
-                        "Hugging Face dataset '{repo}' has no dataset registered to read it with"
-                    )
-                    .into(),
-                })?;
             let last_modified = hub
                 .commit_date(&repo, commit)
                 .await

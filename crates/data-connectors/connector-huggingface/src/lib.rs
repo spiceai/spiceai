@@ -21,7 +21,7 @@ limitations under the License.
 //! the Hub's own API, so private and gated datasets work with an `hf_token`.
 
 use std::any::Any;
-use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -29,16 +29,20 @@ use std::sync::{Arc, LazyLock, Weak};
 
 use async_trait::async_trait;
 use data_connector_api::listing::{
-    LISTING_TABLE_PARAMETERS, ListingTableConnector, detect_file_extension_from_path,
-    detect_file_extension_from_url_or_path,
+    LISTING_TABLE_PARAMETERS, ListingTableConnector, ListingTableTemplate,
+    detect_file_extension_from_path, detect_file_extension_from_url_or_path,
+    file_matches_extension,
 };
 use data_connector_api::{
     ConnectorComponent, ConnectorContext, ConnectorParams, DataConnector, DataConnectorError,
     DataConnectorFactory, DataConnectorResult, NewDataConnectorResult,
 };
 use datafusion::datasource::TableProvider;
+use datafusion::datasource::file_format::{FileFormat, csv::CsvFormat};
+use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::runtime_env::RuntimeEnv;
+use futures::FutureExt;
 use object_store::ObjectStore;
 use parking_lot::Mutex;
 use runtime_component::dataset::DatasetSpec;
@@ -57,7 +61,7 @@ mod tests;
 
 use hub::{Commit, EntryKind, Hub, HubConfig};
 use location::DatasetLocation;
-use table::HuggingFaceTable;
+use table::{CommitCheck, HuggingFaceTable};
 
 // `register_data_connector!` names `linkme` unqualified.
 use data_connector_api::linkme;
@@ -82,6 +86,16 @@ enum Error {
 
     #[snafu(display("{source}"))]
     Hub { source: hub::Error },
+
+    #[snafu(display(
+        "The columns of Hugging Face dataset '{repo}' changed at commit {commit}: the dataset was registered with columns ({registered}), and the files now have ({found}). CSV and TSV files are read by column position, so these files cannot be read with the registered columns. Restart Spice to register the new columns, or pin `from` to the commit the dataset was registered at. See: {DOCS_URL}"
+    ))]
+    ColumnsChanged {
+        repo: location::RepoId,
+        commit: String,
+        registered: String,
+        found: String,
+    },
 }
 
 static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
@@ -260,17 +274,86 @@ impl HuggingFace {
                 ),
             });
         };
+        let schema_dataset =
+            schema_dataset(&self.hub, dataset, &location, &commit.sha, &extension).await?;
         let template = listing
-            .listing_table_template(dataset, listing_url.as_ref(), &extension, file_format)
+            .listing_table_template(
+                &schema_dataset,
+                listing_url.as_ref(),
+                &extension,
+                Arc::clone(&file_format),
+            )
             .await?;
-        let table =
-            HuggingFaceTable::try_new(location, Arc::clone(&self.hub), template, commit.sha)
-                .map_err(|source| DataConnectorError::UnableToGetReadProvider {
-                    dataconnector: CONNECTOR_NAME.to_string(),
-                    connector_component: ConnectorComponent::from(dataset),
-                    source: Box::new(source),
-                })?;
+        let positional = (file_format.as_ref() as &dyn Any).is::<CsvFormat>();
+        let commit_check = positional
+            .then(|| self.positional_check(dataset, &listing, &extension, &file_format, &template));
+        let table = HuggingFaceTable::try_new(
+            location,
+            Arc::clone(&self.hub),
+            template,
+            commit.sha,
+            commit_check,
+        )
+        .map_err(|source| DataConnectorError::UnableToGetReadProvider {
+            dataconnector: CONNECTOR_NAME.to_string(),
+            connector_component: ConnectorComponent::from(dataset),
+            source: Box::new(source),
+        })?;
         Ok(Arc::new(table))
+    }
+
+    /// A check that a new commit's CSV or TSV files still have the registered columns, in
+    /// order: those formats are read by position, so a reordered or renamed column would
+    /// otherwise put values under the wrong names.
+    fn positional_check(
+        &self,
+        dataset: &DatasetSpec,
+        listing: &HuggingFaceListing,
+        extension: &str,
+        file_format: &Arc<dyn FileFormat>,
+        template: &ListingTableTemplate,
+    ) -> CommitCheck {
+        let hub = Arc::clone(&self.hub);
+        let dataset = dataset.clone();
+        let listing = listing.clone();
+        let extension = extension.to_string();
+        let file_format = Arc::clone(file_format);
+        let registered = column_names(template.file_schema());
+        Arc::new(move |commit: String| {
+            let hub = Arc::clone(&hub);
+            let dataset = dataset.clone();
+            let listing = HuggingFaceListing {
+                commit: commit.clone(),
+                ..listing.clone()
+            };
+            let extension = extension.clone();
+            let file_format = Arc::clone(&file_format);
+            let registered = registered.clone();
+            async move {
+                let external = |e: DataConnectorError| DataFusionError::External(Box::new(e));
+                let location = listing.location.clone();
+                let url = table::listing_url(&location, &commit)?;
+                let schema_dataset = schema_dataset(&hub, &dataset, &location, &commit, &extension)
+                    .await
+                    .map_err(external)?;
+                let template = listing
+                    .listing_table_template(&schema_dataset, url.as_ref(), &extension, file_format)
+                    .await
+                    .map_err(external)?;
+                let found = column_names(template.file_schema());
+                if found == registered {
+                    Ok(())
+                } else {
+                    Err(DataFusionError::External(Box::new(Error::ColumnsChanged {
+                        repo: location.repo().clone(),
+                        commit,
+                        registered: registered.join(", "),
+                        found: found.join(", "),
+                    })))
+                }
+            }
+            .boxed()
+        })
     }
 
     fn location(dataset: &DatasetSpec) -> DataConnectorResult<DatasetLocation> {
@@ -324,27 +407,33 @@ impl HuggingFace {
 
         // Extensions of the selected files, by whether they are a data format.
         let mut data_extensions = BTreeSet::new();
-        let mut other_extensions = BTreeMap::new();
+        let mut other_extensions = BTreeSet::new();
+        let folder_prefix = if folder.is_empty() {
+            String::new()
+        } else {
+            format!("{folder}/")
+        };
         for entry in entries.iter().filter(|entry| entry.kind == EntryKind::File) {
-            let relative = entry
-                .path
-                .strip_prefix(folder)
-                .map_or(entry.path.as_str(), |rest| rest.trim_start_matches('/'));
+            let Some(relative) = entry.path.strip_prefix(&folder_prefix) else {
+                continue;
+            };
             if glob.as_ref().is_some_and(|glob| !glob.matches(relative)) {
                 continue;
             }
-            let Some(extension) = detect_file_extension_from_path(&entry.path) else {
-                continue;
-            };
-            match extension.format_extension.as_deref() {
+            let extension = detect_file_extension_from_path(&entry.path);
+            match extension
+                .as_ref()
+                .and_then(|e| e.format_extension.as_deref())
+            {
                 Some(format) if INFERABLE_FORMATS.contains(&format) => {
-                    data_extensions
-                        .insert(extension.file_extension.trim_start_matches('.').to_string());
+                    let extension = extension.as_ref().map_or("", |e| e.file_extension.as_str());
+                    data_extensions.insert(extension.trim_start_matches('.').to_string());
                 }
                 _ => {
-                    other_extensions
-                        .entry(extension.file_extension)
-                        .or_insert(entry.path.clone());
+                    other_extensions.insert(extension.map_or_else(
+                        || "files without an extension".to_string(),
+                        |e| e.file_extension,
+                    ));
                 }
             }
         }
@@ -354,6 +443,23 @@ impl HuggingFace {
         } else {
             format!("'{}' in dataset '{}'", location.path(), location.repo())
         };
+        // A single file without an extension lists nothing: its format must be named.
+        if entries.is_empty() && !location.is_folder() && glob.is_none() {
+            let entry = self
+                .hub
+                .entry(location.repo(), &commit.sha, location.path())
+                .await
+                .map_err(|source| hub_error(dataset, source))?;
+            if entry.is_some_and(|entry| entry.kind == EntryKind::File) {
+                return Err(DataConnectorError::InvalidConfigurationNoSource {
+                    dataconnector: CONNECTOR_NAME.to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
+                    message: format!(
+                        "{selected} has no file extension to infer its format from. Set `file_format` to parquet, csv, tsv, json, jsonl or orc. See: {DOCS_URL}"
+                    ),
+                });
+            }
+        }
         match data_extensions.len() {
             1 => Ok(data_extensions.pop_first()),
             0 if other_extensions.is_empty() => {
@@ -371,11 +477,7 @@ impl HuggingFace {
                 connector_component: ConnectorComponent::from(dataset),
                 message: format!(
                     "No Parquet, CSV, TSV, JSON or ORC files were found under {selected} (found {}). Point `from` at the dataset's data files, or read the Hub's Parquet conversion of it with '@~parquet'. See: {DOCS_URL}",
-                    other_extensions
-                        .keys()
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join(", ")
+                    other_extensions.into_iter().collect::<Vec<_>>().join(", ")
                 ),
             }),
             _ => Err(DataConnectorError::InvalidConfigurationNoSource {
@@ -394,6 +496,78 @@ impl HuggingFace {
     }
 }
 
+/// The dataset as schema inference sees it. A location with a glob infers its schema from a
+/// file the glob selects — the listing alone would infer it from any file in the folder —
+/// unless the dataset names its own `schema_source_path`.
+async fn schema_dataset(
+    hub: &Hub,
+    dataset: &DatasetSpec,
+    location: &DatasetLocation,
+    commit: &str,
+    extension: &str,
+) -> DataConnectorResult<DatasetSpec> {
+    let Some((folder, glob)) = location.glob() else {
+        return Ok(dataset.clone());
+    };
+    if dataset.params.contains_key("schema_source_path") {
+        return Ok(dataset.clone());
+    }
+    let pattern =
+        glob::Pattern::new(glob).map_err(|e| DataConnectorError::InvalidConfigurationNoSource {
+            dataconnector: CONNECTOR_NAME.to_string(),
+            connector_component: ConnectorComponent::from(dataset),
+            message: format!("Invalid glob '{glob}' in `from`: {e}"),
+        })?;
+    let folder_prefix = if folder.is_empty() {
+        String::new()
+    } else {
+        format!("{folder}/")
+    };
+    let entries = hub
+        .list(location.repo(), commit, folder, true)
+        .await
+        .map_err(|source| hub_error(dataset, source))?;
+    // The last matching file, as the listing would infer from the newest one and every file
+    // of a commit has the commit's date.
+    let source = entries
+        .iter()
+        .filter(|entry| entry.kind == EntryKind::File)
+        .filter(|entry| {
+            entry
+                .path
+                .strip_prefix(&folder_prefix)
+                .is_some_and(|relative| pattern.matches(relative))
+        })
+        .filter(|entry| {
+            object_store::path::Path::parse(&entry.path)
+                .is_ok_and(|path| file_matches_extension(&path, extension))
+        })
+        .map(|entry| entry.path.as_str())
+        .max();
+    let mut dataset = dataset.clone();
+    if let Some(source) = source {
+        let repo = location.repo();
+        dataset.params.insert(
+            "schema_source_path".to_string(),
+            format!(
+                "{}://datasets/{}/{}@{commit}/{source}",
+                location::SCHEME,
+                repo.owner(),
+                repo.name()
+            ),
+        );
+    }
+    Ok(dataset)
+}
+
+fn column_names(schema: &datafusion::arrow::datatypes::SchemaRef) -> Vec<String> {
+    schema
+        .fields()
+        .iter()
+        .map(|field| field.name().clone())
+        .collect()
+}
+
 /// Maps a Hub error during dataset registration to the connector error a user acts on.
 fn hub_error(dataset: &DatasetSpec, source: hub::Error) -> DataConnectorError {
     let dataconnector = CONNECTOR_NAME.to_string();
@@ -401,7 +575,8 @@ fn hub_error(dataset: &DatasetSpec, source: hub::Error) -> DataConnectorError {
     match source {
         hub::Error::RepoNotFound { .. }
         | hub::Error::RevisionNotFound { .. }
-        | hub::Error::InvalidToken => DataConnectorError::InvalidConfigurationNoSource {
+        | hub::Error::InvalidToken
+        | hub::Error::InvalidEndpoint { .. } => DataConnectorError::InvalidConfigurationNoSource {
             dataconnector,
             connector_component,
             message: source.to_string(),
@@ -470,7 +645,7 @@ impl DataConnector for HuggingFace {
 
 /// The listing-table machinery for one dataset at one commit: file format and options, schema
 /// inference and partition discovery.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct HuggingFaceListing {
     params: Parameters,
     io_runtime: Handle,

@@ -33,6 +33,7 @@ use datafusion::datasource::listing::ListingTableUrl;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
+use futures::future::BoxFuture;
 use object_store::ObjectStore;
 use parking_lot::RwLock;
 
@@ -80,6 +81,10 @@ pub fn listing_url(location: &DatasetLocation, commit: &str) -> DFResult<Listing
     ListingTableUrl::try_new(url, pattern)
 }
 
+/// Checks, before the first scan of a commit, that the commit's files can be read with the
+/// schema the dataset registered with.
+pub type CommitCheck = Arc<dyn Fn(String) -> BoxFuture<'static, DFResult<()>> + Send + Sync>;
+
 /// A table reading a Hugging Face dataset at the commit its revision names when each scan
 /// starts.
 pub struct HuggingFaceTable {
@@ -90,6 +95,7 @@ pub struct HuggingFaceTable {
     schema: SchemaRef,
     /// The table at the commit the latest scan read.
     pinned: RwLock<Pinned>,
+    commit_check: Option<CommitCheck>,
 }
 
 struct Pinned {
@@ -117,6 +123,7 @@ impl HuggingFaceTable {
         hub: Arc<Hub>,
         template: ListingTableTemplate,
         commit: String,
+        commit_check: Option<CommitCheck>,
     ) -> DFResult<Self> {
         let table = template.build(listing_url(&location, &commit)?)?;
         Ok(Self {
@@ -126,6 +133,7 @@ impl HuggingFaceTable {
             template,
             schema: table.schema(),
             pinned: RwLock::new(Pinned { commit, table }),
+            commit_check,
         })
     }
 
@@ -150,6 +158,9 @@ impl HuggingFaceTable {
             }
         }
 
+        if let Some(check) = &self.commit_check {
+            check(commit.sha.clone()).await?;
+        }
         let table = self
             .template
             .build(listing_url(&self.location, &commit.sha)?)?;

@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -33,6 +34,9 @@ IMDB = "hf://datasets/stanfordnlp/imdb@e6281661ce1c48d982bc483cf8a173c1bbeb5d31"
 GSM8K = "hf://datasets/openai/gsm8k@740312add88f781978c0658806c59bc2815b9866"
 SCIFACT = "hf://datasets/mteb/scifact@cf10ab6856b15b0e670ef8ae5dae4e266c12d035"
 IRIS = "hf://datasets/scikit-learn/iris@0bda0ce801be0fa2f464ff845a9d5ceae99aad7d"
+# The commit of imdb's `refs/convert/parquet`, the branch `@~parquet` names: pinned, since the
+# Hub may regenerate the conversion. The alias itself is covered by the parser's unit tests.
+IMDB_CONVERTED = "hf://datasets/stanfordnlp/imdb@0b525c3ee2447b87002590030af0cdeaf509422a"
 
 # name -> (from, Spice SQL, DuckDB SQL over the same files, recorded answer). The answers
 # are integers so the engines cannot disagree on formatting.
@@ -56,9 +60,9 @@ CASES = {
         {"n": 50000, "s": 25000, "c": 65471551},
     ),
     "imdb_converted": (
-        "hf://datasets/stanfordnlp/imdb@~parquet/plain_text/test/",
+        f"{IMDB_CONVERTED}/plain_text/test/",
         "SELECT count(*) AS n, sum(label) AS s, sum(character_length(text)) AS c FROM {t}",
-        "SELECT count(*) AS n, sum(label) AS s, sum(length(text)) AS c FROM 'hf://datasets/stanfordnlp/imdb@~parquet/plain_text/test/*.parquet'",
+        f"SELECT count(*) AS n, sum(label) AS s, sum(length(text)) AS c FROM '{IMDB_CONVERTED}/plain_text/test/*.parquet'",
         {"n": 25000, "s": 12500, "c": 32344810},
     ),
     "gsm8k_test": (
@@ -87,15 +91,18 @@ CASES = {
     ),
 }
 
-# Full-row diffs for the tables small enough to compare every row.
+# Full-row diffs for the tables small enough to compare every row: (Spice SQL, DuckDB SQL,
+# recorded SHA-256 of DuckDB's rows as `row_hash` computes it).
 ROW_DIFFS = {
     "iris": (
         'SELECT "Id", "SepalLengthCm", "SepalWidthCm", "PetalLengthCm", "PetalWidthCm", "Species" FROM {t} ORDER BY "Id"',
         f"SELECT Id, SepalLengthCm, SepalWidthCm, PetalLengthCm, PetalWidthCm, Species FROM read_csv('{IRIS}/Iris.csv', header=true) ORDER BY Id",
+        "ba4eaf75aeda79bb70cd9aa9b19300b4111e7a937ffce40c2d6ef7feaebd7a75",
     ),
     "gsm8k_test": (
         "SELECT question, answer FROM {t} ORDER BY question, answer",
         f"SELECT question, answer FROM '{GSM8K}/main/test-00000-of-00001.parquet' ORDER BY question, answer",
+        "f356dccf3734ae1c1c94822393eddb8feced836dbe24964290ce4e01a03b2d52",
     ),
 }
 
@@ -138,6 +145,11 @@ def normalize(rows: list[dict]) -> list[dict]:
             out[key.lower()] = value
         normalized.append(out)
     return normalized
+
+
+def row_hash(rows: list[dict]) -> str:
+    canonical = json.dumps(normalize(rows), sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    return hashlib.sha256(canonical.encode()).hexdigest()
 
 
 def run(spiced: Path, directory: Path, timeout: float, duckdb: str | None) -> None:
@@ -226,20 +238,24 @@ def run(spiced: Path, directory: Path, timeout: float, duckdb: str | None) -> No
                     answer = normalize(sql(spice_sql.format(t=f"{name}_{mode}")))
                     if answer != [expected]:
                         failures.append(f"{name}_{mode}: Spice answered {answer}, expected {expected}")
-            if duckdb:
-                for name, (spice_sql, duckdb_sql) in ROW_DIFFS.items():
+            for name, (spice_sql, duckdb_sql, recorded) in ROW_DIFFS.items():
+                want = None
+                if duckdb:
                     want = normalize(oracle(duckdb_sql))
-                    for mode in ("federated", "accelerated"):
-                        got = normalize(sql(spice_sql.format(t=f"{name}_{mode}")))
-                        if got != want:
-                            mismatch = next(
-                                (i for i, (a, b) in enumerate(zip(got, want)) if a != b),
-                                min(len(got), len(want)),
-                            )
-                            failures.append(
-                                f"{name}_{mode}: {len(got)} rows vs DuckDB's {len(want)}; first difference at row {mismatch}"
-                            )
-            # A folder of mixed formats is refused with an actionable error, not guessed.
+                    if row_hash(want) != recorded:
+                        failures.append(f"{name}: DuckDB's rows hash to {row_hash(want)}, recorded {recorded}")
+                for mode in ("federated", "accelerated"):
+                    got = normalize(sql(spice_sql.format(t=f"{name}_{mode}")))
+                    if row_hash(got) == recorded:
+                        continue
+                    detail = f"{len(got)} rows hash to {row_hash(got)}, recorded {recorded}"
+                    if want is not None:
+                        mismatch = next(
+                            (i for i, (a, b) in enumerate(zip(got, want)) if a != b),
+                            min(len(got), len(want)),
+                        )
+                        detail += f"; first difference from DuckDB's {len(want)} rows at row {mismatch}"
+                    failures.append(f"{name}_{mode}: {detail}")
             assert not failures, "\n".join(failures)
             print(
                 f"PASS: {len(datasets)} datasets ({len(CASES)} locations, federated and accelerated)"

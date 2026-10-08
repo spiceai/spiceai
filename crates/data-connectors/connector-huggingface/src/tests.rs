@@ -48,6 +48,7 @@ use crate::{HuggingFace, PARAMETERS, store};
 
 const C1: &str = "1111111111111111111111111111111111111111";
 const C2: &str = "2222222222222222222222222222222222222222";
+const C3: &str = "3333333333333333333333333333333333333333";
 const TOKEN: &str = "hf_test_token";
 
 #[derive(Clone)]
@@ -82,6 +83,8 @@ struct Faults {
     expired: u32,
     /// The CDN answers a ranged request with the whole file.
     ignore_range: bool,
+    /// Tree pages after the first answer 404, as a listing cut short would.
+    missing_later_pages: bool,
 }
 
 #[derive(Default)]
@@ -344,6 +347,9 @@ async fn hub_handler(State(mock): State<Mock>, request: Request<Body>) -> Respon
             };
             let folder = rest.join("/");
             let query = request.uri().query().unwrap_or_default().to_string();
+            if state.faults.missing_later_pages && query.contains("cursor=") {
+                return hub_error(StatusCode::NOT_FOUND, "EntryNotFound", "does not exist");
+            }
             let recursive = query.contains("recursive=true");
             let cursor: usize = query
                 .split('&')
@@ -779,6 +785,109 @@ async fn a_single_file_and_a_glob_select_their_files() {
     );
 }
 
+/// A glob infers its schema from a file it selects, not from any file in its folder.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_glob_infers_its_schema_from_the_files_it_selects() {
+    let mock = Mock::start().await;
+    mock.commit(
+        "o/globschema",
+        C1,
+        vec![
+            ("data/train-0.csv", text("id,name\n1,one\n2,two\n")),
+            ("data/train-1.csv", text("id,name\n3,three\n")),
+            // Every file of a commit has the commit's date, and a folder-wide inference keeps
+            // the first of equally new files: this one, listed first.
+            ("data/aa-other.csv", text("x,y,z\n7,8,9\n")),
+        ],
+    );
+    mock.branch("o/globschema", "main", C1);
+    let connector = connector(&mock, None, &[]);
+    let dataset = DatasetSpec::new(
+        "hf://datasets/o/globschema/data/train-*.csv",
+        TableReference::bare("t"),
+    );
+    let table = connector.table(&dataset).await.expect("registers");
+    let names: Vec<_> = table
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+    assert_eq!(names, ["id", "name"]);
+    let ctx = SessionContext::new();
+    ctx.register_table("t", table).expect("registered");
+    let batches = query(&ctx, "SELECT id, name FROM t ORDER BY id").await;
+    assert_eq!(
+        arrow::util::pretty::pretty_format_batches(&batches)
+            .expect("printable")
+            .to_string(),
+        "+----+-------+\n| id | name  |\n+----+-------+\n| 1  | one   |\n| 2  | two   |\n| 3  | three |\n+----+-------+"
+    );
+}
+
+/// CSV is read by column position, so a commit whose files reorder the columns must fail the
+/// scan rather than put values under the wrong names; a commit with the same columns reads.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_csv_commit_with_reordered_columns_fails_instead_of_misreading() {
+    let mock = Mock::start().await;
+    mock.commit(
+        "o/csvmove",
+        C1,
+        vec![("data/a.csv", text("id,name,city\n1,ann,oslo\n"))],
+    );
+    mock.branch("o/csvmove", "main", C1);
+    let connector = connector(&mock, None, &[]);
+    let dataset = DatasetSpec::new("hf://datasets/o/csvmove/data/", TableReference::bare("t"));
+    let ctx = SessionContext::new();
+    ctx.register_table("t", connector.table(&dataset).await.expect("registers"))
+        .expect("registered");
+    let sql = "SELECT id, name, city FROM t ORDER BY id";
+    let printed = |batches: &[RecordBatch]| {
+        arrow::util::pretty::pretty_format_batches(batches)
+            .expect("printable")
+            .to_string()
+    };
+    assert_eq!(
+        printed(&query(&ctx, sql).await),
+        "+----+------+------+\n| id | name | city |\n+----+------+------+\n| 1  | ann  | oslo |\n+----+------+------+"
+    );
+
+    // The branch moves to files whose columns are reordered.
+    mock.commit(
+        "o/csvmove",
+        C2,
+        vec![("data/a.csv", text("id,city,name\n2,rome,bob\n"))],
+    );
+    mock.branch("o/csvmove", "main", C2);
+    connector.hub.forget_revisions();
+    let error = ctx
+        .sql(sql)
+        .await
+        .expect("plans")
+        .collect()
+        .await
+        .expect_err("reordered columns");
+    assert!(
+        error.to_string().contains(
+            "The columns of Hugging Face dataset 'o/csvmove' changed at commit 2222222222222222222222222222222222222222: the dataset was registered with columns (id, name, city), and the files now have (id, city, name)."
+        ),
+        "{error}"
+    );
+
+    // A later commit with the registered columns reads again.
+    mock.commit(
+        "o/csvmove",
+        C3,
+        vec![("data/a.csv", text("id,name,city\n3,cy,lima\n"))],
+    );
+    mock.branch("o/csvmove", "main", C3);
+    connector.hub.forget_revisions();
+    assert_eq!(
+        printed(&query(&ctx, sql).await),
+        "+----+------+------+\n| id | name | city |\n+----+------+------+\n| 3  | cy   | lima |\n+----+------+------+"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn csv_and_jsonl_files_are_read_through_the_hub_cache() {
     let mock = Mock::start().await;
@@ -849,6 +958,33 @@ async fn a_folder_of_mixed_formats_asks_for_a_narrower_location() {
     assert_eq!(
         error.to_string(),
         "Cannot setup the dataset t (hf) with an invalid configuration. No Parquet, CSV, TSV, JSON or ORC files were found under 'docs' in dataset 'o/mixed' (found .md). Point `from` at the dataset's data files, or read the Hub's Parquet conversion of it with '@~parquet'. See: https://spiceai.org/docs/components/data-connectors/huggingface"
+    );
+
+    mock.commit("o/mixed", C2, vec![("data/raw", text("id\n1\n"))]);
+    mock.branch("o/mixed", "next", C2);
+    let raw = DatasetSpec::new(
+        "hf://datasets/o/mixed@next/data/raw",
+        TableReference::bare("t"),
+    );
+    assert_eq!(
+        connector
+            .table(&raw)
+            .await
+            .expect_err("no extension")
+            .to_string(),
+        "Cannot setup the dataset t (hf) with an invalid configuration. 'data/raw' in dataset 'o/mixed' has no file extension to infer its format from. Set `file_format` to parquet, csv, tsv, json, jsonl or orc. See: https://spiceai.org/docs/components/data-connectors/huggingface"
+    );
+    let folder = DatasetSpec::new(
+        "hf://datasets/o/mixed@next/data/",
+        TableReference::bare("t"),
+    );
+    assert_eq!(
+        connector
+            .table(&folder)
+            .await
+            .expect_err("no data files")
+            .to_string(),
+        "Cannot setup the dataset t (hf) with an invalid configuration. No Parquet, CSV, TSV, JSON or ORC files were found under 'data' in dataset 'o/mixed' (found files without an extension). Point `from` at the dataset's data files, or read the Hub's Parquet conversion of it with '@~parquet'. See: https://spiceai.org/docs/components/data-connectors/huggingface"
     );
 
     // `file_format` settles it.
@@ -939,10 +1075,10 @@ async fn the_token_is_sent_to_the_hub_and_never_to_the_cdn() {
     );
 
     let authorized = connector(&mock, Some(TOKEN), &[]);
+    mock.clear_seen();
     let ctx = SessionContext::new();
     ctx.register_table("t", authorized.table(&dataset).await.expect("registers"))
         .expect("registered");
-    mock.clear_seen();
     assert_rows(
         &query(&ctx, "SELECT * FROM t ORDER BY id").await,
         &rows(0..50),
@@ -1189,6 +1325,32 @@ mod store_reads {
             .filter(|s| s.path.contains("/revision/"))
             .count();
         assert_eq!(lookups, 3);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_listing_whose_later_page_is_missing_is_an_error_not_a_shorter_listing() {
+        let mock = Mock::start().await;
+        let files: Vec<(String, File)> = (0..9)
+            .map(|i| (format!("data/f-{i}.csv"), text("id\n1\n")))
+            .collect();
+        mock.commit(
+            "r/cut",
+            C1,
+            files.iter().map(|(p, f)| (p.as_str(), f.clone())).collect(),
+        );
+        {
+            let mut state = mock.0.lock();
+            state.page_size = 4;
+            state.faults.missing_later_pages = true;
+        }
+        let (store, _) = registered(&mock, "r/cut");
+        let listed =
+            futures::TryStreamExt::try_collect::<Vec<_>>(store.list(Some(&path("r/cut", "data"))))
+                .await;
+        assert!(
+            matches!(listed, Err(object_store::Error::NotFound { .. })),
+            "a listing cut short must fail: {listed:?}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread")]

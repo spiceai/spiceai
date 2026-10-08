@@ -147,6 +147,9 @@ pub enum Error {
         source: tokio::task::JoinError,
     },
 
+    #[snafu(display("The Hugging Face Hub endpoint '{endpoint}' is not an http(s) URL."))]
+    InvalidEndpoint { endpoint: String },
+
     /// An error several concurrent callers received from one shared request.
     #[snafu(display("{message}"))]
     Shared { message: String },
@@ -298,6 +301,8 @@ pub struct Hub {
     listings: Cache<ListingKey, Arc<[TreeEntry]>>,
     /// The CDN URL of a file and the content id the Hub reported for it.
     file_urls: Cache<FileKey, (Url, Option<String>)>,
+    /// The description of a path at a commit, which cannot change.
+    entries: Cache<FileKey, Option<TreeEntry>>,
 }
 
 impl fmt::Debug for Hub {
@@ -313,9 +318,15 @@ impl Hub {
     ///
     /// # Errors
     ///
-    /// Returns an error if the token cannot be sent in an HTTP header, or the HTTP client
-    /// cannot be built.
+    /// Returns an error if the endpoint is not an http(s) URL, the token cannot be sent in an
+    /// HTTP header, or the HTTP client cannot be built.
     pub fn new(config: HubConfig, io_runtime: Handle) -> Result<Self> {
+        ensure!(
+            matches!(config.endpoint.scheme(), "http" | "https") && config.endpoint.has_host(),
+            InvalidEndpointSnafu {
+                endpoint: config.endpoint.to_string(),
+            }
+        );
         let authorization = config
             .token
             .as_ref()
@@ -361,12 +372,19 @@ impl Hub {
                 .max_capacity(MAX_CACHED_FILE_URLS)
                 .time_to_live(FILE_URL_TTL)
                 .build(),
+            entries: Cache::builder().max_capacity(MAX_CACHED_FILE_URLS).build(),
         })
     }
 
     #[must_use]
     pub fn endpoint(&self) -> &Url {
         &self.config.endpoint
+    }
+
+    /// Whether requests carry a token.
+    #[must_use]
+    pub fn is_authenticated(&self) -> bool {
+        self.authorization.is_some()
     }
 
     /// Forgets every branch and tag resolution, as if [`REVISION_TTL`] had passed.
@@ -420,13 +438,16 @@ impl Hub {
     ///
     /// Returns an error if the commit cannot be looked up.
     pub async fn commit_date(&self, repo: &RepoId, commit: &str) -> Result<DateTime<Utc>> {
-        let key = (repo.clone(), commit.to_string());
-        if let Some(date) = self.commit_dates.get(&key).await {
-            return Ok(date);
-        }
-        let resolved = self.fetch_commit(repo, commit).await?;
-        self.commit_dates.insert(key, resolved.date).await;
-        Ok(resolved.date)
+        // Every object read of a scan asks for the date; concurrent first asks share one
+        // request.
+        self.commit_dates
+            .try_get_with((repo.clone(), commit.to_string()), async {
+                self.fetch_commit(repo, commit)
+                    .await
+                    .map(|resolved| resolved.date)
+            })
+            .await
+            .map_err(|error| Arc::try_unwrap(error).unwrap_or_else(|shared| shared.duplicate()))
     }
 
     async fn fetch_commit(&self, repo: &RepoId, revision: &str) -> Result<Commit> {
@@ -496,6 +517,7 @@ impl Hub {
         let mut entries = Vec::new();
         let mut next = Some(url);
         while let Some(page_url) = next.take() {
+            let first_page = entries.is_empty();
             let (headers, body) = match self
                 .request(repo, Some(commit), Method::GET, page_url, None)
                 .await
@@ -505,8 +527,9 @@ impl Hub {
                     let body = read_body(repo, &self.config.endpoint, response).await?;
                     (headers, body)
                 }
-                // The tree of a path that does not exist (or names a file) is empty.
-                Err(error) if error.is_entry_not_found() => break,
+                // The tree of a path that does not exist (or names a file) is empty. A later
+                // page that is missing is an error: ending the listing there would drop files.
+                Err(error) if first_page && error.is_entry_not_found() => break,
                 Err(error) => return Err(error),
             };
             let page: Vec<TreeEntry> =
@@ -515,7 +538,12 @@ impl Hub {
                     message: format!("a page of the file listing could not be read ({e})"),
                 })?;
             entries.extend(page);
-            next = next_page(&headers, &self.config.endpoint);
+            next = next_page(&headers, &self.config.endpoint).map_err(|message| {
+                Error::UnexpectedResponse {
+                    repo: repo.clone(),
+                    message,
+                }
+            })?;
         }
         Ok(entries.into())
     }
@@ -527,6 +555,23 @@ impl Hub {
     /// Returns an error if the dataset or commit does not exist, access is denied, or the Hub
     /// cannot be reached.
     pub async fn entry(
+        &self,
+        repo: &RepoId,
+        commit: &str,
+        path: &str,
+    ) -> Result<Option<TreeEntry>> {
+        let key = FileKey {
+            repo: repo.clone(),
+            commit: commit.to_string(),
+            path: path.to_string(),
+        };
+        self.entries
+            .try_get_with(key, self.fetch_entry(repo, commit, path))
+            .await
+            .map_err(|error| Arc::try_unwrap(error).unwrap_or_else(|shared| shared.duplicate()))
+    }
+
+    async fn fetch_entry(
         &self,
         repo: &RepoId,
         commit: &str,
@@ -655,6 +700,15 @@ impl Hub {
                     repo: repo.clone(),
                     message: format!("the download of '{path}' redirected without a location"),
                 })?;
+            ensure!(
+                redirect_allowed(&self.config.endpoint, &location),
+                UnexpectedResponseSnafu {
+                    repo: repo.clone(),
+                    message: format!(
+                        "the download of '{path}' redirected to a non-https URL, which was not followed"
+                    ),
+                }
+            );
             // Only a redirect off the Hub's origin is a CDN URL worth reusing: the Hub's own
             // `resolve-cache` redirects are cheap and not signed.
             if !self.is_endpoint_origin(&location) {
@@ -949,6 +1003,7 @@ impl Error {
             | Error::TaskStopped { .. }
             | Error::HttpClient { .. }
             | Error::InvalidToken
+            | Error::InvalidEndpoint { .. }
             | Error::Shared { .. } => Error::Shared {
                 message: self.to_string(),
             },
@@ -1120,18 +1175,43 @@ async fn read_body(repo: &RepoId, endpoint: &Url, response: reqwest::Response) -
     })
 }
 
-/// The `rel="next"` page of a paginated listing, when it is on the Hub's own origin.
-fn next_page(headers: &HeaderMap, endpoint: &Url) -> Option<Url> {
-    let link = headers.get(LINK)?.to_str().ok()?;
-    link.split(',').find_map(|part| {
+/// The `rel="next"` page of a paginated listing, `None` on the last page.
+///
+/// A next page on another origin — a mirror or proxy passing the Hub's own `Link` through —
+/// is requested from the configured endpoint, which serves the same paths. A `Link` whose next
+/// page cannot be read is an error: treating it as the last page would drop files.
+fn next_page(headers: &HeaderMap, endpoint: &Url) -> Result<Option<Url>, String> {
+    let Some(link) = headers.get(LINK) else {
+        return Ok(None);
+    };
+    let link = link
+        .to_str()
+        .map_err(|_| "the listing's Link header is not valid text".to_string())?;
+    let Some(target) = link.split(',').find_map(|part| {
         let (target, params) = part.trim().split_once(';')?;
-        let is_next = params
+        params
             .split(';')
-            .any(|param| matches!(param.trim(), "rel=\"next\"" | "rel=next"));
-        let target = target.trim().strip_prefix('<')?.strip_suffix('>')?;
-        let url = endpoint.join(target).ok()?;
-        (is_next && url.origin() == endpoint.origin()).then_some(url)
-    })
+            .any(|param| matches!(param.trim(), "rel=\"next\"" | "rel=next"))
+            .then_some(target.trim())
+    }) else {
+        return Ok(None);
+    };
+    let mut url = target
+        .strip_prefix('<')
+        .and_then(|target| target.strip_suffix('>'))
+        .and_then(|target| endpoint.join(target).ok())
+        .ok_or_else(|| format!("the listing's next page {target:?} is not a valid URL"))?;
+    if url.origin() != endpoint.origin() {
+        let rebased = url.set_scheme(endpoint.scheme()).is_ok()
+            && url.set_host(endpoint.host_str()).is_ok()
+            && url.set_port(endpoint.port()).is_ok();
+        if !rebased {
+            return Err(format!(
+                "the listing's next page {target:?} could not be requested from {endpoint}"
+            ));
+        }
+    }
+    Ok(Some(url))
 }
 
 /// The time until the Hub's rate-limit window resets, from its `RateLimit` header
@@ -1207,8 +1287,143 @@ fn is_transient_status(status: StatusCode) -> bool {
     )
 }
 
+/// Whether a file read may follow a redirect to `location`: bytes from an https Hub are never
+/// fetched in cleartext.
+fn redirect_allowed(endpoint: &Url, location: &Url) -> bool {
+    location.scheme() == "https" || (endpoint.scheme() == "http" && location.scheme() == "http")
+}
+
 /// Whether `revision` is a full commit SHA, which names an immutable snapshot.
 #[must_use]
 pub fn is_commit_sha(revision: &str) -> bool {
     revision.len() == 40 && revision.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn url(value: &str) -> Url {
+        Url::parse(value).expect("a valid URL")
+    }
+
+    #[test]
+    fn content_range_is_parsed_and_validated() {
+        assert_eq!(
+            parse_content_range("bytes 0-15/20470363"),
+            Some((0, 15, 20_470_363))
+        );
+        assert_eq!(parse_content_range("bytes 7-7/8"), Some((7, 7, 8)));
+        for invalid in [
+            "bytes 9-3/20",
+            "bytes 0-20/20",
+            "bytes */20",
+            "bytes 0-1",
+            "items 0-1/2",
+            "",
+        ] {
+            assert_eq!(parse_content_range(invalid), None, "{invalid}");
+        }
+    }
+
+    #[test]
+    fn the_next_page_is_requested_from_the_endpoint() {
+        let endpoint = url("https://hf-mirror.example");
+        let next = |link: &'static str| {
+            let mut headers = HeaderMap::new();
+            headers.insert(LINK, HeaderValue::from_static(link));
+            next_page(&headers, &endpoint).map(|page| page.map(|u| u.to_string()))
+        };
+        assert_eq!(
+            next("<https://hf-mirror.example/api/datasets/o/d/tree/main?cursor=abc>; rel=\"next\""),
+            Ok(Some(
+                "https://hf-mirror.example/api/datasets/o/d/tree/main?cursor=abc".to_string()
+            ))
+        );
+        // A mirror passing the Hub's own link through: the same page, from the mirror.
+        assert_eq!(
+            next("<https://huggingface.co/api/datasets/o/d/tree/main?cursor=abc>; rel=\"next\""),
+            Ok(Some(
+                "https://hf-mirror.example/api/datasets/o/d/tree/main?cursor=abc".to_string()
+            ))
+        );
+        assert_eq!(
+            next("<https://hf-mirror.example/x>; rel=\"prev\""),
+            Ok(None)
+        );
+        assert_eq!(next_page(&HeaderMap::new(), &endpoint), Ok(None));
+        assert_eq!(
+            next("https://hf-mirror.example/x; rel=\"next\""),
+            Err(
+                "the listing's next page \"https://hf-mirror.example/x\" is not a valid URL"
+                    .to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn the_rate_limit_reset_comes_from_the_hub_headers() {
+        let mut headers = HeaderMap::new();
+        headers.insert("ratelimit", HeaderValue::from_static("\"api\";r=0;t=55"));
+        assert_eq!(rate_limit_reset(&headers), Some(Duration::from_secs(55)));
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, HeaderValue::from_static("7"));
+        assert_eq!(rate_limit_reset(&headers), Some(Duration::from_secs(7)));
+        assert_eq!(rate_limit_reset(&HeaderMap::new()), None);
+    }
+
+    #[test]
+    fn a_read_never_follows_an_https_hub_to_cleartext() {
+        let hub = url("https://huggingface.co");
+        assert!(redirect_allowed(
+            &hub,
+            &url("https://cas-bridge.xethub.hf.co/x")
+        ));
+        assert!(!redirect_allowed(
+            &hub,
+            &url("http://cas-bridge.xethub.hf.co/x")
+        ));
+        let loopback = url("http://127.0.0.1:8080");
+        assert!(redirect_allowed(
+            &loopback,
+            &url("http://localhost:9000/blob")
+        ));
+        assert!(!redirect_allowed(&loopback, &url("ftp://localhost/blob")));
+    }
+
+    #[test]
+    fn hub_urls_keep_every_component_in_its_own_segment() {
+        let hub = Hub::new(
+            HubConfig {
+                endpoint: url("https://huggingface.co"),
+                token: None,
+            },
+            tokio::runtime::Builder::new_current_thread()
+                .build()
+                .expect("a runtime")
+                .handle()
+                .clone(),
+        )
+        .expect("a Hub client");
+        let repo = RepoId::new("o", "d").expect("a valid repository");
+        assert_eq!(
+            hub.api_url(
+                &repo,
+                &["tree"],
+                "refs/convert/parquet",
+                "a b/c%d#e?.parquet"
+            )
+            .as_str(),
+            "https://huggingface.co/api/datasets/o/d/tree/refs%2Fconvert%2Fparquet/a%20b/c%25d%23e%3F.parquet"
+        );
+        assert_eq!(
+            hub.resolve_url(
+                &repo,
+                "e6281661ce1c48d982bc483cf8a173c1bbeb5d31",
+                "plain_text/x.parquet"
+            )
+            .as_str(),
+            "https://huggingface.co/datasets/o/d/resolve/e6281661ce1c48d982bc483cf8a173c1bbeb5d31/plain_text/x.parquet"
+        );
+    }
 }
