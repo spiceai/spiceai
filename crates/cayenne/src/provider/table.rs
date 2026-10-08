@@ -786,6 +786,7 @@ struct SnapshotScanListingRequest<'a> {
     snapshot_id: &'a str,
     limit: Option<usize>,
     scan_schema: SchemaRef,
+    file_statistics_schema: SchemaRef,
     captured_files: Option<&'a CapturedSnapshotFiles>,
 }
 
@@ -1335,6 +1336,8 @@ struct RawScanInput {
     /// `structural_version` (a schema-evolve advances the generation → a fresh key),
     /// so it needs no separate `ScanViewKey` component.
     read_schema: SchemaRef,
+    /// Canonical stored schema captured with the scan, before view conversion.
+    file_statistics_schema: SchemaRef,
 }
 
 impl RawScanInput {
@@ -1613,6 +1616,7 @@ impl Default for ScanViewCache {
 /// On a frozen snapshot that work is identical across queries, so the first
 /// complete listing is stored here and later scans prune in memory.
 struct CachedSnapshotListing {
+    statistics_schema: SchemaRef,
     snapshot_id: String,
     dir_generation: u64,
     listing_epoch: u64,
@@ -2000,6 +2004,9 @@ pub struct CayenneTableProvider {
     /// One-shot pause while holding the statistics publication mutex.
     #[cfg(test)]
     pub(crate) test_statistics_publish_hook: Arc<ParkingMutex<Option<TestPrePublishHook>>>,
+    /// One-shot pause after footer serialization, before per-file publication.
+    #[cfg(test)]
+    pub(crate) test_file_statistics_publish_hook: Arc<ParkingMutex<Option<TestPrePublishHook>>>,
     /// Reports arrival at the schema statistics fence and its acquisition.
     #[cfg(test)]
     pub(crate) test_schema_statistics_lock_probe:
@@ -2013,7 +2020,7 @@ pub struct CayenneTableProvider {
     /// Test-only seam after selecting a scan view, before building its file plan.
     /// Consumed on first fire, outside the listing fence.
     #[cfg(test)]
-    test_post_scan_view_selection_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
+    pub(crate) test_post_scan_view_selection_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
     /// Test-only seam fired after a snapshot-directory LIST is collected and
     /// before it is stored in [`Self::cached_snapshot_listing`], so a test can
     /// add files and refresh listing in the window an in-flight LIST would
@@ -9475,6 +9482,8 @@ impl CayenneTableProvider {
             #[cfg(test)]
             test_statistics_publish_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
+            test_file_statistics_publish_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
             test_schema_statistics_lock_probe: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
             test_post_scan_input_capture_hook: Arc::new(ParkingMutex::new(None)),
@@ -11686,6 +11695,8 @@ impl CayenneTableProvider {
             #[cfg(test)]
             test_statistics_publish_hook: Arc::clone(&self.test_statistics_publish_hook),
             #[cfg(test)]
+            test_file_statistics_publish_hook: Arc::clone(&self.test_file_statistics_publish_hook),
+            #[cfg(test)]
             test_schema_statistics_lock_probe: Arc::clone(&self.test_schema_statistics_lock_probe),
             #[cfg(test)]
             test_post_scan_input_capture_hook: Arc::clone(&self.test_post_scan_input_capture_hook),
@@ -13304,6 +13315,7 @@ impl CayenneTableProvider {
                 snapshot_id: &snapshot_id,
                 limit: None,
                 scan_schema,
+                file_statistics_schema: self.table_schema(),
                 captured_files: None,
             })
             .await
@@ -30296,6 +30308,7 @@ impl CayenneTableProvider {
         // window, so it is consistent with the data captured above and every scan-plan
         // branch can build from this one schema instead of re-reading the live
         // `table_schema` (which a concurrent `evolve_schema_live` could swap mid-plan).
+        let file_statistics_schema = self.table_schema();
         let read_schema = self.read_schema();
 
         // Pin the snapshot dirs this scan reads (the captured current snapshot + all
@@ -30324,6 +30337,7 @@ impl CayenneTableProvider {
             structural_epoch,
             scan_guard,
             read_schema,
+            file_statistics_schema,
         })
     }
 
@@ -30365,6 +30379,7 @@ impl CayenneTableProvider {
                 snapshot_id,
                 limit: None,
                 scan_schema: Self::snapshot_scan_schema(&self.table_schema(), &options),
+                file_statistics_schema: self.table_schema(),
                 captured_files: None,
             };
             let store = state.runtime_env().object_store(&table_url)?;
@@ -35096,6 +35111,7 @@ impl CayenneTableProvider {
                     false,
                     // Match the main file scan's view types so the union branches agree.
                     Some(Arc::clone(&scan.read_schema)),
+                    Arc::clone(&scan.file_statistics_schema),
                     // Protected-snapshot scans are internal union branches, not the
                     // user point-lookup path — keep default repartition.
                     false,
@@ -35283,6 +35299,7 @@ impl CayenneTableProvider {
             false,
             // Internal reads read the stored types (None -> Utf8/Binary).
             None,
+            self.table_schema(),
             // Internal reads are not user point-lookups — keep default repartition.
             false,
             // Internal reads (compaction, keyset) also benefit from keeping small
@@ -35314,6 +35331,7 @@ impl CayenneTableProvider {
         // Utf8/Binary (internal reads); the query path passes the view-typed read
         // schema so the scan output matches the advertised `TableProvider::schema()`.
         read_schema_override: Option<SchemaRef>,
+        file_statistics_schema: SchemaRef,
         // When true, this scan is highly selective (PK point lookup / small IN /
         // tight BETWEEN). Report `supports_repartitioning() == false` on the
         // Vortex source so DataFusion's `repartition_file_scans` rule does NOT
@@ -35346,7 +35364,8 @@ impl CayenneTableProvider {
         // keeping re-encoded files unchanged. The query path passes the
         // view-typed read schema so the scan output matches the advertised
         // `TableProvider::schema()` and downstream joins plan on view arrays.
-        let base_schema = read_schema_override.unwrap_or_else(|| self.table_schema());
+        let base_schema =
+            read_schema_override.unwrap_or_else(|| Arc::clone(&file_statistics_schema));
         let table_url = Self::snapshot_listing_url(
             &self.table_metadata.path,
             &self.table_metadata.table_id,
@@ -35420,6 +35439,7 @@ impl CayenneTableProvider {
                 snapshot_id,
                 limit: statistic_file_limit,
                 scan_schema: Arc::clone(&scan_schema),
+                file_statistics_schema: Arc::clone(&file_statistics_schema),
                 captured_files,
             })
             .await?;
@@ -36110,6 +36130,7 @@ impl CayenneTableProvider {
         );
         if collect_stats
             && let Some(cached) = self.cached_snapshot_listing.load_full()
+            && cached.statistics_schema == request.file_statistics_schema
             && cached.snapshot_id == request.snapshot_id
             && cached.dir_generation == dir_generation
             && cached.listing_epoch == listing_epoch
@@ -36153,10 +36174,11 @@ impl CayenneTableProvider {
                         &store,
                         request.options.listing.format.as_ref(),
                         &part_file,
+                        &request.file_statistics_schema,
                     )
                     .await?
                 } else {
-                    Arc::new(Statistics::new_unknown(&self.table_schema()))
+                    Arc::new(Statistics::new_unknown(&request.file_statistics_schema))
                 };
                 Ok(part_file.with_statistics(statistics))
             })
@@ -36173,6 +36195,7 @@ impl CayenneTableProvider {
             if gen_after == dir_generation && epoch_after == listing_epoch {
                 self.cached_snapshot_listing
                     .store(Some(Arc::new(CachedSnapshotListing {
+                        statistics_schema: Arc::clone(&request.file_statistics_schema),
                         snapshot_id: request.snapshot_id.to_string(),
                         dir_generation,
                         listing_epoch,
@@ -36225,11 +36248,11 @@ impl CayenneTableProvider {
         store: &Arc<dyn ObjectStore>,
         format: &dyn FileFormat,
         part_file: &PartitionedFile,
+        table_schema: &SchemaRef,
     ) -> datafusion_common::Result<Arc<Statistics>> {
         // The statistics below are computed against the table schema, so a cached
         // entry is valid only for the schema it was computed with.
-        let table_schema = self.table_schema();
-        let schema_fingerprint = Arc::new(SchemaFingerprint::from_schema(&table_schema));
+        let schema_fingerprint = Arc::new(SchemaFingerprint::from_schema(table_schema));
         if let Some(cached) = self.scan_file_statistics.get(&TableScopedPath {
             table: None,
             path: part_file.object_meta.location.clone(),
@@ -36241,14 +36264,29 @@ impl CayenneTableProvider {
         let file_path = part_file.object_meta.location.to_string();
         let file_size_bytes = i64::try_from(part_file.object_meta.size).unwrap_or(i64::MAX);
 
-        if let Ok(Some(persisted)) = self
-            .catalog
-            .get_snapshot_file_statistics(&self.table_metadata.table_id, snapshot_id, &file_path)
-            .await
+        // Schema validation and catalog reads share evolution's publication fence.
+        // Footer I/O below remains outside this mutex.
+        let persisted = {
+            let _guard = self.table_statistics_persistence_lock.lock().await;
+            if table_schema.as_ref() == self.table_schema().as_ref() {
+                self.catalog
+                    .get_snapshot_file_statistics(
+                        &self.table_metadata.table_id,
+                        snapshot_id,
+                        &file_path,
+                    )
+                    .await
+                    .ok()
+                    .flatten()
+            } else {
+                None
+            }
+        };
+        if let Some(persisted) = persisted
             && persisted.file_size_bytes == file_size_bytes
             && let Some(statistics) = crate::stats::statistics_from_persisted_blob(
                 &persisted.statistics_blob,
-                &self.table_schema(),
+                table_schema,
                 persisted.num_rows,
             )
             // A blob written before per-column byte sizes were persisted carries none,
@@ -36277,12 +36315,17 @@ impl CayenneTableProvider {
 
         let statistics = Arc::new(
             format
-                .infer_stats(state, store, self.table_schema(), &part_file.object_meta)
+                .infer_stats(
+                    state,
+                    store,
+                    Arc::clone(table_schema),
+                    &part_file.object_meta,
+                )
                 .await?,
         );
 
         if let Some(blob) =
-            crate::stats::statistics_to_persisted_blob(statistics.as_ref(), &self.table_schema())
+            crate::stats::statistics_to_persisted_blob(statistics.as_ref(), table_schema)
         {
             let num_rows = match statistics.num_rows {
                 DFPrecision::Exact(rows) | DFPrecision::Inexact(rows) => {
@@ -36290,17 +36333,26 @@ impl CayenneTableProvider {
                 }
                 DFPrecision::Absent => 0,
             };
-            if let Err(error) = self
-                .catalog
-                .upsert_snapshot_file_statistics(&SnapshotFileStatistics {
-                    table_id: self.table_metadata.table_id.clone(),
-                    snapshot_id: snapshot_id.to_string(),
-                    file_path,
-                    file_size_bytes,
-                    num_rows,
-                    statistics_blob: blob,
-                })
-                .await
+            #[cfg(test)]
+            {
+                let hook = self.test_file_statistics_publish_hook.lock().take();
+                if let Some(hook) = hook {
+                    hook().await;
+                }
+            }
+            let _guard = self.table_statistics_persistence_lock.lock().await;
+            if table_schema.as_ref() == self.table_schema().as_ref()
+                && let Err(error) = self
+                    .catalog
+                    .upsert_snapshot_file_statistics(&SnapshotFileStatistics {
+                        table_id: self.table_metadata.table_id.clone(),
+                        snapshot_id: snapshot_id.to_string(),
+                        file_path,
+                        file_size_bytes,
+                        num_rows,
+                        statistics_blob: blob,
+                    })
+                    .await
             {
                 tracing::debug!(
                     table = %self.table_metadata.table_name,
@@ -37098,6 +37150,7 @@ impl CayenneTableProvider {
                 snapshot_id,
                 limit: None,
                 scan_schema,
+                file_statistics_schema: self.table_schema(),
                 captured_files: None,
             })
             .await
@@ -37800,6 +37853,7 @@ impl TableProvider for CayenneTableProvider {
         // below builds from it (not a live re-read) so they stay mutually consistent
         // across a concurrent schema-evolution.
         let read_schema = Arc::clone(&scan_view.raw.read_schema);
+        let file_statistics_schema = Arc::clone(&scan_view.raw.file_statistics_schema);
         drop(scan_view);
         let need_pk_deletion = deletion_snapshot.has_deletions();
 
@@ -38013,6 +38067,7 @@ impl TableProvider for CayenneTableProvider {
                 scan_listing_config,
                 allow_sorted_ordering,
                 Some(Arc::clone(&read_schema)),
+                Arc::clone(&file_statistics_schema),
                 is_pk_selective_scan,
                 // The main branch is often the scan's ONLY source, so byte-range
                 // splitting can be its only decode parallelism; it opts out only
@@ -38044,6 +38099,7 @@ impl TableProvider for CayenneTableProvider {
                 protected_snapshots: protected_map,
                 deletion_snapshot: &deletion_snapshot,
                 read_schema: Arc::clone(&read_schema),
+                file_statistics_schema: Arc::clone(&file_statistics_schema),
                 lookup_selection: protected_lookup_selection,
                 pinned_lookup_index: protected_pinned_lookup_index,
             })
@@ -52987,6 +53043,7 @@ mod tests {
                 snapshot_id: &snapshot_id,
                 limit: file_limit,
                 scan_schema: Arc::clone(&scan_schema),
+                file_statistics_schema: provider.table_schema(),
                 captured_files: None,
             })
             .await
@@ -53550,6 +53607,7 @@ mod tests {
                 snapshot_id: &snapshot_id,
                 limit: None,
                 scan_schema: Arc::clone(&scan_schema),
+                file_statistics_schema: provider.table_schema(),
                 captured_files: None,
             })
             .await
@@ -53572,6 +53630,7 @@ mod tests {
                 snapshot_id: &snapshot_id,
                 limit: None,
                 scan_schema: Arc::clone(&scan_schema),
+                file_statistics_schema: provider.table_schema(),
                 captured_files: None,
             })
             .await
@@ -53596,6 +53655,7 @@ mod tests {
                 snapshot_id: &snapshot_id,
                 limit: None,
                 scan_schema: Arc::clone(&scan_schema),
+                file_statistics_schema: provider.table_schema(),
                 captured_files: None,
             })
             .await
@@ -54333,6 +54393,7 @@ mod tests {
             snapshot_id: &snapshot_id,
             limit: file_limit,
             scan_schema: Arc::clone(&scan_schema),
+            file_statistics_schema: provider.table_schema(),
             captured_files: None,
         };
 

@@ -2301,6 +2301,281 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn schema_evolution_fences_queued_decimal_file_statistics() {
+        decimal_file_statistics_across_evolution(false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn schema_evolution_old_scan_rejects_new_decimal_file_statistics() {
+        decimal_file_statistics_across_evolution(true).await;
+    }
+
+    async fn decimal_file_statistics_across_evolution(new_blob_first: bool) {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let connection = format!(
+            "sqlite://{}",
+            temp_dir.path().join("file_decimal.db").display()
+        );
+        let catalog = Arc::new(CayenneCatalog::new(connection.as_str()).expect("catalog"));
+        catalog.init().await.expect("init catalog");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("amount", DataType::Decimal128(10, 2), false),
+        ]));
+        let ctx = SessionContext::new();
+        let provider = Arc::new(
+            CayenneTableProvider::create_table(
+                Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+                CreateTableOptions {
+                    table_name: "file_decimal".to_string(),
+                    schema: Arc::clone(&schema),
+                    primary_key: vec![],
+                    on_conflict: None,
+                    base_path: temp_dir.path().to_string_lossy().to_string(),
+                    partition_column: None,
+                    vortex_config: crate::metadata::VortexConfig {
+                        inline_max_rows: 0,
+                        inline_max_bytes: 0,
+                        inline_max_buffer_bytes: 0,
+                        ..Default::default()
+                    },
+                },
+                ctx.runtime_env(),
+            )
+            .await
+            .expect("create table"),
+        );
+        let amounts = Decimal128Array::from(vec![12_345_i128, 67_890])
+            .with_precision_and_scale(10, 2)
+            .expect("decimals");
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 2])),
+                Arc::new(amounts),
+            ],
+        )
+        .expect("batch");
+        insert_batch(&provider, batch).await;
+        provider
+            .drain_in_flight_maintenance()
+            .await
+            .expect("drain writes");
+        provider.checkpoint_mem_tier().await.expect("checkpoint");
+        provider
+            .drain_in_flight_maintenance()
+            .await
+            .expect("drain checkpoint");
+        let metadata = catalog.get_table("file_decimal").await.expect("metadata");
+        let (_, files) = provider
+            .snapshot_file_metadata(&ctx.state(), &metadata.current_snapshot_id, &schema)
+            .await
+            .expect("physical file metadata");
+        assert_eq!(files.len(), 1, "one physical Vortex file");
+        let path = files[0].location.to_string();
+        catalog
+            .update_table_schema_dropping_statistics(&metadata.table_id, &schema)
+            .await
+            .expect("cold persisted statistics");
+        provider.clear_scan_file_statistics_cache();
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        let hook = Box::new(move || {
+            Box::pin(async move {
+                let _ = entered_tx.send(());
+                let _ = release_rx.await;
+            }) as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+        });
+        if new_blob_first {
+            *provider.test_post_scan_view_selection_hook.lock() = Some(hook);
+        } else {
+            *provider.test_file_statistics_publish_hook.lock() = Some(hook);
+        }
+        let scan_provider = Arc::clone(&provider);
+        let state = ctx.state();
+        let task_ctx = ctx.task_ctx();
+        let old_scan = tokio::spawn(async move {
+            let filters = if new_blob_first {
+                vec![datafusion_expr::col("amount").eq(datafusion_expr::lit(
+                    datafusion_common::ScalarValue::Decimal128(Some(12_345), 10, 2),
+                ))]
+            } else {
+                vec![]
+            };
+            let plan = scan_provider
+                .scan(&state, None, &filters, None)
+                .await
+                .expect("old scan plan");
+            collect(plan, task_ctx).await.expect("old scan rows")
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(30), entered_rx)
+            .await
+            .expect("footer publication reached")
+            .expect("publisher signal");
+        let incoming = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("amount", DataType::Decimal128(14, 4), false),
+        ]);
+        let plan = widening_plan(&schema, &incoming, &[]);
+        provider
+            .evolve_schema_live(&plan)
+            .await
+            .expect("evolve while footer publisher parked");
+        assert!(
+            catalog
+                .get_snapshot_file_statistics(
+                    &metadata.table_id,
+                    &metadata.current_snapshot_id,
+                    &path
+                )
+                .await
+                .expect("post evolution statistics")
+                .is_none()
+        );
+        if new_blob_first {
+            let plan = provider
+                .scan(&ctx.state(), None, &[], None)
+                .await
+                .expect("new-schema scan");
+            let rows = collect(plan, ctx.task_ctx())
+                .await
+                .expect("warm new-schema statistics");
+            assert_eq!(rows.iter().map(RecordBatch::num_rows).sum::<usize>(), 2);
+        }
+        let before_release = catalog
+            .get_snapshot_file_statistics(&metadata.table_id, &metadata.current_snapshot_id, &path)
+            .await
+            .expect("stats before release");
+        assert_eq!(before_release.is_some(), new_blob_first);
+        release_tx.send(()).expect("release footer publisher");
+        let old_rows = old_scan.await.expect("old scan task");
+        let mut old_values = Vec::new();
+        for batch in &old_rows {
+            assert_eq!(batch.column(0).null_count(), 0);
+            assert_eq!(batch.column(1).null_count(), 0);
+            assert_eq!(batch.column(1).data_type(), &DataType::Decimal128(10, 2));
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("old ids");
+            let amounts = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .expect("old amounts");
+            for row in 0..batch.num_rows() {
+                old_values.push((ids.value(row), amounts.value(row)));
+            }
+        }
+        old_values.sort_unstable();
+        if new_blob_first {
+            // Provider filters may be inexact. The matching row must survive;
+            // accepting the other original row permits exact or inexact pushdown.
+            assert!(old_values.contains(&(1, 12_345_i128)));
+            assert!(
+                old_values
+                    .iter()
+                    .all(|row| { matches!(row, (1, 12_345_i128) | (2, 67_890_i128)) })
+            );
+            let mut unique = old_values.clone();
+            unique.dedup();
+            assert_eq!(unique, old_values, "no duplicate rows");
+        } else {
+            assert_eq!(old_values, vec![(1, 12_345_i128), (2, 67_890_i128)]);
+        }
+        eprintln!("DECIMAL_FILE_OLD_SCAN {old_values:?}");
+        let persisted = catalog
+            .get_snapshot_file_statistics(&metadata.table_id, &metadata.current_snapshot_id, &path)
+            .await
+            .expect("post publication statistics");
+        eprintln!("DECIMAL_FILE_RESURRECTED {}", persisted.is_some());
+        if let Some(stats) = &persisted {
+            eprintln!(
+                "DECIMAL_FILE_EVOLVED_STATS {:?}",
+                crate::stats::statistics_from_persisted_blob(
+                    &stats.statistics_blob,
+                    &plan.evolved_schema,
+                    stats.num_rows
+                )
+            );
+        }
+        let fresh_catalog =
+            Arc::new(CayenneCatalog::new(connection.as_str()).expect("fresh catalog"));
+        fresh_catalog.init().await.expect("init fresh catalog");
+        let reopened = Arc::new(
+            CayenneTableProvider::new(
+                "file_decimal",
+                fresh_catalog as Arc<dyn MetadataCatalog>,
+                ctx.runtime_env(),
+            )
+            .await
+            .expect("reopen"),
+        );
+        let fresh_ctx = SessionContext::new();
+        fresh_ctx
+            .register_table("file_decimal", reopened)
+            .expect("register reopened");
+        for sql in [
+            "SELECT id, amount FROM file_decimal ORDER BY id",
+            "SELECT id, amount FROM file_decimal WHERE amount = CAST(123.45 AS DECIMAL(14,4)) ORDER BY id",
+        ] {
+            let physical = fresh_ctx
+                .sql(sql)
+                .await
+                .expect("plan reopened rows")
+                .create_physical_plan()
+                .await
+                .expect("physical reopened plan");
+            eprintln!(
+                "DECIMAL_FILE_PLAN {sql}:\n{}",
+                datafusion_physical_plan::displayable(physical.as_ref()).indent(true)
+            );
+            let rows = collect(physical, fresh_ctx.task_ctx())
+                .await
+                .expect("reopened rows");
+            let mut actual = Vec::new();
+            for b in rows {
+                assert_eq!(b.column(0).null_count(), 0);
+                assert_eq!(b.column(1).null_count(), 0);
+                let ids = b
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("ids");
+                let values = b
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .expect("amounts");
+                assert_eq!(b.column(1).data_type(), &DataType::Decimal128(14, 4));
+                for i in 0..b.num_rows() {
+                    actual.push((ids.value(i), values.value(i)));
+                }
+            }
+            eprintln!("DECIMAL_FILE_REOPEN {sql}: {actual:?}");
+            let expected = if sql.contains("WHERE") {
+                vec![(1, 1_234_500_i128)]
+            } else {
+                vec![(1, 1_234_500_i128), (2, 6_789_000_i128)]
+            };
+            assert_eq!(actual, expected);
+        }
+        if new_blob_first {
+            assert_eq!(
+                persisted.expect("new blob retained").statistics_blob,
+                before_release.expect("new blob existed").statistics_blob,
+                "old scan must not overwrite the new-schema blob"
+            );
+        } else {
+            assert!(
+                persisted.is_none(),
+                "obsolete footer publisher must not resurrect an old-scale blob"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn schema_evolution_queued_integer_statistics_remain_conservative_after_reopen() {
         let temp_dir = TempDir::new().expect("temp dir");
         let connection = format!("sqlite://{}", temp_dir.path().join("integer.db").display());
