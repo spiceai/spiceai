@@ -15,12 +15,13 @@ runs:
         set -euo pipefail
 
         # Give up on an unresponsive mirror after 10 seconds and use the next
-        # mirror or source. Retries stay off: Ubuntu 24.04's apt can wait
-        # forever when a delayed retry is queued behind other downloads from
-        # the same mirror. apt applies the last value in filename order, so this
-        # file must sort after the GitHub-hosted image's zz-retries.
+        # mirror or source. Retries run without a delay: Ubuntu 24.04's apt can
+        # wait forever when a delayed retry is queued behind other downloads
+        # from the same mirror. apt applies the last value in filename order, so
+        # this file must sort after the GitHub-hosted image's zz-retries.
         sudo tee /etc/apt/apt.conf.d/zz-spice-acquire > /dev/null <<'EOF'
-        Acquire::Retries "0";
+        Acquire::Retries "3";
+        Acquire::Retries::Delay "false";
         Acquire::http::Timeout "10";
         Acquire::https::Timeout "10";
         Acquire::ForceIPv4 "true";
