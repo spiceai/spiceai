@@ -39,6 +39,12 @@ pub struct ParameterSpec {
     pub one_of: Option<&'static [&'static str]>,
     pub one_of_ignore_ascii_case: bool,
     pub deprecation_message: Option<&'static str>,
+    /// Where a parameter that is no longer read now lives (e.g. `runtime.params.tuning`).
+    /// Such a parameter is kept in the list only so that `Parameters` drops it without
+    /// the generic "not supported" warning, because the owning component reports it with
+    /// a message of its own. It is left out of the published schema and of "did you
+    /// mean" suggestions.
+    pub moved_to: Option<&'static str>,
     pub r#type: ParameterType,
 }
 
@@ -56,6 +62,7 @@ impl ParameterSpec {
             help_link: "",
             examples: &[],
             deprecation_message: None,
+            moved_to: None,
             r#type: ParameterType::Component,
             one_of: None,
             one_of_ignore_ascii_case: false,
@@ -75,6 +82,7 @@ impl ParameterSpec {
             help_link: "",
             examples: &[],
             deprecation_message: None,
+            moved_to: None,
             r#type: ParameterType::Runtime,
             one_of: None,
             one_of_ignore_ascii_case: false,
@@ -115,6 +123,18 @@ impl ParameterSpec {
     pub const fn examples(mut self, examples: &'static [&'static str]) -> Self {
         self.examples = examples;
         self
+    }
+
+    #[must_use]
+    pub const fn moved_to(mut self, location: &'static str) -> Self {
+        self.moved_to = Some(location);
+        self
+    }
+
+    /// Whether the parameter is no longer read (see [`Self::moved_to`]).
+    #[must_use]
+    pub const fn is_retired(&self) -> bool {
+        self.moved_to.is_some()
     }
 
     #[must_use]

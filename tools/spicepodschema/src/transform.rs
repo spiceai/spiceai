@@ -126,7 +126,11 @@ pub fn connector_params_to_schema(connector: &ConnectorSchema) -> Value {
     let mut properties = Map::new();
     let mut required = Vec::new();
 
-    for spec in connector.parameters {
+    for spec in connector
+        .parameters
+        .iter()
+        .filter(|spec| !spec.is_retired())
+    {
         let property_name = get_property_name(spec, connector.prefix);
         let property_schema = param_spec_to_schema(spec);
 

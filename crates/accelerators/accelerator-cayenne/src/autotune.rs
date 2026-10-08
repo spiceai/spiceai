@@ -535,12 +535,12 @@ impl WorkloadProfile {
     }
 }
 
-/// The `cayenne_tuning` mode: how the knobs this module derives get their values.
+/// The runtime-wide `runtime.params.tuning` mode: how the knobs this module derives get their values.
 ///
 /// [`Self::Adaptive`] is selected only by an explicit `adaptive`. Unset, `auto`,
 /// and anything unrecognized are all [`Self::Auto`], so no other signal — and no
 /// typo — can land a table in the closed loop. Shared by the accelerator and the
-/// catalog connector, which accept the same parameter and must agree on it.
+/// catalog connector, which read the same runtime parameter and must agree on it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum TuningMode {
     /// Derive the knobs statically from the detected environment and, where
@@ -555,9 +555,8 @@ pub(crate) enum TuningMode {
 impl TuningMode {
     /// Resolve a raw parameter value, ignoring case and surrounding whitespace.
     ///
-    /// Returns the mode and whether the value was unrecognized, so a caller can
-    /// warn once about a typo while still running on the safe default rather than
-    /// failing the dataset over a tuning hint.
+    /// Returns the mode and whether the value was unrecognized. An unrecognized value
+    /// resolves to [`Self::Auto`], and the caller decides whether to reject it.
     #[must_use]
     pub(crate) fn parse(raw: Option<&str>) -> (Self, bool) {
         let Some(mode) = raw.map(str::trim) else {

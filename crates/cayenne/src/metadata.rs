@@ -1056,7 +1056,7 @@ pub struct VortexConfig {
     #[serde(default = "default_cdc_mem_tier_seal_age_ms")]
     pub cdc_mem_tier_seal_age_ms: u64,
     /// Enable the closed-loop dynamic auto-tuner (see `provider::tuning`). Set by
-    /// the `cayenne_tuning` mode: `auto` (default) → `false` (static derivation
+    /// the runtime-wide `runtime.params.tuning` mode: `auto` (default) → `false` (static derivation
     /// only); `adaptive` → `true` (static warm-start + the closed loop). When on,
     /// a per-table controller measures the CDC ingest rate *and the runtime's
     /// whole-system response* (apply latency vs offered load, read amplification
@@ -1105,7 +1105,7 @@ pub struct VortexConfig {
     /// signal-driven controller for that metric). When any is set, the closed loop
     /// drives that high-level SLO toward target with small incremental steps,
     /// converging within `goal_convergence_window_secs`. Set from the
-    /// `cayenne_goal_*` params. A goal declares a target, not a controller, so it
+    /// `runtime.params.goal_*` params. A goal declares a target, not a controller, so it
     /// never turns `dynamic_tuning` on — set without it, the goal is inert (the
     /// accelerator warns). Runtime-only — never compared by
     /// `configuration_matches` (does not affect data layout).

@@ -267,8 +267,8 @@ const MEM_TIER_BUDGET_FRACTION: u64 = 16;
 // ---------------------------------------------------------------------------
 
 /// Default convergence window: the time budget the goal-seeking controller aims
-/// to reach its targets within. Operators override it per dataset
-/// (`cayenne_goal_convergence_window`).
+/// to reach its targets within. Operators override it runtime-wide
+/// (`runtime.params.goal_convergence_window`).
 pub(crate) const DEFAULT_GOAL_CONVERGENCE_WINDOW: Duration = Duration::from_mins(1);
 
 /// How long a per-batch write / publish latency sample stays a live controller
@@ -918,7 +918,7 @@ impl WindowMax {
     /// Peak window width, DERIVED from [`DEFAULT_GOAL_CONVERGENCE_WINDOW`] (60s) so
     /// the value and its doc can never drift if the default changes: the peak spans
     /// a full goal-convergence window — the horizon the SLO is stated over. FIXED to
-    /// the DEFAULT: it does NOT track a per-dataset `cayenne_goal_convergence_window`
+    /// the DEFAULT: it does NOT track a configured `runtime.params.goal_convergence_window`
     /// override (that override retunes the controller's step dwell, not this
     /// observability window), so a table with a non-default convergence window still
     /// reports its freshness peak over this ~60s horizon. Making it track the

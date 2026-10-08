@@ -40,7 +40,6 @@ datasets:
       on_conflict:
         _id: upsert
       params:
-        cayenne_tuning: auto
         cayenne_metastore: sqlite
         cayenne_force_view_types: "false"
         cayenne_deletion_mode: key
@@ -129,7 +128,6 @@ datasets:
       on_conflict:
         _id: upsert
       params:
-        cayenne_tuning: auto
         cayenne_metastore: sqlite
         cayenne_force_view_types: "false"
         cayenne_deletion_mode: key
@@ -197,7 +195,6 @@ datasets:
       on_conflict:
         _id: upsert
       params:
-        cayenne_tuning: auto
         cayenne_metastore: sqlite
         cayenne_force_view_types: "false"
         cayenne_deletion_mode: key
@@ -253,7 +250,6 @@ datasets:
       on_conflict:
         _id: upsert
       params:
-        cayenne_tuning: auto
         cayenne_metastore: sqlite
         cayenne_force_view_types: "false"
         cayenne_deletion_mode: key
@@ -318,7 +314,6 @@ datasets:
       on_conflict:
         _id: upsert
       params:
-        cayenne_tuning: auto
         cayenne_metastore: sqlite
         cayenne_force_view_types: "false"
         cayenne_deletion_mode: key
@@ -386,7 +381,6 @@ datasets:
       on_conflict:
         _id: upsert
       params:
-        cayenne_tuning: auto
         cayenne_metastore: sqlite
         cayenne_force_view_types: "false"
         cayenne_deletion_mode: key
@@ -448,7 +442,6 @@ datasets:
       on_conflict:
         _id: upsert
       params:
-        cayenne_tuning: auto
         cayenne_metastore: sqlite
         cayenne_force_view_types: "false"
         cayenne_deletion_mode: key
@@ -501,7 +494,6 @@ datasets:
       on_conflict:
         _id: upsert
       params:
-        cayenne_tuning: auto
         cayenne_metastore: sqlite
         cayenne_force_view_types: "false"
         cayenne_deletion_mode: key
