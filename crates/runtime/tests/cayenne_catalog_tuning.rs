@@ -204,6 +204,10 @@ async fn catalog_table_dynamic_tuning(
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    not(feature = "spicebench"),
+    ignore = "the Cayenne catalog connector requires the spicebench feature"
+)]
 async fn adaptive_tuning_enabled_turns_adaptive_on_for_catalog_tables() {
     assert!(
         catalog_table_dynamic_tuning(Some("enabled"), &[]).await,
@@ -212,6 +216,10 @@ async fn adaptive_tuning_enabled_turns_adaptive_on_for_catalog_tables() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    not(feature = "spicebench"),
+    ignore = "the Cayenne catalog connector requires the spicebench feature"
+)]
 async fn catalog_tables_are_static_by_default() {
     assert!(
         !catalog_table_dynamic_tuning(None, &[]).await,
@@ -220,6 +228,10 @@ async fn catalog_tables_are_static_by_default() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    not(feature = "spicebench"),
+    ignore = "the Cayenne catalog connector requires the spicebench feature"
+)]
 async fn retired_catalog_tuning_param_warns_once_per_node_and_is_not_applied() {
     let dynamic = catalog_table_dynamic_tuning(None, &[("cayenne_tuning", "enabled")]).await;
     assert!(
