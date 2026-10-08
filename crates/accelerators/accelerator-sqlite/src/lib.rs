@@ -450,10 +450,39 @@ impl DataAccelerator for SqliteAccelerator {
         )))
     }
 
+    async fn validate_init(
+        &self,
+        source: &dyn AccelerationSource,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if !source.is_file_accelerated() {
+            return Ok(());
+        }
+        let path = self.file_path(source)?;
+        if let Some(acceleration) = source.acceleration()
+            && acceleration.params.contains_key("sqlite_file")
+            && !self.is_valid_file(source)
+        {
+            if std::path::Path::new(&path).is_dir() {
+                return Err(Error::InvalidFileIsDirectory.into());
+            }
+            let extension = std::path::Path::new(&path)
+                .extension()
+                .and_then(OsStr::to_str)
+                .unwrap_or("");
+            return Err(Error::InvalidFileExtension {
+                valid_extensions: self.valid_file_extensions().join(","),
+                extension: extension.to_string(),
+            }
+            .into());
+        }
+        Ok(())
+    }
+
     async fn init(
         &self,
         source: &dyn AccelerationSource,
     ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
+        self.validate_init(source).await?;
         if !source.is_file_accelerated() {
             return Ok(BootstrapStatus::none());
         }
@@ -464,21 +493,6 @@ impl DataAccelerator for SqliteAccelerator {
             if !acceleration.params.contains_key("sqlite_file") {
                 make_spice_data_directory()
                     .map_err(|err| Error::AccelerationCreationFailed { source: err.into() })?;
-            } else if !self.is_valid_file(source) {
-                if std::path::Path::new(&path).is_dir() {
-                    return Err(Error::InvalidFileIsDirectory.into());
-                }
-
-                let extension = std::path::Path::new(&path)
-                    .extension()
-                    .and_then(OsStr::to_str)
-                    .unwrap_or("");
-
-                return Err(Error::InvalidFileExtension {
-                    valid_extensions: self.valid_file_extensions().join(","),
-                    extension: extension.to_string(),
-                }
-                .into());
             }
 
             // Before a snapshot download or a connection opens the file. See
@@ -575,12 +589,7 @@ impl DataAccelerator for SqliteAccelerator {
                 .iter()
                 .filter_map(|spicepod_ds| {
                     let acceleration = spicepod_ds.acceleration.as_ref()?;
-                    let engine_str = acceleration
-                        .engine
-                        .as_deref()
-                        .unwrap_or("arrow")
-                        .to_lowercase();
-                    if engine_str != "sqlite" {
+                    if !acceleration.engine_name().eq_ignore_ascii_case("sqlite") {
                         return None;
                     }
                     if !matches!(

@@ -556,6 +556,7 @@ async fn test_cayenne_s3_express_multi_zone_live() -> Result<(), String> {
                 refresh_mode: Some(RefreshMode::Full),
                 primary_key: Some("VendorID".to_string()),
                 on_conflict,
+                write_mode: spicepod::acceleration::WriteMode::Acceleration,
                 params: Some(accel_params),
                 ..Acceleration::default()
             });

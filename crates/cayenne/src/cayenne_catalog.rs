@@ -18,9 +18,9 @@ limitations under the License.
 
 use super::catalog::{CatalogError, CatalogResult, MetadataCatalog, SnapshotSequenceCommit};
 use super::metadata::{
-    ColdTierFile, CreateTableOptions, DeleteFile, DeletionType, InlinedData, InlinedDataStats,
-    InlinedDelete, PartitionMetadata, PkConflictDetection, SnapshotFile, SnapshotFileStatistics,
-    TableMetadata, TableStatistics, TableStorageStats,
+    ColdTierFile, CreateTableOptions, DeleteFile, DeletionType, IndexRunRecord, InlinedData,
+    InlinedDataStats, InlinedDelete, PartitionMetadata, PkConflictDetection, SnapshotFile,
+    SnapshotFileStatistics, TableMetadata, TableStatistics, TableStorageStats,
 };
 use super::metastore::sqlite::{SqliteMetastore, is_memory_db_path};
 #[cfg(feature = "turso")]
@@ -411,7 +411,7 @@ impl CayenneCatalog {
         txn.commit().await?;
         tracing::debug!(
             table_id,
-            "Dropped persisted column statistics because a decimal column's scale changed"
+            "Dropped persisted statistics during a logical schema change"
         );
         Ok(())
     }
@@ -1136,7 +1136,7 @@ impl CayenneCatalog {
         // cold store. No inline payload: a graduation's content is the cold files
         // registered below, and the overwrite clear correctly drops the warm
         // tier's inline corpus along with everything else keyed on the old snapshot.
-        self.commit_overwrite_in_txn(txn, table_id, new_snapshot_id, None)
+        self.commit_overwrite_in_txn(txn, table_id, new_snapshot_id, None, &[])
             .await?;
         // One statement per file rather than `execute_many`: each row carries
         // a statistics blob and a primary-key bloom of up to
@@ -1178,6 +1178,7 @@ impl CayenneCatalog {
         table_id: &str,
         new_snapshot_id: &str,
         inlined: Option<&InlinedData>,
+        delete_files: &[crate::metadata::DeleteFile],
     ) -> CatalogResult<()> {
         for (name, value) in [("table_id", table_id), ("new_snapshot_id", new_snapshot_id)] {
             if uuid::Uuid::parse_str(value).is_err() {
@@ -1237,6 +1238,13 @@ impl CayenneCatalog {
                         .to_string(),
                     source: Box::new(e),
                 })?;
+        }
+
+        // The position deletes that hide the copies later copies superseded, after
+        // the batch above cleared the previous snapshot's.
+        for chunk in delete_files.chunks(32_000 / 10) {
+            let (sql, params) = Self::build_insert_delete_files_chunk_sql(chunk);
+            txn.execute(ExecuteParams { sql: &sql, params }).await?;
         }
         Ok(())
     }
@@ -3673,6 +3681,7 @@ impl MetadataCatalog for CayenneCatalog {
         table_id: &str,
         new_snapshot_id: &str,
         inlined: Option<&InlinedData>,
+        delete_files: &[crate::metadata::DeleteFile],
     ) -> CatalogResult<()> {
         // Same retry-on-conflict shape as commit_compaction; the only
         // additional work happens inside the transaction via
@@ -3695,7 +3704,7 @@ impl MetadataCatalog for CayenneCatalog {
             })?;
 
             match self
-                .commit_overwrite_in_txn(&mut *tx, table_id, new_snapshot_id, inlined)
+                .commit_overwrite_in_txn(&mut *tx, table_id, new_snapshot_id, inlined, delete_files)
                 .await
             {
                 Ok(()) => match tx.commit().await {
@@ -4351,6 +4360,67 @@ impl MetadataCatalog for CayenneCatalog {
             .await
     }
 
+    async fn register_index_run(&self, run: &IndexRunRecord) -> CatalogResult<()> {
+        self.metastore
+            .execute_helper(ExecuteParams {
+                sql: "INSERT OR REPLACE INTO cayenne_index_run \
+                      (table_id, index_key, run_name, row_count, size_bytes) \
+                      VALUES (?1, ?2, ?3, ?4, ?5)",
+                params: vec![
+                    MetastoreValue::Text(run.table_id.clone()),
+                    MetastoreValue::Text(run.index_key.clone()),
+                    MetastoreValue::Text(run.run_name.clone()),
+                    MetastoreValue::Integer(i64::try_from(run.row_count).unwrap_or(i64::MAX)),
+                    MetastoreValue::Integer(i64::try_from(run.size_bytes).unwrap_or(i64::MAX)),
+                ],
+            })
+            .await
+    }
+
+    async fn list_index_runs(&self, table_id: &str) -> CatalogResult<Vec<IndexRunRecord>> {
+        let owner = table_id.to_string();
+        self.metastore
+            .query_helper(
+                QueryParams {
+                    sql: r"
+                    SELECT index_key, run_name, row_count, size_bytes
+                    FROM cayenne_index_run
+                    WHERE table_id = ?1
+                    ",
+                    params: vec![MetastoreValue::Text(table_id.to_string())],
+                },
+                move |row| {
+                    Ok(IndexRunRecord {
+                        table_id: owner.clone(),
+                        index_key: row.get_string(0)?,
+                        run_name: row.get_string(1)?,
+                        row_count: u64::try_from(row.get_i64(2)?).unwrap_or(0),
+                        size_bytes: u64::try_from(row.get_i64(3)?).unwrap_or(0),
+                    })
+                },
+            )
+            .await
+    }
+
+    async fn remove_index_run(
+        &self,
+        table_id: &str,
+        index_key: &str,
+        run_name: &str,
+    ) -> CatalogResult<()> {
+        self.metastore
+            .execute_helper(ExecuteParams {
+                sql: "DELETE FROM cayenne_index_run \
+                      WHERE table_id = ?1 AND index_key = ?2 AND run_name = ?3",
+                params: vec![
+                    MetastoreValue::Text(table_id.to_string()),
+                    MetastoreValue::Text(index_key.to_string()),
+                    MetastoreValue::Text(run_name.to_string()),
+                ],
+            })
+            .await
+    }
+
     async fn add_inlined_data(&self, data: InlinedData) -> CatalogResult<String> {
         let table_id = data.table_id.clone();
         let sequence_number = data.sequence_number;
@@ -4598,7 +4668,8 @@ impl MetadataCatalog for CayenneCatalog {
                         (SELECT COUNT(*) FROM cayenne_snapshot_file_statistics WHERE table_id = ?1),
                         (SELECT COUNT(*) FROM cayenne_insert_record WHERE table_id = ?2),
                         idt.n, idt.row_total, idt.bytes,
-                        idl.n, idl.deletes
+                        idl.n, idl.deletes,
+                        (SELECT COUNT(*) FROM cayenne_index_run WHERE table_id = ?1)
                     FROM
                         (SELECT COUNT(*) AS n,
                                 COALESCE(SUM(file_size_bytes), 0) AS bytes,
@@ -4651,6 +4722,7 @@ impl MetadataCatalog for CayenneCatalog {
                         inlined_bytes: row.get_i64(19)?,
                         inlined_delete_entries: row.get_i64(20)?,
                         inlined_delete_rows: row.get_i64(21)?,
+                        index_run_rows: row.get_i64(22)?,
                     })
                 },
             )
@@ -9385,7 +9457,7 @@ mod tests {
 
         let before = catalog.metastore_query_count();
         let result = catalog
-            .commit_overwrite(&table_id, &uuid::Uuid::now_v7().to_string(), None)
+            .commit_overwrite(&table_id, &uuid::Uuid::now_v7().to_string(), None, &[])
             .await;
         violations.extend(statement_conflict_violation(
             "commit_overwrite",
@@ -9810,7 +9882,7 @@ mod tests {
     /// the aggregate query joins through `cayenne_table`, and a join that yields
     /// no rows still has to produce one all-zero result row for the gauges.
     #[tokio::test]
-    async fn table_storage_stats_of_an_untouched_table_is_all_zero() {
+    async fn table_storage_stats_tracks_index_run_registration_and_removal() {
         let (_table_root, base_path) = test_table_root();
         let test_db = format!(
             "sqlite://./.test_table_storage_stats_empty_{}.db",
@@ -9840,6 +9912,38 @@ mod tests {
             .await
             .expect("sample storage stats for an empty table");
         assert_eq!(stats, crate::metadata::TableStorageStats::default());
+
+        for run_name in ["first.run", "second.run", "third.run"] {
+            catalog
+                .register_index_run(&crate::metadata::IndexRunRecord {
+                    table_id: table_id.clone(),
+                    index_key: "key".to_string(),
+                    run_name: run_name.to_string(),
+                    row_count: 100,
+                    size_bytes: 20,
+                })
+                .await
+                .expect("register an index run");
+        }
+        let stats = catalog
+            .table_storage_stats(&table_id)
+            .await
+            .expect("count registered runs");
+        assert_eq!(stats.index_run_rows, 3);
+        let other_stats = catalog
+            .table_storage_stats(&uuid::Uuid::now_v7().to_string())
+            .await
+            .expect("sample another table");
+        assert_eq!(other_stats.index_run_rows, 0);
+        catalog
+            .remove_index_run(&table_id, "key", "second.run")
+            .await
+            .expect("unregister an index run");
+        let stats = catalog
+            .table_storage_stats(&table_id)
+            .await
+            .expect("count remaining runs");
+        assert_eq!(stats.index_run_rows, 2);
 
         let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
         let _ = std::fs::remove_file(db_path);

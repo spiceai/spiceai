@@ -479,6 +479,12 @@ impl AcceleratorEngineRegistry {
         .options(params)
         .indexes(acceleration_settings.indexes.clone());
         let suppress_auto_on_conflict = cayenne_pk_conflict_detection_none(acceleration_settings);
+        // Cayenne keeps the last version of each key whatever `on_conflict` says: a
+        // primary key alone makes its table upsert on that key. The setting still
+        // decides where a read-write dataset's writes go (see the accelerated
+        // table), so it stays on the acceleration and is only ignored here.
+        let honors_on_conflict =
+            acceleration_settings.engine != runtime_acceleration::Engine::Cayenne;
 
         // If there are constraints from the federated table, then add them to the accelerated table
         // For Arrow/MemTable accelerator, on_conflict will be automatically derived from primary key constraints
@@ -494,19 +500,22 @@ impl AcceleratorEngineRegistry {
             }
         }
 
-        if let Some(on_conflict) =
-            acceleration_settings
-                .on_conflict()
-                .map_err(|e| Error::InvalidConfiguration {
-                    msg: format!("on_conflict invalid: {e}"),
-                })?
+        if honors_on_conflict
+            && let Some(on_conflict) =
+                acceleration_settings
+                    .on_conflict()
+                    .map_err(|e| Error::InvalidConfiguration {
+                        msg: format!("on_conflict invalid: {e}"),
+                    })?
         {
             external_table_builder = external_table_builder.on_conflict(on_conflict);
         }
 
         // Pass UpsertOptions for constraint validation behavior
-        external_table_builder =
-            external_table_builder.upsert_options(acceleration_settings.upsert_options());
+        if honors_on_conflict {
+            external_table_builder =
+                external_table_builder.upsert_options(acceleration_settings.upsert_options());
+        }
 
         match acceleration_settings.table_constraints(Arc::clone(&schema)) {
             Ok(Some(constraints)) => {
@@ -514,8 +523,11 @@ impl AcceleratorEngineRegistry {
                     external_table_builder =
                         external_table_builder.constraints(constraints.clone());
                     // Update on_conflict to match the new constraints' primary key
-                    // if user hasn't explicitly configured on_conflict
-                    if acceleration_settings.on_conflict.is_empty() && !suppress_auto_on_conflict {
+                    // if user hasn't explicitly configured on_conflict (or the engine
+                    // ignores it)
+                    if (acceleration_settings.on_conflict.is_empty() || !honors_on_conflict)
+                        && !suppress_auto_on_conflict
+                    {
                         let primary_keys: Vec<String> =
                             get_primary_keys_from_constraints(&constraints, &schema);
                         if !primary_keys.is_empty() {
@@ -630,6 +642,18 @@ pub trait DataAccelerator: Send + Sync {
         }
     }
 
+    /// Validate initialization without changing storage or starting background work.
+    ///
+    /// The runtime calls this while the installed generation can still write. Engines
+    /// must also validate inside [`Self::init`] because filesystem state can change
+    /// between validation and initialization. Decorators must forward this method.
+    async fn validate_init(
+        &self,
+        _source: &dyn AccelerationSource,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
+    }
+
     /// Initialize the accelerator for a component
     /// Returns `WasBootstrapped::yes()` if the accelerator was initialized from existing data,
     /// `WasBootstrapped::no()` otherwise.
@@ -684,7 +708,7 @@ pub trait DataAccelerator: Send + Sync {
     }
 
     /// How this engine's writes accumulate for `acceleration`, or `None` when the engine
-    /// is not the one that acceleration names.
+    /// is not the one that acceleration uses.
     ///
     /// `unset_refresh_mode` is what an absent `refresh_mode` resolves to for the source's
     /// connector, which the caller resolves because only it knows the `from:` value (see

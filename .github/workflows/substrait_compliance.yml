@@ -128,8 +128,10 @@ jobs:
         run: |
           sccache --show-stats || echo "::warning::sccache --show-stats failed, so the cache server is not answering either. Read a build failure in this job as a possible cache-backend outage rather than a code failure."
 
+      # Merge-queue checks keep no artifacts. The push run for the merged
+      # commit, the nightly and a dispatch still publish the reports.
       - name: Upload JSON and CSV reports
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && github.event_name != 'merge_group' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: substrait-compliance-mode-a-tpch
@@ -143,7 +145,7 @@ jobs:
         run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
 
       - name: Upload spiceio logs
-        if: always() && runner.os == 'macOS'
+        if: always() && runner.os == 'macOS' && github.event_name != 'merge_group'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: spiceio-substrait-compliance-logs

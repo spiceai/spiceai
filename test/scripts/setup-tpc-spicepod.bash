@@ -133,6 +133,7 @@ if [ "$bench" = "tpch" ]; then
       echo "      duckdb_open: $dbname" >> spicepod.yaml
       echo "    acceleration:" >> spicepod.yaml
       echo "      enabled: true" >> spicepod.yaml
+      echo "      engine: arrow" >> spicepod.yaml
     done
   fi
   if [ "$engine" = "postgres" ]; then
@@ -192,6 +193,7 @@ if [ "$bench" = "tpcds" ]; then
       echo "      duckdb_open: $dbname" >> spicepod.yaml
       echo "    acceleration:" >> spicepod.yaml
       echo "      enabled: true" >> spicepod.yaml
+      echo "      engine: arrow" >> spicepod.yaml
     done
   fi
   if [ "$engine" = "postgres" ]; then

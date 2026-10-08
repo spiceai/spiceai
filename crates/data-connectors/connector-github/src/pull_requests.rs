@@ -1065,4 +1065,118 @@ mod tests {
             );
         }
     }
+
+    /// The `pulls` dataset wraps the GraphQL client. An empty HTTP 200 from the
+    /// GitHub GraphQL API must retry, then load rows — not fail as a JSON decode.
+    #[test]
+    fn empty_200_from_graphql_retries_then_loads_pulls() {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        use std::time::Duration;
+
+        use crate::test_util::block_on;
+        use connector_graphql::graphql::builder::GraphQLClientBuilder;
+        use connector_graphql::graphql::provider::GraphQLTableProviderBuilder;
+        use datafusion::catalog::TableProvider;
+        use datafusion::physical_plan::collect;
+        use datafusion::prelude::SessionContext;
+        use reqwest::header::{CONTENT_TYPE, HeaderMap, HeaderValue};
+        use url::Url;
+        use wiremock::matchers::{header, method};
+        use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+        let table_args = args(PullRequestCommentType::None, 25);
+        block_on(async move {
+            struct EmptyThenJson {
+                remaining_empty: AtomicU32,
+            }
+
+            impl Respond for EmptyThenJson {
+                fn respond(&self, _request: &Request) -> ResponseTemplate {
+                    if self
+                        .remaining_empty
+                        .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                            left.checked_sub(1)
+                        })
+                        .is_ok()
+                    {
+                        return ResponseTemplate::new(200)
+                            .insert_header("Retry-After", "0")
+                            .set_body_string("");
+                    }
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "application/json")
+                        .set_body_json(json!({
+                            "data": {
+                                "repository": {
+                                    "pullRequests": {
+                                        "pageInfo": {"hasNextPage": false, "endCursor": null},
+                                        "nodes": [pull_request_node(&Value::Null)]
+                                    }
+                                }
+                            }
+                        }))
+                }
+            }
+
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(header("content-type", "application/json"))
+                .respond_with(EmptyThenJson {
+                    remaining_empty: AtomicU32::new(1),
+                })
+                .mount(&server)
+                .await;
+
+            let params = table_args.get_graphql_values();
+            let query = params.query.as_ref();
+            let mut default_headers = HeaderMap::new();
+            default_headers.append(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+            let http_client = reqwest::Client::builder()
+                .user_agent(util::spiceai_user_agent())
+                .connect_timeout(Duration::from_secs(10))
+                .timeout(Duration::from_mins(2))
+                .gzip(true)
+                .brotli(true)
+                .zstd(true)
+                .deflate(true)
+                .default_headers(default_headers)
+                .build()
+                .expect("GitHub-style HTTP client to build");
+            let client = GraphQLClientBuilder::new(
+                Url::parse(&format!("{}/graphql", server.uri())).expect("valid URL"),
+                params.unnest_behavior,
+            )
+            .with_json_pointer(params.json_pointer)
+            .with_schema(params.schema)
+            .build(http_client)
+            .expect("GitHub-style GraphQL client to build");
+
+            let provider = GraphQLTableProviderBuilder::new(client)
+                .with_schema_transform(crate::github_gql_raw_schema_cast)
+                .with_context(std::sync::Arc::new(table_args))
+                .build_without_validation(query)
+                .expect("provider to build from the pulls schema");
+
+            let ctx = SessionContext::new();
+            let plan = TableProvider::scan(&provider, &ctx.state(), None, &[], None)
+                .await
+                .expect("scan to plan");
+            let batches = collect(plan, ctx.task_ctx())
+                .await
+                .expect("empty HTTP 200 must retry and then load pull requests");
+
+            let rows: usize = batches
+                .iter()
+                .map(arrow::array::RecordBatch::num_rows)
+                .sum();
+            assert_eq!(rows, 1, "the retried page must yield the pull request");
+
+            let requests = server
+                .received_requests()
+                .await
+                .expect("recorded requests")
+                .len();
+            assert_eq!(requests, 2, "one empty 200 then one JSON page");
+        });
+    }
 }

@@ -344,6 +344,19 @@ Results validation, snapshotting and metrics are not supported with append tests
 
 Append tests are not built by default, as the File connector source generation relies on the `duckdb` crate to generate the source data. Because of this, the append test can significantly increase the testoperator build time. To build with append support, use the `append` feature flag: `cargo build -p testoperator --release --features append`.
 
+### Running Cold-Start Tests
+
+`testoperator run cold-start` starts `spiced` with an empty data directory and measures how long its accelerations take to load and report ready. With `--baseline-spiced-path` it alternates runs of the candidate and a baseline binary, such as the previous release, on the same host and fails when the candidate's median or slowest time to ready exceeds `--max-ready-ratio` times the baseline's median or slowest. `--max-full-compactions` fails a run that commits more full Cayenne compactions than that before it is ready, a bound that does not depend on the host's speed. Every run must load the same row count. Both binaries receive `--cpu-cores` (default 2).
+
+```bash
+testoperator run cold-start \
+  -p 'test/spicepods/cold_start/delta_lake-cayenne[file]-append_unkeyed_sorted.yaml' \
+  -s ./target/release/spiced --baseline-spiced-path ./spiced-v2.3.1 \
+  --runs 3 --max-full-compactions 0 --ready-wait 600
+```
+
+The spicepods in `test/spicepods/cold_start/` read a synthetic Delta Lake table that `test/scripts/cold_start_delta_fixture.py` generates; `.github/workflows/testoperator_run_cold_start.yml` seeds it in MinIO and runs every spicepod nightly.
+
 ### Scheduled Runs
 
 `testoperator dispatch <dir> --workflow <workflow>` dispatches one GitHub Actions run per test in the configs under `dir`; `.github/workflows/testoperator_dispatch.yml` runs it on a schedule over the configs in `dispatch/`. A config runs daily unless it sets `schedule: weekly`, which the configs whose source is a hosted service (Databricks, Snowflake, Oracle Cloud, BigQuery, Athena, Glue, DynamoDB, Azure Blob Storage, Spice Cloud) do, as do the source-to-accelerator checks described below. The daily run passes `--schedule daily` and the weekly run `--schedule weekly`; without `--schedule`, as in a manual dispatch, every config is dispatched.

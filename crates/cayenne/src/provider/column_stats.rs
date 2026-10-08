@@ -110,6 +110,11 @@ pub(crate) struct ColumnStatsAccumulator {
 }
 
 impl ColumnStatsAccumulator {
+    /// Logical schema used to accumulate and serialize these bounds.
+    pub(crate) fn schema(&self) -> &arrow_schema::Schema {
+        &self.schema
+    }
+
     /// Create a new accumulator for the given schema, maintaining NDV sketches
     /// for every NDV-tracked column. Used by every write that produces a
     /// persisted file (`write_to_snapshot`: checkpoint spills, staged appends,
@@ -170,6 +175,30 @@ impl ColumnStatsAccumulator {
             row_count: std::sync::atomic::AtomicI64::new(0),
             schema: schema.clone(),
         })
+    }
+
+    /// An empty accumulator for the same schema that keeps NDV sketches for the
+    /// same columns as this one.
+    pub(crate) fn empty_like(&self) -> Self {
+        let num_cols = self.dtypes.len();
+        let ndv = match self.state.lock() {
+            Ok(state) => state
+                .ndv
+                .iter()
+                .map(|slot| slot.as_ref().map(|_| crate::hll::HyperLogLog::new()))
+                .collect(),
+            Err(_) => (0..num_cols).map(|_| None).collect(),
+        };
+        Self {
+            state: std::sync::Mutex::new(ColumnStatsState {
+                columns: vec![vortex::array::stats::StatsSet::default(); num_cols],
+                seeded: vec![false; num_cols],
+                ndv,
+            }),
+            dtypes: self.dtypes.clone(),
+            row_count: std::sync::atomic::AtomicI64::new(0),
+            schema: self.schema.clone(),
+        }
     }
 
     /// Whether to maintain an NDV sketch for `dt`. Covers the types whose
@@ -663,6 +692,29 @@ impl ColumnStatsAccumulator {
         }
 
         // Merge per-column NDV sketches (register-wise max).
+        Self::merge_ndv(&mut state, other_ndv);
+    }
+
+    /// Merge only `other`'s NDV sketches, leaving the row count and min/max/null
+    /// statistics as they are.
+    pub(crate) fn merge_ndv_from(&self, other: &Self) {
+        let other_ndv = {
+            let Ok(other_state) = other.state.lock() else {
+                tracing::warn!(
+                    "ColumnStatsAccumulator: mutex poisoned in merge_ndv_from(), skipping"
+                );
+                return;
+            };
+            other_state.ndv.clone()
+        };
+        let Ok(mut state) = self.state.lock() else {
+            tracing::warn!("ColumnStatsAccumulator: mutex poisoned in merge_ndv_from(), skipping");
+            return;
+        };
+        Self::merge_ndv(&mut state, other_ndv);
+    }
+
+    fn merge_ndv(state: &mut ColumnStatsState, other_ndv: Vec<Option<crate::hll::HyperLogLog>>) {
         for (idx, other_hll) in other_ndv.into_iter().enumerate() {
             let (Some(other_hll), Some(slot)) = (other_hll, state.ndv.get_mut(idx)) else {
                 continue;

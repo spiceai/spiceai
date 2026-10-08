@@ -17,8 +17,10 @@ limitations under the License.
 use std::{collections::HashMap, time::Duration};
 
 use bollard::secret::HealthConfig;
+#[cfg(any(feature = "duckdb", not(target_os = "windows")))]
+use spicepod::acceleration::RefreshMode;
 #[cfg(feature = "duckdb")]
-use spicepod::acceleration::{Mode, OnConflictBehavior, RefreshMode};
+use spicepod::acceleration::{Mode, OnConflictBehavior};
 #[cfg(feature = "duckdb")]
 use spicepod::component::dataset::OnSchemaChange;
 use spicepod::{
@@ -50,7 +52,10 @@ pub fn make_mongodb_dataset(path: &str, name: &str, port: u16, accelerated: bool
     ]);
     dataset.params = Some(DatasetParams::from_string_map(params));
     if accelerated {
-        dataset.acceleration = Some(Acceleration::default());
+        dataset.acceleration = Some(Acceleration {
+            engine: Some("arrow".to_string()),
+            ..Acceleration::default()
+        });
     }
     dataset
 }
@@ -96,6 +101,41 @@ pub fn make_mongodb_widen_dataset(path: &str, name: &str, port: u16, duckdb_file
 
 #[cfg(feature = "duckdb")]
 pub fn make_mongodb_change_stream_dataset(path: &str, name: &str, port: u16) -> Dataset {
+    change_stream_dataset(
+        path,
+        name,
+        port,
+        Acceleration {
+            enabled: true,
+            engine: Some("duckdb".to_string()),
+            refresh_mode: Some(RefreshMode::Changes),
+            primary_key: Some("_id".to_string()),
+            on_conflict: HashMap::from([("_id".to_string(), OnConflictBehavior::Upsert)]),
+            ..Default::default()
+        },
+    )
+}
+
+/// A Change Streams dataset on Cayenne keyed by `_id` alone: Cayenne keeps one row
+/// per primary key without `on_conflict`.
+#[cfg(not(target_os = "windows"))]
+pub fn make_mongodb_cayenne_change_stream_dataset(path: &str, name: &str, port: u16) -> Dataset {
+    change_stream_dataset(
+        path,
+        name,
+        port,
+        Acceleration {
+            enabled: true,
+            engine: Some("cayenne".to_string()),
+            refresh_mode: Some(RefreshMode::Changes),
+            primary_key: Some("_id".to_string()),
+            ..Default::default()
+        },
+    )
+}
+
+#[cfg(any(feature = "duckdb", not(target_os = "windows")))]
+fn change_stream_dataset(path: &str, name: &str, port: u16, acceleration: Acceleration) -> Dataset {
     let mut dataset = Dataset::new(format!("mongodb:{path}"), name.to_string());
     let connection_string =
         format!("mongodb://localhost:{port}/testdb?directConnection=true&replicaSet=rs0&tls=false");
@@ -112,14 +152,7 @@ pub fn make_mongodb_change_stream_dataset(path: &str, name: &str, port: u16) -> 
         ("change_stream_batch_size".to_string(), "10".to_string()),
     ]);
     dataset.params = Some(DatasetParams::from_string_map(params));
-    dataset.acceleration = Some(Acceleration {
-        enabled: true,
-        engine: Some("duckdb".to_string()),
-        refresh_mode: Some(RefreshMode::Changes),
-        primary_key: Some("_id".to_string()),
-        on_conflict: HashMap::from([("_id".to_string(), OnConflictBehavior::Upsert)]),
-        ..Default::default()
-    });
+    dataset.acceleration = Some(acceleration);
     dataset
 }
 
