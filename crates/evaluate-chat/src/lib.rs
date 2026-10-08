@@ -540,11 +540,7 @@ mod tests {
 
         evaluator.evaluate(request).await.expect("evaluation");
 
-        let sent = chat
-            .requests()
-            .into_iter()
-            .next()
-            .expect("one request");
+        let sent = chat.requests().into_iter().next().expect("one request");
         assert_eq!(sent.reasoning_effort, Some(ReasoningEffort::Low));
     }
 
