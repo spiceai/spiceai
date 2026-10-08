@@ -21,7 +21,8 @@ runtime-request-context = { path = "../runtime-request-context" }
 runtime-status = { path = "../runtime-status" }
 runtime-udfs-api = { path = "../runtime-udfs-api" }
 serde.workspace = true
-serde_json.workspace = true
+# Labels keep the order they were written in.
+serde_json = { workspace = true, features = ["preserve_order"] }
 tokio.workspace = true
 tracing.workspace = true
 
