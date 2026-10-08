@@ -587,6 +587,9 @@ fn reported_again(error: &ChangeBatchError) -> ChangeBatchError {
         ChangeBatchError::DeferredBuild { message } => ChangeBatchError::DeferredBuild {
             message: message.clone(),
         },
+        ChangeBatchError::UnknownOperation { op } => {
+            ChangeBatchError::UnknownOperation { op: op.clone() }
+        }
         ChangeBatchError::Arrow { .. } => ChangeBatchError::DeferredBuild {
             message: error.to_string(),
         },
