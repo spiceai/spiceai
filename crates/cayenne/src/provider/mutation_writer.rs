@@ -73,7 +73,7 @@ use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion_execution::TaskContext;
 use datafusion_physical_plan::{SendableRecordBatchStream, execute_stream};
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use parking_lot::Mutex as ParkingMutex;
 use tokio::sync::OwnedMutexGuard;
 
@@ -292,10 +292,24 @@ fn restore_post_validation(
     *post_validation.lock() = Some(state);
 }
 
+/// Which rules resolve a key a write repeats; see [`super::key_conflicts`].
+#[derive(Debug, Clone, Copy)]
+enum WriteKind {
+    /// A refresh or `INSERT`: each record batch is one statement under the
+    /// table's `on_conflict`.
+    Statement,
+    /// Applied changes: a later change of a key supersedes an earlier one.
+    ChangeStream,
+}
+
 pub(super) struct AppendMutationWriter<'a> {
     table: &'a CayenneTableProvider,
     context: &'a Arc<CayenneContext>,
     task_context: &'a Arc<TaskContext>,
+    /// The caller holds the write lock over a table it observed to hold no rows
+    /// (`CayenneTableProvider::holds_no_rows`), so a streaming append has no
+    /// stored key to check its own against.
+    into_empty_table: bool,
 }
 
 impl<'a> AppendMutationWriter<'a> {
@@ -309,7 +323,21 @@ impl<'a> AppendMutationWriter<'a> {
             table,
             context,
             task_context,
+            into_empty_table: false,
         }
+    }
+
+    fn can_buffer_rebuildable_write(&self) -> bool {
+        self.table.is_cdc_memory_mode()
+            && super::write_recovery::RebuildableWrite::permits(self.table, self.task_context)
+    }
+
+    /// Write into a table the caller observed, under the write lock it still
+    /// holds, to hold no rows: a streaming append skips the conflict check.
+    #[must_use]
+    pub(super) fn into_empty_table(mut self) -> Self {
+        self.into_empty_table = true;
+        self
     }
 
     pub(super) async fn write_cdc_pipelined(
@@ -349,7 +377,7 @@ impl<'a> AppendMutationWriter<'a> {
         // ALWAYS at N=1 — falls through to the byte-identical serial path below.
         let mem_tier_shards = self.table.mem_tier_shard_count();
         if mem_tier_shards > 1
-            && self.table.is_cdc_mem_tier_armed()
+            && (self.table.is_cdc_mem_tier_armed() || self.can_buffer_rebuildable_write())
             && self.table.metadata().partition_column.is_none()
         {
             if let Some(prepared) = self
@@ -412,9 +440,41 @@ impl<'a> AppendMutationWriter<'a> {
             });
         }
 
+        // The RAM tier owns the whole write before publishing, so resolve its
+        // raw batches before preparing conflict validation. The durable fallback
+        // receives those same resolved raw batches for a fresh validation pass.
+        // Buffer only permanent memory data, replayable CDC with a real source
+        // callback, or an explicitly rebuildable write to this storage owner.
+        // Rebuildable writes make no source acknowledgement promise. Replayable
+        // CDC still defers acknowledgement behind the covering checkpoint.
+        let (data, write_guard) = if self.table.metadata().partition_column.is_none()
+            && (self.table.is_memory_resident_mode()
+                || self.table.is_cdc_mem_tier_armed()
+                || self.can_buffer_rebuildable_write())
+        {
+            match self
+                .write_cdc_in_memory(data, write_guard, write_start)
+                .await?
+            {
+                MemWriteOutcome::Done(cdc_write) => return Ok(*cdc_write),
+                MemWriteOutcome::FallBackToDurable {
+                    stream,
+                    write_guard,
+                } => (stream, write_guard),
+            }
+        } else if self.table.metadata().partition_column.is_none() {
+            (
+                self.collapse_inline_candidate(data, WriteKind::ChangeStream)
+                    .await?
+                    .0,
+                write_guard,
+            )
+        } else {
+            (data, write_guard)
+        };
         let prepared = self.table.prepare_stream_for_insert(data).await?;
-        let mut post_validation = prepared.post_validation();
-        let mut may_have_on_conflict_deletions = prepared.may_have_on_conflict_deletions();
+        let post_validation = prepared.post_validation();
+        let may_have_on_conflict_deletions = prepared.may_have_on_conflict_deletions();
         let prepared_stream = prepared.stream;
 
         // Retention used to block the pipelined path because it ran inline
@@ -487,47 +547,7 @@ impl<'a> AppendMutationWriter<'a> {
             ));
         }
 
-        // In-memory write path: append the validated batch to the RAM tier instead
-        // of persisting a per-batch durable BLOB. Taken when EITHER the table is a
-        // `mode: memory` accelerator (`is_memory_resident_mode` — the mem-tier is
-        // its permanent store) OR a key-based, non-partitioned CDC table
-        // (`is_cdc_memory_mode`) whose runtime has armed deferral for a replayable
-        // source (`has_slot_advancer`). The two differ in how the runtime acks the
-        // source slot: `mode: memory` never checkpoints, so the slot is committed
-        // immediately (nothing to defer behind); `cdc_durability: memory` defers the
-        // ack behind the covering durable checkpoint. Every other table/source keeps
-        // the durable path below, byte-identical.
-        let (mut prepared_stream, write_guard) = if self.table.is_memory_resident_mode()
-            || self.table.is_cdc_mem_tier_armed()
-        {
-            match self
-                .write_cdc_in_memory(prepared_stream, &post_validation, write_guard, write_start)
-                .await?
-            {
-                MemWriteOutcome::Done(cdc_write) => return Ok(*cdc_write),
-                // Sustained overload: the global budget is full even after a
-                // bounded wait for other tables to release AND a spill drained
-                // the tier (firing the slot advancer, so the prior mem batches
-                // are durable). This batch takes the durable path below with a
-                // NORMAL committer — safe because the slot is not ahead of
-                // durable (spill-then-fallback ordering guard).
-                //
-                // The spill moved rows the batch's conflicts were resolved
-                // against into files, so validate the batch again: the durable
-                // path must tombstone the prior versions where they live now.
-                MemWriteOutcome::FallBackToDurable {
-                    stream,
-                    write_guard,
-                } => {
-                    let prepared = self.table.prepare_stream_for_insert(stream).await?;
-                    post_validation = prepared.post_validation();
-                    may_have_on_conflict_deletions = prepared.may_have_on_conflict_deletions();
-                    (prepared.stream, write_guard)
-                }
-            }
-        } else {
-            (prepared_stream, write_guard)
-        };
+        let mut prepared_stream = prepared_stream;
 
         match self
             .try_inline_or_restream(prepared_stream, &post_validation)
@@ -793,37 +813,56 @@ impl<'a> AppendMutationWriter<'a> {
         }
     }
 
-    /// In-memory CDC write path, shared by `cdc_durability: memory` and
-    /// `mode: memory`. Drains the validated stream into RAM, computes the
-    /// on-conflict tombstones in memory, and appends to the mem tier (returning the
-    /// mem-tier epoch) under byte caps (per-table, plus a process-wide one when the
-    /// runtime has installed the global budget) that bound the resident tier.
-    ///
-    /// The modes diverge on cap breach and slot ack. `cdc_durability: memory`
-    /// buffers the whole burst, then on breach spills the tier durable (and, under
-    /// sustained overload, falls back to the durable path), and the runtime DEFERS
-    /// the source slot ack behind the covering durable checkpoint. `mode: memory`
-    /// never checkpoints or spills: it enforces the RAM bound incrementally as the
-    /// burst is buffered — an oversized burst returns `MemTierLimitExceeded` before
-    /// it can allocate toward OOM — and the runtime commits the slot immediately.
-    /// PK conflict validation still runs either way (it populated `post_validation`
-    /// as the stream was prepared).
+    /// Probe inline admission on raw batches. A complete buffered write has its
+    /// repeated keys resolved before validation — per `on_conflict` for a
+    /// statement, as later changes for a change stream; an overflow replays the
+    /// raw head and remaining stream through the ordinary streaming path.
+    async fn collapse_inline_candidate(
+        &self,
+        mut raw: SendableRecordBatchStream,
+        kind: WriteKind,
+    ) -> Result<(SendableRecordBatchStream, bool)> {
+        let schema = raw.schema();
+        let mut buffer = InlineBatchBuffer::new(
+            Arc::clone(&schema),
+            self.context.inline_max_rows(),
+            self.context.inline_max_buffer_bytes(),
+        );
+        while let Some(batch) = StreamExt::next(&mut raw).await {
+            buffer.push(batch?);
+            if !buffer.should_continue_buffering() {
+                return Ok((buffer.into_chained_stream(raw), true));
+            }
+        }
+        let batches = match kind {
+            WriteKind::Statement => self.table.collapse_buffered_write(buffer.batches)?,
+            WriteKind::ChangeStream => self.table.collapse_buffered_changes(buffer.batches)?,
+        };
+        Ok((
+            Box::pin(RecordBatchStreamAdapter::new(
+                schema,
+                futures::stream::iter(batches.into_iter().map(Ok)),
+            )),
+            false,
+        ))
+    }
+
+    /// Buffer one CDC write in RAM, resolve its raw batches, then validate and
+    /// append the survivors. Memory mode checks its hard limit during the raw
+    /// drain; CDC memory durability may spill or fall back after validation.
     async fn write_cdc_in_memory(
         &self,
-        mut prepared_stream: SendableRecordBatchStream,
-        post_validation: &Arc<ParkingMutex<Option<PostValidationState>>>,
+        mut raw_stream: SendableRecordBatchStream,
         write_guard: OwnedMutexGuard<()>,
         write_start: Instant,
     ) -> Result<MemWriteOutcome> {
-        // Drain the prepared stream into RAM (CDC batches are small per apply).
-        // Draining also RUNS the deferred PK-conflict validation, populating
-        // `post_validation` with the on-conflict deletions.
-        let schema = prepared_stream.schema();
+        // Buffer the raw write before any primary-key validation observes it.
+        let schema = raw_stream.schema();
         let mut batches: Vec<RecordBatch> = Vec::new();
         let mut incoming = arrow_tools::batch_bytes::RetainedBytes::new();
         let mut incoming_rows: u64 = 0;
         let drain_start = Instant::now();
-        while let Some(batch) = StreamExt::next(&mut prepared_stream).await {
+        while let Some(batch) = StreamExt::next(&mut raw_stream).await {
             let batch = batch?;
             incoming.add(&batch);
             let incoming_bytes = incoming.total();
@@ -844,12 +883,23 @@ impl<'a> AppendMutationWriter<'a> {
             }
             batches.push(batch);
         }
-        drop(prepared_stream);
-        let incoming_bytes = incoming.total();
-        // Decompose `cdc_path_inmemory`: draining the prepared stream RUNS the
-        // deferred PK-conflict validation and decodes the upstream CDC batches,
-        // so this is the "produce + validate the batch" slice — separating
-        // upstream-bound cost from the fence + append cost that follows.
+        drop(raw_stream);
+        let raw_batches = self.table.collapse_buffered_changes(batches)?;
+        let raw = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            futures::stream::iter(raw_batches.clone().into_iter().map(Ok)),
+        ));
+        // Validating the resolved batches RUNS the deferred PK-conflict
+        // validation; the tier holds what it yields, so size the admission from
+        // those batches, not the raw burst.
+        let prepared = self.table.prepare_stream_for_insert(raw).await?;
+        let post_validation = prepared.post_validation();
+        let batches: Vec<RecordBatch> = prepared.stream.try_collect().await?;
+        let incoming_bytes = arrow_tools::batch_bytes::RetainedBytes::of(&batches);
+        incoming_rows = batches
+            .iter()
+            .map(|batch| batch.num_rows() as u64)
+            .fold(0_u64, u64::saturating_add);
         record_cayenne_write_phase(
             self.table.table_name(),
             "inmemory_stream_drain",
@@ -906,7 +956,7 @@ impl<'a> AppendMutationWriter<'a> {
                     "cdc_path_inmemory_fallback",
                     write_start,
                 );
-                let stream = MemorySourceConfig::try_new_exec(&[batches], schema, None)
+                let stream = MemorySourceConfig::try_new_exec(&[raw_batches], schema, None)
                     .and_then(|exec| execute_stream(exec, Arc::clone(self.task_context)))?;
                 return Ok(MemWriteOutcome::FallBackToDurable {
                     stream,
@@ -918,7 +968,7 @@ impl<'a> AppendMutationWriter<'a> {
         let PostValidationState {
             on_conflict_deletions,
             validated_keys,
-        } = take_post_validation(post_validation);
+        } = take_post_validation(&post_validation);
         let superseded =
             u64::try_from(on_conflict_deletions.total_superseded()).unwrap_or(u64::MAX);
 
@@ -960,11 +1010,11 @@ impl<'a> AppendMutationWriter<'a> {
         )))
     }
 
-    /// Sharded (N>1) in-memory CDC write path (§5 Phase 3, step b). Drains the
-    /// RAW decoded stream and splits each batch by PK shard, applies the
-    /// whole-apply OOM-safety caps/budget exactly as [`Self::write_cdc_in_memory`]
-    /// to the shards' bytes, then DECOUPLES decode from validation: the per-batch
-    /// on-conflict validation runs PER SHARD
+    /// Sharded (N>1) in-memory CDC write path (§5 Phase 3, step b). Drains and
+    /// collapses the RAW decoded stream and splits each batch by PK shard,
+    /// applies the whole-apply OOM-safety caps/budget exactly as
+    /// [`Self::write_cdc_in_memory`] to the shards' bytes, then DECOUPLES decode
+    /// from validation: the per-batch on-conflict validation runs PER SHARD
     /// ([`CayenneTableProvider::validate_and_append_sharded`]),
     /// with the N shard appends joined concurrently. The combined post-validation
     /// state is published for the durable fallback.
@@ -1002,6 +1052,11 @@ impl<'a> AppendMutationWriter<'a> {
             batches.push(batch);
         }
         drop(stream);
+        batches = self.table.collapse_buffered_changes(batches)?;
+        incoming_rows = batches
+            .iter()
+            .map(|batch| batch.num_rows() as u64)
+            .fold(0_u64, u64::saturating_add);
         record_cayenne_write_phase(
             self.table.table_name(),
             "inmemory_stream_drain",
@@ -1119,7 +1174,11 @@ impl<'a> AppendMutationWriter<'a> {
         )))
     }
 
-    pub(super) async fn write(&self, data: SendableRecordBatchStream) -> Result<u64> {
+    pub(super) async fn write(
+        &self,
+        data: SendableRecordBatchStream,
+        write_guard: OwnedMutexGuard<()>,
+    ) -> Result<u64> {
         self.table.ensure_no_incomplete_write().await?;
 
         let pending_pk_deletions = !self.table.pk_deletion_strategy().is_position_based()
@@ -1132,6 +1191,25 @@ impl<'a> AppendMutationWriter<'a> {
             );
         }
 
+        let (data, streaming) = if self.table.metadata().partition_column.is_none()
+            && !self.table.has_retention_delete_filters()
+        {
+            self.collapse_inline_candidate(data, WriteKind::Statement)
+                .await?
+        } else {
+            (data, true)
+        };
+        // A streaming append resolves the keys it repeats after the write. A
+        // table with a partition column (one created through Cayenne's own DDL)
+        // keeps the validation that rejects a key repeated across batches.
+        if streaming
+            && self.table.metadata().partition_column.is_none()
+            && let Some(resolver) = self.table.key_resolver()?
+        {
+            return self
+                .write_resolving_repeats_after(data, resolver, write_guard)
+                .await;
+        }
         let prepared = self.table.prepare_stream_for_insert(data).await?;
         let post_validation = prepared.post_validation();
         let may_have_on_conflict_deletions = prepared.may_have_on_conflict_deletions();
@@ -1144,6 +1222,95 @@ impl<'a> AppendMutationWriter<'a> {
             may_have_on_conflict_deletions,
         )
         .await
+    }
+
+    /// Write a streaming append once, then resolve the keys it repeats across
+    /// record batches ([`super::overwrite_postpass`]) before publishing it.
+    ///
+    /// Each batch resolves its own repeats and stamps its rows with its arrival
+    /// sequence. Conflict validation still supersedes (upsert) or keeps (`drop`)
+    /// each stored copy an incoming key meets, but keeps a key the append repeats
+    /// across batches instead of rejecting it. Once the snapshot is written, a
+    /// query over its files alone finds every incoming copy the policy does not
+    /// keep: a position-deletion table hides them with position deletes on the
+    /// new files, published with the snapshot; a key-deletion table rewrites the
+    /// files that hold them, since a key tombstone would hide the kept copy too.
+    async fn write_resolving_repeats_after(
+        &self,
+        data: SendableRecordBatchStream,
+        resolver: super::key_conflicts::KeyResolver,
+        write_guard: OwnedMutexGuard<()>,
+    ) -> Result<u64> {
+        // A writer's row versions order a key's copies only against the copies this
+        // write holds, which are all of them only in a load into an empty table.
+        if self.table.row_versions.is_some() && !self.into_empty_table {
+            return Err(super::Error::DataFusion {
+                source: datafusion_common::DataFusionError::Internal(format!(
+                    "an append carrying row versions reached a table '{}' that holds rows",
+                    self.table.table_name()
+                )),
+            });
+        }
+        let write = super::overwrite::WriteShape {
+            target_size_bytes: self.context.target_file_size_bytes(),
+            target_partitions: self.task_context.session_config().target_partitions(),
+            write_policy: crate::provider::delta_encoding::WritePolicy::DELTA,
+        };
+        let scope = if self.into_empty_table {
+            super::append_stage::ValidationScope::Empty
+        } else {
+            super::append_stage::ValidationScope::Locked
+        };
+        let super::append_stage::StagedAppend {
+            new_snapshot_id: snapshot_id,
+            on_conflict_deletions,
+            validated_keys,
+            stats,
+            row_count: rows,
+            superseded: superseded_rows,
+        } = self
+            .table
+            .stage_resolved_append(data, resolver, write, scope)
+            .await?;
+
+        if rows == 0 {
+            self.cleanup_layered_append_dirs(std::slice::from_ref(&snapshot_id))
+                .await;
+            return Ok(0);
+        }
+        super::append_commit::PreparedResolvedAppend {
+            table: self.table.clone_for_write(),
+            context: Arc::clone(self.context),
+            _write_guard: write_guard,
+            snapshot_id,
+            rows,
+            stats,
+            deletions: on_conflict_deletions,
+            validated_keys,
+            superseded: superseded_rows,
+            into_empty_table: self.into_empty_table,
+        }
+        .commit()
+        .await
+    }
+
+    async fn cleanup_layered_append_dirs(&self, snapshot_ids: &[String]) {
+        if self.table.table_path().starts_with("s3://") {
+            return;
+        }
+        for snapshot_id in snapshot_ids {
+            let path = self.table.snapshot_dir_path_for(snapshot_id);
+            if let Err(error) = tokio::fs::remove_dir_all(&path).await
+                && error.kind() != std::io::ErrorKind::NotFound
+            {
+                tracing::debug!(
+                    table = self.table.table_name(),
+                    path = %path.display(),
+                    %error,
+                    "Failed to remove an uncommitted append snapshot directory"
+                );
+            }
+        }
     }
 
     async fn write_prepared_stream(
@@ -1366,6 +1533,20 @@ impl<'a> AppendMutationWriter<'a> {
         } = take_post_validation(post_validation);
 
         let superseded = on_conflict_deletions.total_superseded();
+        self.publish_written_snapshot(&new_snapshot_id, rows, on_conflict_deletions)
+            .await?;
+        Ok((rows, stats_acc, validated_keys, superseded))
+    }
+
+    /// Resolve `on_conflict_deletions` and publish `new_snapshot_id`, holding
+    /// `rows` written rows, as a protected snapshot, atomically with the
+    /// deletions. A write of no rows publishes only the deletions.
+    async fn publish_written_snapshot(
+        &self,
+        new_snapshot_id: &str,
+        rows: u64,
+        on_conflict_deletions: super::on_conflict::OnConflictDeletions,
+    ) -> Result<()> {
         // Acquiring the visibility lock + listing fence serializes this table's
         // commits; under concurrent upserts `publish_lock_wait` is the contention
         // signal (commits queueing). Split it out so it is not hidden inside the
@@ -1398,7 +1579,7 @@ impl<'a> AppendMutationWriter<'a> {
         // no new rows.
         if rows == 0 {
             self.table.commit_on_conflict_publish(update, None).await;
-            return Ok((rows, stats_acc, validated_keys, superseded));
+            return Ok(());
         }
 
         // `publish` is the metastore finalization total; the sub-phases attribute
@@ -1413,22 +1594,21 @@ impl<'a> AppendMutationWriter<'a> {
 
         // Durably record the new snapshot's sequence before making it visible.
         self.table
-            .record_written_snapshot_sequence(&new_snapshot_id, new_sequence)
+            .record_written_snapshot_sequence(new_snapshot_id, new_sequence)
             .await?;
         record_cayenne_write_phase(self.table.table_name(), "publish_seq", seq_start);
         // Atomically publish the deletion-cache update and the protected snapshot
         // so concurrent scans never observe the new protected snapshot with a stale deletion view (the duplicate-PK window).
         let cas_start = Instant::now();
         self.table
-            .commit_on_conflict_publish(update, Some((&new_snapshot_id, new_sequence)))
+            .commit_on_conflict_publish(update, Some((new_snapshot_id, new_sequence)))
             .await;
         record_cayenne_write_phase(self.table.table_name(), "publish_cas", cas_start);
         record_cayenne_write_phase(self.table.table_name(), "publish", publish_start);
         // Fold the metastore publish-wall latency into the adaptive tuner's
         // publish-bound signal (the single-writer finalization on the CDC-apply path).
         self.context.record_publish_latency(publish_start.elapsed());
-
-        Ok((rows, stats_acc, validated_keys, superseded))
+        Ok(())
     }
 
     async fn try_inline_or_restream(

@@ -1519,6 +1519,22 @@ impl SqliteMetastore {
         )
     ";
 
+    /// Schema for the `cayenne_index_run` table: one row per persisted
+    /// secondary index run (see `metadata::IndexRunRecord`). The run's bytes
+    /// live in the table's object store; captured in metastore snapshots via
+    /// `EXPECTED_TABLES`.
+    const INDEX_RUN_TABLE_DDL: &'static str = r"
+        CREATE TABLE IF NOT EXISTS cayenne_index_run (
+            table_id TEXT NOT NULL,
+            index_key TEXT NOT NULL,
+            run_name TEXT NOT NULL,
+            row_count BIGINT NOT NULL,
+            size_bytes BIGINT NOT NULL,
+            FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE,
+            PRIMARY KEY (table_id, index_key, run_name)
+        )
+    ";
+
     /// Schema for the `cayenne_inlined_data` table.
     ///
     /// Stores small batches of insert data as Arrow IPC blobs directly in the
@@ -1725,7 +1741,7 @@ impl MetastoreBackend for SqliteMetastore {
             .call(|conn| {
                 // Create tables in a transaction
                 conn.execute_batch(&format!(
-                    "{}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {};",
+                    "{}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {};",
                     Self::TABLE_TABLE_DDL,
                     Self::TABLE_NAME_UNIQUE_INDEX_DDL,
                     Self::DELETE_FILE_TABLE_DDL,
@@ -1739,7 +1755,8 @@ impl MetastoreBackend for SqliteMetastore {
                     Self::COLD_TIER_FILE_TABLE_DDL,
                     Self::INLINED_DATA_TABLE_DDL,
                     Self::INLINED_DELETE_TABLE_DDL,
-                    Self::PK_INDEX_TABLE_DDL
+                    Self::PK_INDEX_TABLE_DDL,
+            Self::INDEX_RUN_TABLE_DDL
                 ))?;
 
                 // Backfill new columns for existing deployments (SQLite doesn't support IF NOT EXISTS for ALTER TABLE until v3.35)

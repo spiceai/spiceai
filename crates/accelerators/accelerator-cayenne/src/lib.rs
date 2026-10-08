@@ -59,7 +59,7 @@ use data_accelerator_api::snapshots::{
 use data_accelerator_api::spice_data_base_path;
 use data_accelerator_api::{
     AccelerationSource, AcceleratorEngineRegistry, BootstrapStatus, DataAccelerator,
-    get_primary_keys_from_constraints, upsert_dedup,
+    get_primary_keys_from_constraints,
 };
 use runtime_acceleration::Engine;
 use runtime_acceleration::OnSchemaChange;
@@ -289,12 +289,9 @@ fn maintained_aggregate_specs_for_cayenne(
 /// expression over the table `schema`. The resulting expression references the
 /// table columns by their schema position, so it lines up with the CDC batches
 /// the view is maintained from. For serving, the view answers a query only when
-/// this predicate is structurally equal to the query's `FilterExec` predicate
-/// (see `MaintainedAggregateView::matches_query`): that holds when the query
-/// filters the scan output directly, but a projection or type-coercion between
-/// the scan and the filter changes the predicate's column indices/literal types
-/// and the view silently falls back to a re-scan. Declare the filter to match
-/// the predicate the query carries over the scan output.
+/// the query's scan applies the same conjuncts (see
+/// `cayenne::maintained_aggregate::PredicateConjuncts`), so the predicate is
+/// folded the way the planner folds a query's `WHERE`.
 fn parse_maintained_aggregate_filter(
     sql: &str,
     schema: &Schema,
@@ -317,6 +314,17 @@ fn parse_maintained_aggregate_filter(
                 "Cayenne maintained_aggregates filter '{sql}' is not a valid SQL predicate over the table columns: {source}"
             )),
         })?;
+    // Fold the predicate the way the planner folds a query's `WHERE`, so it has
+    // the shape the query's scan applies: `ts_col > '2007-01-02 00:00:00'`
+    // compares against a `Timestamp` literal rather than a `CAST` of a string,
+    // and `BETWEEN` becomes the two comparisons the planner rewrites it to. A
+    // predicate that does not fold is kept as written; it is maintained the same
+    // way and only ever loses the match.
+    let logical =
+        util::expr::coerce_and_simplify_exprs([logical.clone()], &Arc::new(schema.clone()))
+            .ok()
+            .and_then(|mut folded| folded.pop())
+            .unwrap_or(logical);
     // Plan through the session rather than calling `create_physical_expr`
     // directly: the session coerces the expression against the schema first, and
     // a filter written the way SQL is normally written needs that. A predicate
@@ -3345,15 +3353,11 @@ impl DataAccelerator for CayenneAccelerator {
         acceleration: &spicepod::acceleration::Acceleration,
         unset_refresh_mode: runtime_acceleration::acceleration::RefreshMode,
     ) -> Option<data_accelerator_api::SpicepodWriteProfile> {
-        // The contract is `None` unless the acceleration names this engine. The runtime
+        // The contract is `None` unless the acceleration uses this engine. The runtime
         // enumerates Cayenne accelerations before asking, so this is the implementation
         // holding up its own end: another consumer would otherwise get a confident
         // Cayenne classification for a DuckDB or Arrow acceleration.
-        if !acceleration
-            .engine
-            .as_deref()
-            .is_some_and(|engine| engine.eq_ignore_ascii_case("cayenne"))
-        {
+        if !acceleration.engine_name().eq_ignore_ascii_case("cayenne") {
             return None;
         }
 
@@ -3516,15 +3520,12 @@ impl DataAccelerator for CayenneAccelerator {
         }
     }
 
-    async fn init(
+    async fn validate_init(
         &self,
         source: &dyn AccelerationSource,
-    ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if !source.is_file_accelerated() {
-            // Memory mode (`mode: memory`) is fully in-RAM and ephemeral — there is
-            // nothing to bootstrap on disk; the dataset reloads from its federated
-            // source on startup, like the in-memory Arrow accelerator.
-            return Ok(BootstrapStatus::none());
+            return Ok(());
         }
 
         if let Some(acceleration) = source.acceleration() {
@@ -3565,7 +3566,18 @@ impl DataAccelerator for CayenneAccelerator {
         {
             Self::ensure_no_catalog_under_data_dir(source, &dir_path).await?;
         }
+        Ok(())
+    }
 
+    async fn init(
+        &self,
+        source: &dyn AccelerationSource,
+    ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
+        self.validate_init(source).await?;
+        if !source.is_file_accelerated() {
+            return Ok(BootstrapStatus::none());
+        }
+        let dir_path = self.file_path(source)?;
         let is_s3_express = s3::is_s3_express_data_path(source);
 
         // Handle S3 Express One Zone configuration
@@ -3947,13 +3959,9 @@ impl DataAccelerator for CayenneAccelerator {
 
         // If partitioning is requested, wrap with PartitionTableProvider
         if partition_by.is_empty() {
-            // Non-partitioned table - wrap in PolyTableProvider for proper deletion/retention support
-            // Wrap with upsert deduplication if needed based on on_conflict settings
-            let write_provider = upsert_dedup::wrap_with_upsert_dedup_if_needed(
-                cayenne_table,
-                &cmd.options,
-                cmd.constraints.clone(),
-            );
+            // Non-partitioned table - wrap in PolyTableProvider for proper deletion/retention support.
+            // Cayenne resolves the keys every write repeats per `on_conflict` itself.
+            let write_provider: Arc<dyn TableProvider> = cayenne_table;
 
             let mut schema_metadata = HashMap::new();
             schema_metadata.insert(
@@ -4133,12 +4141,8 @@ impl DataAccelerator for CayenneAccelerator {
             let partition_provider =
                 Arc::new(partition_provider.with_insert_strategy(insert_strategy));
 
-            // Wrap with upsert deduplication if needed based on on_conflict settings
-            let write_provider = upsert_dedup::wrap_with_upsert_dedup_if_needed(
-                partition_provider,
-                &cmd.options,
-                cmd.constraints.clone(),
-            );
+            // Each partition resolves the keys its writes repeat per `on_conflict`.
+            let write_provider: Arc<dyn TableProvider> = partition_provider;
 
             let mut schema_metadata = HashMap::new();
             schema_metadata.insert(
@@ -4543,6 +4547,70 @@ mod tests {
             .expect("a WHERE predicate evaluates to Boolean");
         assert!(!mask.value(0), "2007-01-01 is not after the bound");
         assert!(mask.value(1), "2008-01-01 is after the bound");
+    }
+
+    /// A maintained filter is folded the way the planner folds the same `WHERE`,
+    /// so a query with that `WHERE` can be served from the view: the predicate
+    /// the query's scan applies must have the same conjuncts as the view's. The
+    /// CH-benCH q1 and q6 predicates cover a timestamp compared against a
+    /// string, which folds into a `Timestamp` literal, and `BETWEEN`, which the
+    /// planner splits into two comparisons.
+    #[tokio::test]
+    async fn a_maintained_filter_has_the_conjuncts_the_planner_gives_the_same_where() {
+        use arrow::datatypes::TimeUnit;
+        use cayenne::maintained_aggregate::PredicateConjuncts;
+        use datafusion::datasource::MemTable;
+        use datafusion::physical_plan::ExecutionPlan;
+        use datafusion::physical_plan::filter::FilterExec;
+
+        fn filter_predicate(
+            plan: &Arc<dyn ExecutionPlan>,
+        ) -> Option<Arc<dyn datafusion::physical_expr::PhysicalExpr>> {
+            if let Some(filter) = plan.downcast_ref::<FilterExec>() {
+                return Some(Arc::clone(filter.predicate()));
+            }
+            plan.children().into_iter().find_map(filter_predicate)
+        }
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new(
+                "ol_delivery_d",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                true,
+            ),
+            Field::new("ol_quantity", DataType::Int32, true),
+            Field::new("ol_amount", DataType::Decimal128(6, 2), true),
+        ]));
+        let ctx = datafusion::prelude::SessionContext::new();
+        ctx.register_table(
+            "order_line",
+            Arc::new(
+                MemTable::try_new(Arc::clone(&schema), vec![vec![]]).expect("empty test table"),
+            ),
+        )
+        .expect("register the test table");
+
+        for sql in [
+            "ol_delivery_d > '2007-01-02 00:00:00.000000'",
+            "ol_delivery_d >= '1997-01-01 00:00:00' AND ol_delivery_d < '2030-01-01 00:00:00' AND ol_quantity BETWEEN 1 AND 100000",
+        ] {
+            let view = parse_maintained_aggregate_filter(sql, &schema)
+                .expect("the CH-benCH filter must be accepted");
+            let plan = ctx
+                .sql(&format!("SELECT ol_amount FROM order_line WHERE {sql}"))
+                .await
+                .expect("plan the query")
+                .create_physical_plan()
+                .await
+                .expect("plan the query physically");
+            let query = filter_predicate(&plan).expect("the query plan filters the table");
+
+            assert_eq!(
+                PredicateConjuncts::try_from_predicate(&view),
+                PredicateConjuncts::try_from_predicate(&query),
+                "the view filter '{sql}' is {view}, but the planner applies {query}"
+            );
+        }
     }
 
     /// In memory mode an unset mem-tier cap means "no cap", and `auto` asks for
@@ -5267,9 +5335,14 @@ mod tests {
                 .is_some(),
             "the engine name is matched the way the runtime matches it: case-insensitively"
         );
+        assert!(
+            accelerator
+                .spicepod_write_profile(&named(None), RefreshMode::Full)
+                .is_some(),
+            "an acceleration that names no engine uses Cayenne, the default engine"
+        );
 
-        // `None` is the default Arrow engine, not an unspecified Cayenne one.
-        for other in [Some("duckdb"), Some("arrow"), Some("sqlite"), None] {
+        for other in [Some("duckdb"), Some("arrow"), Some("sqlite")] {
             assert!(
                 accelerator
                     .spicepod_write_profile(&named(other), RefreshMode::Full)

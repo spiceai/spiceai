@@ -164,8 +164,6 @@ mod postgres;
 mod prepared_statements;
 #[cfg(any(feature = "mongodb", feature = "dynamodb", feature = "cosmosdb"))]
 mod pushdown_roundtrip;
-#[cfg(feature = "rate-control")]
-mod rate_control;
 mod ready_state;
 mod refresh_retry;
 mod refresh_sql;
@@ -175,6 +173,7 @@ mod results_cache_warmup;
 #[cfg(all(unix, feature = "duckdb", feature = "postgres"))]
 mod retention;
 mod s3;
+mod s3_folder_marker;
 mod s3_location_pruning;
 mod s3_parquet_overwrite;
 #[cfg(any(
