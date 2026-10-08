@@ -78,9 +78,9 @@ pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("inline_flush_max_bytes")
         .description("Maximum inline IPC bytes before checkpointing inline data to Vortex. Default: 8388608.")
         .default("8388608"),
-    // Retired: tuning moved to `runtime.params.tuning`. Listed only so `Parameters` drops
+    // Retired: tuning moved to `runtime.params.adaptive_tuning`. Listed only so `Parameters` drops
     // it without a second, generic warning; left out of the published schema.
-    ParameterSpec::component("tuning").moved_to("runtime.params.tuning"),
+    ParameterSpec::component("tuning").moved_to("runtime.params.adaptive_tuning"),
 ];
 
 /// A catalog connector for Cayenne lakehouse catalogs.
@@ -104,7 +104,7 @@ impl CayenneCatalogConnector {
         })
     }
 
-    /// `runtime_tuning` is `runtime.params.tuning`, the runtime-wide tuning mode.
+    /// `runtime_tuning` is `runtime.params.adaptive_tuning`, the runtime-wide tuning mode.
     async fn parse_provider_config(
         &self,
         catalog_name: Option<&str>,
@@ -239,10 +239,10 @@ impl CayenneCatalogConnector {
             .and_then(|v| parse_num_param::<i64>(v, "inline_flush_max_bytes"))
             .map(|v| v.max(0));
 
-        // Tuning mode (`runtime.params.tuning`): `auto` (default) keeps the static,
-        // hardware-derived knobs; `adaptive` additionally runs the closed-loop
+        // Tuning mode (`runtime.params.adaptive_tuning`): `disabled` (default) keeps the static,
+        // hardware-derived knobs; `enabled` additionally runs the closed-loop
         // controller in `cayenne::provider::context`. Unlike the accelerator
-        // path, the catalog path has no schema inference, so `adaptive` is seeded
+        // path, the catalog path has no schema inference, so `enabled` is seeded
         // purely from the detected `HardwareProfile` — the controller's bounds
         // anchor to `[floor, 4×seed]`, so a host-appropriate seed is essential.
         let raw_tuning = runtime_tuning;
@@ -252,7 +252,7 @@ impl CayenneCatalogConnector {
         let data_path = data_dir.clone().unwrap_or_else(|| base.clone());
         let metastore_path = metadata_dir.clone().unwrap_or(base);
 
-        // The engine owns both the `tuning` vocabulary and the hardware probe: a catalog
+        // The engine owns both the `adaptive_tuning` vocabulary and the hardware probe: a catalog
         // has no schema inference, so the seed comes from the host alone, and the
         // controller anchors its bounds to `[floor, 4x seed]` — a seed that ignored the
         // host would leave it riding the wrong window. Asked through the registration
@@ -270,30 +270,30 @@ impl CayenneCatalogConnector {
         } else {
             // This catalog builds its provider from the `cayenne` library, so it works in a
             // binary that links no Cayenne *accelerator* — but only the engine can seed the
-            // controller, so `adaptive` cannot be honoured here. Say so rather than quietly
+            // controller, so `enabled` cannot be honoured here. Say so rather than quietly
             // serving a statically-tuned catalog, which is the same configuration an
-            // operator would get by asking for `auto`.
+            // operator would get by setting `disabled`.
             //
-            // The engine owns the `tuning` vocabulary; the two names are recognized here
+            // The engine owns the `adaptive_tuning` vocabulary; the two names are recognized here
             // only to decide which warning a build that cannot ask should emit, so that a
             // typo is still reported rather than passing as a valid mode.
             let value = raw_tuning.map(str::trim).unwrap_or_default();
-            if value.eq_ignore_ascii_case("adaptive") {
+            if value.eq_ignore_ascii_case("enabled") {
                 tracing::warn!(
-                    "`runtime.params.tuning` is `adaptive`, but this build links no Cayenne accelerator to size the controller, so this catalog runs with static tuning ('auto') instead. Link the `accelerator-cayenne` crate to enable adaptive tuning. See: https://spiceai.org/docs/components/catalogs/cayenne"
+                    "`runtime.params.adaptive_tuning` is `enabled`, but this build links no Cayenne accelerator to size the controller, so this catalog runs with static tuning (`disabled`) instead. Link the `accelerator-cayenne` crate to enable adaptive tuning. See: https://spiceai.org/docs/components/catalogs/cayenne"
                 );
             }
             data_accelerator_api::AdaptiveTuningOutcome {
                 tuning_value_invalid: !value.is_empty()
-                    && !value.eq_ignore_ascii_case("auto")
-                    && !value.eq_ignore_ascii_case("adaptive"),
+                    && !value.eq_ignore_ascii_case("disabled")
+                    && !value.eq_ignore_ascii_case("enabled"),
                 seeds: None,
             }
         };
 
         if outcome.tuning_value_invalid {
             tracing::warn!(
-                "{} This catalog runs with static tuning ('auto') instead.",
+                "{} This catalog runs with static tuning (`disabled`) instead.",
                 spicepod::component::runtime::invalid_tuning_message(
                     raw_tuning.unwrap_or_default().trim()
                 )
@@ -394,7 +394,7 @@ impl CatalogConnector for CayenneCatalogConnector {
             .read()
             .await
             .as_ref()
-            .and_then(|app| app.runtime.params.get("tuning").cloned());
+            .and_then(|app| app.runtime.params.get("adaptive_tuning").cloned());
         let runtime_env = runtime.datafusion().ctx.runtime_env();
         let provider_config = self
             .parse_provider_config(Some(catalog.name.as_str()), runtime_tuning.as_deref())
@@ -511,7 +511,7 @@ mod tests {
             "connector cayenne",
             vec![(
                 "cayenne_tuning".to_string(),
-                SecretString::new("adaptive".to_string().into()),
+                SecretString::new("enabled".to_string().into()),
             )],
             PREFIX,
             Arc::new(RwLock::new(Secrets::new())),

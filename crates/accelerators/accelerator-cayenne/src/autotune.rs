@@ -535,9 +535,9 @@ impl WorkloadProfile {
     }
 }
 
-/// The runtime-wide `runtime.params.tuning` mode: how the knobs this module derives get their values.
+/// The runtime-wide `runtime.params.adaptive_tuning` mode: how the knobs this module derives get their values.
 ///
-/// [`Self::Adaptive`] is selected only by an explicit `adaptive`. Unset, `auto`,
+/// [`Self::Adaptive`] is selected only by an explicit `enabled`. Unset, `disabled`,
 /// and anything unrecognized are all [`Self::Auto`], so no other signal — and no
 /// typo — can land a table in the closed loop. Shared by the accelerator and the
 /// catalog connector, which read the same runtime parameter and must agree on it.
@@ -562,10 +562,10 @@ impl TuningMode {
         let Some(mode) = raw.map(str::trim) else {
             return (Self::Auto, false);
         };
-        if mode.eq_ignore_ascii_case("adaptive") {
+        if mode.eq_ignore_ascii_case("enabled") {
             (Self::Adaptive, false)
         } else {
-            (Self::Auto, !mode.eq_ignore_ascii_case("auto"))
+            (Self::Auto, !mode.eq_ignore_ascii_case("disabled"))
         }
     }
 
@@ -686,7 +686,10 @@ mod tests {
     fn only_an_explicit_adaptive_value_enables_the_closed_loop() {
         // Unset and `auto` are the same answer, and neither is flagged invalid.
         assert_eq!(TuningMode::parse(None), (TuningMode::Auto, false));
-        assert_eq!(TuningMode::parse(Some("auto")), (TuningMode::Auto, false));
+        assert_eq!(
+            TuningMode::parse(Some("disabled")),
+            (TuningMode::Auto, false)
+        );
         // `adaptive` matches case-insensitively, ignoring surrounding whitespace.
         assert_eq!(
             TuningMode::parse(Some("  Adaptive ")),

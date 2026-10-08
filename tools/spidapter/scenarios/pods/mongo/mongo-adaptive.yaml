@@ -16,7 +16,7 @@ runtime:
     cdc_max_coalesced_bytes: "134217728"
     cdc_max_coalesce_age_ms: "250"
     cdc_commit_timeout_ms: "60000"
-    tuning: adaptive
+    adaptive_tuning: enabled
   caching:
     sql_results:
       enabled: false

@@ -3,7 +3,7 @@ kind: Spicepod
 name: postgres-cayenne[file]-adaptive-1slot
 
 # SINGLE-SHARED-SLOT variant of the default `postgres-cayenne[file]-adaptive` (which is 4-slot +
-# deep prefetch). IDENTICAL to that pod — adaptive self-tuning (`runtime.params.tuning: adaptive`;
+# deep prefetch). IDENTICAL to that pod — adaptive self-tuning (`runtime.params.adaptive_tuning: enabled`;
 # schema inference is always on), the `runtime.params` `goal_*` SLOs, and the SAME deep CDC prefetch
 # (16384) — EXCEPT every changes-mode table shares ONE replication slot instead of the default
 # four. Kept as a SEPARATE pod to A/B the slot-count effect against the 4-slot default with
@@ -49,7 +49,7 @@ runtime:
     cdc_max_coalesced_envelopes: '16384'
     cdc_max_coalesced_bytes: '536870912' # 512 MB
     cdc_max_coalesce_age_ms: '2000'
-    tuning: adaptive
+    adaptive_tuning: enabled
     goal_replication_lag: '5s'
     goal_freshness: '30s'
     goal_query_latency: '10s'

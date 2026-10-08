@@ -533,8 +533,8 @@ impl Default for TelemetryConfig {
 /// Docs page for the `runtime.params` keys, linked from tuning diagnostics.
 pub const RUNTIME_PARAMS_DOCS_URL: &str = "https://spiceai.org/docs/reference/spicepod/runtime";
 
-/// Validate `runtime.params.tuning`: `auto` or `adaptive`, ignoring case and
-/// surrounding whitespace. An unset parameter is valid (it means `auto`).
+/// Validate `runtime.params.adaptive_tuning`: `enabled` or `disabled`, ignoring case and
+/// surrounding whitespace. An unset parameter is valid (it means `disabled`).
 ///
 /// # Errors
 ///
@@ -542,11 +542,11 @@ pub const RUNTIME_PARAMS_DOCS_URL: &str = "https://spiceai.org/docs/reference/sp
 pub fn validate_tuning_param<S: std::hash::BuildHasher>(
     params: &HashMap<String, String, S>,
 ) -> Result<(), String> {
-    let Some(value) = params.get("tuning") else {
+    let Some(value) = params.get("adaptive_tuning") else {
         return Ok(());
     };
     let mode = value.trim();
-    if mode.eq_ignore_ascii_case("auto") || mode.eq_ignore_ascii_case("adaptive") {
+    if mode.eq_ignore_ascii_case("disabled") || mode.eq_ignore_ascii_case("enabled") {
         return Ok(());
     }
     Err(invalid_tuning_message(mode))
@@ -589,7 +589,11 @@ pub fn retired_tuning_param_warnings<S: std::hash::BuildHasher>(
         .iter()
         .filter(|key| params.contains_key(**key))
         .map(|key| {
-            let new_name = key.strip_prefix("cayenne_").unwrap_or(key);
+            let new_name = if *key == "cayenne_tuning" {
+                "adaptive_tuning"
+            } else {
+                key.strip_prefix("cayenne_").unwrap_or(key)
+            };
             let mut subject = kind.to_string();
             if let Some(first) = subject.get_mut(..1) {
                 first.make_ascii_uppercase();
@@ -609,11 +613,11 @@ pub fn renamed_runtime_param_warning(old_name: &str, new_name: &str) -> String {
     )
 }
 
-/// The error for an unrecognized `runtime.params.tuning` value.
+/// The error for an unrecognized `runtime.params.adaptive_tuning` value.
 #[must_use]
 pub fn invalid_tuning_message(value: &str) -> String {
     format!(
-        "Invalid `runtime.params.tuning` value '{value}': expected `auto` or `adaptive`. See: {RUNTIME_PARAMS_DOCS_URL}"
+        "Invalid `runtime.params.adaptive_tuning` value '{value}': expected `enabled` or `disabled`. See: {RUNTIME_PARAMS_DOCS_URL}"
     )
 }
 
@@ -2670,12 +2674,12 @@ datasets:
     }
 
     #[test]
-    fn test_tuning_param_accepts_auto_and_adaptive() {
-        for value in ["auto", "adaptive", "ADAPTIVE", " auto "] {
-            let yaml = format!("params:\n  tuning: \"{value}\"\n");
+    fn test_tuning_param_accepts_enabled_and_disabled() {
+        for value in ["disabled", "enabled", "ENABLED", " disabled "] {
+            let yaml = format!("params:\n  adaptive_tuning: \"{value}\"\n");
             let runtime: Runtime = yaml::from_str(&yaml).expect("valid tuning must parse");
             assert_eq!(
-                runtime.params.get("tuning").map(String::as_str),
+                runtime.params.get("adaptive_tuning").map(String::as_str),
                 Some(value)
             );
         }
@@ -2685,23 +2689,23 @@ datasets:
 
     #[test]
     fn test_tuning_param_invalid_value_fails_load() {
-        let error = yaml::from_str::<Runtime>("params:\n  tuning: adaptve\n")
+        let error = yaml::from_str::<Runtime>("params:\n  adaptive_tuning: enablde\n")
             .expect_err("an invalid tuning value must fail the load");
         assert!(
             error
                 .to_string()
-                .contains(&invalid_tuning_message("adaptve")),
+                .contains(&invalid_tuning_message("enablde")),
             "unexpected error: {error}"
         );
         assert_eq!(
-            invalid_tuning_message("adaptve"),
-            "Invalid `runtime.params.tuning` value 'adaptve': expected `auto` or `adaptive`. See: https://spiceai.org/docs/reference/spicepod/runtime"
+            invalid_tuning_message("enablde"),
+            "Invalid `runtime.params.adaptive_tuning` value 'enablde': expected `enabled` or `disabled`. See: https://spiceai.org/docs/reference/spicepod/runtime"
         );
     }
 
     #[test]
     fn test_retired_tuning_param_warning_text() {
-        let params = HashMap::from([("cayenne_tuning".to_string(), "adaptive".to_string())]);
+        let params = HashMap::from([("cayenne_tuning".to_string(), "enabled".to_string())]);
         assert_eq!(
             retired_tuning_param_warnings(
                 "dataset",
@@ -2709,12 +2713,12 @@ datasets:
                 &params,
                 RETIRED_DATASET_TUNING_PARAMS
             ),
-            vec!["Dataset 'orders' sets `cayenne_tuning`, which is no longer a dataset parameter, so it has no effect. Set `runtime.params.tuning` instead. See: https://spiceai.org/docs/reference/spicepod/runtime".to_string()]
+            vec!["Dataset 'orders' sets `cayenne_tuning`, which is no longer a dataset parameter, so it has no effect. Set `runtime.params.adaptive_tuning` instead. See: https://spiceai.org/docs/reference/spicepod/runtime".to_string()]
         );
-        let params = HashMap::from([("cayenne_tuning".to_string(), "auto".to_string())]);
+        let params = HashMap::from([("cayenne_tuning".to_string(), "disabled".to_string())]);
         assert_eq!(
             retired_tuning_param_warnings("catalog", "lake", &params, RETIRED_CATALOG_TUNING_PARAMS),
-            vec!["Catalog 'lake' sets `cayenne_tuning`, which is no longer a catalog parameter, so it has no effect. Set `runtime.params.tuning` instead. See: https://spiceai.org/docs/reference/spicepod/runtime".to_string()]
+            vec!["Catalog 'lake' sets `cayenne_tuning`, which is no longer a catalog parameter, so it has no effect. Set `runtime.params.adaptive_tuning` instead. See: https://spiceai.org/docs/reference/spicepod/runtime".to_string()]
         );
         assert!(
             retired_tuning_param_warnings(

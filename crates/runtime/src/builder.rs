@@ -67,8 +67,8 @@ const CAYENNE_OPTIMIZER_RULES_PARAM: &str = "cayenne_optimizer_rules";
 /// (`goal_*`) the closed loop steers toward. Declared here so the keys are part of the
 /// recognized `runtime.params` vocabulary and don't false-warn as unknown; the values
 /// are resolved (and validated) where the per-dataset Cayenne config is built, and
-/// `tuning` is also validated when the Spicepod loads.
-const TUNING_PARAM: &str = "tuning";
+/// `adaptive_tuning` is also validated when the Spicepod loads.
+const ADAPTIVE_TUNING_PARAM: &str = "adaptive_tuning";
 const GOAL_REPLICATION_LAG_PARAM: &str = "goal_replication_lag";
 const GOAL_FRESHNESS_PARAM: &str = "goal_freshness";
 const GOAL_QUERY_LATENCY_PARAM: &str = "goal_query_latency";
@@ -125,7 +125,7 @@ const KNOWN_CAYENNE_RUNTIME_PARAMS: &[&str] = &[
 
 /// Runtime-wide tuning keys, which carry no `cayenne_` prefix.
 const TUNING_RUNTIME_PARAMS: &[&str] = &[
-    TUNING_PARAM,
+    ADAPTIVE_TUNING_PARAM,
     GOAL_REPLICATION_LAG_PARAM,
     GOAL_FRESHNESS_PARAM,
     GOAL_QUERY_LATENCY_PARAM,

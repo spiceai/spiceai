@@ -658,7 +658,7 @@ mod test {
     #[test]
     fn test_retired_param_is_dropped_and_not_suggested() {
         let specs = [
-            ParameterSpec::component("tuning").moved_to("runtime.params.tuning"),
+            ParameterSpec::component("tuning").moved_to("runtime.params.adaptive_tuning"),
             ParameterSpec::component("host"),
         ];
         let format = |key| {

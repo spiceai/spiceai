@@ -9,7 +9,7 @@ name: postgres-cayenne[file]-adaptive-turso
 #
 # Adaptive-tuning variant of the non-tuned postgres-cayenne[file] baseline. Instead of either
 # the static `auto` derivation (the baseline) or a hand-pinned -cdc-tuned-* config, every Cayenne
-# table runs under `runtime.params.tuning: adaptive`: the runtime still warm-starts each knob from the detected
+# table runs under `runtime.params.adaptive_tuning: enabled`: the runtime still warm-starts each knob from the detected
 # host + inferred schema, then runs the closed-feedback loop that adapts those knobs over time
 # within the environment-derived [floor, ceiling] as the workload shifts.
 #
@@ -63,14 +63,14 @@ runtime:
       enabled: false
   task_history:
     enabled: false
-  # `tuning: adaptive` and the `goal_*` SLOs are runtime-wide: they apply to every Cayenne
+  # `adaptive_tuning: enabled` and the `goal_*` SLOs are runtime-wide: they apply to every Cayenne
   # dataset, with no per-dataset override. The goals are the high-level targets the closed
   # loop converges toward — NOT actuator knobs. Replication-lag/freshness drive the CDC
   # (changes) tables (inert on the full-refresh reference tables); query-latency (p99)
   # applies to all. QPH is measured across all datasets (a query/join spans several,
   # counted once).
   params:
-    tuning: adaptive
+    adaptive_tuning: enabled
     goal_replication_lag: '5s'
     goal_freshness: '30s'
     goal_query_latency: '10s'
@@ -101,7 +101,7 @@ datasets:
         # metastore backend. This is a structural backend choice, not a tunable actuator, so it
         # does not pin any knob under adaptive tuning.
         cayenne_metastore: turso
-        # `tuning` and the goal-driven SLOs are runtime-wide, set under `runtime.params`
+        # `adaptive_tuning` and the goal-driven SLOs are runtime-wide, set under `runtime.params`
         # (above); there is no per-dataset override.
 
   - from: postgres:district
