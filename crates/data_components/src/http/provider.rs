@@ -4012,17 +4012,19 @@ impl HttpTableProvider {
         Ok(())
     }
 
-    /// The request bodies `filters` make this connector send, in filter order:
-    /// one POST per value, and a GET when there are none.
+    /// The values `filters` make this connector send for the request column
+    /// `column` (`request_path`, `request_query` or `request_body`), in filter
+    /// order. None means the request goes without one: the dataset's own path
+    /// and query, and a GET rather than a POST.
     ///
-    /// Follows the shapes `extract_filter_values` records a body from —
-    /// `request_body = '<literal>'` and `request_body IN (<literals>)`, under
-    /// any nesting of `AND`/`OR` — so a cache keyed on stored request values
-    /// can tell which method a lookup will use. Other predicates on
-    /// `request_body` (`<>`, `LIKE`, a literal on the left) record no body.
+    /// Follows the shapes `extract_filter_values` records a value from —
+    /// `<column> = '<literal>'` and `<column> IN (<literals>)`, under any
+    /// nesting of `AND`/`OR` — so a cache keyed on stored request values can
+    /// tell which request a lookup will make. Other predicates (`<>`, `LIKE`,
+    /// a literal on the left) record nothing.
     #[must_use]
-    pub fn request_body_filter_values(filters: &[Expr]) -> Vec<&str> {
-        fn walk<'a>(expr: &'a Expr, values: &mut Vec<&'a str>) {
+    pub fn request_filter_values<'a>(filters: &'a [Expr], column: &str) -> Vec<&'a str> {
+        fn walk<'a>(expr: &'a Expr, name: &str, values: &mut Vec<&'a str>) {
             match expr {
                 Expr::BinaryExpr(BinaryExpr { left, op, right }) => match op {
                     Operator::Eq => {
@@ -4030,20 +4032,20 @@ impl HttpTableProvider {
                             Expr::Column(column),
                             Expr::Literal(ScalarValue::Utf8(Some(value)), _),
                         ) = (left.as_ref(), right.as_ref())
-                            && column.name == "request_body"
+                            && column.name == name
                         {
                             values.push(value);
                         }
                     }
                     Operator::And | Operator::Or => {
-                        walk(left, values);
-                        walk(right, values);
+                        walk(left, name, values);
+                        walk(right, name, values);
                     }
                     _ => {}
                 },
                 Expr::InList(in_list) => {
                     if let Expr::Column(column) = in_list.expr.as_ref()
-                        && column.name == "request_body"
+                        && column.name == name
                     {
                         values.extend(in_list.list.iter().filter_map(|item| match item {
                             Expr::Literal(ScalarValue::Utf8(Some(value)), _) => {
@@ -4058,7 +4060,7 @@ impl HttpTableProvider {
         }
         let mut values = Vec::new();
         for filter in filters {
-            walk(filter, &mut values);
+            walk(filter, column, &mut values);
         }
         values
     }
@@ -6389,15 +6391,17 @@ mod tests {
         }
     }
 
-    /// `request_body_filter_values` names exactly the bodies the scan sends:
-    /// the distinct POST bodies of `extract_partitions`, or none for a GET.
+    /// `request_filter_values` names exactly the bodies and queries the scan
+    /// sends: the distinct values `extract_partitions` produces, or none when
+    /// the request goes without one.
     #[test]
-    fn request_body_filter_values_matches_extracted_partitions() {
+    fn request_filter_values_matches_extracted_partitions() {
         use datafusion::prelude::{col, lit};
         let provider = base_provider()
             .with_allowed_paths(["/items"])
             .expect("allowed path")
-            .enable_body_filters(1024);
+            .enable_body_filters(1024)
+            .enable_query_filters(1024);
         let body = || col("request_body");
         let cases: Vec<(&str, Vec<Expr>, Vec<&str>)> = vec![
             ("eq", vec![body().eq(lit("x"))], vec!["x"]),
@@ -6433,7 +6437,7 @@ mod tests {
         ];
         for (name, filters, expected) in cases {
             assert_eq!(
-                HttpTableProvider::request_body_filter_values(&filters),
+                HttpTableProvider::request_filter_values(&filters, "request_body"),
                 expected,
                 "{name}"
             );
@@ -6453,6 +6457,45 @@ mod tests {
                     .collect()
             };
             assert_eq!(sent, expected_sent, "{name}: bodies the scan sends");
+        }
+
+        let query = || col("request_query");
+        let query_cases: Vec<(&str, Vec<Expr>, Vec<&str>)> = vec![
+            ("eq", vec![query().eq(lit("q=a"))], vec!["q=a"]),
+            (
+                "in list",
+                vec![query().in_list(vec![lit("q=a"), lit("q=b")], false)],
+                vec!["q=a", "q=b"],
+            ),
+            ("not eq", vec![query().not_eq(lit("q=a"))], vec![]),
+            (
+                "path only",
+                vec![col("request_path").eq(lit("/items"))],
+                vec![],
+            ),
+        ];
+        for (name, filters, expected) in query_cases {
+            assert_eq!(
+                HttpTableProvider::request_filter_values(&filters, "request_query"),
+                expected,
+                "query {name}"
+            );
+            let mut sent: Vec<Option<String>> = provider
+                .extract_partitions(&filters)
+                .expect("extract partitions")
+                .into_iter()
+                .map(|partition| partition.1)
+                .collect();
+            sent.dedup();
+            let expected_sent: Vec<Option<String>> = if expected.is_empty() {
+                vec![None]
+            } else {
+                expected
+                    .iter()
+                    .map(|value| Some((*value).to_string()))
+                    .collect()
+            };
+            assert_eq!(sent, expected_sent, "query {name}: queries the scan sends");
         }
     }
 

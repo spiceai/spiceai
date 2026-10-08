@@ -1758,14 +1758,19 @@ impl AcceleratedTable {
             )));
         }
 
-        // A lookup that sends a GET must not match the POST entries cached
-        // for the same path. Without filters the scan lists the whole cache
-        // and makes no request, so nothing is pinned.
-        let get_identity_filter: Option<Expr> = if is_caching_mode && !filters.is_empty() {
-            caching::get_request_identity_filter(filters, &self.accelerator.schema())
+        // A lookup must not match entries cached for other requests to the
+        // same path — a POST, or another query. Without filters the scan lists
+        // the whole cache and makes no request, so nothing is pinned.
+        let identity_filters: Vec<Expr> = if is_caching_mode && !filters.is_empty() {
+            caching::request_identity_filters(filters, &self.accelerator.schema())
         } else {
-            None
+            Vec::new()
         };
+        let identity_columns: Vec<&str> = identity_filters
+            .iter()
+            .flat_map(Expr::column_refs)
+            .map(|column| column.name.as_str())
+            .collect();
 
         // For caching mode, extend the accelerator scan projection to
         // include the storage-only columns the caching pipeline needs:
@@ -1784,16 +1789,11 @@ impl AcceleratedTable {
         // ds`) would push only the user's columns to the accelerator
         // and the FilterExec on top would fail with `No field named
         // __spice_cache_namespace`.
-        // The GET predicate is re-applied above the scan when the accelerator
-        // cannot apply it exactly, so the scan must then carry `request_body`.
+        // The identity predicates are re-applied above the scan when the
+        // accelerator cannot apply them exactly, so the scan must carry their
+        // columns.
         let extended_projection = if is_caching_mode {
-            extend_projection_for_caching(
-                projection,
-                &self.accelerator.schema(),
-                get_identity_filter
-                    .as_ref()
-                    .map(|_| caching::REQUEST_BODY_COLUMN),
-            )
+            extend_projection_for_caching(projection, &self.accelerator.schema(), &identity_columns)
         } else {
             None
         };
@@ -1832,7 +1832,7 @@ impl AcceleratedTable {
         };
         let mut storage_filters: Vec<Expr> = filters.to_vec();
         storage_filters.extend(namespace_filter.iter().cloned());
-        storage_filters.extend(get_identity_filter.iter().cloned());
+        storage_filters.extend(identity_filters.iter().cloned());
         let scan_filters: &[Expr] = if is_caching_mode {
             &storage_filters
         } else {
@@ -1864,7 +1864,7 @@ impl AcceleratedTable {
                 // Unsupported for some filters.
                 let mut filters_to_reapply = self.get_filters_to_reapply(filters)?;
                 // Re-apply each storage-only predicate (the cache namespace
-                // and the GET identity) as a hard FilterExec only if the
+                // and the request identity) as a hard FilterExec only if the
                 // accelerator does NOT report exact pushdown for it.
                 //
                 // The DataFusion contract for `supports_filters_pushdown`
@@ -1886,7 +1886,7 @@ impl AcceleratedTable {
                 // a false-positive panic in `BatchCoalescer` even though
                 // the data itself is well-formed. This bites the localpod
                 // chained-accelerator path in particular.
-                for storage_filter in namespace_filter.into_iter().chain(get_identity_filter) {
+                for storage_filter in namespace_filter.into_iter().chain(identity_filters) {
                     let pushdown = self
                         .accelerator
                         .supports_filters_pushdown(&[&storage_filter])?
@@ -2003,7 +2003,7 @@ impl AcceleratedTable {
     /// scan-output schema. They stay on the logical `TableProvider::schema()`
     /// chain — so `MetadataEnrichedTableProvider` still surfaces the inferred
     /// row-count/byte-size as table statistics and an accelerator keeps its
-    /// tuning warm-start — but their values vary per table, and DataFusion
+    /// tuning warm-start — but their values vary per table, and `DataFusion`
     /// builds a join's output schema by merging its inputs' schema-level
     /// metadata in input order. Leaving them here lets `join_selection`'s
     /// build/probe swap flip the surviving values, so the rule's output schema
@@ -2449,8 +2449,8 @@ impl TableLayer for AcceleratedTable {
 /// Extends projection to include columns required by the caching pipeline
 /// for accelerator scans: `_fetched_at` (freshness check) and
 /// `__spice_cache_namespace` (per-principal isolation filter applied as a
-/// hard `FilterExec` on top of the scan), plus `filter_column` when a
-/// storage-only predicate on it may be re-applied above the scan.
+/// hard `FilterExec` on top of the scan), plus `filter_columns`, whose
+/// storage-only predicates may be re-applied above the scan.
 ///
 /// Returns `Some(extended_projection)` if any extension was needed, or
 /// `None` if both columns are already present (or `projection` is `None`,
@@ -2458,7 +2458,7 @@ impl TableLayer for AcceleratedTable {
 fn extend_projection_for_caching(
     projection: Option<&Vec<usize>>,
     schema: &SchemaRef,
-    filter_column: Option<&str>,
+    filter_columns: &[&str],
 ) -> Option<Vec<usize>> {
     let proj = projection?;
     let mut extended: Option<Vec<usize>> = None;
@@ -2467,7 +2467,7 @@ fn extend_projection_for_caching(
         caching::CACHE_NAMESPACE_COLUMN,
     ]
     .into_iter()
-    .chain(filter_column)
+    .chain(filter_columns.iter().copied())
     {
         let Ok(idx) = schema.index_of(col) else {
             continue;
@@ -2998,7 +2998,7 @@ mod tests {
     #[test]
     fn test_extend_projection_none_returns_none() {
         let schema = schema_with_fetched_at();
-        let result = extend_projection_for_caching(None, &schema, None);
+        let result = extend_projection_for_caching(None, &schema, &[]);
         assert!(result.is_none(), "None projection should return None");
     }
 
@@ -3007,7 +3007,7 @@ mod tests {
         let schema = schema_with_fetched_at();
         // Projection includes fetched_at (index 3)
         let projection = vec![0, 1, 3];
-        let result = extend_projection_for_caching(Some(&projection), &schema, None);
+        let result = extend_projection_for_caching(Some(&projection), &schema, &[]);
         assert!(
             result.is_none(),
             "Projection already including fetched_at should return None"
@@ -3019,7 +3019,7 @@ mod tests {
         let schema = schema_with_fetched_at();
         // Projection does NOT include fetched_at
         let projection = vec![0, 2]; // id, content
-        let extended = extend_projection_for_caching(Some(&projection), &schema, None)
+        let extended = extend_projection_for_caching(Some(&projection), &schema, &[])
             .expect("Should extend projection");
         assert_eq!(
             extended,
@@ -3032,7 +3032,7 @@ mod tests {
     fn test_extend_projection_single_column() {
         let schema = schema_with_fetched_at();
         let projection = vec![2]; // just content
-        let extended = extend_projection_for_caching(Some(&projection), &schema, None)
+        let extended = extend_projection_for_caching(Some(&projection), &schema, &[])
             .expect("Should extend projection");
         assert_eq!(
             extended,
