@@ -451,6 +451,10 @@ jobs:
           url: ${{ env.SPICE_HTTP_ENDPOINT }}/v1/ready
           timeout: '60'
 
+      - name: Configure apt mirrors (Linux)
+        if: matrix.target.target_os == 'linux'
+        uses: ./.github/actions/configure-apt
+
       - name: Install expect (linux)
         if: matrix.target.target_os == 'linux'
         run: |
@@ -655,6 +659,10 @@ jobs:
         with:
           url: ${{ env.SPICE_HTTP_ENDPOINT }}/v1/ready
           timeout: '300'
+
+      - name: Configure apt mirrors (Linux)
+        if: matrix.target.target_os == 'linux'
+        uses: ./.github/actions/configure-apt
 
       - name: Install expect (linux)
         if: matrix.target.target_os == 'linux'
@@ -1230,6 +1238,10 @@ jobs:
         with:
           pg-db: testdb
 
+      - name: Configure apt mirrors (Linux)
+        if: matrix.target.target_os == 'linux'
+        uses: ./.github/actions/configure-apt
+
       - name: Install MySQL (Linux)
         if: matrix.target.target_os == 'linux'
         run: |
@@ -1420,6 +1432,10 @@ jobs:
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Configure apt mirrors (Linux)
+        if: matrix.target.target_os == 'linux'
+        uses: ./.github/actions/configure-apt
 
       - name: Install Clickhouse
         if: matrix.target.target_os == 'linux'
@@ -2026,6 +2042,9 @@ jobs:
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Configure apt mirrors
+        uses: ./.github/actions/configure-apt
 
       - name: Install mssql-tools
         run: |
