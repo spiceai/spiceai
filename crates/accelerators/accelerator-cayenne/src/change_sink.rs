@@ -16,6 +16,9 @@ limitations under the License.
 
 //! Native CDC execution and storage durability fences for the table owner.
 
+#[cfg(test)]
+mod tests;
+
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -23,7 +26,7 @@ use arrow::datatypes::SchemaRef;
 use arrow_tools::record_batch::try_cast_to;
 use arrow_tools::schema_evolution::WideningPlan;
 use async_trait::async_trait;
-use cayenne::{CayenneTableProvider, SlotAdvancer};
+use cayenne::{CayenneTableProvider, RebuildableWrite, SlotAdvancer};
 use data_accelerator_api::upsert_dedup::UpsertDedupTableProvider;
 use data_components::cdc::ChangeBatch as CdcBatch;
 use datafusion::datasource::TableProvider;
@@ -44,7 +47,7 @@ use runtime_acceleration::change_sink::provider::{
 use runtime_acceleration::change_sink::{
     BackendWrite, ChangeBatch, ChangeCapabilities, ChangePayload, ChangeSinkBackend,
     ChangeSinkContext, DurabilityObserver, Recovery, ReplacementSupport, SchemaEvolutionSupport,
-    StorageDurability, WriteOptions,
+    SetKey, StorageDurability, WriteOptions,
 };
 use runtime_table_partition::provider::PartitionTableProvider;
 use spice_table::{LayerWalk, find_concrete};
@@ -103,20 +106,20 @@ impl CayenneChangeSinkBackend {
         }))
     }
 
-    /// Only replayable CDC can arm RAM writes. A checkpoint must cover pending
-    /// RAM work before disarming, since later durable writes can supersede it.
-    async fn select_recovery_path(&self, replayable: bool) -> Result<()> {
-        let observer = if replayable
-            && self.table.is_cdc_memory_mode()
-            && !self.table.is_memory_resident_mode()
-        {
+    /// A checkpoint must cover buffered work before durable writes can supersede
+    /// it. Rebuildable writes need no source callback; a real CDC callback must
+    /// finish its outstanding acknowledgements before being removed.
+    async fn select_recovery_path(&self, recovery: Recovery) -> Result<()> {
+        let buffered = self.table.is_cdc_memory_mode() && !self.table.is_memory_resident_mode();
+        let observer = if recovery == Recovery::Replayable && buffered {
             self.observer.read().clone()
         } else {
             None
         };
         if let Some(observer) = observer {
             self.table.install_slot_advancer(observer);
-        } else if self.table.has_slot_advancer() {
+        } else if buffered && (recovery != Recovery::Rebuildable || self.table.has_slot_advancer())
+        {
             self.table
                 .checkpoint_mem_tier()
                 .await
@@ -143,7 +146,12 @@ impl CayenneChangeSinkBackend {
                 }
                 ChangeOperationType::Truncate | ChangeOperationType::Unknown => false,
             });
-        self.select_recovery_path(replayable).await?;
+        self.select_recovery_path(if replayable {
+            Recovery::Replayable
+        } else {
+            Recovery::Durable
+        })
+        .await?;
 
         let changed = !groups.is_empty();
         let mut finalizer: Option<BoxFuture<'static, Result<()>>> = None;
@@ -333,16 +341,56 @@ impl ChangeSinkBackend for CayenneChangeSinkBackend {
                 batches,
                 append_validations,
             } => {
-                // Rebuildable input has no replay position. Use the composed
-                // provider's delete-then-append path without arming RAM writes.
-                self.select_recovery_path(false).await?;
+                let batches = if self.table.is_memory_resident_mode()
+                    && batches.iter().any(|batch| batch.num_rows() > 0)
+                {
+                    let target = self.context.table.schema();
+                    let batches = batches
+                        .into_iter()
+                        .map(|batch| try_cast_to(batch, Arc::clone(&target)).map_err(Into::into))
+                        .collect::<Result<Vec<_>>>()
+                        .map_err(before_mutation)?;
+                    let incoming_bytes = batches
+                        .iter()
+                        .map(|batch| {
+                            u64::try_from(batch.get_array_memory_size()).unwrap_or(u64::MAX)
+                        })
+                        .fold(0_u64, u64::saturating_add);
+                    let filters = scope.as_ref().map(SetKey::filters);
+                    self.table
+                        .preflight_memory_append(incoming_bytes, filters.as_deref())
+                        .await
+                        .map_err(|error| before_mutation(error.into()))?;
+                    batches
+                } else {
+                    batches
+                };
+                let rebuildable = options.recovery == Recovery::Rebuildable;
+                self.select_recovery_path(if rebuildable {
+                    Recovery::Rebuildable
+                } else {
+                    Recovery::Durable
+                })
+                .await?;
+                let rebuildable_context = rebuildable.then(|| {
+                    let mut state = ctx.state();
+                    state
+                        .config_mut()
+                        .set_extension(Arc::new(RebuildableWrite::new(&self.table)));
+                    SessionContext::new_with_state(state)
+                });
+                let ctx = rebuildable_context.as_ref().unwrap_or(ctx);
                 let changed = self
                     .provider
                     .apply_rows(schema, batches, scope, append_validations, options, ctx)
                     .await?;
                 Ok(BackendWrite::complete(
                     changed,
-                    self.storage_durability(None),
+                    if rebuildable {
+                        StorageDurability::NotPromised
+                    } else {
+                        self.storage_durability(None)
+                    },
                 ))
             }
         }

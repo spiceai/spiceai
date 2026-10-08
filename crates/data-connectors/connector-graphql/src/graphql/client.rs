@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use runtime_rate_control::RateController;
+use runtime_rate_control::{RateController, RequestOutcome};
 use token_provider::TokenProvider;
 use tokio::sync::Semaphore;
 use {crate::graphql::InvalidPaginationRegexSnafu, data_components::rate_limit::RateLimiter};
@@ -98,6 +98,12 @@ fn reverse_fibonacci_shrink(current: usize) -> usize {
 
 pub(crate) type UnnestHandler = Box<dyn Fn(&Value) -> Result<Vec<Value>> + Send + Sync>;
 
+/// Nodes already emitted for this nested connection before a follow-up page.
+/// Stamped on each follow-up connection so fan-out can tell a short last page
+/// (prior pages already counted) from a truncated first page that claimed
+/// `hasNextPage: false`. GitHub never sends this key.
+pub const NESTED_DELIVERED_BEFORE_KEY: &str = "__spice_delivered_before";
+
 pub enum UnnestBehavior {
     Depth(usize),
     Custom(UnnestHandler),
@@ -178,6 +184,13 @@ fn nested_end_cursor(connection: &Value) -> Option<&str> {
     nested_page_info(connection, "endCursor")
         .and_then(Value::as_str)
         .filter(|cursor| !cursor.is_empty())
+}
+
+fn nested_node_count(connection: &Value) -> usize {
+    connection
+        .get("nodes")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len)
 }
 
 impl std::fmt::Debug for UnnestBehavior {
@@ -266,6 +279,7 @@ impl std::fmt::Display for PaginationArgument {
 
 impl PaginationArgument {
     /// Formats the pagination arguments to be inserted into a Graphql variable.
+    /// The cursor is opaque server data, so it is escaped into the string literal.
     ///
     /// Example:
     /// ```rust
@@ -280,7 +294,7 @@ impl PaginationArgument {
     /// );
     /// ```
     fn format_arguments(&self, cursor: Option<String>) -> String {
-        match (self, cursor) {
+        match (self, cursor.map(|c| escape_graphql_string(&c))) {
             (PaginationArgument::First(z), Some(c)) => {
                 format!(r#"first: {z}, after: "{c}""#)
             }
@@ -935,6 +949,14 @@ pub(crate) struct GraphQLQueryResult {
 }
 
 impl GraphQLClient {
+    /// Feed a request outcome to the origin's adaptive rate controller. A no-op
+    /// when the origin has no rate limit configured.
+    fn record_adaptive_outcome(&self, outcome: RequestOutcome) {
+        if let Some(rate_controller) = &self.rate_controller {
+            rate_controller.record_outcome(outcome);
+        }
+    }
+
     #[expect(clippy::too_many_arguments)]
     pub fn new(
         client: reqwest::Client,
@@ -1058,7 +1080,9 @@ impl GraphQLClient {
         query: &GraphQLQuery,
         error_checker: Option<ErrorChecker>,
     ) -> Result<()> {
-        let response = Self::fetch_checked_with_retry(self, query, error_checker).await?;
+        let response = self
+            .fetch_checked_with_retry(query, error_checker, None, None, false)
+            .await?;
 
         check_health_payload(self.resolve_json_pointer(query)?, &response)
     }
@@ -1212,7 +1236,14 @@ impl GraphQLClient {
         let semaphore_wait = semaphore_started.elapsed();
 
         let http_started = Instant::now();
-        let response = request.send().await.context(ReqwestInternalSnafu)?;
+        // A transport/timeout/connection error is a failure signal for adaptive
+        // rate control: the origin is unreachable or too slow, so admit fewer
+        // requests until it recovers.
+        let response = request
+            .send()
+            .await
+            .inspect_err(|_| self.record_adaptive_outcome(RequestOutcome::Failure))
+            .context(ReqwestInternalSnafu)?;
 
         if let Some(permit) = permit {
             drop(permit);
@@ -1240,6 +1271,17 @@ impl GraphQLClient {
             .and_then(|value| value.to_str().ok())
             .map(ToString::to_string);
         let retry_after = retry_after_from_headers(&response_headers);
+
+        // Feed the response outcome to adaptive rate control, matching the HTTP
+        // provider's classification: a retryable status (408/429/5xx) is a failure
+        // signal; a 2xx is a success; any other status (a non-retryable 4xx such as
+        // 401/403/404) is discarded — the origin answered promptly, but the failure
+        // is a client/auth/config condition that throttling cannot remediate.
+        if data_components::resilient_http::status_is_retryable(status) {
+            self.record_adaptive_outcome(RequestOutcome::Failure);
+        } else if status.is_success() {
+            self.record_adaptive_outcome(RequestOutcome::Success);
+        }
 
         // Read the raw body first so we can classify it before JSON decoding.
         let response_bytes = response.bytes().await.context(ReqwestInternalSnafu)?;
@@ -1321,6 +1363,71 @@ impl GraphQLClient {
             .transpose()?;
 
         Ok(response)
+    }
+
+    /// Same retry policy as [`Self::execute_with_retry`], but stops after the
+    /// HTTP + GraphQL checks — it does not run [`Self::process_response`].
+    /// Nested overflow pages need that split: they assemble a synthetic parent
+    /// from the connection JSON themselves, and routing them through
+    /// `execute_with_retry` would recurse into nested pagination.
+    ///
+    /// With `shrink_page_size`, an upstream backend error shrinks `first:` for
+    /// the next attempt while `cursor` keeps the page's `after:`; the health
+    /// check sends its query unchanged.
+    async fn fetch_checked_with_retry(
+        &self,
+        query: &GraphQLQuery,
+        error_checker: Option<ErrorChecker>,
+        query_cost: Option<u32>,
+        cursor: Option<String>,
+        shrink_page_size: bool,
+    ) -> Result<serde_json::Value> {
+        let backoff = FibonacciBackoffBuilder::new()
+            .max_retries(Some(PAGE_RETRY_MAX_ATTEMPTS as usize))
+            .build();
+
+        let close_connection = Arc::new(AtomicBool::new(false));
+        let attempts = Arc::new(AtomicU32::new(0));
+        let page_size_override: Arc<std::sync::Mutex<Option<usize>>> =
+            Arc::new(std::sync::Mutex::new(None));
+
+        retry(backoff, || {
+            let error_checker = error_checker.clone();
+            let cursor = cursor.clone();
+            let should_close = close_connection.swap(false, Ordering::Relaxed);
+            let close_conn = Arc::clone(&close_connection);
+            let page_size_override_current = {
+                let guard = page_size_override
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *guard
+            };
+            let page_size_override_ref = Arc::clone(&page_size_override);
+            let attempt = attempts.fetch_add(1, Ordering::Relaxed);
+
+            async move {
+                self.fetch_checked(
+                    query,
+                    None,
+                    cursor.as_deref(),
+                    error_checker,
+                    query_cost,
+                    should_close,
+                    page_size_override_current,
+                )
+                .await
+                .map_err(|e| {
+                    map_retriable_error(
+                        e,
+                        &close_conn,
+                        shrink_page_size.then_some(&page_size_override_ref),
+                        query,
+                        attempt,
+                    )
+                })
+            }
+        })
+        .await
     }
 
     /// The result for a page that yielded no rows, keeping whichever schema the table is
@@ -1425,21 +1532,20 @@ impl GraphQLClient {
 
         let mut extras = Vec::new();
         let mut cursor = cursor.to_string();
+        let mut delivered = nested_connection(parent, pager).map_or(0, nested_node_count);
         for _ in 0..MAX_PAGINATION_ITERATIONS {
-            let mut query: GraphQLQuery =
+            let query: GraphQLQuery =
                 Arc::<str>::from(pager.next_page_query(parent_id, &cursor)).try_into()?;
-            // The follow-up query already names `after:`; do not let outer-page
-            // pagination rewrite it.
-            query.pagination_parameters = None;
+            // Keep `pagination_parameters` so a gateway retry can shrink
+            // `first:` while `fetch_checked_with_retry` passes this page's
+            // `after:` cursor (clearing parameters made shrink a no-op).
             let mut response = self
-                .fetch_checked(
+                .fetch_checked_with_retry(
                     &query,
-                    None,
-                    None,
                     error_checker.clone(),
                     query_cost,
-                    false,
-                    None,
+                    Some(cursor.clone()),
+                    true,
                 )
                 .await?;
 
@@ -1448,7 +1554,7 @@ impl GraphQLClient {
                 .and_then(|data| data.get_mut("node"))
                 .and_then(|node| node.get_mut(pager.connection_key))
                 .map(Value::take);
-            let Some(next_connection) = next_connection else {
+            let Some(mut next_connection) = next_connection else {
                 return Err(Error::InvalidObjectAccess {
                     message: format!(
                         "Follow-up page for '{}' returned no connection.",
@@ -1457,8 +1563,13 @@ impl GraphQLClient {
                 });
             };
 
+            if let Some(connection) = next_connection.as_object_mut() {
+                connection.insert(NESTED_DELIVERED_BEFORE_KEY.to_string(), json!(delivered));
+            }
+
             let has_next = nested_has_next(&next_connection);
             let next_cursor = nested_end_cursor(&next_connection).map(str::to_string);
+            delivered = delivered.saturating_add(nested_node_count(&next_connection));
 
             let mut synthetic = parent_fields.clone();
             synthetic.insert(pager.connection_key.to_string(), next_connection);
@@ -1467,12 +1578,24 @@ impl GraphQLClient {
             if !has_next {
                 return Ok(extras);
             }
-            cursor = next_cursor.ok_or_else(|| Error::InvalidObjectAccess {
+            let next_cursor = next_cursor.ok_or_else(|| Error::InvalidObjectAccess {
                 message: format!(
                     "Follow-up page for '{}' was truncated without an endCursor.",
                     pager.connection_key
                 ),
             })?;
+            // Outer pagination stops on a repeated cursor. Nested pages must
+            // fail immediately: looping until MAX_PAGINATION_ITERATIONS would
+            // spend ~1,000 API requests on one malformed page.
+            if next_cursor == cursor {
+                return Err(Error::InvalidObjectAccess {
+                    message: format!(
+                        "Follow-up page for '{}' returned the same endCursor, so pagination cannot continue.",
+                        pager.connection_key
+                    ),
+                });
+            }
+            cursor = next_cursor;
         }
 
         Err(Error::InvalidObjectAccess {
@@ -1795,32 +1918,6 @@ impl GraphQLClient {
     /// as HTTP 200 with an "internal error" message, which reaches this path as
     /// an inferred `InvalidCredentialsOrPermissions`; see
     /// `should_shrink_page_size`.
-    async fn fetch_checked_with_retry(
-        client: &Self,
-        query: &GraphQLQuery,
-        error_checker: Option<ErrorChecker>,
-    ) -> Result<serde_json::Value> {
-        let backoff = FibonacciBackoffBuilder::new()
-            .max_retries(Some(PAGE_RETRY_MAX_ATTEMPTS as usize))
-            .build();
-        let close_connection = Arc::new(AtomicBool::new(false));
-        let attempts = Arc::new(AtomicU32::new(0));
-
-        retry(backoff, || {
-            let error_checker = error_checker.clone();
-            let should_close = close_connection.swap(false, Ordering::Relaxed);
-            let close_conn = Arc::clone(&close_connection);
-            let attempt = attempts.fetch_add(1, Ordering::Relaxed);
-            async move {
-                client
-                    .fetch_checked(query, None, None, error_checker, None, should_close, None)
-                    .await
-                    .map_err(|e| map_retriable_error(e, &close_conn, None, query, attempt))
-            }
-        })
-        .await
-    }
-
     async fn execute_with_retry(
         client: &Self,
         query: &GraphQLQuery,
@@ -2584,6 +2681,422 @@ mod tests {
                 cursor_order,
                 vec!["c1", "c2"],
                 "follow-up pages of one parent must be requested in cursor order"
+            );
+        }
+
+        /// Nested overflow pages go through the same retry policy as outer
+        /// pages. A 403 `rate limit` on the first `after:` follow-up must not
+        /// abort the scan; the next attempt completes the connection.
+        #[tokio::test]
+        async fn a_transient_rate_limit_on_a_nested_page_is_retried() {
+            let server = MockServer::start().await;
+
+            Mock::given(method("POST"))
+                .and(body_string_contains(r#"after: \"c2\""#))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": {"node": {"reviews": reviews_page(&["R5"], false, "c3")}}
+                })))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("POST"))
+                .and(body_string_contains(r#"after: \"c1\""#))
+                .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+                    "message": "API rate limit exceeded for user"
+                })))
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+
+            Mock::given(method("POST"))
+                .and(body_string_contains(r#"after: \"c1\""#))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": {"node": {"reviews": reviews_page(&["R3", "R4"], true, "c2")}}
+                })))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("POST"))
+                .and(body_string_contains("view(first: 10)"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": {"view": {
+                        "nodes": [{"id": "PR_1", "reviews": reviews_page(&["R1", "R2"], true, "c1")}],
+                        "pageInfo": {"hasNextPage": false, "endCursor": Value::Null},
+                    }}
+                })))
+                .mount(&server)
+                .await;
+
+            let unnest_reviews: UnnestHandler = Box::new(|parent: &Value| {
+                Ok(parent
+                    .get("reviews")
+                    .and_then(|c| c.get("nodes"))
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default())
+            });
+
+            let client = GraphQLClientBuilder::new(
+                Url::parse(&format!("{}/graphql", server.uri())).expect("valid URL"),
+                UnnestBehavior::Custom(unnest_reviews),
+            )
+            .with_json_pointer(Some("/data/view/nodes"))
+            .with_schema(Some(Arc::new(Schema::new(vec![Field::new(
+                "id",
+                DataType::Utf8,
+                true,
+            )]))))
+            .with_nested_pager(Some(NestedConnectionPager {
+                connection_key: "reviews",
+                parent_id_key: "id",
+                type_condition: "PullRequest",
+                node_selection: "id",
+                page_size: 2,
+            }))
+            .build(reqwest::Client::new())
+            .expect("client to build");
+
+            let query = GraphQLQuery::try_from(Arc::<str>::from(OUTER_QUERY))
+                .expect("query to parse")
+                .with_json_pointer(Arc::from("/data/view/nodes"));
+            let result = client
+                .execute(&query, None, None, None, None, None)
+                .await
+                .expect("a retried nested page must complete the connection");
+
+            let mut ids: Vec<String> = Vec::new();
+            for batch in &result.records {
+                let column = batch
+                    .column_by_name("id")
+                    .expect("the id column")
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("id to be a string column");
+                for i in 0..column.len() {
+                    ids.push(column.value(i).to_string());
+                }
+            }
+
+            assert_eq!(
+                ids,
+                vec!["R1", "R2", "R3", "R4", "R5"],
+                "the scan must emit every child after retrying the rate-limited nested page"
+            );
+
+            let c1_attempts = server
+                .received_requests()
+                .await
+                .expect("recorded requests")
+                .iter()
+                .filter(|r| String::from_utf8_lossy(&r.body).contains(r#"after: \"c1\""#))
+                .count();
+            assert!(
+                c1_attempts >= 2,
+                "the rate-limited nested page must be requested again, got {c1_attempts}"
+            );
+            let outer_requests = server
+                .received_requests()
+                .await
+                .expect("recorded requests")
+                .iter()
+                .filter(|r| String::from_utf8_lossy(&r.body).contains("view(first: 10)"))
+                .count();
+            assert_eq!(
+                outer_requests, 1,
+                "retrying a nested page must not refetch the outer page, got {outer_requests}"
+            );
+        }
+
+        /// A follow-up page that repeats its `endCursor` must fail immediately.
+        /// Outer pagination already stops on a repeated cursor; without this
+        /// guard the nested loop would issue ~1,000 identical `after:` requests.
+        #[tokio::test]
+        async fn a_repeated_nested_cursor_fails_without_spinning() {
+            let server = MockServer::start().await;
+
+            Mock::given(method("POST"))
+                .and(body_string_contains(r#"after: \"c1\""#))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": {"node": {"reviews": reviews_page(&["R3", "R4"], true, "c1")}}
+                })))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("POST"))
+                .and(body_string_contains("view(first: 10)"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": {"view": {
+                        "nodes": [{"id": "PR_1", "reviews": reviews_page(&["R1", "R2"], true, "c1")}],
+                        "pageInfo": {"hasNextPage": false, "endCursor": Value::Null},
+                    }}
+                })))
+                .mount(&server)
+                .await;
+
+            let unnest_reviews: UnnestHandler = Box::new(|parent: &Value| {
+                Ok(parent
+                    .get("reviews")
+                    .and_then(|c| c.get("nodes"))
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default())
+            });
+
+            let client = GraphQLClientBuilder::new(
+                Url::parse(&format!("{}/graphql", server.uri())).expect("valid URL"),
+                UnnestBehavior::Custom(unnest_reviews),
+            )
+            .with_json_pointer(Some("/data/view/nodes"))
+            .with_schema(Some(Arc::new(Schema::new(vec![Field::new(
+                "id",
+                DataType::Utf8,
+                true,
+            )]))))
+            .with_nested_pager(Some(NestedConnectionPager {
+                connection_key: "reviews",
+                parent_id_key: "id",
+                type_condition: "PullRequest",
+                node_selection: "id",
+                page_size: 2,
+            }))
+            .build(reqwest::Client::new())
+            .expect("client to build");
+
+            let query = GraphQLQuery::try_from(Arc::<str>::from(OUTER_QUERY))
+                .expect("query to parse")
+                .with_json_pointer(Arc::from("/data/view/nodes"));
+            let error = client
+                .execute(&query, None, None, None, None, None)
+                .await
+                .expect_err("a repeated nested cursor must fail the scan");
+            assert!(
+                error.to_string().contains("same endCursor"),
+                "the error must name the repeated cursor, got: {error}"
+            );
+
+            let c1_attempts = server
+                .received_requests()
+                .await
+                .expect("recorded requests")
+                .iter()
+                .filter(|r| String::from_utf8_lossy(&r.body).contains(r#"after: \"c1\""#))
+                .count();
+            assert_eq!(
+                c1_attempts, 1,
+                "a repeated cursor must not be requested again, got {c1_attempts}"
+            );
+        }
+
+        #[test]
+        fn nested_follow_up_query_parses_pagination_so_gateway_shrink_keeps_after() {
+            let pager = NestedConnectionPager {
+                connection_key: "reviews",
+                parent_id_key: "id",
+                type_condition: "PullRequest",
+                node_selection: "id",
+                page_size: 100,
+            };
+            let query: GraphQLQuery = Arc::<str>::from(pager.next_page_query("PR_1", "c1"))
+                .try_into()
+                .expect("follow-up query to parse");
+            assert!(
+                query.pagination_parameters.is_some(),
+                "nested follow-up must parse first/after so shrink can rewrite first"
+            );
+
+            let rewritten = query
+                .to_string_with_page_size(None, Some("c1".to_string()), Some(25))
+                .expect("page-size rewrite");
+            assert!(
+                rewritten.contains("first: 25"),
+                "gateway shrink must rewrite first:, got {rewritten}"
+            );
+            assert!(
+                rewritten.contains(r#"after: "c1""#),
+                "gateway shrink must keep the nested after cursor, got {rewritten}"
+            );
+        }
+
+        /// A nested `endCursor` is opaque server data: a quote or backslash in it
+        /// must reach the follow-up query escaped, or the query is invalid GraphQL.
+        #[tokio::test]
+        async fn a_nested_cursor_with_quotes_is_sent_escaped() {
+            let server = MockServer::start().await;
+            let cursor = r#"cur"so\r"#;
+
+            Mock::given(method("POST"))
+                .and(body_string_contains("node(id:"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": {"node": {"reviews": reviews_page(&["R3"], false, "c2")}}
+                })))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("POST"))
+                .and(body_string_contains("view(first: 10)"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": {"view": {
+                        "nodes": [{"id": "PR_1", "reviews": reviews_page(&["R1", "R2"], true, cursor)}],
+                        "pageInfo": {"hasNextPage": false, "endCursor": Value::Null},
+                    }}
+                })))
+                .mount(&server)
+                .await;
+
+            let unnest_reviews: UnnestHandler = Box::new(|parent: &Value| {
+                Ok(parent
+                    .get("reviews")
+                    .and_then(|c| c.get("nodes"))
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default())
+            });
+
+            let client = GraphQLClientBuilder::new(
+                Url::parse(&format!("{}/graphql", server.uri())).expect("valid URL"),
+                UnnestBehavior::Custom(unnest_reviews),
+            )
+            .with_json_pointer(Some("/data/view/nodes"))
+            .with_schema(Some(Arc::new(Schema::new(vec![Field::new(
+                "id",
+                DataType::Utf8,
+                true,
+            )]))))
+            .with_nested_pager(Some(NestedConnectionPager {
+                connection_key: "reviews",
+                parent_id_key: "id",
+                type_condition: "PullRequest",
+                node_selection: "id",
+                page_size: 2,
+            }))
+            .build(reqwest::Client::new())
+            .expect("client to build");
+
+            let query = GraphQLQuery::try_from(Arc::<str>::from(OUTER_QUERY))
+                .expect("query to parse")
+                .with_json_pointer(Arc::from("/data/view/nodes"));
+            client
+                .execute(&query, None, None, None, None, None)
+                .await
+                .expect("the follow-up page must complete the connection");
+
+            let follow_up: Vec<String> = server
+                .received_requests()
+                .await
+                .expect("recorded requests")
+                .iter()
+                .filter_map(|r| serde_json::from_slice::<Value>(&r.body).ok())
+                .filter_map(|body| {
+                    body.get("query")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .filter(|q| q.contains("node(id:"))
+                .collect();
+            assert_eq!(
+                follow_up.len(),
+                1,
+                "one follow-up request, got {follow_up:?}"
+            );
+            assert!(
+                follow_up[0].contains(r#"after: "cur\"so\\r""#),
+                "the cursor must be escaped in the follow-up query, got {}",
+                follow_up[0]
+            );
+        }
+
+        /// A 502 on a nested follow-up must retry with a smaller `first:` and
+        /// the same `after:` cursor, not resend the original page size.
+        #[tokio::test]
+        async fn a_gateway_error_on_a_nested_page_retries_with_a_smaller_first() {
+            let server = MockServer::start().await;
+
+            Mock::given(method("POST"))
+                .and(body_string_contains(r#"after: \"c1\""#))
+                .respond_with(ResponseTemplate::new(502).set_body_string("Bad Gateway"))
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+
+            Mock::given(method("POST"))
+                .and(body_string_contains(r#"after: \"c1\""#))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": {"node": {"reviews": reviews_page(&["R3", "R4", "R5"], false, "c2")}}
+                })))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("POST"))
+                .and(body_string_contains("view(first: 10)"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": {"view": {
+                        "nodes": [{"id": "PR_1", "reviews": reviews_page(&["R1", "R2"], true, "c1")}],
+                        "pageInfo": {"hasNextPage": false, "endCursor": Value::Null},
+                    }}
+                })))
+                .mount(&server)
+                .await;
+
+            let unnest_reviews: UnnestHandler = Box::new(|parent: &Value| {
+                Ok(parent
+                    .get("reviews")
+                    .and_then(|c| c.get("nodes"))
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default())
+            });
+
+            let client = GraphQLClientBuilder::new(
+                Url::parse(&format!("{}/graphql", server.uri())).expect("valid URL"),
+                UnnestBehavior::Custom(unnest_reviews),
+            )
+            .with_json_pointer(Some("/data/view/nodes"))
+            .with_schema(Some(Arc::new(Schema::new(vec![Field::new(
+                "id",
+                DataType::Utf8,
+                true,
+            )]))))
+            .with_nested_pager(Some(NestedConnectionPager {
+                connection_key: "reviews",
+                parent_id_key: "id",
+                type_condition: "PullRequest",
+                node_selection: "id",
+                page_size: 2,
+            }))
+            .build(reqwest::Client::new())
+            .expect("client to build");
+
+            let query = GraphQLQuery::try_from(Arc::<str>::from(OUTER_QUERY))
+                .expect("query to parse")
+                .with_json_pointer(Arc::from("/data/view/nodes"));
+            client
+                .execute(&query, None, None, None, None, None)
+                .await
+                .expect("a shrunken nested retry must complete the connection");
+
+            let c1_bodies: Vec<String> = server
+                .received_requests()
+                .await
+                .expect("recorded requests")
+                .iter()
+                .filter(|r| String::from_utf8_lossy(&r.body).contains(r#"after: \"c1\""#))
+                .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+                .collect();
+            assert_eq!(
+                c1_bodies.len(),
+                2,
+                "gateway retry must send the nested page twice, got {}",
+                c1_bodies.len()
+            );
+            assert!(
+                c1_bodies[0].contains("first: 2"),
+                "first attempt uses the pager page size, got {}",
+                c1_bodies[0]
+            );
+            assert!(
+                c1_bodies[1].contains("first: 1") && c1_bodies[1].contains(r#"after: \"c1\""#),
+                "retry must shrink first: and keep after:, got {}",
+                c1_bodies[1]
             );
         }
     }

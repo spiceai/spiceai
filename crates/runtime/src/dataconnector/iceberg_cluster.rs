@@ -136,6 +136,11 @@ impl TableLayer for IcebergClusterTableProvider {
         // for this layer without anyone deciding what it should say.
         match walk {
             LayerWalk::Read | LayerWalk::Index => Some(below),
+            // Serialising a scan for a remote node changes no row a scan
+            // returns, so the table this layer scans can stand in for it. That
+            // is `inner`, which a rebuild that puts a new base beneath this
+            // layer does not replace.
+            LayerWalk::Passthrough => Some(&self.inner),
             // Serialising a scan for a remote node is all this layer does; a
             // source, CDC, write or retention walk has no meaning through it.
             LayerWalk::CdcDetection

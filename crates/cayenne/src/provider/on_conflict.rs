@@ -1205,6 +1205,8 @@ pub(crate) struct ProtectedSnapshotScan<'a> {
     /// View-typed read schema so protected-snapshot scans match the main file
     /// scan in the union (see `viewify_read_schema`).
     pub(crate) read_schema: SchemaRef,
+    /// Canonical stored schema captured with the main scan.
+    pub(crate) file_statistics_schema: SchemaRef,
     /// The main scan's secondary index selection and pinned view, applied to
     /// each protected snapshot's files as to the current snapshot's.
     pub(crate) lookup_selection: Option<super::lookup_index::LookupSelection>,

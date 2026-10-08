@@ -169,11 +169,13 @@ impl TableLayer for KeepFirst {
         // Exhaustive on purpose: a wildcard would answer a future walk kind
         // for this layer without anyone deciding what it should say.
         match walk {
+            // Only writes are filtered: a scan returns the table beneath's rows.
             LayerWalk::Read
             | LayerWalk::CdcDetection
             | LayerWalk::Source
             | LayerWalk::RetentionDelete
-            | LayerWalk::Index => Some(below),
+            | LayerWalk::Index
+            | LayerWalk::Passthrough => Some(below),
             LayerWalk::Write => None,
         }
     }
