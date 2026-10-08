@@ -2219,10 +2219,10 @@ impl CayenneAccelerator {
             }
             // The closed-loop controller rides the per-table background compaction
             // task's tick; with that task disabled (interval == 0) it would never
-            // run (nor emit the autotune gauges), so adaptive falls back to auto.
+            // run (nor emit the autotune gauges), so adaptive falls back to static tuning.
             if config.dynamic_tuning && config.compaction_background_interval_ms == 0 {
                 tracing::warn!(
-                    "Dataset '{table_name}': `runtime.params.adaptive_tuning` is `enabled`, which needs background compaction enabled (the controller runs on its tick), but `cayenne_compaction_background_interval_ms` is 0, so this dataset falls back to 'auto'. Set a non-zero interval to enable adaptive tuning."
+                    "Dataset '{table_name}' cannot use adaptive tuning because `cayenne_compaction_background_interval_ms` is 0 and the tuner runs on the background compaction tick, so it uses static tuning even though `runtime.params.adaptive_tuning` is `enabled`. Set `cayenne_compaction_background_interval_ms` to a non-zero value to enable adaptive tuning for it."
                 );
                 config.dynamic_tuning = false;
             }
