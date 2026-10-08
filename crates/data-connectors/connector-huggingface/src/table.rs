@@ -37,18 +37,21 @@ use futures::future::BoxFuture;
 use object_store::ObjectStore;
 use parking_lot::RwLock;
 
-use crate::hub::Hub;
 use crate::location::DatasetLocation;
-use crate::store::{self, HuggingFaceStore};
+use crate::store::HuggingFaceStore;
 
-/// The listing location of `location` at `commit`.
+/// The listing location of `location` at `commit`, under the URL of the store that reads it.
 ///
 /// # Errors
 ///
 /// Returns an error if the location's glob is not a valid pattern.
-pub fn listing_url(location: &DatasetLocation, commit: &str) -> DFResult<ListingTableUrl> {
+pub fn listing_url(
+    store_url: &url::Url,
+    location: &DatasetLocation,
+    commit: &str,
+) -> DFResult<ListingTableUrl> {
     let repo = location.repo();
-    let mut url = store::STORE_URL.clone();
+    let mut url = store_url.clone();
     let (folder, glob) = match location.glob() {
         Some((folder, glob)) => (folder, Some(glob)),
         None => (location.path(), None),
@@ -89,7 +92,6 @@ pub type CommitCheck = Arc<dyn Fn(String) -> BoxFuture<'static, DFResult<()>> + 
 /// starts.
 pub struct HuggingFaceTable {
     location: DatasetLocation,
-    hub: Arc<Hub>,
     store: Arc<HuggingFaceStore>,
     template: ListingTableTemplate,
     schema: SchemaRef,
@@ -120,16 +122,15 @@ impl HuggingFaceTable {
     /// Returns an error if the listing table cannot be built at `commit`.
     pub fn try_new(
         location: DatasetLocation,
-        hub: Arc<Hub>,
+        store: Arc<HuggingFaceStore>,
         template: ListingTableTemplate,
         commit: String,
         commit_check: Option<CommitCheck>,
     ) -> DFResult<Self> {
-        let table = template.build(listing_url(&location, &commit)?)?;
+        let table = template.build(listing_url(store.url(), &location, &commit)?)?;
         Ok(Self {
             location,
-            hub,
-            store: store::store(),
+            store,
             template,
             schema: table.schema(),
             pinned: RwLock::new(Pinned { commit, table }),
@@ -142,12 +143,13 @@ impl HuggingFaceTable {
         // The scanning session may have its own object store registry (a refresh builds one
         // per run), so the store is registered with it before anything is listed or read.
         state.runtime_env().register_object_store(
-            &store::STORE_URL,
+            self.store.url(),
             Arc::clone(&self.store) as Arc<dyn ObjectStore>,
         );
 
         let commit = self
-            .hub
+            .store
+            .hub()
             .commit(self.location.repo(), self.location.revision())
             .await
             .map_err(|e| DataFusionError::External(Box::new(e)))?;
@@ -161,9 +163,9 @@ impl HuggingFaceTable {
         if let Some(check) = &self.commit_check {
             check(commit.sha.clone()).await?;
         }
-        let table = self
-            .template
-            .build(listing_url(&self.location, &commit.sha)?)?;
+        let table =
+            self.template
+                .build(listing_url(self.store.url(), &self.location, &commit.sha)?)?;
         tracing::debug!(
             "Hugging Face dataset '{}' at revision '{}' moved to commit {}",
             self.location.repo(),

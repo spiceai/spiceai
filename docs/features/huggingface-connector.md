@@ -87,7 +87,9 @@ Every scan resolves the revision to a commit, then lists and reads files only at
 
 The schema is resolved when the dataset is registered, and files at later commits are read against it, as for the other object-store connectors. An accelerated dataset picks up new commits of its branch on each refresh.
 
-The `_location` metadata column, when enabled, holds the commit-pinned `hf://datasets/<owner>/<dataset>@<commit>/<path>` of each row's file. DuckDB and `HfFileSystem` can read these locations directly.
+CSV and TSV files are read by column position. Every CSV or TSV file a dataset selects must therefore have the dataset's columns in the same order. Registration fails if one does not, and so does a scan of a later commit whose files changed their columns. In either case the error names the file and its columns.
+
+The `_location` metadata column, when enabled, holds the commit-pinned location of each row's file. For a public dataset read without `hf_token`, that is `hf://datasets/<owner>/<dataset>@<commit>/<path>`, which DuckDB and `HfFileSystem` can read directly. Datasets read with a token, or through `hf_endpoint`, use a host naming that configuration, `hf://datasets.<fingerprint>/...`. This keeps every token's reads separate.
 
 ## Performance
 

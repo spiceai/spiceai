@@ -16,15 +16,15 @@ limitations under the License.
 
 //! The object store Hugging Face dataset files are read through.
 //!
-//! One store, registered under `hf://datasets`, serves every dataset. An object's path names
-//! its repository and commit as well as the file, `{owner}/{name}@{commit}/{path}`, so the URL
-//! of an object is the `hf://datasets/{owner}/{name}@{commit}/{path}` location `HfFileSystem`
-//! and `DuckDB` read. The Hub client (endpoint and token) each repository is read with is the
-//! one its dataset registered.
+//! A store reads with one Hub client — one endpoint and token — and serves every dataset
+//! repository that client can read. An object's path names its repository and commit as well
+//! as the file, `{owner}/{name}@{commit}/{path}`. Each store has its own URL (see
+//! [`store_url`]), so datasets read with different tokens or endpoints never share a client,
+//! and a store reading the public Hub without a token gives its objects the
+//! `hf://datasets/{owner}/{name}@{commit}/{path}` locations `HfFileSystem` and `DuckDB` read.
 
-use std::collections::HashMap;
 use std::fmt;
-use std::sync::{Arc, LazyLock};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -36,32 +36,36 @@ use object_store::{
     MultipartUpload, ObjectMeta, ObjectStore, PutMultipartOptions, PutOptions, PutPayload,
     PutResult,
 };
-use parking_lot::RwLock;
 use url::Url;
 
-use crate::hub::{self, EntryKind, Hub, TreeEntry};
+use crate::hub::{self, EntryKind, Hub, HubConfig, TreeEntry};
 use crate::location::RepoId;
 
 const STORE_NAME: &str = "HuggingFace";
+/// Hex digits of the configuration fingerprint in a store's URL.
+const FINGERPRINT_LEN: usize = 16;
 
-/// The URL the store is registered under.
-pub static STORE_URL: LazyLock<Url> = LazyLock::new(|| {
-    Url::parse("hf://datasets/").unwrap_or_else(|_| unreachable!("a valid URL literal"))
-});
-
-static STORE: LazyLock<Arc<HuggingFaceStore>> =
-    LazyLock::new(|| Arc::new(HuggingFaceStore::default()));
-
-/// The process-wide store.
+/// The URL a store reading with `config` is registered under: `hf://datasets/` for the public
+/// Hub without a token, else `hf://datasets.{fingerprint}/`, a host naming the endpoint and
+/// token without revealing the token.
 #[must_use]
-pub fn store() -> Arc<HuggingFaceStore> {
-    Arc::clone(&STORE)
+pub fn store_url(config: &HubConfig) -> Url {
+    let public_hub = config.token.is_none()
+        && Url::parse(hub::DEFAULT_ENDPOINT).is_ok_and(|default| default == config.endpoint);
+    let host = if public_hub {
+        "datasets".to_string()
+    } else {
+        format!("datasets.{}", &config.fingerprint()[..FINGERPRINT_LEN])
+    };
+    Url::parse(&format!("hf://{host}/"))
+        .unwrap_or_else(|_| unreachable!("a host of letters, digits and a dot is valid"))
 }
 
-/// A read-only [`ObjectStore`] over Hugging Face dataset repositories.
-#[derive(Debug, Default)]
+/// A read-only [`ObjectStore`] over the Hugging Face dataset repositories one Hub client reads.
+#[derive(Debug)]
 pub struct HuggingFaceStore {
-    hubs: RwLock<HashMap<RepoId, Arc<Hub>>>,
+    hub: Arc<Hub>,
+    url: Url,
 }
 
 impl fmt::Display for HuggingFaceStore {
@@ -71,38 +75,21 @@ impl fmt::Display for HuggingFaceStore {
 }
 
 impl HuggingFaceStore {
-    /// Reads `repo` with `hub` from now on.
-    ///
-    /// Objects are addressed by repository and commit alone, so every dataset reading a
-    /// repository reads it with one client: the latest registered, so that a reloaded dataset's
-    /// new token takes effect — except that a client with a token is never replaced by one
-    /// without, for the same endpoint: a public read of a gated dataset must not take away the
-    /// token another dataset reads its files with. Every path names a commit, so any client that
-    /// can read the repository at the endpoint reads the same bytes.
-    pub fn register(&self, repo: RepoId, hub: Arc<Hub>) {
-        let mut hubs = self.hubs.write();
-        if let Some(existing) = hubs.get(&repo)
-            && existing.is_authenticated()
-            && !hub.is_authenticated()
-            && existing.endpoint() == hub.endpoint()
-        {
-            return;
-        }
-        hubs.insert(repo, hub);
+    #[must_use]
+    pub fn new(hub: Arc<Hub>) -> Self {
+        let url = store_url(hub.config());
+        Self { hub, url }
     }
 
-    fn hub(&self, repo: &RepoId, location: &Path) -> object_store::Result<Arc<Hub>> {
-        self.hubs
-            .read()
-            .get(repo)
-            .cloned()
-            .ok_or_else(|| object_store::Error::NotFound {
-                path: location.to_string(),
-                source: format!(
-                    "Hugging Face dataset '{repo}' has no dataset registered to read it with"
-                )
-                .into(),
-            })
+    /// The URL this store is registered under.
+    #[must_use]
+    pub fn url(&self) -> &Url {
+        &self.url
+    }
+
+    #[must_use]
+    pub fn hub(&self) -> &Arc<Hub> {
+        &self.hub
     }
 }
 
@@ -225,7 +212,7 @@ impl ObjectStore for HuggingFaceStore {
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
         let Target { repo, commit, path } = target(location)?;
-        let hub = self.hub(&repo, location)?;
+        let hub = &self.hub;
         if let Some(version) = &options.version
             && version != commit
         {
@@ -310,9 +297,8 @@ impl ObjectStore for HuggingFaceStore {
         let Some(prefix) = prefix.cloned() else {
             return stream::once(async { Err(read_only("listing every dataset")) }).boxed();
         };
-        let hub = target(&prefix).and_then(|target| self.hub(&target.repo, &prefix));
+        let hub = Arc::clone(&self.hub);
         stream::once(async move {
-            let hub = hub?;
             let Target { repo, commit, path } = target(&prefix)?;
             let last_modified = hub
                 .commit_date(&repo, commit)
@@ -338,7 +324,7 @@ impl ObjectStore for HuggingFaceStore {
             return Err(read_only("listing every dataset"));
         };
         let Target { repo, commit, path } = target(prefix)?;
-        let hub = self.hub(&repo, prefix)?;
+        let hub = &self.hub;
         let last_modified = hub
             .commit_date(&repo, commit)
             .await

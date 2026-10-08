@@ -44,7 +44,8 @@ use secrecy::SecretString;
 
 use crate::hub::{Hub, HubConfig};
 use crate::location::RepoId;
-use crate::{HuggingFace, PARAMETERS, store};
+use crate::store::{HuggingFaceStore, store_url};
+use crate::{HuggingFace, PARAMETERS};
 
 const C1: &str = "1111111111111111111111111111111111111111";
 const C2: &str = "2222222222222222222222222222222222222222";
@@ -94,6 +95,8 @@ struct MockState {
     page_size: usize,
     /// When set, the Hub answers 401 to requests without this bearer token.
     token: Option<String>,
+    /// More bearer tokens the Hub accepts.
+    tokens: Vec<String>,
     faults: Faults,
     seen: Vec<Seen>,
     hub_base: String,
@@ -270,14 +273,14 @@ fn ranged(bytes: &Bytes, range: Option<&str>, extra: &[(&str, String)]) -> Respo
 async fn hub_handler(State(mock): State<Mock>, request: Request<Body>) -> Response<Body> {
     let mut state = mock.0.lock();
     record(&mut state, false, &request);
-    if let Some(token) = &state.token {
-        let expected = format!("Bearer {token}");
-        let authorized = request
+    let accepted: Vec<String> = state.token.iter().chain(&state.tokens).cloned().collect();
+    if !accepted.is_empty() {
+        let presented = request
             .headers()
             .get("authorization")
             .and_then(|value| value.to_str().ok())
-            == Some(expected.as_str());
-        if !authorized {
+            .and_then(|value| value.strip_prefix("Bearer "));
+        if !presented.is_some_and(|token| accepted.iter().any(|t| t == token)) {
             return hub_error(
                 StatusCode::UNAUTHORIZED,
                 "",
@@ -634,7 +637,7 @@ fn connector(mock: &Mock, token: Option<&str>, params: &[(&str, &str)]) -> Huggi
         .collect();
     HuggingFace {
         params: Parameters::new(params, "hf", &PARAMETERS),
-        hub,
+        store: Arc::new(HuggingFaceStore::new(hub)),
         io_runtime: tokio::runtime::Handle::current(),
     }
 }
@@ -731,7 +734,7 @@ async fn scans_read_one_commit_and_follow_the_branch() {
         ],
     );
     mock.branch("o/branch", "main", C2);
-    connector.hub.forget_revisions();
+    connector.store.hub().forget_revisions();
     mock.clear_seen();
     let batches = query(&ctx, "SELECT id, name, score FROM t ORDER BY id").await;
     let expected = concat(&[rows(0..450), rows(1000..1100)]);
@@ -872,7 +875,7 @@ async fn a_csv_commit_with_reordered_columns_fails_instead_of_misreading() {
         vec![("data/a.csv", text("id,city,name\n2,rome,bob\n"))],
     );
     mock.branch("o/csvmove", "main", C2);
-    connector.hub.forget_revisions();
+    connector.store.hub().forget_revisions();
     let error = ctx
         .sql(sql)
         .await
@@ -882,7 +885,7 @@ async fn a_csv_commit_with_reordered_columns_fails_instead_of_misreading() {
         .expect_err("reordered columns");
     assert!(
         error.to_string().contains(
-            "The columns of Hugging Face dataset 'o/csvmove' changed at commit 2222222222222222222222222222222222222222: the dataset was registered with columns (id, name, city), and the files now have (id, city, name)."
+            "File 'data/a.csv' of Hugging Face dataset 'o/csvmove' at commit 2222222222222222222222222222222222222222 has columns (id, city, name), but the dataset's columns are (id, name, city). CSV and TSV files are read by column position"
         ),
         "{error}"
     );
@@ -894,11 +897,136 @@ async fn a_csv_commit_with_reordered_columns_fails_instead_of_misreading() {
         vec![("data/a.csv", text("id,name,city\n3,cy,lima\n"))],
     );
     mock.branch("o/csvmove", "main", C3);
-    connector.hub.forget_revisions();
+    connector.store.hub().forget_revisions();
     assert_eq!(
         printed(&query(&ctx, sql).await),
         "+----+------+------+\n| id | name | city |\n+----+------+------+\n| 3  | cy   | lima |\n+----+------+------+"
     );
+}
+
+/// Every CSV file a location selects must have the dataset's columns in order, not just the
+/// one the schema is inferred from: they are all read by position.
+#[tokio::test(flavor = "multi_thread")]
+async fn csv_files_whose_columns_disagree_fail_registration() {
+    let mock = Mock::start().await;
+    mock.commit(
+        "o/csvmixed",
+        C1,
+        vec![
+            ("data/a.csv", text("id,name,city\n1,bob,rome\n")),
+            // Neither the file the schema is inferred from nor the last one.
+            ("data/m.csv", text("id,city,name\n3,lima,cy\n")),
+            ("data/z.csv", text("id,name,city\n2,ann,oslo\n")),
+        ],
+    );
+    mock.branch("o/csvmixed", "main", C1);
+    let connector = connector(&mock, None, &[]);
+    let dataset = DatasetSpec::new("hf://datasets/o/csvmixed/data/", TableReference::bare("t"));
+    let message = connector
+        .table(&dataset)
+        .await
+        .expect_err("a file's columns differ")
+        .to_string();
+    assert!(
+        message.starts_with(
+            "Cannot setup the dataset t (hf) with an invalid configuration. File 'data/m.csv' of Hugging Face dataset 'o/csvmixed' at commit 1111111111111111111111111111111111111111 has columns (id, city, name), but the dataset's columns are (id, name, city)."
+        ),
+        "{message}"
+    );
+    assert!(
+        message.contains(
+            "CSV and TSV files are read by column position, so the file cannot be read with the dataset's columns."
+        ),
+        "{message}"
+    );
+
+    // Files with the same columns register and read.
+    mock.commit(
+        "o/csvmixed",
+        C2,
+        vec![
+            ("data/a.csv", text("id,name,city\n1,bob,rome\n")),
+            ("data/z.csv", text("id,name,city\n2,ann,oslo\n")),
+        ],
+    );
+    mock.branch("o/csvmixed", "main", C2);
+    connector.store.hub().forget_revisions();
+    let ctx = SessionContext::new();
+    ctx.register_table("t", connector.table(&dataset).await.expect("registers"))
+        .expect("registered");
+    let batches = query(&ctx, "SELECT id, name, city FROM t ORDER BY id").await;
+    assert_eq!(
+        arrow::util::pretty::pretty_format_batches(&batches)
+            .expect("printable")
+            .to_string(),
+        "+----+------+------+\n| id | name | city |\n+----+------+------+\n| 1  | bob  | rome |\n| 2  | ann  | oslo |\n+----+------+------+"
+    );
+}
+
+/// Datasets read with different tokens or endpoints never share a client: each configuration
+/// has its own store, under its own URL.
+#[tokio::test(flavor = "multi_thread")]
+async fn each_token_reads_through_its_own_store() {
+    let public = HubConfig {
+        endpoint: url::Url::parse("https://huggingface.co").expect("a URL"),
+        token: None,
+    };
+    assert_eq!(store_url(&public).as_str(), "hf://datasets/");
+    let with_token = |token: &str| HubConfig {
+        token: Some(SecretString::from(token.to_string())),
+        ..public.clone()
+    };
+    let first = store_url(&with_token("hf_one"));
+    assert_ne!(first, store_url(&with_token("hf_two")));
+    assert_eq!(
+        first,
+        store_url(&with_token("hf_one")),
+        "the same on every executor"
+    );
+    assert!(first.as_str().starts_with("hf://datasets."), "{first}");
+    assert!(!first.as_str().contains("hf_one"), "{first}");
+    let mirror = HubConfig {
+        endpoint: url::Url::parse("https://hf-mirror.example").expect("a URL"),
+        token: None,
+    };
+    assert_ne!(store_url(&mirror), store_url(&public));
+
+    // Two datasets on one private repository, each with its own valid token: each reads with
+    // its own, whichever registered last.
+    let mock = Mock::start().await;
+    mock.commit("o/shared", C1, vec![("a.parquet", parquet(&rows(0..20)))]);
+    mock.branch("o/shared", "main", C1);
+    mock.0.lock().tokens = vec!["hf_one".to_string(), "hf_two".to_string()];
+    let one = connector(&mock, Some("hf_one"), &[]);
+    let two = connector(&mock, Some("hf_two"), &[]);
+    assert_ne!(one.store.url(), two.store.url());
+    let dataset = DatasetSpec::new(
+        "hf://datasets/o/shared/a.parquet",
+        TableReference::bare("t"),
+    );
+    let ctx = SessionContext::new();
+    ctx.register_table("one", one.table(&dataset).await.expect("registers"))
+        .expect("registered");
+    ctx.register_table("two", two.table(&dataset).await.expect("registers"))
+        .expect("registered");
+    for (table, token) in [("one", "hf_one"), ("two", "hf_two"), ("one", "hf_one")] {
+        one.store.hub().forget_revisions();
+        two.store.hub().forget_revisions();
+        mock.clear_seen();
+        assert_rows(
+            &query(&ctx, &format!("SELECT * FROM {table} ORDER BY id")).await,
+            &rows(0..20),
+        );
+        let bearer = format!("Bearer {token}");
+        let hub_requests: Vec<_> = mock.seen().into_iter().filter(|s| !s.cdn).collect();
+        assert!(!hub_requests.is_empty(), "{table} resolved its revision");
+        assert!(
+            hub_requests
+                .iter()
+                .all(|s| s.authorization.as_deref() == Some(bearer.as_str())),
+            "{table} must read with {token}: {hub_requests:#?}"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -1121,16 +1249,10 @@ async fn the_token_is_sent_to_the_hub_and_never_to_the_cdn() {
 mod store_reads {
     use super::*;
 
-    fn registered(mock: &Mock, repo: &str) -> (Arc<store::HuggingFaceStore>, Arc<Hub>) {
+    fn registered(mock: &Mock, _repo: &str) -> (Arc<HuggingFaceStore>, Arc<Hub>) {
         let connector = connector(mock, None, &[]);
-        let repo = RepoId::new(
-            repo.split('/').next().unwrap_or_default(),
-            repo.split('/').nth(1).unwrap_or_default(),
-        )
-        .expect("a valid repository");
-        let store = store::store();
-        store.register(repo, Arc::clone(&connector.hub));
-        (store, connector.hub)
+        let hub = Arc::clone(connector.store.hub());
+        (connector.store, hub)
     }
 
     fn file_bytes() -> Bytes {

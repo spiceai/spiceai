@@ -377,14 +377,8 @@ impl Hub {
     }
 
     #[must_use]
-    pub fn endpoint(&self) -> &Url {
-        &self.config.endpoint
-    }
-
-    /// Whether requests carry a token.
-    #[must_use]
-    pub fn is_authenticated(&self) -> bool {
-        self.authorization.is_some()
+    pub fn config(&self) -> &HubConfig {
+        &self.config
     }
 
     /// Forgets every branch and tag resolution, as if [`REVISION_TTL`] had passed.

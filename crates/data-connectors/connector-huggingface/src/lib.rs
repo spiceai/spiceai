@@ -29,20 +29,22 @@ use std::sync::{Arc, LazyLock, Weak};
 
 use async_trait::async_trait;
 use data_connector_api::listing::{
-    LISTING_TABLE_PARAMETERS, ListingTableConnector, ListingTableTemplate,
-    detect_file_extension_from_path, detect_file_extension_from_url_or_path,
-    file_matches_extension,
+    LISTING_TABLE_PARAMETERS, ListingTableConnector, detect_file_extension_from_path,
+    detect_file_extension_from_url_or_path, file_matches_extension,
 };
 use data_connector_api::{
     ConnectorComponent, ConnectorContext, ConnectorParams, DataConnector, DataConnectorError,
     DataConnectorFactory, DataConnectorResult, NewDataConnectorResult,
 };
+use datafusion::config::CsvOptions;
 use datafusion::datasource::TableProvider;
-use datafusion::datasource::file_format::{FileFormat, csv::CsvFormat};
+use datafusion::datasource::file_format::{
+    csv::CsvFormat, file_compression_type::FileCompressionType,
+};
 use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::runtime_env::RuntimeEnv;
-use futures::FutureExt;
+use futures::{FutureExt, StreamExt, TryStreamExt};
 use object_store::ObjectStore;
 use parking_lot::Mutex;
 use runtime_component::dataset::DatasetSpec;
@@ -61,6 +63,7 @@ mod tests;
 
 use hub::{Commit, EntryKind, Hub, HubConfig};
 use location::DatasetLocation;
+use store::HuggingFaceStore;
 use table::{CommitCheck, HuggingFaceTable};
 
 // `register_data_connector!` names `linkme` unqualified.
@@ -86,15 +89,30 @@ enum Error {
 
     #[snafu(display("{source}"))]
     Hub { source: hub::Error },
+}
 
+/// A CSV or TSV file that cannot be read with the dataset's columns.
+#[derive(Debug, Snafu)]
+enum ColumnsError {
     #[snafu(display(
-        "The columns of Hugging Face dataset '{repo}' changed at commit {commit}: the dataset was registered with columns ({registered}), and the files now have ({found}). CSV and TSV files are read by column position, so these files cannot be read with the registered columns. Restart Spice to register the new columns, or pin `from` to the commit the dataset was registered at. See: {DOCS_URL}"
+        "File '{file}' of Hugging Face dataset '{repo}' at commit {commit} has columns ({found}), but the dataset's columns are ({columns}). CSV and TSV files are read by column position, so the file cannot be read with the dataset's columns. Narrow `from` to files with the dataset's columns, or restart Spice to register the columns of a dataset that changed. See: {DOCS_URL}"
     ))]
-    ColumnsChanged {
+    Differ {
         repo: location::RepoId,
         commit: String,
-        registered: String,
+        file: String,
         found: String,
+        columns: String,
+    },
+
+    #[snafu(display(
+        "Failed to read the header of '{file}' of Hugging Face dataset '{repo}' at commit {commit}, so its columns cannot be checked against the dataset's: {reason}"
+    ))]
+    Unreadable {
+        repo: location::RepoId,
+        commit: String,
+        file: String,
+        reason: String,
     },
 }
 
@@ -113,21 +131,26 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
     all_parameters
 });
 
-/// Hub clients by configuration fingerprint, so datasets read with the same endpoint and token
-/// share one client and its caches.
-static HUBS: LazyLock<Mutex<HashMap<String, Weak<Hub>>>> =
+/// Stores by configuration fingerprint, so datasets read with the same endpoint and token share
+/// one client and its caches, and datasets read with different ones never do.
+static STORES: LazyLock<Mutex<HashMap<String, Weak<HuggingFaceStore>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
 
-fn shared_hub(config: HubConfig, io_runtime: Handle) -> Result<Arc<Hub>, hub::Error> {
+fn shared_store(
+    config: HubConfig,
+    io_runtime: Handle,
+) -> Result<Arc<HuggingFaceStore>, hub::Error> {
     let fingerprint = config.fingerprint();
-    let mut hubs = HUBS.lock();
-    if let Some(hub) = hubs.get(&fingerprint).and_then(Weak::upgrade) {
-        return Ok(hub);
+    let mut stores = STORES.lock();
+    if let Some(store) = stores.get(&fingerprint).and_then(Weak::upgrade) {
+        return Ok(store);
     }
-    hubs.retain(|_, hub| hub.strong_count() > 0);
-    let hub = Arc::new(Hub::new(config, io_runtime)?);
-    hubs.insert(fingerprint, Arc::downgrade(&hub));
-    Ok(hub)
+    stores.retain(|_, store| store.strong_count() > 0);
+    let store = Arc::new(HuggingFaceStore::new(Arc::new(Hub::new(
+        config, io_runtime,
+    )?)));
+    stores.insert(fingerprint, Arc::downgrade(&store));
+    Ok(store)
 }
 
 /// Parses `hf_endpoint`. The token is sent to it, so it must be https unless it is loopback.
@@ -183,11 +206,11 @@ impl DataConnectorFactory for HuggingFaceFactory {
                 ExposedParamLookup::Absent(_) => parse_endpoint(hub::DEFAULT_ENDPOINT)?,
             };
             let token: Option<SecretString> = params.parameters.get("token").ok().cloned();
-            let hub = shared_hub(HubConfig { endpoint, token }, params.io_runtime.clone())
+            let store = shared_store(HubConfig { endpoint, token }, params.io_runtime.clone())
                 .context(HubSnafu)?;
             Ok(Arc::new(HuggingFace {
                 params: params.parameters,
-                hub,
+                store,
                 io_runtime: params.io_runtime,
             }) as Arc<dyn DataConnector>)
         })
@@ -205,14 +228,14 @@ impl DataConnectorFactory for HuggingFaceFactory {
 /// Reads the datasets of one Hub endpoint with one token.
 pub struct HuggingFace {
     params: Parameters,
-    hub: Arc<Hub>,
+    store: Arc<HuggingFaceStore>,
     io_runtime: Handle,
 }
 
 impl fmt::Debug for HuggingFace {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("HuggingFace")
-            .field("hub", &self.hub)
+            .field("store", &self.store)
             .finish_non_exhaustive()
     }
 }
@@ -224,17 +247,20 @@ impl fmt::Display for HuggingFace {
 }
 
 impl HuggingFace {
+    fn hub(&self) -> &Arc<Hub> {
+        self.store.hub()
+    }
+
     /// The dataset's table: the files `from` selects, read at the commit each scan resolves.
     async fn table(&self, dataset: &DatasetSpec) -> DataConnectorResult<Arc<dyn TableProvider>> {
         let location = Self::location(dataset)?;
         // Resolving the revision first checks that the dataset exists and can be read, and
         // pins the schema to one commit.
         let commit = self
-            .hub
+            .hub()
             .commit(location.repo(), location.revision())
             .await
             .map_err(|source| hub_error(dataset, source))?;
-        store::store().register(location.repo().clone(), Arc::clone(&self.hub));
 
         let mut params = self.params.clone();
         if let Some(extension) = self
@@ -249,16 +275,18 @@ impl HuggingFace {
             params.insert("file_extension".to_string(), SecretString::from(extension));
         }
 
-        let listing_url = table::listing_url(&location, &commit.sha).map_err(|source| {
-            DataConnectorError::InvalidConfigurationSourceOnly {
-                dataconnector: CONNECTOR_NAME.to_string(),
-                connector_component: ConnectorComponent::from(dataset),
-                source: Box::new(source),
-            }
-        })?;
+        let listing_url =
+            table::listing_url(self.store.url(), &location, &commit.sha).map_err(|source| {
+                DataConnectorError::InvalidConfigurationSourceOnly {
+                    dataconnector: CONNECTOR_NAME.to_string(),
+                    connector_component: ConnectorComponent::from(dataset),
+                    source: Box::new(source),
+                }
+            })?;
         let listing = HuggingFaceListing {
             params,
             io_runtime: self.io_runtime.clone(),
+            store: Arc::clone(&self.store),
             location: location.clone(),
             commit: commit.sha.clone(),
         };
@@ -274,24 +302,22 @@ impl HuggingFace {
                 ),
             });
         };
+        let files = selected_files(self.hub(), dataset, &location, &commit.sha, &extension).await?;
         // The repository API answers for a gated dataset without access; only its files refuse.
         // Reading a byte of one selected file now fails registration with the Hub's reason,
         // rather than a schema-inference failure that would be retried.
-        if let Some(path) =
-            probe_file(&self.hub, dataset, &location, &commit.sha, &extension).await?
-        {
-            self.hub
+        if let Some(path) = files.last() {
+            self.hub()
                 .read(
                     location.repo(),
                     &commit.sha,
-                    &path,
+                    path,
                     Some(object_store::GetRange::Bounded(0..1)),
                 )
                 .await
                 .map_err(|source| hub_error(dataset, source))?;
         }
-        let schema_dataset =
-            schema_dataset(&self.hub, dataset, &location, &commit.sha, &extension).await?;
+        let schema_dataset = schema_dataset(dataset, &location, &commit.sha, &files);
         let template = listing
             .listing_table_template(
                 &schema_dataset,
@@ -300,12 +326,33 @@ impl HuggingFace {
                 Arc::clone(&file_format),
             )
             .await?;
-        let positional = (file_format.as_ref() as &dyn Any).is::<CsvFormat>();
-        let commit_check = positional
-            .then(|| self.positional_check(dataset, &listing, &extension, &file_format, &template));
+
+        // CSV and TSV are read by column position: every file must have the dataset's columns,
+        // in order, at registration and at every commit a moving revision reaches.
+        let commit_check = match (file_format.as_ref() as &dyn Any).downcast_ref::<CsvFormat>() {
+            Some(csv) => {
+                let check = PositionalCheck {
+                    store: Arc::clone(&self.store),
+                    dataset: dataset.clone(),
+                    location: location.clone(),
+                    extension: extension.clone(),
+                    options: csv.options().clone(),
+                    columns: column_names(template.file_schema()),
+                };
+                check.verify(&commit.sha, &files).await.map_err(|error| {
+                    DataConnectorError::InvalidConfigurationNoSource {
+                        dataconnector: CONNECTOR_NAME.to_string(),
+                        connector_component: ConnectorComponent::from(dataset),
+                        message: error.to_string(),
+                    }
+                })?;
+                Some(check.into_commit_check())
+            }
+            None => None,
+        };
         let table = HuggingFaceTable::try_new(
             location,
-            Arc::clone(&self.hub),
+            Arc::clone(&self.store),
             template,
             commit.sha,
             commit_check,
@@ -316,60 +363,6 @@ impl HuggingFace {
             source: Box::new(source),
         })?;
         Ok(Arc::new(table))
-    }
-
-    /// A check that a new commit's CSV or TSV files still have the registered columns, in
-    /// order: those formats are read by position, so a reordered or renamed column would
-    /// otherwise put values under the wrong names.
-    fn positional_check(
-        &self,
-        dataset: &DatasetSpec,
-        listing: &HuggingFaceListing,
-        extension: &str,
-        file_format: &Arc<dyn FileFormat>,
-        template: &ListingTableTemplate,
-    ) -> CommitCheck {
-        let hub = Arc::clone(&self.hub);
-        let dataset = dataset.clone();
-        let listing = listing.clone();
-        let extension = extension.to_string();
-        let file_format = Arc::clone(file_format);
-        let registered = column_names(template.file_schema());
-        Arc::new(move |commit: String| {
-            let hub = Arc::clone(&hub);
-            let dataset = dataset.clone();
-            let listing = HuggingFaceListing {
-                commit: commit.clone(),
-                ..listing.clone()
-            };
-            let extension = extension.clone();
-            let file_format = Arc::clone(&file_format);
-            let registered = registered.clone();
-            async move {
-                let external = |e: DataConnectorError| DataFusionError::External(Box::new(e));
-                let location = listing.location.clone();
-                let url = table::listing_url(&location, &commit)?;
-                let schema_dataset = schema_dataset(&hub, &dataset, &location, &commit, &extension)
-                    .await
-                    .map_err(external)?;
-                let template = listing
-                    .listing_table_template(&schema_dataset, url.as_ref(), &extension, file_format)
-                    .await
-                    .map_err(external)?;
-                let found = column_names(template.file_schema());
-                if found == registered {
-                    Ok(())
-                } else {
-                    Err(DataFusionError::External(Box::new(Error::ColumnsChanged {
-                        repo: location.repo().clone(),
-                        commit,
-                        registered: registered.join(", "),
-                        found: found.join(", "),
-                    })))
-                }
-            }
-            .boxed()
-        })
     }
 
     fn location(dataset: &DatasetSpec) -> DataConnectorResult<DatasetLocation> {
@@ -416,7 +409,7 @@ impl HuggingFace {
             None => (location.path(), None),
         };
         let entries = self
-            .hub
+            .hub()
             .list(location.repo(), &commit.sha, folder, true)
             .await
             .map_err(|source| hub_error(dataset, source))?;
@@ -462,7 +455,7 @@ impl HuggingFace {
         // A single file without an extension lists nothing: its format must be named.
         if entries.is_empty() && !location.is_folder() && glob.is_none() {
             let entry = self
-                .hub
+                .hub()
                 .entry(location.repo(), &commit.sha, location.path())
                 .await
                 .map_err(|source| hub_error(dataset, source))?;
@@ -515,53 +508,19 @@ impl HuggingFace {
 /// The dataset as schema inference sees it. A location with a glob infers its schema from a
 /// file the glob selects — the listing alone would infer it from any file in the folder —
 /// unless the dataset names its own `schema_source_path`.
-async fn schema_dataset(
-    hub: &Hub,
+fn schema_dataset(
     dataset: &DatasetSpec,
     location: &DatasetLocation,
     commit: &str,
-    extension: &str,
-) -> DataConnectorResult<DatasetSpec> {
-    let Some((folder, glob)) = location.glob() else {
-        return Ok(dataset.clone());
-    };
-    if dataset.params.contains_key("schema_source_path") {
-        return Ok(dataset.clone());
-    }
-    let pattern =
-        glob::Pattern::new(glob).map_err(|e| DataConnectorError::InvalidConfigurationNoSource {
-            dataconnector: CONNECTOR_NAME.to_string(),
-            connector_component: ConnectorComponent::from(dataset),
-            message: format!("Invalid glob '{glob}' in `from`: {e}"),
-        })?;
-    let folder_prefix = if folder.is_empty() {
-        String::new()
-    } else {
-        format!("{folder}/")
-    };
-    let entries = hub
-        .list(location.repo(), commit, folder, true)
-        .await
-        .map_err(|source| hub_error(dataset, source))?;
-    // The last matching file, as the listing would infer from the newest one and every file
-    // of a commit has the commit's date.
-    let source = entries
-        .iter()
-        .filter(|entry| entry.kind == EntryKind::File)
-        .filter(|entry| {
-            entry
-                .path
-                .strip_prefix(&folder_prefix)
-                .is_some_and(|relative| pattern.matches(relative))
-        })
-        .filter(|entry| {
-            object_store::path::Path::parse(&entry.path)
-                .is_ok_and(|path| file_matches_extension(&path, extension))
-        })
-        .map(|entry| entry.path.as_str())
-        .max();
+    files: &[String],
+) -> DatasetSpec {
     let mut dataset = dataset.clone();
-    if let Some(source) = source {
+    if location.glob().is_some()
+        && !dataset.params.contains_key("schema_source_path")
+        // The last selected file, as the listing infers from the newest one and every file of
+        // a commit has the commit's date.
+        && let Some(source) = files.last()
+    {
         let repo = location.repo();
         dataset.params.insert(
             "schema_source_path".to_string(),
@@ -573,29 +532,29 @@ async fn schema_dataset(
             ),
         );
     }
-    Ok(dataset)
+    dataset
 }
 
-/// A data file the location selects at `commit`, for the access probe: the file itself, or the
-/// file a folder or glob would infer its schema from. `None` when the location selects none,
-/// which schema inference then reports.
-async fn probe_file(
+/// The data files the location selects at `commit`, sorted: the file itself, or the files of
+/// the folder or glob with the listing extension. Empty when it selects none, which schema
+/// inference then reports.
+async fn selected_files(
     hub: &Hub,
     dataset: &DatasetSpec,
     location: &DatasetLocation,
     commit: &str,
     extension: &str,
-) -> DataConnectorResult<Option<String>> {
+) -> DataConnectorResult<Vec<String>> {
     if !location.is_folder() && location.glob().is_none() {
         let entry = hub
             .entry(location.repo(), commit, location.path())
             .await
             .map_err(|source| hub_error(dataset, source))?;
         match entry {
-            Some(entry) if entry.kind == EntryKind::File => return Ok(Some(entry.path)),
+            Some(entry) if entry.kind == EntryKind::File => return Ok(vec![entry.path]),
             // A folder named without a trailing `/` is listed like one.
             Some(_) => {}
-            None => return Ok(None),
+            None => return Ok(Vec::new()),
         }
     }
     let (folder, pattern) = match location.glob() {
@@ -611,7 +570,7 @@ async fn probe_file(
         .list(location.repo(), commit, folder, true)
         .await
         .map_err(|source| hub_error(dataset, source))?;
-    Ok(entries
+    let mut files: Vec<String> = entries
         .iter()
         .filter(|entry| entry.kind == EntryKind::File)
         .filter(|entry| {
@@ -629,7 +588,142 @@ async fn probe_file(
                 .is_ok_and(|path| file_matches_extension(&path, extension))
         })
         .map(|entry| entry.path.clone())
-        .max())
+        .collect();
+    files.sort();
+    Ok(files)
+}
+
+/// The bytes read from the start of a CSV or TSV file to find its header.
+const MAX_HEADER_BYTES: u64 = 1024 * 1024;
+/// Headers read at once when checking a dataset's files.
+const HEADER_READ_CONCURRENCY: usize = 16;
+
+/// Checks that CSV or TSV files have a dataset's columns, in order. Those formats are read by
+/// column position, so a file whose columns are reordered or renamed would otherwise put its
+/// values under the wrong names.
+#[derive(Clone)]
+struct PositionalCheck {
+    store: Arc<HuggingFaceStore>,
+    dataset: DatasetSpec,
+    location: DatasetLocation,
+    extension: String,
+    options: CsvOptions,
+    columns: Vec<String>,
+}
+
+impl PositionalCheck {
+    /// Reads the header of each file and compares it with the dataset's columns.
+    async fn verify(&self, commit: &str, files: &[String]) -> Result<(), Box<ColumnsError>> {
+        if self.options.has_header == Some(false) {
+            // Without a header every file is positional by definition: nothing to compare.
+            return Ok(());
+        }
+        let headers: Vec<(String, Result<Vec<String>, String>)> =
+            futures::stream::iter(files.iter().cloned())
+                .map(|file| async move {
+                    let header = self.header(commit, &file).await;
+                    (file, header)
+                })
+                .buffered(HEADER_READ_CONCURRENCY)
+                .collect()
+                .await;
+        for (file, header) in headers {
+            let found = header.map_err(|reason| {
+                Box::new(ColumnsError::Unreadable {
+                    repo: self.location.repo().clone(),
+                    commit: commit.to_string(),
+                    file: file.clone(),
+                    reason,
+                })
+            })?;
+            if found != self.columns {
+                return Err(Box::new(ColumnsError::Differ {
+                    repo: self.location.repo().clone(),
+                    commit: commit.to_string(),
+                    file,
+                    found: found.join(", "),
+                    columns: self.columns.join(", "),
+                }));
+            }
+        }
+        Ok(())
+    }
+
+    /// The column names in the header of `file` at `commit`.
+    async fn header(&self, commit: &str, file: &str) -> Result<Vec<String>, String> {
+        let repo = self.location.repo();
+        let path = object_store::path::Path::parse(format!(
+            "{}/{}@{commit}/{file}",
+            repo.owner(),
+            repo.name()
+        ))
+        .map_err(|e| e.to_string())?;
+        let read = self
+            .store
+            .get_opts(
+                &path,
+                object_store::GetOptions {
+                    range: Some(object_store::GetRange::Bounded(0..MAX_HEADER_BYTES)),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        let stream = read.into_stream().map_err(DataFusionError::from).boxed();
+        let mut decoded = FileCompressionType::from(self.options.compression)
+            .convert_stream(stream)
+            .map_err(|e| e.to_string())?;
+        let terminator = self.options.terminator.unwrap_or(b'\n');
+        let mut bytes = Vec::new();
+        let mut complete = false;
+        while let Some(chunk) = decoded.next().await {
+            let chunk = chunk.map_err(|e| e.to_string())?;
+            bytes.extend_from_slice(&chunk);
+            if let Some(end) = bytes.iter().position(|byte| *byte == terminator) {
+                bytes.truncate(end + 1);
+                complete = true;
+                break;
+            }
+        }
+        if !complete && bytes.len() as u64 >= MAX_HEADER_BYTES {
+            return Err(format!(
+                "its first line is longer than {MAX_HEADER_BYTES} bytes"
+            ));
+        }
+        let mut format = datafusion::arrow::csv::reader::Format::default()
+            .with_header(true)
+            .with_delimiter(self.options.delimiter)
+            .with_quote(self.options.quote);
+        if let Some(escape) = self.options.escape {
+            format = format.with_escape(escape);
+        }
+        let (schema, _) = format
+            .infer_schema(std::io::Cursor::new(bytes), Some(0))
+            .map_err(|e| e.to_string())?;
+        Ok(column_names(&Arc::new(schema)))
+    }
+
+    fn into_commit_check(self) -> CommitCheck {
+        Arc::new(move |commit: String| {
+            let check = self.clone();
+            async move {
+                let files = selected_files(
+                    check.store.hub(),
+                    &check.dataset,
+                    &check.location,
+                    &commit,
+                    &check.extension,
+                )
+                .await
+                .map_err(|e| DataFusionError::External(Box::new(e)))?;
+                check
+                    .verify(&commit, &files)
+                    .await
+                    .map_err(|e| DataFusionError::External(Box::new(e)))
+            }
+            .boxed()
+        })
+    }
 }
 
 fn column_names(schema: &datafusion::arrow::datatypes::SchemaRef) -> Vec<String> {
@@ -707,10 +801,12 @@ impl DataConnector for HuggingFace {
         dataset: &DatasetSpec,
         runtime_env: &Arc<RuntimeEnv>,
     ) -> DataConnectorResult<()> {
-        let location = Self::location(dataset)?;
-        let store = store::store();
-        store.register(location.repo().clone(), Arc::clone(&self.hub));
-        runtime_env.register_object_store(&store::STORE_URL, store as Arc<dyn ObjectStore>);
+        // The physical plans an executor runs name objects under the store's URL.
+        Self::location(dataset)?;
+        runtime_env.register_object_store(
+            self.store.url(),
+            Arc::clone(&self.store) as Arc<dyn ObjectStore>,
+        );
         Ok(())
     }
 }
@@ -721,6 +817,7 @@ impl DataConnector for HuggingFace {
 struct HuggingFaceListing {
     params: Parameters,
     io_runtime: Handle,
+    store: Arc<HuggingFaceStore>,
     location: DatasetLocation,
     commit: String,
 }
@@ -765,7 +862,7 @@ impl ListingTableConnector for HuggingFaceListing {
                     }
                 })?,
         };
-        table::listing_url(&location, &self.commit)
+        table::listing_url(self.store.url(), &location, &self.commit)
             .map(|url| {
                 <datafusion::datasource::listing::ListingTableUrl as AsRef<Url>>::as_ref(&url)
                     .clone()
@@ -795,8 +892,10 @@ impl ListingTableConnector for HuggingFaceListing {
             ),
             runtime_object_store::registry::default_runtime_env(self.io_runtime.clone()),
         );
-        ctx.runtime_env()
-            .register_object_store(&store::STORE_URL, store::store() as Arc<dyn ObjectStore>);
+        ctx.runtime_env().register_object_store(
+            self.store.url(),
+            Arc::clone(&self.store) as Arc<dyn ObjectStore>,
+        );
         ctx
     }
 
@@ -804,7 +903,7 @@ impl ListingTableConnector for HuggingFaceListing {
         &self,
         _dataset: &DatasetSpec,
     ) -> DataConnectorResult<Arc<dyn ObjectStore>> {
-        Ok(store::store() as Arc<dyn ObjectStore>)
+        Ok(Arc::clone(&self.store) as Arc<dyn ObjectStore>)
     }
 
     fn handle_object_store_error(
