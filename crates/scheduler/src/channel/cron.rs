@@ -43,6 +43,22 @@ static CRON_PARSER: LazyLock<CronParser> = LazyLock::new(|| {
         .build()
 });
 
+/// The first time `cron` fires after `after`, evaluated in local time as cron refresh
+/// schedules are.
+///
+/// # Errors
+///
+/// Returns an error if `cron` cannot be parsed or has no further occurrence.
+pub fn next_cron_time(cron: &str, after: std::time::SystemTime) -> Result<std::time::SystemTime> {
+    let cron = CRON_PARSER
+        .parse(cron)
+        .context(crate::FailedToParseCronSnafu)?;
+    let next = cron
+        .find_next_occurrence(&chrono::DateTime::<Local>::from(after), false)
+        .context(crate::FailedToDetermineNextCronRunTimeSnafu)?;
+    Ok(next.into())
+}
+
 impl CronRequestChannel {
     /// Creates a new `CronRequestChannel` with the given cron expression.
     ///

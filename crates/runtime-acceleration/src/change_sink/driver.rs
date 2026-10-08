@@ -25,7 +25,7 @@ use datafusion::execution::context::SessionContext;
 use tokio::runtime::Handle;
 use tokio::sync::{mpsc, oneshot, watch};
 
-use super::batching::{AppendBurst, CdcBurst, CdcIngress, CoalescingBurst};
+use super::batching::{AppendBurst, ApplyingGuard, CdcBurst, CdcIngress, CoalescingBurst};
 use super::source_policy::SchemaDecision;
 use super::{
     BackendWrite, ChangeBatch, ChangeCapabilities, ChangePayload, ChangeSinkBackend,
@@ -707,6 +707,7 @@ impl Owner {
             .drain(&mut burst, &mut replies, admitted_at, self.previous_cycle)
             .await;
         let ingress = burst.ingress().cloned();
+        let _applying = ingress.as_ref().map(ApplyingGuard::enter);
         if let Some(ingress) = &ingress {
             ingress.record_drain(burst.len(), burst.bytes(), admitted_at, reason);
             if let Some(previous) = self.previous_cycle {

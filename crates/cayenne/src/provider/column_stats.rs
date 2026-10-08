@@ -110,6 +110,11 @@ pub(crate) struct ColumnStatsAccumulator {
 }
 
 impl ColumnStatsAccumulator {
+    /// Logical schema used to accumulate and serialize these bounds.
+    pub(crate) fn schema(&self) -> &arrow_schema::Schema {
+        &self.schema
+    }
+
     /// Create a new accumulator for the given schema, maintaining NDV sketches
     /// for every NDV-tracked column. Used by every write that produces a
     /// persisted file (`write_to_snapshot`: checkpoint spills, staged appends,

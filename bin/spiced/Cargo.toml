@@ -31,6 +31,7 @@ connector-ftp = { path = "../../crates/data-connectors/connector-ftp", optional 
 connector-gcs = { path = "../../crates/data-connectors/connector-gcs" }
 connector-git = { path = "../../crates/data-connectors/connector-git" }
 connector-github = { path = "../../crates/data-connectors/connector-github" }
+connector-huggingface = { path = "../../crates/data-connectors/connector-huggingface" }
 connector-glue = { path = "../../crates/data-connectors/connector-glue" }
 connector-graphql = { path = "../../crates/data-connectors/connector-graphql" }
 connector-imap = { path = "../../crates/data-connectors/connector-imap", optional = true }
