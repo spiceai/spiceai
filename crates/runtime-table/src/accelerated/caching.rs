@@ -621,6 +621,35 @@ pub fn request_identity_filters(
     }
 }
 
+/// The filters that re-request a stored entry from the source. The row stores
+/// a GET with `request_body = ''`, and an explicit-empty POST is never cached,
+/// so that predicate is dropped: sent to the source it would replay the GET as
+/// an empty POST and store the POST's response under the GET's entry.
+fn source_replay_filters(filters: &[Expr]) -> Vec<Expr> {
+    filters
+        .iter()
+        .filter(|filter| !is_empty_request_body_predicate(filter))
+        .cloned()
+        .collect()
+}
+
+fn is_empty_request_body_predicate(filter: &Expr) -> bool {
+    let Expr::BinaryExpr(binary) = filter else {
+        return false;
+    };
+    binary.op == datafusion::logical_expr::Operator::Eq
+        && matches!(binary.left.as_ref(), Expr::Column(column) if column.name == REQUEST_BODY_COLUMN)
+        && matches!(
+            binary.right.as_ref(),
+            Expr::Literal(
+                ScalarValue::Utf8(Some(value))
+                    | ScalarValue::LargeUtf8(Some(value))
+                    | ScalarValue::Utf8View(Some(value)),
+                _,
+            ) if value.is_empty()
+        )
+}
+
 /// Maximum number of concurrent refresh requests
 const MAX_CONCURRENT_REFRESHES: usize = 10;
 
@@ -1598,7 +1627,7 @@ impl CacheRefreshHelper {
                     &federated,
                     &session_state,
                     &dataset_name,
-                    &row_filters,
+                    &source_replay_filters(&row_filters),
                     None,
                     cache_write_tx.task_context(&session_state),
                     cache_write_tx.memory_pool(),
@@ -4679,6 +4708,24 @@ mod tests {
                 "{name}"
             );
         }
+    }
+
+    /// A stored GET entry is re-requested without its `request_body = ''`
+    /// predicate, and every other request predicate is kept.
+    #[test]
+    fn source_replay_filters_drop_only_the_empty_body() {
+        let path = col("request_path").eq(lit("/items"));
+        let query = col("request_query").eq(lit(""));
+        let empty_body = col("request_body").eq(lit(""));
+        let body = col("request_body").eq(lit("x"));
+        assert_eq!(
+            source_replay_filters(&[path.clone(), query.clone(), empty_body]),
+            vec![path.clone(), query.clone()]
+        );
+        assert_eq!(
+            source_replay_filters(&[path.clone(), query.clone(), body.clone()]),
+            vec![path, query, body]
+        );
     }
 
     /// Test-only stand-in for the shared `Arc<SessionState>`.
