@@ -105,6 +105,14 @@ env:
   CARGO_HTTP_TIMEOUT: 60
   CARGO_INCREMENTAL: 0
   CARGO_NET_GIT_FETCH_WITH_CLI: true
+  # Lets sccache cache clippy on workspace crates. Under `cargo clippy`, cargo
+  # runs `sccache clippy-driver <rustc> ...`, and sccache only ignores that
+  # leading argument when it is the bare name `rustc`. Cargo otherwise passes
+  # the toolchain's full rustc path, which sccache reads as a second input file
+  # and refuses to cache (`multiple input files`), so every workspace crate is
+  # re-linted on every run. `rustc` resolves through the rustup proxy to the
+  # same toolchain.
+  RUSTC: rustc
 
 jobs:
   # Its own job purely so `sign-off` can key `concurrency` on the commit this
