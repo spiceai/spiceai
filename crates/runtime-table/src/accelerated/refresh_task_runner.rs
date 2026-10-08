@@ -18,8 +18,11 @@ use crate::federated::FederatedTable;
 use runtime_status as status;
 
 use super::{
-    metrics, refresh::RefreshOverrides, refresh_completion::RefreshRequestId,
-    refresh_task::RefreshTask, synchronized_table::SynchronizedTable,
+    metrics,
+    refresh::RefreshOverrides,
+    refresh_completion::RefreshRequestId,
+    refresh_task::{RefreshOutcome, RefreshTask},
+    synchronized_table::SynchronizedTable,
 };
 use futures::{FutureExt, future::BoxFuture};
 use tokio::{
@@ -37,7 +40,7 @@ use std::{any::Any, panic::AssertUnwindSafe, sync::Arc};
 use tokio::sync::{Mutex, RwLock};
 
 use super::refresh::Refresh;
-use datafusion::{datasource::TableProvider, sql::TableReference};
+use datafusion::{common::TableReference, datasource::TableProvider};
 use opentelemetry::KeyValue;
 use spicepod::metric::Metrics;
 
@@ -54,6 +57,10 @@ pub struct RefreshTaskRunnerBuilder {
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
     resource_monitor: Option<runtime_resources::ResourceMonitor>,
+    /// The runtime's query `RuntimeEnv`: its memory pool bounds what a refresh holds in
+    /// memory, and its disk manager is where the refresh spills. `None` uses an unbounded
+    /// default.
+    query_runtime_env: Option<Arc<datafusion::execution::runtime_env::RuntimeEnv>>,
     /// Mutex to protect concurrent access to the accelerator during cache/snapshot operations.
     /// Shared with `CachingAccelerationScanExec`.
     accelerator_write_mutex: Arc<Mutex<()>>,
@@ -94,6 +101,7 @@ impl RefreshTaskRunnerBuilder {
             cpu_runtime: None,
             io_runtime,
             resource_monitor: None,
+            query_runtime_env: None,
             accelerator_write_mutex,
             last_updated_at: Arc::new(AtomicI64::new(0)),
             initial_load_completed: None,
@@ -132,6 +140,15 @@ impl RefreshTaskRunnerBuilder {
     #[must_use]
     pub fn with_resource_monitor(mut self, monitor: runtime_resources::ResourceMonitor) -> Self {
         self.resource_monitor = Some(monitor);
+        self
+    }
+
+    #[must_use]
+    pub fn with_query_runtime_env(
+        mut self,
+        runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+    ) -> Self {
+        self.query_runtime_env = Some(runtime_env);
         self
     }
 
@@ -210,6 +227,10 @@ impl RefreshTaskRunnerBuilder {
             refresh_task_builder = refresh_task_builder.with_resource_monitor(resource_monitor);
         }
 
+        if let Some(runtime_env) = self.query_runtime_env {
+            refresh_task_builder = refresh_task_builder.with_query_runtime_env(runtime_env);
+        }
+
         refresh_task_builder =
             refresh_task_builder.with_s3_express_acceleration(self.is_s3_express_acceleration);
 
@@ -251,7 +272,7 @@ pub struct RefreshTaskRunner {
 }
 
 type RefreshRunFuture =
-    BoxFuture<'static, std::result::Result<super::Result<()>, Box<dyn Any + Send>>>;
+    BoxFuture<'static, std::result::Result<super::Result<RefreshOutcome>, Box<dyn Any + Send>>>;
 
 /// One refresh request: the id it was issued under, and the overrides it
 /// carries.
@@ -263,7 +284,7 @@ type RefreshRunFuture =
 pub type RefreshRequest = (RefreshRequestId, Option<RefreshOverrides>);
 
 /// A finished refresh, reported under the id of the request that started it.
-pub type RefreshTaskCompletion = (RefreshRequestId, super::Result<()>);
+pub type RefreshTaskCompletion = (RefreshRequestId, super::Result<RefreshOutcome>);
 
 type RefreshTaskStartSender = Sender<RefreshRequest>;
 type RefreshTaskCompletionReceiver = Receiver<RefreshTaskCompletion>;
@@ -328,9 +349,9 @@ impl RefreshTaskRunner {
                     select! {
                         res = task => {
                             match res {
-                                Ok(Ok(())) => {
-                                    tracing::debug!("Dataset {dataset_name} refreshed successfully");
-                                    if let Err(err) = notify_refresh_complete.send((running_request, Ok(()))).await {
+                                Ok(Ok(outcome)) => {
+                                    tracing::debug!("Dataset {dataset_name} refreshed successfully ({outcome:?})");
+                                    if let Err(err) = notify_refresh_complete.send((running_request, Ok(outcome))).await {
                                         tracing::debug!("Failed to send refresh task completion for dataset {dataset_name}: {err}");
                                     }
                                 },

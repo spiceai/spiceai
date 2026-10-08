@@ -15,13 +15,14 @@ limitations under the License.
 */
 
 use app::App;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
 use crate::{Runtime, dataaccelerator::AccelerationSource};
 
 pub mod builder;
+pub(crate) mod snapshot_source;
 
 #[cfg(test)]
 mod moved_tests;
@@ -124,7 +125,6 @@ impl Dataset {
         self
     }
 
-    #[expect(clippy::result_large_err)]
     pub(crate) fn parse_table_reference(
         name: &str,
     ) -> std::result::Result<TableReference, crate::Error> {
@@ -138,6 +138,19 @@ impl Dataset {
             }
             .fail(),
         }
+    }
+
+    /// Whether the dataset reads acceleration snapshots (`file_format: snapshot`).
+    #[must_use]
+    pub(crate) fn is_snapshot_source(&self) -> bool {
+        snapshot_source::is_snapshot_format(&self.params)
+    }
+
+    /// Whether the dataset reads acceleration snapshots whose engine is not known yet,
+    /// so it has no acceleration to load them into until loading it resolves the engine.
+    #[must_use]
+    pub(crate) fn is_pending_snapshot_source(&self) -> bool {
+        self.is_snapshot_source() && self.acceleration.is_none()
     }
 
     #[must_use]
@@ -175,6 +188,12 @@ impl AccelerationSource for Dataset {
 
     fn secrets(&self) -> Arc<tokio::sync::RwLock<crate::secrets::Secrets>> {
         self.runtime.secrets()
+    }
+
+    fn snapshot_notifications(
+        &self,
+    ) -> Option<Arc<runtime_acceleration::snapshot::notifications::SnapshotNotifications>> {
+        self.runtime.datafusion().snapshot_notifications()
     }
 
     fn acceleration(&self) -> Option<&Acceleration> {

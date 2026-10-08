@@ -7,13 +7,11 @@ name: CodeQL SARIF upload
 # branch could rewrite this job and still receive `security-events: write`.
 #
 # The job does not check out a repository and does not read ref or sha from
-# the SARIF artifact. `pull_request` is refused: that event runs the analysis
-# workflow from the pull request, which can upload a clean artifact under
-# the expected name. `merge_group` is accepted only when the analysis file
-# at the queue SHA is the default-branch blob. `pull_request_target` is
-# accepted because GitHub runs the default-branch analysis file; the
-# recorded commit is the pull request head, the same commit that file
-# checks out.
+# the SARIF artifact. Pull-request events are refused. `pull_request` runs the
+# analysis workflow from the pull request, which can upload a clean artifact
+# under the expected name. `pull_request_target` is not a trigger: CodeQL does
+# not scan pull request heads. `merge_group` is accepted only when the analysis
+# file at the queue SHA is the default-branch blob.
 on:
   workflow_run:
     workflows: ['CodeQL']
@@ -114,8 +112,8 @@ jobs:
           sha=''
           ref=''
           case "${event}" in
-            pull_request)
-              echo "::error::Refusing to upload SARIF from 'pull_request'. That event runs the analysis workflow from the pull request, so the artifact can be a clean stand-in for a real scan."
+            pull_request|pull_request_target)
+              echo "::error::Refusing to upload SARIF from '${event}'. CodeQL scans the merge queue and trunk and release pushes, not pull request heads."
               exit 1
               ;;
             merge_group)
@@ -136,16 +134,7 @@ jobs:
               sha="${head_sha}"
               ref="refs/heads/${head_branch}"
               ;;
-            pull_request_target)
-              sha="$(jq -r '.pull_requests[0].head.sha // empty' <<<"${run_json}")"
-              pr_number="$(jq -r '.pull_requests[0].number // empty' <<<"${run_json}")"
-              if [[ ! "${pr_number}" =~ ^[0-9]+$ || ! "${sha}" =~ ^[0-9a-f]{40}$ ]]; then
-                echo "::error::pull_request_target run ${SOURCE_RUN_ID} has no pull-request head SHA, so results are not uploaded."
-                exit 1
-              fi
-              ref="refs/pull/${pr_number}/head"
-              ;;
-            push|schedule|workflow_dispatch)
+            push)
               if ! trusted_ref "${head_branch}"; then
                 echo "::error::Refusing to upload SARIF from ${event} on '${head_branch}'. Only trunk and release branches run a trusted analysis workflow."
                 exit 1
@@ -165,7 +154,7 @@ jobs:
           fi
 
           case "${ref}" in
-            refs/heads/trunk|refs/heads/release-*|refs/heads/release/*|refs/heads/gh-readonly-queue/*|refs/pull/[0-9]*/head) ;;
+            refs/heads/trunk|refs/heads/release-*|refs/heads/release/*|refs/heads/gh-readonly-queue/*) ;;
             *)
               echo "::error::Unsupported upload ref '${ref}'."
               exit 1
@@ -187,11 +176,47 @@ jobs:
           run-id: ${{ steps.source.outputs.run-id }}
           github-token: ${{ github.token }}
 
+      # A merge_group analysis outlives its queue entry: by the time it completes,
+      # the queue has often merged or ejected the batch and deleted its
+      # gh-readonly-queue ref, and code scanning rejects an upload to a ref that no
+      # longer exists. The next step decides whether a failure here is that.
       - name: Upload SARIF to code scanning
-        uses: github/codeql-action/upload-sarif@b96794f015dfd88f77b49b1c93e0fa7110f94c63 # v4
+        id: upload
+        continue-on-error: true
+        uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4
         with:
           sarif_file: sarif-results
           category: /language:rust
           sha: ${{ steps.source.outputs.sha }}
           ref: ${{ steps.source.outputs.ref }}
           wait-for-processing: true
+
+      # Only a deleted merge-queue ref is excused. A merged batch is scanned again
+      # by the trunk push, and an ejected one never reaches a protected branch.
+      # Every other failure, including one the ref probe cannot classify, fails.
+      - name: Fail unless the merge-queue ref is gone
+        if: steps.upload.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPLOAD_REF: ${{ steps.source.outputs.ref }}
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          if [[ "${UPLOAD_REF}" != refs/heads/gh-readonly-queue/* ]]; then
+            echo "::error::SARIF upload to '${UPLOAD_REF}' failed. See the 'Upload SARIF to code scanning' step."
+            exit 1
+          fi
+
+          probe_err="$(mktemp)"
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/${UPLOAD_REF#refs/}" --silent 2>"${probe_err}"; then
+            echo "::error::SARIF upload to '${UPLOAD_REF}' failed while the ref still exists. See the 'Upload SARIF to code scanning' step."
+            exit 1
+          fi
+          if grep -q 'HTTP 404' "${probe_err}"; then
+            echo "::notice::'${UPLOAD_REF}' was deleted by the merge queue before this upload ran, so there is nothing to attach SARIF to. Not a failure."
+            exit 0
+          fi
+          echo "::error::SARIF upload to '${UPLOAD_REF}' failed, and probing the ref failed too, so the cause is unknown:"
+          head -c 2000 "${probe_err}"
+          exit 1

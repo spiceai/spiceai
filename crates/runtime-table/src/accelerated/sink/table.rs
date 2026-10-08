@@ -24,7 +24,7 @@ use arrow_tools::{
 use data_components::index_maintenance::perform_index_maintenance;
 use datafusion::{
     catalog::TableProvider, execution::RecordBatchStream, logical_expr::dml::InsertOp,
-    physical_plan::collect, prelude::SessionContext,
+    physical_plan::collect,
 };
 use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
 use runtime_table_partition::provider::PartitionTableProvider;
@@ -238,6 +238,7 @@ impl TableSink {
         &self,
         record_batch_stream: Pin<Box<dyn RecordBatchStream + Send>>,
         overwrite: InsertOp,
+        write: &super::RefreshWrite,
     ) -> Result<(), RetryError<crate::accelerated::Error>> {
         let start = std::time::Instant::now();
         tracing::debug!(
@@ -245,7 +246,8 @@ impl TableSink {
             overwrite
         );
 
-        let ctx = SessionContext::new();
+        let ctx = util::session_state::session_context();
+        let state = write.state(&ctx.state());
         let target_schema = self.table_provider.schema();
         warn_on_narrowing_schema_cast(
             &self.dataset_name,
@@ -262,7 +264,7 @@ impl TableSink {
         let plan_start = std::time::Instant::now();
         let insertion_plan = match self
             .table_provider
-            .insert_into(&ctx.state(), cast_plan, overwrite)
+            .insert_into(&state, cast_plan, overwrite)
             .await
         {
             Ok(plan) => {
@@ -312,7 +314,7 @@ impl TableSink {
         .map_err(retry_from_df_error)?;
 
         let collect_start = std::time::Instant::now();
-        if let Err(e) = collect(insertion_plan, ctx.task_ctx()).await {
+        if let Err(e) = collect(insertion_plan, state.task_ctx()).await {
             tracing::debug!(
                 "TableSink: collect() failed after {:.2}s: {e}",
                 collect_start.elapsed().as_secs_f64()

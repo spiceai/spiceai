@@ -16,7 +16,11 @@ limitations under the License.
 
 use std::sync::{Arc, LazyLock};
 
+use arrow_schema::DataType;
+use datafusion::common::DFSchema;
+use datafusion::logical_expr::ExprSchemable as _;
 use datafusion::logical_expr::expr::{AggregateFunction, ScalarFunction, WindowFunction};
+use datafusion::logical_expr::{Cast, Expr, TryCast};
 use datafusion::sql::unparser::Unparser;
 use datafusion::sql::unparser::dialect::{Dialect, DuckDBDialect, ScalarFnToSqlHandler};
 
@@ -28,10 +32,6 @@ mod duckdb;
 mod re2;
 
 pub use bigquery::SpiceBigQueryDialect;
-
-const REGEXP_LIKE_FLAGS_POSITION: usize = 2; // The position of the flags argument in regexp_like function calls
-const REGEXP_REPLACE_FLAGS_POSITION: usize = 3; // The position of the flags argument in regexp_replace function calls
-const REGEXP_COUNT_FLAGS_POSITION: usize = 3; // The position of the flags argument in regexp_count function calls
 
 pub(crate) const BTRIM_NAME: &str = "btrim";
 const TO_HEX_NAME: &str = "to_hex";
@@ -74,28 +74,22 @@ fn duckdb_scalar_overrides() -> Vec<(&'static str, ScalarFnToSqlHandler)> {
             // DuckDB dialect: regexp_matches(string, pattern[, options])
             // DataFusion dialect: regexp_like(str, regexp[, flags])
             REGEXP_LIKE_NAME,
-            Box::new(
-                duckdb::DuckDBRegexpFunction::Like
-                    .to_datafusion_function(REGEXP_LIKE_FLAGS_POSITION),
-            ) as ScalarFnToSqlHandler,
+            Box::new(duckdb::DuckDBRegexpFunction::Like.to_datafusion_function())
+                as ScalarFnToSqlHandler,
         ),
         (
             // DuckDB dialect: regexp_replace(string, pattern, replacement[, options])
             // DataFusion dialect: regexp_replace(str, regexp, replacement[, flags])
             REGEXP_REPLACE_NAME,
-            Box::new(
-                duckdb::DuckDBRegexpFunction::Replace
-                    .to_datafusion_function(REGEXP_REPLACE_FLAGS_POSITION),
-            ) as ScalarFnToSqlHandler,
+            Box::new(duckdb::DuckDBRegexpFunction::Replace.to_datafusion_function())
+                as ScalarFnToSqlHandler,
         ),
         (
-            // DuckDB dialect: coalesce(len(regexp_extract_all(string, pattern)), 0)
+            // DuckDB dialect: len(regexp_extract_all(string, pattern))
             // DataFusion dialect: regexp_count(str, regexp[, start, flags])
             REGEXP_COUNT_NAME,
-            Box::new(
-                duckdb::DuckDBRegexpFunction::Count
-                    .to_datafusion_function(REGEXP_COUNT_FLAGS_POSITION),
-            ) as ScalarFnToSqlHandler,
+            Box::new(duckdb::DuckDBRegexpFunction::Count.to_datafusion_function())
+                as ScalarFnToSqlHandler,
         ),
     ]
 }
@@ -214,12 +208,135 @@ static DUCKDB_DIALECT: LazyLock<Arc<dyn Dialect>> = LazyLock::new(new_duckdb_dia
 /// does: whatever [`new_duckdb_dialect`] installs is what is asked. A name the
 /// dialect has no handler for renders as `Ok(None)` and is deferred to, which
 /// is why an ordinary function is unaffected.
+///
+/// Running the handler answers whether the call *renders*, which is not the
+/// whole question: `concat_to_string_concat` renders every call it is given,
+/// and its `||` rendering is faithful only while no operand is binary. A
+/// rendering whose correctness turns on an operand's declared type cannot be
+/// checked by running it, because the handler sees `&[Expr]` with no schema —
+/// so `scope` is consulted for those, and is `None` where the type cannot be
+/// proven (see
+/// [`datafusion_table_providers::util::supported_functions::ScalarCallSupport`]).
 #[must_use]
-pub fn duckdb_can_translate(call: &ScalarFunction) -> bool {
+pub fn duckdb_can_translate(call: &ScalarFunction, scope: Option<&DFSchema>) -> bool {
+    if call.func.name() == CONCAT_NAME
+        && !duckdb::concat_arguments_are_renderable(&call.args, scope)
+    {
+        return false;
+    }
     let unparser = Unparser::new(DUCKDB_DIALECT.as_ref());
     DUCKDB_DIALECT
         .scalar_function_to_sql_overrides(&unparser, call.func.name(), &call.args)
         .is_ok()
+}
+
+/// Whether `DuckDB` evaluates this non-function expression node the way
+/// `DataFusion` does. `duckdb::cast_is_renderable` says which casts into text or
+/// binary are refused, and why; [`integer_cast_is_renderable`] refuses one from
+/// a fractional value into an integer, which `DuckDB` rounds where `DataFusion`
+/// truncates; and `duckdb::literal_is_renderable` refuses a binary literal,
+/// which the unparser spells in a form `DuckDB` reads as text.
+#[must_use]
+pub fn duckdb_can_evaluate_expression(expr: &Expr, scope: Option<&DFSchema>) -> bool {
+    duckdb::literal_is_renderable(expr)
+        && duckdb::cast_is_renderable(expr, scope)
+        && integer_cast_is_renderable(expr, scope)
+}
+
+/// Whether `PostgreSQL` evaluates this non-function expression node the way
+/// `DataFusion` does — today, a cast from a fractional value into an integer is
+/// the one shape it does not (see [`integer_cast_is_renderable`]).
+#[must_use]
+pub fn postgres_can_evaluate_expression(expr: &Expr, scope: Option<&DFSchema>) -> bool {
+    integer_cast_is_renderable(expr, scope)
+}
+
+/// Whether `MySQL` evaluates this non-function expression node the way
+/// `DataFusion` does — today, a cast from a fractional value into an integer is
+/// the one shape it does not (see [`integer_cast_is_renderable`]).
+#[must_use]
+pub fn mysql_can_evaluate_expression(expr: &Expr, scope: Option<&DFSchema>) -> bool {
+    integer_cast_is_renderable(expr, scope)
+}
+
+/// Whether an engine that rounds a fractional value on its way into an integer
+/// evaluates this cast the way `DataFusion` does.
+///
+/// `DataFusion` truncates toward zero: `CAST(1.5 AS INT)` is `1` and
+/// `CAST(-1.5 AS INT)` is `-1`, and a `DECIMAL` is divided by its scale in
+/// integer arithmetic (`arrow-cast`'s `cast_decimal_to_integer`), so
+/// `CAST(2.49 AS INT)` is `2` too. `DuckDB`, `PostgreSQL` and `MySQL` round to
+/// the nearest integer instead — `2`, `-2` and `2` — so a cast pushed to any
+/// of them answers a different value than the same cast evaluated locally, and
+/// a filter over it selects different rows, with no error anywhere (issue
+/// #14482). Measured on `DuckDB` v1.4.4, `PostgreSQL` 18.6 and `MariaDB` 11.8:
+/// each answers `2`, `-2`, `3` for `CAST(1.5 AS INT)`, `CAST(-1.5 AS INT)`,
+/// `CAST(2.5 AS INT)`. `BigQuery` documents the same rounding (`CAST(1.5 AS
+/// INT64)` is `2`) and is refused on that documentation, not on a measurement.
+/// A `TRY_CAST` is refused alongside: `DuckDB`'s rounds like its `CAST`, and
+/// the engines that have no `TRY_CAST` at all would fail the query rather than
+/// answer it.
+///
+/// The cast therefore stays local when its target is an integer type and its
+/// operand is a floating-point or decimal value — or cannot be proven not to
+/// be. `scope` is the schema the operand resolves against and is `None` where
+/// the type cannot be read; a column whose type will not resolve is refused
+/// rather than assumed integral, because assuming wrong is a wrong answer and
+/// refusing costs only the pushdown. A table scan's own filter pushdown hands
+/// its filters to this check against the scan's *unqualified* schema while
+/// the filters name their columns with the table's qualifier, so a plain
+/// column that does not resolve as written is looked up by its bare name
+/// before it is given up on; an ambiguous bare name still counts as
+/// unresolved. A literal carries its own type and needs no scope. A cast from
+/// an integer, a boolean or a string is not this
+/// check's to refuse: the engines agree on an integral operand, and a
+/// fractional *string* fails `DataFusion`'s own cast rather than answering a
+/// different row.
+#[must_use]
+pub(crate) fn integer_cast_is_renderable(expr: &Expr, scope: Option<&DFSchema>) -> bool {
+    let (Expr::Cast(Cast {
+        expr: operand,
+        field,
+    })
+    | Expr::TryCast(TryCast {
+        expr: operand,
+        field,
+    })) = expr
+    else {
+        return true;
+    };
+    if !field.data_type().is_integer() {
+        return true;
+    }
+    let empty = DFSchema::empty();
+    match operand_type(operand, scope.unwrap_or(&empty)) {
+        Some(data_type) => !(data_type.is_floating() || data_type.is_decimal()),
+        // A node whose type will not resolve is treated as fractional, because
+        // unprovable and unsafe are the same answer for a check that must not
+        // admit a cast it cannot vouch for.
+        None => false,
+    }
+}
+
+/// The type `operand` has in `scope`, or `None` where it cannot be read.
+///
+/// A plain column that does not resolve as written is retried by its bare
+/// name: the scan-level filter pushdown resolves against the scan's own
+/// unqualified schema while the filter names `t.n`, and refusing every such
+/// cast would cost the pushdown of an integral operand the engines agree on.
+/// An ambiguous bare name resolves to nothing, and the resolution error is
+/// deliberately not propagated — see the caller.
+fn operand_type(operand: &Expr, scope: &DFSchema) -> Option<DataType> {
+    if let Ok(data_type) = operand.get_type(scope) {
+        return Some(data_type);
+    }
+    let Expr::Column(column) = operand else {
+        return None;
+    };
+    scope
+        .field_with_unqualified_name(column.name())
+        .ok()
+        .map(|field| field.data_type().clone())
 }
 
 /// Names of the functions [`new_bigquery_dialect`] rewrites to native
@@ -304,14 +421,25 @@ pub fn new_bigquery_dialect() -> Arc<dyn Dialect> {
 #[cfg(test)]
 mod tests {
     use super::{
-        bigquery, bigquery_native_function_names, duckdb_builtin_scalar_overrides,
-        duckdb_can_translate, duckdb_native_function_names, new_duckdb_dialect,
+        bigquery, bigquery_native_function_names, duckdb, duckdb_builtin_scalar_overrides,
+        duckdb_can_evaluate_expression, duckdb_can_translate, duckdb_native_function_names,
+        integer_cast_is_renderable, mysql_can_evaluate_expression, new_duckdb_dialect,
+        postgres_can_evaluate_expression,
     };
-    use datafusion::functions::expr_fn::upper;
+    use crate::function_support::bigquery_can_evaluate_expression;
+    use arrow_schema::{DataType, Field, Schema};
+    use datafusion::common::DFSchema;
+    use datafusion::functions::expr_fn::{concat, upper};
     use datafusion::functions::regex::expr_fn::{regexp_count, regexp_like, regexp_replace};
     use datafusion::logical_expr::expr::ScalarFunction;
-    use datafusion::prelude::{Expr, col, lit};
+    use datafusion::prelude::{Expr, cast, col, lit, try_cast};
+    use datafusion::scalar::ScalarValue;
     use datafusion::sql::unparser::Unparser;
+    use std::sync::Arc;
+
+    /// One engine's "does it evaluate this node the way `DataFusion` does"
+    /// predicate, named so the engine tables below stay readable.
+    type CanEvaluateExpression = fn(&Expr, Option<&DFSchema>) -> bool;
 
     /// The [`ScalarFunction`] inside a call built by `DataFusion`'s own
     /// `expr_fn` helpers, so these guards run against the real UDFs rather
@@ -323,48 +451,558 @@ mod tests {
         }
     }
 
+    /// A scope declaring these columns, for the checks that read an operand's
+    /// declared type.
+    fn scope_of(columns: &[(&str, DataType)]) -> DFSchema {
+        let fields: Vec<Field> = columns
+            .iter()
+            .map(|(name, data_type)| Field::new(*name, data_type.clone(), true))
+            .collect();
+        DFSchema::try_from(Schema::new(fields)).expect("a schema of plain columns")
+    }
+
+    /// Regression test for #13915: `concat_to_string_concat` renders `||`,
+    /// which `DuckDB` types by its operands — `BLOB || BLOB` is a `BLOB`, where
+    /// the registered `SparkConcat` always returns a string. A binary operand
+    /// therefore has to keep the call local, and the decision needs the scope,
+    /// because the type of a column reference is not in the call.
+    #[test]
+    fn duckdb_declines_a_concat_over_a_binary_column() {
+        for binary in [
+            DataType::Binary,
+            DataType::LargeBinary,
+            DataType::BinaryView,
+            DataType::FixedSizeBinary(3),
+        ] {
+            let scope = scope_of(&[("a", binary.clone()), ("s", DataType::Utf8)]);
+            assert!(
+                !duckdb_can_translate(&call_of(concat(vec![col("a"), col("s")])), Some(&scope)),
+                "a concat over a {binary:?} column must stay local"
+            );
+            // The binary argument is refused wherever it sits, not only first.
+            assert!(
+                !duckdb_can_translate(&call_of(concat(vec![col("s"), col("a")])), Some(&scope)),
+                "a concat whose second argument is {binary:?} must stay local"
+            );
+        }
+    }
+
+    /// A nested `concat` over binary columns is refused at the *outer* call,
+    /// because the check searches the whole operand tree rather than reading
+    /// the argument's final type.
+    ///
+    /// That distinction is the whole point: `SparkConcat` reports `Utf8` for
+    /// the inner call whatever it was handed, so a check reading only the outer
+    /// arguments sees two strings and admits it. `contains_unsupported_functions`
+    /// would still have refused the plan — it walks every expression node with
+    /// `Expr::apply`, so the inner call is visited in its own right — but that
+    /// is the caller's property, not this check's, and this pins both.
+    #[test]
+    fn duckdb_declines_a_nested_concat_over_a_binary_column() {
+        let scope = scope_of(&[("a", DataType::Binary), ("b", DataType::Binary)]);
+        let nested = concat(vec![concat(vec![col("a"), col("b")]), lit("z")]);
+
+        assert!(
+            !duckdb_can_translate(&call_of(nested.clone()), Some(&scope)),
+            "the outer call reaches binary columns through its operand tree"
+        );
+
+        // And the inner call on its own, which is what the caller's own walk
+        // reaches independently.
+        let Expr::ScalarFunction(outer) = &nested else {
+            panic!("expected a scalar function call");
+        };
+        let Some(Expr::ScalarFunction(inner)) = outer.args.first() else {
+            panic!("expected the inner call to be a scalar function");
+        };
+        assert!(
+            !duckdb_can_translate(inner, Some(&scope)),
+            "the inner concat over binary columns must be refused"
+        );
+    }
+
+    /// Regression test for the explicit-cast bypass @copilot found on #14333:
+    /// `ExprSchemable::get_type` reports a cast's *target*, so
+    /// `concat(CAST(bin AS Utf8), 'z')` reads as a string concat. Measured on a
+    /// DuckDB-accelerated dataset, that rendering answers
+    /// `CAST("a" AS VARCHAR) || 'z'`, which for bytes that are not valid UTF-8
+    /// returns the 12-character escaped literal as a row while the same query
+    /// evaluated locally raises `Encountered non UTF-8 data`.
+    #[test]
+    fn duckdb_declines_a_concat_over_a_cast_away_binary_column() {
+        let scope = scope_of(&[("a", DataType::Binary), ("s", DataType::Utf8)]);
+        for laundered in [
+            cast(col("a"), DataType::Utf8),
+            cast(col("a"), DataType::Utf8View),
+            try_cast(col("a"), DataType::Utf8),
+            // A cast of a cast still originates in the binary column.
+            cast(cast(col("a"), DataType::Utf8), DataType::LargeUtf8),
+        ] {
+            assert!(
+                !duckdb_can_translate(
+                    &call_of(concat(vec![laundered.clone(), lit("z")])),
+                    Some(&scope)
+                ),
+                "a cast does not make {laundered:?} renderable"
+            );
+        }
+
+        // A cast that has nothing binary under it is untouched.
+        assert!(duckdb_can_translate(
+            &call_of(concat(vec![cast(col("s"), DataType::LargeUtf8), lit("z")])),
+            Some(&scope)
+        ));
+    }
+
+    /// The refusal is scoped to binary operands: an ordinary string `concat` is
+    /// the common case the `||` rewrite exists to keep pushed down (#13849), so
+    /// it must still federate.
+    #[test]
+    fn duckdb_federates_a_concat_over_string_columns() {
+        let scope = scope_of(&[
+            ("s", DataType::Utf8),
+            ("t", DataType::LargeUtf8),
+            ("n", DataType::Int64),
+        ]);
+        for args in [
+            vec![col("s"), lit("z")],
+            vec![col("s"), col("t")],
+            // A non-string, non-binary argument keeps the implicit cast the
+            // un-rewritten call already relied on.
+            vec![col("s"), col("n")],
+            vec![lit("a"), lit("b")],
+        ] {
+            assert!(
+                duckdb_can_translate(&call_of(concat(args.clone())), Some(&scope)),
+                "concat({args:?}) has a faithful DuckDB rendering and must federate"
+            );
+        }
+    }
+
+    /// With no scope a column's type cannot be proven, and
+    /// `ScalarCallSupport` says a rendering that depends on the type must
+    /// refuse rather than assume one — a physical filter is checked with no
+    /// scope, so guessing `Utf8` there would push down exactly the call this
+    /// issue is about.
+    #[test]
+    fn duckdb_declines_a_concat_whose_column_type_cannot_be_read() {
+        assert!(!duckdb_can_translate(
+            &call_of(concat(vec![col("a"), lit("z")])),
+            None
+        ));
+    }
+
+    /// Regression test for #14355: `DuckDB`'s `CAST(BLOB AS VARCHAR)` renders
+    /// bytes that are not valid UTF-8 as their escaped form, where
+    /// `DataFusion`'s cast raises and its `TRY_CAST` answers NULL, so a text
+    /// cast over a binary operand stays local — whichever text type, and
+    /// wherever the binary value sits under it.
+    #[test]
+    fn duckdb_declines_a_text_cast_over_a_binary_operand() {
+        let scope = scope_of(&[
+            ("a", DataType::Binary),
+            ("l", DataType::LargeBinary),
+            ("s", DataType::Utf8),
+        ]);
+        for text in [DataType::Utf8, DataType::LargeUtf8, DataType::Utf8View] {
+            for operand in [
+                col("a"),
+                col("l"),
+                // A binary value reached through another node still decides
+                // it: `coalesce` answers binary here.
+                datafusion::functions::expr_fn::coalesce(vec![col("a"), col("l")]),
+                lit(ScalarValue::Binary(Some(vec![0xff]))),
+            ] {
+                for expr in [
+                    cast(operand.clone(), text.clone()),
+                    try_cast(operand.clone(), text.clone()),
+                ] {
+                    assert!(
+                        !duckdb_can_evaluate_expression(&expr, Some(&scope)),
+                        "{expr} must stay local"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Regression test for #14397: no cast into a binary type has a `DuckDB`
+    /// rendering that answers what `DataFusion` does — the unparser renders no
+    /// binary type, and a string literal it sends bare is converted under
+    /// `DuckDB`'s own escape rules — so every one stays local, whatever its
+    /// operand and with or without a scope.
+    #[test]
+    fn duckdb_declines_a_cast_into_binary() {
+        let scope = scope_of(&[
+            ("a", DataType::Binary),
+            ("s", DataType::Utf8),
+            ("n", DataType::Int64),
+        ]);
+        for binary in [
+            DataType::Binary,
+            DataType::LargeBinary,
+            DataType::BinaryView,
+            DataType::FixedSizeBinary(4),
+        ] {
+            for operand in [col("s"), col("a"), col("n"), lit("\\xFF")] {
+                for expr in [
+                    cast(operand.clone(), binary.clone()),
+                    try_cast(operand.clone(), binary.clone()),
+                ] {
+                    for scope in [Some(&scope), None] {
+                        assert!(
+                            !duckdb_can_evaluate_expression(&expr, scope),
+                            "{expr} must stay local"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The complement of the tests above. Casting binary into a number is
+    /// unsupported on both engines, so both refuse the query and that shape
+    /// federates as before; a text cast of a string or a number is the common
+    /// case and federates; and a node that is not a cast has no opinion here.
+    #[test]
+    fn duckdb_federates_every_other_cast() {
+        let scope = scope_of(&[
+            ("a", DataType::Binary),
+            ("s", DataType::Utf8),
+            ("n", DataType::Int64),
+        ]);
+        for expr in [
+            cast(col("a"), DataType::Int64),
+            try_cast(col("a"), DataType::Float64),
+            cast(col("n"), DataType::Utf8),
+            try_cast(col("n"), DataType::Utf8View),
+            cast(col("s"), DataType::LargeUtf8),
+            cast(col("s"), DataType::Int64),
+            col("a"),
+            col("a").is_null(),
+        ] {
+            assert!(
+                duckdb_can_evaluate_expression(&expr, Some(&scope)),
+                "{expr} has a faithful DuckDB rendering and must federate"
+            );
+        }
+    }
+
+    /// With no scope a column's type cannot be proven, so a text cast of it is
+    /// refused rather than assumed to be over a string, and an integer cast of
+    /// it is refused rather than assumed to be over an integer; a cast whose
+    /// target neither check is about is not theirs to refuse, and a literal
+    /// carries its own type.
+    #[test]
+    fn duckdb_declines_a_cast_whose_operand_type_cannot_be_read() {
+        assert!(!duckdb_can_evaluate_expression(
+            &cast(col("a"), DataType::Utf8),
+            None
+        ));
+        assert!(!duckdb_can_evaluate_expression(
+            &cast(col("a"), DataType::Int64),
+            None
+        ));
+        assert!(duckdb_can_evaluate_expression(
+            &cast(col("a"), DataType::Float64),
+            None
+        ));
+        assert!(duckdb_can_evaluate_expression(
+            &cast(lit(1_i64), DataType::Utf8),
+            None
+        ));
+        assert!(duckdb_can_evaluate_expression(
+            &cast(lit(1_i64), DataType::Int32),
+            None
+        ));
+    }
+
+    /// Regression test for #14482: `DuckDB`, `PostgreSQL` and `MySQL` round a
+    /// fractional value cast into an integer where `DataFusion` truncates, so
+    /// the cast has to stay local on each of them — `CAST` and `TRY_CAST`, from
+    /// every floating-point and decimal operand, into every integer width, and
+    /// whether the operand is a column, a literal or a value reached through
+    /// another node.
+    #[test]
+    fn a_fractional_to_integer_cast_stays_local_on_every_engine_that_rounds_it() {
+        let scope = scope_of(&[
+            ("f", DataType::Float64),
+            ("h", DataType::Float32),
+            ("d", DataType::Decimal128(10, 2)),
+            ("n", DataType::Int64),
+        ]);
+        let operands = [
+            col("f"),
+            col("h"),
+            col("d"),
+            lit(1.5_f64),
+            lit(1.5_f32),
+            lit(ScalarValue::Decimal128(Some(249), 4, 2)),
+            col("n") * lit(1.5_f64),
+            datafusion::functions::expr_fn::coalesce(vec![col("f"), col("n")]),
+        ];
+        let targets = [
+            DataType::Int8,
+            DataType::Int16,
+            DataType::Int32,
+            DataType::Int64,
+            DataType::UInt8,
+            DataType::UInt16,
+            DataType::UInt32,
+            DataType::UInt64,
+        ];
+        let engines: [(&str, CanEvaluateExpression); 4] = [
+            ("DuckDB", duckdb_can_evaluate_expression),
+            ("PostgreSQL", postgres_can_evaluate_expression),
+            ("MySQL", mysql_can_evaluate_expression),
+            ("BigQuery", bigquery_can_evaluate_expression),
+        ];
+        for (engine, can_evaluate) in engines {
+            for operand in &operands {
+                for target in &targets {
+                    for expr in [
+                        cast(operand.clone(), target.clone()),
+                        try_cast(operand.clone(), target.clone()),
+                    ] {
+                        assert!(
+                            !can_evaluate(&expr, Some(&scope)),
+                            "{engine} rounds {expr}, so it must stay local"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// The complement: the refusal costs only the casts it is about. A cast
+    /// from an integer, a boolean or a string into an integer, and a cast from
+    /// a fractional value into anything but an integer, federate as before.
+    #[test]
+    fn every_other_cast_still_federates_on_the_engines_that_round() {
+        let scope = scope_of(&[
+            ("f", DataType::Float64),
+            ("d", DataType::Decimal128(10, 2)),
+            ("n", DataType::Int64),
+            ("b", DataType::Boolean),
+            ("s", DataType::Utf8),
+        ]);
+        for expr in [
+            cast(col("n"), DataType::Int32),
+            try_cast(col("n"), DataType::UInt8),
+            cast(col("b"), DataType::Int32),
+            cast(col("s"), DataType::Int64),
+            cast(lit(7_i32), DataType::Int64),
+            cast(col("f"), DataType::Float32),
+            cast(col("f"), DataType::Decimal128(10, 2)),
+            cast(col("d"), DataType::Float64),
+            cast(col("f"), DataType::Utf8),
+            col("f"),
+            col("f").gt(lit(1.5_f64)),
+        ] {
+            assert!(
+                integer_cast_is_renderable(&expr, Some(&scope)),
+                "{expr} answers the same on every engine and must federate"
+            );
+            assert!(duckdb_can_evaluate_expression(&expr, Some(&scope)));
+            assert!(postgres_can_evaluate_expression(&expr, Some(&scope)));
+            assert!(mysql_can_evaluate_expression(&expr, Some(&scope)));
+        }
+    }
+
+    /// The scan's own filter pushdown resolves against the scan's unqualified
+    /// schema while its filters name `t.n`: a qualified column is then looked
+    /// up by its bare name, so an integral operand still federates and a
+    /// fractional one is still refused. A name the scope does not hold, or
+    /// holds twice, resolves to nothing and is refused.
+    #[test]
+    fn a_qualified_column_is_resolved_by_name_against_the_scans_own_schema() {
+        let scope = scope_of(&[("n", DataType::Int64), ("f", DataType::Float64)]);
+        assert!(integer_cast_is_renderable(
+            &cast(col("t.n"), DataType::Int32),
+            Some(&scope)
+        ));
+        assert!(!integer_cast_is_renderable(
+            &cast(col("t.f"), DataType::Int32),
+            Some(&scope)
+        ));
+        assert!(!integer_cast_is_renderable(
+            &cast(col("t.x"), DataType::Int32),
+            Some(&scope)
+        ));
+
+        let ambiguous = DFSchema::new_with_metadata(
+            vec![
+                (
+                    Some("a".into()),
+                    Arc::new(Field::new("n", DataType::Int64, true)),
+                ),
+                (
+                    Some("b".into()),
+                    Arc::new(Field::new("n", DataType::Int64, true)),
+                ),
+            ],
+            std::collections::HashMap::new(),
+        )
+        .expect("two qualified columns of one name");
+        assert!(!integer_cast_is_renderable(
+            &cast(col("c.n"), DataType::Int32),
+            Some(&ambiguous)
+        ));
+    }
+
+    /// A literal carries its own type, so an all-literal call still federates
+    /// with no scope: the refusal must cost only the calls it is about.
+    ///
+    /// A binary *literal* is refused on two independent paths, and each is
+    /// asserted separately because only one of them is this check's.
+    /// `duckdb_can_translate` consults the type guard *before* the unparser,
+    /// and a `ScalarValue::Binary` reports `Binary` with or without a scope, so
+    /// the guard is what answers `false` here. The other path is the
+    /// expression check, which refuses the literal wherever it appears. The
+    /// renderer behind both refuses nothing: it spells the literal `X'ff'`,
+    /// which `DuckDB` reads as the text `'xff'`, so a rendering that reached
+    /// `DuckDB` would be a wrong answer rather than an error, and neither
+    /// refusal can be removed on the assumption that the renderer covers it.
+    ///
+    /// A binary *column* has neither: it renders cleanly as `"a" || 'z'`, and
+    /// its type is readable only against a scope. That is why the scope is what
+    /// closes #13915 and an inspection of the arguments alone would not have.
+    #[test]
+    fn duckdb_reads_a_literal_argument_without_a_scope() {
+        assert!(duckdb_can_translate(
+            &call_of(concat(vec![lit("a"), lit("b")])),
+            None
+        ));
+
+        let binary_literal = concat(vec![lit("a"), lit(ScalarValue::Binary(Some(vec![0xff])))]);
+        assert!(!duckdb_can_translate(
+            &call_of(binary_literal.clone()),
+            None
+        ));
+        // The guard, which runs first, is the path that refuses it.
+        assert!(
+            !duckdb::concat_arguments_are_renderable(&call_of(binary_literal.clone()).args, None),
+            "a binary literal reads as binary with no scope, so the type guard refuses it"
+        );
+        assert!(
+            !duckdb_can_evaluate_expression(&lit(ScalarValue::Binary(Some(vec![0xff]))), None),
+            "the expression check refuses the binary literal itself, inside a call or not"
+        );
+        let dialect = new_duckdb_dialect();
+        let unparser = Unparser::new(dialect.as_ref());
+        let rendered = unparser
+            .expr_to_sql(&binary_literal)
+            .expect("the renderer spells a binary literal")
+            .to_string();
+        assert!(
+            rendered.contains("X'ff'"),
+            "the renderer spells the literal X'ff', which DuckDB reads as text, so both \
+             refusals above are what keep it local: {rendered}"
+        );
+    }
+
+    /// A binary literal never reaches `DuckDB`: the unparser spells it `X'ff'`,
+    /// and `DuckDB` reads that as the text `'xff'`, so `b = X'ff'` over a `BLOB`
+    /// column matched the row holding the bytes `xff` rather than `0xFF`.
+    /// Every byte-array variant the unparser renders that way is refused,
+    /// including through a dictionary; a NULL renders as `NULL`, which `DuckDB`
+    /// reads correctly, and a string literal is unaffected.
+    #[test]
+    fn duckdb_declines_a_binary_literal() {
+        let byte = vec![0xff];
+        for value in [
+            ScalarValue::Binary(Some(byte.clone())),
+            ScalarValue::Binary(Some(Vec::new())),
+            ScalarValue::LargeBinary(Some(byte.clone())),
+            ScalarValue::BinaryView(Some(byte.clone())),
+            ScalarValue::FixedSizeBinary(1, Some(byte.clone())),
+            ScalarValue::Dictionary(
+                Box::new(DataType::Int32),
+                Box::new(ScalarValue::Binary(Some(byte))),
+            ),
+        ] {
+            let literal = lit(value.clone());
+            assert!(
+                !duckdb_can_evaluate_expression(&literal, None),
+                "{value:?} must stay local"
+            );
+            // The check is per node; the policy the DuckDB providers install
+            // walks the whole filter, so the comparison around it is refused.
+            assert!(
+                !crate::function_support::deny_spice_functions_for_duckdb_table_providers()
+                    .supports(&col("b").eq(literal), None),
+                "a comparison against {value:?} must stay local"
+            );
+        }
+        for value in [
+            ScalarValue::Binary(None),
+            ScalarValue::LargeBinary(None),
+            ScalarValue::BinaryView(None),
+            ScalarValue::FixedSizeBinary(1, None),
+            ScalarValue::Utf8(Some("ff".to_string())),
+        ] {
+            assert!(
+                duckdb_can_evaluate_expression(&lit(value.clone()), None),
+                "{value:?} renders as a value DuckDB reads correctly and must federate"
+            );
+        }
+    }
+
     /// Regression test for #13900: the `U` flag has no `DuckDB` equivalent, so
     /// the dialect's regex handler refuses to render the call. Before this
     /// check the refusal surfaced as a planning error for the whole query;
     /// declining to federate leaves the call for `DataFusion` to evaluate.
+    ///
+    /// `i` joined the refused set for #14148: the two engines case-fold by
+    /// their own Unicode tables, so `regexp_like(s, '\x{1C89}', 'i')` over `ᲊ`
+    /// is `true` locally and `false` federated (measured on the bundled
+    /// `DuckDB`). `g` stays, measured to agree row for row.
     #[test]
-    fn duckdb_declines_a_regex_flag_duckdb_has_no_equivalent_of() {
-        for flag in ["U", "R", "gU", "iR"] {
+    fn duckdb_declines_every_regexp_flag_but_the_global_replace() {
+        for flag in ["U", "R", "gU", "iR", "i", "gi", "m", "s"] {
             assert!(
-                !duckdb_can_translate(&call_of(regexp_replace(
-                    col("s"),
-                    lit("a"),
-                    lit("X"),
-                    Some(lit(flag)),
-                ))),
+                !duckdb_can_translate(
+                    &call_of(regexp_replace(
+                        col("s"),
+                        lit("a"),
+                        lit("X"),
+                        Some(lit(flag)),
+                    )),
+                    None
+                ),
                 "regexp_replace with flags `{flag}` has no DuckDB rendering"
             );
             assert!(
-                !duckdb_can_translate(&call_of(regexp_like(col("s"), lit("a"), Some(lit(flag))))),
+                !duckdb_can_translate(
+                    &call_of(regexp_like(col("s"), lit("a"), Some(lit(flag)))),
+                    None
+                ),
                 "regexp_like with flags `{flag}` has no DuckDB rendering"
             );
         }
 
-        // The flags DuckDB does have keep federating.
-        for flag in ["g", "i", "gi"] {
-            assert!(
-                duckdb_can_translate(&call_of(regexp_replace(
-                    col("s"),
-                    lit("a"),
-                    lit("X"),
-                    Some(lit(flag)),
-                ))),
-                "regexp_replace with flags `{flag}` renders as DuckDB SQL"
-            );
-        }
+        // The one flag both engines were measured to act on alike keeps
+        // federating, and only for the function that takes it.
+        assert!(
+            duckdb_can_translate(
+                &call_of(regexp_replace(col("s"), lit("a"), lit("X"), Some(lit("g")),)),
+                None
+            ),
+            "regexp_replace with flags `g` renders as DuckDB SQL"
+        );
+        assert!(
+            !duckdb_can_translate(
+                &call_of(regexp_like(col("s"), lit("a"), Some(lit("g")))),
+                None
+            ),
+            "regexp_like takes no `g`, so the flag has no DuckDB rendering there"
+        );
 
         // No flags argument at all is the common shape and must federate.
-        assert!(duckdb_can_translate(&call_of(regexp_replace(
-            col("s"),
-            lit("a"),
-            lit("X"),
-            None,
-        ))));
+        assert!(duckdb_can_translate(
+            &call_of(regexp_replace(col("s"), lit("a"), lit("X"), None,)),
+            None
+        ));
     }
 
     /// Regression test for #13900: `regexp_count`'s start position becomes a
@@ -374,48 +1012,48 @@ mod tests {
     #[test]
     fn duckdb_declines_a_regexp_count_start_it_cannot_turn_into_an_offset() {
         assert!(
-            !duckdb_can_translate(&call_of(regexp_count(
-                col("s"),
-                lit("a"),
-                Some(col("start")),
-                None,
-            ))),
+            !duckdb_can_translate(
+                &call_of(regexp_count(col("s"), lit("a"), Some(col("start")), None,)),
+                None
+            ),
             "a column start position has no DuckDB rendering"
         );
         assert!(
-            !duckdb_can_translate(&call_of(regexp_count(
-                col("s"),
-                lit("a"),
-                Some(lit(0)),
-                None,
-            ))),
+            !duckdb_can_translate(
+                &call_of(regexp_count(col("s"), lit("a"), Some(lit(0)), None,)),
+                None
+            ),
             "a start position below 1 has no DuckDB rendering"
         );
         assert!(
-            duckdb_can_translate(&call_of(regexp_count(
-                col("s"),
-                lit("a"),
-                Some(lit(1)),
-                None,
-            ))),
+            duckdb_can_translate(
+                &call_of(regexp_count(col("s"), lit("a"), Some(lit(1)), None,)),
+                None
+            ),
             "an integer start position renders as a DuckDB substring offset"
         );
         assert!(
-            duckdb_can_translate(&call_of(regexp_count(
-                col("s"),
-                lit("a"),
-                Some(lit(4_294_967_295_i64)),
-                None,
-            ))),
+            duckdb_can_translate(
+                &call_of(regexp_count(
+                    col("s"),
+                    lit("a"),
+                    Some(lit(4_294_967_295_i64)),
+                    None,
+                )),
+                None
+            ),
             "the last offset DuckDB's SUBSTRING accepts still renders"
         );
         assert!(
-            !duckdb_can_translate(&call_of(regexp_count(
-                col("s"),
-                lit("a"),
-                Some(lit(4_294_967_296_i64)),
-                None,
-            ))),
+            !duckdb_can_translate(
+                &call_of(regexp_count(
+                    col("s"),
+                    lit("a"),
+                    Some(lit(4_294_967_296_i64)),
+                    None,
+                )),
+                None
+            ),
             "a start past DuckDB's SUBSTRING range has no rendering and stays local"
         );
     }
@@ -467,32 +1105,41 @@ mod tests {
             ),
         ] {
             assert!(
-                !duckdb_can_translate(&call_of(regexp_count(col("s"), lit(pattern), None, None))),
+                !duckdb_can_translate(
+                    &call_of(regexp_count(col("s"), lit(pattern), None, None)),
+                    None
+                ),
                 "{why} (`{pattern}`) has no faithful DuckDB rendering"
             );
         }
         assert!(
-            !duckdb_can_translate(&call_of(regexp_count(col("s"), col("p"), None, None))),
+            !duckdb_can_translate(&call_of(regexp_count(col("s"), col("p"), None, None)), None),
             "a pattern read from a column cannot be inspected and stays local"
         );
         for flags in ["i", "m", "s", "c", "gi"] {
             assert!(
-                !duckdb_can_translate(&call_of(regexp_count(
-                    col("s"),
-                    lit("a"),
-                    Some(lit(1)),
-                    Some(lit(flags)),
-                ))),
+                !duckdb_can_translate(
+                    &call_of(regexp_count(
+                        col("s"),
+                        lit("a"),
+                        Some(lit(1)),
+                        Some(lit(flags)),
+                    )),
+                    None
+                ),
                 "flags `{flags}` are refused (case folding differs by Unicode version, the rest RE2 reads differently) and stay local"
             );
         }
         assert!(
-            !duckdb_can_translate(&call_of(regexp_count(
-                col("s"),
-                lit("a"),
-                Some(lit(1)),
-                Some(col("f")),
-            ))),
+            !duckdb_can_translate(
+                &call_of(regexp_count(
+                    col("s"),
+                    lit("a"),
+                    Some(lit(1)),
+                    Some(col("f")),
+                )),
+                None
+            ),
             "a flags column is not a constant DuckDB accepts and stays local"
         );
 
@@ -504,7 +1151,7 @@ mod tests {
             regexp_count(col("s"), lit("[0-9]{2,}"), Some(lit(3)), None),
         ] {
             assert!(
-                duckdb_can_translate(&call_of(expr.clone())),
+                duckdb_can_translate(&call_of(expr.clone()), None),
                 "{expr:?} has a faithful DuckDB rendering and must federate"
             );
         }
@@ -514,13 +1161,21 @@ mod tests {
     /// ordinary call keeps federating.
     #[test]
     fn duckdb_defers_on_a_function_the_dialect_does_not_rewrite() {
-        assert!(duckdb_can_translate(&call_of(upper(col("s")))));
+        assert!(duckdb_can_translate(&call_of(upper(col("s"))), None));
     }
 
-    /// The check must answer exactly what the unparser does, or a call it
-    /// admits still fails the query and a call it refuses loses its pushdown
-    /// for nothing. Asking through `expr_to_sql` reaches the handler by the
+    /// The check must not *admit* a call the unparser cannot render, or the
+    /// call still fails the query; and outside the type-dependent exception
+    /// below it must not refuse one it can, or the pushdown is lost for
+    /// nothing. Asking through `expr_to_sql` reaches the handler by the
     /// unparser's own dispatch rather than by the accessor the check uses.
+    ///
+    /// `concat` is deliberately not in this list. Its handler renders every
+    /// call it is given, including the binary-operand calls whose rendering
+    /// answers something else (#13915) — so for `concat` the check is
+    /// *stricter* than the unparser by design, and asserting agreement here
+    /// would assert the bug back in.
+    /// `duckdb_declines_a_concat_over_a_binary_column` pins that direction.
     #[test]
     fn duckdb_can_translate_agrees_with_what_the_unparser_renders() {
         let dialect = new_duckdb_dialect();
@@ -544,7 +1199,7 @@ mod tests {
         ] {
             let renders = unparser.expr_to_sql(&expr).is_ok();
             assert_eq!(
-                duckdb_can_translate(&call_of(expr.clone())),
+                duckdb_can_translate(&call_of(expr.clone()), None),
                 renders,
                 "the per-call check and the unparser disagree about {expr:?}"
             );

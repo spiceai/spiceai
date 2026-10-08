@@ -421,7 +421,9 @@ fn classify_transaction_write(plan: &LogicalPlan) -> Option<Result<TableReferenc
         LogicalPlan::Dml(dml) => Some(match &dml.op {
             WriteOp::Insert(_) | WriteOp::Update => Ok(dml.table_name.clone()),
             WriteOp::Delete => Err("DELETE"),
-            WriteOp::Ctas | WriteOp::Truncate => Err("this operation"),
+            // `WriteOp` is non-exhaustive (DataFusion 55 added MERGE INTO): any
+            // other write cannot be staged atomically, so it aborts the transaction.
+            _ => Err("this operation"),
         }),
         LogicalPlan::Extension(ext) => {
             let dml = ext

@@ -162,6 +162,8 @@ mod plan_capture;
 #[cfg(feature = "postgres")]
 mod postgres;
 mod prepared_statements;
+#[cfg(any(feature = "mongodb", feature = "dynamodb", feature = "cosmosdb"))]
+mod pushdown_roundtrip;
 #[cfg(feature = "rate-control")]
 mod rate_control;
 mod ready_state;
@@ -169,9 +171,11 @@ mod refresh_retry;
 mod refresh_sql;
 mod refresh_worker_panic;
 mod results_cache;
+mod results_cache_warmup;
 #[cfg(all(unix, feature = "duckdb", feature = "postgres"))]
 mod retention;
 mod s3;
+mod s3_folder_marker;
 mod s3_location_pruning;
 mod s3_parquet_overwrite;
 #[cfg(any(
@@ -185,10 +189,14 @@ mod schema_evolution;
 mod sharepoint;
 #[cfg(feature = "snapshots")]
 mod snapshot_integration;
+// Cayenne does not build on Windows.
+#[cfg(all(feature = "snapshots", feature = "duckdb", not(windows)))]
+mod snapshot_source;
 #[cfg(feature = "snowflake")]
 mod snowflake;
 #[cfg(feature = "snowflake")]
 mod snowflake_catalog;
+mod source_unavailable;
 #[cfg(feature = "spark")]
 mod spark;
 mod spiceai;
@@ -225,8 +233,6 @@ fn configure_test_datafusion() {
 
     match DEFAULT_DATAFUSION_CONFIG.write() {
         Ok(mut config) => {
-            config.options_mut().execution.target_partitions = TEST_CPU_CORES;
-
             config.options_mut().execution.coalesce_batches = false;
 
             config.options_mut().optimizer.repartition_joins = false;
@@ -237,10 +243,8 @@ fn configure_test_datafusion() {
 
 /// Pin the process-wide CPU budget to [`TEST_CPU_CORES`].
 ///
-/// Setting `target_partitions` on the default session config is not enough on its
-/// own: with `runtime.query.target_partitions` unset the session builder sizes
-/// partitions from the CPU budget, overwriting whatever the config carried. Both
-/// are pinned to the same constant so they cannot disagree.
+/// Every session sizes `target_partitions` from the CPU budget, so pinning the
+/// budget is what makes plans reproducible across machines.
 ///
 /// Installing is idempotent by intent — the budget is a process-wide `OnceLock`
 /// and all 300-odd callers ask for the same value, so every call after the first
@@ -328,6 +332,8 @@ where
             filters => vec![
                 // Normalize HTTP server ports: http://127.0.0.1:12345 → http://127.0.0.1:<PORT>
                 (r"http://127\.0\.0\.1:\d+", "http://127.0.0.1:<PORT>"),
+                // Docker assigns fixture ports independently for each test instance.
+                (r"(compute_context=host=localhost,port=)\d+(,db=)", "$1<PORT>$2"),
                 // Spark Connect plans include Databricks connection details. Those identify
                 // the test fixture, not the plan being asserted.
                 (r"compute_context=sc://[^ ]+", "compute_context=<DATABRICKS_SPARK_CONNECT>"),

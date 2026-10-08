@@ -17,11 +17,11 @@ limitations under the License.
 //! Regression test for OpenTelemetry-metric ingest into `from: sink:` datasets with
 //! file-based (Cayenne) acceleration across a restart.
 //!
-//! A `sink` dataset stores everything in its acceleration and is parked (pending) on restart
-//! until its first write re-registers it. Until then the ingest cannot look up the table
-//! schema, so a data point that omits a NULL dimension yields a batch narrower than the stored
-//! (wide) acceleration schema. Reopening the wide acceleration then rejects that narrow write
-//! as a removed column:
+//! A `sink` dataset stores everything in its acceleration. Where the acceleration has no
+//! schema to offer, the dataset is parked (pending) until its first write re-registers it, and
+//! until then the ingest cannot look up the table schema: a data point that omits a NULL
+//! dimension yields a batch narrower than the stored (wide) acceleration schema, and reopening
+//! the wide acceleration rejects that narrow write as a removed column:
 //!
 //! ```text
 //! Schema change detected that cannot be evolved under `on_schema_change: append_new_columns`:
@@ -34,6 +34,10 @@ limitations under the License.
 //! table is not yet registered, materializing the omitted dimension as NULL so the write lands.
 //! Cayenne is the engine the production OTLP metric datasets use: it is CDC-backed, so its
 //! file acceleration persists across restarts (reaching the reconciliation this bug lives in).
+//!
+//! A Cayenne acceleration that already holds the dataset's rows does offer a schema, so that
+//! dataset is registered at startup instead of parked, and its stored rows are queryable
+//! before any write arrives.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -52,9 +56,9 @@ use runtime::Runtime;
 use runtime::dataaccelerator::spice_sys::dataset_checkpointer;
 use runtime_acceleration::sidecar::OpenOption;
 use runtime_acceleration::snapshot::SnapshotBehavior;
-use spicepod::acceleration::{Acceleration, Mode};
+use spicepod::acceleration::{Acceleration, Mode, RefreshMode};
 use spicepod::component::access::AccessMode;
-use spicepod::component::dataset::{Dataset, OnSchemaChange};
+use spicepod::component::dataset::{Dataset, OnSchemaChange, TimeFormat};
 use spicepod::param::Params;
 
 use crate::{
@@ -80,6 +84,23 @@ fn make_dataset(data_dir: &str, metadata_dir: &str) -> Dataset {
         ]))),
         ..Acceleration::default()
     });
+    ds
+}
+
+/// [`make_dataset`] with the refresh mode the production OTLP metric datasets run with.
+///
+/// The schema an acceleration holds is recorded in its checkpoint when a refresh task starts
+/// or when a write evolves the schema — never by an ordinary write. A `sink` resolves an unset
+/// `refresh_mode` to `disabled`, which starts no refresh, so one whose columns never change
+/// has no checkpoint to be registered from. `append` starts one, which is why the metric
+/// datasets have a checkpoint and are registrable at startup.
+fn make_appending_dataset(data_dir: &str, metadata_dir: &str) -> Dataset {
+    let mut ds = make_dataset(data_dir, metadata_dir);
+    ds.time_column = Some("time_unix_nano".to_string());
+    ds.time_format = Some(TimeFormat::UnixNanos);
+    if let Some(acceleration) = ds.acceleration.as_mut() {
+        acceleration.refresh_mode = Some(RefreshMode::Append);
+    }
     ds
 }
 
@@ -266,6 +287,77 @@ async fn sink_accelerated_metric_survives_restart_without_schema_mismatch()
             n, 3,
             "a post-restart data point that omits a known dimension must land against the wide \
              checkpoint (2 existing + 1 new), not be rejected as a schema change"
+        );
+
+        rt.shutdown().await;
+        drop(rt);
+    }
+
+    Ok(())
+}
+
+/// A `sink` dataset whose Cayenne acceleration already holds rows must serve them from
+/// startup. Registering it only on the first write leaves those rows unreachable — queries
+/// fail to plan against a table that does not exist — for however long it takes the next
+/// export to arrive, which on a low-rate metric can be minutes.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn sink_accelerated_metric_is_queryable_before_its_first_write_after_restart()
+-> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    let temp_dir = tempfile::tempdir()?;
+    let data_dir = temp_dir.path().join("data").to_string_lossy().to_string();
+    let metadata_dir = temp_dir
+        .path()
+        .join("metadata")
+        .to_string_lossy()
+        .to_string();
+
+    let ds = make_appending_dataset(&data_dir, &metadata_dir);
+
+    // --- Phase 1: put two data points in the acceleration, then shut down. ---
+    {
+        register_test_connectors().await;
+        let rt = start_runtime(&ds).await;
+
+        ingest(&rt, gauge_export(1.0, vec![string_attr("region", "us")])).await?;
+        ingest(&rt, gauge_export(2.0, vec![string_attr("region", "eu")])).await?;
+
+        assert_eq!(
+            row_count(&rt).await?,
+            2,
+            "phase 1 should have ingested two data points"
+        );
+
+        rt.shutdown().await;
+        drop(rt);
+    }
+
+    // --- Phase 2: restart and query without writing anything first. ---
+    {
+        register_test_connectors().await;
+        let rt = start_runtime(&ds).await;
+
+        let n = row_count(&rt).await.map_err(|e| {
+            anyhow::anyhow!(
+                "querying the restarted sink dataset before any write failed, so its stored \
+                 rows are unreachable until the next export registers it: {e}"
+            )
+        })?;
+        eprintln!("phase 2: row_count before any write = {n}");
+        assert_eq!(
+            n, 2,
+            "the rows the acceleration already holds must be served from startup"
+        );
+
+        // The dataset registered from the acceleration must still take writes, and the new
+        // point must land on top of the stored rows rather than replacing them.
+        ingest(&rt, gauge_export(3.0, vec![string_attr("region", "apac")])).await?;
+        assert_eq!(
+            row_count(&rt).await?,
+            3,
+            "a write after the startup registration must append to the stored rows"
         );
 
         rt.shutdown().await;

@@ -16,26 +16,30 @@ limitations under the License.
 
 //! Mode A: `DataFusion` consumer baseline.
 //!
-//! Registers the IBM TPC-H CSVs as in-memory-backed listing tables and lowers
-//! each suite plan with `datafusion-substrait::from_substrait_plan` — the same
+//! Registers the TPC-H tables — the IBM suite's SF 0.01 CSVs as listing tables,
+//! or, at `--scale-factor`, tables generated in memory by `tpchgen` — and lowers
+//! each suite plan with `datafusion-substrait::from_substrait_plan`, the same
 //! consumer `spiced` uses on the `FlightSQL` path. This is a DF-fork signal, not
 //! product CI.
 
 use std::collections::HashSet;
 use std::path::Path;
+use std::sync::Arc;
 use std::time::Instant;
 
 use arrow::array::{Array, AsArray};
 use arrow::datatypes::DataType;
 use arrow::record_batch::RecordBatch;
+use datafusion::common::TableReference;
+use datafusion::datasource::MemTable;
 use datafusion::prelude::{CsvReadOptions, SessionConfig, SessionContext};
-use datafusion::sql::TableReference;
 use datafusion_substrait::logical_plan::consumer::from_substrait_plan;
 use datafusion_substrait::substrait::proto::Plan;
 use prost::Message;
 use snafu::ResultExt;
 
 use crate::compare::{ColumnSpec, TableData, compare};
+use crate::datagen;
 use crate::error::{self, Result};
 use crate::report::{CaseResult, TestStatus};
 use crate::schema::{TPCH_TABLES, schema_for};
@@ -46,6 +50,16 @@ pub const ENGINE_VERSION: &str = "54.1";
 
 pub struct ModeAEngine {
     ctx: SessionContext,
+    tables: Tables,
+}
+
+/// Where the registered TPC-H tables came from.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Tables {
+    /// The suite's CSVs; the files each case's `inputTables` lists must exist.
+    SuiteCsv,
+    /// Generated in memory; the `inputTables` CSV paths are not read.
+    Generated,
 }
 
 impl ModeAEngine {
@@ -56,14 +70,43 @@ impl ModeAEngine {
     /// consumer then looks up the exact Isthmus name on a case-sensitive
     /// catalog, so we register via `TableReference::bare`.
     pub async fn with_tpch_data(data_dir: &Path) -> Result<Self> {
-        let mut config = SessionConfig::new();
-        config.options_mut().sql_parser.enable_ident_normalization = false;
-        let ctx = SessionContext::new_with_config(config);
+        let ctx = session();
         for table in TPCH_TABLES {
             let csv_path = data_dir.join(format!("{}.csv", table.file_stem));
             register_csv(&ctx, table.plan_name, &csv_path, table.file_stem).await?;
         }
-        Ok(Self { ctx })
+        Ok(Self {
+            ctx,
+            tables: Tables::SuiteCsv,
+        })
+    }
+
+    /// Generate every TPC-H table at `scale_factor` and register each as an
+    /// in-memory table under its Isthmus plan name (`TableReference::bare`, as
+    /// above), split into the session's target partitions. Returns the row
+    /// count of each table alongside the engine.
+    pub async fn with_generated_data(
+        scale_factor: f64,
+    ) -> Result<(Self, Vec<(&'static str, usize)>)> {
+        let ctx = session();
+        let parts = ctx.copied_config().target_partitions();
+        let generated = datagen::generate(scale_factor, parts).await?;
+        let mut row_counts = Vec::with_capacity(generated.len());
+        for table in generated {
+            row_counts.push((table.table.file_stem, table.num_rows()));
+            let plan_name = table.table.plan_name;
+            let provider = MemTable::try_new(table.schema, table.partitions)
+                .context(error::RegisterGeneratedTableSnafu { table: plan_name })?;
+            ctx.register_table(TableReference::bare(plan_name), Arc::new(provider))
+                .context(error::RegisterGeneratedTableSnafu { table: plan_name })?;
+        }
+        Ok((
+            Self {
+                ctx,
+                tables: Tables::Generated,
+            },
+            row_counts,
+        ))
     }
 
     pub async fn run_suite(&self, cases: &[&LoadedCase]) -> Result<Vec<CaseResult>> {
@@ -114,7 +157,7 @@ impl ModeAEngine {
     }
 
     async fn execute(&self, case: &LoadedCase) -> std::result::Result<TableData, String> {
-        ensure_inputs_registered(case)?;
+        ensure_inputs_registered(case, self.tables)?;
 
         let proto = Plan::decode(case.plan_bytes.as_slice()).map_err(|e| {
             format!(
@@ -140,6 +183,13 @@ impl ModeAEngine {
 
         Ok(batches_to_table(&batches, &schema))
     }
+}
+
+/// A session whose catalog keeps the Isthmus plans' uppercase table names.
+fn session() -> SessionContext {
+    let mut config = SessionConfig::new();
+    config.options_mut().sql_parser.enable_ident_normalization = false;
+    SessionContext::new_with_config(config)
 }
 
 async fn register_csv(
@@ -169,13 +219,13 @@ async fn register_csv(
     })
 }
 
-fn ensure_inputs_registered(case: &LoadedCase) -> std::result::Result<(), String> {
+fn ensure_inputs_registered(case: &LoadedCase, tables: Tables) -> std::result::Result<(), String> {
     let known: HashSet<&str> = TPCH_TABLES
         .iter()
         .flat_map(|t| [t.file_stem, t.plan_name])
         .collect();
     for InputTable { name, csv_path } in &case.input_tables {
-        if !csv_path.exists() {
+        if tables == Tables::SuiteCsv && !csv_path.exists() {
             return Err(format!(
                 "test '{}' input CSV '{}' does not exist",
                 case.id,

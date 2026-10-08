@@ -24,11 +24,11 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
+use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::memory::MemTable;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
-use datafusion::sql::TableReference;
 use runtime::accelerated::refresh::{Refresh, RefreshSQL};
 use runtime::accelerated::{Error as AcceleratedError, RefreshTaskRunner};
 use runtime::component::dataset::acceleration::RefreshMode;
@@ -189,7 +189,7 @@ async fn refresh_worker_recovers_from_panic() -> Result<(), String> {
     );
 
     match first_result {
-        Ok(()) => return Err("expected panic error from first refresh".to_string()),
+        Ok(_) => return Err("expected panic error from first refresh".to_string()),
         Err(AcceleratedError::RefreshWorkerPanicked {
             dataset_name,
             message,

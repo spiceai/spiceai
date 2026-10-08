@@ -51,7 +51,6 @@ use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
-use datafusion::prelude::SessionContext;
 use datafusion_datasource::sink::{DataSink, DataSinkExec};
 use futures::StreamExt;
 use tokio::sync::mpsc;
@@ -421,7 +420,7 @@ fn spawn_federated_insert(
     receiver: mpsc::Receiver<datafusion::common::Result<arrow::record_batch::RecordBatch>>,
 ) -> JoinHandle<datafusion::common::Result<()>> {
     tokio::spawn(async move {
-        let ctx = SessionContext::new();
+        let ctx = util::session_state::session_context();
         let stream = RecordBatchStreamAdapter::new(schema, ReceiverStream::new(receiver));
         let input: Arc<dyn ExecutionPlan> = Arc::new(SchemaCastScanExec::new(
             Arc::new(StreamingDataUpdateExecutionPlan::new(Box::pin(stream))),
@@ -486,7 +485,7 @@ fn create_partition_physical_exprs(
             datafusion::physical_expr::create_physical_expr(
                 &partitioned_by.expression,
                 &input_dfschema,
-                &execution_props,
+                &execution_props, &datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext::default(),
             )
         })
         .collect()
@@ -797,6 +796,17 @@ mod tests {
         fn properties(&self) -> &Arc<PlanProperties> {
             &self.properties
         }
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(
+                &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+            ) -> datafusion::error::Result<
+                datafusion::common::tree_node::TreeNodeRecursion,
+            >,
+        ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+            Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+        }
+
         fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
             vec![]
         }
@@ -925,11 +935,11 @@ mod tests {
             CayenneCatalog, CayennePartitionCreator, CayenneTableProvider, MetadataCatalog,
         };
         use datafusion::catalog::TableProvider;
+        use datafusion::common::TableReference;
         use datafusion::datasource::MemTable;
         use datafusion::logical_expr::col;
         use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
         use datafusion::scalar::ScalarValue;
-        use datafusion::sql::TableReference;
         use datafusion_table_providers::UnsupportedTypeAction;
         use runtime_component::dataset::acceleration::RefreshMode;
         use runtime_table_partition::expression::PartitionedBy;

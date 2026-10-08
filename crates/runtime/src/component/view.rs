@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use app::App;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use snafu::prelude::*;
 use spicepod::{component::view as spicepod_view, vector::VectorStore};
 use std::ops::{Deref, DerefMut};
@@ -82,7 +82,6 @@ impl std::fmt::Debug for View {
 }
 
 impl View {
-    #[expect(clippy::result_large_err)]
     fn load_sql_ref(sql_ref: &str) -> crate::Result<String> {
         let sql = fs::read_to_string(sql_ref)
             .context(crate::UnableToLoadSqlFileSnafu { file: sql_ref })?;
@@ -218,6 +217,12 @@ impl AccelerationSource for View {
 
     fn secrets(&self) -> Arc<tokio::sync::RwLock<crate::secrets::Secrets>> {
         self.runtime.secrets()
+    }
+
+    fn snapshot_notifications(
+        &self,
+    ) -> Option<Arc<runtime_acceleration::snapshot::notifications::SnapshotNotifications>> {
+        self.runtime.datafusion().snapshot_notifications()
     }
 
     fn acceleration(&self) -> Option<&Acceleration> {

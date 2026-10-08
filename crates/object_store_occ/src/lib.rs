@@ -17,14 +17,31 @@ limitations under the License.
 //! Type-safe object storage with optimistic concurrency control (OCC).
 //!
 //! This crate provides a typed wrapper around [`object_store::ObjectStore`] that uses
-//! conditional writes (ETags/If-Match headers) to detect concurrent modifications.
+//! conditional writes (ETags/If-Match headers) to detect concurrent modifications,
+//! and the primitives every feature that keeps shared state in object storage
+//! builds on:
+//!
+//! - [`conditional_put`]: a conditional write that never degrades into an
+//!   unconditional one.
+//! - [`retry_on_conflict`]: a bounded, jittered compare-and-swap loop.
+//! - [`probe_conditional_writes`]: detects a store that ignores write conditions.
+//! - [`LocalConditionalPut`]: conditional writes for a local directory.
 
+mod capabilities;
+mod conditional;
 pub mod local_conditional_put;
+mod retry;
 mod state;
+pub mod store;
+pub mod wal;
 
 use snafu::Snafu;
 
+pub use capabilities::{ConditionalWriteSupport, Enforcement, probe_conditional_writes};
+pub use conditional::{ConditionalWriteError, Expected, conditional_put};
 pub use local_conditional_put::LocalConditionalPut;
+pub use object_store::UpdateVersion;
+pub use retry::{Attempt, ConflictRetry, RetryOnConflictError, retry_on_conflict};
 pub use state::{InsertResult, ObjectState, UpdateResult, WriteResult};
 
 /// Errors that can occur during object state operations.

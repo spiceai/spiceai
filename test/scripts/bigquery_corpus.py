@@ -51,6 +51,20 @@ FIXTURES = (
 )
 TABLE_FREE = {0, 1, 2, 3, 4, 80, 229, 230}
 COHORT_CASES = {168, 169}
+# The queries a fractional-to-integer cast keeps from federating whole, and the
+# number of remote subtrees each one keeps. BigQuery rounds such a cast where
+# DataFusion truncates, so the connector policy declines to push it down (issue
+# #14482); issue #14607 tracks restoring the pushdown through a truncating
+# rendering. The offline corpus test pins the same three counts.
+ROUNDING_CAST_PARTIAL = {33: 3, 124: 5, 147: 1}
+# Remote subtrees of those queries that never reach BigQuery against the empty
+# fixtures: a join whose build side is empty never polls its probe side. Query
+# 033's outer left join skips its two-subtree probe side; each cross join in
+# query 124 skips its probe subtree.
+EMPTY_BUILD_SKIPPED = {33: 2, 124: 3}
+# An Arrow integer type in a physical plan is always a locally evaluated cast: a
+# remote subtree renders as BigQuery's own SQL, which spells these INT64/BIGINT.
+LOCAL_INTEGER_CAST = re.compile(r"AS U?Int(?:8|16|32|64)\)")
 TRANSPORT = {
     "SchemaCastScanExec",
     "CoalescePartitionsExec",
@@ -167,7 +181,7 @@ def physical_schemas(index: int, explain: str, physical: str) -> list[str]:
 def check_plan(index: int, explain: str) -> None:
     physical = harness.physical_plan(explain)
     nodes = [(len(match[1]), match[2]) for match in PLAN_NODE.finditer(physical)]
-    expected = 0 if index in TABLE_FREE else 1
+    expected = ROUNDING_CAST_PARTIAL.get(index, 0 if index in TABLE_FREE else 1)
     if (
         not nodes
         or sum(name == "VirtualExecutionPlan" for _, name in nodes) != expected
@@ -187,6 +201,17 @@ def check_plan(index: int, explain: str) -> None:
             raise harness.HarnessError(
                 f"Query {index:03}: transport must not impose a limit"
             )
+    if index in ROUNDING_CAST_PARTIAL:
+        # The plan is a tree rather than one chain, so the structural walk below
+        # does not apply. The remote-node count above pins what the refusal
+        # costs; the cast that forced it must still be evaluated locally, since
+        # a plan that lost it is a different case and belongs back under the
+        # single-chain rule.
+        if not LOCAL_INTEGER_CAST.search(physical):
+            raise harness.HarnessError(
+                f"Query {index:03}: rounding-cast case has no local integer cast left"
+            )
+        return
     if nodes[-1][1] != "VirtualExecutionPlan" or [depth for depth, _ in nodes] != list(
         range(0, 2 * len(nodes), 2)
     ):
@@ -390,8 +415,21 @@ def execute_case(
     return record
 
 
+def expected_execution_jobs(queries: list[tuple[int, str]]) -> int:
+    """One job per executed remote subtree: one for each query with a table, one
+    more for each extra subtree a rounding cast splits a query into, less the
+    subtrees an empty join build side never runs."""
+    return (
+        len(queries)
+        - len(TABLE_FREE)
+        + sum(remotes - 1 for remotes in ROUNDING_CAST_PARTIAL.values())
+        - sum(EMPTY_BUILD_SKIPPED.values())
+    )
+
+
 def main() -> int:
     queries = corpus()
+    expected_jobs = expected_execution_jobs(queries)
     aliases, tables = fixtures()
     info, credential = harness.credential_info()
     project = os.environ.get("BIGQUERY_PROJECT_ID", info["project_id"])
@@ -499,16 +537,17 @@ def main() -> int:
                     tuple(datasets.values()),
                     set(),
                 ),
-                expected=len(queries) - len(TABLE_FREE),
+                expected=expected_jobs,
             )
             harness.write_json(output / "jobs.json", jobs)
             summary["execution_jobs_checked"] = True
             summary["execution_jobs"] = len(jobs)
-            if len(jobs) != 263 or any(
+            if len(jobs) != expected_jobs or any(
                 job["error_result"] or job["state"] != "DONE" for job in jobs
             ):
                 summary["errors"].append(
-                    "Expected 263 successful corpus execution jobs; see jobs.json"
+                    f"Expected {expected_jobs} successful corpus execution jobs; "
+                    "see jobs.json"
                 )
     except Exception as error:
         summary["errors"].append(str(error))

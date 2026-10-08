@@ -417,7 +417,7 @@ async fn test_arrow_partition_by_full_refresh_removes_rows_missing_from_source()
     use std::sync::atomic::{AtomicI64, Ordering};
     use std::time::Duration;
 
-    use datafusion::sql::TableReference;
+    use datafusion::common::TableReference;
     use runtime::accelerated::refresh::RefreshOverrides;
     use runtime::component::dataset::acceleration::RefreshMode as OverrideRefreshMode;
 

@@ -98,7 +98,7 @@ jobs:
       - name: Validate datafusion-table-providers commit
         run: bash .github/scripts/validate_table_providers_commit.sh
         env:
-          BRANCH: spiceai-54
+          BRANCH: spiceai-55
 
       - name: Show sccache stats
         if: always() && (runner.os == 'macOS' && steps.setup-spiceio.outputs.endpoint != '')
@@ -185,7 +185,7 @@ jobs:
           # Intersected with the gate's own filterset by the Makefile. Passing it
           # as a second `-E` would union with that filterset and widen the run,
           # because that is how nextest composes repeated `-E` flags.
-          NEXTEST_FILTER_EXTRA: "not (package(aws-sdk-credential-bridge) | package(object_store_occ))"
+          NEXTEST_FILTER_EXTRA: "not package(aws-sdk-credential-bridge)"
 
       - name: Build testoperator
         env:

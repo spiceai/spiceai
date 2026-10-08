@@ -37,7 +37,7 @@ use arrow::datatypes::{
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, TimeUnit};
 use datafusion_common::ScalarValue;
-use vortex::arrow::FromArrowType;
+use vortex::error::VortexResult;
 
 /// Joint accumulator state held under a single mutex so `update()` and
 /// `merge_from()` only pay one acquire per batch. `seeded[i]` is `true`
@@ -78,6 +78,10 @@ pub(crate) enum RowCountUpdate {
     /// the incremental deltas might accumulate. Re-establishes
     /// `num_rows_exact = true`.
     Set(i64),
+    /// Replace with a count that measured only part of the live rows, recorded
+    /// not exact. Used by a full rewrite whose commit retained a protected
+    /// snapshot it never read; see `persist_table_stats_after_snapshot_rewrite`.
+    Estimate(i64),
     /// Leave the count unchanged — rows moved, not added (e.g. the inline-data
     /// checkpoint flush, whose rows were already counted on insert). Preserves the
     /// existing `num_rows_exact`.
@@ -110,7 +114,11 @@ impl ColumnStatsAccumulator {
     /// for every NDV-tracked column. Used by every write that produces a
     /// persisted file (`write_to_snapshot`: checkpoint spills, staged appends,
     /// compaction, overwrite), where NDV is computed once at file birth.
-    pub(crate) fn new(schema: &arrow_schema::Schema) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a column whose Arrow type Vortex cannot represent.
+    pub(crate) fn new(schema: &arrow_schema::Schema) -> VortexResult<Self> {
         Self::new_with_ndv(schema, true)
     }
 
@@ -124,22 +132,22 @@ impl ColumnStatsAccumulator {
     /// synchronous CDC hot loop — whose rows are re-sketched for free when they
     /// later spill to a Vortex file at checkpoint. Min/max/null-count stats are
     /// maintained regardless of this flag.
-    pub(crate) fn new_with_ndv(schema: &arrow_schema::Schema, compute_ndv: bool) -> Self {
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a column whose Arrow type Vortex cannot represent.
+    pub(crate) fn new_with_ndv(
+        schema: &arrow_schema::Schema,
+        compute_ndv: bool,
+    ) -> VortexResult<Self> {
         let num_cols = schema.fields().len();
-        let dtypes: Vec<vortex::dtype::DType> = schema
+        // Converted the way the Vortex writer converts the table schema, so each
+        // column's statistics are typed like the column in the file.
+        let dtypes = schema
             .fields()
             .iter()
-            .map(|f| {
-                vortex::dtype::DType::from_arrow((
-                    f.data_type(),
-                    if f.is_nullable() {
-                        vortex::dtype::Nullability::Nullable
-                    } else {
-                        vortex::dtype::Nullability::NonNullable
-                    },
-                ))
-            })
-            .collect();
+            .map(|f| crate::stats::ARROW_SESSION.from_arrow_field(f))
+            .collect::<VortexResult<Vec<vortex::dtype::DType>>>()?;
         // NDV sketches only for NDV-tracked columns (integers, strings, temporal);
         // other columns get `None` so the write path skips them. When
         // `compute_ndv` is false every slot is `None`, so `update` folds nothing
@@ -152,7 +160,7 @@ impl ColumnStatsAccumulator {
                     .then(crate::hll::HyperLogLog::new)
             })
             .collect();
-        Self {
+        Ok(Self {
             state: std::sync::Mutex::new(ColumnStatsState {
                 columns: vec![vortex::array::stats::StatsSet::default(); num_cols],
                 seeded: vec![false; num_cols],
@@ -161,6 +169,30 @@ impl ColumnStatsAccumulator {
             dtypes,
             row_count: std::sync::atomic::AtomicI64::new(0),
             schema: schema.clone(),
+        })
+    }
+
+    /// An empty accumulator for the same schema that keeps NDV sketches for the
+    /// same columns as this one.
+    pub(crate) fn empty_like(&self) -> Self {
+        let num_cols = self.dtypes.len();
+        let ndv = match self.state.lock() {
+            Ok(state) => state
+                .ndv
+                .iter()
+                .map(|slot| slot.as_ref().map(|_| crate::hll::HyperLogLog::new()))
+                .collect(),
+            Err(_) => (0..num_cols).map(|_| None).collect(),
+        };
+        Self {
+            state: std::sync::Mutex::new(ColumnStatsState {
+                columns: vec![vortex::array::stats::StatsSet::default(); num_cols],
+                seeded: vec![false; num_cols],
+                ndv,
+            }),
+            dtypes: self.dtypes.clone(),
+            row_count: std::sync::atomic::AtomicI64::new(0),
+            schema: self.schema.clone(),
         }
     }
 
@@ -310,6 +342,16 @@ impl ColumnStatsAccumulator {
     }
 
     /// Compute `DataFusion` `ColumnStatistics` from a single Arrow column.
+    ///
+    /// Nested columns (`Map`, `List`, `Struct`, `Union`, and dictionary or
+    /// run-end encodings of them) report only the null count. Their min/max
+    /// could only come from a per-row `ScalarValue` scan, the persisted Vortex
+    /// statistics cannot represent it, and `DataFusion` does not prune on a
+    /// nested value's bounds. `ScalarValue`'s `Map` ordering is also
+    /// unreliable: rows sliced from one batch all compare equal, at a cost that
+    /// grows with the whole batch, so the scan is quadratic and returns an
+    /// arbitrary row. Parquet, ORC, Iceberg, and Delta Lake likewise keep bounds
+    /// only for primitive leaf columns.
     pub(crate) fn compute_column_stats(
         col: &dyn arrow::array::Array,
     ) -> datafusion_common::ColumnStatistics {
@@ -317,7 +359,7 @@ impl ColumnStatsAccumulator {
 
         let null_count = Precision::Exact(col.null_count());
 
-        if col.is_empty() || col.null_count() == col.len() {
+        if col.is_empty() || col.null_count() == col.len() || col.data_type().is_nested() {
             return datafusion_common::ColumnStatistics {
                 null_count,
                 min_value: Precision::Absent,
@@ -645,6 +687,29 @@ impl ColumnStatsAccumulator {
         }
 
         // Merge per-column NDV sketches (register-wise max).
+        Self::merge_ndv(&mut state, other_ndv);
+    }
+
+    /// Merge only `other`'s NDV sketches, leaving the row count and min/max/null
+    /// statistics as they are.
+    pub(crate) fn merge_ndv_from(&self, other: &Self) {
+        let other_ndv = {
+            let Ok(other_state) = other.state.lock() else {
+                tracing::warn!(
+                    "ColumnStatsAccumulator: mutex poisoned in merge_ndv_from(), skipping"
+                );
+                return;
+            };
+            other_state.ndv.clone()
+        };
+        let Ok(mut state) = self.state.lock() else {
+            tracing::warn!("ColumnStatsAccumulator: mutex poisoned in merge_ndv_from(), skipping");
+            return;
+        };
+        Self::merge_ndv(&mut state, other_ndv);
+    }
+
+    fn merge_ndv(state: &mut ColumnStatsState, other_ndv: Vec<Option<crate::hll::HyperLogLog>>) {
         for (idx, other_hll) in other_ndv.into_iter().enumerate() {
             let (Some(other_hll), Some(slot)) = (other_hll, state.ndv.get_mut(idx)) else {
                 continue;
@@ -688,8 +753,9 @@ impl ColumnStatsAccumulator {
             return None;
         };
 
-        let file_stats = crate::stats::build_file_statistics(state.columns.clone(), &self.schema);
-        match crate::stats::serialize_file_statistics(&file_stats) {
+        match crate::stats::build_file_statistics(state.columns.clone(), &self.schema)
+            .and_then(|file_stats| crate::stats::serialize_file_statistics(&file_stats))
+        {
             Ok(bytes) => Some((bytes, row_count)),
             Err(e) => {
                 tracing::warn!("Failed to serialize file statistics: {e}");
@@ -739,7 +805,7 @@ mod tests {
             Field::new("ts", DataType::Timestamp(TimeUnit::Microsecond, None), true),
             Field::new("amount", DataType::Float64, true),
         ]);
-        let acc = ColumnStatsAccumulator::new(&schema);
+        let acc = ColumnStatsAccumulator::new(&schema).expect("supported schema");
 
         // 100 distinct ids, 4 distinct names (each repeated 25x), 10 distinct
         // dates, 7 distinct timestamps, and floats (which must not get a sketch).
@@ -781,5 +847,115 @@ mod tests {
             None,
             "float column must not get an NDV sketch"
         );
+    }
+
+    fn header_map(keys: &[Option<&str>]) -> arrow::array::MapArray {
+        let mut builder = arrow::array::MapBuilder::new(
+            None,
+            arrow::array::StringBuilder::new(),
+            arrow::array::StringBuilder::new(),
+        );
+        for key in keys {
+            match key {
+                Some(key) => {
+                    builder.keys().append_value(key);
+                    builder.values().append_value("v");
+                    builder.append(true).expect("append map entry");
+                }
+                None => builder.append(false).expect("append null map"),
+            }
+        }
+        builder.finish()
+    }
+
+    fn assert_null_count_only(stats: &datafusion_common::ColumnStatistics, nulls: usize) {
+        use datafusion_common::stats::Precision;
+        assert_eq!(stats.null_count, Precision::Exact(nulls));
+        assert_eq!(
+            stats.min_value,
+            Precision::Absent,
+            "nested min must be absent"
+        );
+        assert_eq!(
+            stats.max_value,
+            Precision::Absent,
+            "nested max must be absent"
+        );
+    }
+
+    // regression test for #14368
+    #[test]
+    fn nested_columns_report_null_count_without_min_max() {
+        use arrow::array::{Array, DictionaryArray, ListArray, StructArray, UInt8Array};
+        use arrow::datatypes::Int64Type;
+
+        // Keys chosen so a per-row scan that treats every row as equal would
+        // report 'm' as both bounds instead of 'a'/'z'.
+        let map = header_map(&[Some("m"), Some("z"), None, Some("a")]);
+        assert_null_count_only(&ColumnStatsAccumulator::compute_column_stats(&map), 1);
+
+        let list = ListArray::from_iter_primitive::<Int64Type, _, _>(vec![
+            Some(vec![Some(3), Some(1)]),
+            None,
+            Some(vec![Some(2)]),
+        ]);
+        assert_null_count_only(&ColumnStatsAccumulator::compute_column_stats(&list), 1);
+
+        let structs = StructArray::from(vec![(
+            Arc::new(Field::new("a", DataType::Int64, true)),
+            Arc::new(Int64Array::from(vec![Some(2), Some(1)])) as arrow::array::ArrayRef,
+        )]);
+        assert_null_count_only(&ColumnStatsAccumulator::compute_column_stats(&structs), 0);
+
+        let dictionary = DictionaryArray::new(
+            UInt8Array::from(vec![0, 0, 0]),
+            Arc::new(list.slice(0, 1)) as arrow::array::ArrayRef,
+        );
+        assert!(dictionary.data_type().is_nested());
+        assert_null_count_only(
+            &ColumnStatsAccumulator::compute_column_stats(&dictionary),
+            0,
+        );
+    }
+
+    #[test]
+    fn nested_column_stats_leave_primitive_columns_intact() {
+        use arrow::array::Array;
+        use datafusion_common::stats::Precision;
+
+        let schema = arrow_schema::Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(
+                "headers",
+                header_map(&[Some("x")]).data_type().clone(),
+                true,
+            ),
+        ]);
+        let batch = RecordBatch::try_new(
+            Arc::new(schema.clone()),
+            vec![
+                Arc::new(Int64Array::from(vec![7, 3, 9])),
+                Arc::new(header_map(&[Some("b"), None, Some("a")])),
+            ],
+        )
+        .expect("batch");
+
+        let stats = crate::provider::file_pruning::statistics_from_record_batches(
+            &Arc::new(schema.clone()),
+            std::slice::from_ref(&batch),
+        );
+        assert_eq!(stats.num_rows, Precision::Exact(3));
+        let id = &stats.column_statistics[0];
+        assert_eq!(id.min_value, Precision::Exact(ScalarValue::Int64(Some(3))));
+        assert_eq!(id.max_value, Precision::Exact(ScalarValue::Int64(Some(9))));
+        assert_null_count_only(&stats.column_statistics[1], 1);
+
+        // The persisted path still produces a blob for the table.
+        let acc = ColumnStatsAccumulator::new(&schema).expect("supported schema");
+        acc.update(&batch);
+        let (_, rows) = acc
+            .to_file_statistics_blob_with_row_count()
+            .expect("file statistics blob");
+        assert_eq!(rows, 3);
     }
 }

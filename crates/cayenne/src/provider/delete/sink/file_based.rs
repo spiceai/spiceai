@@ -40,7 +40,6 @@ use async_trait::async_trait;
 use data_components::delete::DeletionSink;
 use datafusion::datasource::listing::ListingTable;
 use datafusion::execution::TaskContext;
-use datafusion::execution::config::SessionConfig;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion_catalog::TableProvider;
@@ -354,7 +353,7 @@ impl FileBasedDeletionSink {
         // Vortex footer/segment caches live inside the VortexFormat embedded in the
         // shared ListingTable and are unaffected by this SessionContext.
         let ctx = SessionContext::new_with_config_rt(
-            SessionConfig::default(),
+            util::session_state::session_config(),
             Arc::clone(&self.runtime_env),
         );
 
@@ -449,6 +448,7 @@ impl DeletionSink for FileBasedDeletionSink {
     ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         // Acquire write lock to prevent racing with concurrent inserts or catalog refreshes.
         let _write_guard = self.write_lock.lock().await;
+        self.provider.ensure_publication_outcome_known()?;
         // Acquire the listing fence in write mode so new scan plan-builds
         // cannot resolve a file listing while we are physically unlinking
         // files. In-flight scans that already released their read fence

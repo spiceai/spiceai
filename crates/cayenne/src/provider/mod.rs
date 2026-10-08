@@ -71,6 +71,8 @@ limitations under the License.
 //! - [`constants`]: Staging-dir name, WAL filename, and other shared constants.
 //! - [`partitioned_wal`]: Cross-partition WAL for the partitioned-table
 //!   coordinator (feature-gated).
+pub(crate) mod append_commit;
+pub(crate) mod append_stage;
 pub(crate) mod clustering;
 pub(crate) mod cold_partition;
 pub(crate) mod column_stats;
@@ -87,6 +89,7 @@ pub(crate) mod file_digest;
 pub(crate) mod file_pruning;
 pub(crate) mod fsync_tier;
 pub(crate) mod inlined_cache;
+pub(crate) mod key_conflicts;
 pub(crate) mod lookup_index;
 pub(crate) mod maintenance;
 pub(crate) mod maintenance_metrics;
@@ -98,13 +101,16 @@ pub(crate) mod memory_account;
 pub(crate) mod mutation_writer;
 pub(crate) mod on_conflict;
 pub(crate) mod overwrite;
+pub(crate) mod overwrite_postpass;
 pub mod partitioned_wal;
 pub(crate) mod pk_index;
 pub(crate) mod pk_keyset_budget;
 pub(crate) mod pk_validation;
 pub(crate) mod predicate_stats;
+pub(crate) mod protected_merge_claims;
 pub(crate) mod query_admission;
 pub(crate) mod retention;
+pub(crate) mod runtime_restricted_scan;
 pub(crate) mod scan;
 pub(crate) mod sink;
 pub(crate) mod staged_upsert;
@@ -114,6 +120,9 @@ pub(crate) mod structural_version;
 pub(crate) mod table;
 pub(crate) mod transaction;
 pub(crate) mod tuning;
+#[cfg(test)]
+mod tuning_sim;
+pub(crate) mod update_keys;
 pub(crate) mod utils;
 pub(crate) mod vortex_format;
 pub(crate) mod wal_checksum;
@@ -146,8 +155,8 @@ pub use scan::CayenneAccelerationExec;
 pub use staged_upsert::{CayenneStagedUpsert, PreparedTxnCommit, TransactionWriteToken};
 pub use staging_wal::{CayenneStagedAppend, PartitionedWalObjectStore, PreparedStagedAppend};
 pub use table::{
-    CayenneCdcWrite, CayenneTableProvider, CayenneTableProviderBuilder, LastSmallFileCompactPath,
-    PreparedAppendSnapshotPublish, ScanViewReuse,
+    CayenneCdcWrite, CayenneTableProvider, CayenneTableProviderBuilder, FileDeletionHold,
+    LastSmallFileCompactPath, PreparedAppendSnapshotPublish, ScanViewReuse,
 };
 pub use transaction::{CayenneTransaction, TransactionCommit, TxnTable};
 pub use tuning::{
@@ -1898,14 +1907,15 @@ mod tests {
                 ),
             ]);
             let offsets = arrow::buffer::OffsetBuffer::new(vec![0i32, 1, 2].into());
-            let map = arrow::array::make_array(
-                arrow::array::ArrayData::builder(map_of(entries_nullable))
-                    .len(2)
-                    .add_buffer(offsets.into_inner().into_inner())
-                    .add_child_data(entries.to_data())
-                    .build()
-                    .expect("build the map array"),
-            );
+            let builder = arrow::array::ArrayData::builder(map_of(entries_nullable))
+                .len(2)
+                .add_buffer(offsets.into_inner().into_inner())
+                .add_child_data(entries.to_data());
+            // SAFETY: the offsets, buffers and child data are well formed. Only the
+            // `entries` nullability declaration is what `ArrayData::validate` rejects,
+            // and reproducing it is the point of the fixture — legacy inline data on
+            // disk carries exactly this declaration.
+            let map = arrow::array::make_array(unsafe { builder.build_unchecked() });
             RecordBatch::try_new(
                 schema_with(entries_nullable),
                 vec![Arc::new(Int32Array::from(vec![1, 2])), map],

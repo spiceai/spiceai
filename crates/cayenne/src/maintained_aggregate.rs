@@ -19,9 +19,10 @@ limitations under the License.
 //! The implementation follows a conservative DBSP-style delta contract: rows
 //! are applied as positive deltas only while the view is known fresh. Any
 //! operation that needs a retraction but cannot provide the old row values marks
-//! the view stale. The physical optimizer may only serve this state when its
-//! freshness epoch exactly matches the scan snapshot epoch captured by
-//! [`crate::provider::CayenneAccelerationExec`].
+//! the view stale. The physical optimizer may only serve this state when it is
+//! fresh at the scan snapshot epoch captured by
+//! [`crate::provider::CayenneAccelerationExec`], so the served batch is the
+//! aggregate of the rows that scan would read.
 
 use std::collections::BTreeMap;
 use std::collections::HashMap;
@@ -31,16 +32,18 @@ use std::sync::Arc;
 use arrow::array::{Array, ArrayRef, BooleanArray, RecordBatch, new_empty_array};
 use arrow::datatypes::Decimal128Type;
 use arrow_schema::{DECIMAL128_MAX_PRECISION, DECIMAL128_MAX_SCALE, DataType, FieldRef, SchemaRef};
+use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::error::Result as DataFusionResult;
 use datafusion::logical_expr::ColumnarValue;
+use datafusion::physical_expr_common::physical_expr::is_volatile;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion_common::{DataFusionError, ScalarValue};
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
 use datafusion_functions_aggregate_common::utils::DecimalAverager;
-use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_expr::expressions::{CastExpr, Column, Literal};
 use datafusion_physical_expr::{Distribution, OrderingRequirements};
+use datafusion_physical_expr::{DynamicFilterTracking, PhysicalExpr, split_conjunction};
 use datafusion_physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
 use parking_lot::RwLock;
 
@@ -56,8 +59,10 @@ pub struct MaintainedAggregateSpec {
     /// equivalent of a query `WHERE`. `None` maintains the aggregate over every
     /// row (the original behavior). When set, maintenance applies only rows the
     /// predicate selects, and the optimizer serves a query from this view only
-    /// when the query's filter matches this predicate exactly (see
-    /// [`MaintainedAggregateView::matches_query`]). This is what lets the
+    /// when the predicate the query's scan applies has exactly this predicate's
+    /// conjuncts (see [`PredicateConjuncts`]). A volatile predicate selects
+    /// different rows on every evaluation, so a view declared with one never
+    /// serves. This is what lets the
     /// flagship serve filtered analytical queries (e.g. CH-benCH q1/q6) that
     /// every general-purpose engine must re-scan O(rows) for, while Cayenne
     /// maintains the filtered relation from the CDC delta and serves O(groups).
@@ -149,6 +154,10 @@ struct MaintainedAggregateView {
     /// is treated exactly as an absent row (not indexed, not accumulated), so all
     /// retraction logic is reused unchanged. See [`MaintainedAggregateSpec::filter`].
     filter: Option<Arc<dyn PhysicalExpr>>,
+    /// `filter` as the conjunct set a query's predicate is matched against:
+    /// empty when the view has no filter, `None` when the filter is volatile, so
+    /// the view describes rows no query can reproduce and never serves.
+    filter_conjuncts: Option<PredicateConjuncts>,
     groups: HashMap<Vec<ScalarValue>, GroupAccumulator>,
     /// Primary-key column indices in the input batch. Empty means no per-PK
     /// index is maintained, so retraction is unavailable and the legacy
@@ -456,12 +465,113 @@ impl SortedScalarIndex {
 struct QueryAggregateSpec {
     group_by: Vec<String>,
     aggregates: Vec<QueryAggregateExpr>,
-    /// The query's row predicate (captured from a `FilterExec` between the
-    /// aggregate and the Cayenne scan), or `None` for an unfiltered query. A
-    /// view serves the query only when this matches the view's own filter
-    /// exactly — a filtered view must never answer an unfiltered query, and vice
+    /// The predicate every row reaching the aggregate satisfied — the query's
+    /// `WHERE`, wherever planning put it — or no conjuncts for an unfiltered
+    /// query. A view serves the query only when this equals the view's own
+    /// filter: a filtered view must never answer an unfiltered query, and vice
     /// versa, or the result would be wrong.
-    filter: Option<Arc<dyn PhysicalExpr>>,
+    filter: PredicateConjuncts,
+}
+
+/// A row predicate as the set of its `AND`-ed conjuncts, compared independently
+/// of the plan that carries it.
+///
+/// A query's `WHERE` reaches the physical optimizer in whatever shape planning
+/// left it: a `FilterExec` above the scan, a predicate pushed into a Vortex file
+/// source, a `FilterExec` on the scan's in-memory branch, or several of these at
+/// once. Each copy references columns by the position in its own input, so the
+/// same column is `ol_delivery_d@1` above the scan and `ol_delivery_d@6` in a
+/// file source. Comparing conjunct sets makes the match independent of how the
+/// predicate was split across operators and in what order, and identifying each
+/// column by name alone makes it independent of position. Everything else is
+/// compared structurally, literal types included, so a predicate matches only
+/// one written against the same column types.
+#[derive(Debug, Clone, Default)]
+pub struct PredicateConjuncts(Vec<Arc<dyn PhysicalExpr>>);
+
+impl PredicateConjuncts {
+    /// The conjuncts of `predicate`, or `None` when it is volatile or dynamic. A
+    /// volatile function (`random()`) or a hash join's runtime filter selects
+    /// different rows each time it is evaluated, so no maintained view can
+    /// describe the rows it keeps.
+    #[must_use]
+    pub fn try_from_predicate(predicate: &Arc<dyn PhysicalExpr>) -> Option<Self> {
+        let mut conjuncts = Self::default();
+        conjuncts.try_add_predicate(predicate)?;
+        Some(conjuncts)
+    }
+
+    /// Adds the conjuncts of `predicate`, with the same `None` contract as
+    /// [`Self::try_from_predicate`]. On `None`, `self` may hold some of the
+    /// conjuncts and must be discarded.
+    #[must_use]
+    pub fn try_add_predicate(&mut self, predicate: &Arc<dyn PhysicalExpr>) -> Option<()> {
+        if is_volatile(predicate)
+            || DynamicFilterTracking::classify(predicate).contains_dynamic_filter()
+        {
+            return None;
+        }
+        for conjunct in split_conjunction(predicate) {
+            // A pushed-down filter can leave a literal `true` behind where a
+            // conjunct was absorbed; it selects every row.
+            if conjunct
+                .downcast_ref::<Literal>()
+                .is_some_and(|literal| literal.value() == &ScalarValue::Boolean(Some(true)))
+            {
+                continue;
+            }
+            self.insert(name_columns_only(conjunct).ok()?);
+        }
+        Some(())
+    }
+
+    /// Adds every conjunct of `other`.
+    pub fn extend(&mut self, other: &Self) {
+        for conjunct in &other.0 {
+            self.insert(Arc::clone(conjunct));
+        }
+    }
+
+    /// Whether there are no conjuncts, i.e. the predicate selects every row.
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn insert(&mut self, conjunct: Arc<dyn PhysicalExpr>) {
+        if !self.0.contains(&conjunct) {
+            self.0.push(conjunct);
+        }
+    }
+}
+
+/// Set equality: both sides hold each conjunct once, so equal lengths and
+/// containment one way imply containment the other way.
+impl PartialEq for PredicateConjuncts {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.len() == other.0.len() && self.0.iter().all(|conjunct| other.0.contains(conjunct))
+    }
+}
+
+impl Eq for PredicateConjuncts {}
+
+/// `expr` with every column reference identified by its name alone (position
+/// 0), so two copies of a predicate planned over different input schemas
+/// compare equal.
+fn name_columns_only(expr: &Arc<dyn PhysicalExpr>) -> DataFusionResult<Arc<dyn PhysicalExpr>> {
+    Arc::clone(expr)
+        .transform_up(|node| {
+            let Some(column) = node.downcast_ref::<Column>() else {
+                return Ok(Transformed::no(node));
+            };
+            if column.index() == 0 {
+                return Ok(Transformed::no(node));
+            }
+            Ok(Transformed::yes(
+                Arc::new(Column::new(column.name(), 0)) as Arc<dyn PhysicalExpr>
+            ))
+        })
+        .data()
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -514,6 +624,17 @@ impl ExecutionPlan for MaintainedAggregateExec {
 
     fn properties(&self) -> &Arc<PlanProperties> {
         self.inner.properties()
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -645,6 +766,13 @@ impl MaintainedAggregateRegistry {
     #[must_use]
     pub fn is_stale(&self) -> bool {
         self.state.read().status == RegistryStatus::Stale
+    }
+
+    /// The epoch of the last delta or rebuild the registry took in, whether or not
+    /// it is stale.
+    #[cfg(test)]
+    pub(crate) fn epoch_for_test(&self) -> u64 {
+        self.state.read().epoch
     }
 
     /// Approximate resident bytes currently retained across every view, and the
@@ -811,7 +939,7 @@ impl MaintainedAggregateRegistry {
     /// Materialize a maintained aggregate batch matching `aggregate`, if fresh.
     ///
     /// Returns `None` when the aggregate shape is unsupported, no declared view
-    /// matches it, or the registry is stale for the scan snapshot epoch.
+    /// matches it, or the registry is stale or not at the scan snapshot epoch.
     ///
     /// # Errors
     ///
@@ -821,7 +949,12 @@ impl MaintainedAggregateRegistry {
         aggregate: &AggregateExec,
         scan_epoch: u64,
     ) -> DataFusionResult<Option<RecordBatch>> {
-        self.batch_for_aggregate_with_output(aggregate, aggregate, scan_epoch, None)
+        self.batch_for_aggregate_with_output(
+            aggregate,
+            aggregate,
+            scan_epoch,
+            PredicateConjuncts::default(),
+        )
     }
 
     /// Materialize a maintained aggregate batch by matching `query_aggregate`
@@ -829,7 +962,8 @@ impl MaintainedAggregateRegistry {
     ///
     /// This is used for `DataFusion`'s split aggregate plans: the partial
     /// aggregate still names the original input columns, while the final
-    /// aggregate carries the user-visible output schema.
+    /// aggregate carries the user-visible output schema. `filter` is the
+    /// predicate every row reaching `query_aggregate` satisfied.
     ///
     /// # Errors
     ///
@@ -839,7 +973,7 @@ impl MaintainedAggregateRegistry {
         query_aggregate: &AggregateExec,
         output_aggregate: &AggregateExec,
         scan_epoch: u64,
-        filter: Option<Arc<dyn PhysicalExpr>>,
+        filter: PredicateConjuncts,
     ) -> DataFusionResult<Option<RecordBatch>> {
         let Some(mut query) = query_spec_for_aggregate(query_aggregate) else {
             return Ok(None);
@@ -850,17 +984,18 @@ impl MaintainedAggregateRegistry {
 
     /// Serve a maintained view directly from a declared [`MaintainedAggregateSpec`]
     /// (group-by + aggregates + optional filter) into `output_schema`, without an
-    /// `AggregateExec`. Exercises the exact fresh/epoch gate, view match (incl.
+    /// `AggregateExec`. Exercises the same fresh/epoch gate, view match (incl.
     /// filter equality), and O(groups) materialize the optimizer rewrite uses —
     /// the entry point for benches/tests that measure the maintained serve cost.
     ///
     /// # Returns
     ///
-    /// `Ok(Some(batch))` when the registry is fresh at `scan_epoch`, a view
-    /// matches `spec` exactly, and it materializes into `output_schema`.
+    /// `Ok(Some(batch))` when the registry is fresh at `scan_epoch`, a
+    /// view matches `spec` exactly, and it materializes into `output_schema`.
     /// `Ok(None)` is the fallback signal (the caller should run normal
-    /// execution) when the registry is stale at `scan_epoch`, no view matches
-    /// `spec`, or the matched view does not fit `output_schema`.
+    /// execution) when the registry is stale or at a different epoch than
+    /// `scan_epoch`, no view matches `spec`, or the matched view does not fit
+    /// `output_schema`.
     ///
     /// # Errors
     ///
@@ -873,6 +1008,13 @@ impl MaintainedAggregateRegistry {
         scan_epoch: u64,
         output_schema: SchemaRef,
     ) -> DataFusionResult<Option<RecordBatch>> {
+        let filter = match &spec.filter {
+            None => PredicateConjuncts::default(),
+            Some(filter) => match PredicateConjuncts::try_from_predicate(filter) {
+                Some(filter) => filter,
+                None => return Ok(None),
+            },
+        };
         let query = QueryAggregateSpec {
             group_by: spec.group_by.clone(),
             aggregates: spec
@@ -883,13 +1025,21 @@ impl MaintainedAggregateRegistry {
                     column: aggregate.column.clone(),
                 })
                 .collect(),
-            filter: spec.filter.clone(),
+            filter,
         };
         self.serve(&query, scan_epoch, output_schema)
     }
 
     /// Shared serve path: only answer from a maintained view when the registry is
-    /// fresh at the scan epoch and a view matches the query shape exactly.
+    /// fresh at the scan's epoch and a view matches the query shape exactly.
+    ///
+    /// The rewrite replaces an immutable scan snapshot. A registry at a different
+    /// epoch holds a different published state of the table, so serving it would
+    /// make this aggregate disagree with other scans of the same snapshot. A
+    /// read-only CDC table may reuse a scan view across later writes; when that
+    /// happens the registry is ahead and this path falls back to the captured
+    /// scan. A registry behind the scan also falls back: it would drop rows the
+    /// snapshot contains.
     fn serve(
         &self,
         query: &QueryAggregateSpec,
@@ -932,9 +1082,14 @@ impl MaintainedAggregateView {
                 )));
             }
         }
+        let filter_conjuncts = match &spec.filter {
+            None => Some(PredicateConjuncts::default()),
+            Some(filter) => PredicateConjuncts::try_from_predicate(filter),
+        };
         Ok(Self {
             spec: ResolvedAggregateSpec::try_new(spec, schema)?,
             filter: spec.filter.clone(),
+            filter_conjuncts,
             groups: HashMap::new(),
             pk_columns,
             pk_index: HashMap::new(),
@@ -1163,25 +1318,13 @@ impl MaintainedAggregateView {
     }
 
     fn matches_query(&self, query: &QueryAggregateSpec) -> bool {
-        // Filter must match EXACTLY: an unfiltered view (filter `None`) answers
-        // only unfiltered queries; a filtered view answers only a query carrying
-        // the identical predicate. `Arc<dyn PhysicalExpr>` compares structurally
-        // (DataFusion's `DynEq`), so two equivalent predicates over the same
-        // schema match. A mismatch (or an unrecognized predicate) falls back to
-        // the base-table scan — correct, just not accelerated.
-        //
-        // BOUNDARY (known limitation): the comparison is index- and type-sensitive
-        // (`Column{index}`, typed `Literal`). The view's filter is parsed against
-        // the table schema (config time) while the query's filter is the
-        // `FilterExec` predicate captured from the physical plan. If a projection
-        // or type-coercion sits between the scan and the filter (e.g. a
-        // `SchemaCastScanExec` reordering columns or advertising `Utf8View` over a
-        // stored `Utf8`), the predicates differ structurally and this returns
-        // `false`, so the view SILENTLY does not serve and the query re-scans. A
-        // future slice can normalize both predicates to a schema-independent
-        // (column-name + canonical-literal) form before comparison; until then,
-        // declare the filter so it matches the query's scan-output predicate.
-        self.filter == query.filter
+        // The filter must match exactly: an unfiltered view answers only
+        // unfiltered queries, and a filtered view only a query whose rows
+        // satisfied the same conjuncts. A predicate that is equivalent but
+        // written differently (`a > 1` against `1 < a`), or compares a column
+        // under a different type, does not match and the query re-scans the
+        // table — correct, just not accelerated.
+        self.filter_conjuncts.as_ref() == Some(&query.filter)
             && self
                 .spec
                 .group_by
@@ -1996,13 +2139,15 @@ impl AggregateAccumulator {
 
 /// Whether an `AggregateExec`'s shape (independent of its aggregation mode) is one
 /// the maintained-aggregate machinery can serve: no LIMIT folded into the aggregate,
-/// no per-aggregate FILTER, and a single non-`GROUPING SET` grouping. The accepted
+/// no per-aggregate FILTER, and at most one non-`GROUPING SET` grouping. A `GROUP
+/// BY` plans one grouping; an aggregate without one plans none
+/// (`PhysicalGroupBy::new(vec![], vec![], vec![], false)`). The accepted
 /// `AggregateMode`s differ by call site, so the mode gate is checked separately.
 pub(crate) fn aggregate_shape_is_maintainable(aggregate: &AggregateExec) -> bool {
     aggregate.limit_options().is_none()
         && aggregate.filter_expr().iter().all(Option::is_none)
         && !aggregate.group_expr().has_grouping_set()
-        && aggregate.group_expr().groups().len() == 1
+        && aggregate.group_expr().groups().len() <= 1
 }
 
 /// The `Column` an aggregate input expression ultimately references, seeing
@@ -2080,10 +2225,10 @@ fn query_spec_for_aggregate(aggregate: &AggregateExec) -> Option<QueryAggregateS
     Some(QueryAggregateSpec {
         group_by,
         aggregates,
-        // The aggregate node carries no filter; the optimizer captures any
-        // `FilterExec` predicate during plan descent and sets it via
+        // The aggregate node carries no filter; the optimizer derives the
+        // predicate its input applied during plan descent and passes it to
         // `batch_for_aggregate_with_output`.
-        filter: None,
+        filter: PredicateConjuncts::default(),
     })
 }
 
@@ -2448,9 +2593,11 @@ mod tests {
         TimestampMicrosecondArray, UInt64Array,
     };
     use arrow_schema::{Field, Schema, TimeUnit};
+    use datafusion::logical_expr::Operator;
     use datafusion::physical_expr::aggregate::AggregateExprBuilder;
-    use datafusion::physical_expr::expressions::{cast, col, lit};
+    use datafusion::physical_expr::expressions::{binary, cast, col, lit};
     use datafusion::physical_plan::aggregates::PhysicalGroupBy;
+    use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
     use datafusion_common::cast::{
         as_float64_array, as_int64_array, as_string_array, as_uint64_array,
     };
@@ -2458,6 +2605,7 @@ mod tests {
     use datafusion_functions_aggregate::count::count_udaf;
     use datafusion_functions_aggregate::min_max::{max_udaf, min_udaf};
     use datafusion_functions_aggregate::sum::sum_udaf;
+    use datafusion_physical_expr::expressions::DynamicFilterPhysicalExpr;
 
     fn schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
@@ -2489,6 +2637,36 @@ mod tests {
             ],
         )
         .expect("test batch should be valid")
+    }
+
+    /// A hash join's runtime filter keeps different rows as the join runs, so a
+    /// predicate that carries one has no conjuncts a maintained view can match.
+    #[test]
+    fn a_predicate_with_a_dynamic_filter_has_no_conjuncts() -> DataFusionResult<()> {
+        let schema = schema();
+        let static_filter = binary(col("i", &schema)?, Operator::Gt, lit(0i64), &schema)?;
+        let static_conjuncts =
+            PredicateConjuncts::try_from_predicate(&static_filter).map(|conjuncts| {
+                conjuncts
+                    .0
+                    .iter()
+                    .map(ToString::to_string)
+                    .collect::<Vec<_>>()
+            });
+        assert_eq!(static_conjuncts, Some(vec!["i@0 > 0".to_string()]));
+
+        // `name` is column 0 already, so the conjunct would pass through
+        // `name_columns_only` unchanged if the dynamic filter were not refused.
+        let dynamic_filter: Arc<dyn PhysicalExpr> = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![col("name", &schema)?],
+            lit(true),
+        ));
+        let with_dynamic_filter = binary(static_filter, Operator::And, dynamic_filter, &schema)?;
+        assert_eq!(
+            PredicateConjuncts::try_from_predicate(&with_dynamic_filter),
+            None
+        );
+        Ok(())
     }
 
     #[test]
@@ -2560,6 +2738,47 @@ mod tests {
             Some(&(1, 1, Some(-2), Some(2.5)))
         );
         assert_eq!(rows.get(&None), Some(&(1, 1, Some(3), Some(4.5))));
+        Ok(())
+    }
+
+    /// The rewrite replaces an immutable scan snapshot, so it may serve only the
+    /// registry state taken at that snapshot's epoch. A reused CDC scan view can
+    /// trail the registry; serving the newer state would count writes the scan
+    /// does not contain (`base_scan_count_at_epoch_1=4`,
+    /// `maintained_count_at_epoch_2=8`).
+    #[test]
+    fn serves_only_the_matching_scan_epoch() -> DataFusionResult<()> {
+        let spec = MaintainedAggregateSpec {
+            filter: None,
+            group_by: vec!["name".to_string()],
+            aggregates: vec![MaintainedAggregateExpr {
+                function: MaintainedAggregateFunction::Count,
+                column: None,
+            }],
+        };
+        let registry = MaintainedAggregateRegistry::try_new(&[spec], &schema())?;
+        registry.apply_insert_batches(1, &[batch()])?;
+        registry.apply_insert_batches(2, &[batch()])?;
+        let aggregate =
+            aggregate_exec_for(&[("count(*)", MaintainedAggregateFunction::Count, None)])?;
+
+        assert!(
+            registry.batch_for_aggregate(&aggregate, 1)?.is_none(),
+            "a registry ahead of the scan snapshot must not serve it"
+        );
+        let served = registry
+            .batch_for_aggregate(&aggregate, 2)?
+            .expect("a registry at the scan snapshot serves it");
+        let counts = as_int64_array(served.column(1))?;
+        assert_eq!(
+            counts.iter().flatten().sum::<i64>(),
+            8,
+            "the matching epoch includes both batches"
+        );
+        assert!(
+            registry.batch_for_aggregate(&aggregate, 3)?.is_none(),
+            "a registry behind the scan snapshot must not serve it"
+        );
         Ok(())
     }
 
@@ -2759,7 +2978,7 @@ mod tests {
         let exec = Arc::new(MaintainedAggregateExec::try_new(batch())?);
 
         assert_eq!(exec.children().len(), 1);
-        let required_distribution = exec.required_input_distribution();
+        let required_distribution = exec.input_distribution_requirements().into_per_child();
         assert_eq!(required_distribution.len(), 1);
         assert!(matches!(
             required_distribution.as_slice(),
@@ -2770,12 +2989,14 @@ mod tests {
         assert!(required_ordering[0].is_none());
         assert_eq!(exec.maintains_input_order(), vec![true]);
         assert_eq!(exec.benefits_from_input_partitioning(), vec![false]);
+        let recompute = ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute);
         Arc::clone(&exec)
-            .with_new_children(Vec::new())
+            .replace_children(Vec::new(), recompute)
             .expect_err("missing maintained aggregate child should be rejected");
 
         let replacement = MemorySourceConfig::try_new_exec(&[vec![batch()]], schema(), None)?;
-        let rewritten = exec.with_new_children(vec![replacement])?;
+        let rewritten = exec.replace_children(vec![replacement], recompute)?;
+
         assert_eq!(rewritten.children().len(), 1);
 
         Ok(())

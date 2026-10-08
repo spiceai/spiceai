@@ -1,17 +1,22 @@
 name: Substrait compliance
 
-# Mode A TPC-H on merge_group, push to trunk/release/feature branches,
-# nightly schedule, and manual dispatch. Not triggered on pull_request.
-# Per-query FAIL/ERROR still exit 0 (report-only pass rate). Do not fail
-# the repository on pass rate until a threshold is set. A harness/build
-# crash must still fail the job.
+# Mode A TPC-H at scale factor 1: the IBM suite's Substrait plans run through
+# the workspace `datafusion-substrait` consumer over TPC-H tables the harness
+# generates with `tpchgen`, compared against the SF 1 goldens in
+# `tools/substrait-compliance/expected/sf1`. Runs on every merge-queue entry,
+# on push to trunk/release/feature branches, nightly, and on manual dispatch.
+# Not triggered on pull_request.
 #
-# Not a required check (`scripts/signoff` REQUIRED_CHECKS): the job runs
-# in the merge queue (path-gated below), on push to trunk/release/feature,
-# and on schedule/dispatch, but a low pass rate does not block merge.
-# `merge_group` cannot honour `paths`, so that event is gated with
-# check-code-changes instead. Docs-only / harness Markdown edits are
-# excluded from those globs so they do not pay for a 90m compile.
+# The merge queue runs it for every entry, with no path filter. What it
+# measures is the Substrait consumer and the DataFusion and arrow tree beneath
+# it, which a Cargo.toml, Cargo.lock or fork-pin change anywhere in the
+# workspace can move, so a filter would skip exactly the entries that change
+# the answer.
+#
+# Report-only on pass rate: per-query FAIL/ERROR exit 0, and the job is not a
+# required check (`scripts/signoff` REQUIRED_CHECKS), so the queue does not
+# wait on it and a low pass rate does not block a merge. A harness/build
+# crash still fails the job.
 
 on:
   push:
@@ -34,9 +39,6 @@ concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
   cancel-in-progress: true
 
-# check-code-changes only runs on merge_group here, where dorny/paths-filter
-# diffs the checkout (`git diff <base>..<head>`). push/schedule/dispatch
-# skip path filtering and always run Mode A.
 permissions:
   contents: read
 
@@ -47,57 +49,18 @@ env:
   SUBSTRAIT_COMPLIANCE_REF: 43d31411c69ef7594887c7d759037bcf8244eeed
 
 jobs:
-  # merge_group cannot path-filter, so decide here whether Mode A should
-  # run. push, schedule, and workflow_dispatch always run Mode A —
-  # dispatch has no useful base to diff (see verus_verify.yml).
-  check_changes:
-    runs-on: ubuntu-latest
-    timeout-minutes: 45
-    outputs:
-      relevant_changes: ${{ steps.check.outputs.relevant_changes == 'true' || github.event_name != 'merge_group' }}
-    steps:
-      - name: Non-merge-group events always run Mode A
-        if: ${{ github.event_name != 'merge_group' }}
-        run: echo "Mode A TPC-H runs on push, schedule, and workflow_dispatch"
-
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: ${{ github.event_name == 'merge_group' }}
-        with:
-          persist-credentials: false
-          fetch-depth: 0
-
-      - name: Check for relevant changes
-        if: ${{ github.event_name == 'merge_group' }}
-        id: check
-        uses: ./.github/actions/check-code-changes
-        with:
-          # Path gate for merge_group only. Harness globs omit `*.md` so
-          # README/RESULTS edits report green without running Mode A.
-          # Keep this list in lockstep with any future path documentation.
-          filters: |
-            code_changes:
-              - 'tools/substrait-compliance/src/**'
-              - 'tools/substrait-compliance/scripts/**'
-              - 'tools/substrait-compliance/Cargo.toml'
-              - 'tools/substrait-compliance/.gitignore'
-              - 'tools/substrait-compliance/NOTICE'
-              - 'Cargo.toml'
-              - 'Cargo.lock'
-              - 'rust-toolchain.toml'
-              - 'rust-toolchain'
-              - '.cargo/**'
-              - '.github/workflows/substrait_compliance.yml'
-              - '.github/actions/setup-rust/**'
-              - '.github/actions/install-protoc/**'
-              - '.github/actions/check-code-changes/**'
-              - 'crates/yaml/**'
-
   mode_a_tpch:
     name: Mode A TPC-H
-    needs: check_changes
-    if: ${{ needs.check_changes.outputs.relevant_changes == 'true' }}
-    runs-on: ubuntu-24.04
-    timeout-minutes: 90
+    # The standard pool, not `spiceai-macos-large`: a debug build of the
+    # harness, then an SF 1 run that takes about 11 seconds.
+    runs-on: spiceai-macos
+    timeout-minutes: 60
+    env:
+      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
+      # MinIO is only the fallback cache, and only on push: merge_group checks
+      # out the queue merge commit, which contains the queued pull request, and
+      # a spiceio miss must not fall through to those credentials.
+      HAS_TEST_MINIO_SECRET: ${{ github.event_name == 'push' && secrets.TEST_MINIO_ENDPOINT != '' && secrets.TEST_MINIO_ACCESS_KEY != '' && secrets.TEST_MINIO_SECRET_KEY != '' }}
     steps:
       - name: Checkout spiceai
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -121,23 +84,54 @@ jobs:
       - name: Install Protoc
         uses: ./.github/actions/install-protoc
 
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+      - name: Set up spiceio
+        if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
+        id: setup-spiceio
+        uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
-          workspaces: '. -> target'
-          save-if: ${{ github.ref == 'refs/heads/trunk' }}
+          smb-url: smb://runner@192.168.3.148/ai_platform_dev
+          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          token: ${{ github.token }}
+          bucket: sccache
+          region: us-west-1
+          immutable-objects: "true"
+          otel-endpoint: spicehq/spiceio
+          otel-api-key: ${{ secrets.SCP_SPICEHQ_SPICEIO_API_KEY }}
+          otel-region: us-west-2
+          instance-id: ci-${{ github.run_id }}-${{ github.job }}
+          machine: ${{ runner.name }}
 
-      - name: Run Mode A TPC-H
+      - name: Set up sccache
+        uses: ./.github/actions/setup-sccache
+        with:
+          minio_endpoint: ${{ env.HAS_TEST_MINIO_SECRET == 'true' && secrets.TEST_MINIO_ENDPOINT || '' }}
+          spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
+          minio_access_key: ${{ env.HAS_TEST_MINIO_SECRET == 'true' && secrets.TEST_MINIO_ACCESS_KEY || '' }}
+          minio_secret_key: ${{ env.HAS_TEST_MINIO_SECRET == 'true' && secrets.TEST_MINIO_SECRET_KEY || '' }}
+
+      - name: Run Mode A TPC-H at SF 1
         # Per-query FAIL/ERROR already exit 0 (report-only pass rate).
         # A nonzero exit is a harness/build/IO failure and must fail the job.
         run: |
           cargo run -p spice-substrait-compliance -- \
             --mode mode-a \
+            --scale-factor 1 \
             --suite tools/substrait-compliance/.ibm/test-suites/tpch \
             --out-json tools/substrait-compliance/results/mode-a-tpch.json \
             --out-csv tools/substrait-compliance/results/mode-a-tpch.csv
 
+      - name: Show sccache stats
+        if: always() && env.SCCACHE_SETUP == 'true'
+        # `always()`: this is the one step that reports cache health, so it must
+        # also run on the failures it would explain. The `||` keeps a diagnostic
+        # from deciding the verdict.
+        run: |
+          sccache --show-stats || echo "::warning::sccache --show-stats failed, so the cache server is not answering either. Read a build failure in this job as a possible cache-backend outage rather than a code failure."
+
+      # Merge-queue checks keep no artifacts. The push run for the merged
+      # commit, the nightly and a dispatch still publish the reports.
       - name: Upload JSON and CSV reports
-        if: ${{ !cancelled() }}
+        if: ${{ !cancelled() && github.event_name != 'merge_group' }}
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: substrait-compliance-mode-a-tpch
@@ -145,3 +139,15 @@ jobs:
             tools/substrait-compliance/results/mode-a-tpch.json
             tools/substrait-compliance/results/mode-a-tpch.csv
           if-no-files-found: warn
+
+      - name: Kill spiceio
+        if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
+        run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
+
+      - name: Upload spiceio logs
+        if: always() && runner.os == 'macOS' && github.event_name != 'merge_group'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: spiceio-substrait-compliance-logs
+          path: ${{ runner.temp }}/spiceio.log
+          if-no-files-found: ignore
