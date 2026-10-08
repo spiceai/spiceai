@@ -976,6 +976,19 @@ fn apply_serve_time_table_clock(entry: &mut ServableEntry, validity: EntryValidi
     }
 }
 
+/// A cache key claimed for one stale-while-revalidate background revalidation.
+/// Dropping it releases the key.
+struct RevalidationClaim {
+    locks: &'static moka::sync::Cache<u64, (), std::hash::RandomState>,
+    key: u64,
+}
+
+impl Drop for RevalidationClaim {
+    fn drop(&mut self) {
+        self.locks.invalidate(&self.key);
+    }
+}
+
 impl Query {
     /// Serves a hit [`Self::probe_results_cache`] found.
     ///
@@ -1366,19 +1379,37 @@ impl Query {
         namespace: CacheNamespace,
         cached_input_tables: Arc<HashSet<TableReference>>,
     ) {
-        // Static Moka cache to track ongoing revalidation tasks by cache key.
-        // This provides built-in single-in-flight semantics - if multiple requests
-        // trigger revalidation for the same key, only one task will run.
-        static REVALIDATION_LOCKS: OnceLock<moka::future::Cache<u64, (), std::hash::RandomState>> =
+        // Cache keys with a background revalidation pending or running. A stale hit
+        // claims its key before spawning anything, so every other stale hit on the key
+        // finds the claim and skips, however the runtime schedules the tasks. A claim
+        // taken inside the spawned task coalesces only the revalidations that overlap
+        // in time: a task that starts after the first one finished runs the same query
+        // again. The time-to-live bounds how long a revalidation that never ends can
+        // keep its key from being refreshed.
+        static REVALIDATION_LOCKS: OnceLock<moka::sync::Cache<u64, (), std::hash::RandomState>> =
             OnceLock::new();
         let locks = REVALIDATION_LOCKS.get_or_init(|| {
-            moka::future::Cache::builder()
+            moka::sync::Cache::builder()
                 .max_capacity(10_000) // Track up to 10k concurrent revalidations
                 .time_to_live(std::time::Duration::from_mins(5)) // Auto-cleanup after 5min
                 .build()
         });
 
         let cache_key_u64 = cache_key.as_u64();
+        if !locks.entry(cache_key_u64).or_insert(()).is_fresh() {
+            tracing::debug!(
+                cache_key = cache_key_u64,
+                "Background revalidation already in progress for this cache key, skipped"
+            );
+            cache::metrics::sql_results::STALE_WHILE_REVALIDATE_SKIPPED.add(1, &[]);
+            return;
+        }
+        // Released when the revalidation ends, whether it stores, fails, or is dropped
+        // with its runtime, so the next stale hit on this key can start another.
+        let claim = RevalidationClaim {
+            locks,
+            key: cache_key_u64,
+        };
 
         // Create a background request context with NoCache to bypass cache lookup
         let background_context = Self::create_background_context(namespace);
@@ -1393,112 +1424,89 @@ impl Query {
 
         // Build the background task
         let background_task = async move {
-            // optionally_get_with provides automatic single-in-flight: if another task
-            // is already running for this key, this will return None immediately
-            let result = locks
-                .optionally_get_with(cache_key_u64, async move {
-                    // Only count as a background query when this task actually runs the revalidation
-                    cache::metrics::sql_results::STALE_WHILE_REVALIDATE_BACKGROUND_QUERIES
-                        .add(1, &[]);
+            let _claim = claim;
+            cache::metrics::sql_results::STALE_WHILE_REVALIDATE_BACKGROUND_QUERIES.add(1, &[]);
 
+            tracing::debug!(
+                cache_key = cache_key_u64,
+                "Starting background revalidation task"
+            );
+
+            let (query, input_tables) = Self::prepare_revalidation_query(
+                &df,
+                &sql_owned,
+                plan_owned,
+                parameters_owned,
+                cached_input_tables,
+            );
+
+            // Captured before the query reads anything, so any
+            // invalidation of its tables that lands while it executes
+            // is ordered after this point and rejects the write.
+            let revalidation_started_at = std::time::Instant::now();
+
+            let result = background_context
+                .scope(async move { query.run().await })
+                .await;
+
+            match result {
+                Ok(query_result) => {
+                    let schema = query_result
+                        .cached_schema()
+                        .unwrap_or_else(|| query_result.schema());
+                    let physical_plan = query_result.physical_plan();
                     tracing::debug!(
                         cache_key = cache_key_u64,
-                        "Starting background revalidation task"
+                        "Background query execution succeeded, collecting batches"
                     );
-
-                    let (query, input_tables) = Self::prepare_revalidation_query(
-                        &df,
-                        &sql_owned,
-                        plan_owned,
-                        parameters_owned,
-                        cached_input_tables,
-                    );
-
-                    // Captured before the query reads anything, so any
-                    // invalidation of its tables that lands while it executes
-                    // is ordered after this point and rejects the write.
-                    let revalidation_started_at = std::time::Instant::now();
-
-                    let result = background_context
-                        .scope(async move { query.run().await })
-                        .await;
-
-                    match result {
-                        Ok(query_result) => {
-                            let schema = query_result
-                                .cached_schema()
-                                .unwrap_or_else(|| query_result.schema());
-                            let physical_plan = query_result.physical_plan();
+                    match query_result.collect_batches().await {
+                        Ok(batches) => {
                             tracing::debug!(
                                 cache_key = cache_key_u64,
-                                "Background query execution succeeded, collecting batches"
+                                num_batches = batches.len(),
+                                "Collected batches, now caching"
                             );
-                            match query_result.collect_batches().await {
-                                Ok(batches) => {
-                                    tracing::debug!(
-                                        cache_key = cache_key_u64,
-                                        num_batches = batches.len(),
-                                        "Collected batches, now caching"
-                                    );
-                                    Self::cache_revalidation_result(
-                                        &df,
-                                        &cache_key,
-                                        batches,
-                                        schema,
-                                        input_tables,
-                                        revalidation_started_at,
-                                        physical_plan,
-                                    )
-                                    .await;
-                                }
-                                Err(e) => {
-                                    tracing::debug!(
-                                        cache_key = cache_key_u64,
-                                        "Background revalidation failed during collection: {}",
-                                        e
-                                    );
-                                    record_revalidation_outcome(failed_revalidation_outcome(
-                                        &e,
-                                        RevalidationOutcome::CollectFailed,
-                                    ));
-                                }
-                            }
+                            Self::cache_revalidation_result(
+                                &df,
+                                &cache_key,
+                                batches,
+                                schema,
+                                input_tables,
+                                revalidation_started_at,
+                                physical_plan,
+                            )
+                            .await;
                         }
                         Err(e) => {
                             tracing::debug!(
                                 cache_key = cache_key_u64,
-                                "Background revalidation query failed: {}",
+                                "Background revalidation failed during collection: {}",
                                 e
                             );
                             record_revalidation_outcome(failed_revalidation_outcome(
                                 &e,
-                                RevalidationOutcome::QueryFailed,
+                                RevalidationOutcome::CollectFailed,
                             ));
                         }
                     }
-
+                }
+                Err(e) => {
                     tracing::debug!(
                         cache_key = cache_key_u64,
-                        "Background revalidation task completed"
+                        "Background revalidation query failed: {}",
+                        e
                     );
-
-                    // Return Some to indicate this task completed the revalidation
-                    Some(())
-                })
-                .await;
-
-            if result == Some(()) {
-                // This task was the one that ran the revalidation
-                // Remove the single-flight guard so future stale hits can trigger another refresh
-                locks.invalidate(&cache_key_u64).await;
-            } else {
-                // Another task is already revalidating this key
-                tracing::debug!(
-                    cache_key = cache_key_u64,
-                    "Background revalidation already in progress for this cache key, skipped"
-                );
-                cache::metrics::sql_results::STALE_WHILE_REVALIDATE_SKIPPED.add(1, &[]);
+                    record_revalidation_outcome(failed_revalidation_outcome(
+                        &e,
+                        RevalidationOutcome::QueryFailed,
+                    ));
+                }
             }
+
+            tracing::debug!(
+                cache_key = cache_key_u64,
+                "Background revalidation task completed"
+            );
         };
 
         // Spawn on dedicated refresh runtime if configured, otherwise use current runtime.
