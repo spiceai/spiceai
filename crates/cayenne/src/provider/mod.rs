@@ -2300,6 +2300,176 @@ mod tests {
         decimal_scale_statistics_publication(true).await;
     }
 
+    #[tokio::test(flavor = "current_thread")]
+    async fn schema_evolution_queued_integer_statistics_remain_conservative_after_reopen() {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let connection = format!("sqlite://{}", temp_dir.path().join("integer.db").display());
+        let catalog = Arc::new(CayenneCatalog::new(connection.as_str()).expect("catalog"));
+        catalog.init().await.expect("init catalog");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int32, false),
+        ]));
+        let ctx = SessionContext::new();
+        let provider = Arc::new(
+            CayenneTableProvider::create_table(
+                Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+                CreateTableOptions {
+                    table_name: "integer_rows".to_string(),
+                    schema: Arc::clone(&schema),
+                    primary_key: vec![],
+                    on_conflict: None,
+                    base_path: temp_dir.path().to_string_lossy().to_string(),
+                    partition_column: None,
+                    vortex_config: crate::metadata::VortexConfig::default(),
+                },
+                ctx.runtime_env(),
+            )
+            .await
+            .expect("create table"),
+        );
+        let batch = |id: i64, value: i32| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(vec![id])),
+                    Arc::new(Int32Array::from(vec![value])),
+                ],
+            )
+            .expect("batch")
+        };
+        insert_batch(&provider, batch(1, 10)).await;
+        provider
+            .drain_in_flight_maintenance()
+            .await
+            .expect("baseline maintenance");
+        provider
+            .checkpoint_inlined_data()
+            .await
+            .expect("baseline checkpoint");
+        provider
+            .drain_in_flight_maintenance()
+            .await
+            .expect("baseline drain");
+        let metadata = catalog.get_table("integer_rows").await.expect("metadata");
+        let baseline = catalog
+            .get_table_statistics(&metadata.table_id)
+            .await
+            .expect("baseline stats")
+            .expect("baseline exists");
+        assert_eq!(baseline.num_rows, 1);
+        assert!(
+            baseline.num_rows_exact,
+            "must start with a real exact aggregate"
+        );
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+        *provider.test_pre_maintenance_statistics_hook.lock() = Some(Box::new(move || {
+            Box::pin(async move {
+                let _ = entered_tx.send(());
+                let _ = release_rx.await;
+            })
+        }));
+        insert_batch(&provider, batch(2, 20)).await;
+        tokio::time::timeout(std::time::Duration::from_secs(30), entered_rx)
+            .await
+            .expect("capture queued delta")
+            .expect("capture signal");
+        let incoming = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]);
+        let plan = widening_plan(&schema, &incoming, &[]);
+        assert!(!plan.changes_decimal_scale());
+        provider
+            .evolve_schema_live(&plan)
+            .await
+            .expect("integer widening");
+        let mut release = Some(release_tx);
+        for phase in ["parked", "drained"] {
+            if phase == "drained" {
+                release
+                    .take()
+                    .expect("release sender")
+                    .send(())
+                    .expect("release old accumulator");
+                provider
+                    .drain_in_flight_maintenance()
+                    .await
+                    .expect("drain rejected accumulator");
+            }
+            let ctx = SessionContext::new();
+            let catalog =
+                Arc::new(CayenneCatalog::new(connection.as_str()).expect("fresh catalog"));
+            catalog.init().await.expect("init fresh catalog");
+            let reopened = Arc::new(
+                CayenneTableProvider::new(
+                    "integer_rows",
+                    Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+                    ctx.runtime_env(),
+                )
+                .await
+                .expect("reopen"),
+            );
+            ctx.register_table(
+                "integer_rows",
+                Arc::clone(&reopened) as Arc<dyn datafusion::datasource::TableProvider>,
+            )
+            .expect("register");
+            let rows = ctx
+                .sql("SELECT id, value FROM integer_rows ORDER BY id")
+                .await
+                .expect("plan rows")
+                .collect()
+                .await
+                .expect("rows");
+            let mut actual = Vec::new();
+            for b in rows {
+                assert_eq!(b.column(0).null_count(), 0, "non-NULL id");
+                assert_eq!(b.column(1).null_count(), 0, "non-NULL value");
+                let ids = b
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("ids");
+                let values = b
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("widened values");
+                for i in 0..b.num_rows() {
+                    actual.push((ids.value(i), values.value(i)));
+                }
+            }
+            assert_eq!(actual, vec![(1, 10), (2, 20)]);
+            let count = query_count(&ctx, "SELECT COUNT(*) FROM integer_rows").await;
+            let durable = catalog
+                .get_table_statistics(&metadata.table_id)
+                .await
+                .expect("durable stats");
+            let optimizer = reopened.optimizer_table_statistics();
+            eprintln!(
+                "INTEGER_REOPEN {phase} rows={actual:?} sql_count={count} durable={:?} optimizer={:?}",
+                durable.as_ref().map(|s| (s.num_rows, s.num_rows_exact)),
+                optimizer.as_ref().map(|s| s.num_rows)
+            );
+            assert_eq!(
+                count, 2,
+                "metadata COUNT must agree with projected rows after reopening"
+            );
+            if let Some(stats) = durable
+                && stats.num_rows_exact
+            {
+                assert_eq!(stats.num_rows, 2);
+            }
+            if let Some(stats) = optimizer
+                && let datafusion_common::stats::Precision::Exact(n) = stats.num_rows
+            {
+                assert_eq!(n, 2);
+            }
+        }
+    }
+
     async fn decimal_scale_statistics_publication(in_flight: bool) {
         async fn assert_decimal_rows(
             provider: Arc<CayenneTableProvider>,
