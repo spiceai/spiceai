@@ -432,7 +432,12 @@ jobs:
       - name: Bootstrap DuckLake TPCH SF1 catalog
         if: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') }}
         run: |
-          python -m pip install --upgrade duckdb minio
+          # DuckLake stamps its catalog with the version of the extension that wrote it, and spiced reads it
+          # with the DuckDB version the `duckdb` crate pins in Cargo.toml. A newer duckdb writes a catalog the
+          # runtime's extension rejects: "Only DuckLake versions 0.1, 0.2, 0.3-dev1 and 0.3 are supported".
+          duckdb_version=$(awk -F'"' '/^duckdb = "/ { print $2; exit }' Cargo.toml)
+          [ -n "$duckdb_version" ] || { echo 'could not read the duckdb version from Cargo.toml'; exit 1; }
+          python -m pip install --upgrade "duckdb==$duckdb_version" minio
 
           python <<'PY'
           import duckdb
@@ -496,6 +501,44 @@ jobs:
 
           connection.close()
           PY
+
+      # The Databricks cluster auto-terminates when idle. A run that arrives while it is still starting
+      # fails every dataset with "The cluster is in unexpected state Pending, while waiting for RUNNING",
+      # and spiced never reaches ready. Bring it up and wait before launching spiced.
+      - name: Start the Databricks cluster
+        if: ${{ contains(github.event.inputs.spicepod_path, 'spark') }}
+        env:
+          DATABRICKS_HOST: ${{ vars.DATABRICKS_HOST }}
+          DATABRICKS_TOKEN: ${{ secrets.DATABRICKS_TOKEN }}
+          DATABRICKS_CLUSTER_ID: ${{ vars.DATABRICKS_CLUSTER_ID }}
+        run: |
+          # The Clusters API takes cluster_id as a query/body parameter; a path segment such as
+          # /clusters/<id>/start returns ENDPOINT_NOT_FOUND.
+          base="https://${DATABRICKS_HOST}/api/2.1/clusters"
+          auth="Authorization: Bearer ${DATABRICKS_TOKEN}"
+
+          state() {
+            curl -s "${base}/get?cluster_id=${DATABRICKS_CLUSTER_ID}" -H "$auth" | jq -r '.state // .message'
+          }
+
+          state_now=$(state)
+          echo "cluster ${DATABRICKS_CLUSTER_ID} state: ${state_now}"
+          if [ "$state_now" = "TERMINATED" ]; then
+            curl -s -X POST "${base}/start" -H "$auth" -H 'Content-Type: application/json' \
+              -d "{\"cluster_id\":\"${DATABRICKS_CLUSTER_ID}\"}" > /dev/null
+          fi
+
+          for _ in $(seq 1 80); do
+            state_now=$(state)
+            echo "cluster ${DATABRICKS_CLUSTER_ID} state: ${state_now}"
+            case "$state_now" in
+              RUNNING) exit 0 ;;
+              ERROR) echo "cluster ${DATABRICKS_CLUSTER_ID} is ERROR"; exit 1 ;;
+            esac
+            sleep 15
+          done
+          echo "cluster ${DATABRICKS_CLUSTER_ID} did not reach RUNNING"
+          exit 1
 
       # `--disable-caching` sends `Cache-Control: no-cache` on the benchmark's Flight
       # connection. It is load-bearing: `runtime.caching.sql_results` is enabled by
