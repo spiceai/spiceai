@@ -32,7 +32,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use app::AppBuilder;
 use arrow::array::{Array, RecordBatch, StringArray};
-use axum::{Router, routing::get};
+use axum::{Router, extract::RawQuery, routing::get};
 use futures::TryStreamExt;
 use runtime::Runtime;
 use runtime_request_context::{Protocol, RequestContext, UserAgent};
@@ -65,8 +65,9 @@ impl OriginCounts {
     }
 }
 
-/// Serve `/items`, answering `get-response` to a GET and `post-response` to a
-/// POST, and count each method.
+/// Serve `/items`, answering `get-response` to a GET (`get-response?<query>`
+/// when it carries a query) and `post-response` to a POST, and count each
+/// method.
 async fn start_origin() -> (oneshot::Sender<()>, SocketAddr, Arc<OriginCounts>) {
     let counts = Arc::new(OriginCounts::default());
     let get_counts = Arc::clone(&counts);
@@ -75,9 +76,13 @@ async fn start_origin() -> (oneshot::Sender<()>, SocketAddr, Arc<OriginCounts>) 
 
     let app = Router::new().route(
         "/items",
-        get(move || {
+        get(move |RawQuery(query): RawQuery| {
             get_counts.get.fetch_add(1, Ordering::SeqCst);
-            async { ([("content-type", "text/plain")], "get-response") }
+            let body = match query {
+                Some(query) if !query.is_empty() => format!("get-response?{query}"),
+                _ => "get-response".to_string(),
+            };
+            async move { ([("content-type", "text/plain")], body) }
         })
         .post(move || {
             post_counts.post.fetch_add(1, Ordering::SeqCst);
@@ -515,6 +520,59 @@ async fn test_caching_mode_explicit_empty_post_with_reordered_columns() -> Resul
             counts.snapshot(),
             (get0, post0 + 1),
             "one POST to the origin"
+        );
+        Ok(())
+    }
+    .await;
+    shutdown.send(()).ok();
+    result
+}
+
+/// A lookup with a query is cached; a later lookup on the same path with no
+/// query must not be answered with it, since the unaccelerated dataset sends
+/// the request without the query.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_caching_mode_get_without_query_after_get_with_query() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug"));
+    register_test_connectors().await;
+    let (shutdown, addr, counts) = start_origin().await;
+    let admin = admin_request_context();
+
+    let result = async {
+        let rt = start_runtime(&format!("http://{addr}"), "caching_query_then_no_query").await?;
+
+        let with_query = run_sql(
+            &rt,
+            &admin,
+            "SELECT content FROM cached WHERE request_path = '/items' AND request_query = 'q=a'",
+        )
+        .await;
+        assert_eq!(contents(&with_query), vec!["get-response?q=a"]);
+        wait_for_cached_rows(&rt, &admin, "cached", 1).await;
+        let (get0, post0) = counts.snapshot();
+
+        let direct = run_sql(
+            &rt,
+            &admin,
+            &format!("SELECT content FROM direct {GET_LOOKUP}"),
+        )
+        .await;
+        assert_eq!(contents(&direct), vec!["get-response"]);
+        let cached = run_sql(
+            &rt,
+            &admin,
+            &format!("SELECT content FROM cached {GET_LOOKUP}"),
+        )
+        .await;
+        assert_eq!(
+            contents(&cached),
+            contents(&direct),
+            "a lookup without a query must not be served the cached query's response"
+        );
+        assert_eq!(
+            counts.snapshot(),
+            (get0 + 2, post0),
+            "both lookups reach the origin"
         );
         Ok(())
     }
