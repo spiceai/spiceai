@@ -976,16 +976,67 @@ fn apply_serve_time_table_clock(entry: &mut ServableEntry, validity: EntryValidi
     }
 }
 
-/// A cache key claimed for one stale-while-revalidate background revalidation.
-/// Dropping it releases the key.
-struct RevalidationClaim {
-    locks: &'static moka::sync::Cache<u64, (), std::hash::RandomState>,
-    key: u64,
+/// Cache keys with a stale-while-revalidate background revalidation pending or
+/// running, each held by the generation of the claim that took it.
+struct RevalidationClaims {
+    held: moka::sync::Cache<u64, u64, std::hash::RandomState>,
+    next_generation: std::sync::atomic::AtomicU64,
 }
 
-impl Drop for RevalidationClaim {
+impl RevalidationClaims {
+    /// `time_to_live` bounds how long a revalidation that never ends can keep its
+    /// key from being claimed again.
+    fn new(time_to_live: std::time::Duration) -> Self {
+        Self {
+            held: moka::sync::Cache::builder()
+                .max_capacity(10_000) // Track up to 10k concurrent revalidations
+                .time_to_live(time_to_live)
+                .build(),
+            next_generation: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Claims `key` for one revalidation, or returns `None` while another claim
+    /// holds it.
+    fn claim(&self, key: u64) -> Option<RevalidationClaim<'_>> {
+        let generation = self
+            .next_generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let claimed = self.held.entry(key).and_compute_with(|held| match held {
+            Some(_) => moka::ops::compute::Op::Nop,
+            None => moka::ops::compute::Op::Put(generation),
+        });
+        matches!(claimed, moka::ops::compute::CompResult::Inserted(_)).then_some(
+            RevalidationClaim {
+                claims: self,
+                key,
+                generation,
+            },
+        )
+    }
+}
+
+/// A cache key claimed for one stale-while-revalidate background revalidation.
+/// Dropping it releases the key.
+struct RevalidationClaim<'a> {
+    claims: &'a RevalidationClaims,
+    key: u64,
+    generation: u64,
+}
+
+impl Drop for RevalidationClaim<'_> {
     fn drop(&mut self) {
-        self.locks.invalidate(&self.key);
+        // Only this claim's own generation is released. A revalidation that outlived
+        // the time-to-live may have been replaced by a later claim on the same key,
+        // which has to stay held until its own revalidation ends.
+        let generation = self.generation;
+        self.claims
+            .held
+            .entry(self.key)
+            .and_compute_with(|held| match held {
+                Some(entry) if *entry.value() == generation => moka::ops::compute::Op::Remove,
+                _ => moka::ops::compute::Op::Nop,
+            });
     }
 }
 
@@ -1384,31 +1435,21 @@ impl Query {
         // finds the claim and skips, however the runtime schedules the tasks. A claim
         // taken inside the spawned task coalesces only the revalidations that overlap
         // in time: a task that starts after the first one finished runs the same query
-        // again. The time-to-live bounds how long a revalidation that never ends can
-        // keep its key from being refreshed.
-        static REVALIDATION_LOCKS: OnceLock<moka::sync::Cache<u64, (), std::hash::RandomState>> =
-            OnceLock::new();
-        let locks = REVALIDATION_LOCKS.get_or_init(|| {
-            moka::sync::Cache::builder()
-                .max_capacity(10_000) // Track up to 10k concurrent revalidations
-                .time_to_live(std::time::Duration::from_mins(5)) // Auto-cleanup after 5min
-                .build()
-        });
+        // again.
+        static REVALIDATION_CLAIMS: OnceLock<RevalidationClaims> = OnceLock::new();
+        let claims = REVALIDATION_CLAIMS
+            .get_or_init(|| RevalidationClaims::new(std::time::Duration::from_mins(5)));
 
         let cache_key_u64 = cache_key.as_u64();
-        if !locks.entry(cache_key_u64).or_insert(()).is_fresh() {
+        // Released when the revalidation ends, whether it stores, fails, or is dropped
+        // with its runtime, so the next stale hit on this key can start another.
+        let Some(claim) = claims.claim(cache_key_u64) else {
             tracing::debug!(
                 cache_key = cache_key_u64,
                 "Background revalidation already in progress for this cache key, skipped"
             );
             cache::metrics::sql_results::STALE_WHILE_REVALIDATE_SKIPPED.add(1, &[]);
             return;
-        }
-        // Released when the revalidation ends, whether it stores, fails, or is dropped
-        // with its runtime, so the next stale hit on this key can start another.
-        let claim = RevalidationClaim {
-            locks,
-            key: cache_key_u64,
         };
 
         // Create a background request context with NoCache to bypass cache lookup
@@ -4119,6 +4160,38 @@ mod tests {
                 );
             })
             .await;
+    }
+
+    /// A claim whose revalidation outlives the time-to-live is replaced by a later
+    /// claim on the same key. Releasing the expired claim must leave its replacement
+    /// held, or a third stale hit would start a revalidation alongside the second.
+    #[test]
+    fn releasing_an_expired_revalidation_claim_keeps_its_replacement_held() {
+        let claims = RevalidationClaims::new(Duration::from_millis(50));
+        let expired = claims.claim(7).expect("an unheld key is claimed");
+        assert!(claims.claim(7).is_none(), "a held key is not claimed twice");
+
+        // Time itself is under test: the first claim has to outlive its time-to-live.
+        std::thread::sleep(Duration::from_millis(150));
+        let replacement = claims
+            .claim(7)
+            .expect("an expired claim no longer holds its key");
+
+        assert_ne!(replacement.generation, expired.generation);
+
+        drop(expired);
+        assert_eq!(
+            claims.held.get(&7),
+            Some(replacement.generation),
+            "releasing the expired claim must not release its replacement"
+        );
+
+        drop(replacement);
+        assert_eq!(
+            claims.held.get(&7),
+            None,
+            "the key is free again once its holder releases it"
+        );
     }
 
     #[tokio::test]
