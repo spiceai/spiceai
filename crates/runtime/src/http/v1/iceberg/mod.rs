@@ -30,6 +30,7 @@ use serde::{self, Deserialize, Serialize};
 
 mod error;
 pub mod namespace;
+mod passthrough;
 pub mod tables;
 
 /// Get Iceberg API config
@@ -37,7 +38,7 @@ pub mod tables;
 /// This endpoint returns the Iceberg Catalog API configuration, including details about overrides, defaults, and available endpoints.
 #[cfg_attr(feature = "openapi", utoipa::path(
     get,
-    path = "/v1/iceberg/config",
+    path = "/v1/config",
     operation_id = "get_config",
     tag = "Iceberg",
     responses(
@@ -47,29 +48,40 @@ pub mod tables;
                 "overrides": {},
                 "defaults": {},
                 "endpoints": [
-                    "GET /v1/iceberg/namespaces",
-                    "HEAD /v1/iceberg/namespaces/{namespace}",
-                    "GET /v1/iceberg/namespaces/{namespace}/tables",
-                    "HEAD /v1/iceberg/namespaces/{namespace}/tables/{table}",
-                    "GET /v1/iceberg/namespaces/{namespace}/tables/{table}"
+                    "GET /v1/{prefix}/namespaces",
+                    "GET /v1/{prefix}/namespaces/{namespace}",
+                    "HEAD /v1/{prefix}/namespaces/{namespace}",
+                    "GET /v1/{prefix}/namespaces/{namespace}/tables",
+                    "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}",
+                    "HEAD /v1/{prefix}/namespaces/{namespace}/tables/{table}"
                 ]
             })
         )))
     )
 ))]
 pub(crate) async fn get_config() -> &'static str {
-    r#"{
+    CONFIG_RESPONSE
+}
+
+/// The Iceberg REST `ConfigResponse`.
+///
+/// `endpoints` uses the resource paths of the Iceberg REST spec, `{prefix}`
+/// placeholder included: clients such as `PyIceberg` and Iceberg Java compare
+/// these strings with their own endpoint constants and refuse any operation not
+/// listed. No `prefix` override is returned, so clients call the paths without
+/// one (`/v1/namespaces`), which is where the routes are served.
+const CONFIG_RESPONSE: &str = r#"{
   "overrides": {},
   "defaults": {},
   "endpoints": [
-    "GET /v1/iceberg/namespaces",
-    "HEAD /v1/iceberg/namespaces/{namespace}",
-    "GET /v1/iceberg/namespaces/{namespace}/tables",
-    "HEAD /v1/iceberg/namespaces/{namespace}/tables/{table}",
-    "GET /v1/iceberg/namespaces/{namespace}/tables/{table}"
+    "GET /v1/{prefix}/namespaces",
+    "GET /v1/{prefix}/namespaces/{namespace}",
+    "HEAD /v1/{prefix}/namespaces/{namespace}",
+    "GET /v1/{prefix}/namespaces/{namespace}/tables",
+    "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}",
+    "HEAD /v1/{prefix}/namespaces/{namespace}/tables/{table}"
   ]
-}"#
-}
+}"#;
 
 #[derive(Debug, Deserialize)]
 #[cfg_attr(feature = "openapi", derive(utoipa::IntoParams))]
@@ -91,7 +103,7 @@ struct NamespacesResponse {
 /// If a `parent` namespace is provided, it will list the child namespaces under the specified parent.
 #[cfg_attr(feature = "openapi", utoipa::path(
     get,
-    path = "/v1/iceberg/namespaces",
+    path = "/v1/namespaces",
     operation_id = "get_iceberg_namespaces",
     tag = "Iceberg",
     params(ParentNamespaceQueryParams),
@@ -156,7 +168,7 @@ pub(crate) async fn get_namespaces(Query(params): Query<ParentNamespaceQueryPara
 /// This endpoint returns a 200 OK response if the namespace exists, otherwise it returns a 404 Not Found response.
 #[cfg_attr(feature = "openapi", utoipa::path(
     head,
-    path = "/v1/iceberg/namespaces/{namespace}",
+    path = "/v1/namespaces/{namespace}",
     operation_id = "head_namespace",
     tag = "Iceberg",
     responses(
@@ -176,16 +188,32 @@ pub(crate) async fn head_namespace(Path(namespace): Path<NamespacePath>) -> Resp
     }
 }
 
-/// Check if a namespace exists.
+/// The Iceberg REST `GetNamespaceResponse`.
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+struct GetNamespaceResponse {
+    namespace: Namespace,
+    /// Always `null`: Spice does not store namespace properties, and the spec
+    /// asks a server without them to return `null` rather than `{}`.
+    properties: Option<std::collections::HashMap<String, String>>,
+}
+
+/// Load an Iceberg namespace
 ///
-/// This endpoint returns a 200 OK response if the namespace exists, otherwise it returns a 404 Not Found response.
+/// Returns the namespace if it exists. Spice does not store namespace properties, so `properties` is `null`.
 #[cfg_attr(feature = "openapi", utoipa::path(
     get,
-    path = "/v1/iceberg/namespaces/{namespace}",
+    path = "/v1/namespaces/{namespace}",
     operation_id = "get_namespace",
     tag = "Iceberg",
     responses(
-        (status = 200, description = "Namespace exists"),
+        (status = 200, description = "Namespace exists", content((
+            GetNamespaceResponse = "application/json",
+            example = json!({
+                "namespace": ["spice", "public"],
+                "properties": null
+            })
+        ))),
         (status = 404, description = "Namespace does not exist"),
         (status = 400, description = "Invalid namespace format")
     )
@@ -198,8 +226,9 @@ pub(crate) async fn get_namespace(Path(namespace): Path<NamespacePath>) -> Respo
     match get_child_namespaces_impl(&df, &namespace) {
         Ok(_) => (
             status::StatusCode::OK,
-            Json(NamespacesResponse {
-                namespaces: vec![namespace],
+            Json(GetNamespaceResponse {
+                namespace,
+                properties: None,
             }),
         )
             .into_response(),
@@ -279,7 +308,7 @@ struct ListTablesResponse {
 
 #[cfg_attr(feature = "openapi", utoipa::path(
     get,
-    path = "/v1/iceberg/namespaces/{namespace}/tables",
+    path = "/v1/namespaces/{namespace}/tables",
     operation_id = "list_tables",
     tag = "Iceberg",
     responses(
@@ -371,5 +400,58 @@ pub(crate) async fn list_tables(Path(namespace): Path<NamespacePath>) -> Respons
             "Invalid namespace: must specify catalog and optionally schema".to_string(),
         )
         .into_response(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{CONFIG_RESPONSE, GetNamespaceResponse, Namespace};
+
+    /// `loadNamespaceMetadata` answers with the spec's `GetNamespaceResponse`,
+    /// which `PyIceberg` validates: `namespace` is required, and `properties`
+    /// is `null` for a server that does not store namespace properties.
+    #[test]
+    fn load_namespace_returns_get_namespace_response() {
+        let body = serde_json::to_value(GetNamespaceResponse {
+            namespace: Namespace::from_parts(vec!["spice".to_string(), "public".to_string()]),
+            properties: None,
+        })
+        .expect("serializes");
+        assert_eq!(
+            body,
+            serde_json::json!({ "namespace": ["spice", "public"], "properties": null })
+        );
+    }
+
+    /// Iceberg REST clients refuse any operation whose endpoint the config does
+    /// not list verbatim in the spec's form (`GET /v1/{prefix}/namespaces`), so
+    /// the list has to name exactly the routes served, in that form.
+    #[test]
+    fn config_advertises_served_routes_in_the_spec_form() {
+        let config: serde_json::Value =
+            serde_json::from_str(CONFIG_RESPONSE).expect("the config response is JSON");
+        let endpoints: Vec<&str> = config["endpoints"]
+            .as_array()
+            .expect("endpoints is an array")
+            .iter()
+            .map(|endpoint| endpoint.as_str().expect("each endpoint is a string"))
+            .collect();
+
+        assert_eq!(
+            endpoints,
+            [
+                "GET /v1/{prefix}/namespaces",
+                "GET /v1/{prefix}/namespaces/{namespace}",
+                "HEAD /v1/{prefix}/namespaces/{namespace}",
+                "GET /v1/{prefix}/namespaces/{namespace}/tables",
+                "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}",
+                "HEAD /v1/{prefix}/namespaces/{namespace}/tables/{table}",
+            ]
+        );
+        assert_eq!(
+            config["overrides"],
+            serde_json::json!({}),
+            "no prefix override"
+        );
     }
 }
