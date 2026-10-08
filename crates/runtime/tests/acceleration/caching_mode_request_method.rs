@@ -205,8 +205,21 @@ const EMPTY_POST_LOOKUP: &str =
     "WHERE request_path = '/items' AND request_query = '' AND request_body = ''";
 
 async fn start_runtime(base_url: &str, app_name: &str) -> Result<Runtime, anyhow::Error> {
+    start_runtime_with(base_url, app_name, None).await
+}
+
+/// Start a runtime whose `cached` dataset uses `refresh_sql` when given.
+async fn start_runtime_with(
+    base_url: &str,
+    app_name: &str,
+    refresh_sql: Option<&str>,
+) -> Result<Runtime, anyhow::Error> {
+    let mut cached = http_dataset(base_url, "cached", true);
+    if let Some(acceleration) = cached.acceleration.as_mut() {
+        acceleration.refresh_sql = refresh_sql.map(str::to_string);
+    }
     let mut app = AppBuilder::new(app_name)
-        .with_dataset(http_dataset(base_url, "cached", true))
+        .with_dataset(cached)
         .with_dataset(http_dataset(base_url, "direct", false))
         .build();
     // Measure only the acceleration-layer cache.
@@ -447,6 +460,60 @@ async fn test_caching_mode_get_with_non_body_predicate_after_post() -> Result<()
             counts.snapshot(),
             (get0 + 2, post0),
             "both lookups reach the origin as a GET"
+        );
+        Ok(())
+    }
+    .await;
+    shutdown.send(()).ok();
+    result
+}
+
+/// The accelerated table exposes the columns `refresh_sql` selects, in its
+/// order, which differs from the source's; an explicit-empty POST, served
+/// from the source, must still return the columns the query names.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_caching_mode_explicit_empty_post_with_reordered_columns() -> Result<(), anyhow::Error>
+{
+    let _tracing = init_tracing(Some("integration=debug"));
+    register_test_connectors().await;
+    let (shutdown, addr, counts) = start_origin().await;
+    let admin = admin_request_context();
+
+    let result = async {
+        let rt = start_runtime_with(
+            &format!("http://{addr}"),
+            "caching_reordered_columns",
+            Some("SELECT content, request_path, request_body FROM cached"),
+        )
+        .await?;
+        let (get0, post0) = counts.snapshot();
+
+        let rows = run_sql(
+            &rt,
+            &admin,
+            &format!("SELECT content, request_path FROM cached {EMPTY_POST_LOOKUP}"),
+        )
+        .await;
+        assert_eq!(contents(&rows), vec!["post-response"]);
+        let paths: Vec<String> = rows
+            .iter()
+            .flat_map(|batch| {
+                let column = batch
+                    .column_by_name("request_path")
+                    .expect("request_path column")
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("request_path is Utf8");
+                (0..column.len())
+                    .map(|i| column.value(i).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(paths, vec!["/items"]);
+        assert_eq!(
+            counts.snapshot(),
+            (get0, post0 + 1),
+            "one POST to the origin"
         );
         Ok(())
     }
