@@ -590,8 +590,8 @@ pub fn sends_explicit_empty_request_body(filters: &[Expr]) -> bool {
 ///
 /// Only `request_body` identifies a cached request reliably: a paginated
 /// response stores each page's own path and query, but every page the
-/// request's body. Empty when the lookup names no request value at all, so
-/// filters only on other columns read across every cached entry, as an
+/// request's body. Empty when the lookup has no predicate on a request column,
+/// so filters only on other columns read across every cached entry, as an
 /// unfiltered scan does.
 ///
 /// Like the namespace predicate, they scope the accelerator read only; the
@@ -601,12 +601,16 @@ pub fn request_identity_filters(
     filters: &[Expr],
     cache_schema: &arrow::datatypes::Schema,
 ) -> Vec<Expr> {
-    // Request headers name a request too, though they are not part of the key
-    // an entry is evicted and refreshed by.
-    let names_request = REQUEST_KEY_COLUMNS
-        .into_iter()
-        .chain(["request_headers"])
-        .any(|column| !HttpTableProvider::request_filter_values(filters, column).is_empty());
+    // Any predicate on a request column makes the read a lookup — even one the
+    // connector turns into no request value, such as `request_body <> 'z'`,
+    // which still sends a GET. Request headers count, though they are not part
+    // of the key an entry is evicted and refreshed by.
+    let names_request = filters.iter().flat_map(Expr::column_refs).any(|column| {
+        REQUEST_KEY_COLUMNS
+            .into_iter()
+            .chain(["request_headers"])
+            .any(|name| column.name == name)
+    });
     if names_request
         && cache_schema.column_with_name(REQUEST_BODY_COLUMN).is_some()
         && HttpTableProvider::request_filter_values(filters, REQUEST_BODY_COLUMN).is_empty()
@@ -4664,7 +4668,7 @@ mod tests {
                 "only a body predicate that sends no body",
                 vec![col("request_body").not_eq(lit("z"))],
                 &http,
-                vec![],
+                get.clone(),
             ),
             ("not an HTTP cache", vec![path], &other, vec![]),
         ];
