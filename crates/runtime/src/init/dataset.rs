@@ -788,21 +788,20 @@ impl Runtime {
         }
 
         let connector_start = Instant::now();
-        let connector = if !bootstrap_status.is_pending()
-            && Self::serves_existing_acceleration(&ds).await
-        {
-            // Served from its existing acceleration at once; the real connector is
-            // built in the background, so the source's state never holds the dataset.
-            Self::reconnecting_connector(&ds)
-        } else {
-            // `load_dataset_connector` owns reporting for this failure -- the
-            // status, the `LOAD_ERROR` count, and a log line at the level its
-            // permanence warrants -- and raises no other error, so propagating it
-            // unreported leaves nothing unreported (#12365). Its reporting is
-            // unconditional, including during teardown, so this path needs no
-            // `is_shutdown()` guard of its own to keep the count at one.
-            self.load_dataset_connector(Arc::clone(&ds)).await?
-        };
+        let connector =
+            if !bootstrap_status.is_pending() && Self::serves_existing_acceleration(&ds).await {
+                // Served from its existing acceleration at once; the real connector is
+                // built in the background, so the source's state never holds the dataset.
+                Self::reconnecting_connector(&ds)
+            } else {
+                // `load_dataset_connector` owns reporting for this failure -- the
+                // status, the `LOAD_ERROR` count, and a log line at the level its
+                // permanence warrants -- and raises no other error, so propagating it
+                // unreported leaves nothing unreported (#12365). Its reporting is
+                // unconditional, including during teardown, so this path needs no
+                // `is_shutdown()` guard of its own to keep the count at one.
+                self.load_dataset_connector(Arc::clone(&ds)).await?
+            };
         tracing::debug!(dataset = %ds.name, duration_ms = connector_start.elapsed().as_millis(), "Dataset connector created");
 
         // Check shutdown between connector load and registration.
