@@ -279,6 +279,7 @@ impl std::fmt::Display for PaginationArgument {
 
 impl PaginationArgument {
     /// Formats the pagination arguments to be inserted into a Graphql variable.
+    /// The cursor is opaque server data, so it is escaped into the string literal.
     ///
     /// Example:
     /// ```rust
@@ -293,7 +294,7 @@ impl PaginationArgument {
     /// );
     /// ```
     fn format_arguments(&self, cursor: Option<String>) -> String {
-        match (self, cursor) {
+        match (self, cursor.map(|c| escape_graphql_string(&c))) {
             (PaginationArgument::First(z), Some(c)) => {
                 format!(r#"first: {z}, after: "{c}""#)
             }
@@ -2913,6 +2914,94 @@ mod tests {
             assert!(
                 rewritten.contains(r#"after: "c1""#),
                 "gateway shrink must keep the nested after cursor, got {rewritten}"
+            );
+        }
+
+        /// A nested `endCursor` is opaque server data: a quote or backslash in it
+        /// must reach the follow-up query escaped, or the query is invalid GraphQL.
+        #[tokio::test]
+        async fn a_nested_cursor_with_quotes_is_sent_escaped() {
+            let server = MockServer::start().await;
+            let cursor = r#"cur"so\r"#;
+
+            Mock::given(method("POST"))
+                .and(body_string_contains("node(id:"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": {"node": {"reviews": reviews_page(&["R3"], false, "c2")}}
+                })))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("POST"))
+                .and(body_string_contains("view(first: 10)"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": {"view": {
+                        "nodes": [{"id": "PR_1", "reviews": reviews_page(&["R1", "R2"], true, cursor)}],
+                        "pageInfo": {"hasNextPage": false, "endCursor": Value::Null},
+                    }}
+                })))
+                .mount(&server)
+                .await;
+
+            let unnest_reviews: UnnestHandler = Box::new(|parent: &Value| {
+                Ok(parent
+                    .get("reviews")
+                    .and_then(|c| c.get("nodes"))
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default())
+            });
+
+            let client = GraphQLClientBuilder::new(
+                Url::parse(&format!("{}/graphql", server.uri())).expect("valid URL"),
+                UnnestBehavior::Custom(unnest_reviews),
+            )
+            .with_json_pointer(Some("/data/view/nodes"))
+            .with_schema(Some(Arc::new(Schema::new(vec![Field::new(
+                "id",
+                DataType::Utf8,
+                true,
+            )]))))
+            .with_nested_pager(Some(NestedConnectionPager {
+                connection_key: "reviews",
+                parent_id_key: "id",
+                type_condition: "PullRequest",
+                node_selection: "id",
+                page_size: 2,
+            }))
+            .build(reqwest::Client::new())
+            .expect("client to build");
+
+            let query = GraphQLQuery::try_from(Arc::<str>::from(OUTER_QUERY))
+                .expect("query to parse")
+                .with_json_pointer(Arc::from("/data/view/nodes"));
+            client
+                .execute(&query, None, None, None, None, None)
+                .await
+                .expect("the follow-up page must complete the connection");
+
+            let follow_up: Vec<String> = server
+                .received_requests()
+                .await
+                .expect("recorded requests")
+                .iter()
+                .filter_map(|r| serde_json::from_slice::<Value>(&r.body).ok())
+                .filter_map(|body| {
+                    body.get("query")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .filter(|q| q.contains("node(id:"))
+                .collect();
+            assert_eq!(
+                follow_up.len(),
+                1,
+                "one follow-up request, got {follow_up:?}"
+            );
+            assert!(
+                follow_up[0].contains(r#"after: "cur\"so\\r""#),
+                "the cursor must be escaped in the follow-up query, got {}",
+                follow_up[0]
             );
         }
 

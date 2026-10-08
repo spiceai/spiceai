@@ -23,12 +23,6 @@ five rows per GraphQL dataset and the README from the `v1.0.0` tag. `check_live.
 requires exact row counts, populated unique keys, and downloaded file content.
 Readiness is polled with a deadline; a fixed startup delay is not used.
 
-The connector paces GitHub GraphQL secondary usage at 90% of GitHub's 2,000
-points/minute (1,800/min) with a one-query burst. That contract lives in
-`graphql_secondary_quota()` and is not a spicepod parameter. REST `core` and
-GraphQL `graphql` primary quotas are metered separately; datasets that share a
-token share each resource's limiter.
-
 All Rust GitHub integration tests run in the dedicated **GitHub Connector
 Integration Tests** job, serially and outside the three general integration
 partitions. That job and the live E2E job share a queued workflow concurrency
