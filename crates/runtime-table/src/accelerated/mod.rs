@@ -1780,25 +1780,19 @@ impl AcceleratedTable {
         // ds`) would push only the user's columns to the accelerator
         // and the FilterExec on top would fail with `No field named
         // __spice_cache_namespace`.
-        let mut extended_projection = if is_caching_mode {
-            extend_projection_for_caching(projection, &self.accelerator.schema())
+        // The GET predicate is re-applied above the scan when the accelerator
+        // cannot apply it exactly, so the scan must then carry `request_body`.
+        let extended_projection = if is_caching_mode {
+            extend_projection_for_caching(
+                projection,
+                &self.accelerator.schema(),
+                get_identity_filter
+                    .as_ref()
+                    .map(|_| caching::REQUEST_BODY_COLUMN),
+            )
         } else {
             None
         };
-        // The GET predicate is re-applied above the scan when the accelerator
-        // cannot apply it exactly, so the scan must carry `request_body`.
-        if get_identity_filter.is_some()
-            && let Some(projection) = projection
-            && let Ok(idx) = self
-                .accelerator
-                .schema()
-                .index_of(caching::REQUEST_BODY_COLUMN)
-        {
-            let target = extended_projection.get_or_insert_with(|| projection.clone());
-            if !target.contains(&idx) {
-                target.push(idx);
-            }
-        }
         let scan_projection = extended_projection.as_ref().or(projection);
         // For caching mode, scope the accelerator scan to the current
         // request's namespace by appending a `__spice_cache_namespace = $ns_id`
@@ -2445,7 +2439,8 @@ impl TableLayer for AcceleratedTable {
 /// Extends projection to include columns required by the caching pipeline
 /// for accelerator scans: `_fetched_at` (freshness check) and
 /// `__spice_cache_namespace` (per-principal isolation filter applied as a
-/// hard `FilterExec` on top of the scan).
+/// hard `FilterExec` on top of the scan), plus `filter_column` when a
+/// storage-only predicate on it may be re-applied above the scan.
 ///
 /// Returns `Some(extended_projection)` if any extension was needed, or
 /// `None` if both columns are already present (or `projection` is `None`,
@@ -2453,13 +2448,17 @@ impl TableLayer for AcceleratedTable {
 fn extend_projection_for_caching(
     projection: Option<&Vec<usize>>,
     schema: &SchemaRef,
+    filter_column: Option<&str>,
 ) -> Option<Vec<usize>> {
     let proj = projection?;
     let mut extended: Option<Vec<usize>> = None;
     for col in [
         caching::CACHE_REFRESHED_AT_COLUMN,
         caching::CACHE_NAMESPACE_COLUMN,
-    ] {
+    ]
+    .into_iter()
+    .chain(filter_column)
+    {
         let Ok(idx) = schema.index_of(col) else {
             continue;
         };
@@ -2989,7 +2988,7 @@ mod tests {
     #[test]
     fn test_extend_projection_none_returns_none() {
         let schema = schema_with_fetched_at();
-        let result = extend_projection_for_caching(None, &schema);
+        let result = extend_projection_for_caching(None, &schema, None);
         assert!(result.is_none(), "None projection should return None");
     }
 
@@ -2998,7 +2997,7 @@ mod tests {
         let schema = schema_with_fetched_at();
         // Projection includes fetched_at (index 3)
         let projection = vec![0, 1, 3];
-        let result = extend_projection_for_caching(Some(&projection), &schema);
+        let result = extend_projection_for_caching(Some(&projection), &schema, None);
         assert!(
             result.is_none(),
             "Projection already including fetched_at should return None"
@@ -3010,7 +3009,7 @@ mod tests {
         let schema = schema_with_fetched_at();
         // Projection does NOT include fetched_at
         let projection = vec![0, 2]; // id, content
-        let extended = extend_projection_for_caching(Some(&projection), &schema)
+        let extended = extend_projection_for_caching(Some(&projection), &schema, None)
             .expect("Should extend projection");
         assert_eq!(
             extended,
@@ -3023,7 +3022,7 @@ mod tests {
     fn test_extend_projection_single_column() {
         let schema = schema_with_fetched_at();
         let projection = vec![2]; // just content
-        let extended = extend_projection_for_caching(Some(&projection), &schema)
+        let extended = extend_projection_for_caching(Some(&projection), &schema, None)
             .expect("Should extend projection");
         assert_eq!(
             extended,
