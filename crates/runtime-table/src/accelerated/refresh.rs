@@ -81,7 +81,7 @@ pub struct VersionsByTime {
     /// the row versions the refresh supplies (unpartitioned Cayenne).
     pub versions_resolved_after_write: bool,
     /// It also resolves them for an append into an empty table (unpartitioned
-    /// file-mode Cayenne).
+    /// file-mode Cayenne; a table with `retention_sql` refuses such a load).
     pub appends_resolved_after_write: bool,
 }
 
