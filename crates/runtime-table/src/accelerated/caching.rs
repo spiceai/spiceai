@@ -4656,7 +4656,7 @@ mod tests {
                 "headers only",
                 vec![col("request_headers").eq(lit(r#"{"x-test":"a"}"#))],
                 &http,
-                get,
+                get.clone(),
             ),
             (
                 "no request value named",
@@ -4668,7 +4668,7 @@ mod tests {
                 "only a body predicate that sends no body",
                 vec![col("request_body").not_eq(lit("z"))],
                 &http,
-                get.clone(),
+                get,
             ),
             ("not an HTTP cache", vec![path], &other, vec![]),
         ];
