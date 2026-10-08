@@ -3458,7 +3458,7 @@ mod tests {
     async fn wait_for_window(target: u64, window: Duration) {
         let deadline = tokio::time::Instant::now() + window * 10;
         loop {
-            let now_window = window_id_for(unix_millis_now(), &window);
+            let now_window = window_id_for(SystemTime::now(), window);
             if now_window >= target {
                 assert_eq!(now_window, target, "the clock skipped past window {target}");
                 return;
@@ -3480,7 +3480,7 @@ mod tests {
         // Lease at the top of a fresh window, so the refresh and the drain
         // finish inside it. Refreshing at the very end of a window could let
         // the clock skip the pre-leased window, which is then discarded.
-        let start = window_id_for(unix_millis_now(), &window);
+        let start = window_id_for(SystemTime::now(), window);
         wait_for_window(start + 1, window).await;
         bucket.refresh_lease().await.expect("lease");
 
