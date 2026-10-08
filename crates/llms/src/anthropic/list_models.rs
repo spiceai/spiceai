@@ -41,7 +41,6 @@ struct Model {
 }
 
 /// Anthropic model lister that fetches available models from the API.
-#[expect(clippy::struct_field_names)]
 pub struct AnthropicModelLister {
     api_key: SecretString,
     api_base: String,
