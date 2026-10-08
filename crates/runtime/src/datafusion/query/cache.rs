@@ -25,6 +25,7 @@ use cache::{
     result::query::CachedQueryResult,
     to_cached_record_batch_stream,
 };
+use dashmap::DashMap;
 use datafusion::{
     common::ParamValues,
     common::TableReference,
@@ -977,10 +978,21 @@ fn apply_serve_time_table_clock(entry: &mut ServableEntry, validity: EntryValidi
 }
 
 /// Cache keys with a stale-while-revalidate background revalidation pending or
-/// running, each held by the generation of the claim that took it.
+/// running, each held by the claim that took it.
+///
+/// A claim is taken on the stale hit's request path, so it is a sharded-map entry
+/// rather than a write to a cache that runs its own maintenance inline.
 struct RevalidationClaims {
-    held: moka::sync::Cache<u64, u64, std::hash::RandomState>,
+    held: DashMap<u64, HeldClaim>,
+    time_to_live: std::time::Duration,
     next_generation: std::sync::atomic::AtomicU64,
+}
+
+/// The claim currently holding a key.
+#[derive(Clone, Copy)]
+struct HeldClaim {
+    generation: u64,
+    claimed_at: std::time::Instant,
 }
 
 impl RevalidationClaims {
@@ -988,31 +1000,39 @@ impl RevalidationClaims {
     /// key from being claimed again.
     fn new(time_to_live: std::time::Duration) -> Self {
         Self {
-            held: moka::sync::Cache::builder()
-                .max_capacity(10_000) // Track up to 10k concurrent revalidations
-                .time_to_live(time_to_live)
-                .build(),
+            held: DashMap::new(),
+            time_to_live,
             next_generation: std::sync::atomic::AtomicU64::new(0),
         }
     }
 
     /// Claims `key` for one revalidation, or returns `None` while another claim
-    /// holds it.
+    /// holds it. A claim older than the time-to-live no longer holds its key.
     fn claim(&self, key: u64) -> Option<RevalidationClaim<'_>> {
         let generation = self
             .next_generation
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        let claimed = self.held.entry(key).and_compute_with(|held| match held {
-            Some(_) => moka::ops::compute::Op::Nop,
-            None => moka::ops::compute::Op::Put(generation),
-        });
-        matches!(claimed, moka::ops::compute::CompResult::Inserted(_)).then_some(
-            RevalidationClaim {
-                claims: self,
-                key,
-                generation,
-            },
-        )
+        let claimed_at = std::time::Instant::now();
+        let claim = HeldClaim {
+            generation,
+            claimed_at,
+        };
+        match self.held.entry(key) {
+            dashmap::Entry::Occupied(mut held) => {
+                if claimed_at.duration_since(held.get().claimed_at) < self.time_to_live {
+                    return None;
+                }
+                held.insert(claim);
+            }
+            dashmap::Entry::Vacant(vacant) => {
+                vacant.insert(claim);
+            }
+        }
+        Some(RevalidationClaim {
+            claims: self,
+            key,
+            generation,
+        })
     }
 }
 
@@ -1032,11 +1052,7 @@ impl Drop for RevalidationClaim<'_> {
         let generation = self.generation;
         self.claims
             .held
-            .entry(self.key)
-            .and_compute_with(|held| match held {
-                Some(entry) if *entry.value() == generation => moka::ops::compute::Op::Remove,
-                _ => moka::ops::compute::Op::Nop,
-            });
+            .remove_if(&self.key, |_, held| held.generation == generation);
     }
 }
 
@@ -4181,14 +4197,14 @@ mod tests {
 
         drop(expired);
         assert_eq!(
-            claims.held.get(&7),
+            claims.held.get(&7).map(|held| held.generation),
             Some(replacement.generation),
             "releasing the expired claim must not release its replacement"
         );
 
         drop(replacement);
         assert_eq!(
-            claims.held.get(&7),
+            claims.held.get(&7).map(|held| held.generation),
             None,
             "the key is free again once its holder releases it"
         );
