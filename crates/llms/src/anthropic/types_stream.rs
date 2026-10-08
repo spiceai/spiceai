@@ -140,14 +140,14 @@ pub struct ContentBlockToolUse {
 #[serde(tag = "type")]
 pub(crate) enum Delta {
     #[serde(rename = "text_delta")]
-    TextDelta { text: String },
+    Text { text: String },
     #[serde(rename = "input_json_delta")]
-    InputJsonDelta { partial_json: String },
-    /// Sent when extended thinking is enabled. OpenAI's format has no equivalent, so it is dropped.
+    InputJson { partial_json: String },
+    /// Sent when extended thinking is enabled. `OpenAI`'s format has no equivalent, so it is dropped.
     #[serde(rename = "thinking_delta")]
-    ThinkingDelta { thinking: String },
+    Thinking { thinking: String },
     #[serde(rename = "signature_delta")]
-    SignatureDelta { signature: String },
+    Signature { signature: String },
 }
 
 impl Delta {
@@ -157,7 +157,7 @@ impl Delta {
         tool_content: Option<&ContentBlockToolUse>,
     ) -> ChatCompletionStreamResponseDelta {
         match (self, tool_content) {
-            (Delta::TextDelta { text }, _) => ChatCompletionStreamResponseDelta {
+            (Delta::Text { text }, _) => ChatCompletionStreamResponseDelta {
                 content: Some(text),
                 function_call: None,
                 tool_calls: None,
@@ -169,7 +169,7 @@ impl Delta {
                 },
             },
             (
-                Delta::InputJsonDelta { partial_json },
+                Delta::InputJson { partial_json },
                 Some(ContentBlockToolUse {
                     id, name: _name, ..
                 }),
@@ -196,9 +196,9 @@ impl Delta {
             // A tool delta without its block should never happen, and thinking has no OpenAI
             // equivalent. Both become an 'empty' response.
             (
-                Delta::InputJsonDelta { partial_json: _ }
-                | Delta::ThinkingDelta { thinking: _ }
-                | Delta::SignatureDelta { signature: _ },
+                Delta::InputJson { partial_json: _ }
+                | Delta::Thinking { thinking: _ }
+                | Delta::Signature { signature: _ },
                 _,
             ) => ChatCompletionStreamResponseDelta {
                 content: None,
