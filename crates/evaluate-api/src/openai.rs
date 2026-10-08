@@ -860,8 +860,9 @@ pub fn system_one_to_decision_request(
 /// # Errors
 ///
 /// Returns a description of the first answer that names no question, repeats one,
-/// carries a boolean choice for a string option, or gives a level outside the rubric.
-/// The result still has to pass [`crate::check_answers`].
+/// carries a boolean choice for a string option, or labels a level with another
+/// level's label. The result still has to pass [`crate::check_answers`], which refuses
+/// a level outside the rubric.
 pub fn decision_response_to_system_one(
     request: &EvaluateRequest,
     response: DecisionResponse,
@@ -934,6 +935,22 @@ pub fn decision_response_to_system_one(
                 };
                 let mut distribution = BTreeMap::new();
                 for entry in probabilities {
+                    // The label names the level too. Read by its index alone, a
+                    // probability labeled with another level would be published under
+                    // the asked level's label. An index outside the rubric is left to
+                    // `check_answers`.
+                    if let Some(level) = usize::try_from(entry.value)
+                        .ok()
+                        .and_then(|index| criteria.get(index))
+                    {
+                        let (label, _) = level_label(level);
+                        if entry.label != label {
+                            return Err(format!(
+                                "question '{id}': level {} is '{label}', but the answer labels it '{}'",
+                                entry.value, entry.label
+                            ));
+                        }
+                    }
                     if distribution
                         .insert(entry.value.to_string(), entry.probability)
                         .is_some()
@@ -1440,6 +1457,31 @@ mod tests {
                 expected
             );
         }
+    }
+
+    /// A score probability names its level twice, by index and by label. When they
+    /// disagree, the answer does not say which level it means, so it is refused rather
+    /// than read by its index alone.
+    #[test]
+    fn a_level_answered_under_another_label_is_an_error() {
+        let asked: EvaluateRequest = serde_json::from_value(json!({
+            "model": "luna", "state": "x",
+            "questions": {"tone": {"type": "score", "criteria": ["calm", {"label": "furious", "description": "Shouting"}]}}
+        }))
+        .expect("request");
+        let response: DecisionResponse = serde_json::from_value(json!({
+            "model": "gpt-6-luna",
+            "answers": [{"type": "score", "name": "tone", "score": 0.1, "probabilities": [
+                {"value": 0, "label": "furious", "probability": 0.9},
+                {"value": 1, "label": "calm", "probability": 0.1}
+            ], "confidence": 0.6}],
+            "usage": {"input_tokens": 1, "output_tokens": 0}
+        }))
+        .expect("response");
+        assert_eq!(
+            decision_response_to_system_one(&asked, response).expect_err("mislabeled"),
+            "question 'tone': level 0 is 'calm', but the answer labels it 'furious'"
+        );
     }
 
     #[test]
