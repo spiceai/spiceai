@@ -105,12 +105,23 @@ fn cayenne_catalog(name: &str, dir: &std::path::Path, extra: &[(&str, &str)]) ->
     catalog
 }
 
+/// The tuning a catalog table resolved.
+#[derive(Debug, PartialEq)]
+struct Resolved {
+    dynamic_tuning: bool,
+    replication_lag_secs: Option<f64>,
+    freshness_secs: Option<f64>,
+    query_latency_ms: Option<f64>,
+    convergence_window_secs: Option<f64>,
+    qph: Option<f64>,
+}
+
 /// Starts a scheduler and executor sharing a Cayenne catalog called `tcat`, creates
 /// `tcat.s.t`, and returns whether that table runs the closed-loop tuner.
-async fn catalog_table_dynamic_tuning(
-    adaptive_tuning: Option<&str>,
+async fn catalog_table_tuning(
+    runtime_params: &[(&str, &str)],
     catalog_params: &[(&str, &str)],
-) -> bool {
+) -> Resolved {
     LazyLock::force(&LOGS);
     let dir = tempfile::tempdir().expect("a temp dir must be created");
     let catalog = cayenne_catalog("tcat", dir.path(), catalog_params);
@@ -118,11 +129,11 @@ async fn catalog_table_dynamic_tuning(
     let mut scheduler = AppBuilder::new("catalog_tuning_scheduler")
         .with_catalog(catalog.clone())
         .build();
-    if let Some(value) = adaptive_tuning {
+    for (key, value) in runtime_params {
         scheduler
             .runtime
             .params
-            .insert("adaptive_tuning".to_string(), value.to_string());
+            .insert((*key).to_string(), (*value).to_string());
     }
     let executor = AppBuilder::new("catalog_tuning_executor")
         .with_catalog(catalog)
@@ -181,26 +192,30 @@ async fn catalog_table_dynamic_tuning(
         }
     }
     assert!(!partitions.is_empty(), "the insert must create a partition");
-    let dynamic_tuning = partitions
+    let resolved = partitions
         .iter()
         .map(|partition| {
-            partition
+            let config = &partition
                 .downcast_ref::<cayenne::CayenneTableProvider>()
                 .expect("every partition must be a Cayenne table")
                 .metadata()
-                .vortex_config
-                .dynamic_tuning
-        })
-        .fold(None, |all: Option<bool>, one| match all {
-            None => Some(one),
-            Some(prev) => {
-                assert_eq!(prev, one, "every partition must agree on dynamic tuning");
-                Some(one)
+                .vortex_config;
+            Resolved {
+                dynamic_tuning: config.dynamic_tuning,
+                replication_lag_secs: config.goal_replication_lag_secs,
+                freshness_secs: config.goal_freshness_secs,
+                query_latency_ms: config.goal_query_latency_ms,
+                convergence_window_secs: config.goal_convergence_window_secs,
+                qph: config.goal_qph,
             }
+        })
+        .reduce(|first, next| {
+            assert_eq!(first, next, "every partition must resolve the same tuning");
+            first
         })
         .expect("at least one partition");
     harness.shutdown().await;
-    dynamic_tuning
+    resolved
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -210,7 +225,9 @@ async fn catalog_table_dynamic_tuning(
 )]
 async fn adaptive_tuning_enabled_turns_adaptive_on_for_catalog_tables() {
     assert!(
-        catalog_table_dynamic_tuning(Some("enabled"), &[]).await,
+        catalog_table_tuning(&[("adaptive_tuning", "enabled")], &[])
+            .await
+            .dynamic_tuning,
         "`runtime.params.adaptive_tuning: enabled` must run the closed-loop tuner on catalog tables"
     );
 }
@@ -222,7 +239,7 @@ async fn adaptive_tuning_enabled_turns_adaptive_on_for_catalog_tables() {
 )]
 async fn catalog_tables_are_static_by_default() {
     assert!(
-        !catalog_table_dynamic_tuning(None, &[]).await,
+        !catalog_table_tuning(&[], &[]).await.dynamic_tuning,
         "without `runtime.params.adaptive_tuning` catalog tables run static tuning"
     );
 }
@@ -233,7 +250,9 @@ async fn catalog_tables_are_static_by_default() {
     ignore = "the Cayenne catalog connector requires the spicebench feature"
 )]
 async fn retired_catalog_tuning_param_warns_once_per_node_and_is_not_applied() {
-    let dynamic = catalog_table_dynamic_tuning(None, &[("cayenne_tuning", "enabled")]).await;
+    let dynamic = catalog_table_tuning(&[], &[("cayenne_tuning", "enabled")])
+        .await
+        .dynamic_tuning;
     assert!(
         !dynamic,
         "the retired catalog `cayenne_tuning` must not turn the closed-loop tuner on"
@@ -249,5 +268,58 @@ async fn retired_catalog_tuning_param_warns_once_per_node_and_is_not_applied() {
     assert!(
         !logs.contains("Ignoring parameter `cayenne_tuning`"),
         "the generic unsupported-parameter warning must not repeat it"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    not(feature = "spicebench"),
+    ignore = "the Cayenne catalog connector requires the spicebench feature"
+)]
+async fn runtime_goals_reach_catalog_tables() {
+    let resolved = catalog_table_tuning(
+        &[
+            ("adaptive_tuning", "enabled"),
+            ("goal_replication_lag", "10s"),
+            ("goal_freshness", "5s"),
+            ("goal_query_latency", "250ms"),
+            ("goal_convergence_window", "2m"),
+            ("goal_qph", "5000"),
+        ],
+        &[],
+    )
+    .await;
+    assert_eq!(
+        resolved,
+        Resolved {
+            dynamic_tuning: true,
+            replication_lag_secs: Some(10.0),
+            freshness_secs: Some(5.0),
+            query_latency_ms: Some(250.0),
+            convergence_window_secs: Some(120.0),
+            qph: Some(5000.0),
+        },
+        "the runtime-wide goals must reach catalog tables"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg_attr(
+    not(feature = "spicebench"),
+    ignore = "the Cayenne catalog connector requires the spicebench feature"
+)]
+async fn goals_without_adaptive_tuning_warn_once_and_leave_the_loop_off() {
+    let resolved = catalog_table_tuning(&[("goal_freshness", "5s")], &[]).await;
+    assert!(
+        !resolved.dynamic_tuning,
+        "a goal must not turn the closed-loop tuner on"
+    );
+    let warning = "`runtime.params.goal_*` is set but `runtime.params.adaptive_tuning` is `disabled`, so catalog 'tcat' ignores the goals.";
+    let logs = logged();
+    // The scheduler and the executor each register the catalog, so each reports it once.
+    assert_eq!(
+        logs.matches(warning).count(),
+        2,
+        "the inert goals must be reported once per registering node:\n{logs}"
     );
 }

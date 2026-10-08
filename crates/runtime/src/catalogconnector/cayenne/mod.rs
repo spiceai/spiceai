@@ -30,6 +30,7 @@ use async_trait::async_trait;
 use cayenne::{CayenneCatalogProvider, CayenneCatalogProviderConfig};
 use data_components::RefreshableCatalogProvider as _;
 use std::any::Any;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 pub mod provider;
@@ -104,11 +105,12 @@ impl CayenneCatalogConnector {
         })
     }
 
-    /// `runtime_tuning` is `runtime.params.adaptive_tuning`, the runtime-wide tuning mode.
+    /// `runtime_params` is the runtime's `runtime.params`, which carry the runtime-wide
+    /// `adaptive_tuning` mode and `goal_*` setpoints.
     async fn parse_provider_config(
         &self,
         catalog_name: Option<&str>,
-        runtime_tuning: Option<&str>,
+        runtime_params: &HashMap<String, String>,
     ) -> CayenneCatalogProviderConfig {
         // Parse a numeric catalog parameter, warning (and ignoring) on a value
         // that does not parse, so a typo surfaces instead of being silently
@@ -245,7 +247,7 @@ impl CayenneCatalogConnector {
         // path, the catalog path has no schema inference, so `enabled` is seeded
         // purely from the detected `HardwareProfile` — the controller's bounds
         // anchor to `[floor, 4×seed]`, so a host-appropriate seed is essential.
-        let raw_tuning = runtime_tuning;
+        let raw_tuning = runtime_params.get("adaptive_tuning").map(String::as_str);
 
         // Probe under the resolved data/metadata dirs, falling back to the data base path.
         let base = crate::spice_data_base_path();
@@ -265,7 +267,7 @@ impl CayenneCatalogConnector {
             .and_then(data_accelerator_api::AcceleratorRegistration::build_with_defaults);
         let outcome = if let Some(engine) = tuning {
             engine
-                .adaptive_tuning_seeds(raw_tuning, &data_path, &metastore_path)
+                .adaptive_tuning_seeds(runtime_params, &data_path, &metastore_path)
                 .await
         } else {
             // This catalog builds its provider from the `cayenne` library, so it works in a
@@ -288,8 +290,17 @@ impl CayenneCatalogConnector {
                     && !value.eq_ignore_ascii_case("disabled")
                     && !value.eq_ignore_ascii_case("enabled"),
                 seeds: None,
+                goals: data_accelerator_api::TuningGoals::default(),
             }
         };
+
+        // A goal declares a target for the closed loop and never turns it on.
+        if outcome.goals.any_target() && outcome.seeds.is_none() {
+            tracing::warn!(
+                "`runtime.params.goal_*` is set but `runtime.params.adaptive_tuning` is `disabled`, so catalog '{}' ignores the goals. Set `runtime.params.adaptive_tuning` to `enabled` to enable goal-seeking. See: https://spiceai.org/docs/reference/spicepod/runtime",
+                catalog_name.unwrap_or_default()
+            );
+        }
 
         if outcome.tuning_value_invalid {
             tracing::warn!(
@@ -347,6 +358,11 @@ impl CayenneCatalogConnector {
             inline_flush_max_segments,
             inline_flush_max_bytes,
             dynamic_tuning,
+            goal_replication_lag_secs: outcome.goals.replication_lag_secs,
+            goal_freshness_secs: outcome.goals.freshness_secs,
+            goal_query_latency_ms: outcome.goals.query_latency_ms,
+            goal_convergence_window_secs: outcome.goals.convergence_window_secs,
+            goal_qph: outcome.goals.qph,
             compaction_background_interval_ms: seed_compaction_background_interval_ms,
             compaction_trigger_files: seed_compaction_trigger_files,
             // The catalog path keeps the engine default (50_000) as the bake-trigger
@@ -389,15 +405,16 @@ impl CatalogConnector for CayenneCatalogConnector {
             tracing::warn!("{warning}");
         }
 
-        let runtime_tuning = runtime
+        let runtime_params = runtime
             .app()
             .read()
             .await
             .as_ref()
-            .and_then(|app| app.runtime.params.get("adaptive_tuning").cloned());
+            .map(|app| app.runtime.params.clone())
+            .unwrap_or_default();
         let runtime_env = runtime.datafusion().ctx.runtime_env();
         let provider_config = self
-            .parse_provider_config(Some(catalog.name.as_str()), runtime_tuning.as_deref())
+            .parse_provider_config(Some(catalog.name.as_str()), &runtime_params)
             .await;
         let refreshable_provider = Arc::new(
             CayenneCatalogProvider::try_new(provider_config, runtime_env, table_selector(catalog))
@@ -488,7 +505,7 @@ mod tests {
         let connector = CayenneCatalogConnector { params };
 
         let config = connector
-            .parse_provider_config(Some("warehouse"), None)
+            .parse_provider_config(Some("warehouse"), &HashMap::new())
             .await;
 
         // Carried for diagnostics only — the storage paths stay keyed on the constant, so

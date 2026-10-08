@@ -598,6 +598,34 @@ fn parse_goal_f64(raw: Option<&str>, key: &str, source_desc: &str) -> Option<f64
     }
 }
 
+/// Resolve the runtime-wide `goal_*` setpoints from `runtime.params`. Times are duration
+/// strings (`5s`/`1m`/`250ms`) and QPH is a number; an invalid value warns and is ignored.
+/// Query latency is stored in ms. QPH is a system-wide metric: a query (e.g. a join)
+/// spans datasets and is counted once globally. The convergence window paces how the
+/// loop chases the SLOs rather than declaring an outcome.
+fn parse_tuning_goals(
+    runtime_params: &std::collections::HashMap<String, String>,
+) -> data_accelerator_api::TuningGoals {
+    let duration = |key: &str| {
+        parse_goal_duration_secs(
+            runtime_params.get(key).map(String::as_str),
+            key,
+            "runtime.params",
+        )
+    };
+    data_accelerator_api::TuningGoals {
+        replication_lag_secs: duration("goal_replication_lag"),
+        freshness_secs: duration("goal_freshness"),
+        query_latency_ms: duration("goal_query_latency").map(|secs| secs * 1000.0),
+        convergence_window_secs: duration("goal_convergence_window"),
+        qph: parse_goal_f64(
+            runtime_params.get("goal_qph").map(String::as_str),
+            "goal_qph",
+            "runtime.params",
+        ),
+    }
+}
+
 const SMALL_WRITE_COMPACTION_TRIGGER_FILES: usize = 4;
 const SMALL_WRITE_COMPACTION_TRIGGER_PROTECTED_SNAPSHOTS: usize = 4;
 const SMALL_WRITE_COMPACTION_TRIGGER_SNAPSHOT_AGE_MS: u64 = 60_000;
@@ -2232,32 +2260,13 @@ impl CayenneAccelerator {
             // goals steer the closed loop but never ENABLE it: `adaptive` is reached
             // only by `runtime.params.adaptive_tuning: enabled`, so a goal set without it is
             // inert and warns below. Query latency is stored in ms.
-            let goal_duration = |key: &str| {
-                parse_goal_duration_secs(
-                    runtime_params.get(key).map(String::as_str),
-                    key,
-                    "runtime.params",
-                )
-            };
-            config.goal_replication_lag_secs = goal_duration("goal_replication_lag");
-            config.goal_freshness_secs = goal_duration("goal_freshness");
-            config.goal_query_latency_ms =
-                goal_duration("goal_query_latency").map(|secs| secs * 1000.0);
-            // The convergence window paces HOW the loop chases the SLOs (step
-            // cadence = window / N), not a target outcome — a control/benchmarking
-            // knob with a sensible default.
-            config.goal_convergence_window_secs = goal_duration("goal_convergence_window");
-            // QPH is a SYSTEM-WIDE metric — a query (e.g. a join) spans datasets and
-            // is counted once globally.
-            config.goal_qph = parse_goal_f64(
-                runtime_params.get("goal_qph").map(String::as_str),
-                "goal_qph",
-                "runtime.params",
-            );
-            let any_goal = config.goal_replication_lag_secs.is_some()
-                || config.goal_freshness_secs.is_some()
-                || config.goal_query_latency_ms.is_some()
-                || config.goal_qph.is_some();
+            let goals = parse_tuning_goals(runtime_params);
+            config.goal_replication_lag_secs = goals.replication_lag_secs;
+            config.goal_freshness_secs = goals.freshness_secs;
+            config.goal_query_latency_ms = goals.query_latency_ms;
+            config.goal_convergence_window_secs = goals.convergence_window_secs;
+            config.goal_qph = goals.qph;
+            let any_goal = goals.any_target();
             // A goal never switches the mode: `adaptive` is a preview feature and
             // is entered only by asking for it, so a goal configured while the
             // loop is off is reported as ignored (below, under the newly-resolved
@@ -3285,15 +3294,18 @@ impl DataAccelerator for CayenneAccelerator {
 
     async fn adaptive_tuning_seeds(
         &self,
-        tuning: Option<&str>,
+        runtime_params: &std::collections::HashMap<String, String>,
         data_path: &str,
         metastore_path: &str,
     ) -> data_accelerator_api::AdaptiveTuningOutcome {
-        let (tuning_mode, tuning_value_invalid) = autotune::TuningMode::parse(tuning);
+        let (tuning_mode, tuning_value_invalid) =
+            autotune::TuningMode::parse(runtime_params.get("adaptive_tuning").map(String::as_str));
+        let goals = parse_tuning_goals(runtime_params);
         if tuning_mode != autotune::TuningMode::Adaptive {
             return data_accelerator_api::AdaptiveTuningOutcome {
                 tuning_value_invalid,
                 seeds: None,
+                goals,
             };
         }
 
@@ -3309,6 +3321,7 @@ impl DataAccelerator for CayenneAccelerator {
 
         data_accelerator_api::AdaptiveTuningOutcome {
             tuning_value_invalid,
+            goals,
             seeds: Some(data_accelerator_api::AdaptiveTuningSeeds {
                 // A small-write cadence, so the controller has a tick to ride.
                 compaction_background_interval_ms: 10_000,

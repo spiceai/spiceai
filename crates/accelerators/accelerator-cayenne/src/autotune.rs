@@ -701,7 +701,10 @@ mod tests {
             (TuningMode::Auto, true)
         );
         // The retired `auto`/`adaptive` values are not recognized.
-        assert_eq!(TuningMode::parse(Some("adaptive")), (TuningMode::Auto, true));
+        assert_eq!(
+            TuningMode::parse(Some("adaptive")),
+            (TuningMode::Auto, true)
+        );
         assert_eq!(TuningMode::parse(Some("auto")), (TuningMode::Auto, true));
         assert!(!TuningMode::default().is_adaptive());
     }

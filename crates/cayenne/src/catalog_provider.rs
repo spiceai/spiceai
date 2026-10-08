@@ -87,6 +87,18 @@ pub struct CayenneCatalogProviderConfig {
     /// inline-flush caps, compaction cadence/trigger, and write concurrency over
     /// time, anchored to the seeded knob values below.
     pub dynamic_tuning: bool,
+    /// The runtime-wide `goal_*` setpoints (`runtime.params`), carried to every table
+    /// the catalog creates. They steer the closed loop and never enable it.
+    /// `goal_replication_lag`, in seconds.
+    pub goal_replication_lag_secs: Option<f64>,
+    /// `goal_freshness`, in seconds.
+    pub goal_freshness_secs: Option<f64>,
+    /// `goal_query_latency`, in milliseconds.
+    pub goal_query_latency_ms: Option<f64>,
+    /// `goal_convergence_window`, in seconds.
+    pub goal_convergence_window_secs: Option<f64>,
+    /// `goal_qph`, in queries per hour.
+    pub goal_qph: Option<f64>,
     /// Hardware-seeded background compaction interval (ms). Seeds the adaptive
     /// controller's starting point; `None` keeps the engine default.
     pub compaction_background_interval_ms: Option<u64>,
@@ -456,6 +468,11 @@ impl CayenneCatalogProvider {
         // Enable the closed loop last so it anchors to the seeded knob values
         // above (the controller bounds derive from `[floor, 4×seed]`).
         config.dynamic_tuning = provider_config.dynamic_tuning;
+        config.goal_replication_lag_secs = provider_config.goal_replication_lag_secs;
+        config.goal_freshness_secs = provider_config.goal_freshness_secs;
+        config.goal_query_latency_ms = provider_config.goal_query_latency_ms;
+        config.goal_convergence_window_secs = provider_config.goal_convergence_window_secs;
+        config.goal_qph = provider_config.goal_qph;
         config
     }
 }
@@ -834,6 +851,11 @@ mod tests {
             inline_flush_max_bytes: None,
             pk_conflict_detection: None,
             dynamic_tuning: false,
+            goal_replication_lag_secs: None,
+            goal_freshness_secs: None,
+            goal_query_latency_ms: None,
+            goal_convergence_window_secs: None,
+            goal_qph: None,
             compaction_background_interval_ms: None,
             compaction_trigger_files: None,
             bake_deletion_index_trigger: None,

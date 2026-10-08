@@ -680,15 +680,15 @@ pub trait DataAccelerator: Send + Sync {
     /// Seeds this engine's adaptive-tuning knobs for a catalog, whose tables are
     /// configured before any of them exists.
     ///
-    /// `tuning` is the operator's raw `adaptive_tuning` parameter, interpreted by the engine
-    /// because it owns the vocabulary; `data_path` and `metastore_path` are the
-    /// directories to probe. A catalog has no schema inference, so the seed comes from
+    /// `runtime_params` is the runtime's `runtime.params`. The engine reads
+    /// `adaptive_tuning` and the `goal_*` setpoints from it because it owns that
+    /// vocabulary; `data_path` and `metastore_path` are the directories to probe. A catalog has no schema inference, so the seed comes from
     /// the host alone — which is precisely why it must come from the engine, and why an
     /// engine with no adaptive controller returns the default outcome and keeps its
     /// static values.
     async fn adaptive_tuning_seeds(
         &self,
-        _tuning: Option<&str>,
+        _runtime_params: &std::collections::HashMap<String, String>,
         _data_path: &str,
         _metastore_path: &str,
     ) -> AdaptiveTuningOutcome {
@@ -1254,6 +1254,32 @@ pub struct AdaptiveTuningOutcome {
     /// `None` when the operator did not ask for adaptive tuning, in which case the engine
     /// keeps its static defaults.
     pub seeds: Option<AdaptiveTuningSeeds>,
+    /// The `goal_*` setpoints the operator configured, resolved whether or not adaptive
+    /// tuning is on, so the caller can report goals that will have no effect.
+    pub goals: TuningGoals,
+}
+
+/// The runtime-wide `goal_*` setpoints the adaptive controller steers toward.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct TuningGoals {
+    pub replication_lag_secs: Option<f64>,
+    pub freshness_secs: Option<f64>,
+    pub query_latency_ms: Option<f64>,
+    /// Paces how fast the loop chases the targets; it is not a target itself.
+    pub convergence_window_secs: Option<f64>,
+    pub qph: Option<f64>,
+}
+
+impl TuningGoals {
+    /// Whether any setpoint that declares a target is set. The convergence window only
+    /// paces the loop, so it does not count.
+    #[must_use]
+    pub fn any_target(&self) -> bool {
+        self.replication_lag_secs.is_some()
+            || self.freshness_secs.is_some()
+            || self.query_latency_ms.is_some()
+            || self.qph.is_some()
+    }
 }
 
 /// How an engine's writes accumulate for one acceleration, classified from the Spicepod
