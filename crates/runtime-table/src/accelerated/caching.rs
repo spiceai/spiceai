@@ -2422,6 +2422,34 @@ impl CacheRefreshHelper {
         Ok(())
     }
 
+    /// Whether the accelerator holds no row for `request` in `namespace_id`.
+    async fn holds_no_rows(
+        accelerator: &Arc<dyn TableProvider>,
+        session_state: &SessionState,
+        request: &[Expr],
+        namespace_id: &str,
+        context: Arc<TaskContext>,
+    ) -> DataFusionResult<bool> {
+        let mut filters = request.to_vec();
+        if accelerator
+            .schema()
+            .column_with_name(CACHE_NAMESPACE_COLUMN)
+            .is_some()
+        {
+            filters.push(namespace_filter_expr(namespace_id));
+        }
+        let plan = TableScanParams::new(session_state, None, &filters, Some(1))
+            .scan_and_optimize(accelerator.as_ref(), &filters)
+            .await?;
+        let mut stream = plan.execute(0, context)?;
+        while let Some(batch) = stream.try_next().await? {
+            if batch.num_rows() > 0 {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     /// Fetch data from federated source for given filters
     async fn fetch_from_source(
         federated: &Arc<dyn TableProvider>,
@@ -2518,6 +2546,8 @@ impl CacheRefreshHelper {
     /// # Arguments
     /// * `is_expired` - If `true`, data exists in the cache but is expired, so we use upsert.
     ///   If `false`, no data exists in the cache, so we use insert (append).
+    /// * `response_filtered` - The cache read also filtered response columns. An empty
+    ///   response then stores nothing, since it cannot name the request's complete key.
     /// * `stale_if_error` - `Disabled` never serves stale; `Enabled` serves it with no bound;
     ///   `For(duration)` serves it only while its measured staleness is within `duration` of
     ///   going stale, and propagates the origin's failure once past that window.
@@ -2539,6 +2569,7 @@ impl CacheRefreshHelper {
         limit: Option<usize>,
         fallback_schema: SchemaRef,
         is_expired: bool,
+        response_filtered: bool,
         stale_if_error: StaleIfError,
         max_age: Duration,
         expired_batches: Option<CacheFallback>,
@@ -2676,7 +2707,9 @@ impl CacheRefreshHelper {
                     }
 
                     let native = batch_write_tx.requires_complete_fetch();
-                    if (native && complete) || (!native && total_rows > 0) {
+                    if (native && complete && (total_rows > 0 || !response_filtered))
+                        || (!native && total_rows > 0)
+                    {
                         let write_request = CacheWriteRequest {
                             batches: batches.clone(),
                             filters: filters.to_vec(),
@@ -3331,6 +3364,18 @@ impl ExecutionPlan for CachingAccelerationScanExec {
             .session_config()
             .get_extension::<runtime_request_context::RequestContext>();
 
+        // A native read that also filters response columns fetches, claims and
+        // stores the whole response of its request. The filter above this scan
+        // applies the response predicates to the result.
+        let response_filtered = batch_write_tx
+            .requires_complete_fetch()
+            .then(|| writer::response_filtered_request(&self.filters))
+            .flatten();
+        let (fill_filters, response_filtered) = match response_filtered {
+            Some(request) => (request, true),
+            None => (self.filters.clone(), false),
+        };
+
         // With neither a fresh nor an SWR window, a stale-if-error entry can
         // only be served after a failing fetch. Do not execute its scan until
         // that failure; successful fetches replace any stored response for the key.
@@ -3346,7 +3391,6 @@ impl ExecutionPlan for CachingAccelerationScanExec {
             let federated = Arc::clone(&self.federated);
             let session_state = Arc::clone(&self.session_state);
             let dataset_name = self.dataset_name.clone();
-            let filters = self.filters.clone();
             let limit = self.limit;
             let stale_if_error = self.stale_if_error;
             let io_runtime = self.io_runtime.clone();
@@ -3361,10 +3405,11 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                     federated,
                     &session_state,
                     &dataset_name,
-                    &filters,
+                    &fill_filters,
                     limit,
                     stream_schema,
                     true, // replace any stored response without a preliminary lookup
+                    response_filtered,
                     stale_if_error,
                     Duration::ZERO,
                     Some(CacheFallback::Deferred {
@@ -3405,6 +3450,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
         let schema_clone = Arc::clone(&schema);
 
         let federated = Arc::clone(&self.federated);
+        let accelerator = Arc::clone(&self.accelerator);
         let session_state = Arc::clone(&self.session_state);
         let dataset_name = self.dataset_name.clone();
         let filters = self.filters.clone();
@@ -3489,10 +3535,11 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                             federated,
                             &session_state,
                             &dataset_name,
-                            &filters,
+                            &fill_filters,
                             limit,
                             Arc::clone(&schema_clone),
                             true, // is_expired = true, will upsert
+                            response_filtered,
                             stale_if_error,
                             max_age,
                             expired_batches,
@@ -3516,7 +3563,7 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                     stale_while_revalidate,
                     &io_runtime,
                     Arc::clone(&schema_clone),
-                    &filters,
+                    &fill_filters,
                     &in_flight_revalidations,
                     &batch_write_tx,
                     namespace,
@@ -3526,14 +3573,41 @@ impl ExecutionPlan for CachingAccelerationScanExec {
                 tracing::debug!(
                     "No cached data for dataset={dataset_name}, treating as cache miss (insert)"
                 );
+                // A response predicate narrowed the empty read, so it proves
+                // nothing about the request. The fill may append only after a
+                // read of the whole request also comes back empty.
+                let batch_write_tx = if response_filtered {
+                    let observed = batch_write_tx.observe_cache_scan();
+                    match CacheRefreshHelper::holds_no_rows(
+                        &accelerator,
+                        &session_state,
+                        &fill_filters,
+                        namespace.storage_id(),
+                        context,
+                    )
+                    .await
+                    {
+                        Ok(true) => observed,
+                        Ok(false) => batch_write_tx.without_scan_observation(),
+                        Err(error) => {
+                            tracing::debug!(
+                                "Replacing cached rows for dataset {dataset_name} because their absence could not be checked: {error}"
+                            );
+                            batch_write_tx.without_scan_observation()
+                        }
+                    }
+                } else {
+                    batch_write_tx
+                };
                 CacheRefreshHelper::handle_cache_miss(
                     federated,
                     &session_state,
                     &dataset_name,
-                    &filters,
+                    &fill_filters,
                     limit,
                     Arc::clone(&schema_clone),
                     false,                  // is_expired = false, will insert (append)
+                    response_filtered,
                     StaleIfError::Disabled, // no cached entry to fall back to
                     max_age.unwrap_or_default(), // unused: no expired batches
                     None,                   // no expired batches
@@ -5954,6 +6028,7 @@ mod tests {
             None,
             Arc::clone(&schema),
             false,
+            false,
             StaleIfError::Disabled,
             Duration::ZERO,
             None,
@@ -5994,6 +6069,7 @@ mod tests {
             &[col("content").eq(lit("test"))],
             None,
             Arc::clone(&schema),
+            false,
             false,
             StaleIfError::Disabled,
             Duration::ZERO,
@@ -6086,6 +6162,7 @@ mod tests {
             None,
             Arc::clone(&schema),
             true,                                     // is_expired
+            false,                                    // response_filtered
             StaleIfError::Enabled,                    // stale_if_error enabled (∞)
             Duration::ZERO,                           // max_age (ignored by Enabled)
             Some(CacheFallback::Loaded(vec![stale])), // expired entry
@@ -6134,6 +6211,7 @@ mod tests {
             None,
             Arc::clone(&schema),
             true,
+            false,
             StaleIfError::Disabled, // stale_if_error disabled
             Duration::ZERO,         // max_age (ignored by Disabled)
             Some(CacheFallback::Loaded(vec![stale])),
@@ -6242,6 +6320,7 @@ mod tests {
             None,
             Arc::clone(&schema),
             true,
+            false,
             stale_if_error,
             max_age,
             Some(CacheFallback::Deferred {
@@ -6412,6 +6491,7 @@ mod tests {
             None,
             Arc::clone(&schema),
             true,
+            false,
             stale_if_error,
             max_age,
             Some(CacheFallback::Deferred {
@@ -6643,6 +6723,7 @@ mod tests {
             None,
             Arc::clone(&schema),
             false,
+            false,
             StaleIfError::Disabled,
             Duration::ZERO,
             None,
@@ -6718,6 +6799,7 @@ mod tests {
                 &filters,
                 None,
                 Arc::clone(&schema),
+                false,
                 false,
                 StaleIfError::Disabled,
                 Duration::ZERO,
@@ -6796,6 +6878,7 @@ mod tests {
                 None,
                 Arc::clone(&schema),
                 false,
+                false,
                 StaleIfError::Disabled,
                 Duration::ZERO,
                 None,
@@ -6866,6 +6949,7 @@ mod tests {
                 &filters,
                 limit,
                 Arc::clone(&schema),
+                false,
                 false,
                 StaleIfError::Disabled,
                 Duration::ZERO,
@@ -6970,6 +7054,7 @@ mod tests {
                 None,
                 Arc::clone(&schema),
                 true,
+                false,
                 StaleIfError::Disabled,
                 Duration::ZERO,
                 None,
@@ -7085,6 +7170,7 @@ mod tests {
                 None,
                 Arc::clone(&schema),
                 true,
+                false,
                 StaleIfError::Disabled,
                 Duration::ZERO,
                 None,
@@ -7324,6 +7410,7 @@ mod tests {
             None,
             Arc::clone(&schema),
             false,
+            false,
             StaleIfError::Disabled,
             Duration::ZERO,
             None,
@@ -7459,6 +7546,7 @@ mod tests {
             None,                              // limit
             Arc::clone(&schema),
             false,                  // is_expired
+            false,                  // response_filtered
             StaleIfError::Disabled, // stale_if_error
             Duration::ZERO,         // max_age (ignored: no expired batches)
             None,                   // expired_batches

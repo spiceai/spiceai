@@ -380,6 +380,19 @@ impl CacheWriteSender {
         }
     }
 
+    /// Forget the storage observation, so no empty scan can prove absence.
+    #[must_use]
+    pub(super) fn without_scan_observation(&self) -> Self {
+        match self {
+            Self::Batched(_) => self.clone(),
+            Self::Sink(writer) => {
+                let mut writer = writer.as_ref().clone();
+                writer.scan_revision = None;
+                Self::Sink(Arc::new(writer))
+            }
+        }
+    }
+
     pub(super) fn confirm_empty_scan(&self, claim: &mut CacheKeyClaim) {
         if let Self::Sink(writer) = self {
             writer
@@ -912,6 +925,46 @@ pub(super) fn canonical_request_filters(filters: &[Expr]) -> Option<Vec<Expr>> {
             })
             .collect(),
     )
+}
+
+/// Columns the HTTP connector builds a request from. It ignores predicates on
+/// every other column, which filter the response.
+const HTTP_REQUEST_COLUMNS: [&str; 4] = [
+    "request_path",
+    "request_query",
+    "request_body",
+    "request_headers",
+];
+
+/// The request-key conjuncts of a read that also filters response columns.
+/// The origin answers that request with its whole response whatever the
+/// response predicates are, so the read can fill the cache for the request.
+/// Returns `None` when no conjunct filters only the response, or when the
+/// remaining conjuncts do not describe one request.
+pub(super) fn response_filtered_request(filters: &[Expr]) -> Option<Vec<Expr>> {
+    let mut request = Vec::new();
+    let mut filters_response = false;
+    let mut pending: Vec<_> = filters.iter().rev().collect();
+    while let Some(expression) = pending.pop() {
+        if let Expr::BinaryExpr(binary) = expression
+            && binary.op == Operator::And
+        {
+            pending.push(&binary.right);
+            pending.push(&binary.left);
+            continue;
+        }
+        if expression
+            .column_refs()
+            .iter()
+            .any(|column| HTTP_REQUEST_COLUMNS.contains(&column.name.as_str()))
+        {
+            request.push(expression.clone());
+        } else {
+            filters_response = true;
+        }
+    }
+    (filters_response && !request.is_empty() && canonical_request_filters(&request).is_some())
+        .then_some(request)
 }
 
 /// A cache-fetch plan, its completion token, and whether it can authorize a replacement.
@@ -1982,5 +2035,33 @@ mod tests {
             ])
             .is_none()
         );
+    }
+
+    #[test]
+    fn response_predicates_fill_only_the_request_they_leave_intact() {
+        let path = col("request_path").eq(lit("/items"));
+        let query = col("request_query").eq(lit("q=a"));
+        let rank = col("rank").eq(lit("1"));
+        assert_eq!(
+            response_filtered_request(&[path.clone(), rank.clone(), query.clone()]),
+            Some(vec![path.clone(), query.clone()])
+        );
+        assert_eq!(
+            response_filtered_request(&[path.clone().and(rank.clone())]),
+            Some(vec![path.clone()])
+        );
+        for unscoped in [
+            vec![path.clone(), query],
+            vec![rank.clone()],
+            vec![path.clone().or(rank.clone()), rank.clone()],
+            vec![
+                path.clone(),
+                col("rank").eq(col("request_query")),
+                rank.clone(),
+            ],
+            vec![path, rank, col("request_headers").eq(lit("x-key: 1"))],
+        ] {
+            assert_eq!(response_filtered_request(&unscoped), None, "{unscoped:?}");
+        }
     }
 }
