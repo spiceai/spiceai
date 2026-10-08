@@ -204,7 +204,7 @@ async fn retired_dataset_tuning_param_is_not_applied_and_warns_once() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
-async fn renamed_runtime_goal_param_warns_once_and_is_not_reported_as_unknown() {
+async fn renamed_runtime_target_param_warns_once_and_is_not_reported_as_unknown() {
     let dir = tempfile::tempdir().expect("temp dir");
     let pod = spicepod(
         "rt_renamed",
@@ -215,7 +215,7 @@ async fn renamed_runtime_goal_param_warns_once_and_is_not_reported_as_unknown() 
     let _ = dynamic_tuning_of("rt_renamed", &pod, dir.path()).await;
 
     let logs = logged();
-    let warning = "`runtime.params.cayenne_goal_freshness` has been renamed, so it has no effect. Set `runtime.params.goal_freshness` instead. See: https://spiceai.org/docs/reference/spicepod/runtime";
+    let warning = "`runtime.params.cayenne_goal_freshness` has been renamed, so it has no effect. Set `runtime.params.target_freshness` instead. See: https://spiceai.org/docs/reference/spicepod/runtime";
     assert_eq!(logs.matches(warning).count(), 1, "logs: {logs}");
     assert!(
         !logs.contains(

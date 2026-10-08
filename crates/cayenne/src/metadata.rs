@@ -1105,7 +1105,7 @@ pub struct VortexConfig {
     /// signal-driven controller for that metric). When any is set, the closed loop
     /// drives that high-level SLO toward target with small incremental steps,
     /// converging within `goal_convergence_window_secs`. Set from the
-    /// `runtime.params.goal_*` params. A goal declares a target, not a controller, so it
+    /// `runtime.params.target_*` params. A goal declares a target, not a controller, so it
     /// never turns `dynamic_tuning` on — set without it, the goal is inert (the
     /// accelerator warns). Runtime-only — never compared by
     /// `configuration_matches` (does not affect data layout).

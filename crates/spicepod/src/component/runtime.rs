@@ -567,11 +567,14 @@ pub const RETIRED_CATALOG_TUNING_PARAMS: &[&str] = &["cayenne_tuning"];
 /// `runtime.params` keys renamed without the `cayenne_` prefix, as `(old, new)`. The old
 /// names are no longer read.
 pub const RENAMED_RUNTIME_TUNING_PARAMS: &[(&str, &str)] = &[
-    ("cayenne_goal_replication_lag", "goal_replication_lag"),
-    ("cayenne_goal_freshness", "goal_freshness"),
-    ("cayenne_goal_query_latency", "goal_query_latency"),
-    ("cayenne_goal_convergence_window", "goal_convergence_window"),
-    ("cayenne_goal_qph", "goal_qph"),
+    ("cayenne_goal_replication_lag", "target_replication_lag"),
+    ("cayenne_goal_freshness", "target_freshness"),
+    ("cayenne_goal_query_latency", "target_query_latency"),
+    (
+        "cayenne_goal_convergence_window",
+        "target_convergence_window",
+    ),
+    ("cayenne_goal_qph", "target_qph"),
 ];
 
 /// One warning for each of `retired` that `params` still sets on a dataset or catalog.
@@ -590,9 +593,11 @@ pub fn retired_tuning_param_warnings<S: std::hash::BuildHasher>(
         .filter(|key| params.contains_key(**key))
         .map(|key| {
             let new_name = if *key == "cayenne_tuning" {
-                "adaptive_tuning"
+                "adaptive_tuning".to_string()
+            } else if let Some(goal) = key.strip_prefix("cayenne_goal_") {
+                format!("target_{goal}")
             } else {
-                key.strip_prefix("cayenne_").unwrap_or(key)
+                key.strip_prefix("cayenne_").unwrap_or(key).to_string()
             };
             let mut subject = kind.to_string();
             if let Some(first) = subject.get_mut(..1) {
@@ -2715,6 +2720,16 @@ datasets:
             ),
             vec!["Dataset 'orders' sets `cayenne_tuning`, which is no longer a dataset parameter, so it has no effect. Set `runtime.params.adaptive_tuning` instead. See: https://spiceai.org/docs/reference/spicepod/runtime".to_string()]
         );
+        let params = HashMap::from([("cayenne_goal_freshness".to_string(), "5s".to_string())]);
+        assert_eq!(
+            retired_tuning_param_warnings(
+                "dataset",
+                "orders",
+                &params,
+                RETIRED_DATASET_TUNING_PARAMS
+            ),
+            vec!["Dataset 'orders' sets `cayenne_goal_freshness`, which is no longer a dataset parameter, so it has no effect. Set `runtime.params.target_freshness` instead. See: https://spiceai.org/docs/reference/spicepod/runtime".to_string()]
+        );
         let params = HashMap::from([("cayenne_tuning".to_string(), "disabled".to_string())]);
         assert_eq!(
             retired_tuning_param_warnings("catalog", "lake", &params, RETIRED_CATALOG_TUNING_PARAMS),
@@ -2734,8 +2749,8 @@ datasets:
     #[test]
     fn test_renamed_runtime_param_warning_text() {
         assert_eq!(
-            renamed_runtime_param_warning("cayenne_goal_freshness", "goal_freshness"),
-            "`runtime.params.cayenne_goal_freshness` has been renamed, so it has no effect. Set `runtime.params.goal_freshness` instead. See: https://spiceai.org/docs/reference/spicepod/runtime"
+            renamed_runtime_param_warning("cayenne_goal_freshness", "target_freshness"),
+            "`runtime.params.cayenne_goal_freshness` has been renamed, so it has no effect. Set `runtime.params.target_freshness` instead. See: https://spiceai.org/docs/reference/spicepod/runtime"
         );
     }
 

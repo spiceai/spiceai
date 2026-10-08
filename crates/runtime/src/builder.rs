@@ -64,16 +64,16 @@ const CAYENNE_FILTER_PROPAGATION_PARAM: &str = "cayenne_filter_propagation";
 const CAYENNE_OPTIMIZER_RULES_PARAM: &str = "cayenne_optimizer_rules";
 
 /// Runtime-wide adaptive-tuning parameters: the tuning mode and the SLO setpoints
-/// (`goal_*`) the closed loop steers toward. Declared here so the keys are part of the
+/// (`target_*`) the closed loop steers toward. Declared here so the keys are part of the
 /// recognized `runtime.params` vocabulary and don't false-warn as unknown; the values
 /// are resolved (and validated) where the per-dataset Cayenne config is built, and
 /// `adaptive_tuning` is also validated when the Spicepod loads.
 const ADAPTIVE_TUNING_PARAM: &str = "adaptive_tuning";
-const GOAL_REPLICATION_LAG_PARAM: &str = "goal_replication_lag";
-const GOAL_FRESHNESS_PARAM: &str = "goal_freshness";
-const GOAL_QUERY_LATENCY_PARAM: &str = "goal_query_latency";
-const GOAL_CONVERGENCE_WINDOW_PARAM: &str = "goal_convergence_window";
-const GOAL_QPH_PARAM: &str = "goal_qph";
+const TARGET_REPLICATION_LAG_PARAM: &str = "target_replication_lag";
+const TARGET_FRESHNESS_PARAM: &str = "target_freshness";
+const TARGET_QUERY_LATENCY_PARAM: &str = "target_query_latency";
+const TARGET_CONVERGENCE_WINDOW_PARAM: &str = "target_convergence_window";
+const TARGET_QPH_PARAM: &str = "target_qph";
 
 /// Process-global `SQLite` metastore pragma tuning keys (cache, mmap, busy
 /// timeout, WAL autocheckpoint, `auto_vacuum`). Consumed once at startup in
@@ -126,11 +126,11 @@ const KNOWN_CAYENNE_RUNTIME_PARAMS: &[&str] = &[
 /// Runtime-wide tuning keys, which carry no `cayenne_` prefix.
 const TUNING_RUNTIME_PARAMS: &[&str] = &[
     ADAPTIVE_TUNING_PARAM,
-    GOAL_REPLICATION_LAG_PARAM,
-    GOAL_FRESHNESS_PARAM,
-    GOAL_QUERY_LATENCY_PARAM,
-    GOAL_CONVERGENCE_WINDOW_PARAM,
-    GOAL_QPH_PARAM,
+    TARGET_REPLICATION_LAG_PARAM,
+    TARGET_FRESHNESS_PARAM,
+    TARGET_QUERY_LATENCY_PARAM,
+    TARGET_CONVERGENCE_WINDOW_PARAM,
+    TARGET_QPH_PARAM,
 ];
 
 /// Recognized `runtime.params` keys that don't belong to a larger prefix

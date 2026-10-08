@@ -681,7 +681,7 @@ pub trait DataAccelerator: Send + Sync {
     /// configured before any of them exists.
     ///
     /// `runtime_params` is the runtime's `runtime.params`. The engine reads
-    /// `adaptive_tuning` and the `goal_*` setpoints from it because it owns that
+    /// `adaptive_tuning` and the `target_*` targets from it because it owns that
     /// vocabulary; `data_path` and `metastore_path` are the directories to probe. A catalog has no schema inference, so the seed comes from
     /// the host alone — which is precisely why it must come from the engine, and why an
     /// engine with no adaptive controller returns the default outcome and keeps its
@@ -1254,14 +1254,14 @@ pub struct AdaptiveTuningOutcome {
     /// `None` when the operator did not ask for adaptive tuning, in which case the engine
     /// keeps its static defaults.
     pub seeds: Option<AdaptiveTuningSeeds>,
-    /// The `goal_*` setpoints the operator configured, resolved whether or not adaptive
-    /// tuning is on, so the caller can report goals that will have no effect.
-    pub goals: TuningGoals,
+    /// The `target_*` targets the operator configured, resolved whether or not adaptive
+    /// tuning is on, so the caller can report targets that will have no effect.
+    pub targets: TuningTargets,
 }
 
-/// The runtime-wide `goal_*` setpoints the adaptive controller steers toward.
+/// The runtime-wide `target_*` targets the adaptive controller steers toward.
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
-pub struct TuningGoals {
+pub struct TuningTargets {
     pub replication_lag_secs: Option<f64>,
     pub freshness_secs: Option<f64>,
     pub query_latency_ms: Option<f64>,
@@ -1270,7 +1270,7 @@ pub struct TuningGoals {
     pub qph: Option<f64>,
 }
 
-impl TuningGoals {
+impl TuningTargets {
     /// Whether any setpoint that declares a target is set. The convergence window only
     /// paces the loop, so it does not count.
     #[must_use]

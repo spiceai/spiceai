@@ -106,7 +106,7 @@ impl CayenneCatalogConnector {
     }
 
     /// `runtime_params` is the runtime's `runtime.params`, which carry the runtime-wide
-    /// `adaptive_tuning` mode and `goal_*` setpoints.
+    /// `adaptive_tuning` mode and `target_*` setpoints.
     async fn parse_provider_config(
         &self,
         catalog_name: Option<&str>,
@@ -290,14 +290,14 @@ impl CayenneCatalogConnector {
                     && !value.eq_ignore_ascii_case("disabled")
                     && !value.eq_ignore_ascii_case("enabled"),
                 seeds: None,
-                goals: data_accelerator_api::TuningGoals::default(),
+                targets: data_accelerator_api::TuningTargets::default(),
             }
         };
 
-        // A goal declares a target for the closed loop and never turns it on.
-        if outcome.goals.any_target() && outcome.seeds.is_none() {
+        // A target steers the closed loop and never turns it on.
+        if outcome.targets.any_target() && outcome.seeds.is_none() {
             tracing::warn!(
-                "`runtime.params.goal_*` is set but `runtime.params.adaptive_tuning` is `disabled`, so catalog '{}' ignores the goals. Set `runtime.params.adaptive_tuning` to `enabled` to enable goal-seeking. See: https://spiceai.org/docs/reference/spicepod/runtime",
+                "`runtime.params.target_*` is set but `runtime.params.adaptive_tuning` is `disabled`, so catalog '{}' ignores the targets. Set `runtime.params.adaptive_tuning` to `enabled` to enable target-seeking. See: https://spiceai.org/docs/reference/spicepod/runtime",
                 catalog_name.unwrap_or_default()
             );
         }
@@ -358,11 +358,11 @@ impl CayenneCatalogConnector {
             inline_flush_max_segments,
             inline_flush_max_bytes,
             dynamic_tuning,
-            goal_replication_lag_secs: outcome.goals.replication_lag_secs,
-            goal_freshness_secs: outcome.goals.freshness_secs,
-            goal_query_latency_ms: outcome.goals.query_latency_ms,
-            goal_convergence_window_secs: outcome.goals.convergence_window_secs,
-            goal_qph: outcome.goals.qph,
+            target_replication_lag_secs: outcome.targets.replication_lag_secs,
+            target_freshness_secs: outcome.targets.freshness_secs,
+            target_query_latency_ms: outcome.targets.query_latency_ms,
+            target_convergence_window_secs: outcome.targets.convergence_window_secs,
+            target_qph: outcome.targets.qph,
             compaction_background_interval_ms: seed_compaction_background_interval_ms,
             compaction_trigger_files: seed_compaction_trigger_files,
             // The catalog path keeps the engine default (50_000) as the bake-trigger

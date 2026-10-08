@@ -598,14 +598,14 @@ fn parse_goal_f64(raw: Option<&str>, key: &str, source_desc: &str) -> Option<f64
     }
 }
 
-/// Resolve the runtime-wide `goal_*` setpoints from `runtime.params`. Times are duration
+/// Resolve the runtime-wide `target_*` setpoints from `runtime.params`. Times are duration
 /// strings (`5s`/`1m`/`250ms`) and QPH is a number; an invalid value warns and is ignored.
 /// Query latency is stored in ms. QPH is a system-wide metric: a query (e.g. a join)
 /// spans datasets and is counted once globally. The convergence window paces how the
 /// loop chases the SLOs rather than declaring an outcome.
-fn parse_tuning_goals(
+fn parse_tuning_targets(
     runtime_params: &std::collections::HashMap<String, String>,
-) -> data_accelerator_api::TuningGoals {
+) -> data_accelerator_api::TuningTargets {
     let duration = |key: &str| {
         parse_goal_duration_secs(
             runtime_params.get(key).map(String::as_str),
@@ -613,14 +613,14 @@ fn parse_tuning_goals(
             "runtime.params",
         )
     };
-    data_accelerator_api::TuningGoals {
-        replication_lag_secs: duration("goal_replication_lag"),
-        freshness_secs: duration("goal_freshness"),
-        query_latency_ms: duration("goal_query_latency").map(|secs| secs * 1000.0),
-        convergence_window_secs: duration("goal_convergence_window"),
+    data_accelerator_api::TuningTargets {
+        replication_lag_secs: duration("target_replication_lag"),
+        freshness_secs: duration("target_freshness"),
+        query_latency_ms: duration("target_query_latency").map(|secs| secs * 1000.0),
+        convergence_window_secs: duration("target_convergence_window"),
         qph: parse_goal_f64(
-            runtime_params.get("goal_qph").map(String::as_str),
-            "goal_qph",
+            runtime_params.get("target_qph").map(String::as_str),
+            "target_qph",
             "runtime.params",
         ),
     }
@@ -2211,7 +2211,7 @@ impl CayenneAccelerator {
             // `enabled` also runs the closed-feedback loop that moves them within
             // the environment-derived [floor, ceiling]. the closed loop is reached ONLY by
             // asking for it there — unset and every other signal (inferred schema, a
-            // configured `goal_*`) resolve to `disabled`. Independently of the mode, an
+            // configured `target_*`) resolve to `disabled`. Independently of the mode, an
             // explicit per-knob value overrides the derived one, and when `enabled`
             // it *pins* that knob so the loop leaves it alone.
             let app = source.app();
@@ -2254,25 +2254,25 @@ impl CayenneAccelerator {
                 );
                 config.dynamic_tuning = false;
             }
-            // Goal-driven tuning: parse the high-level SLO setpoints from
+            // Target-driven tuning: parse the high-level SLO targets from
             // `runtime.params` (runtime-wide; there is no per-dataset override).
             // Times are duration strings (`5s`/`1m`/`250ms`); QPH is a number. The
-            // goals steer the closed loop but never ENABLE it: `adaptive` is reached
-            // only by `runtime.params.adaptive_tuning: enabled`, so a goal set without it is
+            // targets steer the closed loop but never ENABLE it: `adaptive` is reached
+            // only by `runtime.params.adaptive_tuning: enabled`, so a target set without it is
             // inert and warns below. Query latency is stored in ms.
-            let goals = parse_tuning_goals(runtime_params);
-            config.goal_replication_lag_secs = goals.replication_lag_secs;
-            config.goal_freshness_secs = goals.freshness_secs;
-            config.goal_query_latency_ms = goals.query_latency_ms;
-            config.goal_convergence_window_secs = goals.convergence_window_secs;
-            config.goal_qph = goals.qph;
-            let any_goal = goals.any_target();
-            // A goal never switches the mode: `adaptive` is a preview feature and
-            // is entered only by asking for it, so a goal configured while the
+            let targets = parse_tuning_targets(runtime_params);
+            config.goal_replication_lag_secs = targets.replication_lag_secs;
+            config.goal_freshness_secs = targets.freshness_secs;
+            config.goal_query_latency_ms = targets.query_latency_ms;
+            config.goal_convergence_window_secs = targets.convergence_window_secs;
+            config.goal_qph = targets.qph;
+            let any_target = targets.any_target();
+            // A target never switches the mode: `adaptive` is a preview feature and
+            // is entered only by asking for it, so a target configured while the
             // loop is off is reported as ignored (below, under the newly-resolved
             // guard so a dataset that keeps failing to load does not repeat it)
             // rather than silently promoting the table into a different regime.
-            let goals_are_inert = any_goal && !config.dynamic_tuning;
+            let targets_are_inert = any_target && !config.dynamic_tuning;
             if config.dynamic_tuning {
                 tracing::warn!(
                     target: "spiced::acceleration::cayenne",
@@ -2347,13 +2347,13 @@ impl CayenneAccelerator {
                     tracing::warn!(target: "spiced::acceleration::cayenne", "{warning}");
                 }
 
-                // A `goal_*` SLO with the closed loop off does nothing, and it is easy
+                // A `target_*` SLO with the closed loop off does nothing, and it is easy
                 // to set one and assume it took effect.
-                if goals_are_inert {
+                if targets_are_inert {
                     tracing::warn!(
                         target: "spiced::acceleration::cayenne",
                         table = %table_name,
-                        "`runtime.params.goal_*` is set but `runtime.params.adaptive_tuning` is `disabled`, so dataset '{table_name}' ignores the goals. Set `runtime.params.adaptive_tuning` to `enabled` to enable goal-seeking. See: https://spiceai.org/docs/reference/spicepod/runtime"
+                        "`runtime.params.target_*` is set but `runtime.params.adaptive_tuning` is `disabled`, so dataset '{table_name}' ignores the targets. Set `runtime.params.adaptive_tuning` to `enabled` to enable target-seeking. See: https://spiceai.org/docs/reference/spicepod/runtime"
                     );
                 }
 
@@ -3244,14 +3244,14 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .description("Periodic background mem-tier checkpoint interval in milliseconds, in cdc_durability: memory mode only. The accelerator spawns a per-table background task that checkpoints the RAM tier every interval (mirroring the background compactor); this advances the deferred source slot ack on an idle or pure-upsert stream that never trips a delete/truncate event trigger or a write-path cap. Default 1000 (1 s). Set 0 to disable the periodic task."),
         ParameterSpec::component("cdc_mem_tier_shards")
             .description("Number of PK-hash shards the in-RAM CDC tier is partitioned into, in cdc_durability: memory mode only (non-partitioned, key-based merge-on-read tables). Each shard is an independent serial validate->append domain keyed by the RowConverter OwnedRow bytes, so disjoint keys validate and append in parallel within one apply (intra-apply fan-out) while a key's whole version history — upserts AND delete tombstones — stays confined to its one owning shard (last-writer-wins preserved). Checkpoints are always all-shards-atomic on a single source-position axis. Default 1 (the byte-identical serial path). Raise (e.g. 4) on update/insert-heavy CDC tables to lift the per-apply serialization ceiling."),
-        // Retired: these moved to `runtime.params` (`adaptive_tuning`, `goal_*`). They stay listed
+        // Retired: these moved to `runtime.params` (`adaptive_tuning`, `target_*`). They stay listed
         // only so `Parameters` drops them without a second, generic warning, and are left
         // out of the published schema.
         ParameterSpec::component("tuning").moved_to("runtime.params.adaptive_tuning"),
-        ParameterSpec::component("goal_replication_lag").moved_to("runtime.params.goal_replication_lag"),
-        ParameterSpec::component("goal_freshness").moved_to("runtime.params.goal_freshness"),
-        ParameterSpec::component("goal_query_latency").moved_to("runtime.params.goal_query_latency"),
-        ParameterSpec::component("goal_convergence_window").moved_to("runtime.params.goal_convergence_window"),
+        ParameterSpec::component("goal_replication_lag").moved_to("runtime.params.target_replication_lag"),
+        ParameterSpec::component("goal_freshness").moved_to("runtime.params.target_freshness"),
+        ParameterSpec::component("goal_query_latency").moved_to("runtime.params.target_query_latency"),
+        ParameterSpec::component("goal_convergence_window").moved_to("runtime.params.target_convergence_window"),
         ParameterSpec::runtime("cdc_prefetch_buffer")
             .description("Per-dataset override for the CDC source-reader prefetch channel depth (envelopes)."),
         ParameterSpec::runtime("cdc_max_coalesced_envelopes")
@@ -3300,12 +3300,12 @@ impl DataAccelerator for CayenneAccelerator {
     ) -> data_accelerator_api::AdaptiveTuningOutcome {
         let (tuning_mode, tuning_value_invalid) =
             autotune::TuningMode::parse(runtime_params.get("adaptive_tuning").map(String::as_str));
-        let goals = parse_tuning_goals(runtime_params);
+        let targets = parse_tuning_targets(runtime_params);
         if tuning_mode != autotune::TuningMode::Adaptive {
             return data_accelerator_api::AdaptiveTuningOutcome {
                 tuning_value_invalid,
                 seeds: None,
-                goals,
+                targets,
             };
         }
 
@@ -3321,7 +3321,7 @@ impl DataAccelerator for CayenneAccelerator {
 
         data_accelerator_api::AdaptiveTuningOutcome {
             tuning_value_invalid,
-            goals,
+            targets,
             seeds: Some(data_accelerator_api::AdaptiveTuningSeeds {
                 // A small-write cadence, so the controller has a tick to ride.
                 compaction_background_interval_ms: 10_000,
@@ -7448,26 +7448,26 @@ mod tests {
         CayenneAccelerator::get_vortex_config(name, &dataset).await
     }
 
-    /// Adaptive tuning stays `disabled` unless `runtime.params.adaptive_tuning` is `enabled`. A `goal_*`
+    /// Adaptive tuning stays `disabled` unless `runtime.params.adaptive_tuning` is `enabled`. A `target_*`
     /// SLO expresses a target, not a choice of controller, so it must leave the closed
     /// loop off.
     #[tokio::test]
-    async fn test_goals_do_not_enable_adaptive_tuning() {
-        let config = tuning_config("global_goal", &[("goal_replication_lag", "5s")], &[])
+    async fn test_targets_do_not_enable_adaptive_tuning() {
+        let config = tuning_config("global_target", &[("target_replication_lag", "5s")], &[])
             .await
             .expect("config should be valid");
         assert!(
             !config.dynamic_tuning,
-            "a runtime.params goal_* must not turn on the closed loop"
+            "a runtime.params target_* must not turn on the closed loop"
         );
         assert!(
             config.goal_replication_lag_secs.is_some(),
-            "the goal is still parsed so an operator who enables adaptive gets it"
+            "the target is still parsed so an operator who enables adaptive gets it"
         );
 
         let config = tuning_config(
             "adaptive",
-            &[("adaptive_tuning", "enabled"), ("goal_freshness", "30s")],
+            &[("adaptive_tuning", "enabled"), ("target_freshness", "30s")],
             &[],
         )
         .await
@@ -7500,7 +7500,7 @@ mod tests {
 
     /// The old global names are no longer read either.
     #[tokio::test]
-    async fn test_renamed_runtime_goal_params_are_not_applied() {
+    async fn test_renamed_runtime_target_params_are_not_applied() {
         let config = tuning_config(
             "renamed",
             &[
@@ -7516,16 +7516,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_goal_params_resolve_from_runtime_params() {
+    async fn test_target_params_resolve_from_runtime_params() {
         let config = tuning_config(
-            "goals",
+            "targets",
             &[
                 ("adaptive_tuning", "enabled"),
-                ("goal_replication_lag", "10s"),
-                ("goal_freshness", "5s"),
-                ("goal_query_latency", "250ms"),
-                ("goal_convergence_window", "2m"),
-                ("goal_qph", "5000"),
+                ("target_replication_lag", "10s"),
+                ("target_freshness", "5s"),
+                ("target_query_latency", "250ms"),
+                ("target_convergence_window", "2m"),
+                ("target_qph", "5000"),
             ],
             &[],
         )

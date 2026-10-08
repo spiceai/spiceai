@@ -215,7 +215,7 @@ NEXTEST_SELECTION := --all --exclude libnfs \
 # `runtime`'s `rate_control` binary holds the HTTP rate-control tests, which are
 # self-contained and gate the parameter validation and shared-origin rules.
 # `runtime`'s `cayenne_runtime_tuning` binary loads real Spicepods from a temp dir
-# and gates `runtime.params.adaptive_tuning` / `goal_*` resolution and the
+# and gates `runtime.params.adaptive_tuning` / `target_*` resolution and the
 # warnings for the retired `cayenne_tuning` / `cayenne_goal_*` names.
 # They need `runtime/rate-control` in NEXTEST_SELECTION to be built at all —
 # the target's `required-features` drops it otherwise. They are kept out of

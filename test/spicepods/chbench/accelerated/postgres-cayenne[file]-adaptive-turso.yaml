@@ -25,7 +25,7 @@ name: postgres-cayenne[file]-adaptive-turso
 # Background compaction stays at the auto-derived (non-zero) default — the controller rides its
 # tick. No per-ACTUATOR knob value is set anywhere: an explicit knob would *pin* it under adaptive
 # (collapsing its tuning bounds to a point), so the un-pinned baseline gives the loop full freedom.
-# The `goal_*` SLOs (set under `runtime.params`) are NOT actuator knobs — they
+# The `target_*` SLOs (set under `runtime.params`) are NOT actuator knobs — they
 # are the high-level targets the closed loop converges toward (it still moves the un-pinned
 # actuators freely to hit them).
 #
@@ -63,7 +63,7 @@ runtime:
       enabled: false
   task_history:
     enabled: false
-  # `adaptive_tuning: enabled` and the `goal_*` SLOs are runtime-wide: they apply to every Cayenne
+  # `adaptive_tuning: enabled` and the `target_*` SLOs are runtime-wide: they apply to every Cayenne
   # dataset, with no per-dataset override. The goals are the high-level targets the closed
   # loop converges toward — NOT actuator knobs. Replication-lag/freshness drive the CDC
   # (changes) tables (inert on the full-refresh reference tables); query-latency (p99)
@@ -71,10 +71,10 @@ runtime:
   # counted once).
   params:
     adaptive_tuning: enabled
-    goal_replication_lag: '5s'
-    goal_freshness: '30s'
-    goal_query_latency: '10s'
-    goal_qph: '5000'
+    target_replication_lag: '5s'
+    target_freshness: '30s'
+    target_query_latency: '10s'
+    target_qph: '5000'
 
 datasets:
   # ---- TPC-C core tables (mutated by OLTP workload) ----

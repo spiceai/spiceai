@@ -276,15 +276,15 @@ async fn retired_catalog_tuning_param_warns_once_per_node_and_is_not_applied() {
     not(feature = "spicebench"),
     ignore = "the Cayenne catalog connector requires the spicebench feature"
 )]
-async fn runtime_goals_reach_catalog_tables() {
+async fn runtime_targets_reach_catalog_tables() {
     let resolved = catalog_table_tuning(
         &[
             ("adaptive_tuning", "enabled"),
-            ("goal_replication_lag", "10s"),
-            ("goal_freshness", "5s"),
-            ("goal_query_latency", "250ms"),
-            ("goal_convergence_window", "2m"),
-            ("goal_qph", "5000"),
+            ("target_replication_lag", "10s"),
+            ("target_freshness", "5s"),
+            ("target_query_latency", "250ms"),
+            ("target_convergence_window", "2m"),
+            ("target_qph", "5000"),
         ],
         &[],
     )
@@ -299,7 +299,7 @@ async fn runtime_goals_reach_catalog_tables() {
             convergence_window_secs: Some(120.0),
             qph: Some(5000.0),
         },
-        "the runtime-wide goals must reach catalog tables"
+        "the runtime-wide targets must reach catalog tables"
     );
 }
 
@@ -308,18 +308,18 @@ async fn runtime_goals_reach_catalog_tables() {
     not(feature = "spicebench"),
     ignore = "the Cayenne catalog connector requires the spicebench feature"
 )]
-async fn goals_without_adaptive_tuning_warn_once_and_leave_the_loop_off() {
-    let resolved = catalog_table_tuning(&[("goal_freshness", "5s")], &[]).await;
+async fn targets_without_adaptive_tuning_warn_once_and_leave_the_loop_off() {
+    let resolved = catalog_table_tuning(&[("target_freshness", "5s")], &[]).await;
     assert!(
         !resolved.dynamic_tuning,
-        "a goal must not turn the closed-loop tuner on"
+        "a target must not turn the closed-loop tuner on"
     );
-    let warning = "`runtime.params.goal_*` is set but `runtime.params.adaptive_tuning` is `disabled`, so catalog 'tcat' ignores the goals.";
+    let warning = "`runtime.params.target_*` is set but `runtime.params.adaptive_tuning` is `disabled`, so catalog 'tcat' ignores the targets.";
     let logs = logged();
     // The scheduler and the executor each register the catalog, so each reports it once.
     assert_eq!(
         logs.matches(warning).count(),
         2,
-        "the inert goals must be reported once per registering node:\n{logs}"
+        "the inert targets must be reported once per registering node:\n{logs}"
     );
 }
