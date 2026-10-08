@@ -49,6 +49,8 @@ mod checkpoint_turso;
 mod cron;
 #[cfg(feature = "duckdb")]
 mod duckdb_builtin_pushdown;
+#[cfg(any(feature = "duckdb", feature = "sqlite"))]
+mod empty_projection_scan;
 #[cfg(feature = "duckdb")]
 mod file_create_duckdb;
 #[cfg(feature = "duckdb")]
