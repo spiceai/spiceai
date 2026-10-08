@@ -27,6 +27,9 @@ use std::{
 use crate::accelerated::refresh_completion::{RefreshCompletionOutcome, RefreshCompletionWaiter};
 use crate::cluster::partition::get_partition_filter_exprs;
 use crate::dataaccelerator::BootstrapStatus;
+use crate::dataconnector::reconnecting::{
+    ConnectorBuilder, ReconnectingConnector, SourceUnavailable,
+};
 use crate::dataconnector::refresh_source::ConnectorRefreshSource;
 use crate::init::dataset_initialization::DatasetInitialization;
 use crate::init::dataset_loads::DatasetLoad;
@@ -72,6 +75,7 @@ use futures::future::join_all;
 use opentelemetry::KeyValue;
 use runtime_async::is_shutdown_cancellation;
 use runtime_metrics::{self as metrics, components::register_component_metric};
+use runtime_table::accelerated::checkpoint_primary_key::records_acceleration_primary_key;
 use snafu::prelude::*;
 use tokio::sync::Semaphore;
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
@@ -632,48 +636,58 @@ impl Runtime {
     }
 
     async fn load_dataset_connector(&self, ds: Arc<Dataset>) -> Result<Arc<dyn DataConnector>> {
-        let spaced_tracer = Arc::clone(&self.spaced_tracer);
-        let source = ds.source();
-
-        let data_connector: Arc<dyn DataConnector> = match self
-            .get_dataconnector_from_dataset(Arc::clone(&ds))
+        self.build_dataset_connector(Arc::clone(&ds))
             .await
-        {
-            Ok(data_connector) => data_connector,
-            // This is the only failure this function raises, and reporting it is
-            // owned here: the component status, the `LOAD_ERROR` count, and one log
-            // line at the level the failure's permanence warrants. Callers -- both
-            // `try_load_dataset_once` and the hot-reload path in `update_dataset` --
-            // propagate it without reporting it again, so one failure is counted
-            // once and writes one status. See #12365.
-            Err(err) => {
-                let ds_name = &ds.name;
-                self.status.update_dataset(
-                    ds_name,
-                    status::ComponentStatus::error_with_message(err.to_string()),
-                );
-                metrics::datasets::LOAD_ERROR.add(1, &[]);
-                if is_permanent_dataset_failure(&err) {
-                    error_spaced!(
-                        spaced_tracer,
-                        "Error initializing dataset {}. {err}",
-                        ds_name.table()
-                    );
-                    return PermanentDatasetFailureSnafu {
-                        dataset: ds_name.clone(),
-                        reason: err.to_string(),
-                    }
-                    .fail();
-                }
-                warn_spaced!(
-                    spaced_tracer,
-                    "Error initializing dataset {}. {err}",
-                    ds_name.table()
-                );
-                return Err(crate::Error::UnableToInitializeDataConnector { source: err.into() });
-            }
-        };
+            .map_err(|err| self.report_connector_failure(&ds, err))
+    }
 
+    /// Builds `ds`'s connector and registers the component metrics it offers.
+    async fn build_dataset_connector(&self, ds: Arc<Dataset>) -> Result<Arc<dyn DataConnector>> {
+        let data_connector = self.get_dataconnector_from_dataset(Arc::clone(&ds)).await?;
+        Self::register_connector_metrics(&ds, &data_connector);
+        Ok(data_connector)
+    }
+
+    /// Reports a dataset's connector construction failure and returns the error to
+    /// propagate.
+    ///
+    /// This is the only failure connector construction raises, and reporting it is
+    /// owned here: the component status, the `LOAD_ERROR` count, and one log line
+    /// at the level the failure's permanence warrants. Callers -- both
+    /// `try_load_dataset_once` and the hot-reload path in `update_dataset` --
+    /// propagate it without reporting it again, so one failure is counted once and
+    /// writes one status. See #12365.
+    fn report_connector_failure(&self, ds: &Dataset, err: Error) -> Error {
+        let spaced_tracer = Arc::clone(&self.spaced_tracer);
+        let ds_name = &ds.name;
+        self.status.update_dataset(
+            ds_name,
+            status::ComponentStatus::error_with_message(load_failure_status(ds, &err.to_string())),
+        );
+        metrics::datasets::LOAD_ERROR.add(1, &[]);
+        if is_permanent_dataset_failure(&err) {
+            error_spaced!(
+                spaced_tracer,
+                "Error initializing dataset {}. {err}",
+                ds_name.table()
+            );
+            return PermanentDatasetFailureSnafu {
+                dataset: ds_name.clone(),
+                reason: err.to_string(),
+            }
+            .build();
+        }
+        warn_spaced!(
+            spaced_tracer,
+            "Error initializing dataset {}. {err}",
+            ds_name.table()
+        );
+        crate::Error::UnableToInitializeDataConnector { source: err.into() }
+    }
+
+    /// Registers the component metrics `data_connector` offers for `ds`.
+    fn register_connector_metrics(ds: &Dataset, data_connector: &Arc<dyn DataConnector>) {
+        let source = ds.source();
         // Register component metrics for this dataset.
         if let Some(metrics_provider) = data_connector.metrics_provider() {
             let enabled_metrics = ds.metrics.enabled_metrics();
@@ -708,8 +722,6 @@ impl Runtime {
                 enabled_metrics.join(", ")
             );
         }
-
-        Ok(data_connector)
     }
 
     async fn try_load_dataset_once(
@@ -776,19 +788,22 @@ impl Runtime {
         }
 
         let connector_start = Instant::now();
-        let connector = match self.load_dataset_connector(Arc::clone(&ds)).await {
-            Ok(connector) => {
-                tracing::debug!(dataset = %ds.name, duration_ms = connector_start.elapsed().as_millis(), "Dataset connector created");
-                connector
-            }
+        let connector = if !matches!(bootstrap_status, BootstrapStatus::Pending { .. })
+            && Self::serves_existing_acceleration(&ds).await
+        {
+            // Served from its existing acceleration at once; the real connector is
+            // built in the background, so the source's state never holds the dataset.
+            Self::reconnecting_connector(&ds)
+        } else {
             // `load_dataset_connector` owns reporting for this failure -- the
             // status, the `LOAD_ERROR` count, and a log line at the level its
             // permanence warrants -- and raises no other error, so propagating it
             // unreported leaves nothing unreported (#12365). Its reporting is
-            // unconditional, including during teardown, so this arm needs no
+            // unconditional, including during teardown, so this path needs no
             // `is_shutdown()` guard of its own to keep the count at one.
-            Err(err) => return Err(err),
+            self.load_dataset_connector(Arc::clone(&ds)).await?
         };
+        tracing::debug!(dataset = %ds.name, duration_ms = connector_start.elapsed().as_millis(), "Dataset connector created");
 
         // Check shutdown between connector load and registration.
         if self.status.is_shutdown() {
@@ -939,6 +954,22 @@ impl Runtime {
         load_semaphore: Arc<Semaphore>,
         load: &DatasetLoad,
     ) {
+        // Why a dataset with an acceleration on disk is not served from it, logged
+        // once when its first attempt fails. Not before: a source that is reached only
+        // when it is read (HTTP, S3) can fail after the dataset is already served
+        // from its acceleration, and then it does not wait.
+        let waits_for_source = parking_lot::Mutex::new(match Self::waits_for_source_reason(&ds) {
+            Some(reason)
+                if !matches!(bootstrap_status, BootstrapStatus::Pending { .. })
+                    && crate::dataconnector::sink::recorded_checkpoint_schema(&ds)
+                        .await
+                        .is_some() =>
+            {
+                Some(waits_for_source_message(&ds.name, &reason))
+            }
+            _ => None,
+        });
+
         let retry_strategy = FibonacciBackoffBuilder::new().max_retries(None).build();
         let _ = retry(retry_strategy, || async {
             if self.status.is_shutdown() {
@@ -969,10 +1000,16 @@ impl Runtime {
             {
                 Ok(()) => Ok(()),
                 Err(err) if self.status.is_shutdown() => Err(RetryError::permanent(err)),
-                Err(err) if matches!(err, Error::PermanentDatasetFailure { .. }) => {
-                    Err(RetryError::permanent(err))
+                Err(err) => {
+                    if let Some(message) = waits_for_source.lock().take() {
+                        tracing::info!("{message}");
+                    }
+                    if matches!(err, Error::PermanentDatasetFailure { .. }) {
+                        Err(RetryError::permanent(err))
+                    } else {
+                        Err(RetryError::transient(err))
+                    }
                 }
-                Err(err) => Err(RetryError::transient(err)),
             }
         })
         .await;
@@ -1089,6 +1126,275 @@ impl Runtime {
             .await;
     }
 
+    /// A [`ReconnectingConnector`] for `ds` that builds its real connector — and
+    /// registers its component metrics — on first use.
+    pub(crate) fn reconnecting_connector(ds: &Arc<Dataset>) -> Arc<dyn DataConnector> {
+        let ds_for_build = Arc::clone(ds);
+        let build: ConnectorBuilder = Arc::new(move || {
+            let ds = Arc::clone(&ds_for_build);
+            Box::pin(async move { ds.runtime().build_dataset_connector(Arc::clone(&ds)).await })
+        });
+        Arc::new(ReconnectingConnector::new(ds.source(), build))
+    }
+
+    /// Whether `ds` is served from its existing acceleration as soon as it loads,
+    /// connecting to its source in the background: it
+    /// [may be](Self::may_serve_existing_acceleration), and its acceleration has a
+    /// checkpointed schema to serve.
+    pub(crate) async fn serves_existing_acceleration(ds: &Dataset) -> bool {
+        Self::may_serve_existing_acceleration(ds) && Self::has_existing_acceleration(ds).await
+    }
+
+    /// Whether `ds`'s acceleration has a checkpointed schema to serve from.
+    async fn has_existing_acceleration(ds: &Dataset) -> bool {
+        Self::existing_acceleration_schema(ds).await.is_some()
+    }
+
+    /// Whether `ds`'s configuration allows serving it from an existing acceleration
+    /// before its source answers.
+    ///
+    /// Only datasets whose startup the source does not otherwise shape qualify:
+    /// read-only (the write path binds the source when the table is built), not
+    /// `changes` (CDC keeps no dataset checkpoint to serve from; see #14611) or
+    /// `caching` (which is ready immediately and serves its cache on its own), not
+    /// `append` without a `time_column` (which takes the connector's append stream
+    /// when the table is built), no embedding or full-text search columns (whose
+    /// search indexes wrap the source's provider, so search would fail until the
+    /// source answers), no Drasi forwarding (which rides the change stream), not `mode: file_create`, which starts from an empty acceleration by
+    /// design, and not the local file connector, which attaches its file watcher
+    /// when the table is registered and has no outage to ride out.
+    ///
+    /// The schema policy must be one the deferred provider reproduces: under
+    /// `on_schema_change: block` without recreate-on-mismatch, `FederatedTable::new`
+    /// itself defers on the checkpoint schema when the source differs, so resolving
+    /// the source later reaches the same outcome as resolving it now; datasets that
+    /// recreate or evolve on a schema change need the live schema to decide.
+    ///
+    /// This runs before the connector exists, so the refresh mode is resolved the way
+    /// `DataConnector::resolve_refresh_mode` does by default.
+    fn may_serve_existing_acceleration(ds: &Dataset) -> bool {
+        ds.acceleration.as_ref().is_some_and(|a| a.enabled)
+            && Self::waits_for_source_reason(ds).is_none()
+    }
+
+    /// The configuration that makes an accelerated dataset wait for its source
+    /// instead of being served from an existing acceleration (see
+    /// [`Self::may_serve_existing_acceleration`]), named the way the user wrote it, or
+    /// `None` when it does not wait or is not accelerated.
+    fn waits_for_source_reason(ds: &Dataset) -> Option<String> {
+        use crate::component::dataset::OnSchemaChange;
+        use crate::component::dataset::acceleration::Mode;
+
+        let acceleration = ds.acceleration.as_ref().filter(|a| a.enabled)?;
+        // An unset mode resolves the way the connector resolves it (`changes` for
+        // `debezium` and `cdc`), which this check runs before the connector exists to ask.
+        let refresh_mode = acceleration.refresh_mode.unwrap_or_else(|| {
+            runtime_acceleration::acceleration::unset_refresh_mode_for_connector(ds.source())
+        });
+        let reason = if ds.access().allows_write() {
+            "`access: read_write`".to_string()
+        } else if ds.has_embeddings() {
+            "embedding columns".to_string()
+        } else if ds.has_full_text_column() {
+            "full-text search columns".to_string()
+        } else if ds.drasi.as_ref().is_some_and(is_drasi_forwarding) {
+            "Drasi forwarding".to_string()
+        } else if acceleration.mode == Mode::FileCreate {
+            "`mode: file_create`".to_string()
+        } else if ds.source() == crate::dataconnector::file::FILE_DATACONNECTOR {
+            "the `file` connector".to_string()
+        } else if refresh_mode == RefreshMode::Changes {
+            "`refresh_mode: changes`".to_string()
+        } else if refresh_mode == RefreshMode::Caching {
+            "`refresh_mode: caching`".to_string()
+        } else if refresh_mode == RefreshMode::Append && ds.time_column.is_none() {
+            "`refresh_mode: append` without a `time_column`".to_string()
+        } else if ds.on_schema_change != OnSchemaChange::Block {
+            format!("`on_schema_change: {}`", ds.on_schema_change)
+        } else if crate::schema_evolution::recreates_on_schema_mismatch(
+            acceleration,
+            ds.on_schema_change,
+            refresh_mode,
+        ) {
+            format!("`mode: {}`", acceleration.mode)
+        } else {
+            return None;
+        };
+        Some(reason)
+    }
+
+    /// The reason a file-accelerated dataset that failed to load is not served from
+    /// its acceleration, for its status message.
+    fn not_served_reason(ds: &Dataset) -> Option<String> {
+        if !ds.is_file_accelerated() {
+            return None;
+        }
+        Self::waits_for_source_reason(ds)
+    }
+
+    /// Registers `ds` against its existing acceleration without waiting for the
+    /// source. The federated side resolves in the background, retrying the source,
+    /// while queries are served from the acceleration. The acceleration settings the
+    /// source would have inferred are recovered from the checkpoint schema, which
+    /// records them, so the dataset registers with the same primary key, indexes and
+    /// sort columns it would get from the source. Logs `reason`.
+    fn defer_to_existing_acceleration(
+        &self,
+        ds: &Arc<Dataset>,
+        data_connector: &Arc<dyn DataConnector>,
+        resolved_refresh_mode: RefreshMode,
+        checkpoint_schema: arrow_schema::SchemaRef,
+        reason: &SourceUnavailable,
+    ) -> (Arc<Dataset>, FederatedTable) {
+        let ds = Self::apply_inferred_acceleration(
+            Arc::clone(ds),
+            &checkpoint_schema,
+            resolved_refresh_mode,
+        );
+        let federated_table = FederatedTable::new_deferred(
+            Arc::new(ds.spec.clone()),
+            crate::dataconnector::refresh_source::ReportingRefreshSource::new_arc(
+                ConnectorRefreshSource::new_arc(Arc::clone(data_connector), Arc::clone(&ds)),
+                Arc::clone(&ds),
+                Arc::clone(&self.status),
+                match reason {
+                    SourceUnavailable::Failed {
+                        configuration_error,
+                        ..
+                    } => Some(*configuration_error),
+                    SourceUnavailable::NotContacted => None,
+                },
+            ),
+            checkpoint_schema,
+            self.status.shutdown_token(),
+        );
+        reason.log_serving_from_acceleration(&ds.name);
+        (ds, federated_table)
+    }
+
+    /// The schema `ds`'s existing acceleration was checkpointed with, when it has one
+    /// to serve from.
+    /// A checkpoint written before the acceleration's primary key was recorded does
+    /// not count: registering without the source could build the accelerator without
+    /// a key its table has, so that dataset waits for its source once, and its next
+    /// checkpoint records the key.
+    async fn existing_acceleration_schema(ds: &Dataset) -> Option<arrow_schema::SchemaRef> {
+        let schema = crate::dataconnector::sink::recorded_checkpoint_schema(ds).await?;
+        if records_acceleration_primary_key(&schema) {
+            return Some(schema);
+        }
+        tracing::debug!(
+            dataset = %ds.name,
+            "The acceleration checkpoint for dataset {} does not record its primary key (written by an earlier version), so it waits for its source before serving.",
+            ds.name
+        );
+        None
+    }
+
+    /// Resolves `ds`'s source provider, or registers `ds` against its existing
+    /// acceleration instead: at once for a dataset
+    /// [served from its acceleration](Self::serves_existing_acceleration), or when the
+    /// source cannot be read and an acceleration exists. Returns the dataset with any
+    /// inferred acceleration settings applied.
+    async fn federated_table_or_existing_acceleration(
+        &self,
+        ds: Arc<Dataset>,
+        data_connector: &Arc<dyn DataConnector>,
+        resolved_refresh_mode: RefreshMode,
+        allow_schema_mismatch: bool,
+        snapshot_fallback: bool,
+    ) -> Result<(Arc<Dataset>, FederatedTable)> {
+        // A dataset served from its existing acceleration registers before its real
+        // connector is built (see `try_load_dataset_once`); the source is contacted in
+        // the background.
+        if !snapshot_fallback
+            && data_connector
+                .as_any()
+                .downcast_ref::<ReconnectingConnector>()
+                .is_some_and(|connector| !connector.is_connected())
+            && let Some(checkpoint_schema) = Self::existing_acceleration_schema(&ds).await
+        {
+            return Ok(self.defer_to_existing_acceleration(
+                &ds,
+                data_connector,
+                resolved_refresh_mode,
+                checkpoint_schema,
+                &SourceUnavailable::NotContacted,
+            ));
+        }
+
+        let read_result = {
+            let context = RuntimeConnectorContext::for_dataset(&ds);
+            data_connector.read_provider(&context, &ds).await
+        };
+
+        match read_result {
+            Ok(provider) => {
+                // Gap-fill acceleration settings from schema inference (a no-op when
+                // the connector emitted no inferred metadata) before the dataset
+                // flows into registration and any changes stream.
+                let ds = Self::apply_inferred_acceleration(
+                    ds,
+                    &provider.schema(),
+                    resolved_refresh_mode,
+                );
+                let federated_table = if snapshot_fallback {
+                    FederatedTable::new_unchecked(provider)
+                } else {
+                    FederatedTable::new(
+                        Arc::new(ds.spec.clone()),
+                        provider,
+                        ConnectorRefreshSource::new_arc(
+                            Arc::clone(data_connector),
+                            Arc::clone(&ds),
+                        ),
+                        self.status.shutdown_token(),
+                        allow_schema_mismatch,
+                    )
+                    .await
+                };
+                Ok((ds, federated_table))
+            }
+            Err(err) => {
+                // We couldn't connect to the federated table. If the dataset has an existing
+                // accelerated table, we can defer the federated table creation.
+                if !snapshot_fallback
+                    && let Some(checkpoint_schema) = Self::existing_acceleration_schema(&ds).await
+                {
+                    return Ok(self.defer_to_existing_acceleration(
+                        &ds,
+                        data_connector,
+                        resolved_refresh_mode,
+                        checkpoint_schema,
+                        &SourceUnavailable::failed(&err),
+                    ));
+                }
+                self.status.update_dataset(
+                    &ds.name,
+                    status::ComponentStatus::error_with_message(load_failure_status(
+                        &ds,
+                        &err.to_string(),
+                    )),
+                );
+                metrics::datasets::LOAD_ERROR.add(1, &[]);
+                let spaced_tracer = Arc::clone(&self.spaced_tracer);
+                if !err.is_retriable() {
+                    error_spaced!(spaced_tracer, "{}{err}", "");
+                    return PermanentDatasetFailureSnafu {
+                        dataset: ds.name.clone(),
+                        reason: err.to_string(),
+                    }
+                    .fail();
+                }
+                warn_spaced!(spaced_tracer, "{}{err}", "");
+                UnableToLoadDatasetConnectorSnafu {
+                    dataset: ds.name.clone(),
+                }
+                .fail()
+            }
+        }
+    }
+
     /// Apply schema inference to a freshly-resolved dataset.
     ///
     /// When the source connector emitted inferred-schema metadata, this fills any
@@ -1101,9 +1407,14 @@ impl Runtime {
     /// `apply_inferred_schema`. Schema inference is always attempted; this returns
     /// `ds` unchanged when the dataset is not accelerated or the source emitted no
     /// usable metadata.
+    ///
+    /// `source_schema` is the source provider's schema, or — when the dataset is
+    /// served from an existing acceleration before the source answers — the
+    /// acceleration checkpoint's schema, which preserves the inferred metadata
+    /// recorded when the acceleration was built.
     fn apply_inferred_acceleration(
         ds: Arc<Dataset>,
-        provider: &Arc<dyn datafusion::datasource::TableProvider>,
+        source_schema: &arrow_schema::SchemaRef,
         resolved_refresh_mode: RefreshMode,
     ) -> Arc<Dataset> {
         use crate::component::dataset::schema_inference::apply_inferred_schema;
@@ -1117,7 +1428,6 @@ impl Runtime {
             return ds;
         }
 
-        let source_schema = provider.schema();
         let inferred = InferredSchema::from_metadata(source_schema.metadata());
         // Only acceleration settings (primary key / indexes / sort / shard key) are
         // applied here; inferred sizing and column statistics ride on the provider
@@ -1152,7 +1462,7 @@ impl Runtime {
             Some(sql) => match crate::datafusion::refresh_sql::parse_refresh_sql(
                 ds.name.clone(),
                 sql.as_str(),
-                Arc::clone(&source_schema),
+                Arc::clone(source_schema),
             ) {
                 Ok((_, projected)) => projected,
                 Err(error) => {
@@ -1164,7 +1474,7 @@ impl Runtime {
                     return ds;
                 }
             },
-            None => source_schema,
+            None => Arc::clone(source_schema),
         };
 
         let mut new_ds = (*ds).clone();
@@ -1318,75 +1628,19 @@ impl Runtime {
             None
         };
         let schema_start = Instant::now();
-        let federated_table = match data_connector
-            .read_provider(&RuntimeConnectorContext::for_dataset(&ds), &ds)
-            .await
-        {
-            Ok(provider) => {
-                // Gap-fill acceleration settings from schema inference (a no-op when
-                // the connector emitted no inferred metadata) before the dataset
-                // flows into registration and any changes stream.
-                let resolved_refresh_mode = data_connector
-                    .resolve_refresh_mode(ds.acceleration.as_ref().and_then(|a| a.refresh_mode));
-                ds = Self::apply_inferred_acceleration(ds, &provider, resolved_refresh_mode);
-                if snapshot_fallback {
-                    FederatedTable::new_unchecked(provider)
-                } else {
-                    FederatedTable::new(
-                        Arc::new(ds.spec.clone()),
-                        provider,
-                        ConnectorRefreshSource::new_arc(
-                            Arc::clone(&data_connector),
-                            Arc::clone(&ds),
-                        ),
-                        self.status.shutdown_token(),
-                        allow_schema_mismatch,
-                    )
-                    .await
-                }
-            }
-            Err(err) => {
-                // We couldn't connect to the federated table. If the dataset has an existing
-                // accelerated table, we can defer the federated table creation.
-                if !snapshot_fallback
-                    && let Some(federated_table) = FederatedTable::new_deferred(
-                        Arc::new(ds.spec.clone()),
-                        ConnectorRefreshSource::new_arc(
-                            Arc::clone(&data_connector),
-                            Arc::clone(&ds),
-                        ),
-                        self.status.shutdown_token(),
-                    )
-                    .await
-                {
-                    tracing::warn!(
-                        "Failed to connect to the source for dataset {}. Serving data from the existing acceleration for {} while retrying the connection. {err}",
-                        ds.name,
-                        ds.name
-                    );
-                    federated_table
-                } else {
-                    self.status.update_dataset(
-                        &ds.name,
-                        status::ComponentStatus::error_with_message(err.to_string()),
-                    );
-                    metrics::datasets::LOAD_ERROR.add(1, &[]);
-                    if !err.is_retriable() {
-                        error_spaced!(spaced_tracer, "{}{err}", "");
-                        return PermanentDatasetFailureSnafu {
-                            dataset: ds.name.clone(),
-                            reason: err.to_string(),
-                        }
-                        .fail();
-                    }
-                    warn_spaced!(spaced_tracer, "{}{err}", "");
-                    return UnableToLoadDatasetConnectorSnafu {
-                        dataset: ds.name.clone(),
-                    }
-                    .fail();
-                }
-            }
-        };
+        let resolved_refresh_mode = data_connector
+            .resolve_refresh_mode(ds.acceleration.as_ref().and_then(|a| a.refresh_mode));
+
+        let (resolved_ds, federated_table) = self
+            .federated_table_or_existing_acceleration(
+                Arc::clone(&ds),
+                &data_connector,
+                resolved_refresh_mode,
+                allow_schema_mismatch,
+                snapshot_fallback,
+            )
+            .await?;
+        ds = resolved_ds;
 
         tracing::debug!(dataset = %ds.name, duration_ms = schema_start.elapsed().as_millis(), "Dataset schema inference complete");
 
@@ -1520,6 +1774,7 @@ impl Runtime {
         // Drop the dataset's CDC schema-evolution settings; a reload re-installs
         // them at registration before the changes stream starts.
         crate::accelerated::refresh_task::changes::remove_cdc_schema_evolution(&ds_name);
+        self.status.remove_dataset_freshness(&ds_name);
 
         // Deregistering the table is not enough to stop it being read: a cached
         // logical plan holds the `TableSource` it was planned against, so a query
@@ -2934,7 +3189,7 @@ fn newest_by_time_without_overlap_warning(dataset_name: &str, time_column: &str)
 ///
 /// Everything else stays retriable, so a source that is merely unreachable or
 /// an accelerator that is momentarily unavailable still recovers on its own.
-fn is_permanent_dataset_failure(err: &Error) -> bool {
+pub(crate) fn is_permanent_dataset_failure(err: &Error) -> bool {
     match err {
         // The Spicepod names a connector this build cannot provide.
         Error::UnknownDataConnector { .. }
@@ -2943,6 +3198,7 @@ fn is_permanent_dataset_failure(err: &Error) -> bool {
         // Dataset-level settings that contradict each other.
         | Error::FullTextSearchRequiresAcceleration { .. }
         | Error::AcceleratedWriteBackWithoutReplication { .. }
+        | Error::AccelerationWriteModeWithChanges { .. }
         // Durable write-back configurations that would acknowledge a write the
         // dataset cannot then deliver.
         | Error::DurableWriteBackWithRetention { .. }
@@ -3237,6 +3493,28 @@ async fn update_cached_dataset_timestamps(dataset: &Dataset) {
     }
 }
 
+/// The message logged when an accelerated dataset with data on disk waits for its
+/// source before serving, because of `reason` (see
+/// `Runtime::waits_for_source_reason`).
+fn waits_for_source_message(dataset: &TableReference, reason: &str) -> String {
+    format!(
+        "Dataset '{dataset}' waits for its source before serving because it uses {reason}. See: https://spiceai.org/docs/features/data-acceleration/data-refresh"
+    )
+}
+
+/// The status message of a dataset that failed to load: for a file-accelerated
+/// dataset that waits for its source, it says the dataset is not served and why.
+fn load_failure_status(ds: &Dataset, cause: &str) -> String {
+    match Runtime::not_served_reason(ds) {
+        Some(reason) => not_served_status(&reason, cause),
+        None => cause.to_string(),
+    }
+}
+
+fn not_served_status(reason: &str, cause: &str) -> String {
+    format!("Not served: waits for its source because it uses {reason}. Cause: {cause}")
+}
+
 /// Whether a dataset's `drasi:` block is live.
 fn is_drasi_forwarding(drasi: &spicepod::drasi::Drasi) -> bool {
     drasi.forwarding == spicepod::drasi::DrasiForwarding::Enabled
@@ -3351,6 +3629,25 @@ fn with_localpod_dependents(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_waits_for_source_message_names_the_dataset_and_its_configuration() {
+        assert_eq!(
+            super::waits_for_source_message(
+                &datafusion::common::TableReference::bare("orders"),
+                "`refresh_mode: changes`"
+            ),
+            "Dataset 'orders' waits for its source before serving because it uses `refresh_mode: changes`. See: https://spiceai.org/docs/features/data-acceleration/data-refresh"
+        );
+    }
+
+    #[test]
+    fn the_not_served_status_says_why_and_keeps_the_cause() {
+        assert_eq!(
+            super::not_served_status("`refresh_mode: changes`", "connection refused"),
+            "Not served: waits for its source because it uses `refresh_mode: changes`. Cause: connection refused"
+        );
+    }
+
     use super::*;
 
     mod key_rule {
@@ -4785,6 +5082,48 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
         );
     }
 
+    /// `access: read_write` over a source that only supports reads is a Spicepod
+    /// mistake no retry clears: it fails the load once, naming
+    /// `write_mode: acceleration`, instead of retrying for the life of the process.
+    #[tokio::test]
+    async fn a_read_write_dataset_over_a_read_only_source_fails_permanently() {
+        register_connector_factory("schema_only", Arc::new(SchemaOnlyConnectorFactory)).await;
+
+        let mut dataset =
+            spicepod::component::dataset::Dataset::new("schema_only:any", "read_only_source");
+        dataset.access = spicepod::component::access::AccessMode::ReadWrite;
+        dataset.acceleration = Some(spicepod::acceleration::Acceleration {
+            enabled: true,
+            ..spicepod::acceleration::Acceleration::default()
+        });
+
+        let app = app::AppBuilder::new("read_only_source")
+            .with_dataset(dataset.clone())
+            .build();
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+        let ds = DatasetBuilder::try_from(dataset)
+            .expect("valid dataset builder")
+            .with_app(Arc::new(app))
+            .with_runtime(Arc::clone(&runtime))
+            .build()
+            .expect("valid runtime dataset");
+
+        let err = runtime
+            .try_load_dataset_once(Arc::new(ds), BootstrapStatus::None, None)
+            .await
+            .expect_err("a read-only source should fail a read_write load");
+
+        assert!(
+            matches!(err, Error::PermanentDatasetFailure { .. }),
+            "expected a permanent failure, got: {err}"
+        );
+        assert!(
+            err.to_string()
+                .contains("Set `acceleration.write_mode: acceleration`"),
+            "{err}"
+        );
+    }
+
     /// A `from:` no build of the runtime can resolve is settled at parse time,
     /// so it must not be retried either.
     #[tokio::test]
@@ -4882,6 +5221,14 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
         assert!(
             is_permanent_dataset_failure(&err),
             "full-text search without acceleration cannot resolve itself"
+        );
+        let err = crate::AccelerationWriteModeWithChangesSnafu {
+            dataset_name: "orders".to_string(),
+        }
+        .build();
+        assert!(
+            is_permanent_dataset_failure(&err),
+            "write_mode: acceleration with a change stream cannot resolve itself"
         );
     }
 

@@ -18438,6 +18438,7 @@ dependencies = [
  "runtime-udfs-api",
  "search",
  "serde",
+ "serde_json",
  "snafu",
  "spice-table",
  "spicepod",
