@@ -69,9 +69,10 @@ impl SupersededReason {
     }
 
     /// Why a copy with time `loser` lost to the copy with time `winner`, each from
-    /// [`RowVersions`]: an older time, or the same time and an earlier arrival.
+    /// [`RowVersions`] (`None` for a NULL time, older than any time): an older time,
+    /// or the same time and an earlier arrival.
     #[must_use]
-    pub fn of_version(loser: i64, winner: i64) -> Self {
+    pub fn of_version(loser: Option<i64>, winner: Option<i64>) -> Self {
         if loser < winner {
             Self::Older
         } else {
@@ -129,8 +130,8 @@ pub fn superseded_rows(config: &SessionConfig) -> Option<Arc<SupersededRows>> {
 /// `time_column`); read by an accelerator that resolves repeated keys after
 /// writing them.
 pub trait RowVersions: Send + Sync + std::fmt::Debug {
-    /// Each row of `batch`'s time, as UTC nanoseconds. A NULL time is
-    /// [`i64::MIN`], older than any time.
+    /// Each row of `batch`'s time, as UTC nanoseconds. A NULL time stays NULL and is
+    /// older than any time, including [`i64::MIN`].
     ///
     /// # Errors
     ///

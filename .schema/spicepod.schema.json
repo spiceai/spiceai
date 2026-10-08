@@ -688,7 +688,7 @@
           ]
         },
         "state": {
-          "description": "Shared object-store location for runtime state (`file://`, `s3://`, `abfs://`, `abfss://`). Used for SQL results-cache warmup, source rate-control, and distributed query state when those sections do not set their own `state_location`.",
+          "description": "Shared object-store location for runtime state (`file://`, `s3://`, `abfs://`, `abfss://`). Used for SQL results-cache warmup, cluster source rate control, and distributed query state. A `runtime.scheduler.state_location` overrides it for the scheduler.",
           "anyOf": [
             {
               "$ref": "#/$defs/RuntimeState"
@@ -1771,26 +1771,8 @@
     "SourceRateControl": {
       "type": "object",
       "properties": {
-        "state_location": {
-          "description": "Root URI for globally persisted source rate-control state.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "params": {
-          "description": "Optional object store params for source rate-control state.",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Params"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
         "refresh_interval": {
-          "description": "How often each runtime refreshes and persists per-source rate-control state in object storage.",
+          "description": "How often each runtime refreshes and persists per-source rate-control state at `runtime.state.location`.",
           "type": "string",
           "default": "30s"
         },

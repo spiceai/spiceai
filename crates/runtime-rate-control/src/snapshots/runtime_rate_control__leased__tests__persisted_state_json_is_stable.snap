@@ -14,8 +14,10 @@ expression: canonical_json(&wire_format_fixture())
               "attempted": 12,
               "consumed": 5,
               "expires_at_unix_ms": 1700000001000,
+              "failed": 1,
               "granted": 7,
-              "updated_at_unix_ms": 1700000000500
+              "ok": 3,
+              "updated_at_unix_ms": 1700000001500
             },
             "replica-b": {
               "attempted": 0,

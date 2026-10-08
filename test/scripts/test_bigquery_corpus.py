@@ -106,6 +106,12 @@ class CorpusTests(unittest.TestCase):
             with self.assertRaises(HarnessError):
                 corpus.check_plan(wrong, explain(three))
 
+    def test_expected_jobs_exclude_subtrees_an_empty_build_side_skips(self):
+        # 269 planned remote subtrees; the live census sees 264 (#14848).
+        self.assertEqual(corpus.expected_execution_jobs(corpus.corpus()), 264)
+        for index, skipped in corpus.EMPTY_BUILD_SKIPPED.items():
+            self.assertLess(skipped, corpus.ROUNDING_CAST_PARTIAL[index])
+
     def test_transport_cannot_change_field_type_name_or_nullability(self):
         for name in corpus.TRANSPORT:
             physical = name + "\n  " + REMOTE
