@@ -17,6 +17,7 @@ limitations under the License.
 use std::{collections::HashMap, time::Duration};
 
 use bollard::secret::HealthConfig;
+#[cfg(any(feature = "duckdb", not(target_os = "windows")))]
 use spicepod::acceleration::RefreshMode;
 #[cfg(feature = "duckdb")]
 use spicepod::acceleration::{Mode, OnConflictBehavior};
@@ -117,6 +118,7 @@ pub fn make_mongodb_change_stream_dataset(path: &str, name: &str, port: u16) -> 
 
 /// A Change Streams dataset on Cayenne keyed by `_id` alone: Cayenne keeps one row
 /// per primary key without `on_conflict`.
+#[cfg(not(target_os = "windows"))]
 pub fn make_mongodb_cayenne_change_stream_dataset(path: &str, name: &str, port: u16) -> Dataset {
     change_stream_dataset(
         path,
@@ -132,6 +134,7 @@ pub fn make_mongodb_cayenne_change_stream_dataset(path: &str, name: &str, port: 
     )
 }
 
+#[cfg(any(feature = "duckdb", not(target_os = "windows")))]
 fn change_stream_dataset(path: &str, name: &str, port: u16, acceleration: Acceleration) -> Dataset {
     let mut dataset = Dataset::new(format!("mongodb:{path}"), name.to_string());
     let connection_string =
