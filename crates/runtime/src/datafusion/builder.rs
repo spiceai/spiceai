@@ -4340,6 +4340,51 @@ mod tests {
         );
     }
 
+    /// The point-lookup fast path skips rules by name, so a rule that `DataFusion` renames or
+    /// merges silently stops being skipped (`EnsureRequirements` took the place of
+    /// `EnforceDistribution` and `EnforceSorting`). Every name `SKIPPABLE_RULES` lists must
+    /// belong to a rule the session registers once every optional rule is on.
+    #[test]
+    #[cfg(not(windows))]
+    fn every_point_lookup_skippable_rule_is_registered() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let handle = rt.handle().clone();
+
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            handle,
+        )
+        .cayenne_optimizer_rules(CayenneOptimizerRules::all_enabled())
+        .cte_materialization(CteMaterialization::Auto)
+        .with_caching(Arc::new(cache::Caching::default()))
+        .build();
+
+        let state = df.ctx.state();
+        let registered: std::collections::HashSet<&str> = state
+            .analyzer()
+            .rules
+            .iter()
+            .map(|rule| rule.name())
+            .chain(state.optimizers().iter().map(|rule| rule.name()))
+            .chain(state.physical_optimizers().iter().map(|rule| rule.name()))
+            .collect();
+        let unregistered: Vec<&str> = crate::datafusion::point_lookup::SKIPPABLE_RULES
+            .iter()
+            .copied()
+            // The `DuckDB` rules are only compiled in with the `duckdb` feature.
+            .filter(|name| cfg!(feature = "duckdb") || !name.starts_with("DuckDB"))
+            .filter(|name| !registered.contains(name))
+            .collect();
+        assert!(
+            unregistered.is_empty(),
+            "the point-lookup skip list names rules the session does not register, so they are never skipped: {unregistered:?}"
+        );
+    }
+
     #[test]
     #[cfg(not(windows))]
     fn test_built_datafusion_can_enable_one_cayenne_physical_rule() {

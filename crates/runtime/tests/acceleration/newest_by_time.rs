@@ -303,6 +303,46 @@ async fn a_null_time_column_is_the_oldest_version() {
         .await;
 }
 
+/// The same, in a write too large to buffer, so a file-mode refresh resolves its keys
+/// through the streaming path, which carries each surviving row's time, a NULL one
+/// included, in its own columns.
+#[tokio::test]
+async fn a_null_time_column_is_the_oldest_version_in_a_streamed_write() {
+    test_request_context()
+        .scope(async {
+            for mode in modes() {
+                let label = format!("null_streamed_{mode:?}");
+                let source = tempfile::tempdir().expect("source dir");
+                let accel = tempfile::tempdir().expect("acceleration dir");
+                let mut source_rows = vec![
+                    (1, "", "only-null"),
+                    (2, "2026-01-03T00:00:00", "timed"),
+                    (2, "", "null"),
+                    (3, "", "null"),
+                    (3, "2026-01-01T00:00:00", "timed"),
+                ];
+                source_rows
+                    .extend((0..FILLER_KEYS).map(|i| (1_000 + i, "2026-01-01T00:00:00", "filler")));
+                write(source.path(), "a.csv", &csv(&source_rows));
+
+                let (rt, ready) = load(
+                    source.path(),
+                    accel.path(),
+                    &mode,
+                    RefreshMode::Full,
+                    &label,
+                )
+                .await;
+                assert!(ready, "{label}: a NULL time_column loads");
+                assert_eq!(values_of(&rt, 1).await, ["only-null"], "{label}: key 1");
+                assert_eq!(values_of(&rt, 2).await, ["timed"], "{label}: key 2");
+                assert_eq!(values_of(&rt, 3).await, ["timed"], "{label}: key 3");
+                assert_eq!(rows(&rt).await, 3 + FILLER_KEYS, "{label}: one row per key");
+            }
+        })
+        .await;
+}
+
 /// Every stored `v` for `id` in `table`.
 async fn values_in(rt: &Arc<Runtime>, table: &str, id: i64) -> Vec<String> {
     run_query(rt, &format!("SELECT v FROM {table} WHERE id = {id}"))

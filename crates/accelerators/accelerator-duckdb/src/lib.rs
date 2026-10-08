@@ -348,8 +348,7 @@ impl DuckDBAccelerator {
             .chain(app.views.iter().map(|view| view.acceleration.as_ref()));
 
         for acceleration in accelerations.flatten() {
-            let engine_str = acceleration.engine.as_deref().unwrap_or("arrow");
-            if engine_str.to_lowercase() != "duckdb" {
+            if !acceleration.engine_name().eq_ignore_ascii_case("duckdb") {
                 continue;
             }
             // If the path is Some, we're counting the number of file instances
@@ -412,12 +411,7 @@ impl DuckDBAccelerator {
             let Some(acceleration) = &peer.acceleration else {
                 continue;
             };
-            if !acceleration
-                .engine
-                .as_deref()
-                .unwrap_or("arrow")
-                .eq_ignore_ascii_case("duckdb")
-            {
+            if !acceleration.engine_name().eq_ignore_ascii_case("duckdb") {
                 continue;
             }
             if !matches!(

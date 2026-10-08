@@ -57,6 +57,11 @@ COHORT_CASES = {168, 169}
 # #14482); issue #14607 tracks restoring the pushdown through a truncating
 # rendering. The offline corpus test pins the same three counts.
 ROUNDING_CAST_PARTIAL = {33: 3, 124: 5, 147: 1}
+# Remote subtrees of those queries that never reach BigQuery against the empty
+# fixtures: a join whose build side is empty never polls its probe side. Query
+# 033's outer left join skips its two-subtree probe side; each cross join in
+# query 124 skips its probe subtree.
+EMPTY_BUILD_SKIPPED = {33: 2, 124: 3}
 # An Arrow integer type in a physical plan is always a locally evaluated cast: a
 # remote subtree renders as BigQuery's own SQL, which spells these INT64/BIGINT.
 LOCAL_INTEGER_CAST = re.compile(r"AS U?Int(?:8|16|32|64)\)")
@@ -410,13 +415,21 @@ def execute_case(
     return record
 
 
+def expected_execution_jobs(queries: list[tuple[int, str]]) -> int:
+    """One job per executed remote subtree: one for each query with a table, one
+    more for each extra subtree a rounding cast splits a query into, less the
+    subtrees an empty join build side never runs."""
+    return (
+        len(queries)
+        - len(TABLE_FREE)
+        + sum(remotes - 1 for remotes in ROUNDING_CAST_PARTIAL.values())
+        - sum(EMPTY_BUILD_SKIPPED.values())
+    )
+
+
 def main() -> int:
     queries = corpus()
-    # One job per remote subtree: one for each query with a table, and one more
-    # for each extra subtree a rounding cast splits a query into.
-    expected_jobs = len(queries) - len(TABLE_FREE) + sum(
-        remotes - 1 for remotes in ROUNDING_CAST_PARTIAL.values()
-    )
+    expected_jobs = expected_execution_jobs(queries)
     aliases, tables = fixtures()
     info, credential = harness.credential_info()
     project = os.environ.get("BIGQUERY_PROJECT_ID", info["project_id"])
