@@ -614,6 +614,62 @@ const MAX_HEADER_BYTES: u64 = 1024 * 1024;
 /// Headers read at once when checking a dataset's files.
 const HEADER_READ_CONCURRENCY: usize = 16;
 
+/// Finds where the first record of a CSV or TSV file ends, across the chunks of a download: at
+/// a record terminator outside quotes, as the CSV reader splits records, so a quoted column
+/// name may span lines.
+struct RecordScanner {
+    quote: u8,
+    escape: Option<u8>,
+    terminator: Option<u8>,
+    in_quotes: bool,
+    escaped: bool,
+    scanned: usize,
+}
+
+impl RecordScanner {
+    fn new(quote: u8, escape: Option<u8>, terminator: Option<u8>) -> Self {
+        Self {
+            quote,
+            escape,
+            terminator,
+            in_quotes: false,
+            escaped: false,
+            scanned: 0,
+        }
+    }
+
+    /// The end (exclusive) of the first record within `bytes`, which grows between calls, or
+    /// `None` while the record continues past them. Without a configured terminator a record
+    /// ends at `\n` or `\r`, as the CSV reader accepts either.
+    fn record_end(&mut self, bytes: &[u8]) -> Option<usize> {
+        for (index, &byte) in bytes.iter().enumerate().skip(self.scanned) {
+            if self.escaped {
+                self.escaped = false;
+                continue;
+            }
+            if self.in_quotes && Some(byte) == self.escape && self.escape != Some(self.quote) {
+                self.escaped = true;
+                continue;
+            }
+            if byte == self.quote {
+                // A doubled quote inside a quoted field toggles twice: still quoted.
+                self.in_quotes = !self.in_quotes;
+                continue;
+            }
+            let ends = match self.terminator {
+                Some(terminator) => byte == terminator,
+                None => byte == b'\n' || byte == b'\r',
+            };
+            if ends && !self.in_quotes {
+                self.scanned = index + 1;
+                return Some(index + 1);
+            }
+        }
+        self.scanned = bytes.len();
+        None
+    }
+}
+
 /// Checks that CSV or TSV files have a dataset's columns, in order. Those formats are read by
 /// column position, so a file whose columns are reordered or renamed would otherwise put its
 /// values under the wrong names.
@@ -689,21 +745,25 @@ impl PositionalCheck {
         let mut decoded = FileCompressionType::from(self.options.compression)
             .convert_stream(stream)
             .map_err(|e| e.to_string())?;
-        let terminator = self.options.terminator.unwrap_or(b'\n');
+        let mut scanner = RecordScanner::new(
+            self.options.quote,
+            self.options.escape,
+            self.options.terminator,
+        );
         let mut bytes = Vec::new();
         let mut complete = false;
         while let Some(chunk) = decoded.next().await {
             let chunk = chunk.map_err(|e| e.to_string())?;
             bytes.extend_from_slice(&chunk);
-            if let Some(end) = bytes.iter().position(|byte| *byte == terminator) {
-                bytes.truncate(end + 1);
+            if let Some(end) = scanner.record_end(&bytes) {
+                bytes.truncate(end);
                 complete = true;
                 break;
             }
         }
         if !complete && bytes.len() as u64 >= MAX_HEADER_BYTES {
             return Err(format!(
-                "its first line is longer than {MAX_HEADER_BYTES} bytes"
+                "its first record is longer than {MAX_HEADER_BYTES} bytes"
             ));
         }
         let mut format = datafusion::arrow::csv::reader::Format::default()
@@ -712,6 +772,9 @@ impl PositionalCheck {
             .with_quote(self.options.quote);
         if let Some(escape) = self.options.escape {
             format = format.with_escape(escape);
+        }
+        if let Some(terminator) = self.options.terminator {
+            format = format.with_terminator(terminator);
         }
         let (schema, _) = format
             .infer_schema(std::io::Cursor::new(bytes), Some(0))
@@ -970,3 +1033,41 @@ data_connector_api::register_data_connector!(
     CONNECTOR_NAME,
     HuggingFaceFactory
 );
+
+#[cfg(test)]
+mod record_scanner_tests {
+    use super::RecordScanner;
+
+    fn end(bytes: &[u8], escape: Option<u8>, terminator: Option<u8>) -> Option<usize> {
+        RecordScanner::new(b'"', escape, terminator).record_end(bytes)
+    }
+
+    #[test]
+    fn the_first_record_ends_at_a_terminator_outside_quotes() {
+        assert_eq!(end(b"id,name\n1,a\n", None, None), Some(8));
+        assert_eq!(end(b"id,name\r\n1,a\r\n", None, None), Some(8));
+        // A quoted column name spanning lines, and a doubled quote inside one.
+        assert_eq!(end(b"id,\"first\nname\"\n1,a\n", None, None), Some(16));
+        assert_eq!(
+            end(b"id,\"say \"\"hi\"\"\nthere\"\n1\n", None, None),
+            Some(22)
+        );
+        // An escaped quote does not close the field.
+        assert_eq!(end(b"id,\"a\\\"\nb\"\n1\n", Some(b'\\'), None), Some(11));
+        // A configured terminator.
+        assert_eq!(end(b"id,name|1,a|", None, Some(b'|')), Some(8));
+        assert_eq!(end(b"id,name\nmore", None, Some(b'|')), None);
+        assert_eq!(end(b"id,\"open", None, None), None);
+    }
+
+    #[test]
+    fn the_scan_continues_across_chunks() {
+        let mut scanner = RecordScanner::new(b'"', None, None);
+        let mut bytes = b"id,\"first".to_vec();
+        assert_eq!(scanner.record_end(&bytes), None);
+        bytes.extend_from_slice(b"\nname\",x");
+        assert_eq!(scanner.record_end(&bytes), None);
+        bytes.extend_from_slice(b"\n1,2,3\n");
+        assert_eq!(scanner.record_end(&bytes), Some(18));
+    }
+}

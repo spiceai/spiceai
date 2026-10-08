@@ -989,6 +989,32 @@ async fn csv_files_whose_columns_disagree_fail_registration() {
     );
 }
 
+/// A quoted column name may span lines: the header check reads the whole first record.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_quoted_multiline_column_name_is_one_column() {
+    let mock = Mock::start().await;
+    let csv = "id,\"first\nname\"\n1,ann\n";
+    mock.commit(
+        "o/csvquoted",
+        C1,
+        vec![("data/a.csv", text(csv)), ("data/b.csv", text(csv))],
+    );
+    mock.branch("o/csvquoted", "main", C1);
+    let connector = connector(&mock, None, &[]);
+    let dataset = DatasetSpec::new("hf://datasets/o/csvquoted/data/", TableReference::bare("t"));
+    let table = connector
+        .table(&dataset)
+        .await
+        .expect("the header check passes");
+    let names: Vec<_> = table
+        .schema()
+        .fields()
+        .iter()
+        .map(|f| f.name().clone())
+        .collect();
+    assert_eq!(names, ["id", "first\nname"]);
+}
+
 /// Datasets read with different tokens or endpoints never share a client: each configuration
 /// has its own store, under its own URL.
 #[tokio::test(flavor = "multi_thread")]
