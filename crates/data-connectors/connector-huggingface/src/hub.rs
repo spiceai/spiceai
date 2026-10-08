@@ -273,22 +273,6 @@ impl fmt::Debug for HubConfig {
     }
 }
 
-impl HubConfig {
-    /// A fingerprint of the endpoint and token, used to tell two configurations apart without
-    /// keeping the token.
-    #[must_use]
-    pub fn fingerprint(&self) -> String {
-        let mut hasher = blake3::Hasher::new();
-        hasher.update(self.endpoint.as_str().as_bytes());
-        hasher.update(&[0]);
-        if let Some(token) = &self.token {
-            hasher.update(&[1]);
-            hasher.update(token.expose_secret().as_bytes());
-        }
-        hasher.finalize().to_hex().to_string()
-    }
-}
-
 /// A Hugging Face Hub client for one endpoint and token.
 pub struct Hub {
     config: HubConfig,
@@ -609,7 +593,16 @@ impl Hub {
             path: path.to_string(),
         };
         let (response, e_tag) = self.open(&file, range.as_ref()).await?;
-        let (returned, size) = checked_range(&file, range.as_ref(), &response)?;
+        // A whole-file response without `Content-Length` (a chunked proxy) is sized from the
+        // file's description instead.
+        let known_size = if range.is_none() && response.content_length().is_none() {
+            self.entry(repo, commit, path)
+                .await?
+                .map(|entry| entry.size)
+        } else {
+            None
+        };
+        let (returned, size) = checked_range(&file, range.as_ref(), &response, known_size)?;
         let download = Download {
             hub: Arc::clone(self),
             next: returned.start,
@@ -1036,6 +1029,7 @@ fn checked_range(
     file: &FileKey,
     requested: Option<&GetRange>,
     response: &reqwest::Response,
+    known_size: Option<u64>,
 ) -> Result<(Range<u64>, u64)> {
     let FileKey { repo, path, .. } = file;
     let status = response.status();
@@ -1047,10 +1041,13 @@ fn checked_range(
                 message: format!("a read of '{path}' returned HTTP {status}"),
             }
         );
-        let size = response.content_length().context(UnexpectedResponseSnafu {
-            repo: repo.clone(),
-            message: format!("a read of '{path}' returned no Content-Length"),
-        })?;
+        let size = response
+            .content_length()
+            .or(known_size)
+            .context(UnexpectedResponseSnafu {
+                repo: repo.clone(),
+                message: format!("a read of '{path}' returned no Content-Length"),
+            })?;
         return Ok((0..size, size));
     };
 
@@ -1116,7 +1113,7 @@ impl Download {
                 if download.body.is_none() {
                     let range = GetRange::Bounded(download.next..download.end);
                     let (response, _) = download.hub.open(&download.file, Some(&range)).await?;
-                    checked_range(&download.file, Some(&range), &response)?;
+                    checked_range(&download.file, Some(&range), &response, None)?;
                     download.body = Some(response.bytes_stream().boxed());
                 }
                 let Some(body) = download.body.as_mut() else {

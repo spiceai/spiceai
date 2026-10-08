@@ -21,7 +21,7 @@ limitations under the License.
 //! the Hub's own API, so private and gated datasets work with an `hf_token`.
 
 use std::any::Any;
-use std::collections::{BTreeSet, HashMap};
+use std::collections::BTreeSet;
 use std::fmt;
 use std::future::Future;
 use std::pin::Pin;
@@ -131,25 +131,29 @@ static PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
     all_parameters
 });
 
-/// Stores by configuration fingerprint, so datasets read with the same endpoint and token share
-/// one client and its caches, and datasets read with different ones never do.
-static STORES: LazyLock<Mutex<HashMap<String, Weak<HuggingFaceStore>>>> =
-    LazyLock::new(|| Mutex::new(HashMap::new()));
+/// The store reading the public Hub without a token, shared by every dataset that does.
+static PUBLIC_STORE: LazyLock<Mutex<Weak<HuggingFaceStore>>> =
+    LazyLock::new(|| Mutex::new(Weak::new()));
 
-fn shared_store(
+/// The store `component` reads with `config`: the shared public store, or one of its own (see
+/// [`store::store_url`]), so datasets read with different tokens or endpoints never share a
+/// client.
+fn store_for(
     config: HubConfig,
+    component: &str,
     io_runtime: Handle,
 ) -> Result<Arc<HuggingFaceStore>, hub::Error> {
-    let fingerprint = config.fingerprint();
-    let mut stores = STORES.lock();
-    if let Some(store) = stores.get(&fingerprint).and_then(Weak::upgrade) {
+    if !store::is_public(&config) {
+        let hub = Arc::new(Hub::new(config, io_runtime)?);
+        return Ok(Arc::new(HuggingFaceStore::new(hub, component)));
+    }
+    let mut public = PUBLIC_STORE.lock();
+    if let Some(store) = public.upgrade() {
         return Ok(store);
     }
-    stores.retain(|_, store| store.strong_count() > 0);
-    let store = Arc::new(HuggingFaceStore::new(Arc::new(Hub::new(
-        config, io_runtime,
-    )?)));
-    stores.insert(fingerprint, Arc::downgrade(&store));
+    let hub = Arc::new(Hub::new(config, io_runtime)?);
+    let store = Arc::new(HuggingFaceStore::new(hub, component));
+    *public = Arc::downgrade(&store);
     Ok(store)
 }
 
@@ -206,8 +210,16 @@ impl DataConnectorFactory for HuggingFaceFactory {
                 ExposedParamLookup::Absent(_) => parse_endpoint(hub::DEFAULT_ENDPOINT)?,
             };
             let token: Option<SecretString> = params.parameters.get("token").ok().cloned();
-            let store = shared_store(HubConfig { endpoint, token }, params.io_runtime.clone())
-                .context(HubSnafu)?;
+            let component = match &params.component {
+                ConnectorComponent::Dataset(dataset) => dataset.name.to_string(),
+                ConnectorComponent::Catalog(catalog) => catalog.name.clone(),
+            };
+            let store = store_for(
+                HubConfig { endpoint, token },
+                &component,
+                params.io_runtime.clone(),
+            )
+            .context(HubSnafu)?;
             Ok(Arc::new(HuggingFace {
                 params: params.parameters,
                 store,

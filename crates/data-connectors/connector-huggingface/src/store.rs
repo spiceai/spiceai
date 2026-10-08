@@ -42,20 +42,33 @@ use crate::hub::{self, EntryKind, Hub, HubConfig, TreeEntry};
 use crate::location::RepoId;
 
 const STORE_NAME: &str = "HuggingFace";
-/// Hex digits of the configuration fingerprint in a store's URL.
-const FINGERPRINT_LEN: usize = 16;
+/// Hex digits of the key in a store's URL.
+const KEY_LEN: usize = 16;
 
-/// The URL a store reading with `config` is registered under: `hf://datasets/` for the public
-/// Hub without a token, else `hf://datasets.{fingerprint}/`, a host naming the endpoint and
-/// token without revealing the token.
+/// Whether `config` reads the public Hub without a token.
 #[must_use]
-pub fn store_url(config: &HubConfig) -> Url {
-    let public_hub = config.token.is_none()
-        && Url::parse(hub::DEFAULT_ENDPOINT).is_ok_and(|default| default == config.endpoint);
-    let host = if public_hub {
+pub fn is_public(config: &HubConfig) -> bool {
+    config.token.is_none()
+        && Url::parse(hub::DEFAULT_ENDPOINT).is_ok_and(|default| default == config.endpoint)
+}
+
+/// The URL the store `component` reads with `config` is registered under.
+///
+/// The public Hub read without a token is `hf://datasets/`, the location `HfFileSystem` and
+/// `DuckDB` read, and one store serves every such dataset. Any other store serves one
+/// component, under `hf://datasets.{key}/`, the key derived from the endpoint and the
+/// component's name: never from the token, which a URL may show, and the same on every
+/// executor of a cluster.
+#[must_use]
+pub fn store_url(config: &HubConfig, component: &str) -> Url {
+    let host = if is_public(config) {
         "datasets".to_string()
     } else {
-        format!("datasets.{}", &config.fingerprint()[..FINGERPRINT_LEN])
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(config.endpoint.as_str().as_bytes());
+        hasher.update(&[0]);
+        hasher.update(component.as_bytes());
+        format!("datasets.{}", &hasher.finalize().to_hex()[..KEY_LEN])
     };
     Url::parse(&format!("hf://{host}/"))
         .unwrap_or_else(|_| unreachable!("a host of letters, digits and a dot is valid"))
@@ -75,9 +88,10 @@ impl fmt::Display for HuggingFaceStore {
 }
 
 impl HuggingFaceStore {
+    /// A store reading with `hub` for `component` (see [`store_url`]).
     #[must_use]
-    pub fn new(hub: Arc<Hub>) -> Self {
-        let url = store_url(hub.config());
+    pub fn new(hub: Arc<Hub>, component: &str) -> Self {
+        let url = store_url(hub.config(), component);
         Self { hub, url }
     }
 

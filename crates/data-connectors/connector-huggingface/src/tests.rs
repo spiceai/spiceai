@@ -84,6 +84,8 @@ struct Faults {
     expired: u32,
     /// The CDN answers a ranged request with the whole file.
     ignore_range: bool,
+    /// The CDN streams a whole file without `Content-Length`, as a chunked proxy does.
+    chunked: bool,
     /// Tree pages after the first answer 404, as a listing cut short would.
     missing_later_pages: bool,
 }
@@ -549,6 +551,17 @@ async fn cdn_handler(State(mock): State<Mock>, request: Request<Body>) -> Respon
     if state.faults.ignore_range {
         return ranged(&bytes, None, &[]);
     }
+    if state.faults.chunked && range.is_none() {
+        let half = bytes.len() / 2;
+        let parts = vec![
+            Ok::<_, std::io::Error>(bytes.slice(..half)),
+            Ok(bytes.slice(half..)),
+        ];
+        return Response::builder()
+            .status(StatusCode::OK)
+            .body(Body::from_stream(futures::stream::iter(parts)))
+            .expect("a well-formed response");
+    }
     let full = ranged(&bytes, range.as_deref(), &[]);
     if state.faults.truncated > 0 {
         state.faults.truncated -= 1;
@@ -619,6 +632,8 @@ fn text(content: &str) -> File {
     }
 }
 
+static COMPONENTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 fn connector(mock: &Mock, token: Option<&str>, params: &[(&str, &str)]) -> HuggingFace {
     let endpoint = url::Url::parse(&mock.endpoint()).expect("the mock endpoint");
     let hub = Arc::new(
@@ -635,9 +650,14 @@ fn connector(mock: &Mock, token: Option<&str>, params: &[(&str, &str)]) -> Huggi
         .iter()
         .map(|(key, value)| ((*key).to_string(), SecretString::from((*value).to_string())))
         .collect();
+    // Every test connector stands for a dataset of its own.
+    let component = format!(
+        "dataset_{}",
+        COMPONENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    );
     HuggingFace {
         params: Parameters::new(params, "hf", &PARAMETERS),
-        store: Arc::new(HuggingFaceStore::new(hub)),
+        store: Arc::new(HuggingFaceStore::new(hub, &component)),
         io_runtime: tokio::runtime::Handle::current(),
     }
 }
@@ -977,25 +997,24 @@ async fn each_token_reads_through_its_own_store() {
         endpoint: url::Url::parse("https://huggingface.co").expect("a URL"),
         token: None,
     };
-    assert_eq!(store_url(&public).as_str(), "hf://datasets/");
+    assert_eq!(store_url(&public, "a").as_str(), "hf://datasets/");
+    assert_eq!(store_url(&public, "b").as_str(), "hf://datasets/");
     let with_token = |token: &str| HubConfig {
         token: Some(SecretString::from(token.to_string())),
         ..public.clone()
     };
-    let first = store_url(&with_token("hf_one"));
-    assert_ne!(first, store_url(&with_token("hf_two")));
-    assert_eq!(
-        first,
-        store_url(&with_token("hf_one")),
-        "the same on every executor"
-    );
-    assert!(first.as_str().starts_with("hf://datasets."), "{first}");
-    assert!(!first.as_str().contains("hf_one"), "{first}");
+    let one = store_url(&with_token("hf_one"), "one");
+    assert!(one.as_str().starts_with("hf://datasets."), "{one}");
+    assert_ne!(one, store_url(&with_token("hf_two"), "two"));
+    // Derived from the endpoint and the dataset, never the token: the same on every executor
+    // and after a token is rotated, and nothing a URL shows can be traced to the token.
+    assert_eq!(one, store_url(&with_token("hf_rotated"), "one"));
     let mirror = HubConfig {
         endpoint: url::Url::parse("https://hf-mirror.example").expect("a URL"),
         token: None,
     };
-    assert_ne!(store_url(&mirror), store_url(&public));
+    assert_ne!(store_url(&mirror, "a"), store_url(&public, "a"));
+    assert_ne!(store_url(&mirror, "a"), store_url(&mirror, "b"));
 
     // Two datasets on one private repository, each with its own valid token: each reads with
     // its own, whichever registered last.
@@ -1450,6 +1469,31 @@ mod store_reads {
             "{ranges:?}"
         );
         assert_eq!(resumed.1, "20999");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_whole_file_without_content_length_is_sized_from_its_description() {
+        let mock = Mock::start().await;
+        let bytes = file_bytes();
+        mock.commit(
+            "r/chunked",
+            C1,
+            vec![(
+                "blob.bin",
+                File {
+                    bytes: bytes.clone(),
+                    lfs: true,
+                },
+            )],
+        );
+        let (store, _) = registered(&mock, "r/chunked");
+        mock.0.lock().faults.chunked = true;
+        let read = store
+            .get(&path("r/chunked", "blob.bin"))
+            .await
+            .expect("a whole-file read");
+        assert_eq!(read.meta.size, 40_000);
+        assert_eq!(read.bytes().await.expect("the bytes"), bytes);
     }
 
     #[tokio::test(flavor = "multi_thread")]
