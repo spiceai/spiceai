@@ -67,8 +67,9 @@ pub struct DecisionRequest {
     /// decision models.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub safety_identifier: Option<String>,
-    /// How much a chat model reasons before it answers. Omitted keeps the model setting.
-    /// Not forwarded to an OpenAI decision model: that API has no effort field.
+    /// How much a chat model reasons before it answers. Omitted keeps the model's
+    /// setting. A Spice extension: `OpenAI`'s Decisions API has no such field, and a
+    /// decision model returns 400 for it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reasoning_effort: Option<crate::ReasoningEffort>,
 }

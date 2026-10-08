@@ -468,7 +468,7 @@ pub struct EvaluateRequest {
     #[serde(skip)]
     pub safety_identifier: Option<String>,
     /// Effort for a chat evaluator. Skipped in serde so a provider never receives it.
-    /// The OpenAI Decisions API has no effort field.
+    /// The `OpenAI` Decisions API has no effort field.
     #[serde(skip)]
     #[schemars(skip)]
     pub reasoning_effort: Option<ReasoningEffort>,

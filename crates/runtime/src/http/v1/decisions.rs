@@ -58,7 +58,7 @@ const MODELS_DOCS: &str = "https://spiceai.org/docs/components/models";
     request_body = DecisionRequest,
     responses(
         (status = 200, description = "The answers, in question order", body = DecisionResponse),
-        (status = 400, description = "Invalid request, including unknown fields and image inputs"),
+        (status = 400, description = "Invalid request, including unknown fields, image inputs, and `reasoning_effort` for a decision model"),
         (status = 401, description = "The model provider rejected the credentials"),
         (status = 403, description = "The model provider denied access"),
         (status = 404, description = "No model with this name"),
@@ -122,6 +122,21 @@ pub(crate) async fn post(
                 ),
             );
         };
+
+        // A decision model has no reasoning effort to set; answering anyway would hide
+        // that the level the caller asked for was never applied.
+        if request.reasoning_effort.is_some() && model.is_decision_model() {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_request_error",
+                Some("reasoning_effort"),
+                Some("unsupported_parameter"),
+                &format!(
+                    "Model '{}' is a decision model, which does not take `reasoning_effort`. Omit `reasoning_effort`, or name a chat model to set how much it reasons. See: {MODELS_DOCS}",
+                    request.model
+                ),
+            );
+        }
 
         // Request, duration and token metrics are recorded by the model itself, where the
         // inference happens (`ChatWrapper`, or the decision model's wrapper).
@@ -431,8 +446,12 @@ mod tests {
         );
     }
 
-    /// A chat model that replies with a fixed `answers` object.
-    struct AnsweringChat;
+    /// A chat model that replies with a fixed `answers` object, and records the
+    /// reasoning effort of every request it is sent.
+    #[derive(Default)]
+    struct AnsweringChat {
+        efforts: std::sync::Mutex<Vec<Option<async_openai::types::chat::ReasoningEffort>>>,
+    }
 
     #[async_trait]
     impl llms::chat::Chat for AnsweringChat {
@@ -442,11 +461,15 @@ mod tests {
 
         async fn chat_request(
             &self,
-            _req: async_openai::types::chat::CreateChatCompletionRequest,
+            req: async_openai::types::chat::CreateChatCompletionRequest,
         ) -> Result<
             async_openai::types::chat::CreateChatCompletionResponse,
             async_openai::error::OpenAIError,
         > {
+            self.efforts
+                .lock()
+                .expect("efforts lock")
+                .push(req.reasoning_effort);
             Ok(serde_json::from_value(json!({
                 "id": "chatcmpl-test",
                 "object": "chat.completion",
@@ -471,7 +494,7 @@ mod tests {
                 "judge",
                 Arc::new(evaluate_chat::ChatEvaluator::new(
                     "judge",
-                    Arc::new(AnsweringChat),
+                    Arc::new(AnsweringChat::default()),
                 )),
             ),
             json!({
@@ -491,5 +514,65 @@ mod tests {
             json!([{"value": "technical", "probability": 0.25}, {"value": "billing", "probability": 0.75}])
         );
         assert_eq!(body["usage"]["input_tokens"], 50);
+    }
+
+    /// A chat model receives the requested level on its completion request.
+    #[tokio::test]
+    async fn reasoning_effort_reaches_a_chat_model() {
+        let chat = Arc::new(AnsweringChat::default());
+        let (status, body) = call(
+            store_with(
+                "judge",
+                Arc::new(evaluate_chat::ChatEvaluator::new(
+                    "judge",
+                    Arc::clone(&chat) as Arc<dyn llms::chat::Chat>,
+                )),
+            ),
+            json!({
+                "model": "judge",
+                "input": "My payout failed",
+                "questions": [{"type": "choice", "name": "team", "instructions": "Which team?", "choices": [{"value": "technical"}, {"value": "billing", "description": "Payments"}]}],
+                "reasoning_effort": "high"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["answers"][0]["choice"], "billing");
+        assert_eq!(
+            *chat.efforts.lock().expect("efforts lock"),
+            vec![Some(async_openai::types::chat::ReasoningEffort::High)]
+        );
+    }
+
+    /// A decision model has no reasoning effort to set, so a request that sets one is
+    /// refused before the model is called.
+    #[tokio::test]
+    async fn reasoning_effort_for_a_decision_model_is_a_400() {
+        let model = Arc::new(DummyEvaluate::default());
+        let (status, body) = call(
+            store_with("jev", Arc::clone(&model) as Arc<dyn Evaluate>),
+            json!({
+                "model": "jev",
+                "input": "x",
+                "questions": [{"type": "predicate", "instructions": "?"}],
+                "reasoning_effort": "high"
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body,
+            json!({"error": {
+                "message": "Model 'jev' is a decision model, which does not take `reasoning_effort`. Omit `reasoning_effort`, or name a chat model to set how much it reasons. See: https://spiceai.org/docs/components/models",
+                "type": "invalid_request_error",
+                "param": "reasoning_effort",
+                "code": "unsupported_parameter"
+            }})
+        );
+        assert_eq!(
+            model.seen.lock().expect("seen lock").len(),
+            0,
+            "the model is never called"
+        );
     }
 }
