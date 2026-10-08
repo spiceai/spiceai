@@ -1373,15 +1373,11 @@ impl RawScanInput {
 
 /// The cold-tier manifest as published alongside ONE warm snapshot id.
 ///
-/// Every mutation of `cayenne_cold_tier_file` mints a new warm snapshot id in the
-/// same metastore transaction: a promotion commits through
-/// [`MetadataCatalog::commit_overwrite_to_cold`], and that runs the same
-/// `commit_overwrite_in_txn` an overwrite / truncate clear does — which deletes the
-/// table's cold rows. A snapshot id therefore names exactly one cold manifest
-/// state, which is what makes it a sound cache key: an entry whose `snapshot_id`
-/// still equals the live one cannot be stale, and one that does not is simply a
-/// miss that re-reads. No path can leave a mismatched pair servable, so the cache
-/// needs no invalidation hook on the paths that clear the manifest.
+/// Promotion and overwrite publish a new warm snapshot id with their cold file
+/// membership. Schema evolution can instead invalidate statistics without changing
+/// that id. Cache entries therefore identify both the snapshot and the canonical
+/// schema used for their statistics. A lookup must match both, and an off-fence
+/// fetch must recheck both under the listing fence before publication.
 ///
 /// The key is a snapshot id THIS process published: `current_snapshot_id` is in-memory
 /// state advanced by its own publishes (shared across writer clones by `Arc`), so the
@@ -1395,6 +1391,8 @@ impl RawScanInput {
 struct ColdManifestForSnapshot {
     /// Warm snapshot id this manifest was published with.
     snapshot_id: String,
+    /// Canonical schema against which these manifest statistics were captured.
+    statistics_schema: SchemaRef,
     /// Every live cold file for the table at that snapshot.
     files: Arc<Vec<crate::metadata::ColdTierFile>>,
 }
@@ -1408,6 +1406,7 @@ struct ColdTierScan<'a> {
     limit: Option<usize>,
     scan_config: &'a SessionConfig,
     read_schema_override: Option<SchemaRef>,
+    file_statistics_schema: SchemaRef,
     /// The manifest the CALLER captured, in the same fenced instant as the warm
     /// snapshot the rest of its scan reads. Never re-read inside the branch — see
     /// [`RawScanInput::cold_files`].
@@ -1970,7 +1969,7 @@ pub struct CayenneTableProvider {
     /// Uses `RwLock` for concurrent reads during normal operations with occasional
     /// writes on compaction. The lock is held briefly for string operations.
     current_snapshot_id: Arc<RwLock<String>>,
-    /// Cold-tier manifest paired with the warm snapshot id it was published with,
+    /// Cold-tier manifest paired with its warm snapshot id and canonical schema,
     /// so a cross-tier read captures BOTH tiers' file sets in one fenced instant
     /// ([`Self::cold_manifest_under_held_fence`]). `None` until the first resolve.
     ///
@@ -2007,6 +2006,9 @@ pub struct CayenneTableProvider {
     /// One-shot pause after footer serialization, before per-file publication.
     #[cfg(test)]
     pub(crate) test_file_statistics_publish_hook: Arc<ParkingMutex<Option<TestPrePublishHook>>>,
+    /// One-shot pause after an off-fence cold manifest fetch, before publication.
+    #[cfg(test)]
+    pub(crate) test_cold_manifest_fetch_hook: Arc<ParkingMutex<Option<TestPrePublishHook>>>,
     /// Reports arrival at the schema statistics fence and its acquisition.
     #[cfg(test)]
     pub(crate) test_schema_statistics_lock_probe:
@@ -5656,6 +5658,9 @@ impl CayenneTableProvider {
                     .map_err(|source| Error::Catalog { source })?;
             }
             self.table_schema.store(Arc::clone(&plan.evolved_schema));
+            if drop_table_stats {
+                self.cold_manifest.store(Arc::new(None));
+            }
             if let (Some(state), Some(shapes)) = (&self.lookup_index, index_shapes) {
                 state.adopt_shapes(shapes);
             }
@@ -9484,6 +9489,8 @@ impl CayenneTableProvider {
             #[cfg(test)]
             test_file_statistics_publish_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
+            test_cold_manifest_fetch_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
             test_schema_statistics_lock_probe: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
             test_post_scan_input_capture_hook: Arc::new(ParkingMutex::new(None)),
@@ -11696,6 +11703,8 @@ impl CayenneTableProvider {
             test_statistics_publish_hook: Arc::clone(&self.test_statistics_publish_hook),
             #[cfg(test)]
             test_file_statistics_publish_hook: Arc::clone(&self.test_file_statistics_publish_hook),
+            #[cfg(test)]
+            test_cold_manifest_fetch_hook: Arc::clone(&self.test_cold_manifest_fetch_hook),
             #[cfg(test)]
             test_schema_statistics_lock_probe: Arc::clone(&self.test_schema_statistics_lock_probe),
             #[cfg(test)]
@@ -13945,6 +13954,7 @@ impl CayenneTableProvider {
             protected_snapshots,
             current_snapshot_id,
             cold_files,
+            cold_statistics_schema,
             _scan_guard,
         ) = {
             let _fence = self.listing_fence.read().await;
@@ -14016,6 +14026,7 @@ impl CayenneTableProvider {
                 protected_snapshots,
                 current_snapshot_id,
                 cold_files,
+                self.table_schema(),
                 scan_guard,
             )
         };
@@ -14143,6 +14154,7 @@ impl CayenneTableProvider {
                     limit: None,
                     scan_config: &ctx.copied_config(),
                     read_schema_override: None,
+                    file_statistics_schema: cold_statistics_schema,
                     cold_files: cold_files.as_slice(),
                     selective: false,
                 })
@@ -24572,7 +24584,7 @@ impl CayenneTableProvider {
             // this commit just wrote to the scan path as the cold half of the new
             // snapshot. Every subsequent capture then resolves both halves with no
             // metastore read, and no capture can observe one half without the other.
-            self.store_cold_manifest(&new_snapshot_id, &cold_files);
+            self.store_cold_manifest(&new_snapshot_id, &self.table_schema(), &cold_files);
         }
 
         // Re-baseline the maintained live row count from the manifest this commit
@@ -30400,10 +30412,8 @@ impl CayenneTableProvider {
     /// Resolve the cold-tier manifest that belongs to `snapshot_id`, for a caller
     /// that is holding `listing_fence.read()`.
     ///
-    /// The cache entry is only usable when it names the live snapshot id, and a
-    /// cold-manifest change always mints a new one (see
-    /// [`ColdManifestForSnapshot`]) — so a hit is provably the manifest paired with
-    /// `snapshot_id`, and a miss reads the metastore. That read is a deliberate
+    /// The cache entry must match both the snapshot id and canonical schema (see
+    /// [`ColdManifestForSnapshot`]); a miss reads the metastore. That read is a deliberate
     /// `.await` under the held read fence, in the same spirit as the write side's
     /// documented exception: for cold, listing the manifest IS reading a visibility
     /// flip, so it has to happen inside the fence that makes the flip atomic. It is
@@ -30423,14 +30433,16 @@ impl CayenneTableProvider {
         if !self.table_metadata.vortex_config.cold_tier_enabled() {
             return Ok(Arc::new(Vec::new()));
         }
+        let schema = self.table_schema();
         let cached = self.cold_manifest.load_full();
         if let Some(cached) = cached.as_ref()
             && cached.snapshot_id == snapshot_id
+            && cached.statistics_schema == schema
         {
             return Ok(Arc::clone(&cached.files));
         }
         let files = self.fetch_cold_manifest().await?;
-        self.store_cold_manifest(snapshot_id, &files);
+        self.store_cold_manifest(snapshot_id, &schema, &files);
         Ok(files)
     }
 
@@ -30457,11 +30469,13 @@ impl CayenneTableProvider {
     fn store_cold_manifest(
         &self,
         snapshot_id: &str,
+        statistics_schema: &SchemaRef,
         files: &Arc<Vec<crate::metadata::ColdTierFile>>,
     ) {
         self.cold_manifest
             .store(Arc::new(Some(ColdManifestForSnapshot {
                 snapshot_id: snapshot_id.to_string(),
+                statistics_schema: Arc::clone(statistics_schema),
                 files: Arc::clone(files),
             })));
     }
@@ -30471,26 +30485,42 @@ impl CayenneTableProvider {
     ///
     /// Best-effort: a failure (or a flip that lands during the read) leaves the
     /// cache as it was, and the fenced resolve reads again and reports the error.
-    /// The entry is only stored when the snapshot id is unchanged across the read,
-    /// so this can never publish a manifest under an id it does not belong to.
+    /// Publication rechecks both the snapshot id and captured canonical schema
+    /// under the fence, so schema invalidation also rejects an obsolete refill.
     async fn warm_cold_manifest_cache(&self) {
         if !self.table_metadata.vortex_config.cold_tier_enabled() {
             return;
         }
-        let snapshot_id = self.get_current_snapshot_id();
+        let (snapshot_id, schema) = {
+            let _fence = self.listing_fence.read().await;
+            (self.get_current_snapshot_id(), self.table_schema())
+        };
         let cached = self.cold_manifest.load_full();
-        if cached
-            .as_ref()
-            .as_ref()
-            .is_some_and(|cached| cached.snapshot_id == snapshot_id)
-        {
+        if cached.as_ref().as_ref().is_some_and(|cached| {
+            cached.snapshot_id == snapshot_id && cached.statistics_schema == schema
+        }) {
             return;
         }
-        if let Ok(files) = self.fetch_cold_manifest().await
-            && self.get_current_snapshot_id() == snapshot_id
-        {
-            self.store_cold_manifest(&snapshot_id, &files);
+        if let Ok(files) = self.fetch_cold_manifest().await {
+            #[cfg(test)]
+            {
+                let hook = self.test_cold_manifest_fetch_hook.lock().take();
+                if let Some(hook) = hook {
+                    hook().await;
+                }
+            }
+            // Check and publish under the capture fence: an off-fence fetch may
+            // have crossed either a promotion or schema statistics invalidation.
+            let _fence = self.listing_fence.read().await;
+            if self.get_current_snapshot_id() == snapshot_id && self.table_schema() == schema {
+                self.store_cold_manifest(&snapshot_id, &schema, &files);
+            }
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_clear_cold_manifest_cache(&self) {
+        self.cold_manifest.store(Arc::new(None));
     }
 
     /// Compute the scan-ready [`ScanView`] from a [`RawScanInput`] capture: the KDI
@@ -35740,6 +35770,7 @@ impl CayenneTableProvider {
             limit,
             scan_config,
             read_schema_override,
+            file_statistics_schema,
             cold_files,
             selective,
         } = scan;
@@ -35769,7 +35800,8 @@ impl CayenneTableProvider {
         // files and the `object_store_url is None` / `kept.is_empty()` checks
         // below both return `Ok(None)` when nothing survives.
 
-        let base_schema = read_schema_override.unwrap_or_else(|| self.table_schema());
+        let base_schema =
+            read_schema_override.unwrap_or_else(|| Arc::clone(&file_statistics_schema));
         let options = Self::create_listing_options(
             self.context.file_format(),
             &self.pk_deletion_strategy,
@@ -35809,7 +35841,7 @@ impl CayenneTableProvider {
             let mut part_file = PartitionedFile::from(object_meta);
             if let Some(stats) = crate::stats::statistics_from_persisted_blob(
                 &file.statistics_blob,
-                &self.table_schema(),
+                &file_statistics_schema,
                 file.row_count,
             ) {
                 part_file = part_file.with_statistics(stats);
@@ -38130,6 +38162,7 @@ impl TableProvider for CayenneTableProvider {
                 limit,
                 scan_config: scan_listing_config,
                 read_schema_override: Some(Arc::clone(&read_schema)),
+                file_statistics_schema: Arc::clone(&file_statistics_schema),
                 cold_files: cold_files.as_ref().map_or(&[], |files| files.as_slice()),
                 selective: is_pk_selective_scan,
             })

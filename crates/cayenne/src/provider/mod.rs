@@ -2576,6 +2576,263 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn schema_evolution_cold_decimal_scan_uses_captured_schema() {
+        cold_decimal_statistics_across_evolution(true, false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn schema_evolution_cold_decimal_manifest_invalidates_statistics() {
+        cold_decimal_statistics_across_evolution(false, false).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn schema_evolution_cold_decimal_rejects_stale_manifest_refill() {
+        cold_decimal_statistics_across_evolution(false, true).await;
+    }
+
+    async fn cold_decimal_statistics_across_evolution(park_scan: bool, park_refill: bool) {
+        let temp_dir = TempDir::new().expect("temp dir");
+        let connection = format!(
+            "sqlite://{}",
+            temp_dir.path().join("file_decimal.db").display()
+        );
+        let catalog = Arc::new(CayenneCatalog::new(connection.as_str()).expect("catalog"));
+        catalog.init().await.expect("init catalog");
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("amount", DataType::Decimal128(10, 2), false),
+        ]));
+        let ctx = SessionContext::new();
+        let provider = Arc::new(
+            CayenneTableProvider::create_table(
+                Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+                CreateTableOptions {
+                    table_name: "file_decimal".to_string(),
+                    schema: Arc::clone(&schema),
+                    primary_key: vec!["id".to_string()],
+                    on_conflict: None,
+                    base_path: temp_dir.path().to_string_lossy().to_string(),
+                    partition_column: None,
+                    vortex_config: crate::metadata::VortexConfig {
+                        cold_tier_location: Some(format!(
+                            "file://{}",
+                            temp_dir.path().join("cold").display()
+                        )),
+                        cluster_by: vec!["id".to_string()],
+                        cold_tier_warm_max_files: 1,
+                        deletion_mode: crate::metadata::DeletionMode::Key,
+                        inline_max_rows: 0,
+                        inline_max_bytes: 0,
+                        inline_max_buffer_bytes: 0,
+                        ..Default::default()
+                    },
+                },
+                ctx.runtime_env(),
+            )
+            .await
+            .expect("create table"),
+        );
+        let amounts = Decimal128Array::from(vec![12_345_i128, 67_890])
+            .with_precision_and_scale(10, 2)
+            .expect("decimals");
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1_i64, 2])),
+                Arc::new(amounts),
+            ],
+        )
+        .expect("batch");
+        insert_batch(&provider, batch).await;
+        provider
+            .drain_in_flight_maintenance()
+            .await
+            .expect("drain writes");
+        provider.checkpoint_mem_tier().await.expect("checkpoint");
+        provider
+            .drain_in_flight_maintenance()
+            .await
+            .expect("drain checkpoint");
+        assert!(
+            provider
+                .promote_warm_to_cold()
+                .await
+                .expect("real cold promotion")
+        );
+        let files = catalog
+            .list_cold_tier_files(provider.table_id())
+            .await
+            .expect("cold files");
+        assert!(!files.is_empty());
+        assert!(files.iter().all(|file| !file.statistics_blob.is_empty()));
+        assert_eq!(files.iter().map(|file| file.row_count).sum::<i64>(), 2);
+        let mut parked = None;
+        if park_scan || park_refill {
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel();
+            let hook = Box::new(move || {
+                Box::pin(async move {
+                    let _ = entered_tx.send(());
+                    let _ = release_rx.await;
+                })
+                    as std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>
+            });
+            if park_refill {
+                provider.test_clear_cold_manifest_cache();
+                *provider.test_cold_manifest_fetch_hook.lock() = Some(hook);
+            } else {
+                *provider.test_post_scan_view_selection_hook.lock() = Some(hook);
+            }
+            let scan_provider = Arc::clone(&provider);
+            let state = ctx.state();
+            let task_ctx = ctx.task_ctx();
+            let scan = tokio::spawn(async move {
+                let filters = [datafusion_expr::col("amount").eq(datafusion_expr::lit(
+                    datafusion_common::ScalarValue::Decimal128(Some(12_345), 10, 2),
+                ))];
+                let plan = scan_provider
+                    .scan(&state, None, &filters, None)
+                    .await
+                    .expect("old cold plan");
+                collect(plan, task_ctx).await.expect("old cold rows")
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(30), entered_rx)
+                .await
+                .expect("captured cold scan")
+                .expect("capture signal");
+            parked = Some((release_tx, scan));
+        }
+        let incoming = Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("amount", DataType::Decimal128(14, 4), false),
+        ]);
+        let plan = widening_plan(&schema, &incoming, &[]);
+        provider
+            .evolve_schema_live(&plan)
+            .await
+            .expect("evolve cold schema");
+        let cleared = catalog
+            .list_cold_tier_files(provider.table_id())
+            .await
+            .expect("cleared cold blobs");
+        assert_eq!(
+            cleared.len(),
+            files.len(),
+            "statistics invalidation preserves files"
+        );
+        assert!(cleared.iter().all(|file| file.statistics_blob.is_empty()));
+        if let Some((release, scan)) = parked {
+            release.send(()).expect("release captured cold scan");
+            let batches = scan.await.expect("old cold task");
+            let (precision, scale, first, second) = if park_refill {
+                (14, 4, 1_234_500_i128, 6_789_000_i128)
+            } else {
+                (10, 2, 12_345_i128, 67_890_i128)
+            };
+            let mut values = Vec::new();
+            for batch in batches {
+                assert_eq!(batch.column(0).null_count(), 0);
+                assert_eq!(batch.column(1).null_count(), 0);
+                assert_eq!(
+                    batch.column(1).data_type(),
+                    &DataType::Decimal128(precision, scale)
+                );
+                let ids = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("old ids");
+                let amounts = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<Decimal128Array>()
+                    .expect("old decimals");
+                for row in 0..batch.num_rows() {
+                    values.push((ids.value(row), amounts.value(row)));
+                }
+            }
+            values.sort_unstable();
+            eprintln!("COLD_DECIMAL_CAPTURED {values:?}");
+            assert!(
+                values.contains(&(1, first)),
+                "matching old row must survive pruning"
+            );
+            assert!(
+                values
+                    .iter()
+                    .all(|row| *row == (1, first) || *row == (2, second))
+            );
+            let mut unique = values.clone();
+            unique.dedup();
+            assert_eq!(unique, values);
+        }
+        let fresh_catalog =
+            Arc::new(CayenneCatalog::new(connection.as_str()).expect("fresh catalog"));
+        fresh_catalog.init().await.expect("fresh catalog init");
+        let reopened = Arc::new(
+            CayenneTableProvider::new(
+                "file_decimal",
+                fresh_catalog as Arc<dyn MetadataCatalog>,
+                ctx.runtime_env(),
+            )
+            .await
+            .expect("reopen cold table"),
+        );
+        for (phase, table) in [("live", provider), ("reopened", reopened)] {
+            let query_ctx = SessionContext::new();
+            query_ctx
+                .register_table("file_decimal", table)
+                .expect("register cold table");
+            for (sql, expected) in [
+                (
+                    "SELECT id, amount FROM file_decimal ORDER BY id",
+                    vec![(1, 1_234_500_i128), (2, 6_789_000_i128)],
+                ),
+                (
+                    "SELECT id, amount FROM file_decimal WHERE amount = CAST(123.45 AS DECIMAL(14,4)) ORDER BY id",
+                    vec![(1, 1_234_500_i128)],
+                ),
+            ] {
+                let physical = query_ctx
+                    .sql(sql)
+                    .await
+                    .expect("cold SQL")
+                    .create_physical_plan()
+                    .await
+                    .expect("cold physical plan");
+                eprintln!(
+                    "COLD_DECIMAL_PLAN {phase} {sql}:\n{}",
+                    datafusion_physical_plan::displayable(physical.as_ref()).indent(true)
+                );
+                let batches = collect(physical, query_ctx.task_ctx())
+                    .await
+                    .expect("cold SQL rows");
+                let mut actual = Vec::new();
+                for batch in batches {
+                    assert_eq!(batch.column(0).null_count(), 0);
+                    assert_eq!(batch.column(1).null_count(), 0);
+                    assert_eq!(batch.column(1).data_type(), &DataType::Decimal128(14, 4));
+                    let ids = batch
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("ids");
+                    let amounts = batch
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<Decimal128Array>()
+                        .expect("decimals");
+                    for row in 0..batch.num_rows() {
+                        actual.push((ids.value(row), amounts.value(row)));
+                    }
+                }
+                eprintln!("COLD_DECIMAL_ROWS {phase} {sql}: {actual:?}");
+                assert_eq!(actual, expected);
+            }
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn schema_evolution_queued_integer_statistics_remain_conservative_after_reopen() {
         let temp_dir = TempDir::new().expect("temp dir");
         let connection = format!("sqlite://{}", temp_dir.path().join("integer.db").display());
