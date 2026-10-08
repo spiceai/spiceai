@@ -7283,26 +7283,29 @@ mod tests {
     /// key. Drives the production delete-predicate builder the CDC apply uses.
     #[test]
     fn a_cdc_delete_with_a_null_utf8_primary_key_is_an_error() {
+        use runtime_acceleration::change_sink::provider::deletion::build_batch_delete_expr_from_change_batch;
+
         let change_batch =
             create_test_change_batch(vec!["d"], &[vec!["name"]], vec![1], vec![None]);
 
         let err = build_batch_delete_expr_from_change_batch(&change_batch, &[0], "test_dataset")
             .expect_err("a NULL primary key must not become a delete predicate");
+        let datafusion::error::DataFusionError::External(source) = &err else {
+            panic!("expected the predicate builder's NULL-key error, got: {err}");
+        };
         assert!(
             matches!(
-                &err,
-                crate::accelerated::Error::PkFilterExpr {
-                    source: data_components::pk_filter_expr::Error::PrimaryKeyNullValue {
-                        field_name,
-                        row: 0,
-                    },
-                } if field_name == "name"
+                source.downcast_ref::<data_components::pk_filter_expr::Error>(),
+                Some(data_components::pk_filter_expr::Error::PrimaryKeyNullValue {
+                    field_name,
+                    row: 0,
+                }) if field_name == "name"
             ),
             "expected the NULL-key error for 'name' at row 0, got: {err}"
         );
         assert_eq!(
             err.to_string(),
-            "Primary key column 'name' has NULL value at row 0"
+            "External error: Primary key column 'name' has NULL value at row 0"
         );
     }
 
