@@ -197,10 +197,11 @@ const TABLE_STATISTICS_FULL_COLUMN_SYNC_LIMIT: usize = 256;
 /// safe to a base-table scan, which is slower but always correct.
 const MAINTAINED_AGGREGATE_INDEX_POOL_FRACTION: f64 = 0.10;
 
-/// Retained-index budget used when the query memory pool is unbounded, and the
-/// ceiling applied to the derived fraction on a very large pool. An unbounded
-/// pool still needs *some* bound, or an index on a large table grows until the
-/// host OOMs.
+/// Retained-index budget used when the query memory pool is unbounded. An
+/// unbounded pool still needs *some* bound, or an index on a large table grows
+/// until the host OOMs. A bounded pool is charged its fraction with no further
+/// ceiling: the index of a table with tens of millions of maintained rows takes
+/// gigabytes, and the fraction is already the operator's budget for it.
 const MAINTAINED_AGGREGATE_MAX_INDEX_BYTES_DEFAULT: usize = 512 * 1024 * 1024;
 
 /// How many mem-tier checkpoints pass between attempts to rebuild a stale
@@ -225,10 +226,12 @@ const MAINTAINED_AGGREGATE_REBUILD_MAX_FAILURES: u64 = 3;
 /// ended, when it did not error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum MaintainedAggregateRebuild {
-    /// The views were rebuilt from a scan that no write changed while it ran.
+    /// The views were rebuilt from a snapshot of the table, with the writes
+    /// published while it was read applied on top.
     Rebuilt,
-    /// A write became visible while the scan ran, so the scanned rows match no
-    /// single epoch; the registry was left stale for a later attempt.
+    /// The rebuild was abandoned while it ran — the registry was marked stale,
+    /// missed a write's delta, or held more deltas than its budget allows — so
+    /// the registry was left stale for a later attempt.
     Superseded,
 }
 
@@ -257,7 +260,7 @@ fn maintained_aggregate_max_index_bytes(
                 clippy::cast_precision_loss,
                 clippy::cast_possible_truncation,
                 clippy::cast_sign_loss,
-                reason = "budget fraction; result is clamped to [MIN, DEFAULT] and capped at the pool limit"
+                reason = "budget fraction; result is lifted to MIN and capped at the pool limit"
             )]
             let scaled = (limit as f64 * MAINTAINED_AGGREGATE_INDEX_POOL_FRACTION) as usize;
             // The floor lifts a modest pool's share to something an index can
@@ -267,12 +270,7 @@ fn maintained_aggregate_max_index_bytes(
             // budget). Capping at `limit` leaves such a pool a budget any real
             // index overruns, so maintained aggregates fail safe to base-table
             // scans — the intended outcome for a pool that cannot afford them.
-            scaled
-                .clamp(
-                    MAINTAINED_AGGREGATE_MIN_INDEX_BYTES,
-                    MAINTAINED_AGGREGATE_MAX_INDEX_BYTES_DEFAULT,
-                )
-                .min(limit)
+            scaled.max(MAINTAINED_AGGREGATE_MIN_INDEX_BYTES).min(limit)
         }
         // No knowable ceiling to derive from — fall back to the standalone
         // default rather than leaving the index unbounded.
@@ -1577,6 +1575,14 @@ pub enum ScanViewReuse {
     /// Serve a view captured within `lag`. A zero lag recaptures every scan.
     WithinLag(Duration),
 }
+
+/// Session config extension asking a Cayenne scan for the table as it is now:
+/// it reuses a cached scan view only while no write has invalidated it
+/// ([`ScanViewReuse::UntilInvalidated`]), whatever the table's own reuse mode.
+/// A maintained-aggregate rebuild needs this, since its snapshot must contain
+/// every delta it stopped holding before.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct CurrentScanView;
 
 /// Demand-driven cache of [`ScanView`] bundles, keyed by scan-visible identity.
 /// Replaces the per-scan merge-on-read memos: a bundle is built only for a
@@ -26747,64 +26753,123 @@ impl CayenneTableProvider {
             return Ok(MaintainedAggregateRebuild::Rebuilt);
         }
 
-        let ctx = self.create_session_context();
+        // A scan through this session captures the table as it is now, never a
+        // view reused across later writes.
+        let ctx = SessionContext::new_with_config_rt(
+            util::session_state::session_config().with_extension(Arc::new(CurrentScanView)),
+            Arc::clone(self.context.runtime_env()),
+        );
         let session_state = Arc::new(ctx.state());
-        // Take the epoch and the scan's snapshot together under `write_lock`, which
-        // every write that changes the visible rows holds while it does so, so the
-        // snapshot is the state at exactly this epoch. Planning captures the
-        // snapshot; the read below runs after the lock is released.
-        let (plan, epoch) = {
+        // Read only the columns the views use: the primary key and what they
+        // group by, aggregate, and filter on.
+        let columns: Arc<[usize]> = self.maintained_aggregates.rebuild_columns().into();
+        // Start holding deltas under `write_lock`, which every write that
+        // publishes an epoch holds while it does so: the delta of every epoch
+        // after this one is held from here, so none after the snapshot below can
+        // be lost. Only this is done under the lock; planning a large table's scan
+        // there would stall its CDC apply for as long as the planning takes.
+        let mut rebuilder = {
             let _write_guard = self.write_lock.lock().await;
             let epoch = self.maintained_aggregate_epoch.load(Ordering::Acquire);
-            // NOTE: the scan is deliberately unprojected. The views resolve their
-            // group-by, aggregate-input, and PK columns as indices into the TABLE
-            // schema (`ResolvedAggregateSpec`), so a projected scan would renumber
-            // the columns out from under them. Projecting requires re-resolving every
-            // view against the projected schema; until that lands, correctness wins
-            // over the wasted materialization.
-            let plan = <Self as TableProvider>::scan(self, session_state.as_ref(), None, &[], None)
-                .await?;
-            (plan, epoch)
+            self.maintained_aggregates.begin_rebuild(epoch)?
         };
-        let mut stream = datafusion_physical_plan::execute_stream(plan, session_state.task_ctx())?;
-        let mut batches = Vec::new();
+        let plan = match <Self as TableProvider>::scan(
+            self,
+            session_state.as_ref(),
+            Some(&columns.to_vec()),
+            &[],
+            None,
+        )
+        .await
+        {
+            Ok(plan) => plan,
+            Err(error) => {
+                self.maintained_aggregates.abandon_rebuild(&rebuilder);
+                return Err(error);
+            }
+        };
+        // The scan captured the table together with the epoch it is at, and the
+        // held deltas after that epoch are what the rebuild applies on top. A
+        // capture that raced a write's visibility change carries no epoch.
+        let snapshot_epoch = plan
+            .downcast_ref::<CayenneAccelerationExec>()
+            .and_then(CayenneAccelerationExec::maintained_aggregates)
+            .map(|(_, epoch)| epoch);
+        if !snapshot_epoch.is_some_and(|epoch| rebuilder.set_snapshot_epoch(epoch)) {
+            self.maintained_aggregates.abandon_rebuild(&rebuilder);
+            tracing::debug!(
+                table = %self.table_metadata.table_name,
+                "Maintained aggregate rebuild scan captured no usable epoch; the registry stays stale until a later attempt"
+            );
+            return Ok(MaintainedAggregateRebuild::Superseded);
+        }
+        let mut stream =
+            match datafusion_physical_plan::execute_stream(plan, session_state.task_ctx()) {
+                Ok(stream) => stream,
+                Err(error) => {
+                    self.maintained_aggregates.abandon_rebuild(&rebuilder);
+                    return Err(error);
+                }
+            };
+        let (mut batch_count, mut row_count) = (0_usize, 0_usize);
         while let Some(batch) = stream.next().await {
-            batches.push(batch?);
-            // Stop reading once a write is published: the rebuild is superseded
-            // (below), so the rest of the table would be read for nothing.
-            if self.maintained_aggregate_epoch.load(Ordering::Acquire) != epoch {
-                break;
+            let batch = match batch {
+                Ok(batch) => batch,
+                Err(error) => {
+                    self.maintained_aggregates.abandon_rebuild(&rebuilder);
+                    return Err(error);
+                }
+            };
+            batch_count += 1;
+            row_count += batch.num_rows();
+            // Folding a batch extracts scalars row by row — CPU-heavy — so it runs
+            // on the blocking pool rather than stalling the async runtime.
+            let columns = Arc::clone(&columns);
+            let folded = task::spawn_blocking(move || {
+                let result = rebuilder.apply_projected(&batch, &columns);
+                (rebuilder, result)
+            })
+            .await
+            .map_err(|error| {
+                datafusion_common::DataFusionError::Execution(format!(
+                    "maintained aggregate rebuild task failed: {error}"
+                ))
+            })?;
+            rebuilder = folded.0;
+            if let Err(error) = folded.1 {
+                self.maintained_aggregates.abandon_rebuild(&rebuilder);
+                return Err(error);
+            }
+            // A stale mark, an epoch gap, or more held deltas than the budget
+            // allows has abandoned the rebuild; stop reading for nothing.
+            if !self.maintained_aggregates.rebuild_is_current(&rebuilder) {
+                tracing::debug!(
+                    table = %self.table_metadata.table_name,
+                    epoch = rebuilder.epoch(),
+                    "Maintained aggregate rebuild abandoned during its scan; the registry stays stale until a later attempt"
+                );
+                return Ok(MaintainedAggregateRebuild::Superseded);
             }
         }
         #[cfg(test)]
         self.run_test_post_maintained_aggregate_scan_hook().await;
-        // A write that became visible while the scan ran is not in these rows, and
-        // its delta reached a stale registry, which dropped it. Marked fresh, the
-        // views would be served without that write's rows, so leave the registry
-        // stale and let a later attempt rebuild it.
-        if self.maintained_aggregate_epoch.load(Ordering::Acquire) != epoch {
-            self.mark_maintained_aggregates_stale();
-            tracing::debug!(
-                table = %self.table_metadata.table_name,
-                epoch,
-                "Maintained aggregate rebuild superseded by a write during its scan; the registry stays stale until a later attempt"
-            );
-            return Ok(MaintainedAggregateRebuild::Superseded);
-        }
-        // Capture stats before `batches` is moved into the blocking task.
-        let batch_count = batches.len();
-        let row_count = batches.iter().map(RecordBatch::num_rows).sum::<usize>();
-        // Rebuilding iterates every visible row and extracts scalars — CPU-heavy.
-        // Run it on the blocking pool so it cannot stall the async runtime
-        // (mirrors `apply_maintained_aggregate_insert_batches`).
+        let epoch = rebuilder.epoch();
         let registry = Arc::clone(&self.maintained_aggregates);
-        task::spawn_blocking(move || registry.rebuild_from_batches(epoch, &batches))
+        let installed = task::spawn_blocking(move || registry.finish_rebuild(rebuilder))
             .await
             .map_err(|error| {
                 datafusion_common::DataFusionError::Execution(format!(
                     "maintained aggregate rebuild task failed: {error}"
                 ))
             })??;
+        if !installed {
+            tracing::debug!(
+                table = %self.table_metadata.table_name,
+                epoch,
+                "Maintained aggregate rebuild abandoned before it was installed; the registry stays stale until a later attempt"
+            );
+            return Ok(MaintainedAggregateRebuild::Superseded);
+        }
         tracing::debug!(
             table = %self.table_metadata.table_name,
             epoch,
@@ -37695,9 +37760,12 @@ impl TableProvider for CayenneTableProvider {
         //
         // The fields are cloned out (cheap `Arc` / short-`String` / `im`-HAMT clones)
         // so downstream plan-build owns them exactly as when it captured inline.
-        let scan_view = self
-            .scan_view_at_current_input(self.scan_view_reuse)
-            .await?;
+        let reuse = if state.config().get_extension::<CurrentScanView>().is_some() {
+            ScanViewReuse::UntilInvalidated
+        } else {
+            self.scan_view_reuse
+        };
+        let scan_view = self.scan_view_at_current_input(reuse).await?;
         #[cfg(test)]
         {
             let hook = self.test_post_scan_view_selection_hook.lock().take();
@@ -39893,11 +39961,11 @@ mod tests {
             "a pool that can afford the floor is lifted to it"
         );
 
-        // A large pool takes the fraction, capped by the standalone default.
+        // A large pool takes its fraction, with no ceiling below it.
         assert_eq!(
             budget_for(8 * 1024 * 1024 * 1024),
-            MAINTAINED_AGGREGATE_MAX_INDEX_BYTES_DEFAULT,
-            "a large pool is capped at the standalone default"
+            8 * 1024 * 1024 * 1024 / 10,
+            "a large pool takes its tenth"
         );
 
         // The invariant across the range, including degenerate pools.
@@ -58879,6 +58947,23 @@ mod tests {
         runtime_env: Arc<RuntimeEnv>,
         specs: Vec<MaintainedAggregateSpec>,
     ) -> (CayenneTableProvider, Arc<dyn MetadataCatalog>, TempDir) {
+        create_cdc_upsert_table_with_maintained_aggregates_and_reuse(
+            table_name,
+            runtime_env,
+            specs,
+            ScanViewReuse::UntilInvalidated,
+        )
+        .await
+    }
+
+    /// [`create_cdc_upsert_table_with_maintained_aggregates`] with the table's
+    /// scan-view reuse mode.
+    async fn create_cdc_upsert_table_with_maintained_aggregates_and_reuse(
+        table_name: &str,
+        runtime_env: Arc<RuntimeEnv>,
+        specs: Vec<MaintainedAggregateSpec>,
+        reuse: ScanViewReuse,
+    ) -> (CayenneTableProvider, Arc<dyn MetadataCatalog>, TempDir) {
         use arrow::datatypes::{DataType, Field, Schema};
 
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -58920,6 +59005,7 @@ mod tests {
 
         let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), runtime_env)
             .with_maintained_aggregates(specs)
+            .with_scan_view_reuse(reuse)
             .create(options)
             .await
             .expect("table created");
@@ -58955,16 +59041,22 @@ mod tests {
     /// `CountQueryColumn::AllRows`), `sum(value)` over the column, `AggregateMode::Single`.
     fn build_id_count_sum_aggregate_exec() -> AggregateExec {
         use arrow::datatypes::{DataType, Field, Schema};
+
+        build_count_sum_aggregate_exec_over(Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ])))
+    }
+
+    /// [`build_id_count_sum_aggregate_exec`] over an `(id, value)` input schema
+    /// of the caller's choosing, such as a table's view-typed read schema.
+    fn build_count_sum_aggregate_exec_over(schema: SchemaRef) -> AggregateExec {
         use datafusion::physical_expr::aggregate::AggregateExprBuilder;
         use datafusion::physical_expr::expressions::{col, lit};
         use datafusion::physical_plan::aggregates::{AggregateMode, PhysicalGroupBy};
         use datafusion_functions_aggregate::count::count_udaf;
         use datafusion_functions_aggregate::sum::sum_udaf;
 
-        let schema: SchemaRef = Arc::new(Schema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("value", DataType::Int64, false),
-        ]));
         let input = MemorySourceConfig::try_new_exec(&[vec![]], Arc::clone(&schema), None)
             .expect("memory source exec for aggregate input");
 
@@ -59148,11 +59240,11 @@ mod tests {
         );
     }
 
-    /// A stale maintained-aggregate registry is rebuilt from a full scan while CDC
-    /// writes continue. A write that becomes visible during that scan is in neither
-    /// the scanned rows nor the registry, which dropped its delta while stale, so
-    /// the rebuild must not mark the views fresh: served from them, the aggregate
-    /// would leave that write's rows out.
+    /// A stale maintained-aggregate registry is rebuilt from a scan while CDC
+    /// writes continue. A write that becomes visible during that scan is not in
+    /// the scanned rows, so the views the rebuild installs must take its delta in
+    /// from what the registry held: served without it, the aggregate would leave
+    /// that write's rows out.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_maintained_aggregate_rebuild_does_not_serve_a_write_its_scan_missed() {
         use std::sync::atomic::Ordering;
@@ -59249,6 +59341,209 @@ mod tests {
             collect_id_count_sum(&poll_maintained_serve(&provider, &aggregate_exec).await),
             vec![(1, 1, 10), (2, 1, 20), (3, 1, 30)],
             "a rebuild with no write during its scan serves every row"
+        );
+    }
+
+    /// With `force_view_read_schema`, a scan returns a stored `Utf8` primary key
+    /// as `Utf8View`. A maintained-aggregate rebuild folds that scan into views and
+    /// a retraction index keyed in the stored types, so the rebuild must fold the
+    /// key back to `Utf8`: otherwise it fails and the views stay stale.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_maintained_aggregate_rebuild_folds_a_view_typed_string_key() {
+        use arrow::array::{Int64Array, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+
+        let ctx = SessionContext::new();
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("str path"));
+        let data_dir = format!("{}/data", temp_dir.path().to_str().expect("str path"));
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir created");
+        let catalog = Arc::new(
+            CayenneCatalog::new(format!("sqlite://{metadata_dir}/cayenne.db"))
+                .expect("catalog created"),
+        ) as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        // As `create_cdc_upsert_table_with_maintained_aggregates`, with the read
+        // schema mapped to view types. That flag is carried by the injected
+        // context, not the persisted metadata (see
+        // `force_view_read_schema_scan_emits_utf8view`).
+        let vortex_config = VortexConfig {
+            cdc_durability: crate::metadata::CdcDurability::File,
+            inline_max_rows: 0,
+            deletion_mode: crate::metadata::DeletionMode::Key,
+            force_view_read_schema: true,
+            ..VortexConfig::default()
+        };
+        let context = CayenneContext::new(
+            &vortex_config,
+            ctx.runtime_env(),
+            "ma_rebuild_view_typed_key",
+        );
+        let options = CreateTableOptions {
+            table_name: "ma_rebuild_view_typed_key".to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: vec!["id".to_string()],
+            on_conflict: Some(OnConflict::Upsert(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "id".to_string(),
+                ]),
+            )),
+            base_path: data_dir,
+            partition_column: None,
+            vortex_config,
+        };
+        let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
+            .with_context(context)
+            .with_maintained_aggregates(vec![id_count_sum_spec()])
+            .create(options)
+            .await
+            .expect("table created");
+        assert_eq!(
+            provider.read_schema().field(0).data_type(),
+            &DataType::Utf8View,
+            "precondition: the scan the rebuild reads returns the key as Utf8View"
+        );
+
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(vec!["a", "b"])),
+                Arc::new(Int64Array::from(vec![10, 20])),
+            ],
+        )
+        .expect("id/value batch");
+        let write = provider
+            .write_cdc_append_stream(single_batch_stream(batch), &ctx.task_ctx())
+            .await
+            .expect("CDC write prepares");
+        write.finish().await.expect("CDC write publishes");
+
+        provider.mark_maintained_aggregates_stale();
+        let rebuilt = provider
+            .rebuild_maintained_aggregates_from_visible_state()
+            .await
+            .map_err(|error| error.to_string());
+        assert_eq!(
+            rebuilt,
+            Ok(MaintainedAggregateRebuild::Rebuilt),
+            "a rebuild over a view-typed string key must install its views"
+        );
+
+        // The views hold the stored types, and the registry matches an aggregate
+        // whose output schema has them.
+        let served = poll_maintained_serve(
+            &provider,
+            &build_count_sum_aggregate_exec_over(Arc::clone(&schema)),
+        )
+        .await;
+        let ids = served
+            .column(0)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("id is Utf8");
+        let counts = served
+            .column(1)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("count(*) is Int64");
+        let sums = served
+            .column(2)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("sum(value) is Int64");
+        let mut rows = (0..served.num_rows())
+            .map(|row| {
+                (
+                    ids.value(row).to_string(),
+                    counts.value(row),
+                    sums.value(row),
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.sort();
+        assert_eq!(
+            rows,
+            vec![("a".to_string(), 1, 10), ("b".to_string(), 1, 20)],
+            "the rebuilt views must serve every row"
+        );
+    }
+
+    /// A read-only CDC table reuses a scan view across later writes. A
+    /// maintained-aggregate rebuild must not read such a view: its rows predate
+    /// writes whose deltas the stale registry dropped, so the rebuilt views
+    /// would leave those writes out for good.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_maintained_aggregate_rebuild_reads_the_table_not_a_reused_view() {
+        use std::sync::atomic::Ordering;
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) =
+            create_cdc_upsert_table_with_maintained_aggregates_and_reuse(
+                "ma_rebuild_reused_view",
+                ctx.runtime_env(),
+                vec![id_count_sum_spec()],
+                ScanViewReuse::WithinLag(Duration::from_secs(3600)),
+            )
+            .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        let write = |ids: &'static [i64], values: &'static [i64]| {
+            let provider = provider.clone_for_write();
+            let schema = Arc::clone(&schema);
+            async move {
+                let task_ctx = SessionContext::new().task_ctx();
+                provider
+                    .write_cdc_append_stream(
+                        single_batch_stream(id_value_batch(schema, ids, values)),
+                        &task_ctx,
+                    )
+                    .await
+                    .expect("CDC write prepares")
+                    .finish()
+                    .await
+                    .expect("CDC write publishes");
+            }
+        };
+
+        // A query captures a scan view, which this table keeps reusing for an
+        // hour whatever is written after it.
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "ma_rebuild_reused_view").await,
+            vec![],
+        );
+        write(&[1, 2], &[10, 20]).await;
+        // Stale, as after a durable delete; the next write's delta is dropped.
+        provider.mark_maintained_aggregates_stale();
+        write(&[3], &[30]).await;
+        let published = provider.maintained_aggregate_epoch.load(Ordering::Acquire);
+        assert!(
+            test_framework::utils::wait_until_true(std::time::Duration::from_secs(5), || async {
+                provider.maintained_aggregates.epoch_for_test() >= published
+            })
+            .await,
+            "the applier never took in the delta of the write after the stale mark"
+        );
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "ma_rebuild_reused_view").await,
+            vec![],
+            "precondition: the table's scans still answer from the view captured before the writes"
+        );
+
+        assert_eq!(
+            provider
+                .rebuild_maintained_aggregates_from_visible_state()
+                .await
+                .expect("rebuild runs"),
+            MaintainedAggregateRebuild::Rebuilt
+        );
+        let aggregate_exec = build_id_count_sum_aggregate_exec();
+        assert_eq!(
+            collect_id_count_sum(&poll_maintained_serve(&provider, &aggregate_exec).await),
+            vec![(1, 1, 10), (2, 1, 20), (3, 1, 30)],
+            "the rebuilt views must include the write the reused scan view predates"
         );
     }
 
