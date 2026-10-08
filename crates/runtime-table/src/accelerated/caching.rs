@@ -4359,8 +4359,9 @@ mod pool_tests {
                     .is_err(),
                 "public empty path stays invalid"
             );
+            // A GET: the row stores `request_body = ''`, which the refresh
+            // must not replay as an explicit-empty POST (#14768).
             let filters = vec![
-                col("request_body").eq(lit("")),
                 col("request_path").eq(lit("/items")),
                 col("request_query").eq(lit("key=A")),
             ];
@@ -4451,7 +4452,7 @@ mod pool_tests {
             assert!(
                 requests
                     .iter()
-                    .all(|wire| wire.starts_with("POST /items?key=A ")),
+                    .all(|wire| wire.starts_with("GET /items?key=A ")),
                 "enriched={enriched}: {requests:?}",
             );
             println!(
