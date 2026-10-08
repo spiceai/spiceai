@@ -625,6 +625,40 @@ impl DataAccelerator for TursoAccelerator {
         Ok(Arc::new(TursoSidecar::new(pool, source.name().to_string())))
     }
 
+    async fn validate_init(
+        &self,
+        source: &dyn AccelerationSource,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(acceleration) = source.acceleration()
+            && (acceleration.params.contains_key("turso_url")
+                || acceleration.params.contains_key("turso_auth_token"))
+        {
+            return Err(Error::RemoteDatabaseNotSupported.into());
+        }
+        let path = self.file_path(source)?;
+        if path == ":memory:" {
+            return Ok(());
+        }
+        if let Some(acceleration) = source.acceleration()
+            && acceleration.params.contains_key("turso_file")
+            && !self.is_valid_file(source)
+        {
+            if std::path::Path::new(&path).is_dir() {
+                return Err(Error::InvalidFileIsDirectory.into());
+            }
+            let extension = std::path::Path::new(&path)
+                .extension()
+                .and_then(OsStr::to_str)
+                .unwrap_or("");
+            return Err(Error::InvalidFileExtension {
+                valid_extensions: self.valid_file_extensions().join(","),
+                extension: extension.to_string(),
+            }
+            .into());
+        }
+        Ok(())
+    }
+
     /// Initializes a Turso database for the dataset.
     ///
     /// Supports two acceleration modes:
@@ -649,16 +683,7 @@ impl DataAccelerator for TursoAccelerator {
         &self,
         source: &dyn AccelerationSource,
     ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
-        // Reject remote database configurations (not supported as accelerators)
-        // Note: This is an accelerator-specific limitation. Remote databases will be
-        // supported when Turso is used as a data connector.
-        if let Some(acceleration) = source.acceleration()
-            && (acceleration.params.contains_key("turso_url")
-                || acceleration.params.contains_key("turso_auth_token"))
-        {
-            return Err(Error::RemoteDatabaseNotSupported.into());
-        }
-
+        self.validate_init(source).await?;
         let path = self.file_path(source)?;
 
         // Handle memory mode: no file operations needed
@@ -674,21 +699,6 @@ impl DataAccelerator for TursoAccelerator {
             if !acceleration.params.contains_key("turso_file") {
                 make_spice_data_directory()
                     .map_err(|err| Error::AccelerationCreationFailed { source: err.into() })?;
-            } else if !self.is_valid_file(source) {
-                if std::path::Path::new(&path).is_dir() {
-                    return Err(Error::InvalidFileIsDirectory.into());
-                }
-
-                let extension = std::path::Path::new(&path)
-                    .extension()
-                    .and_then(OsStr::to_str)
-                    .unwrap_or("");
-
-                return Err(Error::InvalidFileExtension {
-                    valid_extensions: self.valid_file_extensions().join(","),
-                    extension: extension.to_string(),
-                }
-                .into());
             }
 
             // If mode is FileCreate, snapshot the existing file (if enabled) then delete it to start fresh

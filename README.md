@@ -264,6 +264,7 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 | `cdc`                              | Debezium push ingest (no Kafka)       | Alpha             | JSON + Avro HTTP             |
 | `elasticsearch`<sup>†</sup>        | Elasticsearch (BM25 + kNN + RRF)      | Alpha             |                              |
 | `gcs`, `gs`                        | [Google Cloud Storage][gcs]           | Alpha             | Parquet, CSV, JSON           |
+| `hf`                               | [Hugging Face][huggingface] datasets  | Alpha             | Parquet, CSV, TSV, JSON, ORC |
 | `ftp`, `sftp`                      | FTP/SFTP                              | Alpha             | Parquet, CSV                 |
 | `imap`                             | IMAP                                  | Alpha             | IMAP Emails                  |
 | `scylladb`<sup>†</sup>             | ScyllaDB                              | Alpha             |                              |
@@ -276,6 +277,7 @@ See more demos on [YouTube](https://www.youtube.com/playlist?list=PLesJrUXEx3U9a
 [ducklake]: https://ducklake.select/
 [spark]: https://spark.apache.org/docs/latest/spark-connect-overview.html
 [gcs]: docs/features/gcs-connector.md
+[huggingface]: docs/features/huggingface-connector.md
 [s3]: https://github.com/spiceai/cookbook/tree/trunk/s3#readme
 [spiceai]: https://github.com/spiceai/cookbook/tree/trunk/spiceai#readme
 [dremio]: https://github.com/spiceai/cookbook/tree/trunk/dremio#readme

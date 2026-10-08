@@ -110,6 +110,7 @@ async fn delayed_connector_construction_keeps_metadata_registration_pending() {
                 Table::Federated {
                     data_connector: wrapper,
                     federated_read_table: FederatedTable::new_unchecked(table),
+                    generation: crate::datafusion::FederatedGeneration::Drain,
                 },
             )
             .await

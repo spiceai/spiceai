@@ -38,7 +38,8 @@ use tokio::runtime::Handle;
 use tokio::sync::{Notify, Semaphore, oneshot};
 
 use super::batching::{
-    AppendBurst, AppendIngress, CdcBurst, CdcIngress, CoalescingBurst, CoalescingLimits,
+    AppendBurst, AppendIngress, ApplyingGuard, CdcBurst, CdcIngress, CoalescingBurst,
+    CoalescingLimits,
 };
 use super::provider::{ProviderChangeSinkBackend, refusal::is_before_mutation};
 use super::source_policy::{CdcPolicy, SchemaDecision};
@@ -190,6 +191,26 @@ impl CdcPolicy for UnchangedSchema {
     fn split_on_schema_change(&self) -> bool {
         true
     }
+}
+
+#[test]
+fn applying_guard_clears_the_flag_when_dropped() {
+    let ingress = Arc::new(CdcIngress::new(
+        &TableReference::bare("cdc"),
+        Arc::new(UnchangedSchema),
+        two_input_limits(),
+    ));
+    {
+        let _guard = ApplyingGuard::enter(&ingress);
+        assert!(
+            ingress.is_applying(),
+            "enter must mark the apply as in flight"
+        );
+    }
+    assert!(
+        !ingress.is_applying(),
+        "drop must clear the flag so a cancelled apply cannot leave the producer building ahead"
+    );
 }
 
 #[test]

@@ -1432,6 +1432,8 @@ impl DataFusionBuilder {
                 )
             }),
             schema_evolve_locks: TokioRwLock::new(HashMap::new()),
+            change_generations: super::change_generations::ChangeGenerations::default(),
+            bootstrap_owners: parking_lot::Mutex::new(HashMap::new()),
             pending_sink_tables: TokioRwLock::new(HashMap::new()),
             deferred_tables: TokioRwLock::new(HashMap::new()),
             deferred_catalogs: TokioRwLock::new(HashMap::new()),
