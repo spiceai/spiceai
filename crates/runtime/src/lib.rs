@@ -365,6 +365,15 @@ pub enum Error {
     },
 
     #[snafu(display(
+        "Failed to register dataset {dataset_name} ({connector}): durable write-back records each committed write for delivery from the primary-key check Cayenne runs on it, but this dataset sets '{param}: none', which turns that check off. Every write would be acknowledged and then never reach the source. Remove '{param}', or use a different 'acceleration.write_mode'. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
+    ))]
+    DurableWriteBackWithoutPkConflictDetection {
+        dataset_name: String,
+        connector: String,
+        param: String,
+    },
+
+    #[snafu(display(
         "Failed to register dataset {dataset_name} ({connector}): durable write-back delivers every committed row from the accelerator, so the accelerator has to keep each row until it reaches the source, but 'acceleration.mode: {mode}' does not keep the accelerator across a restart or a recreate. Recreating it discards both the rows that have not been delivered and the record of what still owes delivery, and nothing else holds those values, so an acknowledged write would be lost. Set 'acceleration.mode: file', or use a different 'acceleration.write_mode'. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
     ))]
     DurableWriteBackRecreatingMode {
