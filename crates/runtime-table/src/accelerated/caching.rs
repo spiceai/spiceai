@@ -575,8 +575,11 @@ pub fn request_identity_filters(
     filters: &[Expr],
     cache_schema: &arrow::datatypes::Schema,
 ) -> Vec<Expr> {
+    // Request headers name a request too, though they are not part of the key
+    // an entry is evicted and refreshed by.
     let names_request = REQUEST_KEY_COLUMNS
         .into_iter()
+        .chain(["request_headers"])
         .any(|column| !HttpTableProvider::request_filter_values(filters, column).is_empty());
     if names_request
         && cache_schema.column_with_name(REQUEST_BODY_COLUMN).is_some()
