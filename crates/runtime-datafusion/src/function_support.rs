@@ -27,7 +27,7 @@ use arrow::datatypes::DataType;
 use arrow_tools::schema_evolution::is_widening_cast;
 use datafusion::{
     common::DFSchema,
-    logical_expr::{Expr, ExprSchemable as _, expr::WindowFunctionDefinition},
+    logical_expr::{Expr, ExprSchemable as _},
     scalar::ScalarValue,
 };
 use datafusion_table_providers::util::supported_functions::{ExpressionSupport, FunctionSupport};
@@ -133,7 +133,7 @@ pub fn deny_spice_functions_for_duckdb_dialect_without_carve_out() -> FunctionSu
         .deny_also(DUCKDB_DENIED_BUILTINS.iter().map(|n| (*n).to_string()))
         .scalar_call(Arc::new(crate::dialect::duckdb_can_translate))
         .build()
-        .with_expression_support(Arc::new(duckdb_can_evaluate_expression))
+        .with_expression_support(Arc::new(crate::dialect::duckdb_can_evaluate_expression))
 }
 
 /// The one `DuckDB` policy both public accessors return, so the connector and
@@ -144,51 +144,7 @@ fn duckdb_function_support() -> FunctionSupport {
         .deny_also(DUCKDB_DENIED_BUILTINS.iter().map(|n| (*n).to_string()))
         .scalar_call(Arc::new(crate::dialect::duckdb_can_translate))
         .build()
-        .with_expression_support(Arc::new(duckdb_can_evaluate_expression))
-}
-
-/// Whether `DuckDB` evaluates this non-function expression node the way
-/// `DataFusion` does: neither the casts the dialect refuses
-/// ([`crate::dialect::duckdb_can_evaluate_expression`]) nor a decimal `avg`.
-///
-/// `DuckDB`'s `avg` over a `DECIMAL` answers a `DOUBLE`, which carries about
-/// 16 significant digits and rounds, where `DataFusion` divides the exact
-/// decimal sum and truncates to `Decimal128(p + 4, s + 4)`. The double comes
-/// back cast to that type, so at TPC-H scale it reads one unit high in the
-/// last place, and for a large `DECIMAL(38, 2)` it is wrong in the integer
-/// digits. A decimal `avg` therefore stays local (issue #14492). `DuckDB`'s
-/// decimal `sum` is exact and keeps its pushdown.
-#[must_use]
-pub fn duckdb_can_evaluate_expression(expr: &Expr, schema: Option<&DFSchema>) -> bool {
-    crate::dialect::duckdb_can_evaluate_expression(expr, schema)
-        && !aggregates_a_decimal(expr, schema, &["avg"])
-}
-
-/// Whether `expr` is a call of one of the aggregates `names`, plain or as a
-/// window function, over an operand that is a decimal or whose type cannot
-/// be read (no scope), which is refused rather than assumed.
-fn aggregates_a_decimal(expr: &Expr, schema: Option<&DFSchema>, names: &[&str]) -> bool {
-    let (name, args) = match expr {
-        Expr::AggregateFunction(aggregate) => (aggregate.func.name(), &aggregate.params.args),
-        Expr::WindowFunction(window) => match &window.fun {
-            WindowFunctionDefinition::AggregateUDF(aggregate) => {
-                (aggregate.name(), &window.params.args)
-            }
-            WindowFunctionDefinition::WindowUDF(_) => return false,
-        },
-        _ => return false,
-    };
-    if !names
-        .iter()
-        .any(|candidate| name.eq_ignore_ascii_case(candidate))
-    {
-        return false;
-    }
-    let scope = schema.unwrap_or_else(|| DFSchema::empty_ref());
-    args.iter().any(|arg| {
-        arg.get_type(scope)
-            .map_or(true, |data_type| data_type.is_decimal())
-    })
+        .with_expression_support(Arc::new(crate::dialect::duckdb_can_evaluate_expression))
 }
 
 /// The [`FunctionSupport`] for `BigQuery` over ADBC, as a value for
@@ -263,8 +219,11 @@ pub fn bigquery_can_evaluate_expression(expr: &Expr, schema: Option<&DFSchema>) 
 /// into an integer, which these engines round where `DataFusion` truncates)
 /// out of the pushdown on that route too; without it the same statement
 /// answered differently through ADBC or ODBC than through the engine's own
-/// connector (issue #14482). `None` for an engine with no such shape, or one
-/// this crate has no gate for, which keeps the plain policy.
+/// connector (issue #14482). `SQLite` is keyed for a different reason: it has
+/// no date, time or interval types, so its gate also keeps every temporal value
+/// local ([`sqlite_driver_can_evaluate_expression`]). `None` for an engine with
+/// no such shape, or one this crate has no gate for, which keeps the plain
+/// policy.
 #[must_use]
 pub fn expression_support_for_engine(engine: &str) -> Option<ExpressionSupport> {
     match engine {
@@ -274,6 +233,7 @@ pub fn expression_support_for_engine(engine: &str) -> Option<ExpressionSupport> 
             Some(Arc::new(crate::dialect::postgres_can_evaluate_expression))
         }
         "mysql" => Some(Arc::new(crate::dialect::mysql_can_evaluate_expression)),
+        "sqlite" => Some(Arc::new(sqlite_driver_can_evaluate_expression)),
         // Documented to round a fractional value cast into an integer, like the
         // engines above; the gate costs them only the cast's pushdown.
         "snowflake" | "athena" => Some(Arc::new(crate::dialect::integer_cast_is_renderable)),
@@ -293,7 +253,7 @@ pub fn expression_support_for_engine(engine: &str) -> Option<ExpressionSupport> 
 /// federated scan instead. That costs the pushdown for those plans and returns
 /// the right rows, which is the trade the deny-list exists to make.
 ///
-/// Casts and decimal aggregates are gated by [`sqlite_can_evaluate_expression`].
+/// Casts are gated by [`sqlite_can_evaluate_expression`].
 #[must_use]
 pub fn deny_spice_functions_for_sqlite_table_providers() -> FunctionSupport {
     FunctionSupportBuilder::new()
@@ -330,14 +290,6 @@ pub fn deny_spice_functions_for_sqlite_table_providers() -> FunctionSupport {
 pub fn sqlite_can_evaluate_expression(expr: &Expr, schema: Option<&DFSchema>) -> bool {
     match expr {
         Expr::TryCast(_) => false,
-        // SQLite has no decimal type: it stores a decimal as a REAL or an
-        // INTEGER and computes `avg` and `sum` over it in floating point or in
-        // 64-bit integers. `avg` reads one unit high in the last place against
-        // DataFusion's truncating decimal division, and a `sum` past `i64`
-        // fails with `integer overflow`, so both stay local (issue #14492).
-        Expr::AggregateFunction(_) | Expr::WindowFunction(_) => {
-            !aggregates_a_decimal(expr, schema, &["avg", "sum"])
-        }
         Expr::Cast(cast) => {
             let to = cast.field.data_type();
             if let Expr::Literal(value, _) = cast.expr.as_ref() {
@@ -349,6 +301,33 @@ pub fn sqlite_can_evaluate_expression(expr: &Expr, schema: Option<&DFSchema>) ->
                 .is_ok_and(|from| sqlite_cast_is_faithful(&from, to))
         }
         _ => true,
+    }
+}
+
+/// Whether `SQLite` evaluates this expression node the way `DataFusion` does
+/// when the SQL reaches it through a generic driver — an ADBC `sqlite` driver,
+/// or an ODBC `SQLite` profile — rather than through Spice's own `SQLite`
+/// connector.
+///
+/// Everything [`sqlite_can_evaluate_expression`] refuses, for the same reasons,
+/// and every date, time, timestamp, duration or interval value besides. `SQLite`
+/// has none of those types. The ADBC route unparses with the generic dialect,
+/// which renders `TIMESTAMP '2026-01-30 23:00:00'` as
+/// `CAST('2026-01-30 23:00:00' AS TIMESTAMP)`: `SQLite` gives that cast NUMERIC
+/// affinity and answers the integer `2026`, and since every text value compares
+/// greater than every number, a filter against it selects every row (issue
+/// #14753). A `DATE` literal becomes `2026` the same way, so the canonical date
+/// literal [`sqlite_can_evaluate_expression`] admits — safe only where the
+/// `SQLite` dialect renders it as text — is refused here. An interval renders as
+/// `INTERVAL '1 HOURS'`, which `SQLite` cannot parse (issue #14754). Each of
+/// these stays local, where `DataFusion` evaluates it over the values the driver
+/// returns.
+#[must_use]
+pub fn sqlite_driver_can_evaluate_expression(expr: &Expr, schema: Option<&DFSchema>) -> bool {
+    match expr {
+        Expr::Literal(value, _) => !value.data_type().is_temporal(),
+        Expr::Cast(cast) if cast.field.data_type().is_temporal() => false,
+        _ => sqlite_can_evaluate_expression(expr, schema),
     }
 }
 
@@ -455,15 +434,13 @@ pub fn deny_spice_functions_for_postgres_table_providers() -> FunctionSupport {
 #[cfg(test)]
 mod tests {
     use super::{
-        FunctionSupport, deny_spice_functions_for_bigquery_table_providers,
+        deny_spice_functions_for_bigquery_table_providers,
         deny_spice_functions_for_duckdb_dialect_without_carve_out,
         deny_spice_functions_for_duckdb_table_providers,
         deny_spice_functions_for_mysql_table_providers,
         deny_spice_functions_for_postgres_table_providers,
         deny_spice_functions_for_sqlite_table_providers, expression_support_for_engine,
     };
-    use std::sync::Arc;
-
     use arrow::datatypes::{DataType, Field, Schema, TimeUnit};
     use datafusion::common::DFSchema;
     use datafusion::functions::core::expr_fn::{
@@ -566,10 +543,9 @@ mod tests {
     /// Whether federation would push this plan into `DuckDB`, which is what
     /// `SqlTable::can_execute_plan` asks of the deny-list.
     fn federates(expr: Expr) -> bool {
-        pushes(
-            &plan_projecting(expr),
-            &deny_spice_functions_for_duckdb_table_providers(),
-        )
+        let support = deny_spice_functions_for_duckdb_table_providers();
+        !contains_unsupported_functions(&plan_projecting(expr), &support)
+            .expect("the support check must not error")
     }
 
     /// Regression test for #13900. Federation is an optimization: a call the
@@ -974,147 +950,6 @@ mod tests {
         );
     }
 
-    fn decimal_scan() -> datafusion::logical_expr::LogicalPlanBuilder {
-        let schema = Schema::new(vec![
-            Field::new("g", DataType::Int32, true),
-            Field::new("dec", DataType::Decimal128(15, 2), true),
-            Field::new("i", DataType::Int64, true),
-            Field::new("f", DataType::Float64, true),
-        ]);
-        table_scan(Some("t"), &schema, None).expect("scan t")
-    }
-
-    /// `SELECT g, <aggregate> FROM t GROUP BY g`.
-    fn plan_aggregating(aggregate: Expr) -> LogicalPlan {
-        decimal_scan()
-            .aggregate(vec![col("g")], vec![aggregate])
-            .expect("aggregate")
-            .build()
-            .expect("build plan")
-    }
-
-    /// `SELECT <aggregate>(<column>) OVER (PARTITION BY g) FROM t`.
-    fn plan_windowing(
-        aggregate: Arc<datafusion::logical_expr::AggregateUDF>,
-        column: &str,
-    ) -> LogicalPlan {
-        use datafusion::logical_expr::{
-            ExprFunctionExt as _, WindowFunctionDefinition, expr::WindowFunction,
-        };
-        let window = Expr::from(WindowFunction::new(
-            WindowFunctionDefinition::AggregateUDF(aggregate),
-            vec![col(column)],
-        ))
-        .partition_by(vec![col("g")])
-        .build()
-        .expect("window expression");
-        decimal_scan()
-            .window(vec![window])
-            .expect("window")
-            .build()
-            .expect("build plan")
-    }
-
-    fn pushes(plan: &LogicalPlan, support: &FunctionSupport) -> bool {
-        !contains_unsupported_functions(plan, support).expect("the support check must not error")
-    }
-
-    /// Regression test for #14492: `SQLite` computes a decimal `avg` and `sum`
-    /// in floating point or 64-bit integers, so neither federates; the same
-    /// aggregates over integers and floats keep their pushdown.
-    #[test]
-    fn sqlite_keeps_decimal_avg_and_sum_local() {
-        use datafusion::functions_aggregate::average::avg_udaf;
-        use datafusion::functions_aggregate::expr_fn::{avg, count, max, min, sum};
-        use datafusion::functions_aggregate::sum::sum_udaf;
-        let support = deny_spice_functions_for_sqlite_table_providers();
-        for refused in [avg(col("dec")), sum(col("dec"))] {
-            assert!(
-                !pushes(&plan_aggregating(refused.clone()), &support),
-                "{refused} must stay local on SQLite"
-            );
-        }
-        for refused in [avg_udaf(), sum_udaf()] {
-            assert!(
-                !pushes(&plan_windowing(Arc::clone(&refused), "dec"), &support),
-                "a decimal windowed {} must stay local on SQLite",
-                refused.name()
-            );
-        }
-        assert!(
-            pushes(&plan_windowing(avg_udaf(), "f"), &support),
-            "a float windowed avg must keep its SQLite pushdown"
-        );
-        for allowed in [
-            avg(col("i")),
-            avg(col("f")),
-            sum(col("i")),
-            sum(col("f")),
-            min(col("dec")),
-            max(col("dec")),
-            count(col("dec")),
-        ] {
-            assert!(
-                pushes(&plan_aggregating(allowed.clone()), &support),
-                "{allowed} must keep its SQLite pushdown"
-            );
-        }
-    }
-
-    /// Regression test for #14492: `DuckDB`'s decimal `avg` is a `DOUBLE`, so
-    /// it stays local, on the connector, the accelerator and `DuckLake`; its
-    /// exact decimal `sum` and a non-decimal `avg` keep their pushdown.
-    #[test]
-    fn duckdb_keeps_decimal_avg_local() {
-        use datafusion::functions_aggregate::average::avg_udaf;
-        use datafusion::functions_aggregate::expr_fn::{avg, sum};
-        for (route, support) in [
-            ("duckdb", deny_spice_functions_for_duckdb_table_providers()),
-            (
-                "ducklake",
-                deny_spice_functions_for_duckdb_dialect_without_carve_out(),
-            ),
-        ] {
-            assert!(
-                !pushes(&plan_aggregating(avg(col("dec"))), &support),
-                "a decimal avg must stay local on {route}"
-            );
-            assert!(
-                !pushes(&plan_windowing(avg_udaf(), "dec"), &support),
-                "a decimal windowed avg must stay local on {route}"
-            );
-            for allowed in [sum(col("dec")), avg(col("i")), avg(col("f"))] {
-                assert!(
-                    pushes(&plan_aggregating(allowed.clone()), &support),
-                    "{allowed} must keep its {route} pushdown"
-                );
-            }
-        }
-    }
-
-    /// An aggregate whose operand type cannot be read is refused, not assumed
-    /// to be a non-decimal.
-    #[test]
-    fn a_decimal_aggregate_check_refuses_an_unreadable_operand() {
-        use datafusion::functions_aggregate::expr_fn::{avg, sum};
-        assert!(!super::sqlite_can_evaluate_expression(
-            &avg(col("dec")),
-            None
-        ));
-        assert!(!super::sqlite_can_evaluate_expression(
-            &sum(col("dec")),
-            None
-        ));
-        assert!(!super::duckdb_can_evaluate_expression(
-            &avg(col("dec")),
-            None
-        ));
-        assert!(super::duckdb_can_evaluate_expression(
-            &sum(col("dec")),
-            None
-        ));
-    }
-
     /// A scan of `t(id, s, a)` with `s` text and `a` binary, filtered by
     /// `predicate` and projecting `projection` — the shapes #14355 and #14397
     /// measured.
@@ -1342,11 +1177,64 @@ mod tests {
                 "{engine} evaluates {harmless} as DataFusion does, so its gate must let it federate"
             );
         }
-        for engine in ["sqlite", "databricks", "flightsql", "unknown"] {
+        for engine in ["databricks", "flightsql", "unknown"] {
             assert!(
                 expression_support_for_engine(engine).is_none(),
                 "{engine} has no gate: it truncates like DataFusion, or no policy exists for it"
             );
+        }
+    }
+
+    /// Regression test for #14753 and #14754: through a generic driver,
+    /// `SQLite` reads a date or timestamp literal as the number its year
+    /// parses to and cannot parse an interval, so every temporal value stays
+    /// local — including the canonical date literal the `SQLite` connector's
+    /// own dialect renders faithfully — while the plain comparisons around
+    /// them keep federating.
+    #[test]
+    fn the_sqlite_driver_gate_keeps_every_temporal_value_local() {
+        let gate = expression_support_for_engine("sqlite")
+            .expect("SQLite reached through a driver needs a gate");
+        let timestamp_literal = cast(
+            lit("2026-01-30 23:00:00"),
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+        );
+        let date_literal = cast(lit("2026-01-31"), DataType::Date32);
+        let refused = [
+            ("a string cast into a timestamp (#14753)", timestamp_literal),
+            ("a canonical string cast into a date", date_literal),
+            (
+                "a timestamp value",
+                lit(ScalarValue::TimestampNanosecond(
+                    Some(1_769_814_000_000_000_000),
+                    None,
+                )),
+            ),
+            ("a date value", lit(ScalarValue::Date32(Some(20_484)))),
+            (
+                "an interval (#14754)",
+                lit(ScalarValue::new_interval_mdn(0, 0, 3_600_000_000_000)),
+            ),
+            ("a TRY_CAST", try_cast(col("v"), DataType::Int64)),
+        ];
+        let schema = DFSchema::try_from(Schema::new(vec![
+            Field::new("v", DataType::Utf8, true),
+            Field::new("n", DataType::Int32, true),
+        ]))
+        .expect("build the test schema");
+        for (what, expr) in refused {
+            assert!(
+                !gate(&expr, Some(&schema)),
+                "{what} must stay local: {expr}"
+            );
+        }
+        for expr in [
+            col("v"),
+            lit("2026-01-31"),
+            lit(1_i64),
+            cast(col("n"), DataType::Int64),
+        ] {
+            assert!(gate(&expr, Some(&schema)), "{expr} must still federate");
         }
     }
 

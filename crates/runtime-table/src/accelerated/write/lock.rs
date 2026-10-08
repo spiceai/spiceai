@@ -80,6 +80,28 @@ use datafusion::physical_plan::{
 };
 use futures::{StreamExt, TryStreamExt};
 use tokio::sync::Mutex;
+use util::session_state::SupersededRows;
+
+/// What a write that completed without an error records.
+struct Finished {
+    last_updated_at: Option<Arc<AtomicI64>>,
+    superseded: Option<Arc<SupersededRows>>,
+    dataset_name: TableReference,
+}
+
+impl Finished {
+    fn record(&self) {
+        if let Some(last_updated_at) = self.last_updated_at.as_ref() {
+            crate::accelerated::AcceleratedTable::set_timestamp_to_now(last_updated_at);
+        }
+        if let Some(superseded) = self.superseded.as_ref() {
+            crate::accelerated::superseded::record(
+                &crate::accelerated::refresh_task::DatasetMetricLabels::new(&self.dataset_name),
+                superseded,
+            );
+        }
+    }
+}
 
 /// Wraps a write plan so the accelerator write lock is held for the whole of
 /// the write, rather than only while the plan was being built.
@@ -91,6 +113,8 @@ pub(crate) struct AcceleratorWriteLockExec {
     /// accelerator accepts the write — stamping here too would move the marker
     /// for a write its own validation went on to refuse.
     last_updated_at: Option<Arc<AtomicI64>>,
+    /// The rows the write did not keep, recorded once it completes.
+    superseded: Option<Arc<SupersededRows>>,
     dataset_name: TableReference,
     plan_properties: Arc<PlanProperties>,
 }
@@ -104,6 +128,7 @@ impl AcceleratorWriteLockExec {
         input: Arc<dyn ExecutionPlan>,
         accelerator_write_mutex: Arc<Mutex<()>>,
         last_updated_at: Option<Arc<AtomicI64>>,
+        superseded: Option<Arc<SupersededRows>>,
         dataset_name: TableReference,
     ) -> Self {
         let plan_properties = Arc::new(
@@ -118,6 +143,7 @@ impl AcceleratorWriteLockExec {
             input,
             accelerator_write_mutex,
             last_updated_at,
+            superseded,
             dataset_name,
             plan_properties,
         }
@@ -183,6 +209,7 @@ impl ExecutionPlan for AcceleratorWriteLockExec {
             input,
             Arc::clone(&self.accelerator_write_mutex),
             self.last_updated_at.clone(),
+            self.superseded.clone(),
             self.dataset_name.clone(),
         )))
     }
@@ -196,6 +223,7 @@ impl ExecutionPlan for AcceleratorWriteLockExec {
         let input = Arc::clone(&self.input);
         let accelerator_write_mutex = Arc::clone(&self.accelerator_write_mutex);
         let last_updated_at = self.last_updated_at.clone();
+        let superseded = self.superseded.clone();
         let dataset_name = self.dataset_name.clone();
 
         // The guard is threaded through the stream's own state, so it is
@@ -208,26 +236,29 @@ impl ExecutionPlan for AcceleratorWriteLockExec {
                 "Holding the accelerator write lock for a direct write to dataset {dataset_name}"
             );
             let input_stream = input.execute(partition, context)?;
+            let finished = Finished {
+                last_updated_at,
+                superseded,
+                dataset_name,
+            };
 
             Ok::<_, DataFusionError>(futures::stream::unfold(
-                (input_stream, guard, last_updated_at, false),
-                |(mut input_stream, guard, last_updated_at, failed)| async move {
+                (input_stream, guard, finished, false),
+                |(mut input_stream, guard, finished, failed)| async move {
                     let Some(batch) = input_stream.next().await else {
-                        // The write has finished. Move the freshness marker
-                        // here, under the guard, so the next holder of the lock
+                        // The write has finished. Move the freshness marker,
+                        // and record the rows it did not keep, here, under the guard, so the next holder of the lock
                         // — an acceleration snapshot — reads a timestamp that
                         // already accounts for these rows.
-                        if !failed && let Some(last_updated_at) = last_updated_at.as_ref() {
-                            crate::accelerated::AcceleratedTable::set_timestamp_to_now(
-                                last_updated_at,
-                            );
+                        if !failed {
+                            finished.record();
                         }
                         drop(guard);
                         return None;
                     };
 
                     let failed = failed || batch.is_err();
-                    Some((batch, (input_stream, guard, last_updated_at, failed)))
+                    Some((batch, (input_stream, guard, finished, failed)))
                 },
             ))
         })
