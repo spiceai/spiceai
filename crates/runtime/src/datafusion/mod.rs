@@ -3744,10 +3744,9 @@ impl DataFusion {
             refresh_mode,
             constraint_columns,
         } = setup;
-        let source_constraints = match &*source_table_provider {
-            FederatedTable::Immediate(provider) => provider.constraints(),
-            FederatedTable::Deferred(_) => None,
-        };
+        // A deferred provider reports the primary key the checkpoint recorded, so an
+        // acceleration registered while its source is down keeps its existing key.
+        let source_constraints = source_table_provider.constraints();
         let evolved_schema = self
             .handle_schema_difference(
                 dataset,
@@ -5324,7 +5323,21 @@ impl DataFusion {
             &dataset.metadata,
             &dataset.columns,
         );
-        let metadata_provider = if register_metadata {
+        // A source that has not connected yet cannot answer for its metadata table
+        // until it does, so the acceleration is published now and the metadata table
+        // registers once the source connects.
+        let defer_metadata = register_metadata
+            && dataset.has_metadata_table
+            && self
+                .dataset_placements
+                .get(&dataset.name.to_string())
+                .is_none()
+            && source
+                .as_any()
+                .downcast_ref::<crate::dataconnector::reconnecting::ReconnectingConnector>()
+                .is_some_and(|connector| !connector.is_connected());
+        let installed_provider = defer_metadata.then(|| Arc::clone(&table_provider));
+        let metadata_provider = if register_metadata && !defer_metadata {
             source
                 .metadata_provider(dataset)
                 .await
@@ -5369,6 +5382,19 @@ impl DataFusion {
             permit.installation_failed();
             return Err(error);
         }
+        // A metadata table left by a previous generation must not answer for this one
+        // until the source connects and registers its own.
+        if installed_provider.is_some()
+            && let Err(error) = self.ctx.deregister_table(TableReference::partial(
+                SPICE_METADATA_SCHEMA,
+                dataset.name.to_string(),
+            ))
+        {
+            tracing::warn!(
+                "Failed to remove the previous metadata table for dataset {name}, so 'metadata.{name}' may answer from the previous load until its source connects. Cause: {error}",
+                name = dataset.name,
+            );
+        }
         if let Some(writers) = &mut writers {
             tracing::warn!(
                 "Access mode 'read_write' is enabled for dataset {}. This feature is currently in preview.",
@@ -5381,7 +5407,90 @@ impl DataFusion {
             self.runtime_status
                 .update_dataset(&dataset.name, status::ComponentStatus::Ready);
         }
+        if let Some(installed) = installed_provider {
+            self.register_metadata_when_connected(dataset.clone(), source, installed);
+        }
         Ok((notifier, permit))
+    }
+
+    /// Registers `dataset`'s metadata table once its source connects, retrying with
+    /// backoff while the source is unreachable. Stops when `installed` is no longer
+    /// the dataset's table, so a replacement keeps its own metadata table.
+    fn register_metadata_when_connected(
+        &self,
+        dataset: Dataset,
+        source: Arc<dyn DataConnector>,
+        installed: Arc<dyn TableProvider>,
+    ) {
+        let Some(datafusion) = self.datafusion_ref.get().cloned() else {
+            return;
+        };
+        tokio::spawn(async move {
+            let mut backoff = Duration::from_secs(1);
+            loop {
+                let Some(df) = datafusion.upgrade() else {
+                    return;
+                };
+                if !df.is_installed_provider(&dataset.name, &installed).await {
+                    return;
+                }
+                drop(df);
+                match source.metadata_provider(&dataset).await {
+                    None => return,
+                    Some(Ok(metadata)) => {
+                        let Some(df) = datafusion.upgrade() else {
+                            return;
+                        };
+                        let Ok(_permit) = df.change_generations.lock(&dataset.name).await else {
+                            return;
+                        };
+                        if !df.is_installed_provider(&dataset.name, &installed).await {
+                            return;
+                        }
+                        if let Err(error) = df.ctx.register_table(
+                            TableReference::partial(
+                                SPICE_METADATA_SCHEMA,
+                                dataset.name.to_string(),
+                            ),
+                            metadata,
+                        ) {
+                            tracing::warn!(
+                                "Failed to register the metadata table for dataset {name} after its source connected, so queries against 'metadata.{name}' will not resolve. Cause: {error}",
+                                name = dataset.name,
+                            );
+                        }
+                        return;
+                    }
+                    Some(Err(error)) if !error.is_retriable() => {
+                        tracing::warn!(
+                            "Failed to register the metadata table for dataset {name}, so queries against 'metadata.{name}' will not resolve. Cause: {error}",
+                            name = dataset.name,
+                        );
+                        return;
+                    }
+                    Some(Err(error)) => {
+                        tracing::debug!(
+                            dataset = %dataset.name,
+                            "Metadata table waits for the source to connect: {error}"
+                        );
+                    }
+                }
+                tokio::time::sleep(backoff).await;
+                backoff = (backoff * 2).min(Duration::from_secs(30));
+            }
+        });
+    }
+
+    /// Whether `provider` is the table currently registered for `name`.
+    async fn is_installed_provider(
+        &self,
+        name: &TableReference,
+        provider: &Arc<dyn TableProvider>,
+    ) -> bool {
+        self.ctx
+            .table_provider(name.clone())
+            .await
+            .is_ok_and(|current| std::ptr::addr_eq(Arc::as_ptr(&current), Arc::as_ptr(provider)))
     }
 
     /// Publish without suspension and restore metadata if main installation fails.

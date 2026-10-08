@@ -819,10 +819,12 @@ async fn a_5xx_response_is_recognized_on_a_json_decomposed_dataset() -> Result<(
     register_test_connectors().await;
 
     let origin = Origin::start().await;
+    // Pinned to Arrow: a Cayenne cache does not populate from a query that also
+    // filters on a response column, as `fetch_decomposed_rank` does with `rank` (#14865).
     let dataset = decompose_into_named_columns(caching_dataset(
         &origin,
         "enabled",
-        None,
+        Some("arrow"),
         Mode::Memory,
         vec![],
     ));
