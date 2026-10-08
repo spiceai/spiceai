@@ -86,6 +86,7 @@ use datafusion_physical_expr::{PhysicalExpr, create_physical_expr};
 use futures::StreamExt;
 use std::collections::HashSet;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use tokio::sync::Mutex as TokioMutex;
 
 // Position-based deletion methods implemented in sink/position_based.rs
@@ -144,6 +145,13 @@ impl Drop for StagedPkDelete {
     }
 }
 
+/// Bump `scan_input_version` so [`crate::ScanViewReuse::UntilInvalidated`] recaptures.
+fn bump_scan_input_version(version: Option<&AtomicU64>) {
+    if let Some(version) = version {
+        version.fetch_add(1, Ordering::Release);
+    }
+}
+
 pub(crate) struct PreparedDeletionPublish {
     strategy: PkDeletionStrategyWithCache,
     table_memory: Arc<CayenneMemoryAccount>,
@@ -151,6 +159,7 @@ pub(crate) struct PreparedDeletionPublish {
     publish: PreparedDeletionCache,
     deleted_count: u64,
     cleanup_armed: bool,
+    scan_input_version: Option<Arc<AtomicU64>>,
 }
 
 enum PreparedDeletionCache {
@@ -240,6 +249,7 @@ impl PreparedDeletionPublish {
         }
         self.table_memory
             .set_deletion_bytes(self.strategy.approx_resident_bytes());
+        bump_scan_input_version(self.scan_input_version.as_deref());
         Ok(())
     }
 
@@ -472,6 +482,11 @@ pub struct CayenneDeletionSink {
     /// allocations through the SAME allocator as every other writer of this
     /// table, so memory and the DB `current_sequence_number` never diverge.
     seq_allocator: Arc<TokioMutex<super::super::table::SeqAllocator>>,
+    /// The owning table's `scan_input_version`. Bumped when this sink publishes
+    /// a deletion so [`crate::ScanViewReuse::UntilInvalidated`] recaptures
+    /// rather than serving the pre-delete view. `None` on internal persist-only
+    /// helpers that are not a user-visible delete.
+    scan_input_version: Option<Arc<AtomicU64>>,
     /// Whether this sink must return a VERIFIED deleted-row count — i.e. it backs
     /// a user-visible `DELETE`, where the count is surfaced to the SQL client as
     /// "rows affected". When false (the CDC/internal default), the `pk IN (...)`
@@ -522,7 +537,20 @@ impl CayenneDeletionSink {
             write_lock,
             seq_allocator,
             count_exact: false,
+            scan_input_version: None,
         }
+    }
+
+    /// Wire the owning table's scan-input version so a published delete
+    /// invalidates the demand scan-view cache.
+    #[must_use]
+    pub(crate) fn with_scan_input_version(mut self, version: Arc<AtomicU64>) -> Self {
+        self.scan_input_version = Some(version);
+        self
+    }
+
+    pub(super) fn notify_scan_input_change(&self) {
+        bump_scan_input_version(self.scan_input_version.as_deref());
     }
 
     /// Set whether this sink must return an exact, verified deleted-row count.
@@ -1286,6 +1314,7 @@ impl CayenneDeletionSink {
             publish,
             deleted_count,
             cleanup_armed: true,
+            scan_input_version: self.scan_input_version.as_ref().map(Arc::clone),
         })
     }
 

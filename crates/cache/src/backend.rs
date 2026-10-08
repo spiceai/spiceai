@@ -66,6 +66,24 @@ pub trait CacheBackend<V: Sizeable>: Send + Sync {
     /// Insert a value into the cache with the given key and size
     async fn insert(&self, key: u64, value: V);
 
+    /// Replace the value at `key` with `value` only when `should_replace`
+    /// accepts the value currently stored.
+    ///
+    /// Used to rewrite a resident results-cache entry in place (record a
+    /// decode hit, or promote Encoded → Raw after the second decode): the key,
+    /// TTL and generation stay put, and only the in-memory form (and so the
+    /// weigher) change. Returns whether the replace ran. A concurrent store of
+    /// a newer result must make this return `false`.
+    ///
+    /// Implementations must not restart the entry's remaining TTL when the new
+    /// value asks to keep it ([`crate::Sizeable::keep_remaining_ttl`]).
+    async fn replace_if(
+        &self,
+        key: u64,
+        value: V,
+        should_replace: &(dyn for<'v> Fn(&'v V) -> bool + Send + Sync),
+    ) -> bool;
+
     /// Get a value from the cache by key
     /// Returns None if key doesn't exist or value has expired
     async fn get(&self, key: &u64) -> Option<V>;

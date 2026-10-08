@@ -17,7 +17,7 @@ limitations under the License.
 //! `CREATE TABLE` DDL extension extraction.
 //!
 //! Intercepts `CREATE TABLE` statements containing `WITH (...)` options
-//! (`acceleration.*`, `dataset.*`) and/or `PARTITION BY` clauses. Extracts
+//! (`acceleration.*`, `dataset.*`), `PARTITION BY`, and `CLUSTER BY` clauses. Extracts
 //! these extensions from the AST, stores them in the [`DdlExtensionStore`]
 //! for the analyzer rule to consume, strips them from the statement, and
 //! delegates the cleaned statement to `DataFusion`'s standard planner.
@@ -29,7 +29,7 @@ use datafusion::sql::TableReference;
 use datafusion::sql::parser::Statement;
 use datafusion::sql::sqlparser::ast::{
     ColumnOption, CreateTable, CreateTableOptions, SqlOption, Statement as SQLStatement,
-    TableConstraint,
+    TableConstraint, WrappedCollection,
 };
 
 use crate::datafusion::cayenne_ddl::is_cayenne_catalog;
@@ -112,6 +112,20 @@ fn extract_and_store_extensions(
     };
 
     let partition_by_expr = create_table.partition_by.clone();
+    let cluster_by_exprs = create_table
+        .cluster_by
+        .clone()
+        .map_or_else(Vec::new, |wrapped| match wrapped {
+            WrappedCollection::Parentheses(exprs) => exprs,
+            WrappedCollection::NoWrapping(exprs) => match exprs.as_slice() {
+                // `GenericDialect` represents `CLUSTER BY (a, b)` as one tuple
+                // expression, while Snowflake's parser represents the same
+                // surface as a parenthesized collection. Normalize both ASTs
+                // before catalog-specific validation.
+                [datafusion::sql::sqlparser::ast::Expr::Tuple(items)] => items.clone(),
+                _ => exprs,
+            },
+        });
 
     // Build the extension from WITH options.
     let mut extension = if let Some(ref options) = with_options {
@@ -137,14 +151,16 @@ fn extract_and_store_extensions(
 
     // Attach partition_by expression.
     extension.partition_by = partition_by_expr;
+    extension.cluster_by = cluster_by_exprs;
 
     // Check if we actually extracted anything meaningful.
     let has_recognized_with = extension.acceleration.is_some()
         || extension.dataset.time_column.is_some()
         || extension.dataset.time_format.is_some();
     let has_partition = extension.partition_by.is_some();
+    let has_cluster_by = !extension.cluster_by.is_empty();
 
-    if !has_recognized_with && !has_partition {
+    if !has_recognized_with && !has_partition && !has_cluster_by {
         // Nothing to extract — return unmodified.
         return Ok((create_table, None));
     }
@@ -166,6 +182,9 @@ fn extract_and_store_extensions(
     }
     if has_partition {
         create_table.partition_by = None;
+    }
+    if has_cluster_by {
+        create_table.cluster_by = None;
     }
 
     Ok((create_table, Some(store_key)))
@@ -578,14 +597,14 @@ fn extract_primary_key_columns(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::sql::sqlparser::dialect::PostgreSqlDialect;
+    use datafusion::sql::sqlparser::dialect::GenericDialect;
     use datafusion::sql::sqlparser::parser::Parser;
     use datafusion_ddl::has_ddl_extensions;
     use datafusion_ddl::new_shared_store;
 
     /// Parse SQL into a `CreateTable` AST node for testing.
     fn parse_create_table(sql: &str) -> CreateTable {
-        let stmts = Parser::parse_sql(&PostgreSqlDialect {}, sql).expect("should parse");
+        let stmts = Parser::parse_sql(&GenericDialect {}, sql).expect("should parse");
         match stmts.into_iter().next().expect("should have a statement") {
             SQLStatement::CreateTable(ct) => ct,
             other => panic!("Expected CreateTable, got: {other}"),
@@ -620,6 +639,13 @@ mod tests {
     #[test]
     fn test_partition_by_only() {
         let ct = parse_create_table("CREATE TABLE foo (id INT, region TEXT) PARTITION BY region");
+        assert!(has_ddl_extensions(&ct));
+    }
+
+    #[test]
+    fn test_cluster_by_only() {
+        let ct =
+            parse_create_table("CREATE TABLE foo (id INT, region TEXT) CLUSTER BY (region, id)");
         assert!(has_ddl_extensions(&ct));
     }
 
@@ -732,6 +758,72 @@ mod tests {
             .remove(&TableReference::parse_str("foo"))
             .expect("should have entry");
         assert!(ext.partition_by.is_some());
+    }
+
+    #[test]
+    fn test_extract_cluster_by() {
+        let ct =
+            parse_create_table("CREATE TABLE foo (id INT, region TEXT) CLUSTER BY (region, id)");
+        let store = new_shared_store(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
+        let (modified, store_key) =
+            extract_and_store_extensions(ct, &store).expect("should succeed");
+
+        assert!(store_key.is_some());
+        assert!(modified.cluster_by.is_none());
+
+        let ext = store
+            .write()
+            .expect("store lock should not be poisoned")
+            .remove(&TableReference::parse_str("foo"))
+            .expect("should have entry");
+        assert_eq!(
+            ext.cluster_by
+                .iter()
+                .map(ToString::to_string)
+                .collect::<Vec<_>>(),
+            vec!["region", "id"]
+        );
+    }
+
+    /// Extract a statement's `CLUSTER BY` clause and resolve it to column names
+    /// the way the Cayenne DDL handler does.
+    fn extracted_cluster_by_names(sql: &str) -> DFResult<Vec<String>> {
+        let ct = parse_create_table(sql);
+        let store = new_shared_store(SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA);
+        let (_, store_key) = extract_and_store_extensions(ct, &store).expect("should succeed");
+        assert!(store_key.is_some(), "CLUSTER BY is an extension");
+        let ext = store
+            .write()
+            .expect("store lock should not be poisoned")
+            .remove(&TableReference::parse_str("foo"))
+            .expect("should have entry");
+        cayenne::ddl::operations::cluster_by_column_names(
+            "foo",
+            &ext.cluster_by,
+            &datafusion::sql::planner::IdentNormalizer::default(),
+        )
+    }
+
+    /// One parenthesized column parses as a nested expression, not a tuple, and
+    /// must still name that column: it is also the form the distributed handler
+    /// forwards to executors.
+    #[test]
+    fn test_extract_single_parenthesized_cluster_by() {
+        let names =
+            extracted_cluster_by_names("CREATE TABLE foo (id INT, region TEXT) CLUSTER BY (id)")
+                .expect("a parenthesized column is a column name");
+        assert_eq!(names, vec!["id"]);
+    }
+
+    /// Unquoted `CLUSTER BY` identifiers are normalized the way the column names
+    /// they refer to were; quoted ones keep their case.
+    #[test]
+    fn test_cluster_by_identifiers_are_normalized_like_columns() {
+        let names = extracted_cluster_by_names(
+            r#"CREATE TABLE foo (id INT, "Region" TEXT) CLUSTER BY (ID, "Region")"#,
+        )
+        .expect("column names");
+        assert_eq!(names, vec!["id", "Region"]);
     }
 
     #[test]

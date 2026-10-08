@@ -71,10 +71,21 @@ pub mod metadata;
 pub mod metastore;
 pub mod metastore_layout;
 
-/// Z-order clustering kernel, re-exported for benchmarks only. Not a stable API.
+/// Cold-tier clustering kernel, re-exported for benchmarks only. Not a stable API.
 #[doc(hidden)]
-pub mod __bench_zorder {
-    pub use crate::provider::zorder::zorder_keys;
+pub mod __bench_clustering {
+    pub use crate::provider::clustering::cluster_keys;
+}
+
+/// Returns whether Cayenne can encode `data_type` as a clustering dimension.
+///
+/// This is exposed for accelerator configuration validation so unsupported
+/// columns fail dataset registration instead of silently producing a constant
+/// clustering key.
+#[doc(hidden)]
+#[must_use]
+pub fn is_clusterable_type(data_type: &arrow_schema::DataType) -> bool {
+    provider::clustering::is_clusterable(data_type)
 }
 pub mod optimizer_rules;
 #[cfg(feature = "partition-table-provider")]
@@ -82,6 +93,13 @@ pub(crate) mod partition_creator;
 pub(crate) mod partition_naming;
 pub mod provider;
 pub(crate) mod resource_starvation;
+/// Probe and build accounting for a table's secondary indexes (the
+/// acceleration's `indexes`), so a check can prove a query used row selection
+/// rather than silently falling back to an ordinary scan.
+pub mod lookup_index {
+    pub use crate::provider::lookup_index::{LookupIndexCounters, LookupIndexVerification};
+}
+
 pub mod row_converter;
 pub(crate) mod schema;
 pub mod stats;
@@ -105,8 +123,8 @@ pub use provider::{
     CayenneCdcWrite, CayenneContext, CayenneStagedAppend, CayenneStagedUpsert,
     CayenneTableProvider, CayenneTableProviderBuilder, CayenneTransaction, EncodeBudgetSnapshot,
     LastSmallFileCompactPath, PARTITIONED_WAL_DIR, PartitionedWal, PartitionedWalEntry,
-    PreparedOverwrite, PreparedStagedAppend, PreparedTxnCommit, QueryObservations, SlotAdvancer,
-    TimeRetentionFilterBuilder, TransactionCommit, TransactionWriteToken, TxnTable,
+    PreparedOverwrite, PreparedStagedAppend, PreparedTxnCommit, QueryObservations, ScanViewReuse,
+    SlotAdvancer, TimeRetentionFilterBuilder, TransactionCommit, TransactionWriteToken, TxnTable,
     begin_compaction_shutdown, cap_global_encode_concurrency, clear_global_mem_tier_pool_account,
     compaction_budget, compaction_budget_permits, deregister_query_observations,
     drain_compaction_tasks, encode_budget_snapshot, global_mem_tier_pool_account_bytes,

@@ -31,7 +31,7 @@ parking_lot.workspace = true
 pingora-lru = { workspace = true, optional = true }
 snafu.workspace = true
 spicepod = { path = "../spicepod" }
-tokio.workspace = true
+tokio = { workspace = true, features = ["sync"] }
 tracing.workspace = true
 twox-hash = { workspace = true }
 
@@ -54,6 +54,10 @@ name = "cache_throughput"
 [[bench]]
 harness = false
 name = "hash_algorithms"
+
+[[bench]]
+harness = false
+name = "cache_hit_costs"
 
 [lints]
 workspace = true

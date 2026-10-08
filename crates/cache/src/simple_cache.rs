@@ -141,6 +141,29 @@ impl<
         self.cache.insert(*key, value).await;
     }
 
+    async fn replace_if(
+        &self,
+        key: &u64,
+        value: V,
+        should_replace: &(dyn for<'v> Fn(&'v V) -> bool + Send + Sync),
+    ) -> bool {
+        let outcome = self
+            .cache
+            .entry(*key)
+            .and_compute_with(|current| {
+                let replace = current
+                    .as_ref()
+                    .is_some_and(|entry| should_replace(entry.value()));
+                std::future::ready(if replace {
+                    moka::ops::compute::Op::Put(value)
+                } else {
+                    moka::ops::compute::Op::Nop
+                })
+            })
+            .await;
+        matches!(outcome, moka::ops::compute::CompResult::ReplacedWith(_))
+    }
+
     async fn invalidate_all(&self) {
         self.cache.invalidate_all();
         self.cache.run_pending_tasks().await;

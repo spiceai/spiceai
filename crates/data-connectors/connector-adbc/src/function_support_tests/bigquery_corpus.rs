@@ -122,6 +122,8 @@ async fn register_fixture(
     let pool = AdbcConnectionPoolBuilder::new(StubDatabase {
         schemas: Arc::clone(schemas),
         statement_attempts: Arc::clone(statement_attempts),
+        batches: None,
+        submitted_sql: Arc::default(),
     })
     .with_max_size(Some(1))
     .with_min_idle(Some(0))

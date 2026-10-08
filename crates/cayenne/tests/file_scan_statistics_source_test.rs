@@ -275,6 +275,7 @@ async fn a_blob_without_byte_sizes_is_re_inferred_from_its_footer(
     let stored_schema = table.schema();
     let seeded_stats = cayenne::stats::file_statistics_to_df(
         &cayenne::stats::deserialize_file_statistics(&seeded.statistics_blob, &stored_schema)?,
+        &stored_schema,
         seeded.num_rows,
     );
     assert_eq!(
@@ -313,6 +314,7 @@ async fn a_blob_without_byte_sizes_is_re_inferred_from_its_footer(
             .expect("seeded row is still present");
         let stats = cayenne::stats::file_statistics_to_df(
             &cayenne::stats::deserialize_file_statistics(&row.statistics_blob, &stored_schema)?,
+            &stored_schema,
             row.num_rows,
         );
         if stats.total_byte_size != Precision::Absent {

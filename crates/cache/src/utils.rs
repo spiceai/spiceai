@@ -1398,8 +1398,9 @@ pub(crate) mod tests {
         );
 
         // Build a batch of highly compressible data (repeated zeros) whose
-        // uncompressed memory size exceeds the 2 KiB cache limit but compresses
-        // well under zstd.
+        // uncompressed memory size exceeds the 2 KiB cache limit. The store
+        // path encodes it, so the entry it writes is the compressed one and
+        // fits (see #8508).
         let schema = Arc::new(Schema::new(vec![
             Field::new("a", DataType::Int32, false),
             Field::new("b", DataType::Int32, false),
@@ -1415,7 +1416,6 @@ pub(crate) mod tests {
             raw_size > cache_max,
             "Test precondition: raw size ({raw_size}) must exceed cache max ({cache_max})"
         );
-
         let raw_cache_key = crate::key::CacheKey::Query("zstd-compressible", None)
             .as_raw_key(cache_provider.hasher());
         let stream = Box::pin(RecordBatchStreamAdapter::new(
@@ -1456,12 +1456,11 @@ pub(crate) mod tests {
         assert_eq!(cached_batches[0].num_rows(), n);
     }
 
-    /// Regression test: with an encoder, accumulation must continue past the
-    /// raw cache limit across **multiple batches**. Previously accumulation
-    /// stopped at the limit while the encoded write still proceeded, caching a
-    /// prefix of the result set that would then be served as a complete result.
+    /// Array bytes can sit under `max_size` while [`CachedQueryResult::memory_size`]
+    /// does not. The store path must still encode those under zstd (#8508 weigher
+    /// boundary).
     #[tokio::test]
-    async fn test_encoded_multi_batch_result_cached_in_full() {
+    async fn test_encoded_result_cached_when_weigher_exceeds_max_size() {
         use arrow::array::{Array, Int32Array};
         use datafusion::error::DataFusionError;
         use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
@@ -1481,13 +1480,106 @@ pub(crate) mod tests {
             .expect("valid cache provider"),
         );
 
-        // Two compressible batches, each alone larger than the 2 KiB cache
-        // limit, so the raw limit is crossed before the second batch arrives.
         let schema = Arc::new(Schema::new(vec![
             Field::new("a", DataType::Int32, false),
             Field::new("b", DataType::Int32, false),
         ]));
-        let n = 300; // 300 rows × 2 cols × 4 bytes = 2400 bytes raw > 2048 limit
+        let n = 200; // 200 rows × 2 cols × 4 bytes = 1600 array bytes < 2048
+        let col: Arc<dyn Array> = Arc::new(Int32Array::from(vec![0i32; n]));
+        let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::clone(&col), col])
+            .expect("to create batch");
+
+        let raw_size = batch.get_array_memory_size();
+        let cache_max = usize::try_from(cache_provider.max_size()).unwrap_or(usize::MAX);
+        assert!(
+            raw_size <= cache_max,
+            "Test precondition: array bytes ({raw_size}) must sit under cache max ({cache_max})"
+        );
+        let raw_entry = crate::result::query::CachedQueryResult::new_raw(
+            vec![batch.clone()],
+            Arc::clone(&schema),
+            Arc::new(HashSet::new()),
+            std::time::Instant::now(),
+            std::time::Instant::now(),
+        );
+        assert!(
+            raw_entry.get_memory_size() > cache_max,
+            "Test precondition: weigher ({}) must exceed cache max ({cache_max})",
+            raw_entry.get_memory_size()
+        );
+
+        let raw_cache_key = crate::key::CacheKey::Query("zstd-weigher-boundary", None)
+            .as_raw_key(cache_provider.hasher());
+        let stream = Box::pin(RecordBatchStreamAdapter::new(
+            Arc::clone(&schema),
+            futures::stream::iter(vec![Ok::<RecordBatch, DataFusionError>(batch)]),
+        ));
+
+        let cached_stream = to_cached_record_batch_stream(
+            Arc::clone(&cache_provider),
+            stream,
+            raw_cache_key,
+            Arc::new(HashSet::from(["test_table".into()])),
+            std::time::Instant::now(),
+        );
+
+        let _output = cached_stream
+            .try_collect::<Vec<_>>()
+            .await
+            .expect("stream should be collected successfully");
+
+        let cached = cache_provider
+            .get_raw_key(&raw_cache_key)
+            .await
+            .expect("cache lookup should succeed");
+        assert!(
+            cached.is_some(),
+            "Compressed result should be cached when array bytes fit but the weigher does not"
+        );
+        let cached = cached.expect("must be Some");
+        assert!(
+            cached.is_encoded(),
+            "the stored entry must be encoded so the weigher can admit it"
+        );
+        let cached_batches = cached.records().await.expect("cached result should decode");
+        assert_eq!(cached_batches.len(), 1);
+        assert_eq!(cached_batches[0].num_rows(), n);
+    }
+
+    /// Regression test: with an encoder, accumulation must continue past the
+    /// raw cache limit across **multiple batches**. Previously accumulation
+    /// stopped at the limit while the encoded write still proceeded, caching a
+    /// prefix of the result set that would then be served as a complete result.
+    #[tokio::test]
+    async fn test_encoded_multi_batch_result_cached_in_full() {
+        use arrow::array::{Array, Int32Array};
+        use datafusion::error::DataFusionError;
+        use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
+        use futures::TryStreamExt;
+        use spicepod::component::caching::SQLResultsCacheConfig;
+
+        let cache_provider = Arc::new(
+            crate::QueryResultsCacheProvider::try_new(
+                &SQLResultsCacheConfig {
+                    item_ttl: Some("10m".to_string()),
+                    max_size: Some("4KiB".to_string()),
+                    encoding: spicepod::component::caching::Encoding::Zstd,
+                    ..Default::default()
+                },
+                Box::new([]),
+            )
+            .expect("valid cache provider"),
+        );
+
+        // Two compressible batches, each alone larger than the 4 KiB cache
+        // limit and the raw-store budget, so the pair is encoded rather than
+        // stored raw (which would not fit). The 4 KiB budget keeps
+        // 16 × 4 KiB above the pair's raw size so accumulation is not abandoned.
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Int32, false),
+        ]));
+        let n = 2_500; // 2500 rows × 2 cols × 4 bytes = 20_000 bytes raw per batch
         let make_batch = || {
             let col: Arc<dyn Array> = Arc::new(Int32Array::from(vec![0i32; n]));
             RecordBatch::try_new(Arc::clone(&schema), vec![Arc::clone(&col), col])
@@ -1524,7 +1616,7 @@ pub(crate) mod tests {
             .expect("compressed multi-batch result should be cached");
 
         let cached_batches = cached.records().await.expect("cached result should decode");
-        let cached_rows: usize = cached_batches.iter().map(RecordBatch::num_rows).sum();
+        let cached_rows: usize = cached_batches.iter().map(|b| b.num_rows()).sum();
         assert_eq!(
             cached_rows,
             2 * n,

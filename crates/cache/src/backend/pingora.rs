@@ -371,6 +371,52 @@ impl<V> CacheBackend<V> for PingoraBackend<V>
 where
     V: Sizeable + CacheMetrics + Clone + Send + Sync + 'static,
 {
+    async fn replace_if(
+        &self,
+        key: u64,
+        value: V,
+        should_replace: &(dyn for<'v> Fn(&'v V) -> bool + Send + Sync),
+    ) -> bool {
+        let shard_idx = Self::get_shard_index(key);
+        let replaced;
+        {
+            // Same hold as `insert`/`get`: the value and its metadata stay
+            // paired, and a concurrent writer cannot land between the remove
+            // and the re-admit. Expiry is copied, not refreshed — this is a
+            // reweigh of the resident entry, not a new store.
+            let mut shard = self.metadata_shards[shard_idx].write();
+            let Some(meta) = shard.get(&key).copied() else {
+                return false;
+            };
+            if Instant::now() >= meta.expires_at {
+                return false;
+            }
+            let Some((entry, old_weight)) = self.cache.remove(key) else {
+                shard.remove(&key);
+                return false;
+            };
+            if should_replace(&entry.value) {
+                let weight = value.get_memory_size();
+                let expires_at = if value.keep_remaining_ttl() {
+                    meta.expires_at
+                } else {
+                    Instant::now() + self.ttl
+                };
+                self.cache.admit(key, KeyedValue { key, value }, weight);
+                shard.insert(key, KeyMetadata { expires_at });
+                replaced = true;
+            } else {
+                self.cache.admit(key, entry, old_weight);
+                shard.insert(key, meta);
+                replaced = false;
+            }
+        }
+        if replaced {
+            self.evict_to_weight_limit();
+        }
+        replaced
+    }
+
     async fn insert(&self, key: u64, value: V) {
         // Calculate weight for the value
         let weight = value.get_memory_size();
@@ -546,6 +592,7 @@ mod tests {
     struct TestValue {
         data: String,
         size: usize,
+        keep_ttl: bool,
     }
 
     impl TestValue {
@@ -554,6 +601,7 @@ mod tests {
             Self {
                 data: data.to_string(),
                 size,
+                keep_ttl: false,
             }
         }
 
@@ -561,13 +609,23 @@ mod tests {
             Self {
                 data: data.to_string(),
                 size,
+                keep_ttl: false,
             }
+        }
+
+        fn keeping_ttl(mut self) -> Self {
+            self.keep_ttl = true;
+            self
         }
     }
 
     impl Sizeable for TestValue {
         fn get_memory_size(&self) -> usize {
             self.size
+        }
+
+        fn keep_remaining_ttl(&self) -> bool {
+            self.keep_ttl
         }
     }
 
@@ -698,6 +756,77 @@ mod tests {
         // Weight should reflect only the new value, not accumulated
         assert_eq!(weight_after_first, 100);
         assert_eq!(weight_after_second, 500);
+    }
+
+    #[tokio::test]
+    async fn replace_if_updates_value_and_weight_when_predicate_matches() {
+        let backend = create_backend(1024, 60);
+        let key = 1u64;
+        backend
+            .insert(key, TestValue::with_size("small", 100))
+            .await;
+
+        let replaced = backend
+            .replace_if(key, TestValue::with_size("large", 500), &|_| true)
+            .await;
+
+        assert!(replaced, "predicate matched, so the value must be replaced");
+        assert_eq!(
+            backend.get(&key).await,
+            Some(TestValue::with_size("large", 500))
+        );
+        assert_eq!(
+            backend.weighted_size().await,
+            500,
+            "the weigher must bill the replacement"
+        );
+    }
+
+    #[tokio::test]
+    async fn replace_if_leaves_the_entry_when_predicate_rejects() {
+        let backend = create_backend(1024, 60);
+        let key = 1u64;
+        backend.insert(key, TestValue::new("original")).await;
+
+        let replaced = backend
+            .replace_if(key, TestValue::new("updated"), &|_| false)
+            .await;
+
+        assert!(!replaced);
+        assert_eq!(backend.get(&key).await, Some(TestValue::new("original")));
+    }
+
+    #[tokio::test]
+    async fn replace_if_keeps_expiry_when_the_value_asks() {
+        let backend = create_backend(1024, 60);
+        let key = 7u64;
+        backend.insert(key, TestValue::new("encoded")).await;
+
+        let shard_idx = PingoraBackend::<TestValue>::get_shard_index(key);
+        let expires_at = {
+            let shard = backend.metadata_shards[shard_idx].read();
+            shard.get(&key).expect("metadata").expires_at
+        };
+
+        let replaced = backend
+            .replace_if(key, TestValue::new("raw").keeping_ttl(), &|current| {
+                current.data == "encoded"
+            })
+            .await;
+        assert!(replaced);
+
+        let expires_after = {
+            let shard = backend.metadata_shards[shard_idx].read();
+            shard.get(&key).expect("metadata").expires_at
+        };
+        assert_eq!(
+            expires_at, expires_after,
+            "a promotion must not restart TTL"
+        );
+        assert_eq!(
+            backend.get(&key).await,
+            Some(TestValue::new("raw").keeping_ttl())
+        );
     }
 
     #[tokio::test]

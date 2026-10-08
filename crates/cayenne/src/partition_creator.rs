@@ -38,7 +38,7 @@ use runtime_table_partition::expression::PartitionedBy;
 use snafu::ResultExt as _;
 
 use crate::{
-    CayenneContext, CayenneTableProviderBuilder, MetadataCatalog, PartitionMetadata,
+    CayenneContext, CayenneTableProviderBuilder, MetadataCatalog, PartitionMetadata, ScanViewReuse,
     TimeRetentionFilterBuilder, metadata,
 };
 
@@ -77,6 +77,10 @@ pub struct CayennePartitionCreator {
     compaction_semaphore: Option<Arc<tokio::sync::Semaphore>>,
     /// See [`PartitionCreator::accepts_direct_partition_writes`].
     accepts_direct_partition_writes: bool,
+    /// Scan-view reuse inherited from the parent dataset (read-only `changes` =
+    /// timed lag, otherwise invalidate on write).
+    scan_view_reuse: ScanViewReuse,
+    secondary_indexes: Vec<Vec<String>>,
 }
 
 impl std::fmt::Debug for CayennePartitionCreator {
@@ -150,6 +154,8 @@ impl CayennePartitionCreator {
             context,
             compaction_semaphore: None,
             accepts_direct_partition_writes: false,
+            scan_view_reuse: ScanViewReuse::UntilInvalidated,
+            secondary_indexes: Vec::new(),
         }
     }
 
@@ -170,8 +176,41 @@ impl CayennePartitionCreator {
         self
     }
 
+    /// Inherit the parent dataset's [`ScanViewReuse`].
+    #[must_use]
+    pub fn with_scan_view_reuse(mut self, reuse: ScanViewReuse) -> Self {
+        self.scan_view_reuse = reuse;
+        self
+    }
+
+    /// Maintain the parent dataset's secondary indexes in every partition. See
+    /// [`crate::CayenneTableProviderBuilder::with_secondary_indexes`].
+    #[must_use]
+    pub fn with_secondary_indexes(mut self, indexes: Vec<Vec<String>>) -> Self {
+        self.secondary_indexes = indexes;
+        self
+    }
+
     /// Wire a freshly opened partition provider into the shared caches and, when
     /// the creating engine runs one, the shared compaction budget.
+    fn partition_table_builder(&self) -> CayenneTableProviderBuilder {
+        let mut builder = CayenneTableProviderBuilder::new(
+            Arc::clone(&self.catalog),
+            Arc::clone(self.context.runtime_env()),
+        )
+        .with_context(Arc::clone(&self.context))
+        .with_retention_filters(self.retention_filters.clone())
+        .with_scan_view_reuse(self.scan_view_reuse)
+        .with_secondary_indexes(self.secondary_indexes.clone());
+        if let Some(ref rb) = self.time_retention_filter_builder {
+            builder = builder.with_time_retention_filter_builder(rb.clone());
+        }
+        if let Some(ref os) = self.object_store_config {
+            builder = builder.with_object_store(os.clone());
+        }
+        builder
+    }
+
     fn init_partition_provider(&self, provider: &Arc<crate::CayenneTableProvider>) {
         if let Some(semaphore) = &self.compaction_semaphore {
             provider.spawn_background_compaction(Arc::clone(semaphore));
@@ -318,19 +357,8 @@ impl PartitionCreator for CayennePartitionCreator {
             vortex_config: self.vortex_config.clone(),
         };
 
-        let mut builder = CayenneTableProviderBuilder::new(
-            Arc::clone(&self.catalog),
-            Arc::clone(self.context.runtime_env()),
-        )
-        .with_context(Arc::clone(&self.context))
-        .with_retention_filters(self.retention_filters.clone());
-        if let Some(ref rb) = self.time_retention_filter_builder {
-            builder = builder.with_time_retention_filter_builder(rb.clone());
-        }
-        if let Some(ref os) = self.object_store_config {
-            builder = builder.with_object_store(os.clone());
-        }
-        let cayenne_table = builder
+        let cayenne_table = self
+            .partition_table_builder()
             .create(table_options)
             .await
             .boxed()
@@ -379,39 +407,18 @@ impl PartitionCreator for CayennePartitionCreator {
             let partition_key = partition_meta.composite_key();
             let partition_table_name = self.partition_table_name(&partition_key);
 
-            let mut builder = CayenneTableProviderBuilder::new(
-                Arc::clone(&self.catalog),
-                Arc::clone(self.context.runtime_env()),
-            )
-            .with_context(Arc::clone(&self.context))
-            .with_retention_filters(self.retention_filters.clone());
-            if let Some(ref rb) = self.time_retention_filter_builder {
-                builder = builder.with_time_retention_filter_builder(rb.clone());
-            }
-            if let Some(ref os) = self.object_store_config {
-                builder = builder.with_object_store(os.clone());
-            }
-            let cayenne_table = match builder.open(&partition_table_name).await {
+            let cayenne_table = match self
+                .partition_table_builder()
+                .open(&partition_table_name)
+                .await
+            {
                 Ok(table) => table,
                 Err(crate::provider::Error::Catalog {
                     source: crate::catalog::CatalogError::TableNotFound { .. },
                 }) => {
                     let legacy_name =
                         self.legacy_partition_table_name(&partition_meta.partition_values);
-                    let mut legacy_builder = CayenneTableProviderBuilder::new(
-                        Arc::clone(&self.catalog),
-                        Arc::clone(self.context.runtime_env()),
-                    )
-                    .with_context(Arc::clone(&self.context))
-                    .with_retention_filters(self.retention_filters.clone());
-                    if let Some(ref rb) = self.time_retention_filter_builder {
-                        legacy_builder =
-                            legacy_builder.with_time_retention_filter_builder(rb.clone());
-                    }
-                    if let Some(ref os) = self.object_store_config {
-                        legacy_builder = legacy_builder.with_object_store(os.clone());
-                    }
-                    legacy_builder
+                    self.partition_table_builder()
                         .open(&legacy_name)
                         .await
                         .boxed()

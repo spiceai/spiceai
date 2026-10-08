@@ -3,7 +3,7 @@ additionalLabels: {}
 
 image:
   repository: spiceai/spiceai
-  tag: 2.3.1
+  tag: 2.3.2
 replicaCount: 1
 
 # Update strategy for the Deployment (used when stateful.enabled is false).

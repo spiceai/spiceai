@@ -4,6 +4,7 @@
 //! Persistent implementation of a Vortex table provider.
 mod access_plan;
 mod cache;
+mod write_observer;
 pub use cache::synthetic_object_meta;
 mod deferred_projection;
 mod format;
@@ -27,6 +28,7 @@ pub use segment_cache::{
     register_segment_cache_metrics,
 };
 pub use source::VortexSource;
+pub use write_observer::VortexWriteObserver;
 
 #[cfg(test)]
 mod tests {

@@ -1220,6 +1220,7 @@ impl Https {
             file_format,
             acceleration_enabled,
         )
+        .with_table_reference(dataset.name.clone())
         .with_max_retries(max_retries)
         .with_backoff_method(backoff_method)
         .with_max_retry_duration(max_retry_duration)

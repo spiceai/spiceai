@@ -30,7 +30,9 @@ static QUERY_COUNT: LazyLock<Counter<u64>> = LazyLock::new(|| {
 });
 
 pub fn track_query_count(dimensions: &[KeyValue]) {
-    telemetry::track_query_count(&without_anonymous_excluded(dimensions));
+    if let Some(anonymous) = anonymous_dimensions(dimensions) {
+        telemetry::track_query_count(&anonymous);
+    }
     QUERY_COUNT.add(1, dimensions);
 }
 
@@ -106,7 +108,9 @@ static QUERY_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| {
 });
 
 pub fn track_query_duration(duration: Duration, dimensions: &[KeyValue]) {
-    telemetry::track_query_duration(duration, &without_anonymous_excluded(dimensions));
+    if let Some(anonymous) = anonymous_dimensions(dimensions) {
+        telemetry::track_query_duration(duration, &anonymous);
+    }
     QUERY_DURATION_MS.record(duration.as_secs_f64() * 1000.0, dimensions);
 }
 
@@ -122,7 +126,9 @@ static QUERY_EXECUTION_DURATION_MS: LazyLock<Histogram<f64>> = LazyLock::new(|| 
 });
 
 pub fn track_query_execution_duration(duration: Duration, dimensions: &[KeyValue]) {
-    telemetry::track_query_execution_duration(duration, &without_anonymous_excluded(dimensions));
+    if let Some(anonymous) = anonymous_dimensions(dimensions) {
+        telemetry::track_query_execution_duration(duration, &anonymous);
+    }
     QUERY_EXECUTION_DURATION_MS.record(duration.as_secs_f64() * 1000.0, dimensions);
 }
 
@@ -142,6 +148,35 @@ fn without_anonymous_excluded(dimensions: &[KeyValue]) -> Vec<KeyValue> {
         .filter(|kv| !ANONYMOUS_TELEMETRY_EXCLUDED_KEYS.contains(&kv.key.as_str()))
         .cloned()
         .collect()
+}
+
+/// The dimensions the anonymous telemetry meter records, or `None` when that meter
+/// is not installed and would record nothing.
+fn anonymous_dimensions(dimensions: &[KeyValue]) -> Option<Vec<KeyValue>> {
+    telemetry::meter::METER
+        .get()
+        .map(|_| without_anonymous_excluded(dimensions))
+}
+
+/// Records a finished query's count, total duration, and execution duration under
+/// one set of `dimensions`.
+///
+/// The three always go together, so the anonymous telemetry copy of the dimensions
+/// is built once for all three — or not at all when that meter is absent — rather
+/// than once per instrument on every query.
+pub fn track_query_finished(
+    duration: Duration,
+    execution_duration: Duration,
+    dimensions: &[KeyValue],
+) {
+    if let Some(anonymous) = anonymous_dimensions(dimensions) {
+        telemetry::track_query_count(&anonymous);
+        telemetry::track_query_duration(duration, &anonymous);
+        telemetry::track_query_execution_duration(execution_duration, &anonymous);
+    }
+    QUERY_COUNT.add(1, dimensions);
+    QUERY_DURATION_MS.record(duration.as_secs_f64() * 1000.0, dimensions);
+    QUERY_EXECUTION_DURATION_MS.record(execution_duration.as_secs_f64() * 1000.0, dimensions);
 }
 
 static AI_INFERENCES_WITH_SPICE_COUNT: LazyLock<Counter<u64>> = LazyLock::new(|| {

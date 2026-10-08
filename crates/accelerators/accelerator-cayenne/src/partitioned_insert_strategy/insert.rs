@@ -56,7 +56,9 @@ use super::{
 ///    partition key. For each unique key seen, spawn a writer task that
 ///    streams batches into `CayenneTableProvider::begin_overwrite`, which
 ///    writes data into a fresh `<table_id>/<new_snapshot>/` directory and
-///    returns a [`PreparedOverwrite`] receipt.
+///    returns a [`PreparedOverwrite`] receipt. Every existing partition the
+///    input never reached — all of them, for an empty input — gets an empty
+///    overwrite, because an overwrite replaces the whole table.
 /// 2. **Apply** (single shared transaction): open one transaction on the
 ///    shared [`CayenneCatalog`]. For every receipt, call
 ///    `PreparedOverwrite::apply_in_txn` inside that transaction. Commit
@@ -163,6 +165,39 @@ impl DataSink for CayennePartitionedOverwriteSink {
                     // cause, not a placeholder.
                     fanout_failure = Some(WriteFanoutFailure::WriterChannelClosed);
                     break 'outer;
+                }
+            }
+        }
+
+        // An overwrite replaces the WHOLE table, so a partition the new data
+        // never reached must be emptied too — otherwise its previous rows stay
+        // visible after the refresh. That includes every partition when the
+        // input is empty. Stage an empty overwrite for each one, committed in the
+        // same transaction as the partitions that received rows.
+        if fanout_failure.is_none() {
+            let unreached: Vec<Vec<ScalarValue>> = {
+                let partitions = self.partitions.read().await;
+                partitions
+                    .iter()
+                    .filter(|(key, _)| !senders.contains_key(key.as_str()))
+                    .map(|(_, partition)| partition.partition_values.clone())
+                    .collect()
+            };
+            for partition_values in unreached {
+                match self
+                    .prepare_new_provider_for_partition(partition_values, target_partitions)
+                    .await
+                {
+                    Ok((handle, sender)) => {
+                        // No rows: closing the channel ends the writer's input,
+                        // so it stages an empty snapshot for the partition.
+                        drop(sender);
+                        handles.push(handle);
+                    }
+                    Err(err) => {
+                        fanout_failure = Some(WriteFanoutFailure::Upstream(err));
+                        break;
+                    }
                 }
             }
         }

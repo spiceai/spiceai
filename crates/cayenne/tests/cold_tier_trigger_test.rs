@@ -129,7 +129,7 @@ async fn create_table(
         partition_column: None,
         vortex_config: VortexConfig {
             cold_tier_location: Some(format!("file://{}", cold_dir.to_string_lossy())),
-            cold_clustering_columns: vec!["id".to_string()],
+            cluster_by: vec!["id".to_string()],
             ..vortex_config
         },
     };

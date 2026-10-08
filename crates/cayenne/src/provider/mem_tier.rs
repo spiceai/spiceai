@@ -321,6 +321,11 @@ pub(crate) struct MemSegment {
     /// single-shard path keeps using `MemTier::epoch` as the slot-ack currency, so
     /// behavior is byte-identical) and for the position-based / non-sharded append.
     pub(crate) source_position: Option<u64>,
+    /// The segment's secondary indexes, one per batch, when the table declares
+    /// `indexes` in memory mode. Carried with the segment into every tier version
+    /// that keeps it, so a scan's captured tier always has the index matching
+    /// its batches.
+    pub(crate) index: Option<Arc<crate::provider::mem_tier_index::SegmentIndex>>,
 }
 
 /// Exact per-column min/max over a segment's batches, for predicate pruning.
@@ -445,6 +450,7 @@ impl MemTier {
             incoming_rows,
             superseded,
             None,
+            None,
         )
     }
 
@@ -453,6 +459,7 @@ impl MemTier {
     /// `None` (the single-shard path keeps `MemTier::epoch` as the slot-ack axis,
     /// byte-identical). At N>1 every shard append of one apply passes the SAME
     /// value so the checkpoint reconciles cross-shard durable coverage on one axis.
+    /// `index` is the new segment's secondary index, built off the publish lock.
     #[must_use]
     #[expect(clippy::too_many_arguments)]
     pub(crate) fn append_segment_with_source_position(
@@ -464,6 +471,7 @@ impl MemTier {
         incoming_rows: u64,
         superseded: u64,
         source_position: Option<u64>,
+        index: Option<Arc<crate::provider::mem_tier_index::SegmentIndex>>,
     ) -> Self {
         let statistics = segment_statistics(batches.as_ref());
 
@@ -486,6 +494,7 @@ impl MemTier {
             rows: incoming_rows,
             superseded,
             source_position,
+            index,
         });
 
         Self {
@@ -539,7 +548,8 @@ impl MemTier {
     ///
     /// A segment that loses no row keeps its `Arc`s verbatim — no statistics
     /// recompute and no batch copy — so a predicate matching a few segments costs
-    /// nothing on the rest.
+    /// nothing on the rest. Within a segment that does, a batch that loses no row
+    /// keeps its secondary index, and `reindex` indexes each batch that does.
     ///
     /// A segment that does lose rows has its statistics RECOMPUTED rather than
     /// inherited, and neither way of inheriting them works. Kept `Exact`, an
@@ -554,6 +564,9 @@ impl MemTier {
     pub(crate) fn retain_rows(
         &self,
         mut keep_batch: impl FnMut(&RecordBatch, i64) -> datafusion_common::Result<RecordBatch>,
+        mut reindex: impl FnMut(
+            &RecordBatch,
+        ) -> Option<Arc<crate::provider::mem_tier_index::BatchIndex>>,
     ) -> datafusion_common::Result<(Self, u64)> {
         let mut segments: Vec<MemSegment> = Vec::with_capacity(self.segments.len());
         let mut removed_rows: u64 = 0;
@@ -562,12 +575,21 @@ impl MemTier {
 
         for segment in self.segments.iter() {
             let mut kept: Vec<RecordBatch> = Vec::with_capacity(segment.batches.len());
+            let mut kept_indexes = Vec::with_capacity(segment.batches.len());
             let mut segment_removed = 0u64;
-            for batch in segment.batches.iter() {
+            for (position, batch) in segment.batches.iter().enumerate() {
                 let before = batch.num_rows() as u64;
                 let batch = keep_batch(batch, segment.data_sequence)?;
-                segment_removed = segment_removed.saturating_add(before - batch.num_rows() as u64);
+                let batch_removed = before - batch.num_rows() as u64;
+                segment_removed = segment_removed.saturating_add(batch_removed);
                 if batch.num_rows() > 0 {
+                    if let Some(index) = &segment.index {
+                        kept_indexes.push(if batch_removed == 0 {
+                            index.batch(position)
+                        } else {
+                            reindex(&batch)
+                        });
+                    }
                     kept.push(batch);
                 }
             }
@@ -601,6 +623,11 @@ impl MemTier {
                 rows: segment_rows,
                 superseded: segment.superseded,
                 source_position: segment.source_position,
+                index: segment.index.as_ref().map(|_| {
+                    Arc::new(crate::provider::mem_tier_index::SegmentIndex::from_batches(
+                        kept_indexes,
+                    ))
+                }),
             });
         }
 

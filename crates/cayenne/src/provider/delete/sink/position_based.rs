@@ -916,6 +916,7 @@ impl CayenneDeletionSink {
         updated_map.extend(cache_updates);
         cached_deleted_row_ids.store(Arc::new(updated_map));
         self.refresh_deletion_memory_accounting();
+        self.notify_scan_input_change();
 
         // Return count of NEW deletions
         convert_to_u64_box(new_deletion_count, "new deletion count").map_err(|e| Error::Internal {

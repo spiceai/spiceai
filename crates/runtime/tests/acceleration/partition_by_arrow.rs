@@ -407,3 +407,100 @@ async fn test_arrow_partition_hash_index_and_sort_columns() -> Result<(), anyhow
         })
         .await
 }
+
+/// A full refresh replaces the whole partitioned table: rows the source no longer
+/// returns must disappear from every bucket, including buckets the new data never
+/// reaches and every bucket when the source returns nothing.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_arrow_partition_by_full_refresh_removes_rows_missing_from_source()
+-> Result<(), anyhow::Error> {
+    use std::sync::atomic::{AtomicI64, Ordering};
+    use std::time::Duration;
+
+    use datafusion::sql::TableReference;
+    use runtime::accelerated::refresh::RefreshOverrides;
+    use runtime::component::dataset::acceleration::RefreshMode as OverrideRefreshMode;
+
+    use crate::acceleration::row_count;
+    use crate::utils::wait_until_true;
+
+    const TABLE: &str = "arrow_bucket_shrink_test";
+
+    let _tracing = crate::init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let test_file = std::env::current_dir()
+                .map_err(|e| anyhow::anyhow!("Failed to get current directory: {e}"))?
+                .join("tests/acceleration/data/partition_test.csv");
+
+            crate::configure_test_datafusion();
+
+            let dataset = make_dataset(
+                TABLE,
+                &test_file,
+                vec![PartitionedBy {
+                    name: "expr0".to_string(),
+                    expression: "bucket(3, id)".to_string(),
+                }],
+                HashMap::new(),
+                None,
+            );
+            let app = AppBuilder::new("test_arrow_partition_by_full_refresh_shrink")
+                .with_dataset(dataset)
+                .build();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            tokio::select! {
+                () = tokio::time::sleep(Duration::from_secs(30)) => {
+                    return Err(anyhow::Error::msg("Timeout waiting for components to load"));
+                }
+                () = Arc::clone(&rt).load_components() => {}
+            }
+            runtime_ready_check(&rt).await;
+            assert_eq!(row_count(&rt, TABLE).await?, 10, "initial load");
+
+            for (refresh_sql, expected) in [
+                // One row: at most one of the three buckets receives data.
+                (format!("SELECT * FROM {TABLE} WHERE id = 1"), 1),
+                // No rows: every bucket must be emptied.
+                (format!("SELECT * FROM {TABLE} WHERE id > 1000"), 0),
+            ] {
+                rt.datafusion()
+                    .refresh_table(
+                        &TableReference::from(TABLE),
+                        Some(RefreshOverrides {
+                            sql: Some(refresh_sql.clone()),
+                            mode: Some(OverrideRefreshMode::Full),
+                            max_jitter: None,
+                        }),
+                    )
+                    .await
+                    .map_err(|e| anyhow::anyhow!("refresh_table failed: {e}"))?;
+
+                let last = Arc::new(AtomicI64::new(i64::MIN));
+                let converged = wait_until_true(Duration::from_secs(30), || {
+                    let rt = Arc::clone(&rt);
+                    let last = Arc::clone(&last);
+                    async move {
+                        match row_count(&rt, TABLE).await {
+                            Ok(observed) => {
+                                last.store(observed, Ordering::Relaxed);
+                                observed == expected
+                            }
+                            Err(_) => false,
+                        }
+                    }
+                })
+                .await;
+                assert!(
+                    converged,
+                    "after refreshing with `{refresh_sql}` the table should hold {expected} rows, \
+                     last observed {}",
+                    last.load(Ordering::Relaxed)
+                );
+            }
+
+            Ok(())
+        })
+        .await
+}

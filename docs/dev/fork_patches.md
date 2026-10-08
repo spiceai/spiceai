@@ -105,17 +105,17 @@ own section below — a count here would be one more thing to keep true by hand.
 | [datafusion-ballista](#datafusion-ballista) | `f3b8c4b49d251cb5f1326b69fe4846dc09d36ac0` | `spiceai-54` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `3af703dba0accdff5fdb0ae92ef12588e1dfe88a` | `spiceai-54` |
 | [datafusion-functions-json](#datafusion-functions-json) | `ca9d4c6e5a0de3bfa9fe20a683a9f7d58e36e2cc` | `spiceai-54` |
-| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `ae32853c9b122ac3e48d6fa87c740113379c0aa3` | `spiceai-54` |
+| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `b10ae96a0ad1c16a6d138d7aaa491b6ddbc12a91` | `spiceai-54` |
 | [delta-kernel-rs](#delta-kernel-rs) | `714d64fd5369efc4835109be0fd718db5a3be0aa` | `spiceai-0.23.0` |
 | [docx-rs](#docx-rs) | `2a85dce57d0128e2cd7c369545516c347cb8c529` | `spiceai` |
-| [duckdb-rs](#duckdb-rs) | `9d7be742f060d70066fc041319af787772716e0d` | `spiceai-1.4.4` |
+| [duckdb-rs](#duckdb-rs) | `76655d2ffc1b1e4dfc886de561759b70ead48b96` | `spiceai-1.4.4` |
 | [graph-rs-sdk](#graph-rs-sdk) | `af383410a9c86915263fbd1145b8becfc1e317b5` | `spiceai` |
 | [iceberg-rust](#iceberg-rust) | `351d1bc7b6ac9a835397e248e9c687f305e947d1` | `spiceai-0.10.1-df-54` |
 | [mistral.rs](#mistralrs-and-text-embeddings-inference) | `2d15d171236803481d582a9fbf8a80869bf74d8c` | `spiceai` |
 | [model2vec-rs](#model2vec-rs) | `55fef28a3556895b20204634b788f7c836b610bc` | `spiceai` |
 | [reqwest-eventsource](#dependency-only-forks) | `eb11e695128ce264bf05e4220ce2311c25992c73` | `spiceai` |
 | [rusqlite](#rusqlite-and-tokio-rusqlite) | `e39c9c46dea1f0983cd8d87dabb69b41c9efe1fd` | `master` |
-| [sea-query](#sea-query) | `213b6b876068f58159ebdd5852604a021afaebf9` | `spiceai` |
+| [sea-query](#sea-query) | `ae75baef819513fb8d19af014972dcfa324e201a` | `spiceai` |
 | [snowflake-rs](#snowflake-rs) | `744ffd77fe82171a805562ce001a341a94d52541` | `spiceai-58` |
 | [spark-connect-rs](#spark-connect-rs) | `5f7c2452d4202d7496abac0a6f2eaa4bef46a5ad` | `spiceai` |
 | [text-embeddings-inference](#mistralrs-and-text-embeddings-inference) | `ac4e457936bc11c9b4fee453f2be33133d3146d8` | `spiceai` |
@@ -305,6 +305,7 @@ silently disabled optimization rather than a build failure:
 | Date literal rendered in the unit and width the type calls for (fork PR #60) | `Date32` literals overflow `i32` past 2038 and `Date64` literals render as if milliseconds were days, so a federated filter or join on a date column matches the wrong rows ([#13476](https://github.com/spiceai/spiceai/issues/13476)) | silent | `crates/search/src/index/duckdb/sql.rs::a_date32_literal_outside_the_i32_second_range_names_the_day_it_holds` and `::a_date64_literal_is_read_as_milliseconds_not_as_days`, with `::a_date32_literal_inside_the_i32_second_range_renders_unchanged` as the control against a renderer that declines or shifts every date. The scaling the patch fixes is shared by every engine arm — only the call it is formatted into differs — so a revert fails those three whichever engine renders; `::the_sqlite_arm_renders_a_date_from_the_same_count` pins the sibling arm directly, because this repository renders through that function for DuckDB alone |
 | `DuckDBTable` carries its index list onto the `DuckSqlExec` it builds (fork PR #69) | `DuckDBIntermediateIndexMaterialization` reads that list off the exec node and returns the plan untouched when it is empty, so a DuckDB accelerator declaring `indexes` stops materializing the indexed filters into a CTE and every such query goes back to scanning the whole table. The field has twice survived a refactor that defaulted it to empty, which is why it has a row | silent (perf) | `crates/datafusion-optimizer-rules/src/physical_plan/duckdb/intermediate_index_cte.rs::tests::a_tables_indexes_reach_the_rule_through_the_exec_node`, which plans a filtered scan off a `DuckDBTable` built with an index and asserts the rule rewrites it. Needs `--features duckdb`. The neighbouring `test_rewrite_statement` passes either way — it hands `rewrite_statement` its indexes directly and never crosses the table/exec boundary the patch restores |
 | `FunctionSupport` per-call check (fork PR #61) | A function a backend carves out of the deny-list because its dialect rewrites it federates in *every* call shape, including the ones the dialect cannot render. The unparser then emits the function verbatim into the remote SQL — the unknown-function failure of [#10703](https://github.com/spiceai/spiceai/issues/10703) | build, then silent | `crates/data-connectors/connector-adbc/src/lib.rs::function_support_tests::bigquery_refuses_the_json_call_shapes_its_dialect_cannot_translate` and `::an_untranslatable_predicate_is_left_above_the_federated_scan`. Losing the API fails `cargo check`; a re-cut that keeps `with_scalar_call_support` and drops its use in `contains_unsupported_functions` fails these instead |
+| `FunctionSupport` expression policy gates logical federation, scan filter admission, and convertible physical-filter pushdown ([table-providers PR #75](https://github.com/spiceai/datafusion-table-providers/pull/75)) | BigQuery has no `ILIKE` operator. Losing any gate either emits invalid GoogleSQL or lets a remote `LIMIT` run before the residual local predicate, which can return the wrong row or no row | silent (query failure / wrong rows) | `crates/runtime-datafusion/src/function_support.rs::tests::bigquery_refuses_only_case_insensitive_like_expressions`; `crates/data-connectors/connector-adbc/src/lib.rs::function_support_tests::{bigquery_refuses_case_insensitive_like_but_keeps_like,bigquery_catalog_refuses_case_insensitive_like_but_keeps_like,bigquery_ilike_stays_local_before_limit_on_every_registration_path,bigquery_ilike_residuals_preserve_boolean_and_projection_boundaries,bigquery_supported_like_and_comparison_still_push_down}`; the fork's `supported_functions`, `federation`, scan-filter, and physical-filter policy tests |
 | Analyzer: recursive work tables are neutral, with dialect renderability checked before selecting a remote plan (federation PR #84) | Recursive joins split at the work table, or an unsupported dialect receives a plan it cannot execute | silent (query failure / perf) | `crates/data-connectors/connector-adbc/src/lib.rs::function_support_tests::bigquery_federates_a_recursive_cte_and_its_remote_join`; real-engine guard: `test/scripts/bigquery_pushdown.py::recursive-cte-joined-to-a-table`. The fork also guards unsupported-dialect fallback |
 | Analyzer: consider the complete recursive CTE before splitting its terms (federation PR #85) | A remote scalar-subquery bound makes an incomplete recursive term look unfederatable, so the enclosing CTE executes locally | silent (extra remote jobs) | `crates/data-connectors/connector-adbc/src/lib.rs::function_support_tests::bigquery_federates_a_recursive_cte_and_its_remote_join` (the scalar-bound case) |
 | Analyzer: table rewrites resolve existing output names and preserve aliases and field metadata, including UNNEST projections (federation PR #84) | Computed output references stop resolving or explicit user aliases and metadata change | silent (query failure / output schema) | Real-engine grouped-expression cards in `test/scripts/bigquery_pushdown.py`; in the fork, `test_rewrite_table_scans_moves_a_pinned_name_with_its_table`, quoted user-alias controls, and `test_rewrite_unnest_preserves_alias_metadata` |
@@ -357,6 +358,7 @@ Upstream [duckdb/duckdb-rs](https://github.com/duckdb/duckdb-rs), branch
 | ICU extension statically linked into bundled DuckDB (fork PR #23) | Any query using a named timezone (`AT TIME ZONE 'America/New_York'`) fails at runtime, and DuckDB tries to download the extension from the network | silent (query failure) | `crates/accelerators/accelerator-duckdb/src/lib.rs::bundled_duckdb_resolves_a_named_time_zone_without_installing_icu` |
 | VSS (HNSW) extension statically linked (fork PR #37) | Vector search over a DuckDB accelerator fails, or silently falls back to a full scan | silent (query failure) | `crates/accelerators/accelerator-duckdb/src/lib.rs::bundled_duckdb_builds_an_hnsw_index_without_installing_vss` |
 | Bundled DuckDB version pinned to the release (fork PR #38) | Extension downloads resolve against a mismatched DuckDB version and fail | silent | covered by the two extension guards above |
+| Thrift `TEnumIterator::operator==` backport for macOS 27 (fork PR #47; upstream [duckdb/duckdb@fccde6aa](https://github.com/duckdb/duckdb/commit/fccde6aa1932f48dfa6282a916ea2477b57aa44d)) | Bundled DuckDB with Parquet fails to compile against the macOS 27 SDK: newer libc++ builds the Thrift enum maps with `iterator == end`, and the vendored Thrift header defined only `operator!=` | build (macOS 27) | **GAP** — the fork's own `crates/libduckdb-sys/tests/test_bundled_thrift.py` asserts it inside the fork and does not survive a re-cut of this pin |
 
 ## iceberg-rust
 
@@ -412,6 +414,7 @@ Upstream [SeaQL/sea-query](https://github.com/SeaQL/sea-query).
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|
 | SQLite backend emits a decimal declared type rather than panicking above 16 digits | `CREATE TABLE` for a `Decimal256(40, 4)` column panics; below that the declared type changes, and the SQLite reader keys value decoding off the declared type | silent (panic / wrong decode) | `crates/accelerators/accelerator-sqlite/src/lib.rs::test_sqlite_decimal_round_trip` |
+| Chrono fractional seconds in SQL literals | Timestamp writeback loses microseconds for timezone-aware values rendered through `InsertBuilder` | silent (wrong data) | `crates/runtime/tests/postgres/write_back_delivery.rs::timestamp_microseconds_survive_write_back_and_echo` |
 
 ## snowflake-rs
 
@@ -535,7 +538,7 @@ patch is a build failure, so no behaviour guard applies.
 
 ## Open gaps
 
-**37 rows above are marked GAP** — they have no repo-side guard. Every one of them
+**38 rows above are marked GAP** — they have no repo-side guard. Every one of them
 is accounted for below; `scripts/check_fork_patches.py` fails if that count and this
 sentence disagree, so the list cannot quietly fall behind the tables.
 
@@ -604,13 +607,21 @@ being honoured:
 24. `iceberg-rust` end-to-end SigV4 signing against a Glue REST catalog.
 25. `graph-rs-sdk` tower middleware application.
 
+**Build only.** Loud rather than silent — the compiler catches the loss, but only on
+the platform it affects:
+
+26. `duckdb-rs` Thrift `TEnumIterator::operator==` backport (fork PR #47) — bundled
+    DuckDB stops compiling against the macOS 27 SDK. Invisible on every other
+    platform and on CI images that predate that SDK, so a re-cut that drops it is
+    found by whoever upgrades first rather than by the build.
+
 **Performance only.** A lost patch here costs throughput, not correctness. These are
 deliberately left to the benchmark suites (`testoperator`, the CH-benCH lab runs and
 the scheduled TPC-H/TPC-DS jobs), which already trend these numbers over time and
 will show the regression as a step change. A unit test cannot assert a speedup
 without becoming a flaky timing test:
 
-26. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
+27. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
     `datafusion` eager aggregation; `mistral.rs`/`candle` i-quant MoE kernels;
     `candle-index-select-cu` fallback shim; `model2vec-rs` fast WordPiece;
     `snowflake-rs` streaming batches (memory, not latency — worth a guard if a
