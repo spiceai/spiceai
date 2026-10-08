@@ -274,6 +274,22 @@ impl HuggingFace {
                 ),
             });
         };
+        // The repository API answers for a gated dataset without access; only its files refuse.
+        // Reading a byte of one selected file now fails registration with the Hub's reason,
+        // rather than a schema-inference failure that would be retried.
+        if let Some(path) =
+            probe_file(&self.hub, dataset, &location, &commit.sha, &extension).await?
+        {
+            self.hub
+                .read(
+                    location.repo(),
+                    &commit.sha,
+                    &path,
+                    Some(object_store::GetRange::Bounded(0..1)),
+                )
+                .await
+                .map_err(|source| hub_error(dataset, source))?;
+        }
         let schema_dataset =
             schema_dataset(&self.hub, dataset, &location, &commit.sha, &extension).await?;
         let template = listing
@@ -558,6 +574,62 @@ async fn schema_dataset(
         );
     }
     Ok(dataset)
+}
+
+/// A data file the location selects at `commit`, for the access probe: the file itself, or the
+/// file a folder or glob would infer its schema from. `None` when the location selects none,
+/// which schema inference then reports.
+async fn probe_file(
+    hub: &Hub,
+    dataset: &DatasetSpec,
+    location: &DatasetLocation,
+    commit: &str,
+    extension: &str,
+) -> DataConnectorResult<Option<String>> {
+    if !location.is_folder() && location.glob().is_none() {
+        let entry = hub
+            .entry(location.repo(), commit, location.path())
+            .await
+            .map_err(|source| hub_error(dataset, source))?;
+        match entry {
+            Some(entry) if entry.kind == EntryKind::File => return Ok(Some(entry.path)),
+            // A folder named without a trailing `/` is listed like one.
+            Some(_) => {}
+            None => return Ok(None),
+        }
+    }
+    let (folder, pattern) = match location.glob() {
+        Some((folder, glob)) => (folder, glob::Pattern::new(glob).ok()),
+        None => (location.path(), None),
+    };
+    let folder_prefix = if folder.is_empty() {
+        String::new()
+    } else {
+        format!("{folder}/")
+    };
+    let entries = hub
+        .list(location.repo(), commit, folder, true)
+        .await
+        .map_err(|source| hub_error(dataset, source))?;
+    Ok(entries
+        .iter()
+        .filter(|entry| entry.kind == EntryKind::File)
+        .filter(|entry| {
+            entry
+                .path
+                .strip_prefix(&folder_prefix)
+                .is_some_and(|relative| {
+                    pattern
+                        .as_ref()
+                        .is_none_or(|pattern| pattern.matches(relative))
+                })
+        })
+        .filter(|entry| {
+            object_store::path::Path::parse(&entry.path)
+                .is_ok_and(|path| file_matches_extension(&path, extension))
+        })
+        .map(|entry| entry.path.clone())
+        .max())
 }
 
 fn column_names(schema: &datafusion::arrow::datatypes::SchemaRef) -> Vec<String> {

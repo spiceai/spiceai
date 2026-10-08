@@ -425,6 +425,19 @@ async fn hub_handler(State(mock): State<Mock>, request: Request<Body>) -> Respon
             )
         }
         ["api", "datasets", owner, name, "paths-info", commit] => {
+            // As on the Hub, a gated dataset's paths are described only to an account with
+            // access, while its revisions and tree are public.
+            if state
+                .repos
+                .get(&format!("{owner}/{name}"))
+                .is_some_and(|repo| repo.gated)
+            {
+                return hub_error(
+                    StatusCode::UNAUTHORIZED,
+                    "GatedRepo",
+                    "Access to dataset is restricted.",
+                );
+            }
             let Some(files) = state
                 .repos
                 .get(&format!("{owner}/{name}"))
@@ -1033,6 +1046,13 @@ async fn registration_errors_name_the_dataset_and_the_fix() {
     let endpoint = mock.endpoint();
     assert_eq!(
         error("hf://datasets/o/gated/a.parquet").await,
+        format!(
+            "Insufficient permissions to access the dataset t (hf). Hugging Face dataset 'o/gated' is gated and no `hf_token` is set: accept its access conditions at {endpoint}/datasets/o/gated with the account `hf_token` belongs to. See: https://spiceai.org/docs/components/data-connectors/huggingface"
+        )
+    );
+    // A gated folder: its tree is public, its files are not.
+    assert_eq!(
+        error("hf://datasets/o/gated/").await,
         format!(
             "Insufficient permissions to access the dataset t (hf). Hugging Face dataset 'o/gated' is gated and no `hf_token` is set: accept its access conditions at {endpoint}/datasets/o/gated with the account `hf_token` belongs to. See: https://spiceai.org/docs/components/data-connectors/huggingface"
         )
