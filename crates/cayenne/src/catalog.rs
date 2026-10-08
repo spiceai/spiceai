@@ -289,6 +289,8 @@ pub trait MetadataCatalog: Send + Sync {
     /// in the same transaction: the table aggregate, the snapshot-file cache,
     /// and `cayenne_cold_tier_file.statistics_blob`.
     ///
+    /// Also used when schema evolution has an outstanding row-count delta,
+    /// whose process-local reservation cannot protect the count after reopening.
     /// Used when a widening changes a decimal column's scale. Vortex stores
     /// unscaled integers and decodes them with the current schema's scale, so
     /// publishing the new schema while leaving those blobs in place would

@@ -411,7 +411,7 @@ impl CayenneCatalog {
         txn.commit().await?;
         tracing::debug!(
             table_id,
-            "Dropped persisted column statistics because a decimal column's scale changed"
+            "Dropped persisted statistics during a logical schema change"
         );
         Ok(())
     }
