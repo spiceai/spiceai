@@ -3520,15 +3520,12 @@ impl DataAccelerator for CayenneAccelerator {
         }
     }
 
-    async fn init(
+    async fn validate_init(
         &self,
         source: &dyn AccelerationSource,
-    ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if !source.is_file_accelerated() {
-            // Memory mode (`mode: memory`) is fully in-RAM and ephemeral — there is
-            // nothing to bootstrap on disk; the dataset reloads from its federated
-            // source on startup, like the in-memory Arrow accelerator.
-            return Ok(BootstrapStatus::none());
+            return Ok(());
         }
 
         if let Some(acceleration) = source.acceleration() {
@@ -3569,7 +3566,18 @@ impl DataAccelerator for CayenneAccelerator {
         {
             Self::ensure_no_catalog_under_data_dir(source, &dir_path).await?;
         }
+        Ok(())
+    }
 
+    async fn init(
+        &self,
+        source: &dyn AccelerationSource,
+    ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
+        self.validate_init(source).await?;
+        if !source.is_file_accelerated() {
+            return Ok(BootstrapStatus::none());
+        }
+        let dir_path = self.file_path(source)?;
         let is_s3_express = s3::is_s3_express_data_path(source);
 
         // Handle S3 Express One Zone configuration
