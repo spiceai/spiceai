@@ -620,7 +620,13 @@ pub async fn build_changes_stream(
         //      on a ColumnReference, and acceleration's write path consults
         //      only its own `primary_key` / `on_conflict` config.
         if engine_supports_upsert && !has_upsert_on_pk {
-            let pk_hint = primary_keys.first().cloned().unwrap_or_else(|| "<pk>".to_string());
+            // Composite keys hint the full parenthesized column list — a
+            // single-column suggestion would mis-route UPDATE/DELETE events.
+            let pk_hint = match primary_keys.as_slice() {
+                [] => "<pk>".to_string(),
+                [single] => single.clone(),
+                composite => format!("({})", composite.join(", ")),
+            };
             let msg = if declared_pks.is_empty() && keeps_one_row_per_key_alone {
                 format!(
                     "postgres replication for dataset `{dataset_name}`: the source table's \
