@@ -3935,10 +3935,6 @@ mod tests {
             mode: spicepod::acceleration::Mode::File,
             write_mode: spicepod::acceleration::WriteMode::WriteBack,
             refresh_mode: Some(spicepod::acceleration::RefreshMode::Changes),
-            on_conflict: HashMap::from([(
-                "id".to_string(),
-                spicepod::acceleration::OnConflictBehavior::Upsert,
-            )]),
             // Declared, single-column: durable write-back has nothing to key a
             // delivery on otherwise, so this is part of the valid shape.
             primary_key: Some("id".to_string()),
@@ -4057,9 +4053,9 @@ mod tests {
     /// unremarkable there, because nothing depends on the accelerator holding a row
     /// until a delivery carries it away.
     ///
-    /// Leaving the regime any *other* way — the engine, `on_conflict` or
-    /// `refresh_mode` — still requests `write_mode: write_back`, which cannot be
-    /// delivered and is refused by the prerequisites gate instead. Those doors are
+    /// Leaving the regime any *other* way — the engine or `refresh_mode` — still
+    /// requests `write_mode: write_back`, which cannot be delivered and is refused
+    /// by the prerequisites gate instead. Those doors are
     /// covered by `validate_dataset_refuses_write_back_without_the_durable_prerequisites`.
     #[tokio::test]
     async fn validate_dataset_allows_all_of_them_when_write_back_is_not_requested() {
@@ -4097,13 +4093,6 @@ mod tests {
             ),
             (
                 spicepod::acceleration::Acceleration {
-                    on_conflict: HashMap::new(),
-                    ..durable_write_back_acceleration()
-                },
-                "acceleration.on_conflict",
-            ),
-            (
-                spicepod::acceleration::Acceleration {
                     refresh_mode: Some(spicepod::acceleration::RefreshMode::Full),
                     ..durable_write_back_acceleration()
                 },
@@ -4131,6 +4120,33 @@ mod tests {
             ))
             .is_ok(),
             "a configuration meeting them all must still load"
+        );
+    }
+
+    /// Regression test for #14886: Cayenne no longer uses `on_conflict`, and the
+    /// runtime warns users to remove it, so write-back must load without it — and
+    /// still load with it, for Spicepods that have not removed it yet.
+    #[tokio::test]
+    async fn validate_dataset_loads_write_back_with_or_without_on_conflict() {
+        let runtime = Arc::new(crate::Runtime::builder().build().await);
+
+        let without = durable_write_back_acceleration();
+        assert!(without.on_conflict.is_empty());
+        assert!(
+            validate_dataset(&dataset_with_acceleration(&runtime, without)).is_ok(),
+            "write-back keys on primary_key, not on_conflict"
+        );
+
+        let with = spicepod::acceleration::Acceleration {
+            on_conflict: HashMap::from([(
+                "id".to_string(),
+                spicepod::acceleration::OnConflictBehavior::Upsert,
+            )]),
+            ..durable_write_back_acceleration()
+        };
+        assert!(
+            validate_dataset(&dataset_with_acceleration(&runtime, with)).is_ok(),
+            "a leftover on_conflict must not stop the dataset loading"
         );
     }
 

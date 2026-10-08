@@ -46,7 +46,7 @@ use app::AppBuilder;
 use datafusion::assert_batches_eq;
 use runtime::Runtime;
 use secrecy::ExposeSecret;
-use spicepod::acceleration::{Acceleration, Mode, OnConflictBehavior, RefreshMode, WriteMode};
+use spicepod::acceleration::{Acceleration, Mode, RefreshMode, WriteMode};
 use spicepod::component::dataset::replication::Replication;
 use spicepod::component::{access::AccessMode, dataset::Dataset};
 use spicepod::param::Params;
@@ -212,9 +212,6 @@ fn cdc_dataset(
         mode: Mode::File,
         refresh_mode: Some(RefreshMode::Changes),
         primary_key: Some("id".to_string()),
-        on_conflict: [("id".to_string(), OnConflictBehavior::Upsert)]
-            .into_iter()
-            .collect(),
         write_mode,
         params: Some(Params::from_string_map(accel_params)),
         ..Acceleration::default()

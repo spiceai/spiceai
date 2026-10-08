@@ -8,7 +8,7 @@ serializable-transactions surface (#11870).
 
 - `spicepod.yaml` — the mutated TPC-C tables configured for durable **write-back**
   (`access: read_write` + `acceleration.write_mode: write_back` +
-  `refresh_mode: changes` + `on_conflict: upsert` + dataset
+  `refresh_mode: changes` + `primary_key` + dataset
   `replication.enabled: true`), with a maintained `SUM(s_quantity)` aggregate on
   `stock` to exercise the IVM path.
 - `direct_write_bench.py` — the driver: concurrent gated stock-decrement

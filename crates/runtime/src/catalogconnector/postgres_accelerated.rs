@@ -91,7 +91,7 @@ use datafusion::error::Result as DFResult;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
 use parking_lot::RwLock;
 use snafu::prelude::*;
-use spicepod::acceleration::{Acceleration as SpicepodAcceleration, OnConflictBehavior};
+use spicepod::acceleration::Acceleration as SpicepodAcceleration;
 use spicepod::component::dataset::Dataset as SpicepodDataset;
 use spicepod::param::Params;
 
@@ -184,9 +184,7 @@ fn synthesized_dataset_name(catalog_name: &str, schema_name: &str, table_name: &
 
 /// Render `key` in the string form `ColumnReference` parses (see
 /// `datafusion_table_providers`'s `ColumnReference::try_from`): a single column
-/// verbatim, a compound key as `(a, b, ...)`. Used for BOTH the dataset's
-/// `primary_key` and its `on_conflict` upsert target so both parse to the same
-/// `ColumnReference` and the CDC path's upsert-on-key check matches.
+/// verbatim, a compound key as `(a, b, ...)`, for the dataset's `primary_key`.
 fn column_reference_string(key: &[String]) -> String {
     match key {
         [single] => single.clone(),
@@ -451,7 +449,7 @@ pub struct AcceleratedCatalogProvider {
     /// than once per table.
     slot_name: String,
     /// The acceleration block written onto every synthesized dataset, before the
-    /// per-table `primary_key`/`on_conflict` are filled in
+    /// per-table `primary_key` is filled in
     /// (`CatalogAcceleration::to_dataset_acceleration`). Its `mode` -- the
     /// catalog's -- decides persistence: `Memory`, the default, is fully in-RAM,
     /// so every table re-snapshots from the source on each restart, while a file
@@ -691,18 +689,16 @@ impl AcceleratedCatalogProvider {
         // Declare the CDC key EXPLICITLY rather than relying on schema inference:
         // inference only derives a primary key from `indisprimary`, so a
         // `REPLICA IDENTITY USING INDEX` table (no formal PK) would otherwise get
-        // no key. The same string keys both `primary_key` and the `on_conflict`
-        // upsert target so they parse to the same `ColumnReference` (which
-        // `connector-postgres`'s CDC path requires -- otherwise UPDATE events
-        // append duplicate rows). Inference still fills sort/secondary-indexes.
+        // no key. Cayenne keeps one row per primary key, so the key alone is what
+        // makes UPDATE events replace rows rather than append duplicates.
+        // Inference still fills sort/secondary-indexes.
         let key_ref = column_reference_string(key);
         // The catalog's engine, storage mode and accelerator params apply uniformly
         // to every table it accelerates; only the key is per-table. Under a file
         // mode each table lands in its own directory beneath `cayenne_file_path`,
         // named for the dataset (see `synthesized_dataset_name`).
         spicepod_ds.acceleration = Some(SpicepodAcceleration {
-            primary_key: Some(key_ref.clone()),
-            on_conflict: HashMap::from([(key_ref, OnConflictBehavior::Upsert)]),
+            primary_key: Some(key_ref),
             ..self.table_acceleration.clone()
         });
 
