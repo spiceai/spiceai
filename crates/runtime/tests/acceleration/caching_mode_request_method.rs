@@ -672,3 +672,52 @@ async fn test_caching_mode_paginated_get_serves_every_page() -> Result<(), anyho
     shutdown.send(()).ok();
     result
 }
+
+/// A lookup whose only request predicate names no body — `<>` here, with no
+/// path filter — still sends a GET to the dataset's URL, so it must not be
+/// answered with a POST response cached for that URL.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_caching_mode_body_only_non_body_predicate_after_post() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug"));
+    register_test_connectors().await;
+    let (shutdown, addr, counts) = start_origin().await;
+    let admin = admin_request_context();
+
+    let result = async {
+        // The dataset URL is the endpoint itself, so a lookup needs no path.
+        let rt = start_runtime(&format!("http://{addr}/items"), "caching_body_only_not_eq").await?;
+
+        let post = run_sql(
+            &rt,
+            &admin,
+            "SELECT content FROM cached WHERE request_body = 'x'",
+        )
+        .await;
+        assert_eq!(contents(&post), vec!["post-response"]);
+        wait_for_cached_rows(&rt, &admin, "cached", 1).await;
+        let (get0, post0) = counts.snapshot();
+
+        let lookup = "WHERE request_body <> 'z'";
+        let direct = run_sql(&rt, &admin, &format!("SELECT content FROM direct {lookup}")).await;
+        assert_eq!(
+            contents(&direct),
+            vec!["get-response"],
+            "the predicate sends a GET"
+        );
+        let cached = run_sql(&rt, &admin, &format!("SELECT content FROM cached {lookup}")).await;
+        assert_eq!(
+            contents(&cached),
+            contents(&direct),
+            "the cached lookup must match the unaccelerated GET"
+        );
+        assert_eq!(
+            counts.snapshot(),
+            (get0 + 2, post0),
+            "both lookups reach the origin as a GET"
+        );
+        Ok(())
+    }
+    .await;
+    shutdown.send(()).ok();
+    result
+}
