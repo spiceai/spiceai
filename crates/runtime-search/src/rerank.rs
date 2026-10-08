@@ -625,22 +625,21 @@ impl RerankUDTFProvider {
 
     /// Pick the reranker model to use: the named one, or the only one registered.
     async fn resolve_reranker(&self) -> DataFusionResult<Arc<dyn Rerank>> {
-        let name = match &self.args.model {
-            Some(name) => name.clone(),
-            None => {
-                let mut names = self.models.names().await.into_iter();
-                match (names.next(), names.next()) {
-                    (Some(only), None) => only,
-                    (None, _) => {
-                        return Err(DataFusionError::Plan(format!(
-                            "{RERANK_UDTF_NAME}: no rerankers, chat models, or evaluation models configured. Add one to your Spicepod and reference it via `model => '<name>'`."
-                        )));
-                    }
-                    (Some(_), Some(_)) => {
-                        return Err(DataFusionError::Plan(format!(
-                            "{RERANK_UDTF_NAME}: multiple models configured. Specify which with `model => '<name>'`."
-                        )));
-                    }
+        let name = if let Some(name) = &self.args.model {
+            name.clone()
+        } else {
+            let mut names = self.models.names().await.into_iter();
+            match (names.next(), names.next()) {
+                (Some(only), None) => only,
+                (None, _) => {
+                    return Err(DataFusionError::Plan(format!(
+                        "{RERANK_UDTF_NAME}: no rerankers, chat models, or evaluation models configured. Add one to your Spicepod and reference it via `model => '<name>'`."
+                    )));
+                }
+                (Some(_), Some(_)) => {
+                    return Err(DataFusionError::Plan(format!(
+                        "{RERANK_UDTF_NAME}: multiple models configured. Specify which with `model => '<name>'`."
+                    )));
                 }
             }
         };
