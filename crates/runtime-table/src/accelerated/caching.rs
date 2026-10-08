@@ -25,6 +25,7 @@ use arrow::array::{Array, ArrayRef, RecordBatch, TimestampNanosecondArray};
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use arrow_tools::format::SchemaDisplay;
+use datafusion::common::tree_node::TreeNode;
 use datafusion::common::{DataFusionError, Result as DataFusionResult, TableReference};
 use datafusion::datasource::TableProvider;
 use datafusion::execution::TaskContext;
@@ -540,6 +541,65 @@ pub fn extend_schema_with_cache_namespace(
 /// refresh is rebuilt from and the key eviction removes an entry by.
 pub const REQUEST_KEY_COLUMNS: [&str; 3] = ["request_path", "request_query", "request_body"];
 
+/// The request-key column that tells an HTTP GET from a POST: the HTTP
+/// connector sends a GET when a query leaves it unconstrained and a POST with
+/// the pinned value — the empty string included — otherwise.
+pub const REQUEST_BODY_COLUMN: &str = "request_body";
+
+/// Whether a filter references the `request_body` column.
+fn references_request_body(filter: &Expr) -> bool {
+    filter
+        .column_refs()
+        .iter()
+        .any(|column| column.name == REQUEST_BODY_COLUMN)
+}
+
+/// Whether `filters` can send an explicit-empty POST: a filter on
+/// `request_body` that names the empty string.
+///
+/// A GET's response is stored with `request_body = ''` too, so the cache
+/// cannot tell the two requests apart; such a read bypasses the cache and goes
+/// to the source, as the unaccelerated dataset would. Any filter on
+/// `request_body` that mentions `''` counts, which errs toward bypassing.
+#[must_use]
+pub fn sends_explicit_empty_request_body(filters: &[Expr]) -> bool {
+    filters
+        .iter()
+        .filter(|f| references_request_body(f))
+        .any(|filter| {
+            filter
+                .exists(|expr| {
+                    Ok(matches!(
+                        expr,
+                        Expr::Literal(
+                            ScalarValue::Utf8(Some(value))
+                                | ScalarValue::LargeUtf8(Some(value))
+                                | ScalarValue::Utf8View(Some(value)),
+                            _,
+                        ) if value.is_empty()
+                    ))
+                })
+                .unwrap_or(true)
+        })
+}
+
+/// The storage-only predicate that keeps a GET lookup — one whose filters
+/// leave `request_body` unconstrained — from matching a cached POST response
+/// for the same path. `None` when the cache has no `request_body` column or
+/// the filters constrain it, in which case they already select the entry.
+///
+/// Like the namespace predicate, it scopes the accelerator read only; the
+/// source still receives the user's filters, so the request stays a GET.
+#[must_use]
+pub fn get_request_identity_filter(
+    filters: &[Expr],
+    cache_schema: &arrow::datatypes::Schema,
+) -> Option<Expr> {
+    (cache_schema.column_with_name(REQUEST_BODY_COLUMN).is_some()
+        && !filters.iter().any(references_request_body))
+    .then(|| col(REQUEST_BODY_COLUMN).eq(lit("")))
+}
+
 /// Maximum number of concurrent refresh requests
 const MAX_CONCURRENT_REFRESHES: usize = 10;
 
@@ -883,6 +943,13 @@ async fn flush_cache_writes(
             }
         };
         let mut filters = req.filters;
+        // A GET entry's replace must not delete the POST entries cached for
+        // the same path, so it carries the same predicate its lookup reads by.
+        if !filters.is_empty()
+            && let Some(get_identity) = get_request_identity_filter(&filters, &storage_schema)
+        {
+            filters.push(get_identity);
+        }
         if needs_namespace_stamp {
             filters.push(namespace_filter_expr(ns_id));
         }
@@ -3347,6 +3414,80 @@ mod tests {
     use parking_lot::RwLock;
     use std::sync::Arc;
     use std::time::{Duration, SystemTime};
+
+    /// Every filter shape that can make the HTTP connector send an empty POST
+    /// body bypasses the cache; shapes that send a GET or a non-empty body do
+    /// not.
+    #[test]
+    fn explicit_empty_request_body_is_detected_in_every_filter_shape() {
+        let body = || col("request_body");
+        let cases: Vec<(&str, Vec<Expr>, bool)> = vec![
+            ("eq ''", vec![body().eq(lit(""))], true),
+            ("'' eq", vec![lit("").eq(body())], true),
+            (
+                "in list",
+                vec![body().in_list(vec![lit("x"), lit("")], false)],
+                true,
+            ),
+            ("or", vec![body().eq(lit("x")).or(body().eq(lit("")))], true),
+            (
+                "cast",
+                vec![
+                    datafusion::logical_expr::cast(body(), DataType::Utf8View)
+                        .eq(lit(ScalarValue::Utf8View(Some(String::new())))),
+                ],
+                true,
+            ),
+            (
+                "beside other filters",
+                vec![col("request_path").eq(lit("/items")), body().eq(lit(""))],
+                true,
+            ),
+            ("eq 'x'", vec![body().eq(lit("x"))], false),
+            (
+                "no body filter",
+                vec![col("request_path").eq(lit("/items"))],
+                false,
+            ),
+            (
+                "empty query, no body",
+                vec![col("request_query").eq(lit(""))],
+                false,
+            ),
+            ("no filters", vec![], false),
+        ];
+        for (name, filters, expected) in cases {
+            assert_eq!(
+                sends_explicit_empty_request_body(&filters),
+                expected,
+                "{name}: {filters:?}"
+            );
+        }
+    }
+
+    /// A lookup that leaves `request_body` unconstrained reads GET entries
+    /// only; one that constrains it, or a cache without the column, adds
+    /// nothing.
+    #[test]
+    fn get_request_identity_filter_pins_only_unconstrained_bodies() {
+        let http = Schema::new(vec![
+            Field::new("request_path", DataType::Utf8, true),
+            Field::new("request_body", DataType::Utf8, true),
+        ]);
+        let other = Schema::new(vec![Field::new("id", DataType::Int32, true)]);
+        let path = vec![col("request_path").eq(lit("/items"))];
+        let with_body = vec![
+            col("request_path").eq(lit("/items")),
+            col("request_body").eq(lit("x")),
+        ];
+
+        assert_eq!(
+            get_request_identity_filter(&path, &http),
+            Some(col("request_body").eq(lit("")))
+        );
+        assert_eq!(get_request_identity_filter(&with_body, &http), None);
+        assert_eq!(get_request_identity_filter(&path, &other), None);
+    }
 
     /// Test-only stand-in for the shared `Arc<SessionState>`.
     fn test_session_state() -> Arc<SessionState> {

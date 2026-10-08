@@ -1743,6 +1743,17 @@ impl AcceleratedTable {
             }
         }
 
+        // An explicit-empty request body is a POST whose response the cache
+        // stores exactly as it stores a GET's, so the cache cannot answer it
+        // without risking the other method's response. Ask the source, as the
+        // unaccelerated dataset does, and cache nothing.
+        if is_caching_mode && caching::sends_explicit_empty_request_body(filters) {
+            let federated_provider = self.federated.table_provider().await;
+            return federated_provider
+                .scan(state, projection, filters, limit)
+                .await;
+        }
+
         // For caching mode, extend the accelerator scan projection to
         // include the storage-only columns the caching pipeline needs:
         // `_fetched_at` (freshness check inside
@@ -1760,11 +1771,33 @@ impl AcceleratedTable {
         // ds`) would push only the user's columns to the accelerator
         // and the FilterExec on top would fail with `No field named
         // __spice_cache_namespace`.
-        let extended_projection = if is_caching_mode {
+        // A lookup that sends a GET must not match the POST entries cached
+        // for the same path. Without filters the scan lists the whole cache
+        // and makes no request, so nothing is pinned.
+        let get_identity_filter: Option<Expr> = if is_caching_mode && !filters.is_empty() {
+            caching::get_request_identity_filter(filters, &self.accelerator.schema())
+        } else {
+            None
+        };
+        let mut extended_projection = if is_caching_mode {
             extend_projection_for_caching(projection, &self.accelerator.schema())
         } else {
             None
         };
+        // The GET predicate is re-applied above the scan when the accelerator
+        // cannot apply it exactly, so the scan must carry `request_body`.
+        if get_identity_filter.is_some()
+            && let Some(projection) = projection
+            && let Ok(idx) = self
+                .accelerator
+                .schema()
+                .index_of(caching::REQUEST_BODY_COLUMN)
+        {
+            let target = extended_projection.get_or_insert_with(|| projection.clone());
+            if !target.contains(&idx) {
+                target.push(idx);
+            }
+        }
         let scan_projection = extended_projection.as_ref().or(projection);
         // For caching mode, scope the accelerator scan to the current
         // request's namespace by appending a `__spice_cache_namespace = $ns_id`
@@ -1798,13 +1831,9 @@ impl AcceleratedTable {
         } else {
             None
         };
-        let storage_filters: Vec<Expr> = if let Some(ref nf) = namespace_filter {
-            let mut sf = filters.to_vec();
-            sf.push(nf.clone());
-            sf
-        } else {
-            filters.to_vec()
-        };
+        let mut storage_filters: Vec<Expr> = filters.to_vec();
+        storage_filters.extend(namespace_filter.iter().cloned());
+        storage_filters.extend(get_identity_filter.iter().cloned());
         let scan_filters: &[Expr] = if is_caching_mode {
             &storage_filters
         } else {
@@ -1835,9 +1864,9 @@ impl AcceleratedTable {
                 // results when the accelerator returns Inexact or
                 // Unsupported for some filters.
                 let mut filters_to_reapply = self.get_filters_to_reapply(filters)?;
-                // Re-apply the cache-namespace predicate as a hard
-                // FilterExec only if the accelerator does NOT report exact
-                // pushdown for it.
+                // Re-apply each storage-only predicate (the cache namespace
+                // and the GET identity) as a hard FilterExec only if the
+                // accelerator does NOT report exact pushdown for it.
                 //
                 // The DataFusion contract for `supports_filters_pushdown`
                 // is: `Exact` means the provider guarantees the predicate
@@ -1858,15 +1887,15 @@ impl AcceleratedTable {
                 // a false-positive panic in `BatchCoalescer` even though
                 // the data itself is well-formed. This bites the localpod
                 // chained-accelerator path in particular.
-                if let Some(nf) = namespace_filter {
-                    let nf_pushdown = self
+                for storage_filter in namespace_filter.into_iter().chain(get_identity_filter) {
+                    let pushdown = self
                         .accelerator
-                        .supports_filters_pushdown(&[&nf])?
+                        .supports_filters_pushdown(&[&storage_filter])?
                         .into_iter()
                         .next()
                         .unwrap_or(TableProviderFilterPushDown::Unsupported);
-                    if !matches!(nf_pushdown, TableProviderFilterPushDown::Exact) {
-                        filters_to_reapply.push(nf);
+                    if !matches!(pushdown, TableProviderFilterPushDown::Exact) {
+                        filters_to_reapply.push(storage_filter);
                     }
                 }
                 let input = if caching::uses_source_first(
