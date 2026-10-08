@@ -3475,7 +3475,7 @@ mod tests {
                 "body predicate that sends no body",
                 vec![path.clone(), col("request_body").not_eq(lit("z"))],
                 &http,
-                get,
+                get.clone(),
             ),
             (
                 "path and body",
@@ -3487,7 +3487,7 @@ mod tests {
                 "headers only",
                 vec![col("request_headers").eq(lit(r#"{"x-test":"a"}"#))],
                 &http,
-                get.clone(),
+                get,
             ),
             (
                 "no request value named",
