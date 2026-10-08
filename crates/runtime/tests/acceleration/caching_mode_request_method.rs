@@ -721,3 +721,79 @@ async fn test_caching_mode_body_only_non_body_predicate_after_post() -> Result<(
     shutdown.send(()).ok();
     result
 }
+
+/// A cached GET entry that goes stale is refreshed in the background with the
+/// request it was cached for — a GET — not replayed as an explicit-empty POST,
+/// so the GET lookup that follows is still served the GET response.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_caching_mode_periodic_refresh_replays_a_get_as_a_get() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug"));
+    register_test_connectors().await;
+    let (shutdown, addr, counts) = start_origin().await;
+    let admin = admin_request_context();
+
+    let result = async {
+        let base_url = format!("http://{addr}");
+        let mut cached = http_dataset(&base_url, "cached", true);
+        if let Some(acceleration) = cached.acceleration.as_mut() {
+            acceleration.params = Some(Params::from_string_map(
+                [("caching_ttl".to_string(), "1s".to_string())]
+                    .into_iter()
+                    .collect(),
+            ));
+            acceleration.refresh_check_interval = Some("1s".to_string());
+        }
+        let mut app = AppBuilder::new("caching_periodic_refresh_get")
+            .with_dataset(cached)
+            .build();
+        app.runtime
+            .caching
+            .sql_results
+            .get_or_insert_with(spicepod::component::caching::SQLResultsCacheConfig::default)
+            .enabled = false;
+        configure_test_datafusion();
+        let rt = Runtime::builder().with_app(app).build().await;
+        let load_rt = Arc::new(rt.clone());
+        tokio::select! {
+            () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+                return Err(anyhow::Error::msg("Timed out waiting for datasets to load"));
+            }
+            () = load_rt.load_components() => {}
+        }
+        runtime_ready_check(&rt).await;
+        let (get0, post0) = counts.snapshot();
+
+        let warm = run_sql(
+            &rt,
+            &admin,
+            &format!("SELECT content FROM cached {GET_LOOKUP}"),
+        )
+        .await;
+        assert_eq!(contents(&warm), vec!["get-response"]);
+        wait_for_cached_rows(&rt, &admin, "cached", 1).await;
+
+        // Poll until the background refresh has fetched the stale entry again.
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            let (get, post) = counts.snapshot();
+            if get + post > get0 + post0 + 1 {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "no background refresh reached the origin; requests (get, post) = {:?}",
+                counts.snapshot()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+        }
+        assert_eq!(
+            counts.snapshot().1,
+            post0,
+            "the refresh of a cached GET must not reach the origin as a POST"
+        );
+        Ok(())
+    }
+    .await;
+    shutdown.send(()).ok();
+    result
+}
