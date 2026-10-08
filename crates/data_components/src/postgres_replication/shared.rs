@@ -1025,6 +1025,32 @@ impl CommitChange for SharedLsnCommitter {
     fn supports_deferral(&self) -> bool {
         true
     }
+
+    fn try_absorb(&mut self, other: &dyn CommitChange) -> bool {
+        let Some(other) = other
+            .as_any()
+            .and_then(|other| other.downcast_ref::<Self>())
+        else {
+            return false;
+        };
+        if !Arc::ptr_eq(&self.slot, &other.slot)
+            || !Arc::ptr_eq(&self.watermark_notify, &other.watermark_notify)
+            || self.dataset != other.dataset
+        {
+            return false;
+        }
+        // Both source position updates are infallible monotonic maxima. The
+        // caller must retain the maximum storage fence of the absorbed commits.
+        if other.flush_to > self.flush_to {
+            self.flush_to = other.flush_to;
+            self.source_commit_ts_ms = other.source_commit_ts_ms;
+        }
+        true
+    }
+
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
+    }
 }
 
 /// A shared-slot `PostgreSQL` envelope before it crosses the member stream
@@ -6592,6 +6618,100 @@ mod tests {
         // And the member still counts as idle for crediting.
         ack.credit_idle(700);
         assert_eq!(ack.flush_lsn(), 700);
+    }
+
+    #[tokio::test]
+    async fn deferred_metadata_shared_committer_retains_real_position_and_notification() {
+        let slot = Arc::new(AckSlot::new(10, false));
+        let notify = Arc::new(Notify::new());
+        let make = |flush_to, source_commit_ts_ms| SharedLsnCommitter {
+            slot: Arc::clone(&slot),
+            watermark_notify: Arc::clone(&notify),
+            flush_to,
+            dataset: "customer".into(),
+            source_commit_ts_ms,
+        };
+        let mut committer = make(20, Some(2));
+        assert!(committer.try_absorb(&make(40, Some(4))));
+        assert!(committer.try_absorb(&make(30, None)));
+        assert_eq!(committer.flush_to, 40);
+        assert_eq!(committer.source_commit_ts_ms, Some(4));
+        assert_eq!(
+            slot.committed(),
+            10,
+            "coalescing cannot acknowledge the source"
+        );
+        assert_eq!(
+            slot.pending(),
+            0,
+            "coalescing cannot persist a source position"
+        );
+        committer.commit().await.expect("durable commit");
+        assert_eq!(slot.committed(), 40);
+        assert_eq!(slot.pending(), 40);
+        tokio::time::timeout(std::time::Duration::from_secs(1), notify.notified())
+            .await
+            .expect("the retained committer wakes the position writer");
+        committer.commit().await.expect("retry is idempotent");
+        assert_eq!(slot.committed(), 40);
+    }
+
+    #[test]
+    fn deferred_metadata_shared_committer_rejects_other_identity_without_mutation() {
+        let slot = Arc::new(AckSlot::new(10, false));
+        let notify = Arc::new(Notify::new());
+        let make = || SharedLsnCommitter {
+            slot: Arc::clone(&slot),
+            watermark_notify: Arc::clone(&notify),
+            flush_to: 20,
+            dataset: "customer".into(),
+            source_commit_ts_ms: Some(2),
+        };
+        let mut committer = make();
+        let mut other = make();
+        other.flush_to = 50;
+        other.slot = Arc::new(AckSlot::new(10, false));
+        assert!(
+            !committer.try_absorb(&other),
+            "another member or generation"
+        );
+        other = make();
+        other.watermark_notify = Arc::new(Notify::new());
+        assert!(!committer.try_absorb(&other), "another position writer");
+        other = make();
+        other.dataset = "stock".into();
+        assert!(!committer.try_absorb(&other), "another logical source");
+        assert!(!committer.try_absorb(&crate::cdc::NoOpCommitter));
+        assert_eq!(committer.flush_to, 20);
+        assert_eq!(committer.source_commit_ts_ms, Some(2));
+        assert_eq!(slot.committed(), 10);
+        assert_eq!(slot.pending(), 0);
+    }
+
+    #[test]
+    fn deferred_metadata_shared_committer_preserves_max_lsn_timestamp() {
+        let slot = Arc::new(AckSlot::new(0, false));
+        let notify = Arc::new(Notify::new());
+        let mut first = SharedLsnCommitter {
+            slot: Arc::clone(&slot),
+            watermark_notify: Arc::clone(&notify),
+            flush_to: u64::MAX - 1,
+            dataset: "customer".into(),
+            source_commit_ts_ms: Some(5),
+        };
+        let last = SharedLsnCommitter {
+            slot,
+            watermark_notify: notify,
+            flush_to: u64::MAX,
+            dataset: "customer".into(),
+            source_commit_ts_ms: None,
+        };
+        assert!(first.try_absorb(&last));
+        assert_eq!(first.flush_to, u64::MAX);
+        assert_eq!(
+            first.source_commit_ts_ms, None,
+            "timestamp belongs to the retained LSN"
+        );
     }
 
     #[tokio::test]

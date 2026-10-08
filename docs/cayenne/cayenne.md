@@ -751,7 +751,7 @@ The contract: the slot stays tied to the **persisted** tier (it never advances b
 
 ### Why the mem-tier is safe to lose
 
-The crash model is simple and is the reason `memory` mode is the default:
+For replayable CDC, the crash model is:
 
 - The live mem-tier structure is pure RAM; it is **discarded** on crash/restart. Its *sealed prefix*, though, has a durable shadow, recovered as the inline corpus on the next open — only the unsealed tail is truly lost.
 - The **source slot** is the single source of truth — it holds at most the last-sealed (or last-checkpointed) LSN.
@@ -759,6 +759,8 @@ The crash model is simple and is the reason `memory` mode is the default:
 - The load-bearing invariant, enforced by the `SlotAdvancer` callback: **the slot advances only after the covering seal's or checkpoint's Vortex/metastore writes are durable.**
 
 This trades a bounded crash-replay window — now the seal cadence (~2 s by default) rather than the checkpoint cadence — for the elimination of per-batch durability cost — a good bargain for a replayable CDC source. The tier is bounded on four axes so it can never OOM: a per-table byte cap (`cdc_mem_tier_max_bytes`), an age cap (`cdc_mem_tier_max_age_ms`), a periodic background tick, and a process-global `MemTierBudget` shared across a fleet of tables.
+
+**Rebuildable cache writes** can use this same RAM tier without a source slot. The change sink supplies an execution-scoped permission for the exact table; unmarked writes and other tables do not inherit it. Table-shape checks, memory limits, spills, sharded publication and background checkpoints still apply. Cache publication does not promise durability: an uncheckpointed response can be lost, and a keyed cache miss fetches the origin again. Durable CDC still requires its real source callback and covering checkpoint. A transition from buffered work to durable writes drains the tier first.
 
 ## Table statistics
 
