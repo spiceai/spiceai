@@ -5507,16 +5507,17 @@ impl CayenneTableProvider {
     ///    Old Vortex FILES are fine — they are self-describing and the scan
     ///    adapts them to the evolved schema (missing-column null-fill +
     ///    widened-type cast in the Vortex opener).
-    /// 4. Under one held `listing_fence.write()`: persist the evolved schema
-    ///    to the metastore (`update_table_schema`, or
-    ///    `update_table_schema_dropping_statistics` when a decimal scale
-    ///    change would mis-decode leftover unscaled min/max), swap the
-    ///    in-memory [`Self::table_schema`], re-derive the cached optimizer
-    ///    statistics at the new width (or drop them on a scale change),
-    ///    clear stale per-file statistics, and rebuild the listing table —
-    ///    so a scan observes either the old schema entirely or the new one
-    ///    entirely. In-flight scans keep the `SchemaRef` they already loaded
-    ///    (old files under the old schema stay valid).
+    /// 4. Hold `listing_fence.write()` and then
+    ///    `table_statistics_persistence_lock`, after checkpointing has finished.
+    ///    Persist the evolved schema, atomically dropping persisted statistics
+    ///    when a decimal scale change would mis-decode unscaled min/max or an
+    ///    outstanding live-row delta would leave a stale exact count after
+    ///    reopening. Swap the in-memory [`Self::table_schema`] and either drop
+    ///    cached optimizer statistics under the same invalidation conditions or
+    ///    re-derive them at the new width. Clear stale per-file statistics and
+    ///    rebuild the listing table, so a scan observes either the old schema
+    ///    entirely or the new one entirely. In-flight scans keep the `SchemaRef`
+    ///    they already loaded (old files under the old schema stay valid).
     ///
     /// Idempotent: re-applying a plan whose evolved schema is already live is
     /// a no-op; a crash between the metastore UPDATE and the swap is healed by
