@@ -1371,16 +1371,14 @@ impl RefreshTask {
         // write holds: a write that replaces the table, or an append it loads into an
         // empty table (which it confirms itself, refusing the append otherwise). An
         // append with no high-water mark reads the whole source, so into an empty
-        // acceleration it is such a load; a retention filter keeps it off that path.
+        // acceleration it is such a load.
         if dedup.versions_resolved_after_write
             && window_start.is_none()
             && self.sink.read().await.synchronized_tables().is_empty()
             && match update.update_type {
                 UpdateType::Overwrite => true,
                 UpdateType::Append => {
-                    dedup.appends_resolved_after_write
-                        && refresh.write_retention_sql_delete_expr.is_none()
-                        && self.acceleration_is_empty().await?
+                    dedup.appends_resolved_after_write && self.acceleration_is_empty().await?
                 }
                 UpdateType::Changes => false,
             }

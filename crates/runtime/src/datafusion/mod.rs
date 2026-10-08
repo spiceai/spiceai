@@ -3264,14 +3264,15 @@ impl DataFusion {
                         // keys as it writes them, ordered by the row versions the refresh
                         // supplies: in file mode after writing, in memory mode over the
                         // buffered write. Only file mode does so for an append into an
-                        // empty table.
+                        // empty table, and not when the table has `retention_sql`.
                         versions_resolved_after_write: acceleration_settings.engine
                             == Engine::Cayenne
                             && acceleration_settings.partition_by.is_empty(),
                         appends_resolved_after_write: acceleration_settings.engine
                             == Engine::Cayenne
                             && acceleration_settings.mode == Mode::File
-                            && acceleration_settings.partition_by.is_empty(),
+                            && acceleration_settings.partition_by.is_empty()
+                            && acceleration_settings.retention_sql.is_none(),
                     }
                 }),
         );
