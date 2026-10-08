@@ -18535,6 +18535,7 @@ dependencies = [
  "tools",
  "tracing",
  "tracing-futures",
+ "tracing-subscriber",
  "url",
  "util",
  "utoipa 5.5.0",
