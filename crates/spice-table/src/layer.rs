@@ -73,6 +73,12 @@ pub enum LayerWalk {
     RetentionDelete,
     /// Find where a dataset's indexes live.
     Index,
+    /// Serve a table as the table beneath it: the walk sees past a layer only
+    /// when a scan through that layer returns exactly the rows, columns, and
+    /// types of the table beneath, so what the walk reaches can be read in its
+    /// place. A layer that computes a column, answers from a copy, or filters
+    /// or masks rows is opaque here, and so is any layer that does not say.
+    Passthrough,
 }
 
 /// One capability stacked onto a dataset's provider.
@@ -93,8 +99,9 @@ pub trait TableLayer: Any + Send + Sync + Debug + 'static {
 
     /// Where `walk` continues, or `None` when it stops at this layer.
     ///
-    /// Defaults to the table beneath — transparent to everything. Two kinds of
-    /// layer override it:
+    /// Defaults to the table beneath — transparent to every walk except
+    /// [`LayerWalk::Passthrough`], which a layer must opt into by saying its
+    /// reads are unchanged. Two kinds of layer override it:
     ///
     /// * one that *is* what a walk looks for, or whose semantics a walk must
     ///   not route around, returns `None` for that walk;
@@ -116,8 +123,17 @@ pub trait TableLayer: Any + Send + Sync + Debug + 'static {
         walk: LayerWalk,
         below: &'a Arc<dyn TableProvider>,
     ) -> Option<&'a Arc<dyn TableProvider>> {
-        let _ = walk;
-        Some(below)
+        match walk {
+            LayerWalk::Read
+            | LayerWalk::CdcDetection
+            | LayerWalk::Source
+            | LayerWalk::Write
+            | LayerWalk::RetentionDelete
+            | LayerWalk::Index => Some(below),
+            // Serving the table beneath in this layer's place is only right
+            // when the layer is known not to change what a scan returns.
+            LayerWalk::Passthrough => None,
+        }
     }
 
     /// A second sub-stack `walk` must also reach, when this layer has one.
@@ -359,12 +375,20 @@ fn step(current: &dyn TableProvider, walk: LayerWalk) -> Option<&Arc<dyn TablePr
         return table.layer.route(walk, &table.below);
     }
     if let Some(adaptor) = current.downcast_ref::<FederatedTableProviderAdaptor>() {
-        // A write is not routed through federation, and an adaptor holding no
-        // physical provider is where the walk legitimately ends.
-        if walk == LayerWalk::Write {
-            return None;
-        }
-        return adaptor.table_provider.as_ref();
+        // An adaptor holding no physical provider is where the walk
+        // legitimately ends.
+        return match walk {
+            // A write is not routed through federation.
+            LayerWalk::Write => None,
+            // The adaptor answers scans from the provider it holds, so a walk
+            // for that provider, passthrough included, continues into it.
+            LayerWalk::Read
+            | LayerWalk::CdcDetection
+            | LayerWalk::Source
+            | LayerWalk::RetentionDelete
+            | LayerWalk::Index
+            | LayerWalk::Passthrough => adaptor.table_provider.as_ref(),
+        };
     }
     None
 }
@@ -690,6 +714,7 @@ mod tests {
                     self.source.as_ref()
                 }
                 LayerWalk::Write | LayerWalk::RetentionDelete | LayerWalk::Index => Some(below),
+                LayerWalk::Passthrough => None,
             }
         }
 
@@ -704,7 +729,8 @@ mod tests {
                 | LayerWalk::Source
                 | LayerWalk::CdcDetection
                 | LayerWalk::Write
-                | LayerWalk::RetentionDelete => None,
+                | LayerWalk::RetentionDelete
+                | LayerWalk::Passthrough => None,
             }
         }
     }
@@ -915,6 +941,7 @@ mod tests {
 #[cfg(test)]
 mod router_tests {
     use datafusion::arrow::datatypes::Schema;
+    use datafusion::datasource::MemTable;
     use datafusion::datasource::empty::EmptyTable;
 
     use super::tests::*;
@@ -1035,6 +1062,66 @@ mod router_tests {
         assert!(
             find_concrete::<EmptyTable>(router.as_ref(), LayerWalk::Write).is_none(),
             "a walk that means one side must not reach the other"
+        );
+    }
+
+    /// A layer that relies on the trait's default routing.
+    #[derive(Debug)]
+    struct DefaultRoutedLayer;
+
+    impl TableLayer for DefaultRoutedLayer {}
+
+    /// Serving the table beneath in a layer's place is only right when the
+    /// layer says its reads are unchanged, so a layer that does not say stops
+    /// the walk, whatever it lets other walks do.
+    #[test]
+    fn passthrough_stops_at_a_layer_that_does_not_opt_in() {
+        let top: Arc<dyn TableProvider> = SpiceTable::over(Arc::new(DefaultRoutedLayer), base());
+
+        assert!(
+            Arc::ptr_eq(peel_to(&top, LayerWalk::Passthrough), &top),
+            "a layer that does not opt in must stop the passthrough walk"
+        );
+        assert!(
+            peel_to(&top, LayerWalk::Read)
+                .downcast_ref::<MemTable>()
+                .is_some(),
+            "the default stays transparent to every other walk"
+        );
+    }
+
+    /// An accelerated table answers from its acceleration, so neither side
+    /// stands in for it, even with the source resolved.
+    #[test]
+    fn passthrough_stops_at_a_router() {
+        let source = layered_marker();
+        let router: Arc<dyn TableProvider> = SpiceTable::over(
+            Arc::new(TestRouter {
+                source: Some(Arc::clone(&source)),
+            }),
+            layered_marker(),
+        );
+
+        assert!(
+            Arc::ptr_eq(peel_to(&router, LayerWalk::Passthrough), &router),
+            "passthrough must not route to either side of a router"
+        );
+        assert!(
+            reached_within(peel_to(&router, LayerWalk::Read), &source),
+            "a read walk still reaches the source, which is why passthrough needs its own walk"
+        );
+    }
+
+    #[test]
+    fn passthrough_crosses_layers_that_leave_reads_unchanged() {
+        let indexed = SpiceTable::over(indexes_named("full_text"), base());
+        let top: Arc<dyn TableProvider> = SpiceTable::over(TestLayer::marker(), indexed);
+
+        assert!(
+            peel_to(&top, LayerWalk::Passthrough)
+                .downcast_ref::<MemTable>()
+                .is_some(),
+            "an index layer and a transparent marker add no columns, so the walk reaches the base"
         );
     }
 }
