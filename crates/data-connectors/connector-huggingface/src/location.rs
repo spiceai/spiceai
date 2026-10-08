@@ -247,6 +247,21 @@ impl DatasetLocation {
         &self.path
     }
 
+    /// The path alone, as a URL a file-extension detector can read: neither the revision
+    /// (`@v1.0`) nor the dataset's name (`my.dataset`) is a file extension.
+    #[must_use]
+    pub fn path_url(&self) -> String {
+        let mut url = url::Url::parse(&format!("{SCHEME}://{DATASETS}/"))
+            .unwrap_or_else(|_| unreachable!("a valid URL literal"));
+        if !self.path.is_empty() {
+            url.path_segments_mut()
+                .unwrap_or_else(|()| unreachable!("an hf:// URL with a host has path segments"))
+                .pop_if_empty()
+                .extend(self.path.split('/'));
+        }
+        url.to_string()
+    }
+
     /// Whether the location names a folder rather than a single file or a glob.
     #[must_use]
     pub fn is_folder(&self) -> bool {

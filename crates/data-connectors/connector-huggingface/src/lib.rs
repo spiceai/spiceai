@@ -291,7 +291,11 @@ impl HuggingFace {
             commit: commit.sha.clone(),
         };
 
-        let (file_format, extension) = listing.get_file_format_and_extension(dataset).await?;
+        // The format comes from the path inside the repository, never from the revision or
+        // the dataset's name.
+        let mut format_view = dataset.clone();
+        format_view.from = location.path_url();
+        let (file_format, extension) = listing.get_file_format_and_extension(&format_view).await?;
         let Some(file_format) = file_format else {
             return Err(DataConnectorError::InvalidConfigurationNoSource {
                 dataconnector: CONNECTOR_NAME.to_string(),
@@ -389,7 +393,7 @@ impl HuggingFace {
                 ExposedParamLookup::Present(_)
             )
         };
-        let from_names_format = detect_file_extension_from_url_or_path(&dataset.from)
+        let from_names_format = detect_file_extension_from_url_or_path(&location.path_url())
             .is_some_and(|extension| extension.format_extension.is_some());
         if named("file_format") || named("file_extension") || from_names_format {
             return Ok(None);

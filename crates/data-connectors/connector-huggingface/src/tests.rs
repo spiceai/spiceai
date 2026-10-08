@@ -642,6 +642,12 @@ fn connector(mock: &Mock, token: Option<&str>, params: &[(&str, &str)]) -> Huggi
     }
 }
 
+/// A session configured as Spice configures its own: among other things, listing a folder
+/// includes the files in its subfolders.
+fn session() -> SessionContext {
+    SessionContext::new_with_config(runtime_datafusion::session_config::get_df_default_config())
+}
+
 async fn query(ctx: &SessionContext, sql: &str) -> Vec<RecordBatch> {
     ctx.sql(sql)
         .await
@@ -700,7 +706,7 @@ async fn scans_read_one_commit_and_follow_the_branch() {
     let registered = table.schema();
 
     // A session that has never seen the store: the scan registers it.
-    let ctx = SessionContext::new();
+    let ctx = session();
     ctx.register_table("t", Arc::clone(&table))
         .expect("the table registers");
     let batches = query(&ctx, "SELECT id, name, score FROM t ORDER BY id").await;
@@ -770,7 +776,7 @@ async fn a_single_file_and_a_glob_select_their_files() {
     );
     mock.branch("o/files", "main", C1);
     let connector = connector(&mock, None, &[]);
-    let ctx = SessionContext::new();
+    let ctx = session();
 
     let file = DatasetSpec::new(
         "hf://datasets/o/files/data/test-0.parquet",
@@ -830,7 +836,7 @@ async fn a_glob_infers_its_schema_from_the_files_it_selects() {
         .map(|f| f.name().clone())
         .collect();
     assert_eq!(names, ["id", "name"]);
-    let ctx = SessionContext::new();
+    let ctx = session();
     ctx.register_table("t", table).expect("registered");
     let batches = query(&ctx, "SELECT id, name FROM t ORDER BY id").await;
     assert_eq!(
@@ -854,7 +860,7 @@ async fn a_csv_commit_with_reordered_columns_fails_instead_of_misreading() {
     mock.branch("o/csvmove", "main", C1);
     let connector = connector(&mock, None, &[]);
     let dataset = DatasetSpec::new("hf://datasets/o/csvmove/data/", TableReference::bare("t"));
-    let ctx = SessionContext::new();
+    let ctx = session();
     ctx.register_table("t", connector.table(&dataset).await.expect("registers"))
         .expect("registered");
     let sql = "SELECT id, name, city FROM t ORDER BY id";
@@ -951,7 +957,7 @@ async fn csv_files_whose_columns_disagree_fail_registration() {
     );
     mock.branch("o/csvmixed", "main", C2);
     connector.store.hub().forget_revisions();
-    let ctx = SessionContext::new();
+    let ctx = session();
     ctx.register_table("t", connector.table(&dataset).await.expect("registers"))
         .expect("registered");
     let batches = query(&ctx, "SELECT id, name, city FROM t ORDER BY id").await;
@@ -1004,7 +1010,7 @@ async fn each_token_reads_through_its_own_store() {
         "hf://datasets/o/shared/a.parquet",
         TableReference::bare("t"),
     );
-    let ctx = SessionContext::new();
+    let ctx = session();
     ctx.register_table("one", one.table(&dataset).await.expect("registers"))
         .expect("registered");
     ctx.register_table("two", two.table(&dataset).await.expect("registers"))
@@ -1029,6 +1035,68 @@ async fn each_token_reads_through_its_own_store() {
     }
 }
 
+/// A revision or a dataset name with a dot is not a file extension: the format of a whole
+/// repository is inferred from its files.
+#[tokio::test(flavor = "multi_thread")]
+async fn dots_in_a_revision_or_name_are_not_file_extensions() {
+    let mock = Mock::start().await;
+    mock.commit(
+        "o/my.data",
+        C1,
+        vec![
+            ("README.md", text("# A dataset\n")),
+            ("data/part-0.parquet", parquet(&rows(0..5))),
+        ],
+    );
+    mock.branch("o/my.data", "v1.0", C1);
+    mock.branch("o/my.data", "release.csv", C1);
+    mock.commit(
+        "o/csvtag",
+        C1,
+        vec![("data/a.csv", text("id,name\n1,one\n"))],
+    );
+    mock.branch("o/csvtag", "v1.gz", C1);
+    let inferred = connector(&mock, None, &[]);
+    let named = connector(&mock, None, &[("file_format", "parquet")]);
+    let ctx = session();
+    for (name, from, connector) in [
+        ("tagged", "hf://datasets/o/my.data@v1.0", &inferred),
+        (
+            "csv_named",
+            "hf://datasets/o/my.data@release.csv/",
+            &inferred,
+        ),
+        ("tagged_parquet", "hf://datasets/o/my.data@v1.0", &named),
+    ] {
+        let dataset = DatasetSpec::new(from, TableReference::bare(name));
+        ctx.register_table(
+            name,
+            connector
+                .table(&dataset)
+                .await
+                .unwrap_or_else(|e| panic!("{from}: {e}")),
+        )
+        .expect("registered");
+        assert_rows(
+            &query(&ctx, &format!("SELECT * FROM {name} ORDER BY id")).await,
+            &rows(0..5),
+        );
+    }
+
+    // A tag that looks like a compression suffix does not make plain CSV read as gzip.
+    let csv = connector(&mock, None, &[("file_format", "csv")]);
+    let dataset = DatasetSpec::new("hf://datasets/o/csvtag@v1.gz", TableReference::bare("c"));
+    ctx.register_table("c", csv.table(&dataset).await.expect("registers"))
+        .expect("registered");
+    let batches = query(&ctx, "SELECT id, name FROM c").await;
+    assert_eq!(
+        arrow::util::pretty::pretty_format_batches(&batches)
+            .expect("printable")
+            .to_string(),
+        "+----+------+\n| id | name |\n+----+------+\n| 1  | one  |\n+----+------+"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn csv_and_jsonl_files_are_read_through_the_hub_cache() {
     let mock = Mock::start().await;
@@ -1045,7 +1113,7 @@ async fn csv_and_jsonl_files_are_read_through_the_hub_cache() {
     );
     mock.branch("o/text", "main", C1);
     let connector = connector(&mock, None, &[]);
-    let ctx = SessionContext::new();
+    let ctx = session();
     for (name, from) in [
         ("c", "hf://datasets/o/text/csv/"),
         ("j", "hf://datasets/o/text/jsonl/"),
@@ -1130,7 +1198,7 @@ async fn a_folder_of_mixed_formats_asks_for_a_narrower_location() {
 
     // `file_format` settles it.
     let connector = self::connector(&mock, None, &[("file_format", "csv")]);
-    let ctx = SessionContext::new();
+    let ctx = session();
     ctx.register_table("t", connector.table(&mixed).await.expect("csv registers"))
         .expect("registered");
     let batches = query(&ctx, "SELECT count(*) AS n FROM t").await;
@@ -1224,7 +1292,7 @@ async fn the_token_is_sent_to_the_hub_and_never_to_the_cdn() {
 
     let authorized = connector(&mock, Some(TOKEN), &[]);
     mock.clear_seen();
-    let ctx = SessionContext::new();
+    let ctx = session();
     ctx.register_table("t", authorized.table(&dataset).await.expect("registers"))
         .expect("registered");
     assert_rows(

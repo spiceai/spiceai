@@ -1196,6 +1196,9 @@ fn next_page(headers: &HeaderMap, endpoint: &Url) -> Result<Option<Url>, String>
         .and_then(|target| endpoint.join(target).ok())
         .ok_or_else(|| format!("the listing's next page {target:?} is not a valid URL"))?;
     if url.origin() != endpoint.origin() {
+        // A mirror served under a path (`https://host/proxy`) serves the Hub's paths below it.
+        let path = format!("{}{}", endpoint.path().trim_end_matches('/'), url.path());
+        url.set_path(&path);
         let rebased = url.set_scheme(endpoint.scheme()).is_ok()
             && url.set_host(endpoint.host_str()).is_ok()
             && url.set_port(endpoint.port()).is_ok();
@@ -1346,6 +1349,22 @@ mod tests {
             Ok(None)
         );
         assert_eq!(next_page(&HeaderMap::new(), &endpoint), Ok(None));
+        // A mirror under a path keeps it.
+        let proxy = url("https://artifacts.example/api/huggingfaceml/hf-remote");
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            LINK,
+            HeaderValue::from_static(
+                "<https://huggingface.co/api/datasets/o/d/tree/main?cursor=abc>; rel=\"next\"",
+            ),
+        );
+        assert_eq!(
+            next_page(&headers, &proxy).map(|page| page.map(|u| u.to_string())),
+            Ok(Some(
+                "https://artifacts.example/api/huggingfaceml/hf-remote/api/datasets/o/d/tree/main?cursor=abc"
+                    .to_string()
+            ))
+        );
         assert_eq!(
             next("https://hf-mirror.example/x; rel=\"next\""),
             Err(
