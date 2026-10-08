@@ -5921,9 +5921,10 @@ mod tests {
             &batch_write_tx,
             CacheNamespace::Public,
         );
-
-        // The background refresh owns the only sender: once it has queued its
-        // write and finished, the writer flushes that write and exits.
+        // `handle_cache_hit` clones the sender it is lent, so dropping this one
+        // leaves the background refresh holding the only sender: once it has queued
+        // its write and finished, the writer flushes that write and exits.
+        drop(batch_write_tx);
         await_writer_exit(consumer_handle).await;
 
         // Verify the federated source was called with the SPECIFIC filters only
