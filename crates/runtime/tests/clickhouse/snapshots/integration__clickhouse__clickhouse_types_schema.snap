@@ -18,3 +18,4 @@ u128: Decimal256(39, 0)
 i128: Decimal256(39, 0)
 ipv4: Utf8
 ipv6: Utf8
+nested: List(Struct("id": Int32, "tags": Map("entries": non-null Struct("keys": non-null Utf8, "values": List(Int32)), unsorted)))
