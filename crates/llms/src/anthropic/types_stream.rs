@@ -140,9 +140,14 @@ pub struct ContentBlockToolUse {
 #[serde(tag = "type")]
 pub(crate) enum Delta {
     #[serde(rename = "text_delta")]
-    TextDelta { text: String },
+    Text { text: String },
     #[serde(rename = "input_json_delta")]
-    InputJsonDelta { partial_json: String },
+    InputJson { partial_json: String },
+    /// Sent when extended thinking is enabled. `OpenAI`'s format has no equivalent, so it is dropped.
+    #[serde(rename = "thinking_delta")]
+    Thinking { thinking: String },
+    #[serde(rename = "signature_delta")]
+    Signature { signature: String },
 }
 
 impl Delta {
@@ -152,7 +157,7 @@ impl Delta {
         tool_content: Option<&ContentBlockToolUse>,
     ) -> ChatCompletionStreamResponseDelta {
         match (self, tool_content) {
-            (Delta::TextDelta { text }, _) => ChatCompletionStreamResponseDelta {
+            (Delta::Text { text }, _) => ChatCompletionStreamResponseDelta {
                 content: Some(text),
                 function_call: None,
                 tool_calls: None,
@@ -164,7 +169,7 @@ impl Delta {
                 },
             },
             (
-                Delta::InputJsonDelta { partial_json },
+                Delta::InputJson { partial_json },
                 Some(ContentBlockToolUse {
                     id, name: _name, ..
                 }),
@@ -188,20 +193,24 @@ impl Delta {
                 },
             },
 
-            // This should never happen, but we need to handle it as an 'empty' response.
-            (Delta::InputJsonDelta { partial_json: _ }, None) => {
-                ChatCompletionStreamResponseDelta {
-                    content: None,
-                    function_call: None,
-                    tool_calls: None,
-                    refusal: None,
-                    role: match role {
-                        Some(MessageRole::Assistant) => Some(Role::Assistant),
-                        Some(MessageRole::User) => Some(Role::User),
-                        None => None,
-                    },
-                }
-            }
+            // A tool delta without its block should never happen, and thinking has no OpenAI
+            // equivalent. Both become an 'empty' response.
+            (
+                Delta::InputJson { partial_json: _ }
+                | Delta::Thinking { thinking: _ }
+                | Delta::Signature { signature: _ },
+                _,
+            ) => ChatCompletionStreamResponseDelta {
+                content: None,
+                function_call: None,
+                tool_calls: None,
+                refusal: None,
+                role: match role {
+                    Some(MessageRole::Assistant) => Some(Role::Assistant),
+                    Some(MessageRole::User) => Some(Role::User),
+                    None => None,
+                },
+            },
         }
     }
 }
@@ -620,6 +629,23 @@ mod tests {
             model: "claude-sonnet-5".to_string(),
             model_from_default: false,
             controls,
+        }
+    }
+
+    #[test]
+    fn thinking_deltas_deserialize_and_yield_no_content() {
+        for payload in [
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"abc"}}"#,
+        ] {
+            let MessageCreateStreamResponse::ContentBlockDelta { delta, .. } =
+                serde_json::from_str(payload).expect("thinking delta should deserialize")
+            else {
+                panic!("expected a content block delta");
+            };
+            let out = delta.into_completion(Some(&MessageRole::Assistant), None);
+            assert!(out.content.is_none());
+            assert!(out.tool_calls.is_none());
         }
     }
 
