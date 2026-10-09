@@ -290,6 +290,15 @@ pub enum AcceleratedTableBuilderError {
 
 pub type AcceleratedTableBuilderResult<T> = std::result::Result<T, AcceleratedTableBuilderError>;
 
+impl AcceleratedTableBuilderError {
+    /// Whether [`Builder::build`] may have started producers or accepted writes
+    /// before failing. A rejected setting fails before anything starts.
+    #[must_use]
+    pub fn may_have_started_ingestion(&self) -> bool {
+        matches!(self, Self::AcceleratedTableError { .. })
+    }
+}
+
 // An accelerated table consists of a federated table and a local accelerator.
 //
 // The accelerator must support inserts.

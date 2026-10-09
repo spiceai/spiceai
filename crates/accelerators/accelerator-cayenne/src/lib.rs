@@ -4172,7 +4172,11 @@ impl DataAccelerator for CayenneAccelerator {
     ) -> bool {
         matches!(
             error.downcast_ref::<Error>(),
-            Some(Error::InvalidConfiguration { .. })
+            Some(
+                Error::InvalidConfiguration { .. }
+                    | Error::InvalidScanConcurrency { .. }
+                    | Error::UnsupportedDataTypes { .. }
+            )
         )
     }
 

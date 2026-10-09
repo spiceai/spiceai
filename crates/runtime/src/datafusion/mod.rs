@@ -1056,6 +1056,15 @@ fn initialization_error(error: DataFusionError, dataset_name: String) -> Error {
     }
 }
 
+/// A drain that never succeeds, for a failed build whose producers nothing stopped.
+fn unproven_cleanup() -> runtime_acceleration::change_sink::Publication {
+    let (_, receiver) =
+        tokio::sync::watch::channel(Some(Err(Arc::new(DataFusionError::Execution(
+            "the failed build may have started work that nothing stopped".into(),
+        )))));
+    runtime_acceleration::change_sink::Publication::Pending(receiver)
+}
+
 /// Report a table build's own failure as such, and anything else as a lifecycle failure.
 fn construction_error(error: DataFusionError, dataset_name: String) -> Error {
     match error {
@@ -3551,7 +3560,7 @@ impl DataFusion {
                 } else {
                     None
                 };
-                let mut table = df
+                let mut table = match df
                     .build_accelerated_table(
                         &dataset,
                         Arc::clone(&source),
@@ -3561,7 +3570,20 @@ impl DataFusion {
                         initial_partition_filters,
                     )
                     .await
-                    .map_err(|error| DataFusionError::External(Box::new(error)))?;
+                {
+                    Ok(table) => table,
+                    // The table that would drain what the builder started is gone.
+                    Err(error)
+                        if matches!(
+                            &error,
+                            Error::UnableToBuildAcceleratedTable { source, .. }
+                                if source.may_have_started_ingestion()
+                        ) =>
+                    {
+                        return Ok(GenerationOwner::new(Err(error), unproven_cleanup));
+                    }
+                    Err(error) => return Err(DataFusionError::External(Box::new(error))),
+                };
                 let hook_result = if registration_hook {
                     source
                         .on_accelerated_table_registration(&dataset, &mut table)
