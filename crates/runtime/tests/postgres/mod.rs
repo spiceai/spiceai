@@ -29,6 +29,8 @@ use datafusion_table_providers::{
 use crate::{init_tracing, utils::test_request_context};
 
 #[cfg(feature = "postgres")]
+pub mod aggregate_clause_pushdown;
+#[cfg(feature = "postgres")]
 pub mod catalog;
 #[cfg(feature = "postgres")]
 pub mod catalog_changes;
