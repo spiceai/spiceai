@@ -4166,6 +4166,16 @@ impl DataAccelerator for CayenneAccelerator {
         }
     }
 
+    fn rejects_configuration(
+        &self,
+        error: &(dyn std::error::Error + Send + Sync + 'static),
+    ) -> bool {
+        matches!(
+            error.downcast_ref::<Error>(),
+            Some(Error::InvalidConfiguration { .. })
+        )
+    }
+
     fn prefix(&self) -> &'static str {
         "cayenne"
     }

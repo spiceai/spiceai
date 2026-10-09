@@ -589,6 +589,9 @@ impl Error {
     /// is the conservative one.
     #[must_use]
     pub(crate) fn is_retriable(&self) -> bool {
+        if let Self::UnableToCreateDataAccelerator { source } = self {
+            return source.is_retriable();
+        }
         !matches!(
             self,
             // Invalid `refresh_sql` / `retention_sql` in the Spicepod.
@@ -1041,6 +1044,23 @@ fn initialization_error(error: DataFusionError, dataset_name: String) -> Error {
             Ok(error) => Error::AcceleratorInitialization {
                 source: error.source,
             },
+            Err(error) => Error::UnableToDrainChanges {
+                dataset_name,
+                source: DataFusionError::External(error),
+            },
+        },
+        error => Error::UnableToDrainChanges {
+            dataset_name,
+            source: error,
+        },
+    }
+}
+
+/// Report a table build's own failure as such, and anything else as a lifecycle failure.
+fn construction_error(error: DataFusionError, dataset_name: String) -> Error {
+    match error {
+        DataFusionError::External(error) => match error.downcast::<Error>() {
+            Ok(error) => *error,
             Err(error) => Error::UnableToDrainChanges {
                 dataset_name,
                 source: DataFusionError::External(error),
@@ -3561,7 +3581,7 @@ impl DataFusion {
                 ))
             })
             .await
-            .context(UnableToDrainChangesSnafu { dataset_name: name })?;
+            .map_err(|error| construction_error(error, name))?;
         Ok(PreparedAcceleratedTable {
             generation: generation.try_map(|result| result)?,
             bootstrap: bootstrap.owner,
