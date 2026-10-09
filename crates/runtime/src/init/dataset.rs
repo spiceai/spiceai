@@ -2454,6 +2454,11 @@ impl Runtime {
         if let Some((param, writes)) = pk_conflict_detection_refusal(
             acceleration_settings,
             data_connector.resolve_refresh_mode(acceleration_settings.refresh_mode),
+            crate::datafusion::select_accelerated_write_mode(
+                ds.source(),
+                ds.access().allows_write(),
+                acceleration_settings.write_mode,
+            ),
         ) {
             crate::PkConflictDetectionDisabledSnafu {
                 dataset_name: ds.name.to_string(),
@@ -3411,7 +3416,8 @@ enum KeyedWrites {
     WriteBack,
     /// `refresh_mode: changes`: the source's changes replace stored rows.
     Changes,
-    /// `write_mode: acceleration`: writes land only in the accelerator.
+    /// Writes land only in the accelerator: `write_mode: acceleration`, or a
+    /// `sink` source.
     AcceleratorWrites,
 }
 
@@ -3425,14 +3431,16 @@ impl KeyedWrites {
                 "this dataset applies its source's changes ('refresh_mode: changes'), so a change to an existing key would add a second row for that key instead of replacing it"
             }
             Self::AcceleratorWrites => {
-                "this dataset keeps its writes in the accelerator ('acceleration.write_mode: acceleration'), so a write to an existing key would add a second row for that key instead of replacing it"
+                "this dataset keeps its writes in the accelerator ('acceleration.write_mode: acceleration', or a 'sink' source), so a write to an existing key would add a second row for that key instead of replacing it"
             }
         }
     }
 }
 
 /// The conflict-detection parameter to refuse, and the keyed writes it would
-/// break, for an acceleration whose refresh mode resolves to `refresh_mode`.
+/// break, for an acceleration whose refresh mode resolves to `refresh_mode` and
+/// whose writes are routed as `write_mode` (`select_accelerated_write_mode`, so a
+/// dataset that cannot be written is judged by its refresh alone).
 ///
 /// With the check off, a staged upsert neither supersedes the stored row for
 /// its key nor records the key for write-back delivery, so every configuration
@@ -3444,13 +3452,15 @@ impl KeyedWrites {
 fn pk_conflict_detection_refusal(
     acceleration: &Acceleration,
     refresh_mode: RefreshMode,
+    write_mode: crate::datafusion::AcceleratedWriteMode,
 ) -> Option<(&'static str, KeyedWrites)> {
+    use crate::datafusion::AcceleratedWriteMode;
     let param = data_accelerator_api::cayenne_pk_conflict_detection_disabled_by(acceleration)?;
-    let writes = match (&acceleration.write_mode, refresh_mode) {
-        (spicepod::acceleration::WriteMode::WriteBack, _) => KeyedWrites::WriteBack,
+    let writes = match (write_mode, refresh_mode) {
+        (AcceleratedWriteMode::WriteBack, _) => KeyedWrites::WriteBack,
         (_, RefreshMode::Changes) => KeyedWrites::Changes,
-        (spicepod::acceleration::WriteMode::Acceleration, _) => KeyedWrites::AcceleratorWrites,
-        _ => return None,
+        (AcceleratedWriteMode::AcceleratorOnly, _) => KeyedWrites::AcceleratorWrites,
+        (AcceleratedWriteMode::WriteThrough, _) => return None,
     };
     Some((param, writes))
 }
@@ -4297,35 +4307,96 @@ mod tests {
     fn pk_conflict_detection_none_is_refused_wherever_a_stored_key_is_rewritten() {
         use spicepod::acceleration::WriteMode;
         let none = [("cayenne_pk_conflict_detection", "none")];
-        for (write_mode, refresh_mode, expected) in [
+        // (source, writable, configured write mode, resolved refresh mode, refusal)
+        for (source, writable, write_mode, refresh_mode, expected) in [
             (
+                "postgres",
+                true,
                 WriteMode::WriteBack,
                 RefreshMode::Changes,
                 Some(KeyedWrites::WriteBack),
             ),
             (
+                "postgres",
+                true,
                 WriteMode::WriteThrough,
                 RefreshMode::Changes,
                 Some(KeyedWrites::Changes),
             ),
             (
+                "postgres",
+                false,
+                WriteMode::WriteThrough,
+                RefreshMode::Changes,
+                Some(KeyedWrites::Changes),
+            ),
+            (
+                "postgres",
+                true,
                 WriteMode::Acceleration,
                 RefreshMode::Full,
                 Some(KeyedWrites::AcceleratorWrites),
             ),
             (
+                "postgres",
+                true,
                 WriteMode::Acceleration,
                 RefreshMode::Append,
                 Some(KeyedWrites::AcceleratorWrites),
             ),
-            (WriteMode::WriteThrough, RefreshMode::Full, None),
-            (WriteMode::WriteThrough, RefreshMode::Append, None),
-            (WriteMode::WriteThrough, RefreshMode::Disabled, None),
+            // A sink source keeps every write in the accelerator, whatever
+            // `write_mode` says.
+            (
+                "sink",
+                true,
+                WriteMode::WriteThrough,
+                RefreshMode::Disabled,
+                Some(KeyedWrites::AcceleratorWrites),
+            ),
+            // A dataset that cannot be written takes no accelerator write, so only
+            // its refresh is judged.
+            (
+                "postgres",
+                false,
+                WriteMode::Acceleration,
+                RefreshMode::Full,
+                None,
+            ),
+            (
+                "postgres",
+                false,
+                WriteMode::WriteBack,
+                RefreshMode::Full,
+                None,
+            ),
+            (
+                "postgres",
+                true,
+                WriteMode::WriteThrough,
+                RefreshMode::Full,
+                None,
+            ),
+            (
+                "postgres",
+                true,
+                WriteMode::WriteThrough,
+                RefreshMode::Append,
+                None,
+            ),
+            (
+                "postgres",
+                true,
+                WriteMode::WriteThrough,
+                RefreshMode::Disabled,
+                None,
+            ),
         ] {
-            let label = format!("{write_mode:?} + {refresh_mode:?}");
+            let label = format!("{source} writable={writable} {write_mode:?} + {refresh_mode:?}");
             let acceleration = acceleration_with_params(write_mode, &none);
+            let routed =
+                crate::datafusion::select_accelerated_write_mode(source, writable, write_mode);
             assert_eq!(
-                pk_conflict_detection_refusal(&acceleration, refresh_mode),
+                pk_conflict_detection_refusal(&acceleration, refresh_mode, routed),
                 expected.map(|writes| ("cayenne_pk_conflict_detection", writes)),
                 "{label}"
             );
@@ -4354,8 +4425,12 @@ mod tests {
         ] {
             let acceleration = acceleration_with_params(WriteMode::WriteThrough, &params);
             assert_eq!(
-                pk_conflict_detection_refusal(&acceleration, RefreshMode::Changes)
-                    .map(|(param, _)| param),
+                pk_conflict_detection_refusal(
+                    &acceleration,
+                    RefreshMode::Changes,
+                    crate::datafusion::AcceleratedWriteMode::WriteThrough
+                )
+                .map(|(param, _)| param),
                 expected,
                 "{params:?}"
             );
@@ -4373,7 +4448,12 @@ mod tests {
         ] {
             let refused = acceleration_with_params(WriteMode::WriteThrough, &params);
             assert!(
-                pk_conflict_detection_refusal(&refused, RefreshMode::Changes).is_some(),
+                pk_conflict_detection_refusal(
+                    &refused,
+                    RefreshMode::Changes,
+                    crate::datafusion::AcceleratedWriteMode::WriteThrough
+                )
+                .is_some(),
                 "{params:?}: none on a CDC dataset is refused"
             );
             let advice = pk_conflict_detection_advice(&refused);
@@ -4386,7 +4466,11 @@ mod tests {
                 advised.params.remove("pk_conflict_detection");
             }
             assert_eq!(
-                pk_conflict_detection_refusal(&advised, RefreshMode::Changes),
+                pk_conflict_detection_refusal(
+                    &advised,
+                    RefreshMode::Changes,
+                    crate::datafusion::AcceleratedWriteMode::WriteThrough
+                ),
                 None,
                 "{params:?}: following {advice:?} must load"
             );
@@ -4402,7 +4486,11 @@ mod tests {
             ..acceleration_with_params(WriteMode::WriteThrough, &none)
         };
         assert_eq!(
-            pk_conflict_detection_refusal(&not_cayenne, RefreshMode::Changes),
+            pk_conflict_detection_refusal(
+                &not_cayenne,
+                RefreshMode::Changes,
+                crate::datafusion::AcceleratedWriteMode::WriteThrough
+            ),
             None,
             "only Cayenne reads the parameter"
         );

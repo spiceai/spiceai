@@ -861,8 +861,9 @@ fn with_pk_conflict_detection_none(mut dataset: Dataset) -> Dataset {
 /// staged upsert neither replaces the stored row for its key nor records the key
 /// for write-back delivery, so a CDC or write-back dataset would keep duplicate
 /// rows or acknowledge writes it never delivers. Registration refuses both,
-/// permanently, with the setting to change; a dataset beside them without the
-/// setting loads and follows the source.
+/// permanently, with the setting to change. A dataset beside them without the
+/// setting loads and follows the source, and so does a read-only full-refresh
+/// dataset with the setting: it takes no writes, whatever its `write_mode`.
 #[tokio::test(flavor = "multi_thread")]
 async fn pk_conflict_detection_none_is_refused_for_keyed_cdc_and_write_back()
 -> Result<(), anyhow::Error> {
@@ -875,7 +876,7 @@ async fn pk_conflict_detection_none_is_refused_for_keyed_cdc_and_write_back()
             let container = common::start_postgres_docker_container_with_logical_wal().await?;
             let port = usize::from(container.host_port(5432)?);
             let source = connect(port).await?;
-            for table in ["pkd_cdc", "pkd_wb", "pkd_ctl"] {
+            for table in ["pkd_cdc", "pkd_wb", "pkd_ctl", "pkd_ro"] {
                 exec(
                     &source,
                     &format!("CREATE TABLE public.{table} (id int PRIMARY KEY, n int NOT NULL)"),
@@ -906,6 +907,20 @@ async fn pk_conflict_detection_none_is_refused_for_keyed_cdc_and_write_back()
                     accel.path(),
                     WriteMode::WriteThrough,
                 ),
+                {
+                    let mut read_only = with_pk_conflict_detection_none(cdc_dataset(
+                        port,
+                        "pkd_ro",
+                        None,
+                        accel.path(),
+                        WriteMode::Acceleration,
+                    ));
+                    read_only.access = AccessMode::Read;
+                    if let Some(acceleration) = read_only.acceleration.as_mut() {
+                        acceleration.refresh_mode = Some(RefreshMode::Full);
+                    }
+                    read_only
+                },
             ];
 
             register_test_connectors().await;
@@ -953,6 +968,18 @@ async fn pk_conflict_detection_none_is_refused_for_keyed_cdc_and_write_back()
                     status(table)
                 );
             }
+
+            // A read-only dataset takes no accelerator writes, so the setting is
+            // not refused there: it loads its full refresh.
+            let loaded = crate::utils::wait_until_true(Duration::from_secs(60), || async {
+                matches!(status("pkd_ro"), Some(ComponentStatus::Ready))
+            })
+            .await;
+            assert!(loaded, "pkd_ro must load, got {:?}", status("pkd_ro"));
+            assert_eq!(
+                accel_scalar(&rt, "SELECT n FROM pkd_ro WHERE id = 1").await?,
+                Some(10)
+            );
 
             // The dataset without the setting loads and follows the source.
             wait_for_bootstrap(&rt, "pkd_ctl").await?;
