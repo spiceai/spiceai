@@ -79,7 +79,7 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
             TestType::Benchmark => {
                 for bench in &test_file.tests.bench {
                     let runs = bench
-                        .expand_source_versions()
+                        .expand_runs()
                         .map_err(|e| anyhow::anyhow!("Failed to read {}: {e}", path.display()))?;
                     for run in runs {
                         tests_to_dispatch.push((

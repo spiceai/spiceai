@@ -62,7 +62,7 @@ pub(crate) async fn run(args: &HtapArgs) -> anyhow::Result<()> {
         SourceType::Postgres => "postgres",
         SourceType::Mysql => "mysql",
     };
-    let (app, mut start_request) = super::get_app_and_start_request(&test_args.common).await?;
+    let (app, mut start_request) = super::get_htap_app_and_start_request(test_args).await?;
 
     let query_set = test_args.load_query_set()?;
     if !matches!(query_set, QuerySet::ChBench) {

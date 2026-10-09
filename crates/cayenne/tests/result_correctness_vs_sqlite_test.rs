@@ -293,7 +293,7 @@ async fn sqllancer_corpus_parity_vs_sqlite() {
 /// DuckDB and chDB lanes compare at SF1.
 #[tokio::test(flavor = "multi_thread")]
 async fn tpch_full_result_parity_vs_sqlite() {
-    use support::oracle_lane::run_fixture_suite;
+    use support::oracle_lane::run_fixture_suite_with_layouts;
     use support::sqlite_engine::SqliteOracle;
     use support::{LoadMode, TPCH_TABLES};
     use test_framework::queries::get_tpch_test_queries;
@@ -303,13 +303,17 @@ async fn tpch_full_result_parity_vs_sqlite() {
     support::tpch_data::ensure_tpch_fixture(&parquet_dir, sf);
 
     let sqlite = SqliteOracle::from_parquet(&parquet_dir, TPCH_TABLES).await;
-    let results = run_fixture_suite(
+    let results = run_fixture_suite_with_layouts(
         &sqlite,
         &parquet_dir,
         TPCH_TABLES,
         "tpch",
         &get_tpch_test_queries(None),
         &[LoadMode::Full],
+        &support::with_layouts(
+            &test_framework::queries::QuerySet::Tpch,
+            support::KEYED_LAYOUTS,
+        ),
         Clone::clone,
     )
     .await;
@@ -326,19 +330,23 @@ async fn tpch_full_result_parity_vs_sqlite() {
 #[tokio::test(flavor = "multi_thread")]
 async fn clickbench_full_result_parity_vs_sqlite() {
     use support::LoadMode;
-    use support::oracle_lane::run_fixture_suite;
+    use support::oracle_lane::run_fixture_suite_with_layouts;
     use support::sqlite_engine::SqliteOracle;
     use test_framework::queries::get_clickbench_test_queries;
 
     let hits_dir = support::clickbench_data::hits_fixture_dir();
     let sqlite = SqliteOracle::from_parquet(hits_dir.path(), &["hits"]).await;
-    let results = run_fixture_suite(
+    let results = run_fixture_suite_with_layouts(
         &sqlite,
         hits_dir.path(),
         &["hits"],
         "clickbench",
         &get_clickbench_test_queries(None),
         &[LoadMode::Full],
+        &support::with_layouts(
+            &test_framework::queries::QuerySet::Clickbench,
+            support::UNKEYED_LAYOUTS,
+        ),
         Clone::clone,
     )
     .await;
@@ -358,7 +366,7 @@ async fn clickbench_full_result_parity_vs_sqlite() {
 /// SF1, where nine of those 19 answer.
 #[tokio::test(flavor = "multi_thread")]
 async fn tpcds_full_result_parity_vs_sqlite() {
-    use support::oracle_lane::run_fixture_suite;
+    use support::oracle_lane::run_fixture_suite_with_layouts;
     use support::sqlite_engine::SqliteOracle;
     use support::tpcds_data::{TPCDS_TABLES, ensure_tpcds_fixture};
     use test_framework::queries::get_tpcds_test_queries;
@@ -367,13 +375,17 @@ async fn tpcds_full_result_parity_vs_sqlite() {
     let dir = support::scratch_dir().join(format!("tpcds_tpcdsgen_sf{sf}"));
     ensure_tpcds_fixture(&dir, sf);
     let sqlite = SqliteOracle::from_parquet(&dir, TPCDS_TABLES).await;
-    let results = run_fixture_suite(
+    let results = run_fixture_suite_with_layouts(
         &sqlite,
         &dir,
         TPCDS_TABLES,
         "tpcds",
         &get_tpcds_test_queries(None, Some(1.0)),
         &[support::LoadMode::Full],
+        &support::with_layouts(
+            &test_framework::queries::QuerySet::Tpcds,
+            support::KEYED_LAYOUTS,
+        ),
         Clone::clone,
     )
     .await;

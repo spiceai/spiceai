@@ -19,6 +19,7 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::path::PathBuf;
 use test_framework::{
     TestType, anyhow,
+    layout::Layout,
     source_versions::{Source, source_versions},
 };
 
@@ -196,6 +197,14 @@ pub struct BenchArgs {
     /// runs the workflow's default line.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub postgres_version: Option<String>,
+    /// The acceleration layout the run configures (`testoperator --layout`):
+    /// features from `primary_key`, `indexes`, `sort`, `cluster`,
+    /// `time_column` and `partition`, joined by commas.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layout: Option<String>,
+    /// Several layouts: one run each, dispatched as its `layout`.
+    #[serde(default, skip_serializing)]
+    pub layouts: Vec<String>,
 }
 
 /// Custom deserializer that accepts either a single item or a vector of items
@@ -247,16 +256,46 @@ impl BenchArgs {
     }
 
     /// The runs this entry dispatches: one per listed `PostgreSQL` line for
-    /// `postgres_version: all`, otherwise just this one.
+    /// `postgres_version: all`, times one per entry of `layouts`.
     ///
     /// # Errors
     ///
     /// When `postgres_version` names a version `test/source_versions.json` does
     /// not list, so a typo or a retired line fails the dispatch instead of
-    /// starting an unsupported server.
-    pub fn expand_source_versions(&self) -> anyhow::Result<Vec<Self>> {
+    /// starting an unsupported server; when a layout does not parse; or when
+    /// the entry sets both `layout` and `layouts`.
+    pub fn expand_runs(&self) -> anyhow::Result<Vec<Self>> {
+        anyhow::ensure!(
+            self.layout.is_none() || self.layouts.is_empty(),
+            "a bench test sets either `layout` or `layouts`, not both"
+        );
+        let layouts: Vec<Option<String>> = if self.layouts.is_empty() {
+            vec![self.layout.clone()]
+        } else {
+            self.layouts.iter().cloned().map(Some).collect()
+        };
+        for layout in layouts.iter().flatten() {
+            layout
+                .parse::<Layout>()
+                .map_err(|e| anyhow::anyhow!("layout '{layout}': {e}"))?;
+        }
+        let versions = self.postgres_versions()?;
+        Ok(versions
+            .iter()
+            .flat_map(|version| {
+                layouts.iter().map(move |layout| Self {
+                    postgres_version: version.clone(),
+                    layout: layout.clone(),
+                    layouts: Vec::new(),
+                    ..self.clone()
+                })
+            })
+            .collect())
+    }
+
+    fn postgres_versions(&self) -> anyhow::Result<Vec<Option<String>>> {
         let Some(requested) = self.postgres_version.as_deref() else {
-            return Ok(vec![self.clone()]);
+            return Ok(vec![None]);
         };
         let listed = source_versions(Source::Postgres)?;
         let versions: Vec<&str> = listed
@@ -267,10 +306,7 @@ impl BenchArgs {
         if requested == ALL_SOURCE_VERSIONS {
             return Ok(versions
                 .into_iter()
-                .map(|version| Self {
-                    postgres_version: Some(version.to_string()),
-                    ..self.clone()
-                })
+                .map(|version| Some(version.to_string()))
                 .collect());
         }
         anyhow::ensure!(
@@ -278,7 +314,7 @@ impl BenchArgs {
             "postgres_version {requested} is not a supported PostgreSQL version; test/source_versions.json lists {}, or use `{ALL_SOURCE_VERSIONS}`",
             versions.join(", ")
         );
-        Ok(vec![self.clone()])
+        Ok(vec![Some(requested.to_string())])
     }
 }
 
@@ -620,11 +656,14 @@ tests:
             .collect();
 
         let runs = test_file.tests.bench[0]
-            .expand_source_versions()
+            .expand_runs()
             .expect("`all` expands");
         assert_eq!(
             runs.iter()
-                .map(|run| run.postgres_version.clone().expect("each run names its line"))
+                .map(|run| run
+                    .postgres_version
+                    .clone()
+                    .expect("each run names its line"))
                 .collect::<Vec<_>>(),
             listed
         );
@@ -633,7 +672,7 @@ tests:
 
         assert_eq!(
             test_file.tests.bench[1]
-                .expand_source_versions()
+                .expand_runs()
                 .expect_err("13 is not a supported line")
                 .to_string(),
             format!(
@@ -643,7 +682,7 @@ tests:
         );
 
         let unset = test_file.tests.bench[2]
-            .expand_source_versions()
+            .expand_runs()
             .expect("an unset version is one run");
         assert_eq!(unset.len(), 1);
         let inputs = serde_json::to_value(&unset[0]).expect("Failed to serialize");

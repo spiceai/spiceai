@@ -165,7 +165,7 @@ async fn micro_and_sqllancer_parity_vs_chdb() {
 #[tokio::test(flavor = "multi_thread")]
 async fn tpch_full_result_parity_vs_chdb() {
     use support::chdb_engine::ChdbOracle;
-    use support::oracle_lane::run_fixture_suite;
+    use support::oracle_lane::run_fixture_suite_with_layouts;
     use support::{LoadMode, TPCH_TABLES};
     use test_framework::queries::get_tpch_test_queries;
 
@@ -176,13 +176,17 @@ async fn tpch_full_result_parity_vs_chdb() {
 
     let chdb = ChdbOracle::new();
     chdb.load_parquet_dir(&parquet_dir, TPCH_TABLES);
-    let results = run_fixture_suite(
+    let results = run_fixture_suite_with_layouts(
         &chdb,
         &parquet_dir,
         TPCH_TABLES,
         "tpch",
         &get_tpch_test_queries(None),
         &[LoadMode::Full],
+        &support::with_layouts(
+            &test_framework::queries::QuerySet::Tpch,
+            support::KEYED_LAYOUTS,
+        ),
         Clone::clone,
     )
     .await;
@@ -200,20 +204,24 @@ async fn tpch_full_result_parity_vs_chdb() {
 async fn clickbench_full_result_parity_vs_chdb() {
     use support::LoadMode;
     use support::chdb_engine::ChdbOracle;
-    use support::oracle_lane::run_fixture_suite;
+    use support::oracle_lane::run_fixture_suite_with_layouts;
     use test_framework::queries::get_clickbench_test_queries;
 
     let _session = CHDB_SESSION.lock().await;
     let hits_dir = support::clickbench_data::hits_fixture_dir();
     let chdb = ChdbOracle::new();
     chdb.load_parquet_dir(hits_dir.path(), &["hits"]);
-    let results = run_fixture_suite(
+    let results = run_fixture_suite_with_layouts(
         &chdb,
         hits_dir.path(),
         &["hits"],
         "clickbench",
         &get_clickbench_test_queries(None),
         &[LoadMode::Full],
+        &support::with_layouts(
+            &test_framework::queries::QuerySet::Clickbench,
+            support::UNKEYED_LAYOUTS,
+        ),
         Clone::clone,
     )
     .await;
@@ -562,7 +570,7 @@ async fn sqllancer_corpus_parity_vs_chdb_inner() {
 #[tokio::test(flavor = "multi_thread")]
 async fn tpcds_full_result_parity_vs_chdb() {
     use support::chdb_engine::ChdbOracle;
-    use support::oracle_lane::run_fixture_suite;
+    use support::oracle_lane::run_fixture_suite_with_layouts;
     use support::tpcds_data::{TPCDS_TABLES, ensure_tpcds_fixture};
     use test_framework::queries::get_tpcds_test_queries;
 
@@ -572,13 +580,17 @@ async fn tpcds_full_result_parity_vs_chdb() {
     ensure_tpcds_fixture(&dir, sf);
     let chdb = ChdbOracle::new();
     chdb.load_parquet_dir(&dir, TPCDS_TABLES);
-    let results = run_fixture_suite(
+    let results = run_fixture_suite_with_layouts(
         &chdb,
         &dir,
         TPCDS_TABLES,
         "tpcds",
         &get_tpcds_test_queries(None, Some(1.0)),
         &[support::LoadMode::Full],
+        &support::with_layouts(
+            &test_framework::queries::QuerySet::Tpcds,
+            support::KEYED_LAYOUTS,
+        ),
         Clone::clone,
     )
     .await;

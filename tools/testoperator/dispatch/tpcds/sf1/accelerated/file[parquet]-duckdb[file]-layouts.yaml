@@ -1,0 +1,14 @@
+# file[parquet]-duckdb[file].yaml under acceleration layouts (see
+# tpch/sf1/accelerated/file[parquet]-duckdb[file]-layouts.yaml).
+schedule: weekly
+tests:
+  bench:
+    spicepod_path: accelerated/file[parquet]-duckdb[file].yaml
+    query_set: tpcds
+    query_overrides: duckdb
+    ready_wait: 300
+    runner_type: spiceai-dev-runners
+    validate_results: true
+    layouts:
+      - primary_key,indexes
+      - primary_key,indexes,sort,time_column
