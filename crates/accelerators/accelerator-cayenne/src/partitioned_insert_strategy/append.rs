@@ -18,9 +18,10 @@ limitations under the License.
 // Append-mode coordinator (issue #10125 §6.3 + step 6).
 //
 // Every participating partition stages its rows into a private target
-// snapshot, and one MetastoreTransaction commits all of them: a keyed
-// partition's target is an overlay (a protected snapshot holding only the
-// write's rows), committed by recording its sequence; any other partition's
+// snapshot, and one MetastoreTransaction commits all of them: a partition whose
+// write publishes on-conflict state (tombstones and re-insert records keyed by
+// primary key) stages into an overlay, a protected snapshot holding only the
+// write's rows, committed by recording its sequence; any other partition's
 // target is a clone of its current snapshot plus the write's rows, committed
 // by advancing its current-snapshot pointer. Publication is delivered by a
 // *barrier*: every participating partition's listing fence is held for write

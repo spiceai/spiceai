@@ -33,14 +33,15 @@ limitations under the License.
 //!   window, the staged files are made durable and every partition commits in
 //!   a single `MetastoreTransaction` (either every partition commits or none
 //!   does), anchored by a top-level [`cayenne::PartitionedWal`] for crash
-//!   recovery on local and object-store tables. A keyed partition's target is
-//!   an *overlay* — a protected snapshot holding only the write's rows, which
-//!   the transaction commits by recording its sequence, leaving the current
-//!   snapshot and the copies the write supersedes behind their tombstones. Any
-//!   other partition's target is a clone of its current snapshot plus the
-//!   write's rows, which the transaction commits by advancing the partition's
-//!   `current_snapshot_id` pointer. See that type's docs for the full
-//!   coordination flow.
+//!   recovery on local and object-store tables. A partition whose write
+//!   publishes on-conflict state (tombstones and re-insert records keyed by
+//!   primary key) stages into an *overlay* — a protected snapshot holding only
+//!   the write's rows, which the transaction commits by recording its
+//!   sequence, leaving the current snapshot and the copies the write supersedes
+//!   behind their tombstones. Any other partition's target is a clone of its
+//!   current snapshot plus the write's rows, which the transaction commits by
+//!   advancing the partition's `current_snapshot_id` pointer. See that type's
+//!   docs for the full coordination flow.
 //!
 //! This module holds the pieces shared by both sinks: the top-level
 //! [`CayennePartitionedInsertStrategy`] that dispatches to whichever sink an
