@@ -305,8 +305,13 @@ async fn run() -> Result<ExitCode> {
             else {
                 return error::ModeBNeedsGeneratedDataSnafu.fail();
             };
+            // `spiced` runs in a temporary directory of its own, so neither its
+            // binary nor the data directory its datasets read may be relative to
+            // this process's working directory.
+            let spiced_path = std::path::absolute(spiced_path)
+                .context(error::AbsolutePathSnafu { path: spiced_path })?;
             let options = mode_b::ServingOptions {
-                spiced_path: spiced_path.clone(),
+                spiced_path,
                 acceleration: (args.acceleration_engine != "none").then(|| {
                     mode_b::AccelerationOptions {
                         engine: args.acceleration_engine.clone(),
@@ -324,7 +329,7 @@ async fn run() -> Result<ExitCode> {
             let tables = datagen::generate(scale_factor, parts).await?;
             let temp_dir;
             let data_dir = if let Some(dir) = &args.data_dir {
-                dir.clone()
+                std::path::absolute(dir).context(error::AbsolutePathSnafu { path: dir })?
             } else {
                 temp_dir = tempfile::tempdir().context(error::WriteFileSnafu {
                     path: std::env::temp_dir(),

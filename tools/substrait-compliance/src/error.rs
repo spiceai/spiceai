@@ -23,6 +23,15 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Snafu, Debug)]
 #[snafu(visibility(pub(crate)))]
 pub enum Error {
+    #[snafu(display(
+        "Failed to resolve '{}' against the working directory: {source}",
+        path.display()
+    ))]
+    AbsolutePath {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
     #[snafu(display("Failed to read '{}': {source}", path.display()))]
     ReadFile {
         path: PathBuf,
