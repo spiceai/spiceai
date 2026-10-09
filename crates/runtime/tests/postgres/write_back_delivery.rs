@@ -838,3 +838,137 @@ async fn timestamp_microseconds_survive_write_back_and_echo() -> Result<(), anyh
         Ok(())
     }).await
 }
+
+// ── refused configurations ──────────────────────────────────────────────────
+
+fn with_pk_conflict_detection_none(mut dataset: Dataset) -> Dataset {
+    if let Some(acceleration) = dataset.acceleration.as_mut() {
+        let mut params: HashMap<String, String> = acceleration
+            .params
+            .as_ref()
+            .map(Params::as_string_map)
+            .unwrap_or_default();
+        params.insert(
+            "cayenne_pk_conflict_detection".to_string(),
+            "none".to_string(),
+        );
+        acceleration.params = Some(Params::from_string_map(params));
+    }
+    dataset
+}
+
+/// Regression test for #14889: with `cayenne_pk_conflict_detection: none` a
+/// staged upsert neither replaces the stored row for its key nor records the key
+/// for write-back delivery, so a CDC or write-back dataset would keep duplicate
+/// rows or acknowledge writes it never delivers. Registration refuses both,
+/// permanently, with the setting to change; a dataset beside them without the
+/// setting loads and follows the source.
+#[tokio::test(flavor = "multi_thread")]
+async fn pk_conflict_detection_none_is_refused_for_keyed_cdc_and_write_back()
+-> Result<(), anyhow::Error> {
+    use runtime::status::ComponentStatus;
+
+    let _tracing = init_tracing(Some(tracing_filter()));
+
+    test_request_context()
+        .scope(async {
+            let container = common::start_postgres_docker_container_with_logical_wal().await?;
+            let port = usize::from(container.host_port(5432)?);
+            let source = connect(port).await?;
+            for table in ["pkd_cdc", "pkd_wb", "pkd_ctl"] {
+                exec(
+                    &source,
+                    &format!("CREATE TABLE public.{table} (id int PRIMARY KEY, n int NOT NULL)"),
+                )
+                .await?;
+                exec(&source, &format!("INSERT INTO public.{table} VALUES (1, 10)")).await?;
+            }
+
+            let accel = tempfile::tempdir()?;
+            let datasets = vec![
+                with_pk_conflict_detection_none(cdc_dataset(
+                    port,
+                    "pkd_cdc",
+                    Some("spice_pkd_slot"),
+                    accel.path(),
+                    WriteMode::WriteThrough,
+                )),
+                with_pk_conflict_detection_none(write_back_dataset(
+                    port,
+                    "pkd_wb",
+                    "spice_pkd_slot",
+                    accel.path(),
+                )),
+                cdc_dataset(
+                    port,
+                    "pkd_ctl",
+                    Some("spice_pkd_slot"),
+                    accel.path(),
+                    WriteMode::WriteThrough,
+                ),
+            ];
+
+            register_test_connectors().await;
+            let mut builder = AppBuilder::new("pk_conflict_detection_none");
+            for dataset in datasets {
+                builder = builder.with_dataset(dataset);
+            }
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(builder.build()).build().await);
+            tokio::select! {
+                () = sleep(Duration::from_mins(2)) => {
+                    return Err(anyhow!("timed out waiting for datasets to load"));
+                }
+                () = Arc::clone(&rt).load_components() => {}
+            }
+
+            let status = |name: &str| rt.status().get_component_status(&format!("dataset:{name}"));
+            for (table, consequence) in [
+                (
+                    "pkd_cdc",
+                    "this dataset applies its source's changes ('refresh_mode: changes'), so a change to an existing key would add a second row for that key instead of replacing it",
+                ),
+                (
+                    "pkd_wb",
+                    "this dataset uses 'acceleration.write_mode: write_back', which records each committed write for delivery from that check, so every write would be acknowledged and never reach the source",
+                ),
+            ] {
+                let expected = format!(
+                    "Failed to register dataset {table} (postgres): 'cayenne_pk_conflict_detection: none' turns off the primary-key check Cayenne uses to replace a stored row, but {consequence}. Set 'cayenne_pk_conflict_detection' to 'auto', its default. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+                );
+                let refused = crate::utils::wait_until_true(Duration::from_secs(30), || async {
+                    matches!(status(table), Some(ComponentStatus::Error(Some(message))) if message.contains(&expected))
+                })
+                .await;
+                assert!(refused, "{table} must be refused with {expected:?}, got {:?}", status(table));
+            }
+
+            // The refusal is permanent: a retry would move the status off `Error`
+            // while it rebuilds. Elapsed time is what is under test here.
+            sleep(Duration::from_secs(10)).await;
+            for table in ["pkd_cdc", "pkd_wb"] {
+                assert!(
+                    matches!(status(table), Some(ComponentStatus::Error(Some(_)))),
+                    "{table} stays refused, got {:?}",
+                    status(table)
+                );
+            }
+
+            // The dataset without the setting loads and follows the source.
+            wait_for_bootstrap(&rt, "pkd_ctl").await?;
+            exec(&source, "UPDATE public.pkd_ctl SET n = 20 WHERE id = 1").await?;
+            wait_for("the source update", Some(20), || {
+                accel_scalar(&rt, "SELECT n FROM pkd_ctl WHERE id = 1")
+            })
+            .await?;
+            assert_eq!(
+                accel_scalar(&rt, "SELECT count(*) FROM pkd_ctl").await?,
+                Some(1),
+                "the control keeps one row per key"
+            );
+
+            rt.shutdown().await;
+            Ok(())
+        })
+        .await
+}
