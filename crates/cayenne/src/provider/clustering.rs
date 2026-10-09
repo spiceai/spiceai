@@ -70,18 +70,26 @@ limitations under the License.
 //!    jumps across the domain at every quadrant boundary, and each jump is a
 //!    zone map stretched over the whole range it jumped.
 //!
-//! The key is a pure kernel ([`cluster_keys`]). The promotion path appends it as
-//! a transient column ([`append_cluster_key_column`]), sorts on it, then strips
-//! it ([`strip_cluster_key_column`]) — so the key is never materialized into the
-//! written cold file.
+//! The key is a pure kernel ([`cluster_keys`]), wrapped as a physical
+//! expression ([`ClusterKeyExpr`]). A rewrite projects it as a transient column
+//! over its scan ([`with_cluster_key`]), so the key is computed in every scan
+//! partition concurrently, sorts on it, then projects it away again
+//! ([`without_cluster_key`], or [`strip_cluster_key_column`] per batch) — so the
+//! key is never materialized into a written file.
 
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, AsArray, BinaryArray, RecordBatch};
 use arrow::compute::cast;
 use arrow::datatypes::{Decimal128Type, Float64Type, Int64Type, UInt64Type};
-use arrow_schema::{DataType, Field, Fields, Schema, SchemaRef};
+use arrow_schema::{DataType, Schema, SchemaRef};
 use datafusion_common::{DataFusionError, Result as DFResult, ScalarValue};
+use datafusion_expr::ColumnarValue;
+use datafusion_physical_expr::PhysicalExpr;
+use datafusion_physical_expr::expressions::Column;
+use datafusion_physical_expr::projection::ProjectionExpr;
+use datafusion_physical_plan::ExecutionPlan;
+use datafusion_physical_plan::projection::ProjectionExec;
 
 /// Width, in bits, of the normalized coordinate each clustering column
 /// contributes to the curve. 64 bits captures the full precision of every
@@ -518,44 +526,146 @@ pub fn cluster_key_column_name(base: &Schema) -> String {
     name
 }
 
-/// The schema produced by [`append_cluster_key_column`] for `base`: `base` plus
-/// a trailing `Binary` column named `key_name` (see
-/// [`cluster_key_column_name`]).
-#[must_use]
-pub fn cluster_augmented_schema(base: &Schema, key_name: &str) -> SchemaRef {
-    let mut fields: Vec<Arc<Field>> = base.fields().iter().map(Arc::clone).collect();
-    fields.push(Arc::new(Field::new(key_name, DataType::Binary, false)));
-    Arc::new(Schema::new(Fields::from(fields)))
+/// The Hilbert clustering key of the columns `columns` evaluate to, as the
+/// `Binary` array [`cluster_keys`] computes.
+///
+/// `bounds` is resolved once, by whoever builds the expression, and shared by
+/// every batch — in every partition — the expression evaluates: per-batch
+/// bounds would put each batch on its own coordinate scale, and keys from
+/// different scales do not order against each other.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(crate) struct ClusterKeyExpr {
+    columns: Vec<Arc<dyn PhysicalExpr>>,
+    bounds: Arc<[ColumnBounds]>,
 }
 
-/// Append the clustering key as a trailing `Binary` column named `key_name`
-/// (see [`cluster_key_column_name`]). Sorting the resulting batches ascending by
-/// that column clusters rows along the Hilbert curve over `clustering_indices`
-/// (the proven `SortExec` path is reused via `util::stream_utils::sort_stream`);
-/// the column is stripped right after the sort with
-/// [`strip_cluster_key_column`], so it is never written to a cold file.
+impl std::fmt::Display for ClusterKeyExpr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "cluster_key(")?;
+        for (i, column) in self.columns.iter().enumerate() {
+            if i > 0 {
+                write!(f, ", ")?;
+            }
+            write!(f, "{column}")?;
+        }
+        write!(f, ")")
+    }
+}
+
+impl PhysicalExpr for ClusterKeyExpr {
+    fn data_type(&self, _input_schema: &Schema) -> DFResult<DataType> {
+        Ok(DataType::Binary)
+    }
+
+    fn nullable(&self, _input_schema: &Schema) -> DFResult<bool> {
+        Ok(false)
+    }
+
+    fn evaluate(&self, batch: &RecordBatch) -> DFResult<ColumnarValue> {
+        let rows = batch.num_rows();
+        let columns = self
+            .columns
+            .iter()
+            .map(|c| c.evaluate(batch)?.into_array(rows))
+            .collect::<DFResult<Vec<_>>>()?;
+        Ok(ColumnarValue::Array(
+            Arc::new(cluster_keys(&columns, &self.bounds)?) as ArrayRef,
+        ))
+    }
+
+    fn children(&self) -> Vec<&Arc<dyn PhysicalExpr>> {
+        self.columns.iter().collect()
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn PhysicalExpr>>,
+    ) -> DFResult<Arc<dyn PhysicalExpr>> {
+        if children.len() != self.columns.len() {
+            return Err(DataFusionError::Internal(format!(
+                "cluster_key expects {} children, got {}",
+                self.columns.len(),
+                children.len()
+            )));
+        }
+        Ok(Arc::new(Self {
+            columns: children,
+            bounds: Arc::clone(&self.bounds),
+        }))
+    }
+
+    fn fmt_sql(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{self}")
+    }
+}
+
+/// Project `input`'s columns plus its Hilbert clustering key over the columns
+/// at `clustering_indices`, as a trailing `Binary` column. Returns the plan and
+/// the key column's name ([`cluster_key_column_name`]); sorting the plan by that
+/// column ascending clusters its rows along the curve.
 ///
-/// `bounds` is the per-column normalization range, positionally matching
+/// A projection runs in each of `input`'s partitions, so the key is computed in
+/// all of them concurrently. `bounds` positionally matches
 /// `clustering_indices`; see [`cluster_keys`].
 ///
 /// # Errors
 ///
-/// Returns an error if the key kernel or batch construction fails.
-pub fn append_cluster_key_column(
-    batch: &RecordBatch,
+/// Returns an error if an index is outside `input`'s schema or the projection
+/// cannot be built.
+pub(crate) fn with_cluster_key(
+    input: Arc<dyn ExecutionPlan>,
     clustering_indices: &[usize],
-    bounds: &[ColumnBounds],
-    key_name: &str,
-) -> DFResult<RecordBatch> {
-    let cols: Vec<ArrayRef> = clustering_indices
+    bounds: Vec<ColumnBounds>,
+) -> DFResult<(Arc<dyn ExecutionPlan>, String)> {
+    let schema = input.schema();
+    let key_name = cluster_key_column_name(&schema);
+    let column = |i: usize| -> DFResult<Arc<dyn PhysicalExpr>> {
+        let field = schema.fields().get(i).ok_or_else(|| {
+            DataFusionError::Internal(format!(
+                "clustering column index {i} is outside a {}-column schema",
+                schema.fields().len()
+            ))
+        })?;
+        Ok(Arc::new(Column::new(field.name(), i)))
+    };
+    let key = ClusterKeyExpr {
+        columns: clustering_indices
+            .iter()
+            .map(|&i| column(i))
+            .collect::<DFResult<_>>()?,
+        bounds: bounds.into(),
+    };
+    let mut exprs = (0..schema.fields().len())
+        .map(|i| Ok(ProjectionExpr::new(column(i)?, schema.field(i).name())))
+        .collect::<DFResult<Vec<_>>>()?;
+    exprs.push(ProjectionExpr::new(Arc::new(key), key_name.clone()));
+    Ok((Arc::new(ProjectionExec::try_new(exprs, input)?), key_name))
+}
+
+/// Project away the trailing key column [`with_cluster_key`] added, keeping
+/// the first `columns` columns.
+///
+/// # Errors
+///
+/// Returns an error if the projection cannot be built.
+pub(crate) fn without_cluster_key(
+    keyed: Arc<dyn ExecutionPlan>,
+    columns: usize,
+) -> DFResult<Arc<dyn ExecutionPlan>> {
+    let schema = keyed.schema();
+    let exprs = schema
+        .fields()
         .iter()
-        .map(|&i| Arc::clone(batch.column(i)))
-        .collect();
-    let key = Arc::new(cluster_keys(&cols, bounds)?) as ArrayRef;
-    let schema = cluster_augmented_schema(batch.schema_ref(), key_name);
-    let mut arrays = batch.columns().to_vec();
-    arrays.push(key);
-    RecordBatch::try_new(schema, arrays).map_err(DataFusionError::from)
+        .take(columns)
+        .enumerate()
+        .map(|(i, field)| {
+            ProjectionExpr::new(
+                Arc::new(Column::new(field.name(), i)) as Arc<dyn PhysicalExpr>,
+                field.name(),
+            )
+        })
+        .collect::<Vec<_>>();
+    Ok(Arc::new(ProjectionExec::try_new(exprs, keyed)?))
 }
 
 /// Drop the trailing clustering key column, returning a batch in `original`
@@ -949,7 +1059,7 @@ mod tests {
     }
 
     #[test]
-    fn append_then_strip_roundtrips_and_clusters() {
+    fn cluster_key_expr_clusters_and_strip_roundtrips() {
         use arrow::datatypes::{DataType, Field, Schema};
         let schema = Arc::new(Schema::new(vec![
             Field::new("x", DataType::Int64, false),
@@ -967,31 +1077,49 @@ mod tests {
         .expect("batch");
 
         let bounds = vec![i64_bounds(&xs), i64_bounds(&ys)];
-        let augmented =
-            append_cluster_key_column(&batch, &[0, 1], &bounds, &cluster_key_column_name(&schema))
-                .expect("append");
-        assert_eq!(augmented.num_columns(), 3);
-        assert_eq!(
-            augmented.schema().field(2).name(),
-            CLUSTER_KEY_COLUMN_NAME,
-            "clustering key appended as the trailing column"
-        );
-
-        // The four corners of the unit cell come back in unit steps.
-        let key = augmented
-            .column(2)
+        let expr = ClusterKeyExpr {
+            columns: vec![
+                Arc::new(Column::new("x", 0)) as Arc<dyn PhysicalExpr>,
+                Arc::new(Column::new("y", 1)),
+            ],
+            bounds: bounds.clone().into(),
+        };
+        assert_eq!(expr.to_string(), "cluster_key(x@0, y@1)");
+        let key = expr
+            .evaluate(&batch)
+            .and_then(|v| v.into_array(batch.num_rows()))
+            .expect("key evaluates");
+        let key = key
             .as_any()
             .downcast_ref::<BinaryArray>()
             .expect("binary key");
+        assert_eq!(
+            key,
+            &cluster_keys(
+                &[Arc::clone(batch.column(0)), Arc::clone(batch.column(1))],
+                &bounds
+            )
+            .expect("kernel"),
+            "the expression is the kernel over its columns"
+        );
+
+        // The four corners of the unit cell come back in unit steps.
         let order = argsort(key);
         for pair in order.windows(2) {
             let (a, b) = (pair[0], pair[1]);
             assert_eq!(xs[a].abs_diff(xs[b]) + ys[a].abs_diff(ys[b]), 1);
         }
 
-        // Stripping restores the original schema and column data.
+        // Stripping the trailing key restores the original schema and columns.
+        let key_name = cluster_key_column_name(&schema);
+        assert_eq!(key_name, CLUSTER_KEY_COLUMN_NAME);
+        let mut fields: Vec<Arc<Field>> = schema.fields().iter().map(Arc::clone).collect();
+        fields.push(Arc::new(Field::new(&key_name, DataType::Binary, false)));
+        let mut columns = batch.columns().to_vec();
+        columns.push(Arc::new(key.clone()) as ArrayRef);
+        let augmented =
+            RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).expect("augmented batch");
         let stripped = strip_cluster_key_column(&augmented, &schema).expect("strip");
-        assert_eq!(stripped.schema(), schema);
-        assert_eq!(stripped.num_columns(), 2);
+        assert_eq!(stripped, batch);
     }
 }

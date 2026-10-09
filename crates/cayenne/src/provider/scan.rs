@@ -20,7 +20,7 @@ use std::{
     sync::{Arc, OnceLock},
 };
 
-use crate::maintained_aggregate::MaintainedAggregateRegistry;
+use crate::maintained_aggregate::{MaintainedAggregateRegistry, PredicateConjuncts};
 use crate::provider::lookup_index::LookupIndexExplain;
 use arrow_schema::SchemaRef;
 use datafusion::config::ConfigOptions;
@@ -41,7 +41,9 @@ use parking_lot::Mutex;
 
 use datafusion_physical_expr::Partitioning;
 use datafusion_physical_plan::{
-    DisplayAs, ExecutionPlan, PlanProperties, SortOrderPushdownResult,
+    ChildStats, ChildrenPropertiesMode, DisplayAs, ExecutionPlan, InputDistributionRequirements,
+    PlanProperties, ReplaceChildrenOptions, SortOrderPushdownResult, StatisticsArgs,
+    StatisticsContext,
     execution_plan::{CardinalityEffect, InvariantLevel, check_default_invariants},
     expressions::PhysicalSortExpr,
     filter_pushdown::{
@@ -128,7 +130,7 @@ pub struct CayenneAccelerationExec {
     maintained_aggregate_epoch: u64,
     /// Column-statistics overlay sourced from the table's maintained optimizer
     /// aggregate (live min/max + integer NDV), aligned to the inner plan's
-    /// output schema. Consumed in [`Self::partition_statistics`] to refill
+    /// output schema. Consumed in [`Self::statistics_with_overlay`] to refill
     /// column stats the Cayenne base+delta `UnionExec` drops to
     /// `Precision::Absent` via `DataFusion`'s generic `col_stats_union`
     optimizer_column_overlay: Option<Arc<Statistics>>,
@@ -223,7 +225,7 @@ impl CayenneAccelerationExec {
 
     /// Attaches a column-statistics overlay sourced from the table's maintained
     /// optimizer aggregate (live min/max + integer NDV). At
-    /// [`Self::partition_statistics`] this refills only the columns the Cayenne
+    /// [`Self::statistics_with_overlay`] this refills only the columns the Cayenne
     /// base+delta `UnionExec` wiped to `Precision::Absent`, restoring the
     /// join-key signal `JoinSelection` needs without overriding any surviving
     /// child statistic. A `None` overlay (cold aggregate) is a no-op.
@@ -265,6 +267,51 @@ impl CayenneAccelerationExec {
     /// scan guard AND any maintained-aggregate registry — so both survive the
     /// optimizer transforms applied by the plan-rewriting trait methods
     /// (`with_new_children`, `with_fetch`, `try_swapping_with_projection`).
+    fn with_child(
+        &self,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        let [input]: [Arc<dyn ExecutionPlan>; 1] =
+            children
+                .try_into()
+                .map_err(|children: Vec<Arc<dyn ExecutionPlan>>| {
+                    DataFusionError::External(
+                        super::Error::InvalidChildrenCount {
+                            children_count: children.len(),
+                        }
+                        .into(),
+                    )
+                })?;
+        Ok(Arc::new(self.wrap_rewritten_child(input)))
+    }
+
+    /// The child's statistics, with column statistics the child left `Absent`
+    /// refilled from the optimizer column overlay.
+    ///
+    /// The overlay is a per-table (global) aggregate: its min/max/NDV describe
+    /// the whole table, not any single partition. Only the table-wide aggregate
+    /// stats (`partition == None`) may be refilled from it. Per-partition stats
+    /// (`partition == Some(_)`) pass through unchanged — filling them from the
+    /// global aggregate would misstate a partition's statistics and mislead
+    /// partition-level pruning/optimization.
+    fn statistics_with_overlay(
+        &self,
+        child_stats: Arc<Statistics>,
+        partition: Option<usize>,
+    ) -> Arc<Statistics> {
+        let Some(overlay) = self
+            .optimizer_column_overlay
+            .as_ref()
+            .filter(|_| partition.is_none())
+        else {
+            return child_stats;
+        };
+        Arc::new(restore_absent_column_statistics(
+            Arc::unwrap_or_clone(child_stats),
+            overlay,
+        ))
+    }
+
     fn wrap_rewritten_child(&self, inner: Arc<dyn ExecutionPlan>) -> Self {
         // The output schema is stable across child rewrites (projection/limit
         // pushdown), so the optimizer column overlay stays aligned and valid.
@@ -361,14 +408,15 @@ impl CayenneAccelerationExec {
         plan_has_pushed_filter(&self.inner)
     }
 
-    /// Whether this scan produces every live row of the table: nothing in the
-    /// wrapped plan filters or limits rows. A maintained aggregate view describes
-    /// exactly that relation, so the maintained-aggregate rewrite may substitute the
-    /// view for this scan only when this returns `true`. See
-    /// [`plan_scans_whole_relation`].
+    /// The predicate every row this scan produces satisfied: no conjuncts when it
+    /// produces every live row of the table, or `None` when the wrapped plan does
+    /// something to its rows that a predicate cannot describe. A maintained
+    /// aggregate view describes the live rows its own filter selects, so the
+    /// maintained-aggregate rewrite may substitute the view for this scan only
+    /// when the two predicates are the same. See [`plan_relation_predicate`].
     #[must_use]
-    pub(crate) fn scans_whole_relation(&self) -> bool {
-        plan_scans_whole_relation(&self.inner)
+    pub(crate) fn relation_predicate(&self) -> Option<PredicateConjuncts> {
+        plan_relation_predicate(&self.inner)
     }
 
     /// Whether every column this scan outputs is the stored table column of the
@@ -561,8 +609,10 @@ pub(crate) fn plan_has_pushed_filter(plan: &Arc<dyn ExecutionPlan>) -> bool {
         .any(|config| config.file_source().filter().is_some())
 }
 
-/// Whether `plan` produces every live row of the table it scans: no node in the
-/// subtree filters or limits rows.
+/// The predicate `plan` applies to the live rows of the table it scans: no
+/// conjuncts when it produces every live row, the conjuncts of `P` when it
+/// produces exactly the live rows satisfying `P`, and `None` when it cannot be
+/// established.
 ///
 /// A query's `WHERE` or `LIMIT` does not have to stay above the scan. Physical
 /// `FilterPushdown` hands a predicate to a Vortex source that accepts it, and to
@@ -570,27 +620,63 @@ pub(crate) fn plan_has_pushed_filter(plan: &Arc<dyn ExecutionPlan>) -> bool {
 /// branch that `scan()` already wraps in the query's filters absorbs it, and
 /// `UnionExec` wraps each rejecting branch in its own `FilterExec`. Either way the
 /// `FilterExec` above the scan is removed. A `LIMIT` in a subquery becomes a fetch
-/// inside the scan. So the scan's own subtree is the only place to look.
+/// inside the scan. So the scan's own subtree is the only place to read either.
 ///
-/// The walk fails closed: only nodes known to pass every row through (and every
-/// child of theirs) count, so an operator added later is treated as narrowing the
-/// scan until it is listed here. The deletion-filter execs are listed because they
-/// remove only rows that are no longer live, which is the relation a maintained
-/// view describes. Any fetch fails the check, and a file source fails it when it
-/// carries a predicate (static or dynamic). An in-memory source never carries one.
+/// Every path from `plan` to a source that produces rows must apply the same
+/// conjuncts, gathered from the `FilterExec`s on the path and the file source's
+/// pushed predicate. A path ending in an `EmptyExec` produces no rows, so it
+/// constrains nothing. The walk fails closed: only nodes known to pass every row
+/// through count, so an operator added later is treated as changing the scan's
+/// rows until it is listed here. The deletion-filter execs are listed because
+/// they remove only rows that are no longer live, which is the relation a
+/// maintained view describes. Any fetch, a volatile or dynamic predicate, paths
+/// that disagree, or a plan in which no path produces rows yield `None`.
+pub(crate) fn plan_relation_predicate(plan: &Arc<dyn ExecutionPlan>) -> Option<PredicateConjuncts> {
+    match relation_rows(plan, &PredicateConjuncts::default())? {
+        RelationRows::NoRows => None,
+        RelationRows::Matching(predicate) => Some(predicate),
+    }
+}
+
+/// The rows a path through a scan subtree produces, relative to the table's
+/// live rows. See [`plan_relation_predicate`].
+enum RelationRows {
+    /// None at all: every path ends in an `EmptyExec`.
+    NoRows,
+    /// Exactly the live rows that satisfy every conjunct.
+    Matching(PredicateConjuncts),
+}
+
+/// [`plan_relation_predicate`] for the subtree at `plan`, where `applied` holds
+/// the conjuncts the `FilterExec`s above it on the path apply.
 #[expect(deprecated)]
-pub(crate) fn plan_scans_whole_relation(plan: &Arc<dyn ExecutionPlan>) -> bool {
+fn relation_rows(
+    plan: &Arc<dyn ExecutionPlan>,
+    applied: &PredicateConjuncts,
+) -> Option<RelationRows> {
     if plan.fetch().is_some() {
-        return false;
+        return None;
     }
     if let Some(data_source_exec) = plan.downcast_ref::<DataSourceExec>() {
         let source = data_source_exec.data_source();
         if let Some(config) = source.downcast_ref::<FileScanConfig>() {
-            return config.file_source().filter().is_none();
+            let mut applied = applied.clone();
+            if let Some(predicate) = config.file_source().filter() {
+                applied.try_add_predicate(&predicate)?;
+            }
+            return Some(RelationRows::Matching(applied));
         }
         return source
             .downcast_ref::<datafusion::datasource::memory::MemorySourceConfig>()
-            .is_some();
+            .map(|_| RelationRows::Matching(applied.clone()));
+    }
+    if let Some(filter) = plan.downcast_ref::<datafusion_physical_plan::filter::FilterExec>() {
+        let mut applied = applied.clone();
+        applied.try_add_predicate(filter.predicate())?;
+        return relation_rows(filter.input(), &applied);
+    }
+    if plan.is::<datafusion_physical_plan::empty::EmptyExec>() {
+        return Some(RelationRows::NoRows);
     }
     let passes_every_row = plan.is::<CayenneAccelerationExec>()
         || plan.is::<UnionExec>()
@@ -599,10 +685,26 @@ pub(crate) fn plan_scans_whole_relation(plan: &Arc<dyn ExecutionPlan>) -> bool {
         || plan.is::<datafusion_physical_plan::coalesce_batches::CoalesceBatchesExec>()
         || plan.is::<datafusion_physical_plan::coalesce_partitions::CoalescePartitionsExec>()
         || plan.is::<datafusion_physical_plan::coop::CooperativeExec>()
-        || plan.is::<datafusion_physical_plan::empty::EmptyExec>()
+        || plan.is::<runtime_datafusion::extension::bytes_processed::BytesProcessedExec>()
         || plan.is::<crate::provider::delete::KeyBasedDeletionFilterExec>()
         || plan.is::<crate::provider::delete::Int64PkDeletionFilterExec>();
-    passes_every_row && plan.children().into_iter().all(plan_scans_whole_relation)
+    if !passes_every_row {
+        return None;
+    }
+    let mut rows = RelationRows::NoRows;
+    for child in plan.children() {
+        rows = match (rows, relation_rows(child, applied)?) {
+            (RelationRows::NoRows, child_rows) => child_rows,
+            (matching, RelationRows::NoRows) => matching,
+            (RelationRows::Matching(predicate), RelationRows::Matching(child_predicate)) => {
+                if predicate != child_predicate {
+                    return None;
+                }
+                RelationRows::Matching(predicate)
+            }
+        };
+    }
+    Some(rows)
 }
 
 /// Whether every column `plan` outputs is the table column of the same name, with
@@ -941,7 +1043,11 @@ fn push_dynamic_filters_to_data_source(
         return Ok(None);
     }
 
-    plan.with_new_children(new_children).map(Some)
+    plan.replace_children(
+        new_children,
+        ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+    )
+    .map(Some)
 }
 
 pub(crate) fn round_robin_repartition_if_needed(
@@ -983,17 +1089,26 @@ impl DisplayAs for CayenneAccelerationExec {
             "CayenneAccelerationExec: snapshots_scanned={snapshots_scanned}, files_scanned={files_scanned}"
         )?;
         if let Some(lookup) = &self.lookup_index {
-            write!(
-                f,
-                ", lookup_index={}, lookup_index_outcome={}",
-                lookup.shape.as_deref().unwrap_or("none"),
-                lookup.outcome.as_str()
-            )?;
+            // The index that served the lookup, or `none`; the counts say how
+            // much of what it read the index covered.
+            write!(f, ", lookup_index={}", lookup.served_by().unwrap_or("none"))?;
             if let Some(candidate_files) = lookup.candidate_files {
                 write!(f, ", candidate_files={candidate_files}")?;
             }
+            if let Some(uncovered_files) = lookup.uncovered_files {
+                write!(f, ", uncovered_files={uncovered_files}")?;
+            }
+            if let Some(candidate_batches) = lookup.candidate_batches {
+                write!(f, ", candidate_batches={candidate_batches}")?;
+            }
+            if let Some(uncovered_batches) = lookup.uncovered_batches {
+                write!(f, ", uncovered_batches={uncovered_batches}")?;
+            }
             if let Some(candidate_rows) = lookup.candidate_rows {
                 write!(f, ", candidate_rows={candidate_rows}")?;
+            }
+            if let Some(reason) = lookup.reason {
+                write!(f, ", lookup_index_reason={}", reason.as_str())?;
             }
         }
         Ok(())
@@ -1037,6 +1152,18 @@ impl ExecutionPlan for CayenneAccelerationExec {
         vec![Distribution::UnspecifiedDistribution; self.children().len()]
     }
 
+    fn input_distribution_requirements(&self) -> InputDistributionRequirements {
+        InputDistributionRequirements::new(vec![
+            Distribution::UnspecifiedDistribution;
+            self.children().len()
+        ])
+    }
+
+    /// Owns no dynamic filters; the scan's dynamic filters are produced by joins above it.
+    fn dynamic_expressions_produced(&self) -> Vec<Arc<dyn PhysicalExpr>> {
+        Vec::new()
+    }
+
     fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>> {
         vec![None; self.children().len()]
     }
@@ -1049,32 +1176,47 @@ impl ExecutionPlan for CayenneAccelerationExec {
         vec![false]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.inner]
+    }
+
+    /// `properties()` is read from the child, so there is nothing to keep or recompute.
+    fn replace_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+        _options: ReplaceChildrenOptions,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        self.with_child(children)
+    }
+
+    fn with_new_children_and_same_properties(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        self.with_child(children)
     }
 
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
-        if children.len() != 1 {
-            return Err(DataFusionError::External(
-                super::Error::InvalidChildrenCount {
-                    children_count: children.len(),
-                }
-                .into(),
-            ));
-        }
-
-        let Some(input) = children.into_iter().next() else {
-            unreachable!("should have one input");
-        };
-        Ok(Arc::new(self.wrap_rewritten_child(input)))
+        self.with_child(children)
     }
 
     fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>> {
         let children = self.children().into_iter().cloned().collect();
-        self.with_new_children(children)
+        self.with_child(children)
     }
 
     fn repartitioned(
@@ -1154,25 +1296,27 @@ impl ExecutionPlan for CayenneAccelerationExec {
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
-        let child_stats = self.inner.partition_statistics(partition)?;
-        // The overlay is a per-table (global) aggregate: its min/max/NDV
-        // describe the whole table, not any single partition. Only the
-        // table-wide aggregate stats (`partition == None`) may be refilled from
-        // it. Per-partition stats (`partition == Some(_)`) must pass through
-        // unchanged — filling them from the global aggregate would violate
-        // `partition_statistics(Some(_))` semantics and mislead partition-level
-        // pruning/optimization.
-        let Some(overlay) = self
-            .optimizer_column_overlay
-            .as_ref()
-            .filter(|_| partition.is_none())
-        else {
-            return Ok(child_stats);
+        StatisticsContext::new().compute(self, &StatisticsArgs::new().with_partition(partition))
+    }
+
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        vec![ChildStats::At(partition)]
+    }
+
+    fn statistics_from_inputs(
+        &self,
+        input_stats: &[Arc<Statistics>],
+        args: &StatisticsArgs,
+    ) -> Result<Arc<Statistics>> {
+        let [child_stats] = input_stats else {
+            return Err(DataFusionError::External(
+                super::Error::InvalidChildrenCount {
+                    children_count: input_stats.len(),
+                }
+                .into(),
+            ));
         };
-        Ok(Arc::new(restore_absent_column_statistics(
-            Arc::unwrap_or_clone(child_stats),
-            overlay,
-        )))
+        Ok(self.statistics_with_overlay(Arc::clone(child_stats), args.partition()))
     }
 
     // Allow optimizer to push limits through to inputs
@@ -1198,8 +1342,22 @@ impl ExecutionPlan for CayenneAccelerationExec {
         &self,
         projection: &ProjectionExec,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
+        // `try_swapping_with_projection` is called with a projection whose input is
+        // the receiver, and implementations read that input: `ProjectionExec`
+        // collapses the chain starting at `projection.input()`. Handing the inner
+        // plan a projection whose input is this wrapper would make an inner
+        // `ProjectionExec` find no chain and return the projection unchanged, still
+        // above this wrapper; rewrapping that nests a copy of this node on every
+        // step of the pushdown's descent, without bound. So the projection is
+        // re-rooted on the inner plan first. The wrapper's schema is the inner
+        // plan's, so the expressions and output schema carry over unchanged.
+        let projection = ProjectionExec::try_new_with_schema_metadata(
+            projection.expr().iter().cloned(),
+            Arc::clone(&self.inner),
+            projection.schema().as_ref(),
+        )?;
         self.inner
-            .try_swapping_with_projection(projection)
+            .try_swapping_with_projection(&projection)
             .map(|plan| {
                 plan.map(|plan| Arc::new(self.wrap_rewritten_child(plan)) as Arc<dyn ExecutionPlan>)
             })
@@ -1233,6 +1391,15 @@ impl ExecutionPlan for CayenneAccelerationExec {
     ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
         let result = self.inner.try_pushdown_sort(order)?;
         Ok(result.map(|plan| Arc::new(self.wrap_rewritten_child(plan)) as Arc<dyn ExecutionPlan>))
+    }
+
+    /// Not serializable. Forwarding to the child would ship a scan without this
+    /// node's snapshot guard, memory accounting and statistics overlay.
+    fn try_to_proto(
+        &self,
+        _ctx: &datafusion::physical_plan::proto::ExecutionPlanEncodeCtx<'_>,
+    ) -> Result<Option<datafusion_proto::protobuf::PhysicalPlanNode>> {
+        Ok(None)
     }
 }
 
@@ -2260,6 +2427,64 @@ mod tests {
         );
     }
 
+    /// A projection above the wrapper, over a projection the wrapper holds, must
+    /// collapse into one projection beneath the wrapper. If the outer projection is
+    /// delegated without re-rooting it, the inner `ProjectionExec` hands it back
+    /// still above the wrapper and the projection pushdown nests wrappers without
+    /// bound.
+    #[test]
+    fn projection_over_wrapped_projection_collapses_beneath_the_wrapper() {
+        use datafusion::physical_optimizer::PhysicalOptimizerRule;
+        use datafusion::physical_optimizer::projection_pushdown::ProjectionPushdown;
+
+        let scan = one_partition_plan();
+        let id = col("id", &scan.schema()).expect("id column should exist");
+        let inner = Arc::new(
+            ProjectionExec::try_new(
+                vec![(Arc::clone(&id), "a".to_string()), (id, "b".to_string())],
+                scan,
+            )
+            .expect("inner projection should be created"),
+        );
+        let exec: Arc<dyn ExecutionPlan> = Arc::new(CayenneAccelerationExec::new(inner));
+        let exec_schema = exec.schema();
+        let outer = ProjectionExec::try_new(
+            vec![
+                (col("b", &exec_schema).expect("b column"), "x".to_string()),
+                (col("a", &exec_schema).expect("a column"), "y".to_string()),
+            ],
+            Arc::clone(&exec),
+        )
+        .expect("outer projection should be created");
+
+        let swapped = exec
+            .try_swapping_with_projection(&outer)
+            .expect("projection swap should be attempted")
+            .expect("the projections should collapse");
+        let child = swapped.children()[0];
+        assert!(
+            swapped.is::<CayenneAccelerationExec>()
+                && child.is::<ProjectionExec>()
+                && child.children()[0].is::<DataSourceExec>(),
+            "expected one projection beneath the wrapper, got:\n{}",
+            datafusion::physical_plan::displayable(swapped.as_ref()).indent(true)
+        );
+        assert_eq!(swapped.schema(), outer.schema());
+
+        let optimized = ProjectionPushdown::new()
+            .optimize(Arc::new(outer), &ConfigOptions::default())
+            .expect("projection pushdown should succeed");
+        let rendered = datafusion::physical_plan::displayable(optimized.as_ref())
+            .indent(true)
+            .to_string();
+        assert_eq!(
+            rendered.matches("CayenneAccelerationExec").count(),
+            1,
+            "{rendered}"
+        );
+        assert_eq!(rendered.matches("ProjectionExec").count(), 1, "{rendered}");
+    }
+
     #[test]
     fn scan_identity_returns_none_for_non_file_data_source() {
         // MemorySourceConfig is not a FileScanConfig, so scan_identity must
@@ -2278,8 +2503,8 @@ mod tests {
         use datafusion_common::stats::Precision;
 
         let exec = CayenneAccelerationExec::new(one_partition_plan());
-        let stats = exec
-            .partition_statistics(Some(0))
+        let stats = StatisticsContext::new()
+            .compute(&exec, &StatisticsArgs::new().with_partition(Some(0)))
             .expect("partition statistics should be available");
         assert_eq!(
             stats.num_rows,
@@ -2287,8 +2512,8 @@ mod tests {
             "clean scan must keep the inner plan's exact row count"
         );
         // Aggregate over all partitions must likewise stay exact.
-        let agg = exec
-            .partition_statistics(None)
+        let agg = StatisticsContext::new()
+            .compute(&exec, &StatisticsArgs::new())
             .expect("aggregate statistics should be available");
         assert_eq!(agg.num_rows, Precision::Exact(3));
     }
@@ -2382,8 +2607,8 @@ mod tests {
             UnionExec::try_new(vec![memory, empty]).expect("union exec should be created");
 
         // Sanity: the union poisons min/max + distinct_count to Absent.
-        let poisoned = union
-            .partition_statistics(None)
+        let poisoned = StatisticsContext::new()
+            .compute(union.as_ref(), &StatisticsArgs::new())
             .expect("union statistics should be available");
         assert!(matches!(
             poisoned.column_statistics[0].min_value,
@@ -2415,8 +2640,8 @@ mod tests {
 
         // Without an overlay: poisoned stats pass through unchanged.
         let plain = CayenneAccelerationExec::new(Arc::clone(&union));
-        let plain_stats = plain
-            .partition_statistics(None)
+        let plain_stats = StatisticsContext::new()
+            .compute(&plain, &StatisticsArgs::new())
             .expect("statistics should be available");
         assert!(matches!(
             plain_stats.column_statistics[0].min_value,
@@ -2432,8 +2657,8 @@ mod tests {
         // `col > max` range filter and aren't needed downstream).
         let restored_exec = CayenneAccelerationExec::new(Arc::clone(&union))
             .with_optimizer_column_overlay(Some(overlay));
-        let restored = restored_exec
-            .partition_statistics(None)
+        let restored = StatisticsContext::new()
+            .compute(&restored_exec, &StatisticsArgs::new())
             .expect("statistics should be available");
         let col = &restored.column_statistics[0];
         assert!(matches!(col.min_value, Precision::Absent));
@@ -2447,11 +2672,17 @@ mod tests {
         // The overlay is a per-table (global) aggregate, so it must NOT be
         // applied to per-partition stats: `partition_statistics(Some(_))` must
         // return the child's partition stats untouched.
-        let per_partition = restored_exec
-            .partition_statistics(Some(0))
+        let per_partition = StatisticsContext::new()
+            .compute(
+                &restored_exec,
+                &StatisticsArgs::new().with_partition(Some(0)),
+            )
             .expect("per-partition statistics should be available");
-        let child_partition = union
-            .partition_statistics(Some(0))
+        let child_partition = StatisticsContext::new()
+            .compute(
+                union.as_ref(),
+                &StatisticsArgs::new().with_partition(Some(0)),
+            )
             .expect("child per-partition statistics should be available");
         assert_eq!(
             per_partition.column_statistics[0].min_value,

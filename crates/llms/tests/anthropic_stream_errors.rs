@@ -32,7 +32,7 @@ use std::net::TcpListener;
 use async_openai::error::{ApiError, OpenAIError};
 use async_openai::types::chat::{
     ChatCompletionRequestUserMessageArgs, ChatCompletionResponseStream,
-    CreateChatCompletionRequestArgs,
+    CreateChatCompletionRequest, CreateChatCompletionRequestArgs,
 };
 use chat_api::Chat;
 use futures::StreamExt;
@@ -78,17 +78,20 @@ fn serve_one(status: &'static str, content_type: &'static str, body: &'static st
     format!("http://127.0.0.1:{port}")
 }
 
-/// Opens one streaming chat against `base`.
-async fn chat_stream_against(base: &str) -> ChatCompletionResponseStream {
-    let model = Anthropic::new(
+fn adapter_against(base: &str) -> Anthropic {
+    Anthropic::new(
         GenericAuthMechanism::from_api_key("not-a-real-key"),
         Some("claude-sonnet-4-6"),
         Some(base),
         None,
     )
-    .expect("the adapter is configured");
+    .expect("the adapter is configured")
+}
 
-    let request = CreateChatCompletionRequestArgs::default()
+/// One user turn, with `temperature` set when `temperature` is given. One control per request:
+/// Claude 4 and later reject `temperature` and `top_p` set together.
+fn request_with(temperature: Option<f32>) -> CreateChatCompletionRequest {
+    let mut request = CreateChatCompletionRequestArgs::default()
         .model("claude-sonnet-4-6")
         .messages(vec![
             ChatCompletionRequestUserMessageArgs::default()
@@ -99,9 +102,14 @@ async fn chat_stream_against(base: &str) -> ChatCompletionResponseStream {
         ])
         .build()
         .expect("build the request");
+    request.temperature = temperature;
+    request
+}
 
-    model
-        .chat_stream(request)
+/// Opens one streaming chat against `base`.
+async fn chat_stream_against(base: &str) -> ChatCompletionResponseStream {
+    adapter_against(base)
+        .chat_stream(request_with(None))
         .await
         .expect("a refusal is delivered as a stream item, not as a failure to open the stream")
 }
@@ -381,4 +389,90 @@ async fn a_mid_stream_rate_limit_is_classified_and_keeps_its_cause() {
         "the cause must survive: {message}"
     );
     assert_eq!(api_error_type(&error), Some("AnthropicRateLimitError"));
+}
+
+/// Anthropic's answer to a sampling control the model does not accept, exactly as its newest
+/// generation returns it (measured in <https://github.com/spiceai/spiceai/issues/13564>).
+const TEMPERATURE_REJECTED: &str = r#"{"type":"error","error":{"type":"invalid_request_error","message":"`temperature` is deprecated for this model."}}"#;
+
+fn assert_names_the_rejected_control(message: &str) {
+    assert!(
+        message.contains("'claude-sonnet-4-6'"),
+        "the model that refused the control must be named: {message}"
+    );
+    assert!(
+        message.contains("Remove `temperature` from the request and from the model's `params` (as `temperature`, `anthropic_temperature` or `openai_temperature`)"),
+        "the control and where to remove it must be named: {message}"
+    );
+    assert!(
+        message.contains("`temperature` is deprecated for this model."),
+        "Anthropic's own wording is the diagnostic and must survive as the cause: {message}"
+    );
+    assert!(
+        !message.contains("Anthropic streaming error"),
+        "an explained refusal must not be buried behind the generic stream prefix: {message}"
+    );
+}
+
+/// A streaming request carrying `temperature` to a model that rejects it: the refusal arrives as a
+/// stream item and is explained inside `transform_stream`'s own error formatting, ahead of the arm
+/// that re-types every other `invalid_request_error` behind the generic stream prefix.
+#[tokio::test]
+async fn a_rejected_sampling_control_is_explained_on_the_streaming_path() {
+    let base = serve_one_error("400 Bad Request", TEMPERATURE_REJECTED);
+
+    let error = adapter_against(&base)
+        .chat_stream(request_with(Some(0.2)))
+        .await
+        .expect("a refusal is delivered as a stream item, not as a failure to open the stream")
+        .next()
+        .await
+        .expect("the refusal reaches the caller")
+        .expect_err("a refusal is an error");
+
+    assert_names_the_rejected_control(api_error_message(&error));
+    assert_eq!(api_error_type(&error), Some("invalid_request_error"));
+    assert_eq!(
+        api_error(&error).code.as_deref(),
+        Some("invalid_request_error"),
+        "the caller's request was refused, so the HTTP layer must report a client error"
+    );
+}
+
+/// The same refusal on the non-streaming path.
+#[tokio::test]
+async fn a_rejected_sampling_control_is_explained_on_the_request_path() {
+    let base = serve_one_error("400 Bad Request", TEMPERATURE_REJECTED);
+
+    let error = adapter_against(&base)
+        .chat_request(request_with(Some(0.2)))
+        .await
+        .expect_err("a refusal is an error");
+
+    assert_names_the_rejected_control(api_error_message(&error));
+    assert_eq!(api_error_type(&error), Some("invalid_request_error"));
+    assert_eq!(
+        api_error(&error).code.as_deref(),
+        Some("invalid_request_error"),
+        "the caller's request was refused, so the HTTP layer must report a client error"
+    );
+}
+
+/// The explanation keys on a control the request actually forwarded. The same body answering a
+/// request that set no control is not a rejected control — it is whatever Anthropic says it is —
+/// and takes the generic path.
+#[tokio::test]
+async fn the_same_answer_to_a_request_without_the_control_is_not_explained_as_one() {
+    let error = stream_error("400 Bad Request", TEMPERATURE_REJECTED).await;
+
+    let message = api_error_message(&error);
+    assert!(
+        !message.contains("Remove `temperature`"),
+        "no control was forwarded, so none can be blamed: {message}"
+    );
+    assert!(
+        message.contains("`temperature` is deprecated for this model."),
+        "the cause must survive: {message}"
+    );
+    assert_eq!(api_error_type(&error), Some("AnthropicStreamError"));
 }

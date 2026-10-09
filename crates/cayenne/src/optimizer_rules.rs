@@ -121,14 +121,20 @@ use datafusion::config::{ConfigExtension, ConfigOptions};
 use datafusion::error::{DataFusionError, Result};
 use datafusion::physical_expr::{LexOrdering, PhysicalSortExpr};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
-use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::ExecutionPlanProperties;
 use datafusion::physical_plan::Partitioning;
 use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode};
 use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
+use datafusion::physical_plan::joins::utils::JoinFilter;
 use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode, SortMergeJoinExec};
+use datafusion::physical_plan::limit::LocalLimitExec;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::sorts::sort::SortExec;
+use datafusion::physical_plan::{
+    ChildrenPropertiesMode, ExecutionPlan, ReplaceChildrenOptions, StatisticsArgs,
+    StatisticsContext,
+};
+use datafusion_common::JoinSide;
 use datafusion_common::stats::Precision;
 use datafusion_physical_expr::PhysicalExpr;
 use datafusion_physical_expr::expressions::Column;
@@ -142,7 +148,8 @@ use std::collections::{BTreeSet, HashMap};
 use std::sync::Arc;
 
 use crate::maintained_aggregate::{
-    MaintainedAggregateExec, MaintainedAggregateRegistry, aggregate_shape_is_maintainable,
+    MaintainedAggregateExec, MaintainedAggregateRegistry, PredicateConjuncts,
+    aggregate_shape_is_maintainable,
 };
 use crate::provider::CayenneAccelerationExec;
 use crate::provider::delete::{Int64PkDeletionFilterExec, KeyBasedDeletionFilterExec};
@@ -379,7 +386,10 @@ impl PhysicalOptimizerRule for CayenneDynamicFilterSharing {
                 return Ok(Transformed::no(node));
             }
 
-            let new_node = node.with_new_children(vec![left, right])?;
+            let new_node = node.replace_children(
+                vec![left, right],
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )?;
             Ok(Transformed::yes(new_node))
         })
         .data()
@@ -428,19 +438,19 @@ impl PhysicalOptimizerRule for CayenneMaintainedAggregateRewriter {
 }
 
 /// A Cayenne maintained-aggregate scan source reached during plan descent: the
-/// registry, the scan's freshness epoch, and an optional captured `FilterExec`
-/// predicate (the query's `WHERE`).
+/// registry, the scan's freshness epoch, and the predicate every row reaching the
+/// aggregate satisfied (the query's `WHERE`, wherever planning put it).
 type MaintainedAggregateSource<'a> = (
     &'a Arc<MaintainedAggregateRegistry>,
     u64,
-    Option<Arc<dyn PhysicalExpr>>,
+    PredicateConjuncts,
 );
 
 type MaintainedAggregateMatch<'a> = (
     &'a Arc<MaintainedAggregateRegistry>,
     u64,
     &'a AggregateExec,
-    Option<Arc<dyn PhysicalExpr>>,
+    PredicateConjuncts,
 );
 
 fn maintained_aggregate_source_for_aggregate(
@@ -492,43 +502,53 @@ fn maintained_aggregate_source(
     plan: &Arc<dyn ExecutionPlan>,
 ) -> Option<MaintainedAggregateSource<'_>> {
     if let Some(cayenne_scan) = plan.downcast_ref::<CayenneAccelerationExec>() {
-        // Soundness guard. A maintained view answers the whole table, but reaching
-        // the bare scan says nothing about whether the query still reads the whole
-        // table: physical `FilterPushdown` can move a `WHERE` into the scan (onto a
-        // Vortex source, or into a `FilterExec` on a branch that cannot evaluate it)
-        // and remove the `FilterExec` above, and a subquery `LIMIT` becomes a fetch
-        // inside the scan. Serving the view for such a scan returns whole-table
-        // totals for a subset. Decline unless the scan's subtree provably passes
-        // every live row through, so the real scan and aggregate run. (A `FilterExec`
-        // that survives above the scan is captured by the branch below and matched
-        // against a filtered view.) The view also describes the stored values, so a
-        // projection pushed into the scan that computes a column under a table
+        // Soundness guard. A maintained view answers for the live rows its filter
+        // selects, so it may stand in for this scan only when the scan produces
+        // exactly those rows. Reaching the bare scan says nothing about that:
+        // physical `FilterPushdown` can move a `WHERE` into the scan (onto a Vortex
+        // source, or into a `FilterExec` on a branch that cannot evaluate it) and
+        // remove the `FilterExec` above, and a subquery `LIMIT` becomes a fetch
+        // inside the scan. So the predicate is read off the scan's own subtree,
+        // and a scan whose rows no predicate describes declines, leaving the real
+        // scan and aggregate to run. The view also describes the stored values, so
+        // a projection pushed into the scan that computes a column under a table
         // column's name declines it too.
-        if !cayenne_scan.scans_whole_relation() || !cayenne_scan.outputs_table_columns() {
+        if !cayenne_scan.outputs_table_columns() {
             return None;
         }
+        let predicate = cayenne_scan.relation_predicate()?;
         return cayenne_scan
             .maintained_aggregates()
-            .map(|(registry, scan_epoch)| (registry, scan_epoch, None));
+            .map(|(registry, scan_epoch)| (registry, scan_epoch, predicate));
     }
 
-    // A single `FilterExec` between the aggregate and the Cayenne scan is the
-    // `WHERE` of a filtered analytical query (e.g. CH-benCH q1/q6). Capture its
-    // predicate so the registry can serve from a maintained view declared with
-    // the identical filter. Two stacked filters can't be matched as one
-    // predicate, so bail (fall back to the base-table scan — correct, just not
-    // accelerated).
+    // A `FilterExec` between the aggregate and the Cayenne scan is a `WHERE` that
+    // stayed above the scan (e.g. CH-benCH q1/q6 when its predicate is not pushed
+    // down). Its conjuncts narrow the rows further, so they join the scan's.
     if let Some(filter_exec) = plan.downcast_ref::<datafusion_physical_plan::filter::FilterExec>() {
-        let (registry, scan_epoch, inner_filter) =
+        let (registry, scan_epoch, mut predicate) =
             maintained_aggregate_source(filter_exec.input())?;
-        if inner_filter.is_some() {
+        predicate.try_add_predicate(filter_exec.predicate())?;
+        return Some((registry, scan_epoch, predicate));
+    }
+
+    // Planning trims the scan's output to the columns the aggregate reads with a
+    // projection that selects each one under its own name. That changes no value
+    // the aggregate sees, and the aggregate's inputs are matched to the view by
+    // name, so the view still applies. A projection that computes or renames a
+    // column does not pass: the aggregate would see a different value under a
+    // table column's name.
+    if let Some(projection) = plan.downcast_ref::<ProjectionExec>() {
+        let selects_own_columns = projection.expr().iter().all(|projected| {
+            projected
+                .expr
+                .downcast_ref::<Column>()
+                .is_some_and(|column| column.name() == projected.alias)
+        });
+        if !selects_own_columns {
             return None;
         }
-        return Some((
-            registry,
-            scan_epoch,
-            Some(Arc::clone(filter_exec.predicate())),
-        ));
+        return maintained_aggregate_source(projection.input());
     }
 
     if !plan.is::<RepartitionExec>()
@@ -580,7 +600,9 @@ impl PhysicalOptimizerRule for CayenneStatsAggregateRewriter {
             // Statistics of the aggregate's input are aligned to the schema the
             // aggregate's column indices reference. Soundness guard #2 lives in
             // `stats_aggregate_batch`: every value consumed must be `Exact`.
-            let Ok(input_stats) = query_aggregate.input().partition_statistics(None) else {
+            let Ok(input_stats) = StatisticsContext::new()
+                .compute(query_aggregate.input().as_ref(), &StatisticsArgs::new())
+            else {
                 return Ok(Transformed::no(node));
             };
             let Some(batch) = crate::stats_aggregate::stats_aggregate_batch(
@@ -867,8 +889,27 @@ fn try_rewrite_oversized_join(
             // allocate (regression for #13918). A parent Inner hash join is
             // *not* rewritten, so restore after coalesce must be Hash on the
             // original join keys, not RoundRobin.
+            //
+            // The same memory gate the Cayenne path below is held to decides
+            // this, because the rewrite is not free: it coalesces both sides to
+            // one partition, so the join and both sorts give up every core but
+            // one. That is worth paying to keep an unspillable build side out
+            // of the pool, and is pure loss when the build side was never going
+            // to fill it — a `customer` scan feeding TPC-H Q13's
+            // `LEFT JOIN orders` is ~150k single-column rows and sorts 1.5M
+            // probe rows on one thread to avoid a hash table it has room for
+            // several thousand times over. An unknown or inexact build estimate
+            // still counts as oversized (`unwrap_or(true)`), which is what the
+            // aggregated Q78 bodies report.
             if matches!(*hash_join.join_type(), JoinType::Left | JoinType::Right)
                 && should_spill_oracle_outer_join(hash_join)
+                && build_side_outgrows_pool_share(
+                    hash_join,
+                    &optimizer_config,
+                    gate_bytes,
+                    hash_join_count,
+                )
+                .unwrap_or(true)
             {
                 return finish_sort_merge_rewrite(hash_join, true);
             }
@@ -880,68 +921,17 @@ fn try_rewrite_oversized_join(
         // same-schema self-join (TPC-DS Q4/Q11/Q74 `year_total` curr/prev).
         // Those joins are 1:1 on the grouping key; sort-merge was returning a
         // different LIMIT-100 customer set than hash join at SF-100.
-        let Some(build_row_count) = build_input_row_estimate(hash_join) else {
-            if !should_spill_unknown_size_join(hash_join) {
-                return Ok(None);
-            }
-            return finish_sort_merge_rewrite(hash_join, true);
-        };
-        let Some(estimated_build_bytes) =
-            build_side_memory_estimate(hash_join.left().as_ref(), build_row_count)
-        else {
-            if !should_spill_unknown_size_join(hash_join) {
-                return Ok(None);
-            }
-            return finish_sort_merge_rewrite(hash_join, true);
-        };
-
-        // Per-join budget: the smaller of the absolute pool fraction and an even
-        // share of the pool across every hash join in the plan. A wide query
-        // such as TPC-DS q78 keeps many build sides alive at once, each below
-        // the absolute fraction yet summing past the pool; the fair-share term
-        // catches that, while a lone large join still gets the full fraction.
-        let fair_share = optimizer_config
-            .sort_merge_memory_pool_bytes
-            .map_or(gate_bytes, |pool_bytes| pool_bytes / hash_join_count.max(1));
-        let effective_gate = gate_bytes.min(fair_share);
-
-        // Which of the two terms a join is held to depends on its row count.
-        // Past `gate_bytes` a build side is oversized on the pool's own terms and
-        // spills whatever its rows say — a short-but-wide build can exhaust the
-        // non-spillable hash table well below any row floor. Only the fair-share
-        // term, which tightens as `hash_join_count` grows, can single out a
-        // mid-size join that would have finished comfortably in memory, so a
-        // build side is held to it only once it also clears `sort_merge_min_rows`.
-        //
-        // That is a deliberate loosening of the fair-share bound: a plan wide
-        // enough that `hash_join_count > 1 / sort_merge_memory_pool_fraction` can
-        // now admit builds summing past the pool (at the 0.125 default, above
-        // eight joins). Closing that back up belongs in the share itself, which
-        // charges a 1,000-row build the same slice as a billion-row one and so
-        // under-reports what is free: weighting it by estimated bytes is the fix
-        // (#13155), not holding large builds back from spilling.
-        let clears_row_floor = build_row_count > optimizer_config.sort_merge_min_rows;
-        let applicable_gate = if clears_row_floor {
-            effective_gate
-        } else {
-            gate_bytes
-        };
-        let fire = estimated_build_bytes > applicable_gate;
-
-        tracing::debug!(
-            join_type = ?hash_join.join_type(),
-            build_row_count,
-            estimated_build_bytes,
+        let Some(fire) = build_side_outgrows_pool_share(
+            hash_join,
+            &optimizer_config,
             gate_bytes,
-            fair_share,
-            effective_gate,
-            clears_row_floor,
-            applicable_gate,
-            sort_merge_min_rows = optimizer_config.sort_merge_min_rows,
             hash_join_count,
-            fire,
-            "Evaluated Cayenne oversized-join memory gate"
-        );
+        ) else {
+            if !should_spill_unknown_size_join(hash_join) {
+                return Ok(None);
+            }
+            return finish_sort_merge_rewrite(hash_join, true);
+        };
         fire
     } else {
         // Legacy row-count fallback for direct `DataFusion` users with no memory
@@ -967,6 +957,70 @@ fn try_rewrite_oversized_join(
     }
 
     finish_sort_merge_rewrite(hash_join, false)
+}
+
+/// Does `hash_join`'s build side outgrow the share of the query memory pool it
+/// may claim? `None` means the build size is unknown, which each caller reads
+/// against its own risk: a non-spillable `HashJoinInput` it cannot size is
+/// treated as oversized.
+fn build_side_outgrows_pool_share(
+    hash_join: &HashJoinExec,
+    optimizer_config: &CayenneOptimizerConfig,
+    gate_bytes: usize,
+    hash_join_count: usize,
+) -> Option<bool> {
+    let build_row_count = build_input_row_estimate(hash_join)?;
+    let estimated_build_bytes =
+        build_side_memory_estimate(hash_join.left().as_ref(), build_row_count)?;
+
+    // Per-join budget: the smaller of the absolute pool fraction and an even
+    // share of the pool across every hash join in the plan. A wide query
+    // such as TPC-DS q78 keeps many build sides alive at once, each below
+    // the absolute fraction yet summing past the pool; the fair-share term
+    // catches that, while a lone large join still gets the full fraction.
+    let fair_share = optimizer_config
+        .sort_merge_memory_pool_bytes
+        .map_or(gate_bytes, |pool_bytes| pool_bytes / hash_join_count.max(1));
+    let effective_gate = gate_bytes.min(fair_share);
+
+    // Which of the two terms a join is held to depends on its row count.
+    // Past `gate_bytes` a build side is oversized on the pool's own terms and
+    // spills whatever its rows say — a short-but-wide build can exhaust the
+    // non-spillable hash table well below any row floor. Only the fair-share
+    // term, which tightens as `hash_join_count` grows, can single out a
+    // mid-size join that would have finished comfortably in memory, so a
+    // build side is held to it only once it also clears `sort_merge_min_rows`.
+    //
+    // That is a deliberate loosening of the fair-share bound: a plan wide
+    // enough that `hash_join_count > 1 / sort_merge_memory_pool_fraction` can
+    // now admit builds summing past the pool (at the 0.125 default, above
+    // eight joins). Closing that back up belongs in the share itself, which
+    // charges a 1,000-row build the same slice as a billion-row one and so
+    // under-reports what is free: weighting it by estimated bytes is the fix
+    // (#13155), not holding large builds back from spilling.
+    let clears_row_floor = build_row_count > optimizer_config.sort_merge_min_rows;
+    let applicable_gate = if clears_row_floor {
+        effective_gate
+    } else {
+        gate_bytes
+    };
+    let fire = estimated_build_bytes > applicable_gate;
+
+    tracing::debug!(
+        join_type = ?hash_join.join_type(),
+        build_row_count,
+        estimated_build_bytes,
+        gate_bytes,
+        fair_share,
+        effective_gate,
+        clears_row_floor,
+        applicable_gate,
+        sort_merge_min_rows = optimizer_config.sort_merge_min_rows,
+        hash_join_count,
+        fire,
+        "Evaluated Cayenne oversized-join memory gate"
+    );
+    Some(fire)
 }
 
 /// Replace `hash_join` with a spillable `SortMergeJoinExec`.
@@ -1022,11 +1076,18 @@ fn finish_sort_merge_rewrite(
         .with_preserve_partitioning(true),
     );
 
+    let filter = match hash_join.filter() {
+        None => None,
+        Some(filter) => match left_first_join_filter(filter)? {
+            Some(filter) => Some(filter),
+            None => return Ok(None),
+        },
+    };
     let join = SortMergeJoinExec::try_new(
         left,
         right,
         hash_join.on().to_vec(),
-        hash_join.filter().cloned(),
+        filter,
         *hash_join.join_type(),
         sort_options,
         hash_join.null_equality(),
@@ -1044,6 +1105,15 @@ fn finish_sort_merge_rewrite(
     } else {
         join
     };
+    // `LimitPushdown` folds a `LIMIT` above a hash join into the join's `fetch`,
+    // and drops the limit node when nothing above the join merges partitions, so
+    // that `fetch` can be the only thing enforcing the `LIMIT`. `SortMergeJoinExec`
+    // has no `fetch`: cap each partition at the same count the hash join did, or
+    // a `LIMIT n` query returns every joined row.
+    let join = match hash_join.fetch() {
+        Some(fetch) => Arc::new(LocalLimitExec::new(join, fetch)) as Arc<dyn ExecutionPlan>,
+        None => join,
+    };
 
     tracing::debug!(
         join_type = ?hash_join.join_type(),
@@ -1051,6 +1121,78 @@ fn finish_sort_merge_rewrite(
     );
 
     Ok(Some(join))
+}
+
+/// `filter` with its columns reordered so every left-side column precedes every
+/// right-side one, computing the same predicate.
+///
+/// `SortMergeJoinExec` assembles a filter's intermediate batch as all of its
+/// left-side columns followed by all of its right-side ones
+/// (`get_filter_columns`), whatever order the filter lists them in, while the
+/// filter's schema and expression follow the listed order. A hash join whose
+/// inputs were swapped lists them right first — `JoinFilter::swap` flips each
+/// column's side but keeps its position — so rewriting it to sort-merge unchanged
+/// puts the predicate's inputs in the wrong slots, and the query fails at
+/// execution (CH-benCH q17: `column types must match schema types, expected
+/// Int32 but found Float64 at column index 0`).
+///
+/// `None` when a column belongs to neither input (a mark join's), which a
+/// sort-merge join cannot evaluate; the caller keeps the hash join.
+fn left_first_join_filter(filter: &JoinFilter) -> Result<Option<JoinFilter>> {
+    let indices = filter.column_indices();
+    if indices
+        .iter()
+        .any(|column| !matches!(column.side, JoinSide::Left | JoinSide::Right))
+    {
+        return Ok(None);
+    }
+    let order: Vec<usize> = (0..indices.len())
+        .filter(|&i| indices[i].side == JoinSide::Left)
+        .chain((0..indices.len()).filter(|&i| indices[i].side == JoinSide::Right))
+        .collect();
+    if order
+        .iter()
+        .enumerate()
+        .all(|(position, &listed)| position == listed)
+    {
+        return Ok(Some(filter.clone()));
+    }
+    let mut position_of = vec![0; order.len()];
+    for (position, &listed) in order.iter().enumerate() {
+        position_of[listed] = position;
+    }
+    let listed_schema = filter.schema();
+    let fields: Vec<_> = order
+        .iter()
+        .map(|&listed| Arc::clone(&listed_schema.fields()[listed]))
+        .collect();
+    let schema = Arc::new(Schema::new_with_metadata(
+        fields,
+        listed_schema.metadata().clone(),
+    ));
+    let column_indices = order
+        .iter()
+        .map(|&listed| indices[listed].clone())
+        .collect();
+    let expression = Arc::clone(filter.expression())
+        .transform(|expr| {
+            let Some(column) = expr.downcast_ref::<Column>() else {
+                return Ok(Transformed::no(expr));
+            };
+            let Some(&position) = position_of.get(column.index()) else {
+                return Err(DataFusionError::Internal(format!(
+                    "join filter column {} (#{}) is outside its {}-column intermediate schema",
+                    column.name(),
+                    column.index(),
+                    position_of.len()
+                )));
+            };
+            Ok(Transformed::yes(
+                Arc::new(Column::new(column.name(), position)) as Arc<dyn PhysicalExpr>,
+            ))
+        })
+        .data()?;
+    Ok(Some(JoinFilter::new(expression, column_indices, schema)))
 }
 
 /// `HashJoinExec` may embed a column projection that `SortMergeJoinExec` does
@@ -1112,7 +1254,11 @@ fn wrap_sort_merge_to_hash_join_schema(
 /// 19 GB non-spillable `HashJoinInput` that then exhausts the pool. `None`
 /// means unknown → treat as oversized, except a same-schema self-join.
 fn build_input_row_estimate(hash_join: &HashJoinExec) -> Option<usize> {
-    match hash_join.left().partition_statistics(None).ok()?.num_rows {
+    match StatisticsContext::new()
+        .compute(hash_join.left().as_ref(), &StatisticsArgs::new())
+        .ok()?
+        .num_rows
+    {
         Precision::Exact(row_count) => Some(row_count),
         Precision::Inexact(_) | Precision::Absent => None,
     }
@@ -1166,7 +1312,11 @@ fn rewrite_partitioned_hash_join_to_collect_left(
         PartitionMode::CollectLeft,
         hash_join.null_equality(),
         hash_join.null_aware,
-    )?;
+    )?
+    // A `LIMIT` folded into the join's `fetch` may be the only limit in the plan.
+    .builder()
+    .with_fetch(hash_join.fetch())
+    .build()?;
     Ok(Some(Arc::new(join)))
 }
 
@@ -1477,7 +1627,11 @@ fn spillable_rewrite_build_input_exact_rows(hash_join: &HashJoinExec) -> Option<
     // hash table regardless of join type.
     let build_input = hash_join.left();
 
-    match build_input.partition_statistics(None).ok()?.num_rows {
+    match StatisticsContext::new()
+        .compute(build_input.as_ref(), &StatisticsArgs::new())
+        .ok()?
+        .num_rows
+    {
         Precision::Exact(row_count) => Some(row_count),
         Precision::Inexact(_) | Precision::Absent => None,
     }
@@ -1509,7 +1663,11 @@ fn exact_join_filter_build_key_bytes(
 }
 
 fn exact_join_filter_probe_rows(hash_join: &HashJoinExec) -> Option<usize> {
-    match hash_join.right().partition_statistics(None).ok()?.num_rows {
+    match StatisticsContext::new()
+        .compute(hash_join.right().as_ref(), &StatisticsArgs::new())
+        .ok()?
+        .num_rows
+    {
         Precision::Exact(row_count) | Precision::Inexact(row_count) => Some(row_count),
         Precision::Absent => None,
     }
@@ -1927,8 +2085,11 @@ fn apply_filter_additions(
         return Ok((plan, false));
     }
 
-    plan.with_new_children(new_children)
-        .map(|plan| (plan, true))
+    plan.replace_children(
+        new_children,
+        ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+    )
+    .map(|plan| (plan, true))
 }
 
 impl std::fmt::Debug for CayenneJoinRewriter {
@@ -2139,6 +2300,7 @@ mod tests {
     use datafusion::physical_plan::aggregates::{AggregateExec, AggregateMode, PhysicalGroupBy};
     use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
     use datafusion::physical_plan::joins::{HashJoinExec, PartitionMode, SortMergeJoinExec};
+    use datafusion::physical_plan::limit::LocalLimitExec;
     use datafusion::physical_plan::projection::ProjectionExec;
     use datafusion::physical_plan::repartition::RepartitionExec;
     use datafusion::physical_plan::sorts::sort::SortExec;
@@ -2186,6 +2348,40 @@ mod tests {
             ],
         )
         .expect("test batch should be valid")
+    }
+
+    fn four_row_count_batch() -> RecordBatch {
+        RecordBatch::try_new(
+            maintained_aggregate_test_schema(),
+            vec![
+                Arc::new(StringArray::from(vec![
+                    Some("a"),
+                    Some("a"),
+                    Some("b"),
+                    Some("c"),
+                ])),
+                Arc::new(Int64Array::from(vec![Some(1), Some(2), Some(3), Some(4)])),
+            ],
+        )
+        .expect("four-row count batch should be valid")
+    }
+
+    fn maintained_global_count_aggregate(
+        input: Arc<dyn ExecutionPlan>,
+        schema: Arc<Schema>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let aggregate_expr = AggregateExprBuilder::new(count_udaf(), vec![lit(1_i8)])
+            .schema(Arc::clone(&schema))
+            .alias("count(*)".to_string())
+            .build()?;
+        Ok(Arc::new(AggregateExec::try_new(
+            AggregateMode::Single,
+            PhysicalGroupBy::new(vec![], vec![], vec![], false),
+            vec![Arc::new(aggregate_expr)],
+            vec![None],
+            input,
+            schema,
+        )?))
     }
 
     fn maintained_count_aggregate(
@@ -2241,7 +2437,7 @@ mod tests {
     /// O(groups) maintained state, not an O(rows) re-scan. Pairs with the
     /// module's value-correctness tests (`maintains_min_max_with_retraction`), so
     /// together they prove the served path is both selected AND correct. MIN/MAX
-    /// inherits the whole-relation guard (`scans_whole_relation`) from the shared,
+    /// inherits the scan-predicate guard (`relation_predicate`) from the shared,
     /// function-agnostic `maintained_aggregate_source`.
     #[test]
     fn maintained_aggregate_rewriter_serves_min_max_group_by() -> DFResult<()> {
@@ -2625,8 +2821,420 @@ mod tests {
         Ok(())
     }
 
+    /// `value > bound` over the maintained-aggregate test schema, with `value`
+    /// referenced at `position` — the position differs between a scan's own
+    /// output and a file source's schema.
+    fn value_gt(position: usize, bound: i64) -> Arc<dyn PhysicalExpr> {
+        Arc::new(datafusion_physical_expr::expressions::BinaryExpr::new(
+            Arc::new(Column::new("value", position)),
+            datafusion::logical_expr::Operator::Gt,
+            lit(bound),
+        ))
+    }
+
+    /// A registry with one `COUNT(*) GROUP BY name` view filtered on
+    /// `value > 1`, fresh at epoch 1.
+    fn filtered_count_registry(schema: &Arc<Schema>) -> DFResult<Arc<MaintainedAggregateRegistry>> {
+        let registry = Arc::new(MaintainedAggregateRegistry::try_new(
+            &[MaintainedAggregateSpec {
+                filter: Some(value_gt_one(schema)?),
+                group_by: vec!["name".to_string()],
+                aggregates: vec![MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Count,
+                    column: None,
+                }],
+            }],
+            schema,
+        )?);
+        registry.apply_insert_batches(1, &[maintained_aggregate_test_batch()])?;
+        Ok(registry)
+    }
+
+    /// The shape physical filter pushdown leaves a query's `WHERE` in: no
+    /// `FilterExec` above the Cayenne scan, the predicate on the file source,
+    /// and a `FilterExec` on the in-memory branch.
+    fn scan_with_branch_filters(
+        schema: &Arc<Schema>,
+        registry: Arc<MaintainedAggregateRegistry>,
+        file_predicate: Option<Arc<dyn PhysicalExpr>>,
+        memory_predicate: Option<Arc<dyn PhysicalExpr>>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let memory = inlined_exec(schema);
+        let memory = match memory_predicate {
+            Some(predicate) => Arc::new(datafusion_physical_plan::filter::FilterExec::try_new(
+                predicate, memory,
+            )?) as Arc<dyn ExecutionPlan>,
+            None => memory,
+        };
+        let union =
+            UnionExec::try_new(vec![file_exec(schema, "f.vortex", file_predicate), memory])?;
+        Ok(Arc::new(
+            CayenneAccelerationExec::new_with_maintained_aggregates(union, registry, 1),
+        ))
+    }
+
+    fn rewrite(plan: Arc<dyn ExecutionPlan>) -> DFResult<Arc<dyn ExecutionPlan>> {
+        CayenneMaintainedAggregateRewriter::new().optimize(plan, &ConfigOptions::default())
+    }
+
+    // An aggregate without `GROUP BY` is planned with no grouping at all, not one
+    // empty grouping; it must still be answered by a view without `GROUP BY`.
     #[test]
-    fn stats_aggregate_rewriter_folds_sum_over_cayenne_scan() -> DFResult<()> {
+    fn maintained_aggregate_rewriter_serves_an_aggregate_without_group_by() -> DFResult<()> {
+        let schema = maintained_aggregate_test_schema();
+        let registry = Arc::new(MaintainedAggregateRegistry::try_new(
+            &[MaintainedAggregateSpec {
+                filter: None,
+                group_by: vec![],
+                aggregates: vec![MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Sum,
+                    column: Some("value".to_string()),
+                }],
+            }],
+            &schema,
+        )?);
+        registry.apply_insert_batches(1, &[maintained_aggregate_test_batch()])?;
+        let memory = MemorySourceConfig::try_new_exec(
+            &[vec![maintained_aggregate_test_batch()]],
+            Arc::clone(&schema),
+            None,
+        )?;
+        let scan = Arc::new(CayenneAccelerationExec::new_with_maintained_aggregates(
+            memory, registry, 1,
+        )) as Arc<dyn ExecutionPlan>;
+        let sum = AggregateExprBuilder::new(sum_udaf(), vec![col("value", schema.as_ref())?])
+            .schema(Arc::clone(&schema))
+            .alias("sum(value)".to_string())
+            .build()?;
+        let aggregate = Arc::new(AggregateExec::try_new(
+            AggregateMode::Single,
+            // What the physical planner builds for an aggregate without GROUP BY.
+            PhysicalGroupBy::new(vec![], vec![], vec![], false),
+            vec![Arc::new(sum)],
+            vec![None],
+            scan,
+            Arc::clone(&schema),
+        )?) as Arc<dyn ExecutionPlan>;
+
+        let optimized = rewrite(aggregate)?;
+
+        assert!(
+            optimized.is::<MaintainedAggregateExec>(),
+            "an aggregate without GROUP BY must be served from a view without one"
+        );
+        Ok(())
+    }
+
+    fn scan_with_maintained_count(
+        registry: Arc<MaintainedAggregateRegistry>,
+        batch: RecordBatch,
+        epoch: u64,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        let schema = batch.schema();
+        let memory = MemorySourceConfig::try_new_exec(&[vec![batch]], Arc::clone(&schema), None)?;
+        Ok(Arc::new(
+            CayenneAccelerationExec::new_with_maintained_aggregates(memory, registry, epoch),
+        ))
+    }
+
+    fn count_values(batch: &RecordBatch) -> Vec<i64> {
+        let counts = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("count(*) is Int64");
+        let mut values = counts
+            .iter()
+            .map(|value| value.expect("COUNT(*) is non-null"))
+            .collect::<Vec<_>>();
+        values.sort_unstable();
+        values
+    }
+
+    // A reused CDC scan view can trail the registry. Serving the newer view
+    // would make COUNT(*) disagree with another scan of the same snapshot in
+    // the same plan: the scan at epoch 1 holds 4 rows, the registry at epoch 2
+    // holds 8. The rewrite must keep both arms on the scan snapshot.
+    #[tokio::test]
+    async fn maintained_aggregate_rewriter_does_not_serve_a_newer_registry_than_the_scan()
+    -> DFResult<()> {
+        let schema = maintained_aggregate_test_schema();
+        let first = four_row_count_batch();
+        let second = four_row_count_batch();
+        let registry = Arc::new(MaintainedAggregateRegistry::try_new(
+            &[MaintainedAggregateSpec {
+                filter: None,
+                group_by: vec![],
+                aggregates: vec![MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Count,
+                    column: None,
+                }],
+            }],
+            &schema,
+        )?);
+        registry.apply_insert_batches(1, std::slice::from_ref(&first))?;
+        registry.apply_insert_batches(2, std::slice::from_ref(&second))?;
+
+        let matching = scan_with_maintained_count(Arc::clone(&registry), first.clone(), 2)?;
+        // The matching-epoch scan still carries only the first batch so the
+        // served 8 can only come from the registry, not from rescanning.
+        let matching_count = maintained_global_count_aggregate(matching, Arc::clone(&schema))?;
+        let matching_plan = rewrite(matching_count)?;
+        assert!(
+            matching_plan.is::<MaintainedAggregateExec>(),
+            "a scan at the registry epoch must be served from the view"
+        );
+        let task = datafusion::execution::context::SessionContext::new().task_ctx();
+        let matching_rows = collect_plan_rows(Arc::clone(&matching_plan), Arc::clone(&task)).await;
+        assert_eq!(
+            count_values(&matching_rows),
+            vec![8],
+            "maintained_count_at_epoch_2 must be 8"
+        );
+
+        let scan = scan_with_maintained_count(Arc::clone(&registry), first.clone(), 1)?;
+        let unfiltered = maintained_global_count_aggregate(Arc::clone(&scan), Arc::clone(&schema))?;
+        let filtered_scan = Arc::new(datafusion_physical_plan::filter::FilterExec::try_new(
+            value_gt(1, -1_000),
+            scan,
+        )?) as Arc<dyn ExecutionPlan>;
+        let filtered = maintained_global_count_aggregate(filtered_scan, schema)?;
+        let mixed = UnionExec::try_new(vec![unfiltered, filtered])?;
+        let optimized = rewrite(mixed)?;
+        let plan = displayable(optimized.as_ref()).indent(true).to_string();
+        assert!(
+            !plan.contains("MaintainedAggregateExec"),
+            "an epoch-1 scan must not be replaced by the epoch-2 view. Plan:\n{plan}"
+        );
+
+        let mixed_rows = collect_plan_rows(optimized, task).await;
+        assert_eq!(
+            count_values(&mixed_rows),
+            vec![4, 4],
+            "both COUNT(*) arms must see the scan snapshot (4 rows), not the newer registry (8 rows)"
+        );
+        Ok(())
+    }
+
+    // A `WHERE` pushed into the scan is still the query's `WHERE`: when every
+    // branch applies the view's filter, the view answers. The file source names
+    // `value` at a position of its own schema, so the match must go by name.
+    #[test]
+    fn maintained_aggregate_rewriter_serves_a_filter_pushed_into_the_scan() -> DFResult<()> {
+        let schema = maintained_aggregate_test_schema();
+        let scan = scan_with_branch_filters(
+            &schema,
+            filtered_count_registry(&schema)?,
+            Some(value_gt(7, 1)),
+            Some(value_gt(1, 1)),
+        )?;
+
+        let optimized = rewrite(maintained_count_aggregate(scan, schema)?)?;
+
+        assert!(
+            optimized.is::<MaintainedAggregateExec>(),
+            "a scan applying the view's filter on every branch must be served from the view"
+        );
+        Ok(())
+    }
+
+    // A branch that keeps rows the filter would drop makes the scan's rows a
+    // superset of the view's, whatever the other branches do.
+    #[test]
+    fn maintained_aggregate_rewriter_declines_a_scan_whose_branches_filter_differently()
+    -> DFResult<()> {
+        let schema = maintained_aggregate_test_schema();
+        for (file_predicate, memory_predicate) in [
+            (Some(value_gt(1, 1)), None),
+            (None, Some(value_gt(1, 1))),
+            (Some(value_gt(1, 1)), Some(value_gt(1, 2))),
+        ] {
+            let scan = scan_with_branch_filters(
+                &schema,
+                filtered_count_registry(&schema)?,
+                file_predicate,
+                memory_predicate,
+            )?;
+
+            let optimized = rewrite(maintained_count_aggregate(scan, Arc::clone(&schema))?)?;
+
+            assert!(
+                optimized.is::<AggregateExec>(),
+                "branches that disagree on the predicate must not be served from the view"
+            );
+        }
+        Ok(())
+    }
+
+    // The same conjunct with another literal selects other rows.
+    #[test]
+    fn maintained_aggregate_rewriter_declines_a_different_pushed_predicate() -> DFResult<()> {
+        let schema = maintained_aggregate_test_schema();
+        let scan = scan_with_branch_filters(
+            &schema,
+            filtered_count_registry(&schema)?,
+            Some(value_gt(1, 2)),
+            Some(value_gt(1, 2)),
+        )?;
+
+        let optimized = rewrite(maintained_count_aggregate(scan, schema)?)?;
+
+        assert!(
+            optimized.is::<AggregateExec>(),
+            "a pushed predicate other than the view's filter must not be served from the view"
+        );
+        Ok(())
+    }
+
+    // A filter split between the scan and a `FilterExec` that stayed above it is
+    // one predicate: the rows reaching the aggregate satisfy both parts.
+    #[test]
+    fn maintained_aggregate_rewriter_joins_a_surviving_filter_to_the_pushed_one() -> DFResult<()> {
+        let schema = maintained_aggregate_test_schema();
+        let name_not_null: Arc<dyn PhysicalExpr> =
+            Arc::new(datafusion_physical_expr::expressions::IsNotNullExpr::new(
+                col("name", schema.as_ref())?,
+            ));
+        let registry = Arc::new(MaintainedAggregateRegistry::try_new(
+            &[MaintainedAggregateSpec {
+                filter: Some(conjunction([value_gt(1, 1), Arc::clone(&name_not_null)])),
+                group_by: vec!["name".to_string()],
+                aggregates: vec![MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Count,
+                    column: None,
+                }],
+            }],
+            &schema,
+        )?);
+        registry.apply_insert_batches(1, &[maintained_aggregate_test_batch()])?;
+        let scan = scan_with_branch_filters(
+            &schema,
+            registry,
+            Some(value_gt(1, 1)),
+            Some(value_gt(1, 1)),
+        )?;
+        let filter = Arc::new(datafusion_physical_plan::filter::FilterExec::try_new(
+            name_not_null,
+            scan,
+        )?) as Arc<dyn ExecutionPlan>;
+
+        let optimized = rewrite(maintained_count_aggregate(filter, schema)?)?;
+
+        assert!(
+            optimized.is::<MaintainedAggregateExec>(),
+            "the pushed and surviving conjuncts together match the view's filter"
+        );
+        Ok(())
+    }
+
+    // An `EmptyExec` branch produces no rows, so it does not need the filter.
+    #[test]
+    fn maintained_aggregate_rewriter_serves_past_an_empty_branch() -> DFResult<()> {
+        let schema = maintained_aggregate_test_schema();
+        let filtered_memory = Arc::new(datafusion_physical_plan::filter::FilterExec::try_new(
+            value_gt(1, 1),
+            inlined_exec(&schema),
+        )?) as Arc<dyn ExecutionPlan>;
+        let empty = Arc::new(datafusion_physical_plan::empty::EmptyExec::new(Arc::clone(
+            &schema,
+        ))) as Arc<dyn ExecutionPlan>;
+        let scan = Arc::new(CayenneAccelerationExec::new_with_maintained_aggregates(
+            UnionExec::try_new(vec![filtered_memory, empty])?,
+            filtered_count_registry(&schema)?,
+            1,
+        )) as Arc<dyn ExecutionPlan>;
+
+        let optimized = rewrite(maintained_count_aggregate(scan, schema)?)?;
+
+        assert!(
+            optimized.is::<MaintainedAggregateExec>(),
+            "an empty branch must not stop the view from serving"
+        );
+        Ok(())
+    }
+
+    // Planning trims the scan's output with a projection of table columns under
+    // their own names, which the view still describes. A projection that
+    // computes a value under a table column's name hands the aggregate values
+    // the view never saw.
+    #[test]
+    fn maintained_aggregate_rewriter_reads_through_projections_of_table_columns_only()
+    -> DFResult<()> {
+        let schema = maintained_aggregate_test_schema();
+        let registry = Arc::new(MaintainedAggregateRegistry::try_new(
+            &[MaintainedAggregateSpec {
+                filter: None,
+                group_by: vec!["name".to_string()],
+                aggregates: vec![MaintainedAggregateExpr {
+                    function: MaintainedAggregateFunction::Sum,
+                    column: Some("value".to_string()),
+                }],
+            }],
+            &schema,
+        )?);
+        registry.apply_insert_batches(1, &[maintained_aggregate_test_batch()])?;
+        let value_plus_one = datafusion_physical_expr::expressions::binary(
+            col("value", schema.as_ref())?,
+            datafusion::logical_expr::Operator::Plus,
+            lit(1_i64),
+            schema.as_ref(),
+        )?;
+        for (value_expr, served) in [
+            (col("value", schema.as_ref())?, true),
+            (value_plus_one, false),
+        ] {
+            let memory = MemorySourceConfig::try_new_exec(
+                &[vec![maintained_aggregate_test_batch()]],
+                Arc::clone(&schema),
+                None,
+            )?;
+            let scan = Arc::new(CayenneAccelerationExec::new_with_maintained_aggregates(
+                memory,
+                Arc::clone(&registry),
+                1,
+            )) as Arc<dyn ExecutionPlan>;
+            let projection = Arc::new(ProjectionExec::try_new(
+                vec![
+                    (col("name", schema.as_ref())?, "name".to_string()),
+                    (value_expr, "value".to_string()),
+                ],
+                scan,
+            )?) as Arc<dyn ExecutionPlan>;
+            let group_by = PhysicalGroupBy::new_single(vec![(
+                col("name", schema.as_ref())?,
+                "name".to_string(),
+            )]);
+            let sum = AggregateExprBuilder::new(sum_udaf(), vec![col("value", schema.as_ref())?])
+                .schema(Arc::clone(&schema))
+                .alias("sum(value)".to_string())
+                .build()?;
+            let aggregate = Arc::new(AggregateExec::try_new(
+                AggregateMode::Single,
+                group_by,
+                vec![Arc::new(sum)],
+                vec![None],
+                projection,
+                Arc::clone(&schema),
+            )?) as Arc<dyn ExecutionPlan>;
+
+            let optimized = rewrite(aggregate)?;
+
+            assert_eq!(
+                optimized.is::<MaintainedAggregateExec>(),
+                served,
+                "served through a projection of {}",
+                if served {
+                    "the stored column"
+                } else {
+                    "a computed column"
+                }
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stats_aggregate_rewriter_folds_sum_over_cayenne_scan() -> DFResult<()> {
         let schema = maintained_aggregate_test_schema();
         let stats = value_sum_statistics(Precision::Exact(ScalarValue::Int64(Some(6))));
         let scan = Arc::new(CayenneAccelerationExec::new(file_exec_with_statistics(
@@ -2634,14 +3242,31 @@ mod tests {
         )));
         let aggregate = sum_value_aggregate(scan, schema)?;
 
-        let optimized =
-            CayenneStatsAggregateRewriter::new().optimize(aggregate, &ConfigOptions::default())?;
+        let optimized = CayenneStatsAggregateRewriter::new()
+            .optimize(Arc::clone(&aggregate), &ConfigOptions::default())?;
 
         assert!(
             optimized
                 .downcast_ref::<MaintainedAggregateExec>()
                 .is_some(),
             "exact whole-file sum over an unfiltered Cayenne scan must fold"
+        );
+        // The fold serves the footer's exact sum under the aggregate's own schema,
+        // in place of scanning the file.
+        assert_eq!(optimized.schema(), aggregate.schema());
+        let task = datafusion::execution::context::SessionContext::new().task_ctx();
+        let batches = datafusion::physical_plan::collect(optimized, task).await?;
+        let expected = [
+            "+------------+",
+            "| sum(value) |",
+            "+------------+",
+            "| 6          |",
+            "+------------+",
+        ]
+        .join("\n");
+        assert_eq!(
+            arrow::util::pretty::pretty_format_batches(&batches)?.to_string(),
+            expected
         );
         Ok(())
     }
@@ -2739,6 +3364,16 @@ mod tests {
             self.filter.clone()
         }
 
+        fn apply_expressions(
+            &self,
+            f: &mut dyn FnMut(
+                &Arc<dyn PhysicalExpr>,
+            )
+                -> DFResult<datafusion::common::tree_node::TreeNodeRecursion>,
+        ) -> DFResult<datafusion::common::tree_node::TreeNodeRecursion> {
+            datafusion::physical_plan::apply_expression_roots(self.filter.iter(), f)
+        }
+
         fn projection(&self) -> Option<&ProjectionExprs> {
             None
         }
@@ -2793,13 +3428,33 @@ mod tests {
         file_exec_with_statistics(schema, path, filter, Statistics::new_unknown(schema))
     }
 
+    /// A build side the 107 GiB pool the oracle tests configure cannot hold:
+    /// TPC-DS Q78's `--validate` oracle carries ~100 GB in one `HashJoinInput`
+    /// at SF-100. Expressed as rows against the two-column test schemas, which
+    /// `build_side_memory_estimate` charges at 40 bytes each.
+    const OVERSIZED_ORACLE_BUILD_ROWS: usize = 2_500_000_000;
+    /// TPC-H Q13's `customer` build side — ~6 MB against the same schemas, so
+    /// it fits its share of any production pool many times over.
+    const SMALL_ORACLE_BUILD_ROWS: usize = 150_000;
+
+    /// A file scan reporting an exact row count, for the build-side size the
+    /// memory gate reads.
+    fn sized_file_exec(schema: &Arc<Schema>, path: &str, rows: usize) -> Arc<dyn ExecutionPlan> {
+        file_exec_with_statistics(
+            schema,
+            path,
+            None,
+            Statistics::new_unknown(schema).with_num_rows(Precision::Exact(rows)),
+        )
+    }
+
     fn file_exec_with_statistics(
         schema: &Arc<Schema>,
         path: &str,
         filter: Option<Arc<dyn PhysicalExpr>>,
         statistics: Statistics,
     ) -> Arc<dyn ExecutionPlan> {
-        let table_schema = TableSchema::new(Arc::clone(schema), Vec::new());
+        let table_schema = TableSchema::from(Arc::clone(schema));
         let source = Arc::new(TestFileSource::new(table_schema, filter));
         let file = PartitionedFile::from(ObjectMeta {
             location: Path::from(path),
@@ -3534,8 +4189,10 @@ mod tests {
             JoinType::Inner,
             NullEquality::NullEqualsNothing,
         ));
-        let config =
-            config_with_cayenne_optimizer(None, Some(0.125), Some(107 * 1024 * 1024 * 1024));
+        // A pool too small to hold even this 100-key build side, so the outer
+        // child takes the coalesce-and-restore path whose row preservation is
+        // what this test is about.
+        let config = config_with_cayenne_optimizer(None, Some(0.125), Some(1_024));
 
         let task = datafusion::execution::context::SessionContext::new().task_ctx();
         let optimized = optimize_anti_join_sort_merge_with_config(Arc::clone(&parent), &config);
@@ -3551,6 +4208,146 @@ mod tests {
             rewritten.num_rows(),
             100,
             "restored Hash child must emit every left-outer row"
+        );
+    }
+
+    /// Regression test for CH-benCH q17 failing under load with `column types
+    /// must match schema types, expected Int32 but found Float64 at column index
+    /// 0`. Once the planner swaps a hash join's inputs, its residual filter lists
+    /// the right input's column first; the sort-merge rewrite must hand
+    /// `SortMergeJoinExec` a filter in the left-first layout it assembles, and the
+    /// rewritten join must return the hash join's rows.
+    #[tokio::test]
+    async fn sort_merge_rewrite_keeps_a_right_first_join_filter_evaluable() {
+        use arrow::array::Float64Array;
+        use datafusion::logical_expr::Operator;
+        use datafusion::physical_plan::joins::utils::{ColumnIndex, JoinFilter};
+        use datafusion_common::JoinSide;
+        use datafusion_physical_expr::expressions::BinaryExpr;
+
+        // Build side: q17's aggregated subquery `t(i_id, a)`.
+        let left_schema = Arc::new(Schema::new(vec![
+            Field::new("i_id", DataType::Int64, false),
+            Field::new("a", DataType::Float64, false),
+        ]));
+        let left_batch = RecordBatch::try_new(
+            Arc::clone(&left_schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 2])),
+                Arc::new(Float64Array::from(vec![5.0, 1.5])),
+            ],
+        )
+        .expect("left batch");
+        // Probe side: `order_line(ol_i_id, ol_quantity, ol_amount)`.
+        let right_schema = Arc::new(Schema::new(vec![
+            Field::new("ol_i_id", DataType::Int64, false),
+            Field::new("ol_quantity", DataType::Int32, false),
+            Field::new("ol_amount", DataType::Int64, false),
+        ]));
+        let right_batch = RecordBatch::try_new(
+            Arc::clone(&right_schema),
+            vec![
+                Arc::new(Int64Array::from(vec![1, 1, 2, 2, 3])),
+                Arc::new(Int32Array::from(vec![3, 7, 1, 2, 1])),
+                Arc::new(Int64Array::from(vec![10, 20, 30, 40, 50])),
+            ],
+        )
+        .expect("right batch");
+        let left =
+            MemorySourceConfig::try_new_exec(&[vec![left_batch]], Arc::clone(&left_schema), None)
+                .expect("left exec");
+        let right =
+            MemorySourceConfig::try_new_exec(&[vec![right_batch]], Arc::clone(&right_schema), None)
+                .expect("right exec");
+
+        // `CAST(ol_quantity@0 AS Float64) < a@1`, listed right first: the layout
+        // `JoinFilter::swap` leaves when the planner makes `t` the build side.
+        let filter_schema = Arc::new(Schema::new(vec![
+            Field::new("ol_quantity", DataType::Int32, false),
+            Field::new("a", DataType::Float64, false),
+        ]));
+        let predicate = Arc::new(BinaryExpr::new(
+            cast(
+                Arc::new(Column::new("ol_quantity", 0)),
+                filter_schema.as_ref(),
+                DataType::Float64,
+            )
+            .expect("cast ol_quantity"),
+            Operator::Lt,
+            Arc::new(Column::new("a", 1)),
+        )) as Arc<dyn PhysicalExpr>;
+        let filter = JoinFilter::new(
+            predicate,
+            vec![
+                ColumnIndex {
+                    index: 1,
+                    side: JoinSide::Right,
+                },
+                ColumnIndex {
+                    index: 1,
+                    side: JoinSide::Left,
+                },
+            ],
+            filter_schema,
+        );
+        let hash_join = HashJoinExec::try_new(
+            left,
+            right,
+            vec![(
+                Arc::new(Column::new("i_id", 0)) as Arc<dyn PhysicalExpr>,
+                Arc::new(Column::new("ol_i_id", 0)) as Arc<dyn PhysicalExpr>,
+            )],
+            Some(filter),
+            &JoinType::Inner,
+            None,
+            PartitionMode::CollectLeft,
+            NullEquality::NullEqualsNothing,
+            false,
+        )
+        .expect("hash join");
+
+        let rewritten = super::finish_sort_merge_rewrite(&hash_join, false)
+            .expect("the rewrite plans")
+            .expect("an inner hash join with a residual filter is rewritten");
+        assert!(
+            rewritten.is::<SortMergeJoinExec>(),
+            "the rewrite must produce the sort-merge join under test, got {}",
+            displayable(rewritten.as_ref()).one_line()
+        );
+
+        let rows = |batch: &RecordBatch| -> Vec<(i64, i32, i64)> {
+            let id = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("i_id");
+            let quantity = batch
+                .column(3)
+                .as_any()
+                .downcast_ref::<Int32Array>()
+                .expect("ol_quantity");
+            let amount = batch
+                .column(4)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("ol_amount");
+            let mut rows: Vec<_> = (0..batch.num_rows())
+                .map(|i| (id.value(i), quantity.value(i), amount.value(i)))
+                .collect();
+            rows.sort_unstable();
+            rows
+        };
+        let task = datafusion::execution::context::SessionContext::new().task_ctx();
+        let expected = rows(&collect_plan_rows(Arc::new(hash_join), Arc::clone(&task)).await);
+        assert_eq!(
+            expected,
+            vec![(1, 3, 10), (2, 1, 30)],
+            "hash join oracle: each item keeps only the lines below its average"
+        );
+        assert_eq!(
+            rows(&collect_plan_rows(rewritten, task).await),
+            expected,
+            "the sort-merge rewrite must return the hash join's rows"
         );
     }
 
@@ -4089,12 +4886,26 @@ mod tests {
         let left_schema = channel_schema("ss_item_sk", "ss_qty");
         let right_schema = channel_schema("ws_item_sk", "ws_qty");
         let left = hash_repartition(
-            grouped_count_over(inlined_exec(&left_schema), "ss_item_sk"),
+            grouped_count_over(
+                sized_file_exec(
+                    &left_schema,
+                    "store_sales.parquet",
+                    OVERSIZED_ORACLE_BUILD_ROWS,
+                ),
+                "ss_item_sk",
+            ),
             "ss_item_sk",
             4,
         );
         let right = hash_repartition(
-            grouped_count_over(inlined_exec(&right_schema), "ws_item_sk"),
+            grouped_count_over(
+                sized_file_exec(
+                    &right_schema,
+                    "web_sales.parquet",
+                    OVERSIZED_ORACLE_BUILD_ROWS,
+                ),
+                "ws_item_sk",
+            ),
             "ws_item_sk",
             4,
         );
@@ -4248,8 +5059,24 @@ mod tests {
         // per side and fills the spillable cap at SF-100 (regression for #13918).
         let left_schema = channel_schema("ss_item_sk", "ss_ticket_number");
         let right_schema = channel_schema("sr_item_sk", "sr_ticket_number");
-        let left = hash_repartition(inlined_exec(&left_schema), "ss_item_sk", 4);
-        let right = hash_repartition(inlined_exec(&right_schema), "sr_item_sk", 4);
+        let left = hash_repartition(
+            sized_file_exec(
+                &left_schema,
+                "store_sales.parquet",
+                OVERSIZED_ORACLE_BUILD_ROWS,
+            ),
+            "ss_item_sk",
+            4,
+        );
+        let right = hash_repartition(
+            sized_file_exec(
+                &right_schema,
+                "store_returns.parquet",
+                OVERSIZED_ORACLE_BUILD_ROWS,
+            ),
+            "sr_item_sk",
+            4,
+        );
         let join = Arc::new(hash_join_with_join_type(
             left,
             right,
@@ -4273,14 +5100,110 @@ mod tests {
         // with 0 bytes cannot allocate (regression for #13918).
         let left_schema = channel_schema("sr_item_sk", "sr_ticket_number");
         let right_schema = channel_schema("ss_item_sk", "ss_ticket_number");
-        let left = hash_repartition(inlined_exec(&left_schema), "sr_item_sk", 4);
-        let right = hash_repartition(inlined_exec(&right_schema), "ss_item_sk", 4);
+        let left = hash_repartition(
+            sized_file_exec(
+                &left_schema,
+                "store_returns.parquet",
+                OVERSIZED_ORACLE_BUILD_ROWS,
+            ),
+            "sr_item_sk",
+            4,
+        );
+        let right = hash_repartition(
+            sized_file_exec(
+                &right_schema,
+                "store_sales.parquet",
+                OVERSIZED_ORACLE_BUILD_ROWS,
+            ),
+            "ss_item_sk",
+            4,
+        );
         let join = Arc::new(hash_join_with_join_type(
             left,
             right,
             "sr_item_sk",
             "ss_item_sk",
             JoinType::Right,
+            NullEquality::NullEqualsNothing,
+        ));
+        let config =
+            config_with_cayenne_optimizer(None, Some(0.125), Some(107 * 1024 * 1024 * 1024));
+
+        let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
+        assert_coalesced_oracle_file_scan_sort_merge(&optimized, 4);
+    }
+
+    #[test]
+    fn keeps_small_oracle_left_join_of_file_scans_as_hash_join() {
+        // TPC-H Q13 on a spicepod with no Cayenne: `customer LEFT JOIN orders`.
+        // The build side is ~150k single-key rows, so there is no unspillable
+        // `HashJoinInput` to trade for — and the rewrite would coalesce both
+        // sides to one partition and sort 1.5M probe rows on one thread.
+        let left_schema = channel_schema("c_custkey", "c_val");
+        let right_schema = channel_schema("o_custkey", "o_orderkey");
+        let left = hash_repartition(
+            sized_file_exec(&left_schema, "customer.parquet", SMALL_ORACLE_BUILD_ROWS),
+            "c_custkey",
+            4,
+        );
+        let right = hash_repartition(
+            sized_file_exec(&right_schema, "orders.parquet", 1_500_000),
+            "o_custkey",
+            4,
+        );
+        let join = Arc::new(hash_join_with_join_type(
+            left,
+            right,
+            "c_custkey",
+            "o_custkey",
+            JoinType::Left,
+            NullEquality::NullEqualsNothing,
+        ));
+        let config =
+            config_with_cayenne_optimizer(None, Some(0.125), Some(107 * 1024 * 1024 * 1024));
+
+        let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
+
+        assert!(
+            optimized.is::<HashJoinExec>(),
+            "an outer join whose build side fits the pool must stay a hash join, not coalesce to one partition: {}",
+            displayable(optimized.as_ref()).indent(false)
+        );
+    }
+
+    #[test]
+    fn rewrites_unknown_size_oracle_left_join_of_file_scans_to_coalesced_sort_merge() {
+        // An outer join over a build side nothing can size is still treated as
+        // oversized: `HashJoinInput` cannot spill, so an unknown build is the
+        // case the pool cannot survive being wrong about.
+        let left_schema = channel_schema("ss_item_sk", "ss_ticket_number");
+        let right_schema = channel_schema("sr_item_sk", "sr_ticket_number");
+        let left = hash_repartition(
+            file_exec_with_statistics(
+                &left_schema,
+                "store_sales.parquet",
+                None,
+                Statistics::new_unknown(&left_schema),
+            ),
+            "ss_item_sk",
+            4,
+        );
+        let right = hash_repartition(
+            file_exec_with_statistics(
+                &right_schema,
+                "store_returns.parquet",
+                None,
+                Statistics::new_unknown(&right_schema),
+            ),
+            "sr_item_sk",
+            4,
+        );
+        let join = Arc::new(hash_join_with_join_type(
+            left,
+            right,
+            "ss_item_sk",
+            "sr_item_sk",
+            JoinType::Left,
             NullEquality::NullEqualsNothing,
         ));
         let config =
@@ -4334,6 +5257,114 @@ mod tests {
             1,
             "CollectLeft build side must be one partition"
         );
+    }
+
+    /// `LimitPushdown` folds a `LIMIT` into a hash join's `fetch`. Where nothing
+    /// above the join merges partitions that `fetch` is the plan's only limit, so
+    /// a rewrite that drops it returns every joined row of a `LIMIT n` query.
+    #[test]
+    fn the_collect_left_rewrite_keeps_the_join_fetch() {
+        let left_schema = channel_schema("ss_item_sk", "ss_qty");
+        let right_schema = channel_schema("ws_item_sk", "ws_qty");
+        let left = hash_repartition(
+            crate::cte_materialization::test_cte_scan_exec("ss", Arc::clone(&left_schema)),
+            "ss_item_sk",
+            4,
+        );
+        let right = hash_repartition(
+            crate::cte_materialization::test_cte_scan_exec("ws", Arc::clone(&right_schema)),
+            "ws_item_sk",
+            4,
+        );
+        let join = Arc::new(
+            hash_join_with_join_type(
+                left,
+                right,
+                "ss_item_sk",
+                "ws_item_sk",
+                JoinType::Left,
+                NullEquality::NullEqualsNothing,
+            )
+            .builder()
+            .with_fetch(Some(7))
+            .build()
+            .expect("a hash join with a fetch should be valid"),
+        );
+        let config =
+            config_with_cayenne_optimizer(None, Some(0.125), Some(107 * 1024 * 1024 * 1024));
+
+        let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
+
+        let rewritten = optimized
+            .downcast_ref::<HashJoinExec>()
+            .expect("CTE-scan join must stay a hash join, not sort-merge");
+        assert_eq!(
+            *rewritten.partition_mode(),
+            PartitionMode::CollectLeft,
+            "precondition: the join must be rewritten to CollectLeft"
+        );
+        assert_eq!(
+            rewritten.fetch(),
+            Some(7),
+            "the rewritten join must keep the LIMIT folded into its fetch"
+        );
+    }
+
+    /// The sort-merge rewrite has no `fetch` to carry the folded `LIMIT` in, so
+    /// it must cap each partition with a `LocalLimitExec` instead.
+    #[test]
+    fn the_sort_merge_rewrite_keeps_the_join_fetch() {
+        let left_schema = channel_schema("ss_item_sk", "ss_ticket_number");
+        let right_schema = channel_schema("sr_item_sk", "sr_ticket_number");
+        let left = hash_repartition(
+            file_exec_with_statistics(
+                &left_schema,
+                "store_sales.parquet",
+                None,
+                Statistics::new_unknown(&left_schema),
+            ),
+            "ss_item_sk",
+            4,
+        );
+        let right = hash_repartition(
+            file_exec_with_statistics(
+                &right_schema,
+                "store_returns.parquet",
+                None,
+                Statistics::new_unknown(&right_schema),
+            ),
+            "sr_item_sk",
+            4,
+        );
+        let join = Arc::new(
+            hash_join_with_join_type(
+                left,
+                right,
+                "ss_item_sk",
+                "sr_item_sk",
+                JoinType::Left,
+                NullEquality::NullEqualsNothing,
+            )
+            .builder()
+            .with_fetch(Some(7))
+            .build()
+            .expect("a hash join with a fetch should be valid"),
+        );
+        let config =
+            config_with_cayenne_optimizer(None, Some(0.125), Some(107 * 1024 * 1024 * 1024));
+
+        let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
+
+        let limit = optimized
+            .downcast_ref::<LocalLimitExec>()
+            .unwrap_or_else(|| {
+                panic!(
+                    "the rewrite must keep the join's fetch as a per-partition limit:\n{}",
+                    displayable(optimized.as_ref()).indent(true)
+                )
+            });
+        assert_eq!(limit.fetch(), 7, "the limit must be the join's fetch");
+        assert_coalesced_oracle_file_scan_sort_merge(limit.input(), 4);
     }
 
     #[test]

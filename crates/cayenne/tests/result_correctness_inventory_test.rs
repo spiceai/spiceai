@@ -37,7 +37,7 @@ use std::sync::Arc;
 use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
-use support::inventory::{assert_inventory_complete, build_inventory, inventory_by_suite};
+use support::inventory::{assert_inventory_complete, build_inventory, fixture, inventory_by_suite};
 use support::{compare_actual_results, compare_actual_results_detailed, keep_unverified_order};
 use test_framework::queries::Query;
 use test_framework::queries::validation::{
@@ -439,14 +439,14 @@ fn an_unreviewed_unverified_order_fails_the_lane() {
     // Reviewed in the inventory: an accepted, named hole.
     let reviewed = [hole("tpcds", "tpcds_q36")];
     assert!(
-        unexplained(&reviewed, &inventory).is_empty(),
+        unexplained(&reviewed, &inventory, &[]).is_empty(),
         "tpcds_q36's ORDER BY over a CASE the projection omits is reviewed"
     );
 
     // Not reviewed: the lane must not accept it.
     let unreviewed = [hole("tpcds", "tpcds_q1")];
     assert_eq!(
-        unexplained(&unreviewed, &inventory).len(),
+        unexplained(&unreviewed, &inventory, &[]).len(),
         1,
         "an unverified order nobody has reviewed has to fail, not be counted"
     );
@@ -462,10 +462,96 @@ fn an_unreviewed_unverified_order_fails_the_lane() {
         },
     }];
     assert_eq!(
-        unexplained(&violating, &inventory).len(),
+        unexplained(&violating, &inventory, &[]).len(),
         1,
         "a reviewed hole does not excuse a violation on the same query"
     );
+}
+
+/// Two engines that both return nothing agree, and have compared nothing: the
+/// cell is `Vacuous`, not `Pass`, and a lane accepts it only where the inventory
+/// reviews why the answer is empty.
+#[test]
+fn an_answer_with_no_value_is_vacuous_not_a_pass() {
+    use arrow::array::Float64Array;
+    use support::report::{RunResult, unexplained};
+
+    let query = Query::new("q".into(), "SELECT sum(x) FROM t".into(), false);
+    let sums = |value: Option<f64>| {
+        RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "sum",
+                DataType::Float64,
+                true,
+            )])),
+            vec![Arc::new(Float64Array::from(vec![value]))],
+        )
+        .expect("sum batch")
+    };
+    let is_vacuous = |left: &[RecordBatch], right: &[RecordBatch]| {
+        matches!(
+            compare_actual_results(&query, left, right),
+            support::ParityOutcome::Vacuous { .. }
+        )
+    };
+
+    // No rows on either side, and one all-NULL aggregate row on each: `SUM` over
+    // an input whose filter selected nothing.
+    assert!(is_vacuous(&[], &[]));
+    assert!(is_vacuous(&[sums(None)], &[sums(None)]));
+    // A value on both sides is a comparison; nothing against a value is a
+    // mismatch, not an empty agreement.
+    assert!(matches!(
+        compare_actual_results(&query, &[sums(Some(1.0))], &[sums(Some(1.0))]),
+        support::ParityOutcome::Pass
+    ));
+    assert!(matches!(
+        compare_actual_results(&query, &[], &[sums(Some(1.0))]),
+        support::ParityOutcome::Fail { .. }
+    ));
+
+    let empty = |suite: &str, name: &str| RunResult {
+        suite: suite.to_string(),
+        name: name.to_string(),
+        engine_pair: "cayenne-sqlite",
+        outcome: support::ParityOutcome::Vacuous {
+            detail: "both sides returned no non-NULL value (0 and 0 rows)".to_string(),
+        },
+    };
+    let inventory = build_inventory();
+    let at_sf1 = [("tpcds", fixture::TPCDS_TPCDSGEN_SF1)];
+    let at_sf0_1 = [("tpcds", fixture::TPCDS_TPCDSGEN_SF0_1)];
+    assert!(
+        unexplained(&[empty("tpcds", "tpcds_q8")], &inventory, &at_sf1).is_empty(),
+        "tpcds_q8's empty answer on tpcdsgen's SF1 rows is reviewed"
+    );
+    assert_eq!(
+        unexplained(&[empty("tpch", "tpch_q1")], &inventory, &[]).len(),
+        1,
+        "an empty answer nobody reviewed fails the lane"
+    );
+    // A review holds only on the fixture it names: Q13 selects nothing at
+    // SF 0.1 and answers at SF1, where an empty answer is a wrong one.
+    assert!(unexplained(&[empty("tpcds", "tpcds_q13")], &inventory, &at_sf0_1).is_empty());
+    assert_eq!(
+        unexplained(&[empty("tpcds", "tpcds_q13")], &inventory, &at_sf1).len(),
+        1,
+        "an empty answer on a fixture its review does not name fails the lane"
+    );
+    // A lane that names no fixture for the suite accepts no empty answer.
+    assert_eq!(
+        unexplained(&[empty("tpcds", "tpcds_q8")], &inventory, &[]).len(),
+        1
+    );
+    // A load-mode label reviews as its suite.
+    assert_eq!(
+        unexplained(&[empty("chbench[changes]", "chbench_q1")], &inventory, &[]).len(),
+        1
+    );
+    // The names lanes build at their default scales are the reviewed ones.
+    assert_eq!(fixture::tpcds_dsdgen(1.0), fixture::TPCDS_DSDGEN_SF1);
+    assert_eq!(fixture::tpcds_tpcdsgen(1.0), fixture::TPCDS_TPCDSGEN_SF1);
+    assert_eq!(fixture::tpcds_tpcdsgen(0.1), fixture::TPCDS_TPCDSGEN_SF0_1);
 }
 
 /// Prove the harness routes through the shipped `compare_query_result_batches`.
@@ -1393,4 +1479,433 @@ fn sort_check_keeps_a_tie_group_across_null_values_in_a_preceding_key() {
         ),
         "k2 goes 2 then 1 inside a k1 tie of NULLs: {result:?}"
     );
+}
+
+// --- Dialect translation for the standalone oracles ---------------------------
+//
+// These pin what each rewrite means. A rule that drifts changes what an oracle
+// is asked, so its lane compares Cayenne against a different question — and
+// agrees or disagrees for reasons that have nothing to do with Cayenne.
+
+mod dialect {
+    use super::support::chbench_data::chbench_batches;
+    use super::support::clickbench_data::make_reduced_hits;
+    use super::support::dialect::{ColumnKinds, Oracle, translate, untranslatable};
+    use super::support::tpcds_data::table_schemas;
+    use super::support::tpch_data::tpch_batches;
+    use arrow::datatypes::Schema;
+    use test_framework::queries::{
+        Query, get_chbench_test_queries, get_clickbench_test_queries, get_tpcds_test_queries,
+        get_tpch_test_queries,
+    };
+
+    fn schemas_of(batches: &[(&str, arrow::record_batch::RecordBatch)]) -> Vec<Schema> {
+        batches
+            .iter()
+            .map(|(_, batch)| batch.schema().as_ref().clone())
+            .collect()
+    }
+
+    fn tpch_kinds() -> ColumnKinds {
+        let schemas = schemas_of(&tpch_batches(0.001));
+        ColumnKinds::from_schemas(schemas.iter())
+    }
+
+    fn translated(sql: &str, oracle: Oracle, kinds: &ColumnKinds) -> String {
+        translate(sql, oracle, kinds).unwrap_or_else(|e| panic!("translate {sql}: {e}"))
+    }
+
+    /// The four suites a lane compares against each oracle.
+    fn suites() -> Vec<(&'static str, Vec<Query>, ColumnKinds)> {
+        let tpcds = table_schemas();
+        let hits = make_reduced_hits(1);
+        let chbench = schemas_of(&chbench_batches(1));
+        vec![
+            ("tpch", get_tpch_test_queries(None), tpch_kinds()),
+            (
+                "tpcds",
+                get_tpcds_test_queries(None, Some(1.0)),
+                ColumnKinds::from_schemas(tpcds.iter()),
+            ),
+            (
+                "clickbench",
+                get_clickbench_test_queries(None),
+                ColumnKinds::from_schemas([hits.schema().as_ref()]),
+            ),
+            (
+                "chbench",
+                get_chbench_test_queries(None),
+                ColumnKinds::from_schemas(chbench.iter()),
+            ),
+        ]
+    }
+
+    /// A query the inventory does not exclude for an oracle must translate, or
+    /// its lane reports an engine error rather than a comparison.
+    #[test]
+    fn every_suite_query_translates_or_names_why_not() {
+        for (suite, queries, kinds) in suites() {
+            for oracle in [Oracle::Sqlite, Oracle::ClickHouse] {
+                for query in &queries {
+                    if untranslatable(&query.sql, oracle).is_some() {
+                        continue;
+                    }
+                    if let Err(error) = translate(&query.sql, oracle, &kinds) {
+                        panic!(
+                            "{suite} {} has no {oracle:?} translation: {error}",
+                            query.name
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn unsupported_constructs_are_named_per_oracle() {
+        let rollup = "SELECT a, sum(b) FROM t GROUP BY ROLLUP (a)";
+        assert_eq!(
+            untranslatable(rollup, Oracle::Sqlite),
+            Some("SQLite has no GROUP BY ROLLUP, CUBE or GROUPING SETS")
+        );
+        assert_eq!(untranslatable(rollup, Oracle::ClickHouse), None);
+        assert!(untranslatable("SELECT stddev_samp(x) FROM t", Oracle::Sqlite).is_some());
+        assert!(
+            untranslatable("SELECT regexp_replace(s, 'a', 'b') FROM t", Oracle::Sqlite).is_some()
+        );
+        assert_eq!(
+            untranslatable("SELECT count(*) FROM t", Oracle::Sqlite),
+            None
+        );
+    }
+
+    /// DataFusion puts NULLs last ascending and first descending; SQLite and
+    /// ClickHouse do not, so every ORDER BY states it — windows included.
+    #[test]
+    fn null_placement_is_stated_on_every_order_by() {
+        let kinds = tpch_kinds();
+        let sql = "SELECT l_orderkey, rank() OVER (ORDER BY l_tax DESC) FROM lineitem \
+                   ORDER BY l_orderkey, l_tax DESC";
+        for (oracle, first_term) in [(Oracle::Sqlite, "l_orderkey"), (Oracle::ClickHouse, "1")] {
+            let out = translated(sql, oracle, &kinds);
+            assert!(out.contains("ORDER BY l_tax DESC NULLS FIRST)"), "{out}");
+            assert!(
+                out.contains(&format!(
+                    "ORDER BY {first_term} NULLS LAST, l_tax DESC NULLS FIRST"
+                )),
+                "{out}"
+            );
+        }
+        // A stated placement is kept.
+        let out = translated(
+            "SELECT l_orderkey FROM lineitem ORDER BY l_orderkey NULLS FIRST",
+            Oracle::Sqlite,
+            &kinds,
+        );
+        assert!(out.ends_with("ORDER BY l_orderkey NULLS FIRST"), "{out}");
+    }
+
+    /// SQLite compares dates as ISO text, so every date literal and interval
+    /// becomes that text or `date()`, and a month step that SQLite would not
+    /// clamp to the month's end is refused.
+    #[test]
+    fn sqlite_dates_become_iso_text() {
+        let kinds = tpch_kinds();
+        let out = translated(
+            "SELECT count(*) FROM orders WHERE o_orderdate >= date '1993-07-01' \
+             AND o_orderdate < date '1993-07-01' + interval '3' month \
+             AND o_orderdate < CAST('2002-5-01' AS DATE)",
+            Oracle::Sqlite,
+            &kinds,
+        );
+        assert!(out.contains("o_orderdate >= '1993-07-01'"), "{out}");
+        assert!(out.contains("date('1993-07-01', '+3 months')"), "{out}");
+        assert!(out.contains("o_orderdate < '2002-05-01'"), "{out}");
+
+        let days = translated(
+            "SELECT count(*) FROM lineitem WHERE l_shipdate <= date '1998-12-01' - interval '90 days'",
+            Oracle::Sqlite,
+            &kinds,
+        );
+        assert!(days.contains("date('1998-12-01', '-90 days')"), "{days}");
+
+        // 2000-01-31 + 1 month: DataFusion clamps to 2000-02-29, SQLite's date()
+        // normalizes to 2000-03-02.
+        let error = translate(
+            "SELECT count(*) FROM orders WHERE o_orderdate < date '2000-01-31' + interval '1' month",
+            Oracle::Sqlite,
+            &kinds,
+        )
+        .expect_err("SQLite cannot clamp month arithmetic to the end of the month");
+        assert!(error.contains("does not clamp"), "{error}");
+        let extract = translated(
+            "SELECT extract(year FROM l_shipdate) FROM lineitem",
+            Oracle::Sqlite,
+            &kinds,
+        );
+        assert!(
+            extract.contains("CAST(strftime('%Y', l_shipdate) AS INTEGER)"),
+            "{extract}"
+        );
+    }
+
+    /// A string compared with a timestamp is rewritten into the one text form
+    /// the SQLite loader stores timestamps in.
+    #[test]
+    fn sqlite_timestamp_literals_match_the_stored_form() {
+        let chbench = schemas_of(&chbench_batches(1));
+        let kinds = ColumnKinds::from_schemas(chbench.iter());
+        let out = translated(
+            "SELECT count(*) FROM order_line WHERE ol_delivery_d > '2007-01-02 00:00:00.000000' \
+             AND ol_delivery_d < '2030-01-01 00:00:00'",
+            Oracle::Sqlite,
+            &kinds,
+        );
+        assert!(
+            out.contains("ol_delivery_d > '2007-01-02 00:00:00'"),
+            "{out}"
+        );
+        assert!(
+            out.contains("ol_delivery_d < '2030-01-01 00:00:00'"),
+            "{out}"
+        );
+        let text = super::support::dialect::sqlite_timestamp_text(
+            chrono::NaiveDate::from_ymd_opt(2007, 1, 2)
+                .and_then(|d| d.and_hms_micro_opt(3, 4, 5, 600))
+                .expect("timestamp"),
+        );
+        assert_eq!(text, "2007-01-02 03:04:05.000600");
+    }
+
+    /// SQLite reads an `ORDER BY` name as an output column only through an
+    /// alias, and parses no parenthesized compound operand: TPC-DS Q72 and Q87
+    /// failed to prepare on those counts. Each shape fails as written, and its
+    /// translation runs and keeps the standard's answer.
+    #[test]
+    fn sqlite_aliases_qualified_columns_and_unparenthesizes_compound_operands() {
+        use arrow::datatypes::{DataType, Field};
+
+        let schema = Schema::new(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("w", DataType::Int64, true),
+        ]);
+        let kinds = ColumnKinds::from_schemas([&schema]);
+        let sqlite = rusqlite::Connection::open_in_memory().expect("open SQLite");
+        sqlite
+            .execute_batch(
+                "CREATE TABLE t (a INTEGER, w INTEGER);
+                 INSERT INTO t VALUES (1, 30), (2, 10), (3, 20);
+                 CREATE TABLE u (a INTEGER, w INTEGER);
+                 INSERT INTO u VALUES (2, 10);",
+            )
+            .expect("create the tables");
+
+        let ambiguous = "SELECT t1.w FROM t t1, t t2 WHERE t1.a = t2.a ORDER BY w DESC";
+        let error = sqlite.prepare(ambiguous).expect_err("SQLite rejects it");
+        assert!(
+            error.to_string().contains("ambiguous column name: w"),
+            "{error}"
+        );
+        let sql = translated(ambiguous, Oracle::Sqlite, &kinds);
+        assert!(sql.contains("t1.w AS w"), "{sql}");
+        let ordered: Vec<i64> = sqlite
+            .prepare(&sql)
+            .and_then(|mut statement| {
+                statement
+                    .query_map([], |row| row.get(0))?
+                    .collect::<Result<_, _>>()
+            })
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        assert_eq!(ordered, [30, 20, 10]);
+
+        let parenthesized = "SELECT count(*) FROM \
+             ((SELECT a FROM t) EXCEPT (SELECT a FROM u) EXCEPT (SELECT 3)) AS s";
+        sqlite
+            .prepare(parenthesized)
+            .expect_err("SQLite has no parenthesized compound operand");
+        let sql = translated(parenthesized, Oracle::Sqlite, &kinds);
+        let remaining: i64 = sqlite
+            .query_row(&sql, [], |row| row.get(0))
+            .unwrap_or_else(|e| panic!("{sql}: {e}"));
+        assert_eq!(remaining, 1, "{{1, 2, 3}} less {{2}} less {{3}}");
+
+        // `INTERSECT` binds tighter than `UNION`, and SQLite reads a compound
+        // left to right, so neither grouping has a SQLite spelling.
+        for sql in [
+            "SELECT a FROM t UNION (SELECT a FROM u INTERSECT SELECT a FROM t)",
+            "SELECT a FROM t UNION SELECT a FROM u INTERSECT SELECT a FROM t",
+        ] {
+            let error = translate(sql, Oracle::Sqlite, &kinds).err();
+            assert!(
+                error
+                    .as_deref()
+                    .is_some_and(|e| e.contains("left to right")),
+                "{sql}: {error:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sqlite_decimal_casts_stay_fractional_and_derived_columns_move_into_the_projection() {
+        let kinds = tpch_kinds();
+        let cast = translated(
+            "SELECT CAST(count(*) AS DECIMAL(15,4)) / CAST(count(*) AS DECIMAL(15,4)) FROM orders",
+            Oracle::Sqlite,
+            &kinds,
+        );
+        assert!(cast.contains("CAST(count(*) AS REAL)"), "{cast}");
+        let derived = translated(
+            "SELECT c_count FROM (SELECT c_custkey, count(o_orderkey) FROM customer \
+             LEFT JOIN orders ON c_custkey = o_custkey GROUP BY c_custkey) AS c_orders (c_custkey, c_count)",
+            Oracle::Sqlite,
+            &kinds,
+        );
+        assert!(
+            derived.contains("SELECT c_custkey AS c_custkey, count(o_orderkey) AS c_count"),
+            "{derived}"
+        );
+        assert!(derived.contains(") AS c_orders"), "{derived}");
+    }
+
+    /// Both oracles evaluate `0.06 + 0.01` in doubles; DataFusion, exactly.
+    #[test]
+    fn decimal_literal_arithmetic_is_folded_exactly() {
+        let kinds = tpch_kinds();
+        for oracle in [Oracle::Sqlite, Oracle::ClickHouse] {
+            let out = translated(
+                "SELECT count(*) FROM lineitem WHERE l_discount BETWEEN 0.06 - 0.01 AND 0.06 + 0.01 \
+                 AND l_tax < 0.01 - 0.06 AND l_quantity < 0.5 * 0.2 AND l_linenumber < 1 + 10",
+                oracle,
+                &kinds,
+            );
+            assert!(out.contains("BETWEEN 0.05 AND 0.07"), "{oracle:?}: {out}");
+            assert!(out.contains("l_tax < -0.05"), "{oracle:?}: {out}");
+            assert!(out.contains("l_quantity < 0.10"), "{oracle:?}: {out}");
+            // Integer arithmetic both oracles do exactly themselves.
+            assert!(out.contains("l_linenumber < 1 + 10"), "{oracle:?}: {out}");
+        }
+    }
+
+    /// TPC-H Q19's join predicate sits in every branch of an OR; factored out,
+    /// both oracles can join on it instead of crossing `lineitem` with `part`.
+    #[test]
+    fn a_conjunct_common_to_every_or_branch_is_factored_out() {
+        let kinds = tpch_kinds();
+        let out = translated(
+            "SELECT count(*) FROM lineitem, part WHERE (p_partkey = l_partkey AND p_size = 1) \
+             OR (p_partkey = l_partkey AND p_size = 2)",
+            Oracle::Sqlite,
+            &kinds,
+        );
+        assert!(
+            out.contains("WHERE (p_partkey = l_partkey) AND (((p_size = 1)) OR ((p_size = 2)))"),
+            "{out}"
+        );
+        // Nothing common: left alone.
+        let out = translated(
+            "SELECT count(*) FROM part WHERE p_size = 1 OR p_size = 2",
+            Oracle::Sqlite,
+            &kinds,
+        );
+        assert!(out.contains("WHERE p_size = 1 OR p_size = 2"), "{out}");
+    }
+
+    /// ClickHouse's `/` is floating-point and its `DATE` wraps before 1970.
+    #[test]
+    fn clickhouse_divides_integers_as_integers_and_keeps_old_dates() {
+        let kinds = tpch_kinds();
+        let out = translated(
+            "SELECT sum(l_linenumber) / count(*), sum(l_tax) / count(*) FROM lineitem",
+            Oracle::ClickHouse,
+            &kinds,
+        );
+        assert!(out.contains("intDiv(sum(l_linenumber), count(*))"), "{out}");
+        // Decimals divide as doubles: ClickHouse would keep only the dividend's
+        // two decimal places.
+        assert!(
+            out.contains("toFloat64(sum(l_tax)) / toFloat64(count(*))"),
+            "{out}"
+        );
+        let floats = translated(
+            "SELECT avg(l_tax) / avg(l_quantity) FROM lineitem",
+            Oracle::ClickHouse,
+            &kinds,
+        );
+        assert!(
+            floats.contains("toFloat64(avg(l_tax)) / toFloat64(avg(l_quantity))"),
+            "{floats}"
+        );
+        let dates = translated(
+            "SELECT count(*) FROM orders WHERE o_orderdate > date '1900-01-02' \
+             AND CAST(o_orderdate AS DATE) < CAST('2002-5-01' AS DATE)",
+            Oracle::ClickHouse,
+            &kinds,
+        );
+        assert!(
+            dates.contains("o_orderdate > CAST('1900-01-02' AS Date32)"),
+            "{dates}"
+        );
+        assert!(dates.contains("CAST(o_orderdate AS Date32)"), "{dates}");
+        assert!(dates.contains("CAST('2002-05-01' AS Date32)"), "{dates}");
+    }
+
+    /// An ORDER BY name means the output column before an input one; ClickHouse,
+    /// told to prefer input columns for WHERE, would read it the other way.
+    #[test]
+    fn clickhouse_orders_by_output_position_and_names_qualified_columns() {
+        let kinds = tpch_kinds();
+        let out = translated(
+            "SELECT o_orderpriority, sum(o_totalprice) AS o_totalprice FROM orders \
+             GROUP BY o_orderpriority ORDER BY o_totalprice DESC, o_orderpriority",
+            Oracle::ClickHouse,
+            &kinds,
+        );
+        assert!(
+            out.ends_with("ORDER BY 2 DESC NULLS FIRST, 1 NULLS LAST"),
+            "{out}"
+        );
+        let qualified = translated(
+            "SELECT o.o_orderkey, c.c_custkey, o.o_custkey FROM orders o, customer c \
+             WHERE o.o_custkey = c.c_custkey ORDER BY o_orderkey",
+            Oracle::ClickHouse,
+            &kinds,
+        );
+        assert!(
+            qualified.contains("SELECT o.o_orderkey AS o_orderkey, c.c_custkey AS c_custkey"),
+            "{qualified}"
+        );
+        assert!(qualified.ends_with("ORDER BY 1 NULLS LAST"), "{qualified}");
+    }
+
+    #[test]
+    fn clickhouse_keeps_standard_null_and_decimal_semantics() {
+        let kinds = tpch_kinds();
+        let out = translated(
+            "SELECT stddev_samp(l_quantity), coalesce(l_tax, 0.0), \
+             CASE WHEN l_tax > 0 THEN l_tax ELSE 0.00 END FROM lineitem",
+            Oracle::ClickHouse,
+            &kinds,
+        );
+        assert!(
+            out.contains("if(count(l_quantity) > 1, stddevSamp(l_quantity), NULL)"),
+            "{out}"
+        );
+        // DataFusion reads `0.0` as a double, so the decimal beside it becomes one.
+        assert!(out.contains("coalesce(toFloat64(l_tax), 0.0)"), "{out}");
+        assert!(out.contains("THEN toFloat64(l_tax) ELSE 0.00 END"), "{out}");
+    }
+
+    #[test]
+    fn clickhouse_functions_and_backslashes_keep_their_meaning() {
+        let hits = make_reduced_hits(1);
+        let kinds = ColumnKinds::from_schemas([hits.schema().as_ref()]);
+        let out = translated(
+            r#"SELECT to_timestamp("EventTime"), length("URL"), regexp_replace("URL", '^a\.(b)$', '\1') FROM hits"#,
+            Oracle::ClickHouse,
+            &kinds,
+        );
+        assert!(out.contains(r#"toDateTime("EventTime")"#), "{out}");
+        assert!(out.contains(r#"char_length("URL")"#), "{out}");
+        assert!(out.contains(r"'^a\\.(b)$', '\\1'"), "{out}");
+    }
 }

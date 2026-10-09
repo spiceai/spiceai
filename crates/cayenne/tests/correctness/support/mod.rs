@@ -40,13 +40,19 @@
 #![allow(clippy::needless_raw_string_hashes)]
 
 pub mod chbench_data;
+#[cfg(feature = "result-correctness-chdb")]
+pub mod chdb_engine;
+pub mod clickbench_data;
+pub mod dialect;
 pub mod harness;
 pub mod inventory;
+pub mod oracle_lane;
 pub mod report;
 pub mod sqlite_engine;
 pub mod sqllancer;
 pub mod ssb_data;
 pub mod standalone_engines;
+pub mod tpcds_data;
 pub mod tpch_data;
 
 #[expect(unused_imports)] // re-exported for integration test crates
@@ -125,6 +131,15 @@ const FIXTURE_STAMP: &str = ".fixture-complete";
 #[derive(Debug, Clone)]
 pub enum ParityOutcome {
     Pass,
+    /// The two results matched and held nothing to compare: no rows, or rows
+    /// holding only NULL. An empty agreement proves something only when empty is
+    /// the query's intended answer on the fixture; when the fixture merely fails
+    /// to reach the query's filters — the usual cause — it is a comparison that
+    /// never happened. Not a `Pass`: accepted only where the inventory reviews
+    /// why the answer is empty.
+    Vacuous {
+        detail: String,
+    },
     /// Content matched, but the query's `ORDER BY` was not fully verified —
     /// a term that maps to no output column, an unparseable statement, or a key
     /// type with no comparator. Not a failure, and deliberately not a `Pass`:
@@ -474,6 +489,69 @@ impl CayenneHarness {
     }
 }
 
+impl CayenneHarness {
+    /// A harness holding `{table}.parquet` from `parquet_dir` for each table,
+    /// loaded the given way.
+    pub async fn from_parquet_dir(parquet_dir: &Path, tables: &[&str], mode: LoadMode) -> Self {
+        let mut harness = Self::new().await;
+        for table in tables {
+            harness
+                .load_parquet_table_with_mode(
+                    table,
+                    &parquet_dir.join(format!("{table}.parquet")),
+                    mode,
+                )
+                .await;
+        }
+        harness
+    }
+}
+
+/// The column kinds of `{table}.parquet` in `parquet_dir` for each table — what
+/// [`dialect::translate`] needs to rewrite a suite's SQL for an oracle.
+#[must_use]
+pub fn fixture_column_kinds(parquet_dir: &Path, tables: &[&str]) -> dialect::ColumnKinds {
+    use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
+    let schemas: Vec<Schema> = tables
+        .iter()
+        .map(|table| {
+            let path = parquet_dir.join(format!("{table}.parquet"));
+            let file = std::fs::File::open(&path)
+                .unwrap_or_else(|e| panic!("open {}: {e}", path.display()));
+            ParquetRecordBatchReaderBuilder::try_new(file)
+                .unwrap_or_else(|e| panic!("read schema of {}: {e}", path.display()))
+                .schema()
+                .as_ref()
+                .clone()
+        })
+        .collect();
+    dialect::ColumnKinds::from_schemas(schemas.iter())
+}
+
+/// Where the lanes keep fixtures and logs between runs:
+/// `CAYENNE_PARITY_SCRATCH`, or `target/cayenne_parity_scratch`.
+#[must_use]
+pub fn scratch_dir() -> PathBuf {
+    let dir = std::env::var_os("CAYENNE_PARITY_SCRATCH").map_or_else(
+        || PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/cayenne_parity_scratch"),
+        PathBuf::from,
+    );
+    std::fs::create_dir_all(&dir).expect("create the parity scratch dir");
+    dir
+}
+
+/// A scale factor or size from the environment, or `default`. A value that is
+/// set and does not parse fails rather than silently running the default.
+#[must_use]
+pub fn env_f64(name: &str, default: f64) -> f64 {
+    match std::env::var(name) {
+        Ok(text) => text
+            .parse()
+            .unwrap_or_else(|e| panic!("{name}={text} is not a number: {e}")),
+        Err(_) => default,
+    }
+}
+
 /// Split batches into up to `n_chunks` non-empty groups for append-mode loads.
 fn split_batches_into_chunks(batches: &[RecordBatch], n_chunks: usize) -> Vec<Vec<RecordBatch>> {
     let n_chunks = n_chunks.max(1);
@@ -648,6 +726,22 @@ pub fn compare_results_detailed(
     ) {
         Ok(comparison) => {
             let unchecked = comparison.unchecked;
+            if comparison.result == QueryValidationResult::Pass
+                && holds_no_value(cayenne)
+                && holds_no_value(reference)
+            {
+                return ComparedResults {
+                    outcome: ParityOutcome::Vacuous {
+                        detail: format!(
+                            "both sides returned no non-NULL value ({} and {} rows)",
+                            row_count(cayenne),
+                            row_count(reference)
+                        ),
+                    },
+                    reason: None,
+                    unchecked,
+                };
+            }
             match comparison.result {
                 QueryValidationResult::Pass if unchecked.is_empty() => ComparedResults {
                     outcome: ParityOutcome::Pass,
@@ -680,6 +774,22 @@ pub fn compare_results_detailed(
             unchecked: Vec::new(),
         },
     }
+}
+
+/// Whether `batches` hold no value a comparison could check: no rows, or only
+/// NULL cells — what `SUM` over an empty input returns.
+#[must_use]
+pub fn holds_no_value(batches: &[RecordBatch]) -> bool {
+    batches.iter().all(|batch| {
+        batch
+            .columns()
+            .iter()
+            .all(|column| column.null_count() == column.len())
+    })
+}
+
+fn row_count(batches: &[RecordBatch]) -> usize {
+    batches.iter().map(RecordBatch::num_rows).sum()
 }
 
 /// All suite queries that form the parity inventory (no exclusions applied).

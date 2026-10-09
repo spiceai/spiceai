@@ -158,12 +158,14 @@ impl<T: S3Vectors + Send + Sync + ?Sized> S3VectorsRetryMiddleware<T> {
         &self,
         operation: F,
         is_transient: impl Fn(&E) -> bool + Clone,
-    ) -> Result<O, SdkError<E>>
+    ) -> Result<O, Box<SdkError<E>>>
     where
         F: Fn() -> Fut,
         Fut: Future<Output = Result<O, SdkError<E>>>,
         E: std::fmt::Debug,
     {
+        // `SdkError` alone is over clippy's `result_large_err` limit. Callers
+        // unbox at the `async_trait` boundary, which does not carry the lint.
         tokio::time::timeout(
             self.operation_timeout,
             retry(self.retry_strategy.clone(), || async {
@@ -180,7 +182,9 @@ impl<T: S3Vectors + Send + Sync + ?Sized> S3VectorsRetryMiddleware<T> {
                 std::io::ErrorKind::TimedOut,
                 "Operation timed out",
             ))
-        })?
+        })
+        .map_err(Box::new)?
+        .map_err(Box::new)
     }
 }
 
@@ -310,6 +314,7 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsRetry
             CreateIndexError::is_transient,
         )
         .await
+        .map_err(|err| *err)
     }
 
     async fn create_vector_bucket(
@@ -321,6 +326,7 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsRetry
             CreateVectorBucketError::is_transient,
         )
         .await
+        .map_err(|err| *err)
     }
 
     async fn delete_index(
@@ -332,6 +338,7 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsRetry
             DeleteIndexError::is_transient,
         )
         .await
+        .map_err(|err| *err)
     }
 
     async fn delete_vector_bucket(
@@ -343,6 +350,7 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsRetry
             DeleteVectorBucketError::is_transient,
         )
         .await
+        .map_err(|err| *err)
     }
 
     async fn delete_vector_bucket_policy(
@@ -354,6 +362,7 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsRetry
             DeleteVectorBucketPolicyError::is_transient,
         )
         .await
+        .map_err(|err| *err)
     }
 
     async fn delete_vectors(
@@ -365,6 +374,7 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsRetry
             DeleteVectorsError::is_transient,
         )
         .await
+        .map_err(|err| *err)
     }
 
     async fn get_index(
@@ -373,6 +383,7 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsRetry
     ) -> Result<GetIndexOutput, SdkError<GetIndexError>> {
         self.execute_with_retry(|| self.inner.get_index(input), GetIndexError::is_transient)
             .await
+            .map_err(|err| *err)
     }
 
     async fn get_vector_bucket(
@@ -384,6 +395,7 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsRetry
             GetVectorBucketError::is_transient,
         )
         .await
+        .map_err(|err| *err)
     }
 
     async fn get_vector_bucket_policy(
@@ -395,6 +407,7 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsRetry
             GetVectorBucketPolicyError::is_transient,
         )
         .await
+        .map_err(|err| *err)
     }
 
     async fn get_vectors(
@@ -406,6 +419,7 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsRetry
             GetVectorsError::is_transient,
         )
         .await
+        .map_err(|err| *err)
     }
 
     async fn list_indexes(
@@ -417,6 +431,7 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsRetry
             ListIndexesError::is_transient,
         )
         .await
+        .map_err(|err| *err)
     }
 
     async fn list_vector_buckets(
@@ -428,6 +443,7 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsRetry
             ListVectorBucketsError::is_transient,
         )
         .await
+        .map_err(|err| *err)
     }
 
     async fn list_vectors(
@@ -439,6 +455,7 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsRetry
             ListVectorsError::is_transient,
         )
         .await
+        .map_err(|err| *err)
     }
 
     async fn put_vector_bucket_policy(
@@ -450,6 +467,7 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsRetry
             PutVectorBucketPolicyError::is_transient,
         )
         .await
+        .map_err(|err| *err)
     }
 
     async fn put_vectors(
@@ -461,6 +479,7 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsRetry
             PutVectorsError::is_transient,
         )
         .await
+        .map_err(|err| *err)
     }
 
     async fn query_vectors(
@@ -472,5 +491,6 @@ impl<T: S3Vectors + Send + Sync + 'static + ?Sized> S3Vectors for S3VectorsRetry
             QueryVectorsError::is_transient,
         )
         .await
+        .map_err(|err| *err)
     }
 }

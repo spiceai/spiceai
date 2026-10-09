@@ -41,7 +41,7 @@ filter = 'binary(=mutation_model_test)'
 slow-timeout = { period = "120s", terminate-after = 8 }
 
 [[profile.default.overrides]]
-filter = 'binary(=result_correctness_vs_duckdb_test)'
+filter = 'binary(=result_correctness_vs_duckdb_test) | binary(=result_correctness_vs_sqlite_test)'
 retries = 0
 slow-timeout = { period = "120s", terminate-after = 12 }
 """

@@ -30,9 +30,11 @@ use datafusion::{
     logical_expr::{BinaryExpr, Operator, TableProviderFilterPushDown, dml::InsertOp},
     physical_expr::{OrderingRequirements, PhysicalSortExpr},
     physical_plan::{
-        DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, PhysicalExpr, PlanProperties,
-        collect,
+        ChildStats, DisplayAs, DisplayFormatType, Distribution, ExecutionPlan,
+        InputDistributionRequirements, PhysicalExpr, PlanProperties, ReplaceChildrenOptions,
+        StatisticsArgs, StatisticsContext, collect,
         empty::EmptyExec,
+        execution_plan::ChildrenPropertiesMode,
         execution_plan::{CardinalityEffect, InvariantLevel},
         filter_pushdown::{
             ChildPushdownResult, FilterDescription, FilterPushdownPhase, FilterPushdownPropagation,
@@ -604,6 +606,21 @@ impl TableProvider for PartitionTableProvider {
 
         Ok(Arc::new(DeletionExec::new(deletion_sink)))
     }
+
+    /// MERGE INTO is not fanned out across partitions (unlike UPDATE and DELETE),
+    /// so reject it the way `DataFusion`'s default does.
+    async fn merge_into(
+        &self,
+        _state: &dyn Session,
+        _source: Arc<dyn ExecutionPlan>,
+        _merge_schema: datafusion::common::DFSchemaRef,
+        _on: Expr,
+        _clauses: Vec<datafusion::logical_expr::dml::MergeIntoClause>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        Err(DataFusionError::NotImplemented(
+            "PartitionTableProvider does not support MERGE INTO".to_string(),
+        ))
+    }
 }
 
 /// A deletion sink that applies deletion filters to all partitions in a partitioned table.
@@ -696,17 +713,29 @@ impl DeletionSink for PartitionedUpdateSink {
         &self,
         _context: Arc<TaskContext>,
     ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
-        let mut total_updated = 0u64;
+        let mut plans = Vec::with_capacity(self.partitions.len());
         for partition in &self.partitions {
-            let plan = partition
-                .table_provider
-                .update(
-                    &self.session_state,
-                    self.assignments.clone(),
-                    self.filters.clone(),
-                )
-                .await?;
+            plans.push(
+                partition
+                    .table_provider
+                    .update(
+                        &self.session_state,
+                        self.assignments.clone(),
+                        self.filters.clone(),
+                    )
+                    .await?,
+            );
+        }
+        // Check every partition's updated rows before writing any, so an UPDATE a
+        // partition refuses changes no partition.
+        for plan in &plans {
+            if let Some(update) = plan.downcast_ref::<data_components::update::UpdateExec>() {
+                update.prepare(Arc::clone(&self.task_ctx)).await?;
+            }
+        }
 
+        let mut total_updated = 0u64;
+        for plan in plans {
             let results = collect(plan, Arc::clone(&self.task_ctx)).await?;
 
             for batch in results {
@@ -777,7 +806,17 @@ impl ExecutionPlan for PartitionedUnionExec {
     }
 
     fn required_input_distribution(&self) -> Vec<Distribution> {
-        self.inner_union.required_input_distribution()
+        self.inner_union
+            .input_distribution_requirements()
+            .into_per_child()
+    }
+
+    fn input_distribution_requirements(&self) -> InputDistributionRequirements {
+        self.inner_union.input_distribution_requirements()
+    }
+
+    fn dynamic_expressions_produced(&self) -> Vec<Arc<dyn PhysicalExpr>> {
+        self.inner_union.dynamic_expressions_produced()
     }
 
     fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>> {
@@ -792,13 +831,27 @@ impl ExecutionPlan for PartitionedUnionExec {
         self.inner_union.benefits_from_input_partitioning()
     }
 
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        self.inner_union.apply_expressions(f)
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         self.inner_union.children()
     }
 
-    fn with_new_children(
+    /// The children are the inner union's, so the union replaces them and keeps or
+    /// recomputes its properties as `options` says.
+    fn replace_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
+        options: ReplaceChildrenOptions,
     ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
         if children.is_empty() {
             return Err(DataFusionError::Plan(
@@ -806,12 +859,33 @@ impl ExecutionPlan for PartitionedUnionExec {
             ));
         }
 
-        Ok(Arc::new(PartitionedUnionExec::try_new(children)?))
+        let inner_union = Arc::clone(&self.inner_union).replace_children(children, options)?;
+        Ok(Arc::new(PartitionedUnionExec { inner_union }))
+    }
+
+    fn with_new_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
+    }
+
+    fn with_new_children_and_same_properties(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
+        self.replace_children(
+            children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Keep),
+        )
     }
 
     fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>, DataFusionError> {
-        let children = self.children().into_iter().cloned().collect();
-        self.with_new_children(children)
+        let inner_union = Arc::clone(&self.inner_union).reset_state()?;
+        Ok(Arc::new(PartitionedUnionExec { inner_union }))
     }
 
     fn repartitioned(
@@ -838,7 +912,23 @@ impl ExecutionPlan for PartitionedUnionExec {
         &self,
         partition: Option<usize>,
     ) -> Result<Arc<Statistics>, DataFusionError> {
-        self.inner_union.partition_statistics(partition)
+        StatisticsContext::new().compute(
+            self.inner_union.as_ref(),
+            &StatisticsArgs::new().with_partition(partition),
+        )
+    }
+
+    /// The children are the inner union's, so the union decides which child statistics it needs.
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        self.inner_union.child_stats_requests(partition)
+    }
+
+    fn statistics_from_inputs(
+        &self,
+        input_stats: &[Arc<Statistics>],
+        args: &StatisticsArgs,
+    ) -> Result<Arc<Statistics>, DataFusionError> {
+        self.inner_union.statistics_from_inputs(input_stats, args)
     }
 
     fn supports_limit_pushdown(&self) -> bool {
@@ -861,7 +951,15 @@ impl ExecutionPlan for PartitionedUnionExec {
         &self,
         projection: &ProjectionExec,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>, DataFusionError> {
-        self.inner_union.try_swapping_with_projection(projection)
+        // `try_swapping_with_projection` implementations read the projection's
+        // input as the node being swapped with, so re-root it on the inner union
+        // (whose schema this node shares) before delegating.
+        let projection = ProjectionExec::try_new_with_schema_metadata(
+            projection.expr().iter().cloned(),
+            Arc::clone(&self.inner_union),
+            projection.schema().as_ref(),
+        )?;
+        self.inner_union.try_swapping_with_projection(&projection)
     }
 
     fn gather_filters_for_pushdown(
@@ -891,6 +989,15 @@ impl ExecutionPlan for PartitionedUnionExec {
 
     fn with_new_state(&self, _state: Arc<dyn Any + Send + Sync>) -> Option<Arc<dyn ExecutionPlan>> {
         None
+    }
+
+    /// Not serializable, as before `try_to_proto` existed. Forwarding would ship a bare
+    /// `UnionExec`, which behaves the same but loses this node's identity on the remote side.
+    fn try_to_proto(
+        &self,
+        _ctx: &datafusion::physical_plan::proto::ExecutionPlanEncodeCtx<'_>,
+    ) -> Result<Option<datafusion_proto::protobuf::PhysicalPlanNode>, DataFusionError> {
+        Ok(None)
     }
 }
 
@@ -1074,16 +1181,68 @@ mod tests {
             .register_table("partitioned_table", Arc::new(provider))
             .expect("register partitioned table");
 
-        context
+        let ordered = context
             .sql(
                 "SELECT id FROM partitioned_table \
                  ORDER BY bucket(10, id) DESC",
             )
             .await
             .expect("build logical plan")
-            .create_physical_plan()
+            .collect()
             .await
-            .expect("UDF ordering over a partitioned union must produce a valid physical plan");
+            .expect("UDF ordering over a partitioned union must plan and execute");
+        let ordered_ids: Vec<i32> = ordered
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("id is an Int32 column")
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+
+        // Every row of both partitions comes back exactly once.
+        let mut sorted_ids = ordered_ids.clone();
+        sorted_ids.sort_unstable();
+        assert_eq!(sorted_ids, vec![1, 2, 3, 4, 5, 6]);
+
+        // And in descending bucket order. Ids that share a bucket may come back in
+        // either order, so the order is checked against each id's bucket, read back
+        // through the same UDF, rather than against one fixed sequence.
+        let buckets: std::collections::HashMap<i32, i64> = context
+            .sql("SELECT id, CAST(bucket(10, id) AS BIGINT) FROM partitioned_table")
+            .await
+            .expect("build logical plan")
+            .collect()
+            .await
+            .expect("bucket every id")
+            .iter()
+            .flat_map(|batch| {
+                let ids = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("id is an Int32 column")
+                    .values()
+                    .to_vec();
+                let batch_buckets = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int64Array>()
+                    .expect("the bucket was cast to BIGINT")
+                    .values()
+                    .to_vec();
+                ids.into_iter().zip(batch_buckets)
+            })
+            .collect();
+        let ordered_buckets: Vec<i64> = ordered_ids.iter().map(|id| buckets[id]).collect();
+        assert!(
+            ordered_buckets.is_sorted_by(|earlier, later| earlier >= later),
+            "rows must come back in bucket(10, id) DESC order, got ids {ordered_ids:?} with buckets {ordered_buckets:?}"
+        );
     }
 
     #[tokio::test]
@@ -1877,19 +2036,15 @@ mod tests {
             .expect("scan failed");
 
         let recorded = tracker.lock().expect("lock poisoned");
-        // At least one partition scanned
-        assert!(
-            !recorded.is_empty(),
-            "Expected at least one partition to be scanned"
+        // `user_id = 100` pins one bucket, so pruning keeps exactly one of the three
+        // partitions. That scan must still receive the base-column filter, and only
+        // it: other user ids hash to the same bucket, so the bucket alone does not
+        // select the row (correctness requirement).
+        assert_eq!(
+            *recorded,
+            vec![vec![col("user_id").eq(lit(100i32))]],
+            "expected exactly one partition scanned, with `user_id = 100` as its only data filter"
         );
-
-        // The data filter `user_id = 100` MUST be present (correctness requirement)
-        for (idx, filters) in recorded.iter().enumerate() {
-            assert!(
-                !filters.is_empty(),
-                "Partition {idx}: expected data filter user_id=100 to be passed through",
-            );
-        }
     }
 
     #[tokio::test]
@@ -1940,5 +2095,42 @@ mod tests {
             TableProviderFilterPushDown::Inexact,
             "Base column filter should be Inexact (delegated to creator)"
         );
+    }
+
+    /// The union's statistics must still reach the optimizer through
+    /// `StatisticsContext`, which is how `DataFusion` 55 derives them: the whole-plan
+    /// row count is the sum of the partitions', and a per-partition request is
+    /// answered by the partition that owns it.
+    #[test]
+    fn partitioned_union_reports_the_union_of_its_partitions_statistics() {
+        use datafusion::common::stats::Precision;
+        use datafusion::datasource::memory::MemorySourceConfig;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let partition = |ids: Vec<i32>| -> Arc<dyn ExecutionPlan> {
+            let batch =
+                RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(Int32Array::from(ids))])
+                    .expect("valid batch");
+            MemorySourceConfig::try_new_exec(&[vec![batch]], Arc::clone(&schema), None)
+                .expect("valid memory exec")
+        };
+        let union =
+            PartitionedUnionExec::try_new(vec![partition(vec![1, 2]), partition(vec![3, 4, 5])])
+                .expect("valid union");
+
+        let whole = StatisticsContext::new()
+            .compute(&union, &StatisticsArgs::new())
+            .expect("union statistics");
+        assert_eq!(whole.num_rows, Precision::Exact(5));
+
+        let second = StatisticsContext::new()
+            .compute(&union, &StatisticsArgs::new().with_partition(Some(1)))
+            .expect("per-partition statistics");
+        assert_eq!(second.num_rows, Precision::Exact(3));
+
+        // The deprecated entry point must agree for callers not yet migrated.
+        #[expect(deprecated, reason = "asserts the legacy entry point still agrees")]
+        let legacy = union.partition_statistics(None).expect("legacy statistics");
+        assert_eq!(legacy.num_rows, Precision::Exact(5));
     }
 }

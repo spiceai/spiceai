@@ -48,12 +48,6 @@ use mysql_async::prelude::Queryable;
 use crate::init_tracing;
 use crate::mysql::common;
 
-// 13324 base; this suite also uses +1 (purged-position), +2 (stale-backlog),
-// +5 (version matrix: pinned 8.0 fallback). Distinct from the other MySQL suites
-// (comments 13320, e2e 13322/13323, refresh_retry 13327, schema_inference
-// 13328, rehydration 13337) so parallel test binaries never fight over a
-// container.
-const MYSQL_REPLICATION_PORT: u16 = 13324;
 /// Pinned image for the pre-8.2 positioning branch (`SHOW MASTER STATUS`
 /// fallback). The modern `SHOW BINARY LOG STATUS` branch is exercised by the
 /// rest of this suite via `mysql:latest` (always an 8.2+ version), so it needs
@@ -245,8 +239,8 @@ fn ids_of(envelope: &ChangeEnvelope) -> Vec<i32> {
 async fn bootstrap_then_stream_changes_then_resume() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("data_components::mysql_replication=debug,info"));
 
-    let port = MYSQL_REPLICATION_PORT;
-    let _container = common::start_mysql_docker_container(port).await?;
+    let container = common::start_mysql_docker_container().await?;
+    let port = container.host_port(3306)?;
     let pool = setup_source_table(port).await?;
     let store: Arc<MemoryPositionStore> = Arc::new(MemoryPositionStore::default());
 
@@ -419,8 +413,8 @@ async fn bootstrap_then_stream_changes_then_resume() -> Result<(), anyhow::Error
 async fn purged_position_behavior() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("data_components::mysql_replication=debug,info"));
 
-    let port = MYSQL_REPLICATION_PORT + 1;
-    let _container = common::start_mysql_docker_container(port).await?;
+    let container = common::start_mysql_docker_container().await?;
+    let port = container.host_port(3306)?;
     let pool = setup_source_table(port).await?;
 
     // A persisted position pointing at a binlog file the server never had —
@@ -578,8 +572,8 @@ async fn purged_position_behavior() -> Result<(), anyhow::Error> {
 async fn resume_with_stale_backlog_is_not_ready_until_caught_up() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("data_components::mysql_replication=debug,info"));
 
-    let port = MYSQL_REPLICATION_PORT + 2;
-    let _container = common::start_mysql_docker_container(port).await?;
+    let container = common::start_mysql_docker_container().await?;
+    let port = container.host_port(3306)?;
     let pool = setup_source_table(port).await?;
     let store: Arc<MemoryPositionStore> = Arc::new(MemoryPositionStore::default());
 
@@ -694,7 +688,7 @@ async fn bootstrap_and_stream_once(port: u16, server_id: u32) -> Result<(), anyh
 #[tokio::test(flavor = "multi_thread")]
 async fn bootstrap_streams_on_mysql_8_0() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("data_components::mysql_replication=debug,info"));
-    let port = MYSQL_REPLICATION_PORT + 5;
-    let _container = common::start_mysql_docker_container_with_image(port, MYSQL_IMAGE_8_0).await?;
+    let container = common::start_mysql_docker_container_with_image(MYSQL_IMAGE_8_0).await?;
+    let port = container.host_port(3306)?;
     bootstrap_and_stream_once(port, 200_401).await
 }

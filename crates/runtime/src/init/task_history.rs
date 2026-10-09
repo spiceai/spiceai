@@ -20,7 +20,7 @@ use crate::{
     task_history,
 };
 use datafusion::catalog::TableProvider;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use snafu::prelude::*;
 use std::fmt::Write;
 use std::sync::Arc;

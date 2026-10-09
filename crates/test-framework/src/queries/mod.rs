@@ -469,15 +469,14 @@ impl From<&(&'static str, u32)> for TableWithRowCount {
 }
 
 impl QuerySet {
-    #[expect(clippy::unused_async)]
-    pub async fn get_queries(
+    pub fn get_queries(
         &self,
         overrides: Option<QueryOverrides>,
         _instance: Option<&SpicedInstance>,
         _random_param_set_count: Option<usize>,
         scale_factor: Option<f64>,
-    ) -> anyhow::Result<Vec<Query>> {
-        match self {
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<Query>>> + Send {
+        std::future::ready(match self {
             QuerySet::Tpch => Ok(get_tpch_test_queries(overrides)),
             QuerySet::Tpcds => Ok(get_tpcds_test_queries(overrides, scale_factor)),
             QuerySet::Clickbench => Ok(get_clickbench_test_queries(overrides)),
@@ -509,7 +508,7 @@ impl QuerySet {
 
                 Ok(add_tpch_parameters(queries))
             }
-        }
+        })
     }
 
     /// At scale factor 1, how many rows should be present in each table for the query set

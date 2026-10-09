@@ -55,18 +55,6 @@ use crate::utils::{
 };
 use crate::{configure_test_datafusion, init_tracing};
 
-const MYSQL_E2E_PORT: u16 = 13322;
-#[cfg(not(target_os = "windows"))]
-const MYSQL_E2E_CAYENNE_PORT: u16 = 13323;
-#[cfg(not(target_os = "windows"))]
-const MYSQL_E2E_RESTART_PORT: u16 = 13321;
-#[cfg(not(target_os = "windows"))]
-const MYSQL_E2E_GTID_PORT: u16 = 13330;
-#[cfg(not(target_os = "windows"))]
-const MYSQL_E2E_RECONNECT_PORT: u16 = 13331;
-#[cfg(not(target_os = "windows"))]
-const MYSQL_E2E_TYPES_PORT: u16 = 13332;
-
 /// The accelerator engine a run of the e2e exercises.
 struct EngineConfig {
     engine: &'static str,
@@ -164,9 +152,13 @@ fn make_dataset(
             .then(|| Params::from_string_map(engine.accel_params.clone())),
         refresh_mode: Some(RefreshMode::Changes),
         primary_key: Some(ds.primary_key.to_string()),
-        on_conflict: vec![(ds.primary_key.to_string(), OnConflictBehavior::Upsert)]
-            .into_iter()
-            .collect(),
+        // Cayenne keeps one row per primary key on its own; the other engines
+        // replace a row only through an `on_conflict` upsert keyed on it.
+        on_conflict: if engine.engine == "cayenne" {
+            HashMap::new()
+        } else {
+            HashMap::from([(ds.primary_key.to_string(), OnConflictBehavior::Upsert)])
+        },
         ..Acceleration::default()
     });
     dataset
@@ -225,7 +217,7 @@ async fn wait_for_scalar_i64(
     }
 }
 
-async fn run_replication_e2e(port: u16, engine: EngineConfig) -> Result<(), anyhow::Error> {
+async fn run_replication_e2e(engine: EngineConfig) -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(
         "integration=debug,runtime=debug,data_components::mysql_replication=debug,info",
     ));
@@ -233,9 +225,10 @@ async fn run_replication_e2e(port: u16, engine: EngineConfig) -> Result<(), anyh
 
     test_request_context()
         .scope(async {
-            let _container = common::start_mysql_docker_container(port)
+            let container = common::start_mysql_docker_container()
                 .await
                 .map_err(|e| anyhow!("start container: {e}"))?;
+            let port = container.host_port(3306)?;
 
             // ------------------------------------------------------------
             // 1. Create schema + seed on the source.
@@ -377,14 +370,11 @@ async fn run_replication_e2e(port: u16, engine: EngineConfig) -> Result<(), anyh
 
 #[tokio::test(flavor = "multi_thread")]
 async fn mysql_binlog_replication_end_to_end() -> Result<(), anyhow::Error> {
-    run_replication_e2e(
-        MYSQL_E2E_PORT,
-        EngineConfig {
-            engine: "duckdb",
-            mode: spicepod::acceleration::Mode::Memory,
-            accel_params: HashMap::new(),
-        },
-    )
+    run_replication_e2e(EngineConfig {
+        engine: "duckdb",
+        mode: spicepod::acceleration::Mode::Memory,
+        accel_params: HashMap::new(),
+    })
     .await
 }
 
@@ -406,14 +396,11 @@ async fn mysql_binlog_replication_end_to_end_cayenne() -> Result<(), anyhow::Err
             temp_dir.path().join("metadata.db").display().to_string(),
         ),
     ]);
-    run_replication_e2e(
-        MYSQL_E2E_CAYENNE_PORT,
-        EngineConfig {
-            engine: "cayenne",
-            mode: spicepod::acceleration::Mode::File,
-            accel_params,
-        },
-    )
+    run_replication_e2e(EngineConfig {
+        engine: "cayenne",
+        mode: spicepod::acceleration::Mode::File,
+        accel_params,
+    })
     .await
 }
 
@@ -433,10 +420,10 @@ async fn mysql_binlog_replication_restart_resume_cayenne() -> Result<(), anyhow:
 
     test_request_context()
         .scope(async {
-            let port = MYSQL_E2E_RESTART_PORT;
-            let _container = common::start_mysql_docker_container(port)
+            let container = common::start_mysql_docker_container()
                 .await
                 .map_err(|e| anyhow!("start container: {e}"))?;
+            let port = container.host_port(3306)?;
 
             // Seed just the orders table on the source.
             let pool = common::get_mysql_conn(port)?;
@@ -562,10 +549,10 @@ async fn mysql_binlog_replication_gtid_resume_cayenne() -> Result<(), anyhow::Er
 
     test_request_context()
         .scope(async {
-            let port = MYSQL_E2E_GTID_PORT;
-            let _container = common::start_mysql_gtid_docker_container(port)
+            let container = common::start_mysql_gtid_docker_container()
                 .await
                 .map_err(|e| anyhow!("start gtid container: {e}"))?;
+            let port = container.host_port(3306)?;
 
             let pool = common::get_mysql_conn(port)?;
             exec(&pool, DDL_STATEMENTS[1]).await?; // repl_orders
@@ -836,11 +823,12 @@ async fn mysql_binlog_replication_survives_a_dump_reconnect_cayenne() -> Result<
 
     test_request_context()
         .scope(async {
-            let _container = common::start_mysql_docker_container(MYSQL_E2E_RECONNECT_PORT)
+            let container = common::start_mysql_docker_container_retrying_startup()
                 .await
                 .map_err(|e| anyhow!("start container: {e}"))?;
+            let port = container.host_port(3306)?;
 
-            let pool = common::get_mysql_conn(MYSQL_E2E_RECONNECT_PORT)?;
+            let pool = common::get_mysql_conn(port)?;
             exec(&pool, RECONNECT_DDL).await?;
             for id in 1..=RECONNECT_ROWS {
                 exec(
@@ -882,11 +870,7 @@ async fn mysql_binlog_replication_survives_a_dump_reconnect_cayenne() -> Result<
                 accel_params,
             };
             let app = AppBuilder::new("mysql_replication_reconnect")
-                .with_dataset(make_dataset(
-                    &dataset,
-                    &mysql_params(MYSQL_E2E_RECONNECT_PORT),
-                    &engine,
-                ))
+                .with_dataset(make_dataset(&dataset, &mysql_params(port), &engine))
                 .build();
 
             configure_test_datafusion();
@@ -1247,11 +1231,12 @@ async fn mysql_binlog_replication_decodes_every_column_type_cayenne() -> Result<
 
     test_request_context()
         .scope(async {
-            let _container = common::start_mysql_docker_container(MYSQL_E2E_TYPES_PORT)
+            let container = common::start_mysql_docker_container_retrying_startup()
                 .await
                 .map_err(|e| anyhow!("start container: {e}"))?;
+            let port = container.host_port(3306)?;
 
-            let pool = common::get_mysql_conn(MYSQL_E2E_TYPES_PORT)?;
+            let pool = common::get_mysql_conn(port)?;
             exec(&pool, TYPES_DDL).await?;
             for seed in TYPES_SEED {
                 exec(&pool, seed).await?;
@@ -1279,7 +1264,7 @@ async fn mysql_binlog_replication_decodes_every_column_type_cayenne() -> Result<
             let app = AppBuilder::new("mysql_replication_types")
                 .with_dataset(make_dataset(
                     &dataset,
-                    &mysql_params(MYSQL_E2E_TYPES_PORT),
+                    &mysql_params(port),
                     &EngineConfig {
                         engine: "cayenne",
                         mode: spicepod::acceleration::Mode::File,

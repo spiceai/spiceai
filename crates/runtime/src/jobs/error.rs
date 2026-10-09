@@ -102,6 +102,9 @@ pub enum Error {
     ))]
     ConcurrentModification { job_id: String },
 
+    #[snafu(display("Job {job_id} already finished (status: {status}), so it is not run again"))]
+    JobAlreadyFinished { job_id: String, status: String },
+
     #[snafu(display(
         "Concurrent modification detected for chunk {chunk_index} of job {job_id}. Another scheduler already wrote this chunk."
     ))]

@@ -15,6 +15,14 @@ name: Verus Verification
 # hit. Prefix-unambiguity of `[tag][id.len() LE][id]` is a Verus postcondition
 # discharged for every `(tag, id, payload)` triple.
 #
+# `crates/key-index/src/escape_proof.rs`: each column's key encoding is
+# prefix-free for every input, so concatenating a compound key's columns adds
+# no collisions: key tuples whose columns encode differently never encode to
+# the same bytes. Which values one column's encoding tells apart is the
+# encoder's choice (floats give `-0.0` and `0.0`, and every NaN, one encoding
+# each). A lookup can still return another key's rows, because a wide key is
+# indexed by a 64-bit hash of those bytes; the query's own filter drops them.
+#
 # `crates/sharded-cache/src/layout.rs`: both array indices the results cache
 # derives from a key — the shard, and the `TinyLFU` counter cell — subscript
 # fixed-size arrays under the shard lock, so an out-of-range result is a panic
@@ -25,6 +33,11 @@ name: Verus Verification
 # request. A proof is a claim about the tree it was checked against; two
 # individually green changes can combine into one the verifier would reject, and
 # no other check in the queue would notice.
+#
+# Which crates are checked is derived, never listed: every workspace member
+# whose manifest sets `[package.metadata.verus] verify = true` (read from
+# `cargo metadata`) is path-filtered, pin-checked and verified below. Opting a
+# crate in is the whole change; nothing in this file names it.
 #
 # One job, one required context: `Verify Verus proofs` is required on `trunk`,
 # and it is the whole gate for every crate that carries proofs. A second job per
@@ -80,14 +93,14 @@ permissions:
 env:
   # The verifier and its specification library ship together and are versioned
   # together, so these move as a set. VERUS_VSTD_VERSION must match the `vstd`
-  # pin in every crate that opted into verification (`crates/hash-index`,
-  # `crates/cache` and `crates/sharded-cache` today), and VERUS_SHA256 pins the
-  # exact bytes of the archive: a release tag names an asset, it does not fix
-  # its contents, and this job executes what it downloads.
-  VERUS_RELEASE: release/0.2026.08.30.b432e82
-  VERUS_ASSET: verus-0.2026.08.30.b432e82-x86-linux.zip
-  VERUS_SHA256: 067f5f72a457fe66b77c0c10b180f2a919a9c7481a8baa024ffc716aa931a41b
-  VERUS_VSTD_VERSION: 0.0.0-2026-08-30-0159
+  # pin in `[workspace.dependencies]`, which every crate that opted into
+  # verification inherits (checked below), and VERUS_SHA256 pins the exact
+  # bytes of the archive: a release tag names an asset, it does not fix its
+  # contents, and this job executes what it downloads.
+  VERUS_RELEASE: release/0.2026.09.27.3cf1832
+  VERUS_ASSET: verus-0.2026.09.27.3cf1832-x86-linux.zip
+  VERUS_SHA256: 43814031e10df043221d83c7fa842e3ebd662cb7b0090fc1eb4d7a8673226978
+  VERUS_VSTD_VERSION: 0.0.0-2026-09-20-0158
 
 jobs:
   verus-verify:
@@ -117,6 +130,69 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
 
+      # The crates that opted into verification, from the manifests themselves,
+      # so the path filter, the pin check and the verify loop below cannot drift
+      # from them. `--no-deps` reads the workspace's manifests without resolving
+      # or building anything, and the runner's preinstalled stable is enough for
+      # that: the pinned toolchain is only installed once there is work to do.
+      #
+      # The opt-in alone would let a crate leave the gate by flipping it to
+      # `verify = false` while keeping its proofs. Every crate that depends on
+      # `vstd` must therefore have opted in: proofs cannot be written without
+      # `vstd`, so the only way out of this list is to delete them.
+      - name: List the verified crates
+        id: crates
+        run: |
+          set -euo pipefail
+          metadata=$(RUSTUP_TOOLCHAIN=stable cargo metadata --no-deps --format-version 1)
+          crate_dirs() {
+            jq -r --arg root "$PWD/" ".packages[] | select($1)
+                | .manifest_path | ltrimstr(\$root) | rtrimstr(\"/Cargo.toml\")" \
+              <<<"$metadata" | sort
+          }
+          dirs=$(crate_dirs '.metadata.verus.verify == true')
+          with_vstd=$(crate_dirs 'any(.dependencies[]; .name == "vstd")')
+          unverified=$(comm -13 <(echo "$dirs") <(echo "$with_vstd"))
+          if [ -n "$unverified" ]; then
+            echo "::error::These crates depend on vstd but do not set" \
+                 "[package.metadata.verus] verify = true, so their proofs would" \
+                 "go unchecked: $(echo $unverified). Opt them in, or remove" \
+                 "their proofs and the vstd dependency."
+            exit 1
+          fi
+          if [ -z "$dirs" ]; then
+            echo "::error::No workspace crate sets [package.metadata.verus] verify = true," \
+                 "so this gate would verify nothing."
+            exit 1
+          fi
+          echo "Verified crates:"
+          echo "$dirs"
+          {
+            echo 'dirs<<EOF'
+            echo "$dirs"
+            echo 'EOF'
+            echo 'filters<<EOF'
+            echo 'code_changes:'
+            sed "s|.*|  - '&/**'|" <<<"$dirs"
+            # The verifier is a rustc driver bound to one toolchain, so a
+            # workspace toolchain bump can invalidate this gate without
+            # touching the crate. `vstd` is an ordinary dependency, so what is
+            # verified is resolved outside the crate: the root manifest owns
+            # the `vstd` pin and `[patch.crates-io]`, which can redirect it,
+            # the lockfile selects its proc-macro crates, and cargo config can
+            # replace the source or change how the driver is invoked. Last,
+            # the gate itself, and the two composite actions this job runs:
+            # one decides whether verification happens at all, the other
+            # installs the toolchain the driver requires.
+            for path in rust-toolchain.toml Cargo.toml Cargo.lock '.cargo/**' \
+                        .github/workflows/verus_verify.yml \
+                        '.github/actions/check-code-changes/**' \
+                        '.github/actions/setup-rust/**'; do
+              echo "  - '$path'"
+            done
+            echo 'EOF'
+          } >> "$GITHUB_OUTPUT"
+
       # Decides whether the verification work below runs, on the events that
       # reach this job at all — a pull request skips the job outright.
       #
@@ -127,30 +203,7 @@ jobs:
         id: changes
         uses: ./.github/actions/check-code-changes
         with:
-          filters: |
-            code_changes:
-              - 'crates/hash-index/**'
-              - 'crates/cache/**'
-              - 'crates/sharded-cache/**'
-              # The verifier is a rustc driver bound to one toolchain, so a
-              # workspace toolchain bump can invalidate this gate without
-              # touching the crate.
-              - 'rust-toolchain.toml'
-              # `vstd` is an ordinary dependency, so what is verified is resolved
-              # outside the crate: the root manifest owns `[patch.crates-io]` and
-              # can redirect `vstd` past the version string "Check pins agree"
-              # reads, the lockfile selects its proc-macro crates, and cargo
-              # config can replace the source or change how the driver is
-              # invoked.
-              - 'Cargo.toml'
-              - 'Cargo.lock'
-              - '.cargo/**'
-              # The gate itself, and the two composite actions this job runs: one
-              # decides whether verification happens at all, the other installs
-              # the toolchain the driver requires.
-              - '.github/workflows/verus_verify.yml'
-              - '.github/actions/check-code-changes/**'
-              - '.github/actions/setup-rust/**'
+          filters: ${{ steps.crates.outputs.filters }}
 
       # A manual run is how someone re-checks the proofs on demand, so it must
       # never be able to skip them. `dorny/paths-filter` has no base to diff
@@ -184,17 +237,29 @@ jobs:
         if: steps.gate.outputs.verify == 'true'
         uses: ./.github/actions/setup-rust
 
+      # Every verified crate must depend on exactly the `vstd` this verifier
+      # ships with. Read from the manifests as cargo resolves them rather than
+      # grepped, so a crate that inherits the workspace pin and one that
+      # overrides it are checked alike, and a crate with no `vstd` is caught.
       - name: Check pins agree
         if: steps.gate.outputs.verify == 'true'
+        env:
+          VERIFIED_DIRS: ${{ steps.crates.outputs.dirs }}
         run: |
           set -euo pipefail
-          for manifest in crates/hash-index/Cargo.toml crates/cache/Cargo.toml \
-                          crates/sharded-cache/Cargo.toml; do
-            pinned=$(grep -oP 'vstd = "=\K[^"]+' "$manifest")
-            if [ "$pinned" != "$VERUS_VSTD_VERSION" ]; then
-              echo "::error::vstd pin in $manifest is '$pinned'," \
+          metadata=$(cargo metadata --no-deps --format-version 1)
+          mapfile -t crate_dirs <<<"$VERIFIED_DIRS"
+          for crate_dir in "${crate_dirs[@]}"; do
+            pinned=$(jq -r --arg manifest "$PWD/$crate_dir/Cargo.toml" '.packages[]
+                | select(.manifest_path == $manifest)
+                | [.dependencies[] | select(.name == "vstd") | .req] | first // ""' \
+              <<<"$metadata")
+            if [ "$pinned" != "=$VERUS_VSTD_VERSION" ]; then
+              echo "::error::$crate_dir depends on vstd '${pinned:-<none>}'," \
                    "but this workflow runs Verus '$VERUS_VSTD_VERSION'." \
-                   "The verifier and vstd ship together — update both."
+                   "The verifier and vstd ship together: update the vstd pin in" \
+                   "[workspace.dependencies] and VERUS_VSTD_VERSION together, and" \
+                   "inherit it with vstd.workspace = true."
               exit 1
             fi
           done
@@ -275,14 +340,16 @@ jobs:
 
       - name: Verify
         if: steps.gate.outputs.verify == 'true'
+        env:
+          VERIFIED_DIRS: ${{ steps.crates.outputs.dirs }}
         run: |
           set -euo pipefail
           export PATH="$VERUS_DIR:$PATH"
-          # Every crate that opted into `[package.metadata.verus]` must be
-          # checked here, in this one job. A crate missing from this loop is
-          # a proof CI never sees. A second job per crate would be a second
+          # Every crate that opted into `[package.metadata.verus]` is checked
+          # here, in this one job. A second job per crate would be a second
           # required check — do not split the loop out.
-          for crate_dir in crates/hash-index crates/cache crates/sharded-cache; do
+          mapfile -t crate_dirs <<<"$VERIFIED_DIRS"
+          for crate_dir in "${crate_dirs[@]}"; do
             crate_name=$(basename "$crate_dir")
             (
               cd "$crate_dir"

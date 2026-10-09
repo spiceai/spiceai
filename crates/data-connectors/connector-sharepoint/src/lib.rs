@@ -528,6 +528,15 @@ fn parse_object_store_components(
     ))
 }
 
+/// The user-facing name of `parameter`, noting the `flow` parameter that requires it.
+fn required_with(params: &Parameters, parameter: &str, flow: &str) -> String {
+    format!(
+        "`{}` (required with `{}`)",
+        params.user_param(parameter),
+        params.user_param(flow)
+    )
+}
+
 fn build_auth_from_params(params: &Parameters) -> Result<SharepointAuth> {
     let tenant = params.get("tenant_id").expose().ok().map(String::from);
     let client_id = params.get("client_id").expose().ok().map(String::from);
@@ -574,10 +583,10 @@ fn build_auth_from_params(params: &Parameters) -> Result<SharepointAuth> {
     }
     if let Some(assertion) = saml_assertion {
         let tenant = tenant.ok_or_else(|| Error::MissingParameter {
-            parameter: "tenant_id".into(),
+            parameter: format!("`{}`", params.user_param("tenant_id")),
         })?;
         let client_id = client_id.ok_or_else(|| Error::MissingParameter {
-            parameter: "client_id".into(),
+            parameter: format!("`{}`", params.user_param("client_id")),
         })?;
         return Ok(SharepointAuth::SamlBearer(SamlBearerConfig {
             tenant_id: tenant,
@@ -589,22 +598,22 @@ fn build_auth_from_params(params: &Parameters) -> Result<SharepointAuth> {
     }
 
     let tenant = tenant.ok_or_else(|| Error::MissingParameter {
-        parameter: "tenant_id".into(),
+        parameter: format!("`{}`", params.user_param("tenant_id")),
     })?;
     let client_id = client_id.ok_or_else(|| Error::MissingParameter {
-        parameter: "client_id".into(),
+        parameter: format!("`{}`", params.user_param("client_id")),
     })?;
 
     if let Some(code) = auth_code {
         let secret = client_secret.ok_or_else(|| Error::MissingParameter {
-            parameter: "client_secret (required with auth_code)".into(),
+            parameter: required_with(params, "client_secret", "auth_code"),
         })?;
         let redirect = params
             .get("redirect_uri")
             .expose()
             .ok()
             .ok_or_else(|| Error::MissingParameter {
-                parameter: "redirect_uri (required with auth_code)".into(),
+                parameter: required_with(params, "redirect_uri", "auth_code"),
             })?
             .to_string();
         return Ok(SharepointAuth::AuthCode {
@@ -618,7 +627,7 @@ fn build_auth_from_params(params: &Parameters) -> Result<SharepointAuth> {
     }
     if let Some(token) = refresh_token {
         let secret = client_secret.ok_or_else(|| Error::MissingParameter {
-            parameter: "client_secret (required with refresh_token)".into(),
+            parameter: required_with(params, "client_secret", "refresh_token"),
         })?;
         return Ok(SharepointAuth::RefreshToken {
             tenant_id: tenant,
@@ -1042,6 +1051,58 @@ mod tests {
         assert_eq!(
             url_extension("sharepoint://me/Documents/data.json#section").as_deref(),
             Some("json")
+        );
+    }
+
+    fn auth_error(params: &[(&str, &str)]) -> String {
+        let params = Parameters::new(
+            params
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), SecretString::from((*v).to_string())))
+                .collect(),
+            CONNECTOR_NAME,
+            PARAMETERS.as_slice(),
+        );
+        match build_auth_from_params(&params) {
+            Ok(_) => panic!("authentication should be refused"),
+            Err(error) => error.to_string(),
+        }
+    }
+
+    #[test]
+    fn missing_parameter_errors_name_the_spicepod_keys() {
+        assert_eq!(
+            auth_error(&[("auth_code", "code")]),
+            "Missing required parameter: `sharepoint_tenant_id`. Specify a value. For details, visit: https://spiceai.org/docs/components/data-connectors/sharepoint#parameters"
+        );
+        assert_eq!(
+            auth_error(&[("auth_code", "code"), ("tenant_id", "t")]),
+            "Missing required parameter: `sharepoint_client_id`. Specify a value. For details, visit: https://spiceai.org/docs/components/data-connectors/sharepoint#parameters"
+        );
+        assert_eq!(
+            auth_error(&[
+                ("auth_code", "code"),
+                ("tenant_id", "t"),
+                ("client_id", "c")
+            ]),
+            "Missing required parameter: `sharepoint_client_secret` (required with `sharepoint_auth_code`). Specify a value. For details, visit: https://spiceai.org/docs/components/data-connectors/sharepoint#parameters"
+        );
+        assert_eq!(
+            auth_error(&[
+                ("auth_code", "code"),
+                ("tenant_id", "t"),
+                ("client_id", "c"),
+                ("client_secret", "s"),
+            ]),
+            "Missing required parameter: `sharepoint_redirect_uri` (required with `sharepoint_auth_code`). Specify a value. For details, visit: https://spiceai.org/docs/components/data-connectors/sharepoint#parameters"
+        );
+        assert_eq!(
+            auth_error(&[
+                ("refresh_token", "r"),
+                ("tenant_id", "t"),
+                ("client_id", "c")
+            ]),
+            "Missing required parameter: `sharepoint_client_secret` (required with `sharepoint_refresh_token`). Specify a value. For details, visit: https://spiceai.org/docs/components/data-connectors/sharepoint#parameters"
         );
     }
 

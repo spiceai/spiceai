@@ -225,7 +225,7 @@ async fn build(
         maxs: Vec::with_capacity(blocks),
         any: Vec::with_capacity(blocks),
     };
-    let key = col(column);
+    let key = col(column).bind(reader.dtype()).map_err(vortex_error)?;
 
     let mut start = 0;
     while start < row_count {

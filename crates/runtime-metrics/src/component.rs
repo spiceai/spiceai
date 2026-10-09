@@ -23,6 +23,7 @@ use runtime_api_types::v1::ComponentType;
 pub enum MetricType {
     ObservableCounterU64,
     ObservableGaugeU64,
+    ObservableGaugeF64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

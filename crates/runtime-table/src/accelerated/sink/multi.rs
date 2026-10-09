@@ -97,9 +97,9 @@ impl MultiSink {
                 })
             })?;
 
-        let _ = collect(insertion_plan, ctx_state.task_ctx())
+        collect(insertion_plan, ctx_state.task_ctx())
             .await
-            .map_err(retry_from_df_error);
+            .map_err(retry_from_df_error)?;
         Ok(())
     }
 
@@ -140,7 +140,21 @@ impl MultiSink {
         &self,
         record_batch_stream: Pin<Box<dyn RecordBatchStream + Send>>,
         overwrite: InsertOp,
+        write: &super::RefreshWrite,
     ) -> Result<(), RetryError<crate::accelerated::Error>> {
+        // Row versions let one accelerator resolve repeated keys as it writes, but every
+        // table here receives the rows and not every one reads them. The refresh resolves
+        // them before writing to a table with synchronized children, so one attached since
+        // then fails the write, and the next attempt resolves them first.
+        if write.row_versions.is_some() {
+            return Err(RetryError::transient(
+                crate::accelerated::Error::FailedToWriteData {
+                    source: DataFusionError::Execution(
+                        "a synchronized dataset attached during this refresh, so it was not applied; the next refresh writes the same rows to both".to_string(),
+                    ),
+                },
+            ));
+        }
         let schema = record_batch_stream.schema();
         let (tx, _) = broadcast::channel::<RecordBatch>(32);
         let mut join_set = JoinSet::new();
@@ -168,7 +182,7 @@ impl MultiSink {
         let primary_provider = Arc::clone(&self.original_table_provider);
         join_set.spawn(Self::spawn_parent_task(
             primary_provider,
-            ctx.state(),
+            write.state(&ctx.state()),
             tx.subscribe(),
             Arc::clone(&schema),
             parent_complete_tx,
@@ -532,9 +546,14 @@ mod tests {
             tx.send(create_test_record_batch(&[i])).unwrap_or_default();
         }
 
-        // Verify we get an error when reading from a lagged stream
+        // A lagged child must fail on the batches it missed rather than write
+        // fewer rows: capacity 1 and ten sends leave the receiver nine behind.
         let result = stream.next().await.expect("should have an item");
-        result.expect_err("expected lagging error");
+        let err = result.expect_err("expected lagging error");
+        let DataFusionError::External(source) = &err else {
+            panic!("expected the broadcast lag as an external error, got: {err}");
+        };
+        assert_eq!(source.to_string(), "channel lagged by 9");
     }
 
     #[tokio::test]
@@ -647,7 +666,10 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    /// The children take 50, 100 and 150 ms over their batch, yet the barrier
+    /// releases them together. Paused time makes that exact: every child's
+    /// elapsed time is the slowest child's 150 ms, not its own.
+    #[tokio::test(start_paused = true)]
     async fn test_multiple_children_synchronization() {
         let barrier = Arc::new(Barrier::new(3)); // 3 children
         let (tx, rx1) = broadcast::channel(32);
@@ -693,19 +715,26 @@ mod tests {
         // Wait for all tasks
         let results = futures::future::join_all(tasks).await;
 
-        // Verify all tasks completed successfully and got the same data
+        // Every child got the one batch, and none was released before the
+        // slowest had finished its own.
         for result in results {
-            let (batches, _) = result.expect("task completed");
-            assert_eq!(batches.len(), 1);
-            // Verify batch contents
+            let (batches, elapsed) = result.expect("task completed");
+            assert_eq!(batches, vec![create_test_record_batch(&[1, 2, 3])]);
+            assert_eq!(
+                elapsed,
+                Duration::from_millis(150),
+                "the barrier releases every child together, when the slowest finishes"
+            );
         }
     }
 
+    /// Reads `stream` to its end, spending `delay` on each batch, and reports
+    /// how long that took on the (possibly paused) tokio clock.
     async fn process_stream(
         mut stream: RecordBatchBroadcastStream,
         delay: Duration,
     ) -> (Vec<RecordBatch>, Duration) {
-        let start = std::time::Instant::now();
+        let start = tokio::time::Instant::now();
         let mut results = Vec::new();
         while let Some(result) = stream.next().await {
             sleep(delay).await;

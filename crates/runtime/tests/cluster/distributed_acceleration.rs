@@ -243,7 +243,7 @@ async fn cluster_distributes_accelerated_table_with_federated_source() -> Result
             // Local-filesystem cluster state (avoids the S3 partition store the other
             // cluster tests use, so this runs hermetically without AWS creds).
             let scheduler_cfg = SchedulerConfig {
-                state_location: format!("file://{}", state_tempdir.path().display()),
+                state_location: Some(format!("file://{}", state_tempdir.path().display())),
                 params: None,
                 partition_assignment_interval: "1s".to_string(),
                 max_partition_assignments_per_interval:
@@ -333,7 +333,7 @@ async fn cluster_distributes_accelerated_table_with_column_metadata() -> Result<
             dataset.columns = vec![id_col];
 
             let scheduler_cfg = SchedulerConfig {
-                state_location: format!("file://{}", state_tempdir.path().display()),
+                state_location: Some(format!("file://{}", state_tempdir.path().display())),
                 params: None,
                 partition_assignment_interval: "1s".to_string(),
                 max_partition_assignments_per_interval:
@@ -845,7 +845,7 @@ async fn test_distributed_acceleration_join_two_partitioned_tables() -> Result<(
                 .expect("scheduler should have partition store");
 
             for table_name in ["test_data", "categories"] {
-                let table_ref = datafusion::sql::TableReference::parse_str(table_name);
+                let table_ref = datafusion::common::TableReference::parse_str(table_name);
                 let assigned = crate::utils::wait_until_true(Duration::from_mins(1), || async {
                     partition_store.refresh().await.ok();
                     partition_store
@@ -952,7 +952,7 @@ async fn test_distributed_refresh_forwarding() -> Result<(), anyhow::Error> {
             // Trigger refresh from the scheduler. Previously this would fail with
             // "the refresh worker is no longer running. channel closed" because the
             // scheduler doesn't run local refresh workers. Now it forwards to executors.
-            let table_ref = datafusion::sql::TableReference::parse_str("test_data");
+            let table_ref = datafusion::common::TableReference::parse_str("test_data");
             harness
                 .scheduler
                 .datafusion()
@@ -1046,7 +1046,7 @@ async fn test_on_demand_refresh_discovers_new_partitions() -> Result<(), anyhow:
                 .scheduler
                 .partition_store()
                 .expect("scheduler should have partition store");
-            let table_ref = datafusion::sql::TableReference::parse_str("test_data");
+            let table_ref = datafusion::common::TableReference::parse_str("test_data");
 
             let partitions_assigned =
                 crate::utils::wait_until_true(Duration::from_secs(30), || async {
@@ -1232,6 +1232,7 @@ fn make_memory_accelerated_dataset(
 
     dataset.acceleration = Some(Acceleration {
         enabled: true,
+        engine: Some("arrow".to_string()),
         mode: Mode::Memory,
         refresh_mode: Some(RefreshMode::Full),
         partition_by: vec![PartitionedBy {
@@ -1244,7 +1245,8 @@ fn make_memory_accelerated_dataset(
     dataset
 }
 
-/// Create a dataset partitioned by a raw column value (not `bucket()`).
+/// Create a dataset with in-memory Arrow acceleration, partitioned by a raw column value (not
+/// `bucket()`).
 /// Each unique value of `partition_column` becomes its own partition.
 fn make_column_partitioned_dataset(
     source_path: impl Into<String>,
@@ -1255,6 +1257,7 @@ fn make_column_partitioned_dataset(
 
     dataset.acceleration = Some(Acceleration {
         enabled: true,
+        engine: Some("arrow".to_string()),
         mode: Mode::Memory,
         refresh_mode: Some(RefreshMode::Full),
         partition_by: vec![PartitionedBy {
@@ -1285,9 +1288,9 @@ fn make_named_scheduler_config_with_max_partitions_per_executor(
 ) -> SchedulerConfig {
     let run_id = uuid::Uuid::new_v4();
     SchedulerConfig {
-        state_location: format!(
+        state_location: Some(format!(
             "s3://spiceai-integration-tests/cluster-state/{test_name}/{run_id}/"
-        ),
+        )),
         params: Some(spicepod::param::Params::from_string_map(
             std::collections::HashMap::from([
                 ("s3_region".to_string(), "us-east-1".to_string()),

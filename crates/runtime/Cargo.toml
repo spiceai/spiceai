@@ -98,6 +98,7 @@ jsonwebtoken = { version = "10.3.0", features = ["aws_lc_rs"] }
 linkme.workspace = true
 llms = { path = "../llms", default-features = false }
 evaluate-api = { path = "../evaluate-api" }
+evaluate-chat = { path = "../evaluate-chat" }
 mediatype = "0.21.0"
 moka.workspace = true
 mysql_async = { workspace = true, optional = true }
@@ -171,6 +172,7 @@ rusqlite = { workspace = true, optional = true }
 rustls.workspace = true
 elasticsearch = { path = "../elasticsearch", optional = true }
 duration-parse = { workspace = true, optional = true }
+s3-event-notifications = { path = "../s3-event-notifications" }
 s3_vectors = { path = "../s3_vectors", optional = true }
 scheduler = { path = "../scheduler" }
 schemars.workspace = true
@@ -236,6 +238,13 @@ aws-credential-types = { workspace = true, features = [
 # SDK). A dev-dependency, so it stays out of the shipped runtime and is exempt from
 # the `restricted_deps` driver-confinement guard.
 aws-sdk-dynamodb.workspace = true
+# Used directly by the `tests/cosmosdb` integration suite to create the emulator's
+# database and container; the same version and features as `connector-cosmosdb`.
+azure_core = "0.31.0"
+azure_data_cosmos = { version = "0.30.0", default-features = false, features = [
+    "hmac_rust",
+    "key_auth",
+] }
 ballista-core.workspace = true
 bcder = "0.7.4"
 bollard = "0.18.1"
@@ -465,3 +474,10 @@ workspace = true
 name = "result_correctness"
 path = "tests/result_correctness.rs"
 required-features = ["duckdb", "sqlite"]
+
+# A binary of its own so `make nextest` can run it without loading `integration`,
+# which on macOS is too large for dyld to map the shared cache beside it.
+[[test]]
+name = "rate_control"
+path = "tests/rate_control.rs"
+required-features = ["rate-control"]

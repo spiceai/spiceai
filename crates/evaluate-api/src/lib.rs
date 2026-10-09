@@ -18,8 +18,10 @@ limitations under the License.
 //!
 //! An evaluation model takes unstructured `state` plus a map of typed
 //! `questions` and returns structured `answers` (noul / choice / score) with
-//! calibrated probabilities. Implemented by provider crates; called by the
-//! runtime's `POST /v1/evaluate` endpoint — which never names a provider.
+//! probabilities. Implemented by provider crates and by `evaluate-chat`, which
+//! answers through any chat model; called by the runtime's `POST /v1/evaluate`
+//! endpoint — which never names a provider. [`check_answers`] holds every
+//! implementation's answers to the same invariants.
 //!
 //! Deliberately separate from chat completions: System One models such as
 //! `TypeSafe` Jev do not generate strings and must not be faked as `OpenAI` chat.
@@ -33,6 +35,10 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use snafu::Snafu;
+
+mod check;
+
+pub use check::{check_answers, is_probability, probability_sum_tolerance};
 
 /// Name → evaluation model map. Holds System One providers (e.g. `TypeSafe` Jev).
 pub type EvaluateModelStore = std::collections::HashMap<String, Arc<dyn Evaluate>>;
@@ -179,6 +185,16 @@ impl From<&str> for NonNullEntry {
 impl From<String> for NonNullEntry {
     fn from(value: String) -> Self {
         Self::String(value)
+    }
+}
+
+impl From<&NonNullEntry> for EntryType {
+    fn from(value: &NonNullEntry) -> Self {
+        match value {
+            NonNullEntry::String(text) => Self::String(text.clone()),
+            NonNullEntry::Array(items) => Self::Array(items.clone()),
+            NonNullEntry::Object(fields) => Self::Object(fields.clone()),
+        }
     }
 }
 
@@ -453,10 +469,11 @@ pub trait Evaluate: Send + Sync + Debug {
     /// should substitute their upstream model id before calling the remote API.
     async fn evaluate(&self, request: EvaluateRequest) -> Result<EvaluateResponse>;
 
-    /// Optional health check (e.g. list models). Default is a no-op.
-    async fn health(&self) -> Result<()> {
-        Ok(())
-    }
+    /// Checks the model can answer, e.g. by listing the provider's models.
+    ///
+    /// No default: a wrapper that inherited one would silently skip the check of the
+    /// model it wraps, so every implementation says what its health is.
+    async fn health(&self) -> Result<()>;
 }
 
 #[cfg(test)]
@@ -708,10 +725,14 @@ mod tests {
     /// `TypeSafe` documents score criteria as two to ten levels.
     #[test]
     fn score_criteria_requires_two_levels() {
+        const LEVELS_ERROR: &str =
+            "score criteria must contain between two and ten non-null levels";
+
         let one = serde_json::from_value::<Question>(
             json!({"type": "score", "instructions": "how bad?", "criteria": ["only"]}),
-        );
-        assert!(one.is_err(), "one level must be rejected: {one:?}");
+        )
+        .expect_err("one level must be rejected");
+        assert_eq!(one.to_string(), LEVELS_ERROR);
 
         serde_json::from_value::<Question>(
             json!({"type": "score", "instructions": "how bad?", "criteria": ["calm", "angry"]}),
@@ -727,8 +748,9 @@ mod tests {
         let eleven: Vec<String> = (0..11).map(|i| format!("level {i}")).collect();
         let over = serde_json::from_value::<Question>(
             json!({"type": "score", "instructions": "how bad?", "criteria": eleven}),
-        );
-        assert!(over.is_err(), "eleven levels must be rejected: {over:?}");
+        )
+        .expect_err("eleven levels must be rejected");
+        assert_eq!(over.to_string(), LEVELS_ERROR);
     }
 
     /// A provider reply with no answers is malformed, not a successful evaluation.
@@ -736,8 +758,12 @@ mod tests {
     fn response_requires_at_least_one_answer() {
         let empty = serde_json::from_value::<EvaluateResponse>(
             json!({"model": "jev-latest", "answers": {}}),
+        )
+        .expect_err("empty answers must be rejected");
+        assert_eq!(
+            empty.to_string(),
+            "answers must contain at least one answer"
         );
-        assert!(empty.is_err(), "empty answers must be rejected: {empty:?}");
     }
 
     /// A partial `usage` block must not turn a successful evaluation into an error.

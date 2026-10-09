@@ -13,6 +13,7 @@ version.workspace = true
 [dependencies]
 arrow.workspace = true
 arrow-flight = { workspace = true, features = ["flight-sql-experimental"] }
+arrow_tools = { path = "../arrow_tools" }
 base64.workspace = true
 bytes.workspace = true
 futures.workspace = true

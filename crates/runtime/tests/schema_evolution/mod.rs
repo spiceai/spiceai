@@ -62,8 +62,8 @@ async fn test_schema_evolution() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
-            let port = common::get_random_port()?;
-            let running_container = common::start_postgres_docker_container(port).await?;
+            let running_container = common::start_postgres_docker_container().await?;
+            let port = usize::from(running_container.host_port(5432)?);
 
             let pool = common::get_postgres_connection_pool(port, None).await?;
             let db_conn = pool
@@ -303,8 +303,8 @@ async fn test_schema_evolution_file_update_mode() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
-            let port = common::get_random_port()?;
-            let running_container = common::start_postgres_docker_container(port).await?;
+            let running_container = common::start_postgres_docker_container().await?;
+            let port = usize::from(running_container.host_port(5432)?);
 
             let pool = common::get_postgres_connection_pool(port, None).await?;
             let db_conn = pool
@@ -870,8 +870,8 @@ async fn test_schema_evolution_widening_duckdb_sync_all_columns() -> Result<(), 
                 accel_file.to_string_lossy().to_string(),
             )]);
 
-            let port = common::get_random_port()?;
-            let running_container = common::start_postgres_docker_container(port).await?;
+            let running_container = common::start_postgres_docker_container().await?;
+            let port = usize::from(running_container.host_port(5432)?);
             let pool = common::get_postgres_connection_pool(port, None).await?;
             let db_conn = pool
                 .connect_direct()
@@ -979,8 +979,8 @@ async fn test_schema_evolution_widening_cayenne_sync_all_columns() -> Result<(),
                 ),
             ]);
 
-            let port = common::get_random_port()?;
-            let running_container = common::start_postgres_docker_container(port).await?;
+            let running_container = common::start_postgres_docker_container().await?;
+            let port = usize::from(running_container.host_port(5432)?);
             let pool = common::get_postgres_connection_pool(port, None).await?;
             let db_conn = pool
                 .connect_direct()
@@ -1052,8 +1052,8 @@ async fn test_schema_evolution_append_new_columns_only() -> Result<(), anyhow::E
                 accel_file.to_string_lossy().to_string(),
             )]);
 
-            let port = common::get_random_port()?;
-            let running_container = common::start_postgres_docker_container(port).await?;
+            let running_container = common::start_postgres_docker_container().await?;
+            let port = usize::from(running_container.host_port(5432)?);
             let pool = common::get_postgres_connection_pool(port, None).await?;
             let db_conn = pool
                 .connect_direct()

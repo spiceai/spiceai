@@ -39,5 +39,11 @@ datafusion-table-providers = { workspace = true, features = ["postgres"] }
 snafu.workspace = true
 util = { path = "../../util" }
 
+[dev-dependencies]
+runtime-acceleration = { path = "../../runtime-acceleration", features = ["test-support"] }
+runtime-secrets = { path = "../../runtime-secrets" }
+secrecy.workspace = true
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
 [lints]
 workspace = true

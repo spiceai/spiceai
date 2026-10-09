@@ -43,8 +43,8 @@ use datafusion::sql::sqlparser::ast::{
 };
 use datafusion::sql::unparser::Unparser;
 use datafusion::sql::unparser::dialect::{
-    BigQueryDialect, CharacterLengthStyle, DateFieldExtractStyle, Dialect, IntervalStyle,
-    ScalarFnToSqlHandler,
+    BigQueryDialect, CharacterLengthStyle, DateFieldExtractStyle, Dialect, DistinctFromStyle,
+    IntervalStyle, ScalarFnToSqlHandler,
 };
 
 pub(crate) const JSON_GET_INT_NAME: &str = "json_get_int";
@@ -1646,6 +1646,10 @@ impl Dialect for SpiceBigQueryDialect {
         self.inner.date_field_extract_style()
     }
 
+    fn distinct_from_style(&self) -> DistinctFromStyle {
+        self.inner.distinct_from_style()
+    }
+
     fn character_length_style(&self) -> CharacterLengthStyle {
         self.inner.character_length_style()
     }
@@ -1728,6 +1732,10 @@ impl Dialect for SpiceBigQueryDialect {
 
     fn supports_column_alias_in_table_alias(&self) -> bool {
         self.inner.supports_column_alias_in_table_alias()
+    }
+
+    fn derived_table_evaluates_volatile_outputs_once(&self) -> bool {
+        self.inner.derived_table_evaluates_volatile_outputs_once()
     }
 
     fn requires_derived_table_alias(&self) -> bool {

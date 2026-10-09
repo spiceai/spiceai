@@ -21,7 +21,7 @@ limitations under the License.
 //! - Empty file downloads that could cause runtime errors
 //! - SQL injection via unquoted table identifiers
 
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use std::path::Path;
 
 /// The maximum safe nesting depth for JSON values.
@@ -154,7 +154,7 @@ pub fn validate_non_empty_bytes(bytes: &[u8], context: &str) -> Result<(), Strin
 /// # Examples
 ///
 /// ```
-/// use datafusion::sql::TableReference;
+/// use datafusion::common::TableReference;
 /// use util::security::quote_table_reference;
 ///
 /// // Simple table name

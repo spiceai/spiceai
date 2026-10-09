@@ -396,11 +396,10 @@ pub async fn vended_object_store(
 mod delta {
     use std::collections::HashMap;
 
+    use datafusion::common::TableReference;
     use datafusion::config::TableParquetOptions;
     use datafusion::datasource::TableProvider;
-    use datafusion::sql::TableReference;
     use secrecy::{ExposeSecret, SecretString};
-    use snafu::prelude::*;
     use tokio::runtime::Handle;
 
     use super::*;
@@ -604,10 +603,20 @@ mod tests {
 
         #[tokio::test]
         async fn test_s3_scheme_builds_with_explicit_region() {
-            let url = Url::parse("s3://my-bucket/path/to/table").expect("valid url");
-            let store =
-                vended_object_store(&url, dummy_credentials(), Some("us-west-2".to_string())).await;
-            assert!(store.is_ok(), "expected S3 store, got: {:?}", store.err());
+            for scheme in ["s3", "s3a"] {
+                let url =
+                    Url::parse(&format!("{scheme}://my-bucket/path/to/table")).expect("valid url");
+                let store =
+                    vended_object_store(&url, dummy_credentials(), Some("us-west-2".to_string()))
+                        .await
+                        .unwrap_or_else(|err| panic!("expected an S3 store for {url}, got: {err}"));
+                // The bucket comes from the URL host, not the path.
+                assert_eq!(
+                    store.to_string(),
+                    "AmazonS3(my-bucket)",
+                    "wrong store for {url}"
+                );
+            }
         }
 
         #[tokio::test]
@@ -619,23 +628,39 @@ mod tests {
             assert!(matches!(err, Error::MissingBucket { .. }), "got: {err}");
         }
 
+        /// Builds the store for `url` and asserts it is the Azure store for
+        /// account `account`, container `container`.
+        async fn assert_vends_azure_store(url: &str) {
+            let url = Url::parse(url).expect("valid url");
+            let store = vended_object_store(&url, dummy_credentials(), None)
+                .await
+                .unwrap_or_else(|err| panic!("expected an Azure store for {url}, got: {err}"));
+            assert_eq!(
+                store.to_string(),
+                "MicrosoftAzure { account: account, container: container }",
+                "wrong store for {url}"
+            );
+        }
+
         #[tokio::test]
         async fn test_azure_scheme_builds() {
-            let url = Url::parse("abfss://container@account.dfs.core.windows.net/path")
-                .expect("valid url");
-            let store = vended_object_store(&url, dummy_credentials(), None).await;
-            assert!(
-                store.is_ok(),
-                "expected Azure store, got: {:?}",
-                store.err()
-            );
+            for url in [
+                "abfss://container@account.dfs.core.windows.net/path",
+                "abfs://container@account.dfs.core.windows.net/path",
+                "az://container@account.dfs.core.windows.net/path",
+                "abfss://container@account.blob.core.windows.net/path",
+            ] {
+                assert_vends_azure_store(url).await;
+            }
         }
 
         #[tokio::test]
         async fn test_gcs_scheme_builds() {
             let url = Url::parse("gs://bucket/path").expect("valid url");
-            let store = vended_object_store(&url, dummy_credentials(), None).await;
-            assert!(store.is_ok(), "expected GCS store, got: {:?}", store.err());
+            let store = vended_object_store(&url, dummy_credentials(), None)
+                .await
+                .unwrap_or_else(|err| panic!("expected a GCS store for {url}, got: {err}"));
+            assert_eq!(store.to_string(), "GoogleCloudStorage(bucket)");
         }
 
         #[tokio::test]
@@ -678,15 +703,29 @@ mod tests {
         use crate::unity_catalog::Endpoint;
 
         fn vending_response(expiration_time: i64) -> serde_json::Value {
+            aws_vending_response("AKIA123", expiration_time)
+        }
+
+        fn aws_vending_response(access_key_id: &str, expiration_time: i64) -> serde_json::Value {
             serde_json::json!({
                 "aws_temp_credentials": {
-                    "access_key_id": "AKIA123",
+                    "access_key_id": access_key_id,
                     "secret_access_key": "SECRET",
                     "session_token": "TOKEN"
                 },
                 "expiration_time": expiration_time,
                 "url": "s3://bucket/path"
             })
+        }
+
+        /// The AWS key id and expiration a vend returned: the two values that
+        /// tell one vending response from another.
+        fn vended_key_and_expiry(creds: &TemporaryTableCredentials) -> (&str, i64) {
+            let aws = creds
+                .aws_temp_credentials
+                .as_ref()
+                .expect("vended credentials should carry AWS credentials");
+            (aws.access_key_id.as_str(), creds.expiration_time)
         }
 
         fn make_credentials(server: &MockServer) -> VendedTableCredentials {
@@ -736,20 +775,50 @@ mod tests {
         #[tokio::test]
         async fn test_expired_credentials_revend() {
             let server = MockServer::start().await;
-            // First response is already expired, forcing the second get() to re-vend.
+            let expired_at = now_millis() - MINUTE_MS;
+            let fresh_until = now_millis() + 60 * MINUTE_MS;
+            // The first vend answers with credentials that have already expired,
+            // forcing the second get() to re-vend; only that re-vend can reach the
+            // fresh response mounted after it.
             Mock::given(method("POST"))
                 .and(path("/api/2.1/unity-catalog/temporary-table-credentials"))
                 .respond_with(
                     ResponseTemplate::new(200)
-                        .set_body_json(vending_response(now_millis() - MINUTE_MS)),
+                        .set_body_json(aws_vending_response("AKIA-EXPIRED", expired_at)),
                 )
-                .expect(2)
+                .up_to_n_times(1)
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path("/api/2.1/unity-catalog/temporary-table-credentials"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(aws_vending_response("AKIA-FRESH", fresh_until)),
+                )
+                .expect(1)
                 .mount(&server)
                 .await;
 
             let credentials = make_credentials(&server);
-            credentials.get().await.expect("first vend should succeed");
-            credentials.get().await.expect("second vend should succeed");
+            let first = credentials.get().await.expect("first vend should succeed");
+            assert_eq!(vended_key_and_expiry(&first), ("AKIA-EXPIRED", expired_at));
+
+            let second = credentials.get().await.expect("second vend should succeed");
+            assert_eq!(
+                vended_key_and_expiry(&second),
+                ("AKIA-FRESH", fresh_until),
+                "expired credentials must be replaced by the re-vended ones"
+            );
+
+            // The fresh credentials are now cached, so a third get() is served
+            // without vending again (the fresh mock's `expect(1)` is verified when
+            // the server drops).
+            let third = credentials
+                .get()
+                .await
+                .expect("cached credentials should be served");
+            assert_eq!(vended_key_and_expiry(&third), ("AKIA-FRESH", fresh_until));
         }
 
         #[tokio::test]

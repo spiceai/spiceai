@@ -4,6 +4,8 @@
 
 Chat completions (`POST /v1/chat/completions`) are **not supported**. Use `POST /v1/evaluate`.
 
+Chat models can answer `POST /v1/evaluate` too, with uncalibrated probabilities. See [Evaluate API](evaluate.md).
+
 ## Spicepod
 
 ```yaml

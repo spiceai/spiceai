@@ -58,14 +58,19 @@ pub enum Error {
     #[snafu(display(
         "Cannot connect to AWS Glue to retrieve databases. Verify your AWS credentials and region are configured correctly. For help with AWS Glue configuration, visit: https://docs.spiceai.org/components/catalogs/glue  {source}"
     ))]
-    GetDatabases { source: SdkError<GetDatabasesError> },
+    GetDatabases {
+        // `SdkError` alone is over clippy's `result_large_err` limit.
+        #[snafu(source(from(SdkError<GetDatabasesError>, Box::new)))]
+        source: Box<SdkError<GetDatabasesError>>,
+    },
 
     #[snafu(display(
         "Cannot retrieve tables from Glue database '{database}'. Verify the database exists and you have permissions to access it. {source}"
     ))]
     GetTables {
         database: String,
-        source: SdkError<GetTablesError>,
+        #[snafu(source(from(SdkError<GetTablesError>, Box::new)))]
+        source: Box<SdkError<GetTablesError>>,
     },
 
     #[snafu(display(

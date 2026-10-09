@@ -24,12 +24,25 @@ runs:
         working-directory: ${{ inputs.working-directory }}
         print-log: 'false'
 
+    # No `working-directory:`: the runner refuses to start a step whose directory
+    # does not exist, and its bare "No such file or directory" hides that an
+    # earlier step failed before the runtime was set up. Still fails closed on a
+    # missing log, but says why.
     - name: Check logs
       shell: bash
-      working-directory: ${{ inputs.working-directory }}
       env:
         ALLOW: ${{ inputs.allow }}
+        SPICE_LOG_DIR: ${{ inputs.working-directory }}
       run: |
+        if [ ! -d "$SPICE_LOG_DIR" ]; then
+          echo "::error::No spice.log to check: $SPICE_LOG_DIR does not exist, so the runtime was never started from it. An earlier failed step is the likely cause; if none failed, check the working-directory input."
+          exit 1
+        fi
+        cd "$SPICE_LOG_DIR" || exit 1
+        if [ ! -f spice.log ]; then
+          echo "::error::No spice.log in $SPICE_LOG_DIR, so the runtime was never started from it. An earlier failed step is the likely cause; if none failed, check the working-directory input."
+          exit 1
+        fi
         cat spice.log
 
         # `spiced` logs with_ansi(true), so an allow pattern such as

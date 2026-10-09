@@ -23,11 +23,11 @@ use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef, TimeUnit};
 use async_stream::stream;
 use clickhouse_rs::{Block, ClientHandle, Pool};
+use datafusion::common::TableReference;
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
 use datafusion::physical_plan::EmptyRecordBatchStream;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::sql::TableReference;
 use datafusion_table_providers::sql::db_connection_pool::dbconnection::{
     self, AsyncDbConnection, DbConnection,
 };
@@ -389,16 +389,26 @@ mod tests {
 
     #[test]
     fn test_map_clickhouse_type_to_arrow_invalid() {
-        let invalid_cases = vec![
-            "UnknownType",
-            "Decimal(18, 4, 2)",
-            "Nullable(UnknownType)",
-            "Decimal(80)",
-        ];
-
-        for input in invalid_cases {
-            let result = map_clickhouse_type_to_arrow(input);
-            assert!(result.is_err(), "Expected error for input: {input}");
+        // Each input reaches its own refusal, and the message names what was refused; a
+        // `Nullable` wrapper is unwrapped first, so its inner type is the one named.
+        for (input, refusal) in [
+            ("UnknownType", "Unsupported Clickhouse type: UnknownType"),
+            (
+                "Decimal(18, 4, 2)",
+                "Invalid Decimal type: Decimal(18, 4, 2)",
+            ),
+            (
+                "Nullable(UnknownType)",
+                "Unsupported Clickhouse type: UnknownType",
+            ),
+            ("Decimal(80)", "Unsupported Decimal precision: 80"),
+        ] {
+            let err = map_clickhouse_type_to_arrow(input)
+                .expect_err("an invalid ClickHouse type must be refused");
+            assert!(
+                matches!(&err, clickhouse_rs::errors::Error::Other(message) if message == refusal),
+                "{input}: {err:?}"
+            );
         }
     }
 }

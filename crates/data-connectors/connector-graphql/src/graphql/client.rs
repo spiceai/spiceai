@@ -14,14 +14,19 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use runtime_rate_control::RateController;
+use runtime_rate_control::{RateController, RequestOutcome};
 use token_provider::TokenProvider;
 use tokio::sync::Semaphore;
 use {crate::graphql::InvalidPaginationRegexSnafu, data_components::rate_limit::RateLimiter};
 
 use super::{
-    ArrowInternalSnafu, Error, ErrorChecker, PAGE_RETRY_MAX_ATTEMPTS, ReqwestInternalSnafu, Result,
-    is_gateway_error, is_retriable_error,
+    ArrowInternalSnafu, Error, ErrorChecker, PAGE_RETRY_MAX_ATTEMPTS, RefusalKind,
+    ReqwestInternalSnafu, Result, error_retry_after, is_gateway_error, is_retriable_error,
+    response::{
+        ResponseBodyFormat, classify_response_body, retry_after_from_headers,
+        unexpected_response_error,
+    },
+    should_shrink_page_size,
 };
 use arrow::{
     array::RecordBatch,
@@ -37,7 +42,7 @@ use reqwest::{RequestBuilder, StatusCode};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use snafu::ResultExt;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::{cmp::min, fmt::Display, io::Cursor, sync::Arc, time::Instant};
 use util::fibonacci_backoff::FibonacciBackoffBuilder;
 use util::{RetryError, retry};
@@ -92,6 +97,12 @@ fn reverse_fibonacci_shrink(current: usize) -> usize {
 }
 
 pub(crate) type UnnestHandler = Box<dyn Fn(&Value) -> Result<Vec<Value>> + Send + Sync>;
+
+/// Nodes already emitted for this nested connection before a follow-up page.
+/// Stamped on each follow-up connection so fan-out can tell a short last page
+/// (prior pages already counted) from a truncated first page that claimed
+/// `hasNextPage: false`. GitHub never sends this key.
+pub const NESTED_DELIVERED_BEFORE_KEY: &str = "__spice_delivered_before";
 
 pub enum UnnestBehavior {
     Depth(usize),
@@ -173,6 +184,13 @@ fn nested_end_cursor(connection: &Value) -> Option<&str> {
     nested_page_info(connection, "endCursor")
         .and_then(Value::as_str)
         .filter(|cursor| !cursor.is_empty())
+}
+
+fn nested_node_count(connection: &Value) -> usize {
+    connection
+        .get("nodes")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len)
 }
 
 impl std::fmt::Debug for UnnestBehavior {
@@ -261,6 +279,7 @@ impl std::fmt::Display for PaginationArgument {
 
 impl PaginationArgument {
     /// Formats the pagination arguments to be inserted into a Graphql variable.
+    /// The cursor is opaque server data, so it is escaped into the string literal.
     ///
     /// Example:
     /// ```rust
@@ -275,7 +294,7 @@ impl PaginationArgument {
     /// );
     /// ```
     fn format_arguments(&self, cursor: Option<String>) -> String {
-        match (self, cursor) {
+        match (self, cursor.map(|c| escape_graphql_string(&c))) {
             (PaginationArgument::First(z), Some(c)) => {
                 format!(r#"first: {z}, after: "{c}""#)
             }
@@ -921,6 +940,7 @@ impl GraphQLQuery {
     }
 }
 
+#[derive(Debug)]
 pub(crate) struct GraphQLQueryResult {
     pub(crate) records: Vec<RecordBatch>,
     limit_reached: bool,
@@ -929,6 +949,14 @@ pub(crate) struct GraphQLQueryResult {
 }
 
 impl GraphQLClient {
+    /// Feed a request outcome to the origin's adaptive rate controller. A no-op
+    /// when the origin has no rate limit configured.
+    fn record_adaptive_outcome(&self, outcome: RequestOutcome) {
+        if let Some(rate_controller) = &self.rate_controller {
+            rate_controller.record_outcome(outcome);
+        }
+    }
+
     #[expect(clippy::too_many_arguments)]
     pub fn new(
         client: reqwest::Client,
@@ -1025,15 +1053,14 @@ impl GraphQLClient {
         error_checker: Option<ErrorChecker>,
         query_cost: Option<u32>,
     ) -> Result<GraphQLQueryResult> {
-        self.execute_inner(
+        Self::execute_with_retry(
+            self,
             query,
             schema,
             limit,
             cursor,
             error_checker,
             query_cost,
-            false,
-            None,
         )
         .await
     }
@@ -1054,7 +1081,7 @@ impl GraphQLClient {
         error_checker: Option<ErrorChecker>,
     ) -> Result<()> {
         let response = self
-            .fetch_checked(query, None, None, error_checker, None, false, None)
+            .fetch_checked_with_retry(query, error_checker, None, None, false)
             .await?;
 
         check_health_payload(self.resolve_json_pointer(query)?, &response)
@@ -1136,6 +1163,7 @@ impl GraphQLClient {
                 .await
                 .map_err(|e| Error::RateLimited {
                     message: format!("{e}"),
+                    retry_after: None,
                 })?;
         }
         let github_rate_limit_wait = github_rate_limit_started.elapsed();
@@ -1148,6 +1176,7 @@ impl GraphQLClient {
                     .await
                     .map_err(|e| Error::RateLimited {
                         message: format!("{e}"),
+                        retry_after: None,
                     })?,
             )
         } else {
@@ -1174,21 +1203,20 @@ impl GraphQLClient {
 
         let body = format!(r#"{{"query": {}}}"#, json!(query_string));
 
-        // When close_connection is true (after a gateway error like 502), build a
-        // fresh reqwest::Client so the retry goes out on a new TCP connection instead
-        // of reusing the (possibly broken) pooled connection. Preserve user-agent and
-        // timeouts to match the original client — GitHub requires a User-Agent header.
-        let http_client = if close_connection {
-            reqwest::Client::builder()
-                .user_agent(util::spiceai_user_agent())
-                .pool_max_idle_per_host(0)
-                .build()
-                .context(ReqwestInternalSnafu)?
-        } else {
-            self.client.clone()
-        };
-
-        let mut request = http_client.post(self.endpoint.clone()).body(body);
+        // Keep `self.client` on every attempt. Replacing it with a default
+        // `Client` drops `Content-Type`, timeouts, compression, and proxy/TLS
+        // (GitHub's client sets those at connector-github/src/lib.rs). The
+        // GraphQL body is always JSON, so set that header here rather than
+        // relying on `default_headers`. After a broken stream, `Connection:
+        // close` asks the pool not to reuse this connection.
+        let mut request = self
+            .client
+            .post(self.endpoint.clone())
+            .header(reqwest::header::CONTENT_TYPE, "application/json")
+            .body(body);
+        if close_connection {
+            request = request.header(reqwest::header::CONNECTION, "close");
+        }
         request = request_with_auth(request, self.auth.as_ref());
 
         // Replace separated semaphore with RateController semaphore: https://github.com/spiceai/spiceai/issues/8636
@@ -1208,7 +1236,14 @@ impl GraphQLClient {
         let semaphore_wait = semaphore_started.elapsed();
 
         let http_started = Instant::now();
-        let response = request.send().await.context(ReqwestInternalSnafu)?;
+        // A transport/timeout/connection error is a failure signal for adaptive
+        // rate control: the origin is unreachable or too slow, so admit fewer
+        // requests until it recovers.
+        let response = request
+            .send()
+            .await
+            .inspect_err(|_| self.record_adaptive_outcome(RequestOutcome::Failure))
+            .context(ReqwestInternalSnafu)?;
 
         if let Some(permit) = permit {
             drop(permit);
@@ -1226,10 +1261,32 @@ impl GraphQLClient {
         }
 
         let status = response.status();
+        let content_type = response_headers
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(ToString::to_string);
+        let content_length = response.content_length();
+        let content_encoding = response_headers
+            .get(reqwest::header::CONTENT_ENCODING)
+            .and_then(|value| value.to_str().ok())
+            .map(ToString::to_string);
+        let retry_after = retry_after_from_headers(&response_headers);
 
-        // Get the response body as text first, so we can log it if JSON parsing fails
-        let response_text = response.text().await.context(ReqwestInternalSnafu)?;
+        // Feed the response outcome to adaptive rate control, matching the HTTP
+        // provider's classification: a retryable status (408/429/5xx) is a failure
+        // signal; a 2xx is a success; any other status (a non-retryable 4xx such as
+        // 401/403/404) is discarded — the origin answered promptly, but the failure
+        // is a client/auth/config condition that throttling cannot remediate.
+        if data_components::resilient_http::status_is_retryable(status) {
+            self.record_adaptive_outcome(RequestOutcome::Failure);
+        } else if status.is_success() {
+            self.record_adaptive_outcome(RequestOutcome::Success);
+        }
+
+        // Read the raw body first so we can classify it before JSON decoding.
+        let response_bytes = response.bytes().await.context(ReqwestInternalSnafu)?;
         let http_elapsed = http_started.elapsed();
+        let response_text = String::from_utf8_lossy(&response_bytes).into_owned();
 
         let header = |name: &str| response_headers.get(name).and_then(|v| v.to_str().ok());
         tracing::debug!(
@@ -1241,8 +1298,9 @@ impl GraphQLClient {
             weighted_limiter_wait_ms = weighted_limiter_wait.as_millis(),
             semaphore_wait_ms = semaphore_wait.as_millis(),
             http_ms = http_elapsed.as_millis(),
-            response_bytes = response_text.len(),
+            response_bytes = response_bytes.len(),
             http_status = status.as_u16(),
+            content_type = content_type.as_deref(),
             ratelimit_limit = header("x-ratelimit-limit"),
             ratelimit_remaining = header("x-ratelimit-remaining"),
             ratelimit_used = header("x-ratelimit-used"),
@@ -1251,31 +1309,40 @@ impl GraphQLClient {
             "GraphQL page fetch"
         );
 
-        // Try to parse as JSON
-        let response: serde_json::Value = serde_json::from_str(&response_text)
-            .map_err(|e| {
-                let preview = response_text.chars().take(1000).collect::<String>();
-                tracing::error!(
-                    "Failed to decode response body as JSON.\nHTTP Status: {}\nJSON Parse Error: {}\nResponse body preview (first 1000 chars):\n{}",
-                    status,
-                    e,
-                    preview
-                );
+        let format = classify_response_body(
+            content_type.as_deref(),
+            &response_bytes,
+            content_length,
+            content_encoding.as_deref(),
+        );
 
-                // For server errors returning HTML (e.g., upstream gateway/proxy errors),
-                // provide a clear message instead of exposing the JSON parse error.
-                let detail = if status.is_server_error() {
+        if format != ResponseBodyFormat::Json {
+            return Err(unexpected_response_error(
+                status,
+                format,
+                &response_text,
+                retry_after,
+            ));
+        }
+
+        let response: serde_json::Value =
+            serde_json::from_str(&response_text).map_err(|source| {
+                let preview = json_error_preview(&response_text, &source);
+                let detail = if status.is_success() {
+                    format!(
+                        "The response body could not be parsed as JSON. Technical details: {source}"
+                    )
+                } else if status.is_server_error() {
                     "The server returned a non-JSON response (likely an upstream proxy error). This is a temporary issue and will be retried automatically. If the problem persists, contact support or check the API status page.".to_string()
                 } else {
-                    format!(
-                        "The response could not be parsed as JSON. Technical details: {e}"
-                    )
+                    format!("The response could not be parsed as JSON. Technical details: {source}")
                 };
 
                 Error::JsonDecodeError {
                     status,
                     detail,
                     response_preview: preview,
+                    retry_after,
                 }
             })?;
 
@@ -1287,7 +1354,7 @@ impl GraphQLClient {
         );
 
         // Check for errors before processing data
-        handle_http_error(status, &response)?;
+        handle_http_error(status, &response, retry_after)?;
         handle_graphql_query_error(&response, &query_string)?;
 
         // Custom error checker (e.g., for GitHub rate limits)
@@ -1296,6 +1363,71 @@ impl GraphQLClient {
             .transpose()?;
 
         Ok(response)
+    }
+
+    /// Same retry policy as [`Self::execute_with_retry`], but stops after the
+    /// HTTP + GraphQL checks — it does not run [`Self::process_response`].
+    /// Nested overflow pages need that split: they assemble a synthetic parent
+    /// from the connection JSON themselves, and routing them through
+    /// `execute_with_retry` would recurse into nested pagination.
+    ///
+    /// With `shrink_page_size`, an upstream backend error shrinks `first:` for
+    /// the next attempt while `cursor` keeps the page's `after:`; the health
+    /// check sends its query unchanged.
+    async fn fetch_checked_with_retry(
+        &self,
+        query: &GraphQLQuery,
+        error_checker: Option<ErrorChecker>,
+        query_cost: Option<u32>,
+        cursor: Option<String>,
+        shrink_page_size: bool,
+    ) -> Result<serde_json::Value> {
+        let backoff = FibonacciBackoffBuilder::new()
+            .max_retries(Some(PAGE_RETRY_MAX_ATTEMPTS as usize))
+            .build();
+
+        let close_connection = Arc::new(AtomicBool::new(false));
+        let attempts = Arc::new(AtomicU32::new(0));
+        let page_size_override: Arc<std::sync::Mutex<Option<usize>>> =
+            Arc::new(std::sync::Mutex::new(None));
+
+        retry(backoff, || {
+            let error_checker = error_checker.clone();
+            let cursor = cursor.clone();
+            let should_close = close_connection.swap(false, Ordering::Relaxed);
+            let close_conn = Arc::clone(&close_connection);
+            let page_size_override_current = {
+                let guard = page_size_override
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                *guard
+            };
+            let page_size_override_ref = Arc::clone(&page_size_override);
+            let attempt = attempts.fetch_add(1, Ordering::Relaxed);
+
+            async move {
+                self.fetch_checked(
+                    query,
+                    None,
+                    cursor.as_deref(),
+                    error_checker,
+                    query_cost,
+                    should_close,
+                    page_size_override_current,
+                )
+                .await
+                .map_err(|e| {
+                    map_retriable_error(
+                        e,
+                        &close_conn,
+                        shrink_page_size.then_some(&page_size_override_ref),
+                        query,
+                        attempt,
+                    )
+                })
+            }
+        })
+        .await
     }
 
     /// The result for a page that yielded no rows, keeping whichever schema the table is
@@ -1400,21 +1532,20 @@ impl GraphQLClient {
 
         let mut extras = Vec::new();
         let mut cursor = cursor.to_string();
+        let mut delivered = nested_connection(parent, pager).map_or(0, nested_node_count);
         for _ in 0..MAX_PAGINATION_ITERATIONS {
-            let mut query: GraphQLQuery =
+            let query: GraphQLQuery =
                 Arc::<str>::from(pager.next_page_query(parent_id, &cursor)).try_into()?;
-            // The follow-up query already names `after:`; do not let outer-page
-            // pagination rewrite it.
-            query.pagination_parameters = None;
+            // Keep `pagination_parameters` so a gateway retry can shrink
+            // `first:` while `fetch_checked_with_retry` passes this page's
+            // `after:` cursor (clearing parameters made shrink a no-op).
             let mut response = self
-                .fetch_checked(
+                .fetch_checked_with_retry(
                     &query,
-                    None,
-                    None,
                     error_checker.clone(),
                     query_cost,
-                    false,
-                    None,
+                    Some(cursor.clone()),
+                    true,
                 )
                 .await?;
 
@@ -1423,7 +1554,7 @@ impl GraphQLClient {
                 .and_then(|data| data.get_mut("node"))
                 .and_then(|node| node.get_mut(pager.connection_key))
                 .map(Value::take);
-            let Some(next_connection) = next_connection else {
+            let Some(mut next_connection) = next_connection else {
                 return Err(Error::InvalidObjectAccess {
                     message: format!(
                         "Follow-up page for '{}' returned no connection.",
@@ -1432,8 +1563,13 @@ impl GraphQLClient {
                 });
             };
 
+            if let Some(connection) = next_connection.as_object_mut() {
+                connection.insert(NESTED_DELIVERED_BEFORE_KEY.to_string(), json!(delivered));
+            }
+
             let has_next = nested_has_next(&next_connection);
             let next_cursor = nested_end_cursor(&next_connection).map(str::to_string);
+            delivered = delivered.saturating_add(nested_node_count(&next_connection));
 
             let mut synthetic = parent_fields.clone();
             synthetic.insert(pager.connection_key.to_string(), next_connection);
@@ -1442,12 +1578,24 @@ impl GraphQLClient {
             if !has_next {
                 return Ok(extras);
             }
-            cursor = next_cursor.ok_or_else(|| Error::InvalidObjectAccess {
+            let next_cursor = next_cursor.ok_or_else(|| Error::InvalidObjectAccess {
                 message: format!(
                     "Follow-up page for '{}' was truncated without an endCursor.",
                     pager.connection_key
                 ),
             })?;
+            // Outer pagination stops on a repeated cursor. Nested pages must
+            // fail immediately: looping until MAX_PAGINATION_ITERATIONS would
+            // spend ~1,000 API requests on one malformed page.
+            if next_cursor == cursor {
+                return Err(Error::InvalidObjectAccess {
+                    message: format!(
+                        "Follow-up page for '{}' returned the same endCursor, so pagination cannot continue.",
+                        pager.connection_key
+                    ),
+                });
+            }
+            cursor = next_cursor;
         }
 
         Err(Error::InvalidObjectAccess {
@@ -1761,14 +1909,17 @@ impl GraphQLClient {
     /// Note: Rate limit handling (waiting until reset time) is done proactively by the
     /// `RateLimiter` trait via `check_rate_limit()` before each request.
     ///
-    /// On gateway errors (HTTP 502/504) the next retry is sent with a smaller
+    /// On an upstream backend error the next retry is sent with a smaller
     /// per-page size, shrinking along a reverse-Fibonacci sequence. A 502 from
     /// an upstream proxy commonly means the GitHub GraphQL backend timed out
     /// while resolving an oversized query; requesting a smaller page gives the
     /// backend a chance to complete within its per-request deadline instead of
-    /// replaying the exact same failing query.
+    /// replaying the exact same failing query. GitHub reports the same timeout
+    /// as HTTP 200 with an "internal error" message, which reaches this path as
+    /// an inferred `InvalidCredentialsOrPermissions`; see
+    /// `should_shrink_page_size`.
     async fn execute_with_retry(
-        client: &Arc<Self>,
+        client: &Self,
         query: &GraphQLQuery,
         schema: Option<SchemaRef>,
         limit: Option<usize>,
@@ -1781,6 +1932,7 @@ impl GraphQLClient {
             .build();
 
         let close_connection = Arc::new(AtomicBool::new(false));
+        let attempts = Arc::new(AtomicU32::new(0));
 
         // Seed the shrink sequence with the query's declared page size (if any).
         // `None` means "no override" for the first attempt; the query's own
@@ -1803,6 +1955,7 @@ impl GraphQLClient {
                 *guard
             };
             let page_size_override_ref = Arc::clone(&page_size_override);
+            let attempt = attempts.fetch_add(1, Ordering::Relaxed);
 
             async move {
                 client
@@ -1818,46 +1971,90 @@ impl GraphQLClient {
                     )
                     .await
                     .map_err(|e| {
-                        if is_retriable_error(&e) {
-                            if matches!(
-                                &e,
-                                Error::JsonDecodeError { status, .. } if status.is_success()
-                            ) {
-                                // Truncated HTTP 200: the pooled connection is
-                                // likely half-closed. Retry on a new TCP stream.
-                                close_conn.store(true, Ordering::Relaxed);
-                            }
-                            if is_gateway_error(&e) {
-                                close_conn.store(true, Ordering::Relaxed);
-                                // Shrink the per-page size for the next retry.
-                                // Seed from the query's declared page size on
-                                // the first gateway error, then reverse-Fib.
-                                let mut guard = page_size_override_ref
-                                    .lock()
-                                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                                let current = guard.unwrap_or_else(|| {
-                                    query
-                                        .pagination_parameters
-                                        .as_ref()
-                                        .map_or(GATEWAY_SHRINK_DEFAULT_PAGE_SIZE, |p| {
-                                            p.pagination_argument.size()
-                                        })
-                                });
-                                let next = reverse_fibonacci_shrink(current);
-                                tracing::warn!(
-                                    "Gateway error; shrinking GraphQL page size for retry: {current} -> {next}"
-                                );
-                                *guard = Some(next);
-                            }
-                            tracing::warn!("Page fetch failed, will retry: {e}");
-                            RetryError::transient(e)
-                        } else {
-                            RetryError::permanent(e)
-                        }
+                        map_retriable_error(
+                            e,
+                            &close_conn,
+                            Some(&page_size_override_ref),
+                            query,
+                            attempt,
+                        )
                     })
             }
         })
         .await
+    }
+}
+
+/// Classify a page-fetch error for the retry loop: WARN + transient (honoring
+/// `Retry-After` when present), or permanent. Empty/truncated HTTP 200 and
+/// gateway statuses also close the pooled connection for the next attempt.
+fn map_retriable_error(
+    e: Error,
+    close_conn: &Arc<AtomicBool>,
+    page_size_override: Option<&Arc<std::sync::Mutex<Option<usize>>>>,
+    query: &GraphQLQuery,
+    attempt: u32,
+) -> RetryError<Error> {
+    if !is_retriable_error(&e) {
+        return RetryError::permanent(e);
+    }
+
+    // `Retry-After` (including `0`) must not bypass the page-retry budget: the
+    // backoff crate does not count a `Some(retry_after)` delay against
+    // `max_retries`, so an upstream that always sends `Retry-After` would loop.
+    if attempt >= PAGE_RETRY_MAX_ATTEMPTS {
+        tracing::warn!("Page fetch failed after {PAGE_RETRY_MAX_ATTEMPTS} retries: {e}");
+        return RetryError::permanent(e);
+    }
+
+    if matches!(
+        &e,
+        Error::JsonDecodeError { status, .. } if status.is_success()
+    ) || matches!(
+        &e,
+        Error::UnexpectedResponse {
+            status,
+            format: ResponseBodyFormat::Empty | ResponseBodyFormat::Incomplete,
+            ..
+        } if status.is_success()
+    ) {
+        // Truncated or empty HTTP 200: the pooled connection is likely
+        // half-closed. Retry on a new TCP stream.
+        close_conn.store(true, Ordering::Relaxed);
+    }
+    if is_gateway_error(&e) {
+        close_conn.store(true, Ordering::Relaxed);
+    }
+    if let Some(page_size_override_ref) = page_size_override
+        && should_shrink_page_size(&e)
+    {
+        // Shrink the per-page size for the next retry. Seed from the
+        // query's declared page size on the first gateway error, then
+        // reverse-Fib.
+        let mut guard = page_size_override_ref
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current = guard.unwrap_or_else(|| {
+            query
+                .pagination_parameters
+                .as_ref()
+                .map_or(GATEWAY_SHRINK_DEFAULT_PAGE_SIZE, |p| {
+                    p.pagination_argument.size()
+                })
+        });
+        let next = reverse_fibonacci_shrink(current);
+        tracing::warn!(
+            "Upstream backend error; shrinking GraphQL page size for retry: {current} -> {next}"
+        );
+        *guard = Some(next);
+    }
+    tracing::warn!("Page fetch failed, will retry: {e}");
+    match error_retry_after(&e) {
+        Some(retry_after) => RetryError::Transient {
+            err: e,
+            retry_after: Some(retry_after),
+        },
+        None => RetryError::transient(e),
     }
 }
 
@@ -1942,7 +2139,11 @@ fn request_with_auth(request_builder: RequestBuilder, auth: Option<&Auth>) -> Re
     }
 }
 
-fn handle_http_error(status: StatusCode, response: &Value) -> Result<()> {
+fn handle_http_error(
+    status: StatusCode,
+    response: &Value,
+    retry_after: Option<std::time::Duration>,
+) -> Result<()> {
     if status.is_client_error() | status.is_server_error() {
         let message = [
             &response["message"],
@@ -1963,6 +2164,7 @@ fn handle_http_error(status: StatusCode, response: &Value) -> Result<()> {
                 message: format!(
                     "The API rate limited the request (HTTP {status}). Retry later or reduce request concurrency. Details: {message}"
                 ),
+                retry_after,
             });
         }
 
@@ -1971,11 +2173,13 @@ fn handle_http_error(status: StatusCode, response: &Value) -> Result<()> {
                 message: format!(
                     "The API failed with status code {status}. Verify the provided credentials are correct."
                 ),
+                kind: RefusalKind::Explicit,
             }),
             StatusCode::FORBIDDEN => Err(Error::InvalidCredentialsOrPermissions {
                 message: format!(
                     "The API failed with status code {status}. Verify the provided credentials have the necessary permissions."
                 ),
+                kind: RefusalKind::Explicit,
             }),
             StatusCode::GATEWAY_TIMEOUT | StatusCode::REQUEST_TIMEOUT => {
                 Err(Error::InvalidReqwestStatus {
@@ -1983,6 +2187,7 @@ fn handle_http_error(status: StatusCode, response: &Value) -> Result<()> {
                     message: format!(
                         "The API request timed out (HTTP {status}). This is often a transient issue. The data refresh will be retried automatically. If the problem persists, consider reducing query complexity or page size. Details: {message}"
                     ),
+                    retry_after,
                 })
             }
             StatusCode::BAD_GATEWAY | StatusCode::SERVICE_UNAVAILABLE => {
@@ -1991,6 +2196,7 @@ fn handle_http_error(status: StatusCode, response: &Value) -> Result<()> {
                     message: format!(
                         "The API service is temporarily unavailable (HTTP {status}). This is often a transient issue. The data refresh will be retried automatically. Details: {message}"
                     ),
+                    retry_after,
                 })
             }
             _ if status.is_server_error() => Err(Error::InvalidReqwestStatus {
@@ -1998,8 +2204,13 @@ fn handle_http_error(status: StatusCode, response: &Value) -> Result<()> {
                 message: format!(
                     "The API server returned an error (HTTP {status}). This may be a transient issue. The data refresh will be retried automatically. Details: {message}"
                 ),
+                retry_after,
             }),
-            _ => Err(Error::InvalidReqwestStatus { status, message }),
+            _ => Err(Error::InvalidReqwestStatus {
+                status,
+                message,
+                retry_after,
+            }),
         };
     }
     Ok(())
@@ -2013,21 +2224,24 @@ fn handle_graphql_query_error(response: &Value, query: &str) -> Result<()> {
                 return Ok(());
             }
 
-            // GitHub bug: When the app doesn't have access to Projects v2, GitHub sometimes
-            // returns "Something went wrong while executing your query" instead of a proper
-            // permission error. This appears to be a GitHub API bug where lack of permissions
-            // triggers an internal error rather than returning a proper authorization error.
-            // Check for this before processing other GraphQL errors.
+            // GitHub sends "Something went wrong while executing your query" for
+            // two different causes, and the message alone cannot tell them apart:
+            // a backend timeout on a query that is too expensive, and a GitHub
+            // defect where missing Projects v2 access gives an internal error
+            // instead of an authorization error. The timeout is the common case,
+            // so the error is not an explicit deny: the caller retries it with a
+            // smaller page. Check for this before processing other GraphQL errors.
             for error in errors_array {
                 if let Some(message) = error.get("message").and_then(|m| m.as_str())
                     && message.contains("Something went wrong while executing your query")
                 {
                     tracing::debug!(
-                        "Detected GitHub 'Something went wrong' error, likely a permissions issue: {}",
+                        "Detected GitHub 'Something went wrong' error, treating it as a transient backend failure: {}",
                         message
                     );
                     return Err(Error::InvalidCredentialsOrPermissions {
-                        message: "GitHub returned an internal error. This may indicate the GitHub App does not have permission to access the requested resource. Verify the app has the required permissions.".to_string(),
+                        message: "GitHub returned an internal error. The query is usually too expensive for the GitHub backend to complete in time; the request will be retried with a smaller page. If the error persists, verify the GitHub App has permission to access the requested resource.".to_string(),
+                        kind: RefusalKind::Inferred,
                     });
                 }
             }
@@ -2084,6 +2298,7 @@ fn handle_graphql_query_error(response: &Value, query: &str) -> Result<()> {
                     message: format!(
                         "The API returned a 'FORBIDDEN' error. Verify the credentials have the necessary permissions. {message}"
                     ),
+                    kind: RefusalKind::Explicit,
                 });
             }
             if error_type.to_lowercase() == "not_found" {
@@ -2119,6 +2334,65 @@ fn handle_graphql_query_error(response: &Value, query: &str) -> Result<()> {
     Ok(())
 }
 
+/// Characters kept from the start of a body, and on each side of the parse
+/// failure, in a JSON decode preview.
+const JSON_PREVIEW_HEAD: usize = 512;
+const JSON_PREVIEW_CONTEXT: usize = 512;
+
+/// Largest byte index `<= idx` that starts a character.
+fn floor_char_boundary(text: &str, idx: usize) -> usize {
+    let mut idx = idx.min(text.len());
+    while idx > 0 && !text.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
+/// Byte offset in `text` of the 1-based `line`/`column` a `serde_json` error
+/// reports.
+fn json_error_offset(text: &str, line: usize, column: usize) -> usize {
+    let line_start = if line <= 1 {
+        0
+    } else {
+        text.match_indices('\n')
+            .nth(line - 2)
+            .map_or(text.len(), |(idx, _)| idx + 1)
+    };
+    let rest = &text[line_start..];
+    let column_offset = rest
+        .char_indices()
+        .nth(column.saturating_sub(1))
+        .map_or(rest.len(), |(idx, _)| idx);
+    line_start + column_offset
+}
+
+/// Preview of a body that failed to parse as JSON: the head, plus the bytes
+/// around the parse failure. A paginated GraphQL page can fail hundreds of
+/// kilobytes in, where a head-only preview never shows the offending bytes.
+fn json_error_preview(text: &str, err: &serde_json::Error) -> String {
+    let head_end = floor_char_boundary(text, JSON_PREVIEW_HEAD);
+    let offset = json_error_offset(text, err.line(), err.column());
+    let context_start = floor_char_boundary(text, offset.saturating_sub(JSON_PREVIEW_CONTEXT));
+    let context_end = floor_char_boundary(text, offset.saturating_add(JSON_PREVIEW_CONTEXT));
+
+    if context_start <= head_end {
+        // The failure is at or near the head: one contiguous slice shows both.
+        return format!(
+            "[{} bytes total, parse failure at byte {offset}]\n{}",
+            text.len(),
+            &text[..context_end.max(head_end)]
+        );
+    }
+
+    format!(
+        "[{} bytes total, parse failure at byte {offset}]\n{}\n...[{} bytes omitted]...\n{}",
+        text.len(),
+        &text[..head_end],
+        context_start - head_end,
+        &text[context_start..context_end]
+    )
+}
+
 fn format_query_with_context(query: &str, line: usize, column: usize) -> String {
     if line == 0 || column == 0 {
         return query.to_string();
@@ -2152,6 +2426,60 @@ mod tests {
     use crate::graphql::client::GraphQLQuery;
 
     use super::{DuplicateBehavior, PaginationParameters, UnnestBehavior, handle_http_error};
+
+    mod json_error_preview {
+        use crate::graphql::client::{JSON_PREVIEW_HEAD, json_error_preview};
+
+        fn parse_error(text: &str) -> serde_json::Error {
+            serde_json::from_str::<serde_json::Value>(text)
+                .expect_err("the body is expected to be invalid JSON")
+        }
+
+        /// A truncated page fails far past the head, so the preview has to carry
+        /// the bytes where parsing stopped.
+        #[test]
+        fn shows_the_bytes_at_a_far_parse_failure() {
+            let body = format!(
+                "{{\"data\":{{\"filler\":\"{}\",\"tail\":\"cut here",
+                "x".repeat(4096)
+            );
+            let preview = json_error_preview(&body, &parse_error(&body));
+
+            assert!(preview.contains("cut here"), "preview: {preview}");
+            assert!(preview.contains("{\"data\":"), "preview: {preview}");
+            assert!(preview.contains("bytes omitted"), "preview: {preview}");
+            assert!(preview.len() < body.len(), "preview: {preview}");
+        }
+
+        /// A short body is shown whole, with no omission marker.
+        #[test]
+        fn shows_a_short_body_whole() {
+            let body = "{\"data\": oops}";
+            let preview = json_error_preview(body, &parse_error(body));
+
+            assert!(preview.contains(body), "preview: {preview}");
+            assert!(!preview.contains("bytes omitted"), "preview: {preview}");
+        }
+
+        /// A failure inside the head window keeps one contiguous slice.
+        #[test]
+        fn keeps_one_slice_when_the_failure_is_in_the_head() {
+            let body = format!("{{\"a\":\"{}\", oops}}", "y".repeat(JSON_PREVIEW_HEAD / 2));
+            let preview = json_error_preview(&body, &parse_error(&body));
+
+            assert!(!preview.contains("bytes omitted"), "preview: {preview}");
+            assert!(preview.contains("oops"), "preview: {preview}");
+        }
+
+        /// Multi-byte characters must not panic the slicing.
+        #[test]
+        fn handles_multi_byte_characters() {
+            let body = format!("{{\"a\":\"{}\", oops}}", "\u{00e9}".repeat(2048));
+            let preview = json_error_preview(&body, &parse_error(&body));
+
+            assert!(preview.contains("bytes total"), "preview: {preview}");
+        }
+    }
 
     mod health_check_payload {
         use serde_json::json;
@@ -2353,6 +2681,422 @@ mod tests {
                 cursor_order,
                 vec!["c1", "c2"],
                 "follow-up pages of one parent must be requested in cursor order"
+            );
+        }
+
+        /// Nested overflow pages go through the same retry policy as outer
+        /// pages. A 403 `rate limit` on the first `after:` follow-up must not
+        /// abort the scan; the next attempt completes the connection.
+        #[tokio::test]
+        async fn a_transient_rate_limit_on_a_nested_page_is_retried() {
+            let server = MockServer::start().await;
+
+            Mock::given(method("POST"))
+                .and(body_string_contains(r#"after: \"c2\""#))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": {"node": {"reviews": reviews_page(&["R5"], false, "c3")}}
+                })))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("POST"))
+                .and(body_string_contains(r#"after: \"c1\""#))
+                .respond_with(ResponseTemplate::new(403).set_body_json(json!({
+                    "message": "API rate limit exceeded for user"
+                })))
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+
+            Mock::given(method("POST"))
+                .and(body_string_contains(r#"after: \"c1\""#))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": {"node": {"reviews": reviews_page(&["R3", "R4"], true, "c2")}}
+                })))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("POST"))
+                .and(body_string_contains("view(first: 10)"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": {"view": {
+                        "nodes": [{"id": "PR_1", "reviews": reviews_page(&["R1", "R2"], true, "c1")}],
+                        "pageInfo": {"hasNextPage": false, "endCursor": Value::Null},
+                    }}
+                })))
+                .mount(&server)
+                .await;
+
+            let unnest_reviews: UnnestHandler = Box::new(|parent: &Value| {
+                Ok(parent
+                    .get("reviews")
+                    .and_then(|c| c.get("nodes"))
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default())
+            });
+
+            let client = GraphQLClientBuilder::new(
+                Url::parse(&format!("{}/graphql", server.uri())).expect("valid URL"),
+                UnnestBehavior::Custom(unnest_reviews),
+            )
+            .with_json_pointer(Some("/data/view/nodes"))
+            .with_schema(Some(Arc::new(Schema::new(vec![Field::new(
+                "id",
+                DataType::Utf8,
+                true,
+            )]))))
+            .with_nested_pager(Some(NestedConnectionPager {
+                connection_key: "reviews",
+                parent_id_key: "id",
+                type_condition: "PullRequest",
+                node_selection: "id",
+                page_size: 2,
+            }))
+            .build(reqwest::Client::new())
+            .expect("client to build");
+
+            let query = GraphQLQuery::try_from(Arc::<str>::from(OUTER_QUERY))
+                .expect("query to parse")
+                .with_json_pointer(Arc::from("/data/view/nodes"));
+            let result = client
+                .execute(&query, None, None, None, None, None)
+                .await
+                .expect("a retried nested page must complete the connection");
+
+            let mut ids: Vec<String> = Vec::new();
+            for batch in &result.records {
+                let column = batch
+                    .column_by_name("id")
+                    .expect("the id column")
+                    .as_any()
+                    .downcast_ref::<StringArray>()
+                    .expect("id to be a string column");
+                for i in 0..column.len() {
+                    ids.push(column.value(i).to_string());
+                }
+            }
+
+            assert_eq!(
+                ids,
+                vec!["R1", "R2", "R3", "R4", "R5"],
+                "the scan must emit every child after retrying the rate-limited nested page"
+            );
+
+            let c1_attempts = server
+                .received_requests()
+                .await
+                .expect("recorded requests")
+                .iter()
+                .filter(|r| String::from_utf8_lossy(&r.body).contains(r#"after: \"c1\""#))
+                .count();
+            assert!(
+                c1_attempts >= 2,
+                "the rate-limited nested page must be requested again, got {c1_attempts}"
+            );
+            let outer_requests = server
+                .received_requests()
+                .await
+                .expect("recorded requests")
+                .iter()
+                .filter(|r| String::from_utf8_lossy(&r.body).contains("view(first: 10)"))
+                .count();
+            assert_eq!(
+                outer_requests, 1,
+                "retrying a nested page must not refetch the outer page, got {outer_requests}"
+            );
+        }
+
+        /// A follow-up page that repeats its `endCursor` must fail immediately.
+        /// Outer pagination already stops on a repeated cursor; without this
+        /// guard the nested loop would issue ~1,000 identical `after:` requests.
+        #[tokio::test]
+        async fn a_repeated_nested_cursor_fails_without_spinning() {
+            let server = MockServer::start().await;
+
+            Mock::given(method("POST"))
+                .and(body_string_contains(r#"after: \"c1\""#))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": {"node": {"reviews": reviews_page(&["R3", "R4"], true, "c1")}}
+                })))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("POST"))
+                .and(body_string_contains("view(first: 10)"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": {"view": {
+                        "nodes": [{"id": "PR_1", "reviews": reviews_page(&["R1", "R2"], true, "c1")}],
+                        "pageInfo": {"hasNextPage": false, "endCursor": Value::Null},
+                    }}
+                })))
+                .mount(&server)
+                .await;
+
+            let unnest_reviews: UnnestHandler = Box::new(|parent: &Value| {
+                Ok(parent
+                    .get("reviews")
+                    .and_then(|c| c.get("nodes"))
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default())
+            });
+
+            let client = GraphQLClientBuilder::new(
+                Url::parse(&format!("{}/graphql", server.uri())).expect("valid URL"),
+                UnnestBehavior::Custom(unnest_reviews),
+            )
+            .with_json_pointer(Some("/data/view/nodes"))
+            .with_schema(Some(Arc::new(Schema::new(vec![Field::new(
+                "id",
+                DataType::Utf8,
+                true,
+            )]))))
+            .with_nested_pager(Some(NestedConnectionPager {
+                connection_key: "reviews",
+                parent_id_key: "id",
+                type_condition: "PullRequest",
+                node_selection: "id",
+                page_size: 2,
+            }))
+            .build(reqwest::Client::new())
+            .expect("client to build");
+
+            let query = GraphQLQuery::try_from(Arc::<str>::from(OUTER_QUERY))
+                .expect("query to parse")
+                .with_json_pointer(Arc::from("/data/view/nodes"));
+            let error = client
+                .execute(&query, None, None, None, None, None)
+                .await
+                .expect_err("a repeated nested cursor must fail the scan");
+            assert!(
+                error.to_string().contains("same endCursor"),
+                "the error must name the repeated cursor, got: {error}"
+            );
+
+            let c1_attempts = server
+                .received_requests()
+                .await
+                .expect("recorded requests")
+                .iter()
+                .filter(|r| String::from_utf8_lossy(&r.body).contains(r#"after: \"c1\""#))
+                .count();
+            assert_eq!(
+                c1_attempts, 1,
+                "a repeated cursor must not be requested again, got {c1_attempts}"
+            );
+        }
+
+        #[test]
+        fn nested_follow_up_query_parses_pagination_so_gateway_shrink_keeps_after() {
+            let pager = NestedConnectionPager {
+                connection_key: "reviews",
+                parent_id_key: "id",
+                type_condition: "PullRequest",
+                node_selection: "id",
+                page_size: 100,
+            };
+            let query: GraphQLQuery = Arc::<str>::from(pager.next_page_query("PR_1", "c1"))
+                .try_into()
+                .expect("follow-up query to parse");
+            assert!(
+                query.pagination_parameters.is_some(),
+                "nested follow-up must parse first/after so shrink can rewrite first"
+            );
+
+            let rewritten = query
+                .to_string_with_page_size(None, Some("c1".to_string()), Some(25))
+                .expect("page-size rewrite");
+            assert!(
+                rewritten.contains("first: 25"),
+                "gateway shrink must rewrite first:, got {rewritten}"
+            );
+            assert!(
+                rewritten.contains(r#"after: "c1""#),
+                "gateway shrink must keep the nested after cursor, got {rewritten}"
+            );
+        }
+
+        /// A nested `endCursor` is opaque server data: a quote or backslash in it
+        /// must reach the follow-up query escaped, or the query is invalid GraphQL.
+        #[tokio::test]
+        async fn a_nested_cursor_with_quotes_is_sent_escaped() {
+            let server = MockServer::start().await;
+            let cursor = r#"cur"so\r"#;
+
+            Mock::given(method("POST"))
+                .and(body_string_contains("node(id:"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": {"node": {"reviews": reviews_page(&["R3"], false, "c2")}}
+                })))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("POST"))
+                .and(body_string_contains("view(first: 10)"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": {"view": {
+                        "nodes": [{"id": "PR_1", "reviews": reviews_page(&["R1", "R2"], true, cursor)}],
+                        "pageInfo": {"hasNextPage": false, "endCursor": Value::Null},
+                    }}
+                })))
+                .mount(&server)
+                .await;
+
+            let unnest_reviews: UnnestHandler = Box::new(|parent: &Value| {
+                Ok(parent
+                    .get("reviews")
+                    .and_then(|c| c.get("nodes"))
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default())
+            });
+
+            let client = GraphQLClientBuilder::new(
+                Url::parse(&format!("{}/graphql", server.uri())).expect("valid URL"),
+                UnnestBehavior::Custom(unnest_reviews),
+            )
+            .with_json_pointer(Some("/data/view/nodes"))
+            .with_schema(Some(Arc::new(Schema::new(vec![Field::new(
+                "id",
+                DataType::Utf8,
+                true,
+            )]))))
+            .with_nested_pager(Some(NestedConnectionPager {
+                connection_key: "reviews",
+                parent_id_key: "id",
+                type_condition: "PullRequest",
+                node_selection: "id",
+                page_size: 2,
+            }))
+            .build(reqwest::Client::new())
+            .expect("client to build");
+
+            let query = GraphQLQuery::try_from(Arc::<str>::from(OUTER_QUERY))
+                .expect("query to parse")
+                .with_json_pointer(Arc::from("/data/view/nodes"));
+            client
+                .execute(&query, None, None, None, None, None)
+                .await
+                .expect("the follow-up page must complete the connection");
+
+            let follow_up: Vec<String> = server
+                .received_requests()
+                .await
+                .expect("recorded requests")
+                .iter()
+                .filter_map(|r| serde_json::from_slice::<Value>(&r.body).ok())
+                .filter_map(|body| {
+                    body.get("query")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .filter(|q| q.contains("node(id:"))
+                .collect();
+            assert_eq!(
+                follow_up.len(),
+                1,
+                "one follow-up request, got {follow_up:?}"
+            );
+            assert!(
+                follow_up[0].contains(r#"after: "cur\"so\\r""#),
+                "the cursor must be escaped in the follow-up query, got {}",
+                follow_up[0]
+            );
+        }
+
+        /// A 502 on a nested follow-up must retry with a smaller `first:` and
+        /// the same `after:` cursor, not resend the original page size.
+        #[tokio::test]
+        async fn a_gateway_error_on_a_nested_page_retries_with_a_smaller_first() {
+            let server = MockServer::start().await;
+
+            Mock::given(method("POST"))
+                .and(body_string_contains(r#"after: \"c1\""#))
+                .respond_with(ResponseTemplate::new(502).set_body_string("Bad Gateway"))
+                .up_to_n_times(1)
+                .mount(&server)
+                .await;
+
+            Mock::given(method("POST"))
+                .and(body_string_contains(r#"after: \"c1\""#))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": {"node": {"reviews": reviews_page(&["R3", "R4", "R5"], false, "c2")}}
+                })))
+                .mount(&server)
+                .await;
+
+            Mock::given(method("POST"))
+                .and(body_string_contains("view(first: 10)"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "data": {"view": {
+                        "nodes": [{"id": "PR_1", "reviews": reviews_page(&["R1", "R2"], true, "c1")}],
+                        "pageInfo": {"hasNextPage": false, "endCursor": Value::Null},
+                    }}
+                })))
+                .mount(&server)
+                .await;
+
+            let unnest_reviews: UnnestHandler = Box::new(|parent: &Value| {
+                Ok(parent
+                    .get("reviews")
+                    .and_then(|c| c.get("nodes"))
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default())
+            });
+
+            let client = GraphQLClientBuilder::new(
+                Url::parse(&format!("{}/graphql", server.uri())).expect("valid URL"),
+                UnnestBehavior::Custom(unnest_reviews),
+            )
+            .with_json_pointer(Some("/data/view/nodes"))
+            .with_schema(Some(Arc::new(Schema::new(vec![Field::new(
+                "id",
+                DataType::Utf8,
+                true,
+            )]))))
+            .with_nested_pager(Some(NestedConnectionPager {
+                connection_key: "reviews",
+                parent_id_key: "id",
+                type_condition: "PullRequest",
+                node_selection: "id",
+                page_size: 2,
+            }))
+            .build(reqwest::Client::new())
+            .expect("client to build");
+
+            let query = GraphQLQuery::try_from(Arc::<str>::from(OUTER_QUERY))
+                .expect("query to parse")
+                .with_json_pointer(Arc::from("/data/view/nodes"));
+            client
+                .execute(&query, None, None, None, None, None)
+                .await
+                .expect("a shrunken nested retry must complete the connection");
+
+            let c1_bodies: Vec<String> = server
+                .received_requests()
+                .await
+                .expect("recorded requests")
+                .iter()
+                .filter(|r| String::from_utf8_lossy(&r.body).contains(r#"after: \"c1\""#))
+                .map(|r| String::from_utf8_lossy(&r.body).into_owned())
+                .collect();
+            assert_eq!(
+                c1_bodies.len(),
+                2,
+                "gateway retry must send the nested page twice, got {}",
+                c1_bodies.len()
+            );
+            assert!(
+                c1_bodies[0].contains("first: 2"),
+                "first attempt uses the pager page size, got {}",
+                c1_bodies[0]
+            );
+            assert!(
+                c1_bodies[1].contains("first: 1") && c1_bodies[1].contains(r#"after: \"c1\""#),
+                "retry must shrink first: and keep after:, got {}",
+                c1_bodies[1]
             );
         }
     }
@@ -3037,7 +3781,7 @@ mod tests {
         let response = serde_json::from_str(&format!(r#"{{"message": "{message}"}}"#))
             .expect("Failed to consturuct json");
         let status = StatusCode::BAD_REQUEST;
-        let result = handle_http_error(status, &response);
+        let result = handle_http_error(status, &response, None);
         match result {
             Ok(()) => panic!("Expected error"),
             Err(e) => {
@@ -3049,7 +3793,7 @@ mod tests {
             serde_json::from_str(&format!(r#"{{ "error": {{"message": "{message}"}} }}"#))
                 .expect("Failed to consturuct json");
         let status = StatusCode::BAD_REQUEST;
-        let result = handle_http_error(status, &response);
+        let result = handle_http_error(status, &response, None);
         match result {
             Ok(()) => panic!("Expected error"),
             Err(e) => {
@@ -3061,7 +3805,7 @@ mod tests {
             serde_json::from_str(&format!(r#"{{ "errors": [{{"message": "{message}"}}] }}"#))
                 .expect("Failed to consturuct json");
         let status = StatusCode::BAD_REQUEST;
-        let result = handle_http_error(status, &response);
+        let result = handle_http_error(status, &response, None);
         match result {
             Ok(()) => panic!("Expected error"),
             Err(e) => {
@@ -3072,14 +3816,27 @@ mod tests {
         let rate_limited_response =
             serde_json::from_str(r#"{"message": "API rate limit exceeded for user"}"#)
                 .expect("Failed to construct json");
-        let rate_limited_result = handle_http_error(StatusCode::FORBIDDEN, &rate_limited_response);
+        let rate_limited_result =
+            handle_http_error(StatusCode::FORBIDDEN, &rate_limited_response, None);
         match rate_limited_result {
             Ok(()) => panic!("Expected rate-limited error"),
-            Err(super::Error::RateLimited { message }) => {
+            Err(super::Error::RateLimited { message, .. }) => {
                 assert!(message.contains("rate limited"));
                 assert!(message.contains("HTTP 403"));
             }
             Err(other) => panic!("Expected rate-limited error, got {other}"),
+        }
+
+        let retry_after_429 = handle_http_error(
+            StatusCode::TOO_MANY_REQUESTS,
+            &serde_json::from_str(r#"{"message":"slow down"}"#).expect("json"),
+            Some(std::time::Duration::from_secs(120)),
+        );
+        match retry_after_429 {
+            Err(super::Error::RateLimited { retry_after, .. }) => {
+                assert_eq!(retry_after, Some(std::time::Duration::from_secs(120)));
+            }
+            other => panic!("expected RateLimited with Retry-After, got {other:?}"),
         }
     }
 
@@ -3754,6 +4511,423 @@ mod tests {
                 rows, 30,
                 "a scan that runs out of rows answers with the rows there are"
             );
+        }
+    }
+
+    /// Non-JSON and empty GraphQL HTTP bodies: classify before decode, retry
+    /// gateway / empty-200 failures, and keep JSON error payloads on 4xx.
+    mod non_json_responses {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicU32, Ordering};
+
+        use arrow::datatypes::{DataType, Field, Schema};
+        use serde_json::json;
+        use url::Url;
+        use wiremock::matchers::{header, method};
+        use wiremock::{Mock, MockServer, Request, Respond, ResponseTemplate};
+
+        use crate::graphql::Error;
+        use crate::graphql::builder::GraphQLClientBuilder;
+        use crate::graphql::client::{
+            GraphQLClient, GraphQLQuery, GraphQLQueryResult, UnnestBehavior,
+        };
+        use crate::graphql::response::ResponseBodyFormat;
+
+        const QUERY: &str = "query { users { id } }";
+        const JSON_POINTER: &str = "/data/users";
+
+        fn users_payload() -> serde_json::Value {
+            json!({"data": {"users": [{"id": "1"}]}})
+        }
+
+        fn query() -> GraphQLQuery {
+            GraphQLQuery::try_from(Arc::<str>::from(QUERY)).expect("query to parse")
+        }
+
+        fn client(server: &MockServer) -> GraphQLClient {
+            GraphQLClientBuilder::new(
+                Url::parse(&format!("{}/graphql", server.uri())).expect("valid URL"),
+                UnnestBehavior::Depth(0),
+            )
+            .with_json_pointer(Some(JSON_POINTER))
+            .with_schema(Some(Arc::new(Schema::new(vec![Field::new(
+                "id",
+                DataType::Utf8,
+                true,
+            )]))))
+            .build(reqwest::Client::new())
+            .expect("client to build")
+        }
+
+        async fn execute_once(graphql_client: &GraphQLClient) -> Result<GraphQLQueryResult, Error> {
+            graphql_client
+                .execute_inner(&query(), None, None, None, None, None, false, None)
+                .await
+        }
+
+        async fn execute_with_retries(
+            graphql_client: &GraphQLClient,
+        ) -> Result<GraphQLQueryResult, Error> {
+            GraphQLClient::execute_with_retry(
+                graphql_client,
+                &query(),
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+        }
+
+        /// One 502 HTML page from a proxy: typed HTML error, retryable, no JSON-decode wording.
+        #[tokio::test]
+        async fn html_502_is_typed_retryable_unexpected_response() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(502)
+                        .insert_header("content-type", "text/html")
+                        .set_body_string(
+                            "<html><head><title>502 Bad Gateway</title></head>\
+                             <body><center><h1>502 Bad Gateway</h1></center>\
+                             <hr><center>nginx</center></body></html>",
+                        ),
+                )
+                .mount(&server)
+                .await;
+
+            let err = execute_once(&client(&server))
+                .await
+                .expect_err("HTML 502 must not be decoded as JSON");
+
+            match &err {
+                Error::UnexpectedResponse {
+                    status,
+                    format,
+                    preview,
+                    message,
+                    ..
+                } => {
+                    assert_eq!(*status, reqwest::StatusCode::BAD_GATEWAY);
+                    assert_eq!(*format, ResponseBodyFormat::Html);
+                    assert!(
+                        preview.contains("502 Bad Gateway"),
+                        "sanitized preview: {preview}"
+                    );
+                    assert!(
+                        !preview.contains('<'),
+                        "HTML tags must be stripped: {preview}"
+                    );
+                    assert!(
+                        message.contains("HTML") && message.contains("502"),
+                        "typed error names status and format: {message}"
+                    );
+                }
+                other => panic!("expected UnexpectedResponse, got: {other:?}"),
+            }
+
+            let displayed = err.to_string();
+            assert!(
+                !displayed.contains("Failed to decode response body as JSON"),
+                "displayed: {displayed}"
+            );
+            assert!(crate::graphql::is_retriable_error(&err));
+        }
+
+        /// Empty 503 with Retry-After: 0 retries immediately, then the JSON page succeeds.
+        #[tokio::test]
+        async fn empty_503_with_retry_after_then_succeeds() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(FailThenSucceed {
+                    remaining_failures: AtomicU32::new(1),
+                    failure: ResponseTemplate::new(503)
+                        .insert_header("Retry-After", "0")
+                        .set_body_string(""),
+                    success: ResponseTemplate::new(200)
+                        .insert_header("content-type", "application/json")
+                        .set_body_json(users_payload()),
+                })
+                .mount(&server)
+                .await;
+
+            execute_with_retries(&client(&server))
+                .await
+                .expect("empty 503 with Retry-After must retry and then succeed");
+
+            let requests = server
+                .received_requests()
+                .await
+                .expect("recorded requests")
+                .len();
+            assert_eq!(requests, 2, "one 503 then one successful JSON page");
+        }
+
+        /// JSON HTTP 429 keeps `Retry-After` and retries, then succeeds.
+        #[tokio::test]
+        async fn json_429_with_retry_after_then_succeeds() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(FailThenSucceed {
+                    remaining_failures: AtomicU32::new(1),
+                    failure: ResponseTemplate::new(429)
+                        .insert_header("Retry-After", "0")
+                        .insert_header("content-type", "application/json")
+                        .set_body_json(json!({"message": "API rate limit exceeded"})),
+                    success: ResponseTemplate::new(200)
+                        .insert_header("content-type", "application/json")
+                        .set_body_json(users_payload()),
+                })
+                .mount(&server)
+                .await;
+
+            execute_with_retries(&client(&server))
+                .await
+                .expect("JSON 429 with Retry-After must retry and then succeed");
+
+            let requests = server
+                .received_requests()
+                .await
+                .expect("recorded requests")
+                .len();
+            assert_eq!(requests, 2, "one JSON 429 then one successful JSON page");
+        }
+
+        /// GraphQL JSON errors on HTTP 400 are parsed and surfaced, not retried.
+        #[tokio::test]
+        async fn json_errors_on_400_are_surfaced() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(400)
+                        .insert_header("content-type", "application/json")
+                        .set_body_json(json!({
+                            "errors": [{
+                                "message": "Cannot query field \"foo\" on type \"Query\"",
+                                "locations": [{"line": 1, "column": 9}]
+                            }]
+                        })),
+                )
+                .mount(&server)
+                .await;
+
+            let err = execute_once(&client(&server))
+                .await
+                .expect_err("GraphQL errors on 400 must surface");
+
+            let displayed = err.to_string();
+            assert!(
+                displayed.contains("Cannot query field \"foo\""),
+                "GraphQL error must be surfaced: {displayed}"
+            );
+            assert!(!displayed.contains("Failed to decode response body as JSON"));
+            assert!(
+                !crate::graphql::is_retriable_error(&err),
+                "a 400 GraphQL error is not retried"
+            );
+        }
+
+        /// HTML on HTTP 200 is a wrong URL / login page: clear error, not retryable.
+        #[tokio::test]
+        async fn html_on_200_is_not_an_upstream_error() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/html")
+                        .set_body_string("<html><body>Sign in to continue</body></html>"),
+                )
+                .mount(&server)
+                .await;
+
+            let err = execute_once(&client(&server))
+                .await
+                .expect_err("HTML 200 must not be decoded as JSON");
+
+            let displayed = err.to_string();
+            assert!(
+                displayed.contains("HTML instead of JSON"),
+                "displayed: {displayed}"
+            );
+            assert!(displayed.contains("URL") || displayed.contains("redirect"));
+            assert!(!displayed.contains("upstream server returned an error"));
+            assert!(!displayed.contains("Failed to decode response body as JSON"));
+            assert!(!crate::graphql::is_retriable_error(&err));
+        }
+
+        /// HTML HTTP 403 is a permission denial: not retried.
+        #[tokio::test]
+        async fn html_403_is_not_retried() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(403)
+                        .insert_header("content-type", "text/html")
+                        .set_body_string("<html><body>Request forbidden</body></html>"),
+                )
+                .mount(&server)
+                .await;
+
+            let err = execute_with_retries(&client(&server))
+                .await
+                .expect_err("HTML 403 must fail without retrying");
+
+            let displayed = err.to_string();
+            assert!(displayed.contains("HTML"), "displayed: {displayed}");
+            assert!(displayed.contains("403"), "displayed: {displayed}");
+            assert!(!displayed.contains("Failed to decode response body as JSON"));
+            assert!(!crate::graphql::is_retriable_error(&err));
+
+            let requests = server
+                .received_requests()
+                .await
+                .expect("recorded requests")
+                .len();
+            assert_eq!(requests, 1, "a permission denial must not be retried");
+        }
+
+        /// A JSON GraphQL body with no Content-Type still decodes.
+        #[tokio::test]
+        async fn json_body_without_content_type_succeeds() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    // `set_body_bytes` omits Content-Type; `set_body_string` would
+                    // advertise `text/plain` and hide the missing-header path.
+                    ResponseTemplate::new(200)
+                        .set_body_bytes(br#"{"data":{"users":[{"id":"1"}]}}"#),
+                )
+                .mount(&server)
+                .await;
+
+            let result = execute_once(&client(&server))
+                .await
+                .expect("JSON without Content-Type must still parse");
+            assert_eq!(
+                result
+                    .records
+                    .iter()
+                    .map(arrow::array::RecordBatch::num_rows)
+                    .sum::<usize>(),
+                1
+            );
+        }
+
+        /// `application/graphql-response+json` is a JSON GraphQL payload.
+        #[tokio::test]
+        async fn graphql_response_json_on_200_succeeds() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "application/graphql-response+json")
+                        .set_body_json(users_payload()),
+                )
+                .mount(&server)
+                .await;
+
+            let result = execute_once(&client(&server))
+                .await
+                .expect("graphql-response+json on 200 must parse");
+            assert_eq!(
+                result
+                    .records
+                    .iter()
+                    .map(arrow::array::RecordBatch::num_rows)
+                    .sum::<usize>(),
+                1
+            );
+        }
+
+        /// GitHub's GraphQL API intermittently returns an empty HTTP 200; retry then succeed.
+        /// The retry must keep `Content-Type: application/json` (a default
+        /// replacement client would omit it and get HTTP 415).
+        #[tokio::test]
+        async fn empty_200_retries_then_succeeds() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .and(header("content-type", "application/json"))
+                .respond_with(FailThenSucceed {
+                    remaining_failures: AtomicU32::new(1),
+                    failure: ResponseTemplate::new(200)
+                        .insert_header("Retry-After", "0")
+                        .set_body_string(""),
+                    success: ResponseTemplate::new(200)
+                        .insert_header("content-type", "application/json")
+                        .set_body_json(users_payload()),
+                })
+                .mount(&server)
+                .await;
+
+            execute_with_retries(&client(&server))
+                .await
+                .expect("empty HTTP 200 must retry and then succeed");
+
+            let requests = server
+                .received_requests()
+                .await
+                .expect("recorded requests")
+                .len();
+            assert_eq!(requests, 2, "one empty 200 then one successful JSON page");
+        }
+
+        /// After the page-retry budget is spent, the empty-200 message is the one the user sees.
+        #[tokio::test]
+        async fn empty_200_retries_exhausted() {
+            let server = MockServer::start().await;
+            Mock::given(method("POST"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("Retry-After", "0")
+                        .set_body_string(""),
+                )
+                .mount(&server)
+                .await;
+
+            let err = execute_with_retries(&client(&server))
+                .await
+                .expect_err("empty 200 must fail after retries are exhausted");
+
+            let displayed = err.to_string();
+            assert_eq!(
+                displayed,
+                "upstream returned an empty response body (HTTP 200)"
+            );
+            assert!(!displayed.contains("upstream server returned an error"));
+            assert!(!displayed.contains("Failed to decode response body as JSON"));
+
+            let requests = server
+                .received_requests()
+                .await
+                .expect("recorded requests")
+                .len();
+            // Initial attempt + PAGE_RETRY_MAX_ATTEMPTS retries.
+            assert_eq!(
+                requests,
+                1 + crate::graphql::PAGE_RETRY_MAX_ATTEMPTS as usize
+            );
+        }
+
+        struct FailThenSucceed {
+            remaining_failures: AtomicU32,
+            failure: ResponseTemplate,
+            success: ResponseTemplate,
+        }
+
+        impl Respond for FailThenSucceed {
+            fn respond(&self, _request: &Request) -> ResponseTemplate {
+                if self
+                    .remaining_failures
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                        left.checked_sub(1)
+                    })
+                    .is_ok()
+                {
+                    return self.failure.clone();
+                }
+                self.success.clone()
+            }
         }
     }
 }

@@ -21,9 +21,12 @@ on:
   workflow_dispatch:
 
 concurrency:
-  # Allow only one workflow per any non-trunk branch.
-  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
-  cancel-in-progress: true
+  # A newer run cancels the one in progress for the same pull request, merge group, non-trunk
+  # branch or manually dispatched trunk commit. Trunk pushes share one group and never cancel
+  # the running check on `spiceai-macos-large`: a newer push replaces only the run still waiting.
+  # The trunk commit is the merge-group commit that already passed this workflow.
+  group: ${{ github.workflow }}-${{ github.ref_name }}-${{ (github.ref_name == 'trunk' && github.event_name != 'push') && github.sha || 'any-sha' }}
+  cancel-in-progress: ${{ github.ref_name != 'trunk' || github.event_name != 'push' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -167,8 +170,9 @@ jobs:
         if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
         run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
 
+      # Merge-queue checks keep no diagnostic artifacts.
       - name: Upload spiceio logs
-        if: always()
+        if: always() && github.event_name != 'merge_group'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: spiceio-features-logs

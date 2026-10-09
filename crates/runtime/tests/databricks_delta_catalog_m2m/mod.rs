@@ -77,11 +77,11 @@ async fn databricks_delta_lake_m2m_integration_test_catalog() -> Result<(), anyh
                     let results = arrow::util::pretty::pretty_format_batches(&result_batches)
                         .expect("should pretty print result batch");
                     insta::with_settings!({
-                        description => format!("Databricks Catalog (mode: delta_lake) Integration Test Results"),
+                        description => "Databricks Catalog (mode: delta_lake) Integration Test Results",
                         omit_expression => true,
                         snapshot_path => "../snapshots"
                     }, {
-                        insta::assert_snapshot!(format!("test_select_tpch"), results);
+                        insta::assert_snapshot!("test_select_tpch", results);
                     });
                 })),
             ),
@@ -98,11 +98,11 @@ async fn databricks_delta_lake_m2m_integration_test_catalog() -> Result<(), anyh
                     let results = arrow::util::pretty::pretty_format_batches(&result_batches)
                         .expect("should pretty print result batch");
                     insta::with_settings!({
-                        description => format!("Databricks Catalog (mode: delta_lake) Integration Test Results"),
+                        description => "Databricks Catalog (mode: delta_lake) Integration Test Results",
                         omit_expression => true,
                         snapshot_path => "../snapshots"
                     }, {
-                        insta::assert_snapshot!(format!("test_select_tpcds"), results);
+                        insta::assert_snapshot!("test_select_tpcds", results);
                     });
                 })),
             ),

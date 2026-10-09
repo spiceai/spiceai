@@ -277,17 +277,55 @@ mod tests {
 
     #[test]
     fn as_search_index_recognizes_a_known_concrete_type() {
-        let idx: Arc<dyn Index + Send + Sync> = Arc::new(NativeVectorIndex::new(
-            datafusion::sql::TableReference::bare("t"),
-            "embedding".to_string(),
-            vec![Field::new("id", arrow_schema::DataType::Int64, false)],
-            4,
-        ));
+        use crate::index::compound::CompoundReadMode;
 
-        assert!(
-            as_search_index(&idx).is_some(),
-            "NativeVectorIndex is in the known-types list and must be recognized"
-        );
+        let native = || {
+            Arc::new(NativeVectorIndex::new(
+                datafusion::common::TableReference::bare("t"),
+                "embedding".to_string(),
+                vec![Field::new("id", arrow_schema::DataType::Int64, false)],
+                4,
+            ))
+        };
+        let chunker = Arc::new(crate::index::chunking::DelimChunker { delim: ' ' });
+
+        // Each type in the known-types list that builds without external services.
+        let known: Vec<(&str, Arc<dyn Index + Send + Sync>)> = vec![
+            (
+                "NativeVectorIndex",
+                native() as Arc<dyn Index + Send + Sync>,
+            ),
+            (
+                "ChunkedSearchIndex",
+                Arc::new(ChunkedSearchIndex::new(native(), chunker))
+                    as Arc<dyn Index + Send + Sync>,
+            ),
+            (
+                "CompoundSearchIndex",
+                Arc::new(
+                    CompoundSearchIndex::try_new(native(), native(), CompoundReadMode::PrimaryOnly)
+                        .expect("compatible indexes"),
+                ) as Arc<dyn Index + Send + Sync>,
+            ),
+            (
+                "CompoundVectorIndex",
+                Arc::new(
+                    CompoundVectorIndex::try_new(native(), native(), CompoundReadMode::PrimaryOnly)
+                        .expect("compatible indexes"),
+                ) as Arc<dyn Index + Send + Sync>,
+            ),
+        ];
+        for (type_name, idx) in &known {
+            let view = as_search_index(idx).unwrap_or_else(|| {
+                panic!("{type_name} is in the known-types list and must be recognized")
+            });
+            // The borrowed view is that index itself, not some other object.
+            assert!(
+                std::ptr::addr_eq(std::ptr::from_ref(view), Arc::as_ptr(idx)),
+                "{type_name}"
+            );
+            assert_eq!(view.search_column(), "embedding", "{type_name}");
+        }
     }
 
     /// `as_search_index` works by downcasting to a fixed list of known concrete types (mirroring

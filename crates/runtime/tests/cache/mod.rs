@@ -71,11 +71,11 @@ async fn test_cache_control_no_cache() -> Result<(), anyhow::Error> {
                     let results = arrow::util::pretty::pretty_format_batches(&result_batches)
                         .expect("should pretty print result batch");
                     insta::with_settings!({
-                        description => format!("Cache Integration Test Results"),
+                        description => "Cache Integration Test Results",
                         omit_expression => true,
                         snapshot_path => "../snapshots"
                     }, {
-                        insta::assert_snapshot!(format!("cache_integration_test_select"), results);
+                        insta::assert_snapshot!("cache_integration_test_select", results);
                     });
                 })),
             )];

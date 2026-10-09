@@ -1,6 +1,7 @@
 tests:
   bench:
     spicepod_path: accelerated/on_zero_results/file[parquet]-duckdb[memory]-on_zero_results.yaml
+    ready_wait: 300
     query_set: tpch
     runner_type: spiceai-dev-runners
     validate_results: true

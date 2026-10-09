@@ -192,7 +192,7 @@ async fn query_batches(rt: &Runtime, sql: &str) -> Result<Vec<RecordBatch>, Stri
 
 /// Core logic for the hot-reload regression test, parameterized by acceleration engine.
 ///
-/// `engine` should be `"duckdb"`, `"arrow"`, `""` (default Arrow), etc.
+/// `engine` should be `"duckdb"`, `"arrow"`, `""` (the default engine), etc.
 async fn run_view_hot_reload_test(engine: &str) -> Result<(), String> {
     let test_dir = get_test_dir(if engine.is_empty() { "arrow" } else { engine });
     // Clean up any leftovers from a previous run.
@@ -347,7 +347,7 @@ async fn test_http_json_view_hot_reload_duckdb() -> Result<(), String> {
         .await
 }
 
-/// Same regression test with the default Arrow accelerator to determine
+/// Same regression test with the Arrow accelerator to determine
 /// whether the bug is DuckDB-specific or affects all acceleration engines.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_http_json_view_hot_reload_arrow() -> Result<(), String> {

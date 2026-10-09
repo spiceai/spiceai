@@ -33,6 +33,7 @@ use spicepod::component::snapshot::Snapshots;
 use tokio::sync::RwLock;
 
 use crate::Runtime;
+use crate::component::dataset::snapshot_source::SnapshotSource;
 
 use super::require_write_access;
 
@@ -106,6 +107,19 @@ pub async fn list_snapshots(
         )
             .into_response();
     };
+
+    if let Some(manager) = snapshot_source_manager(dataset, &rt).await {
+        let snapshot_manager = match manager {
+            Ok(manager) => manager,
+            Err(response) => return response,
+        };
+        drop(app_lock);
+        let limit = query.limit.unwrap_or(DEFAULT_SNAPSHOTS_LIMIT);
+        return match snapshot_manager.get_snapshot_summary(limit).await {
+            Ok(summary) => (StatusCode::OK, Json(summary)).into_response(),
+            Err(e) => snapshot_api_error_to_response(&e),
+        };
+    }
 
     let Some(acceleration) = &dataset.acceleration else {
         return (
@@ -191,6 +205,18 @@ pub async fn get_snapshot(
         )
             .into_response();
     };
+
+    if let Some(manager) = snapshot_source_manager(dataset, &rt).await {
+        let snapshot_manager = match manager {
+            Ok(manager) => manager,
+            Err(response) => return response,
+        };
+        drop(app_lock);
+        return match snapshot_manager.get_snapshot(snapshot_id).await {
+            Ok(snapshot) => (StatusCode::OK, Json(snapshot)).into_response(),
+            Err(e) => snapshot_api_error_to_response(&e),
+        };
+    }
 
     let Some(acceleration) = &dataset.acceleration else {
         return (
@@ -280,6 +306,20 @@ pub async fn set_current_snapshot(
             .into_response();
     };
 
+    // A dataset reading snapshots never changes them: its current snapshot is the one
+    // the publishing instance names in the metadata this dataset reads.
+    if SnapshotSource::from_spicepod(dataset).is_ok_and(|source| source.is_some()) {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(MessageResponse {
+                message: format!(
+                    "Dataset {dataset_name} reads snapshots (`file_format: snapshot`) and never changes them. Set the current snapshot on the Spice instance that publishes them."
+                ),
+            }),
+        )
+            .into_response();
+    }
+
     let Some(acceleration) = &dataset.acceleration else {
         return (
             StatusCode::BAD_REQUEST,
@@ -334,6 +374,45 @@ pub async fn set_current_snapshot(
             .into_response(),
         Err(e) => snapshot_api_error_to_response(&e),
     }
+}
+
+/// A `SnapshotManager` over the snapshots `dataset` reads, when it reads snapshots
+/// (`file_format: snapshot`): its own `from` location and `s3_*` params, not the
+/// top-level `snapshots` section, which says where snapshotting datasets publish.
+/// `None` for any other dataset.
+async fn snapshot_source_manager(
+    dataset: &spicepod::component::dataset::Dataset,
+    rt: &Runtime,
+) -> Option<Result<SnapshotManager, Response>> {
+    let bad_request = |message: String| {
+        (StatusCode::BAD_REQUEST, Json(MessageResponse { message })).into_response()
+    };
+    let source = match SnapshotSource::from_spicepod(dataset) {
+        Ok(None) => return None,
+        Ok(Some(source)) => source,
+        Err(err) => return Some(Err(bad_request(err.to_string()))),
+    };
+    let params = dataset
+        .params
+        .as_ref()
+        .map(spicepod::param::Params::as_string_map)
+        .unwrap_or_default();
+    let behavior = SnapshotBehavior::bootstrap_only(
+        Arc::new(source.snapshots(&params)),
+        rt.secrets_weak(),
+        rt.tokio_io_runtime(),
+    );
+    Some(
+        SnapshotManager::try_new_for_metadata_queries(dataset.name.clone(), behavior)
+            .await
+            .ok_or_else(|| {
+                bad_request(format!(
+                    "Dataset {} reads snapshots from '{}', which could not be opened. Check the dataset's `s3_*` params.",
+                    dataset.name,
+                    source.location()
+                ))
+            }),
+    )
 }
 
 /// Creates a `SnapshotManager` for querying snapshot metadata.

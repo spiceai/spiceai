@@ -312,7 +312,7 @@ mod tests {
                 datafusion::common::DFSchema::try_from(schema).expect("schema conversion"),
             ),
             name: "test_table".into(),
-            location: String::new(),
+            locations: vec![],
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: false,
@@ -346,7 +346,7 @@ mod tests {
                 datafusion::common::DFSchema::try_from(schema).expect("schema conversion"),
             ),
             name: "test_table".into(),
-            location: String::new(),
+            locations: vec![],
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: false,
@@ -385,7 +385,7 @@ mod tests {
                 datafusion::common::DFSchema::try_from(schema).expect("schema conversion"),
             ),
             name: "test_table".into(),
-            location: String::new(),
+            locations: vec![],
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: false,
@@ -424,7 +424,7 @@ mod tests {
                 datafusion::common::DFSchema::try_from(schema).expect("schema conversion"),
             ),
             name: "test_table".into(),
-            location: String::new(),
+            locations: vec![],
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: false,
@@ -581,8 +581,16 @@ mod tests {
             ("col2", arrow::datatypes::DataType::Utf8),
         ]);
 
-        let result = parse_indexes_option("(col1,invalid):unique", &schema);
-        let _ = result.expect_err("expected error for invalid column");
+        let err = parse_indexes_option("(col1,invalid):unique", &schema)
+            .expect_err("expected error for invalid column");
+        assert!(
+            matches!(
+                &err,
+                DataFusionError::Configuration(message)
+                    if message == "Index column 'invalid' not found in schema"
+            ),
+            "the compound key must be rejected as a configuration error naming 'invalid', got: {err:?}"
+        );
     }
 
     #[test]
@@ -654,7 +662,7 @@ mod tests {
                     .expect("schema conversion"),
             ),
             name: "test_table".into(),
-            location: String::new(),
+            locations: vec![],
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: false,
@@ -739,7 +747,7 @@ mod tests {
                     .expect("schema conversion"),
             ),
             name: "test_table".into(),
-            location: String::new(),
+            locations: vec![],
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: false,
@@ -830,7 +838,7 @@ mod tests {
                     .expect("schema conversion"),
             ),
             name: "customer".into(),
-            location: String::new(),
+            locations: vec![],
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: false,

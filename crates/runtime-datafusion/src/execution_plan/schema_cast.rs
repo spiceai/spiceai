@@ -38,8 +38,9 @@ use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, ExecutionPlanProperties,
-    PhysicalExpr, PlanProperties, SortOrderPushdownResult,
+    ChildStats, DisplayAs, DisplayFormatType, Distribution, ExecutionPlan, ExecutionPlanProperties,
+    InputDistributionRequirements, PhysicalExpr, PlanProperties, ReplaceChildrenOptions,
+    SortOrderPushdownResult, StatisticsArgs, StatisticsContext,
     expressions::{Column, PhysicalSortExpr},
 };
 use futures::StreamExt;
@@ -58,6 +59,13 @@ pub struct SchemaCastScanExec {
 }
 
 impl SchemaCastScanExec {
+    fn with_input(&self, children: Vec<Arc<dyn ExecutionPlan>>) -> Result<Arc<dyn ExecutionPlan>> {
+        let [input]: [Arc<dyn ExecutionPlan>; 1] = children.try_into().map_err(|_| {
+            DataFusionError::Execution("SchemaCastScanExec expects exactly one input".to_string())
+        })?;
+        Ok(Arc::new(Self::new(input, Arc::clone(&self.target_schema))))
+    }
+
     pub fn new(input: Arc<dyn ExecutionPlan>, schema: SchemaRef) -> Self {
         // Compute the actual output schema: iterate over target schema fields,
         // but adjust nullability based on input schema to avoid "non-nullable but contains null values" errors.
@@ -272,6 +280,18 @@ impl ExecutionPlan for SchemaCastScanExec {
         vec![Distribution::UnspecifiedDistribution; self.children().len()]
     }
 
+    fn input_distribution_requirements(&self) -> InputDistributionRequirements {
+        InputDistributionRequirements::new(vec![
+            Distribution::UnspecifiedDistribution;
+            self.children().len()
+        ])
+    }
+
+    /// Casting owns no dynamic filters.
+    fn dynamic_expressions_produced(&self) -> Vec<Arc<dyn PhysicalExpr>> {
+        Vec::new()
+    }
+
     fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>> {
         vec![None; self.children().len()]
     }
@@ -284,29 +304,48 @@ impl ExecutionPlan for SchemaCastScanExec {
         vec![false]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input]
+    }
+
+    /// Always rebuilds through `new`: the output schema's nullability is derived
+    /// from the input, so recomputing is correct whichever mode is requested.
+    fn replace_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+        _options: ReplaceChildrenOptions,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.with_input(children)
     }
 
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        if children.len() == 1 {
-            Ok(Arc::new(Self::new(
-                Arc::clone(&children[0]),
-                Arc::clone(&self.target_schema),
-            )))
-        } else {
-            Err(DataFusionError::Execution(
-                "SchemaCastScanExec expects exactly one input".to_string(),
-            ))
-        }
+        self.with_input(children)
+    }
+
+    fn with_new_children_and_same_properties(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.with_input(children)
     }
 
     fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>> {
         let children = self.children().into_iter().cloned().collect();
-        self.with_new_children(children)
+        self.with_input(children)
     }
 
     fn repartitioned(
@@ -342,6 +381,24 @@ impl ExecutionPlan for SchemaCastScanExec {
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
+        StatisticsContext::new().compute(self, &StatisticsArgs::new().with_partition(partition))
+    }
+
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        vec![ChildStats::At(partition)]
+    }
+
+    fn statistics_from_inputs(
+        &self,
+        input_stats: &[Arc<Statistics>],
+        _args: &StatisticsArgs,
+    ) -> Result<Arc<Statistics>> {
+        let [input_stats] = input_stats else {
+            return Err(DataFusionError::Internal(format!(
+                "SchemaCastScanExec expects statistics for exactly one input, got {}",
+                input_stats.len()
+            )));
+        };
         // The input's statistics are indexed by its own schema, but this exec
         // advertises `output_schema`, which drops, reorders, or retypes columns
         // (caching mode strips storage-only columns like `_fetched_at`).
@@ -350,7 +407,6 @@ impl ExecutionPlan for SchemaCastScanExec {
         // in `AnalysisContext::try_from_statistics` (#14144). Project onto the
         // output schema via the same mapping as the equivalence properties;
         // dropped and retyped columns become unknown.
-        let input_stats = self.input.partition_statistics(partition)?;
         let column_map = Self::output_to_input_columns(&self.input.schema(), &self.output_schema);
 
         let column_statistics: Vec<ColumnStatistics> = column_map
@@ -435,6 +491,15 @@ impl ExecutionPlan for SchemaCastScanExec {
         Ok(result.map(|plan| {
             Arc::new(SchemaCastScanExec::new(plan, target_schema)) as Arc<dyn ExecutionPlan>
         }))
+    }
+
+    /// Not serializable. Forwarding to the input would ship a plan without the
+    /// cast to the target schema, so a remote executor would return the input's types.
+    fn try_to_proto(
+        &self,
+        _ctx: &datafusion::physical_plan::proto::ExecutionPlanEncodeCtx<'_>,
+    ) -> Result<Option<datafusion_proto::protobuf::PhysicalPlanNode>> {
+        Ok(None)
     }
 }
 
@@ -640,8 +705,8 @@ mod tests {
         let source = Arc::new(EmptyExec::new(input_schema_with_extra_column()));
         let schema_cast = SchemaCastScanExec::new(source, expected_output_schema());
 
-        let stats = schema_cast
-            .partition_statistics(None)
+        let stats = StatisticsContext::new()
+            .compute(&schema_cast, &StatisticsArgs::new())
             .expect("partition_statistics should succeed");
         assert_eq!(
             stats.column_statistics.len(),
@@ -676,8 +741,8 @@ mod tests {
         .expect("record batch");
         let source =
             MemorySourceConfig::try_new_exec(&[vec![batch]], input_schema, None).expect("source");
-        let input_total = source
-            .partition_statistics(None)
+        let input_total = StatisticsContext::new()
+            .compute(source.as_ref(), &StatisticsArgs::new())
             .expect("input statistics")
             .total_byte_size;
         assert!(
@@ -686,8 +751,8 @@ mod tests {
         );
 
         let schema_cast = SchemaCastScanExec::new(source, output_schema);
-        let total = schema_cast
-            .partition_statistics(None)
+        let total = StatisticsContext::new()
+            .compute(&schema_cast, &StatisticsArgs::new())
             .expect("partition_statistics should succeed")
             .total_byte_size;
         assert_ne!(
@@ -729,9 +794,15 @@ mod tests {
 
         // Before the fix this returned the `ExprBoundaries` col_index
         // out-of-bounds internal error instead of `Ok`.
-        filter
-            .partition_statistics(None)
+        let stats = StatisticsContext::new()
+            .compute(&filter, &StatisticsArgs::new())
             .expect("filter statistics analysis must not go out of bounds");
+        // The analysis ran over the stripped two-column schema it indexes.
+        assert_eq!(
+            stats.column_statistics.len(),
+            2,
+            "one column statistic per column of the stripped output schema"
+        );
     }
 
     #[test]
@@ -756,9 +827,30 @@ mod tests {
 
         let schema_cast = SchemaCastScanExec::new(sorted_input, target_schema);
 
-        assert!(
-            schema_cast.properties().output_ordering().is_some(),
-            "Ordering should be propagated when types match"
+        // The exact ordering, not just some ordering: a wrong advertised sort key
+        // or direction would let the optimizer drop a sort the plan needs.
+        let output_ordering = schema_cast
+            .properties()
+            .output_ordering()
+            .expect("Ordering should be propagated when types match");
+        assert_eq!(
+            output_ordering.len(),
+            1,
+            "exactly the input's one sort key: {output_ordering:?}"
+        );
+        let sort_expr = &output_ordering[0];
+        let column = sort_expr
+            .expr
+            .downcast_ref::<Column>()
+            .expect("the sort key should remain a column");
+        assert_eq!(column.name(), "id");
+        assert_eq!(column.index(), 0, "column index should match output schema");
+        assert_eq!(
+            sort_expr.options,
+            SortOptions {
+                descending: false,
+                nulls_first: true,
+            }
         );
     }
 
@@ -1431,9 +1523,12 @@ mod tests {
             Field::new("value", DataType::Int64, true),
             Field::new("id", DataType::Int64, true),
         ]));
-        let stats = SchemaCastScanExec::new(source, target_schema)
-            .partition_statistics(None)
-            .expect("partition_statistics should succeed");
+        let stats = StatisticsContext::new()
+            .compute(
+                &SchemaCastScanExec::new(source, target_schema),
+                &StatisticsArgs::new(),
+            )
+            .expect("statistics should be computed");
 
         assert_eq!(stats.num_rows, Precision::Exact(3));
         assert_eq!(
@@ -1457,9 +1552,12 @@ mod tests {
         let source = source_with_null_counts(&input_schema, &[1], 2);
 
         let target_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Utf8, true)]));
-        let stats = SchemaCastScanExec::new(source, target_schema)
-            .partition_statistics(None)
-            .expect("partition_statistics should succeed");
+        let stats = StatisticsContext::new()
+            .compute(
+                &SchemaCastScanExec::new(source, target_schema),
+                &StatisticsArgs::new(),
+            )
+            .expect("statistics should be computed");
 
         assert_eq!(
             stats.column_statistics[0],

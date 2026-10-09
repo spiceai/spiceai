@@ -1,0 +1,15 @@
+version: v1
+kind: Spicepod
+name: delta_lake-arrow-full
+datasets:
+  - from: delta_lake:s3://benchmarks/cold_start/audit_events_3m/
+    name: audit_events
+    params:
+      delta_lake_aws_access_key_id: ${secrets:S3_KEY}
+      delta_lake_aws_secret_access_key: ${secrets:S3_SECRET}
+      delta_lake_aws_endpoint: ${secrets:S3_ENDPOINT}
+      delta_lake_aws_allow_http: true
+    acceleration:
+      enabled: true
+      engine: arrow
+      refresh_mode: full

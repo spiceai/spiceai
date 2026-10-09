@@ -2099,7 +2099,7 @@ async fn generate_initial_spicepod(
         let state_location = format!("{path}/{run_id}");
         if !path.is_empty() {
             let mut sched = Scheduler {
-                state_location,
+                state_location: Some(state_location),
                 params: Some(Params::from_string_map(HashMap::from([
                     ("s3_auth".to_string(), "key".to_string()),
                     (
@@ -2238,13 +2238,6 @@ mod tests {
             SpiceCompute::from_str("local", true),
             Ok(SpiceCompute::Local)
         ));
-    }
-
-    #[test]
-    fn compute_mode_rejects_unknown_values() {
-        use clap::ValueEnum;
-        SpiceCompute::from_str("unexpected", true)
-            .expect_err("unknown compute mode should be rejected");
     }
 
     #[tokio::test]

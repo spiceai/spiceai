@@ -20,7 +20,7 @@ use std::time::Duration;
 use crate::datafusion::error::format_datafusion_error;
 use arrow::array::RecordBatch;
 use async_trait::async_trait;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use opentelemetry_sdk::error::{OTelSdkError, OTelSdkResult};
 use snafu::prelude::*;
 use tokio::sync::RwLock;
@@ -29,7 +29,7 @@ use crate::Runtime;
 use crate::accelerated::Retention;
 use crate::accelerated::refresh::Refresh;
 use crate::component::dataset::TimeFormat;
-use crate::component::dataset::acceleration::Acceleration;
+use crate::component::dataset::acceleration::{Acceleration, Engine};
 use crate::datafusion::Error as DataFusionError;
 use crate::datafusion::{DataFusion, SPICE_RUNTIME_SCHEMA};
 use crate::dataupdate::{DataUpdate, UpdateType};
@@ -45,7 +45,11 @@ pub enum Error {
         "Failed to register the internal metrics table: {}",
         format_datafusion_error(source)
     ))]
-    UnableToRegisterToMetricsTable { source: DataFusionError },
+    UnableToRegisterToMetricsTable {
+        // `datafusion::Error` alone is over clippy's `result_large_err` limit.
+        #[snafu(source(from(DataFusionError, Box::new)))]
+        source: Box<DataFusionError>,
+    },
 }
 
 /// Uses a `Weak` reference to `DataFusion` to prevent blocking its cleanup after runtime termination.
@@ -111,7 +115,11 @@ pub async fn register_metrics_table(
         metrics_table_reference.clone(),
         otel_arrow::schema(),
         None,
-        Acceleration::default(),
+        // An internal table has no source, and Cayenne requires one.
+        Acceleration {
+            engine: Engine::Arrow,
+            ..Acceleration::default()
+        },
         Refresh::default(),
         retention,
         Arc::new(RwLock::new(Secrets::default())),

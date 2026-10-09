@@ -155,6 +155,17 @@ impl TableProvider for MemoryVectorListTable {
     async fn truncate(&self, _state: &dyn Session) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         not_impl_err!("TRUNCATE not supported for 'MemoryVectorListTable' table")
     }
+
+    async fn merge_into(
+        &self,
+        _state: &dyn Session,
+        _source: Arc<dyn ExecutionPlan>,
+        _merge_schema: datafusion::common::DFSchemaRef,
+        _on: Expr,
+        _clauses: Vec<datafusion::logical_expr::dml::MergeIntoClause>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        not_impl_err!("MERGE INTO not supported for 'MemoryVectorListTable' table")
+    }
 }
 
 /// Brute-force exact k-NN scan for [`crate::index::SearchIndex::query_table_provider`].
@@ -378,5 +389,16 @@ impl TableProvider for MemoryVectorQueryTable {
 
     async fn truncate(&self, _state: &dyn Session) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
         not_impl_err!("TRUNCATE not supported for 'MemoryVectorQueryTable' table")
+    }
+
+    async fn merge_into(
+        &self,
+        _state: &dyn Session,
+        _source: Arc<dyn ExecutionPlan>,
+        _merge_schema: datafusion::common::DFSchemaRef,
+        _on: Expr,
+        _clauses: Vec<datafusion::logical_expr::dml::MergeIntoClause>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        not_impl_err!("MERGE INTO not supported for 'MemoryVectorQueryTable' table")
     }
 }

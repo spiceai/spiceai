@@ -461,6 +461,17 @@ impl ExecutionPlan for WorkflowRunsExecutionPlan {
         vec![]
     }
 
+    /// A leaf: no children, so no distribution requirements.
+    fn input_distribution_requirements(
+        &self,
+    ) -> datafusion::physical_plan::InputDistributionRequirements {
+        datafusion::physical_plan::InputDistributionRequirements::new(vec![])
+    }
+
+    fn dynamic_expressions_produced(&self) -> Vec<Arc<dyn PhysicalExpr>> {
+        Vec::new()
+    }
+
     fn required_input_ordering(
         &self,
     ) -> Vec<Option<datafusion::physical_expr::OrderingRequirements>> {
@@ -475,11 +486,39 @@ impl ExecutionPlan for WorkflowRunsExecutionPlan {
         vec![]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
 
+    fn replace_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+        _options: datafusion::physical_plan::ReplaceChildrenOptions,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        // this plan has no children
+        Ok(self)
+    }
+
     fn with_new_children(
+        self: Arc<Self>,
+        _children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        // this plan has no children
+        Ok(self)
+    }
+
+    fn with_new_children_and_same_properties(
         self: Arc<Self>,
         _children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
@@ -532,6 +571,22 @@ impl ExecutionPlan for WorkflowRunsExecutionPlan {
     fn partition_statistics(
         &self,
         _partition: Option<usize>,
+    ) -> datafusion::error::Result<Arc<Statistics>> {
+        Ok(Arc::new(Statistics::new_unknown(&self.schema())))
+    }
+
+    /// A leaf: there are no children whose statistics to request.
+    fn child_stats_requests(
+        &self,
+        _partition: Option<usize>,
+    ) -> Vec<datafusion::physical_plan::ChildStats> {
+        Vec::new()
+    }
+
+    fn statistics_from_inputs(
+        &self,
+        _input_stats: &[Arc<Statistics>],
+        _args: &datafusion::physical_plan::StatisticsArgs,
     ) -> datafusion::error::Result<Arc<Statistics>> {
         Ok(Arc::new(Statistics::new_unknown(&self.schema())))
     }
@@ -589,5 +644,13 @@ impl ExecutionPlan for WorkflowRunsExecutionPlan {
         _order: &[PhysicalSortExpr],
     ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>, DataFusionError> {
         Ok(SortOrderPushdownResult::Unsupported)
+    }
+
+    /// Not serializable: execution calls the GitHub API with this process's client.
+    fn try_to_proto(
+        &self,
+        _ctx: &datafusion::physical_plan::proto::ExecutionPlanEncodeCtx<'_>,
+    ) -> datafusion::error::Result<Option<datafusion_proto::protobuf::PhysicalPlanNode>> {
+        Ok(None)
     }
 }

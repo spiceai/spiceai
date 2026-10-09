@@ -138,7 +138,6 @@ pub struct CatalogBuilder {
     pub runtime: Option<Arc<Runtime>>,
 }
 
-#[expect(clippy::result_large_err)]
 fn compile_globset(patterns: &[String]) -> std::result::Result<Option<GlobSet>, crate::Error> {
     if patterns.is_empty() {
         return Ok(None);
@@ -229,7 +228,6 @@ impl TryFrom<spicepod_catalog::Catalog> for CatalogBuilder {
 }
 
 impl CatalogBuilder {
-    #[expect(clippy::result_large_err)]
     pub fn try_new(from: String, name: &str) -> std::result::Result<Self, crate::Error> {
         crate::component::validate_identifier(name).context(crate::ComponentSnafu)?;
 

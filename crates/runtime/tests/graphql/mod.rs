@@ -488,7 +488,7 @@ async fn test_graphql_pagination_with_limit() -> Result<(), String> {
                     .collect::<Vec<_>>()
                     .join("\n");
                 insta::with_settings!({
-                        description => format!("GraphQL Pagination With Limit Results"),
+                        description => "GraphQL Pagination With Limit Results",
                         omit_expression => true,
                         snapshot_path => "../snapshots"
                     }, {

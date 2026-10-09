@@ -19,7 +19,7 @@ use crate::udtf::{VECTOR_SEARCH_UDTF_NAME, VectorSearchTableFuncArgs};
 use datafusion::catalog::TableProvider;
 use datafusion::error::DataFusionError;
 
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use search::generation::CandidateGeneration;
 
 use runtime_query_engine::query_engine::QueryEngine;

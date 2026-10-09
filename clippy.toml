@@ -12,4 +12,5 @@ disallowed-methods = [
     { path = "std::thread::available_parallelism", reason = "use cpu_budget::cpu_budget() — this reports the node's cores when a pod sets requests.cpu without limits.cpu" },
     { path = "num_cpus::get", reason = "use cpu_budget::cpu_budget() — this reports the node's cores when a pod sets requests.cpu without limits.cpu" },
     { path = "datafusion_common::utils::get_available_parallelism", reason = "use cpu_budget::cpu_budget() — this reports the node's cores when a pod sets requests.cpu without limits.cpu" },
+    { path = "object_store::client::SpawnedReqwestConnector::new", reason = "use object_store_spawn::SpawnedReqwestConnector — this one keeps forwarding errors after a request timeout and grows memory without limit" },
 ]

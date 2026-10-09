@@ -119,7 +119,7 @@ pub(crate) const SPICE_ACCELERATOR_METADATA_KEY: &str = "spice.accelerator";
 pub(crate) const SPICE_OPT_DUCKDB_AGG_PUSHDOWN_KEY: &str =
     "spice.optimizer.duckdb_aggregate_pushdown";
 
-use data_accelerator_api::upsert_dedup;
+use data_accelerator_api::{keep_first, upsert_dedup};
 
 #[derive(Debug, Snafu)]
 pub enum Error {
@@ -348,8 +348,7 @@ impl DuckDBAccelerator {
             .chain(app.views.iter().map(|view| view.acceleration.as_ref()));
 
         for acceleration in accelerations.flatten() {
-            let engine_str = acceleration.engine.as_deref().unwrap_or("arrow");
-            if engine_str.to_lowercase() != "duckdb" {
+            if !acceleration.engine_name().eq_ignore_ascii_case("duckdb") {
                 continue;
             }
             // If the path is Some, we're counting the number of file instances
@@ -412,12 +411,7 @@ impl DuckDBAccelerator {
             let Some(acceleration) = &peer.acceleration else {
                 continue;
             };
-            if !acceleration
-                .engine
-                .as_deref()
-                .unwrap_or("arrow")
-                .eq_ignore_ascii_case("duckdb")
-            {
+            if !acceleration.engine_name().eq_ignore_ascii_case("duckdb") {
                 continue;
             }
             if !matches!(
@@ -814,10 +808,39 @@ impl DataAccelerator for DuckDBAccelerator {
         )))
     }
 
+    async fn validate_init(
+        &self,
+        source: &dyn AccelerationSource,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if !source.is_file_accelerated() {
+            return Ok(());
+        }
+        let path = self.file_path(source)?;
+        if let Some(acceleration) = source.acceleration()
+            && acceleration.params.contains_key("duckdb_file")
+            && !self.is_valid_file(source)
+        {
+            if std::path::Path::new(&path).is_dir() {
+                return Err(Error::InvalidFileIsDirectory.into());
+            }
+            let extension = std::path::Path::new(&path)
+                .extension()
+                .and_then(OsStr::to_str)
+                .unwrap_or("");
+            return Err(Error::InvalidFileExtension {
+                valid_extensions: self.valid_file_extensions().join(","),
+                extension: extension.to_string(),
+            }
+            .into());
+        }
+        Ok(())
+    }
+
     async fn init(
         &self,
         source: &dyn AccelerationSource,
     ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
+        self.validate_init(source).await?;
         if !source.is_file_accelerated() {
             return Ok(BootstrapStatus::none());
         }
@@ -829,21 +852,6 @@ impl DataAccelerator for DuckDBAccelerator {
                 make_spice_data_directory().map_err(|err| {
                     Error::AccelerationInitializationFailed { source: err.into() }
                 })?;
-            } else if !self.is_valid_file(source) {
-                if std::path::Path::new(&path).is_dir() {
-                    return Err(Error::InvalidFileIsDirectory.into());
-                }
-
-                let extension = std::path::Path::new(&path)
-                    .extension()
-                    .and_then(OsStr::to_str)
-                    .unwrap_or("");
-
-                return Err(Error::InvalidFileExtension {
-                    valid_extensions: self.valid_file_extensions().join(","),
-                    extension: extension.to_string(),
-                }
-                .into());
             }
 
             // Recover from any interrupted database file swap (crashed or
@@ -886,9 +894,12 @@ impl DataAccelerator for DuckDBAccelerator {
                 None,
                 resolved_refresh_mode(source, acceleration),
             )
-            .await;
+            .await?;
 
-            self.get_shared_pool(source).await?;
+            // A pending bootstrap must restore the file before any connection opens it.
+            if !matches!(bootstrap_status, BootstrapStatus::Pending { .. }) {
+                self.get_shared_pool(source).await?;
+            }
 
             return Ok(bootstrap_status);
         }
@@ -1724,6 +1735,18 @@ pub(crate) async fn create_table_provider(
         cmd.constraints.clone(),
     );
     let write_provider = guard_unique_index_overwrites(write_provider, cmd);
+    // DuckDB writes a whole stream as one `INSERT … ON CONFLICT DO NOTHING`,
+    // which refuses a key repeated within one batch and resolves one repeated
+    // across batches in parallel-insert order, so `drop` keeps the first copy
+    // here, before the write reaches DuckDB. It sits above the unique-index
+    // guard so the guard validates the rows `drop` keeps.
+    let write_provider = keep_first::wrap_with_keep_first_if_needed(
+        write_provider,
+        &cmd.options,
+        cmd.schema.as_arrow(),
+        &cmd.constraints,
+        keep_first::NanKey::Value,
+    );
 
     let mut schema_metadata = HashMap::new();
     schema_metadata.insert(
@@ -2083,6 +2106,17 @@ impl ExecutionPlan for UniqueIndexValidationExec {
         &self.properties
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input]
     }
@@ -2330,6 +2364,7 @@ mod tests {
         },
         datatypes::{DataType, Field, Schema, TimeUnit},
     };
+    use datafusion::datasource::TableProvider;
     use datafusion::{
         common::{Constraint, Constraints, TableReference, ToDFSchema},
         execution::context::SessionContext,
@@ -2358,7 +2393,7 @@ mod tests {
         CreateExternalTable {
             schema: df_schema,
             name: TableReference::bare("write_settings_table"),
-            location: String::new(),
+            locations: vec![],
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
@@ -2666,6 +2701,228 @@ mod tests {
         );
     }
 
+    fn id_v_schema() -> Arc<Schema> {
+        Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("v", DataType::Utf8, false),
+        ]))
+    }
+
+    async fn drop_on_conflict_table(name: &str) -> Arc<dyn TableProvider> {
+        drop_on_conflict_table_with(name, HashMap::new(), vec![Constraint::PrimaryKey(vec![0])])
+            .await
+    }
+
+    /// An `(id, v)` table with the given options and constraints, and
+    /// `on_conflict: { id: drop }` unless the options set another target.
+    async fn drop_on_conflict_table_with(
+        name: &str,
+        mut options: HashMap<String, String>,
+        constraints: Vec<Constraint>,
+    ) -> Arc<dyn TableProvider> {
+        options
+            .entry("on_conflict".to_string())
+            .or_insert_with(|| "do_nothing:id".to_string());
+        let external_table = CreateExternalTable {
+            schema: ToDFSchema::to_dfschema_ref(id_v_schema())
+                .expect("to convert Arrow schema to DataFusion schema"),
+            name: TableReference::bare(name),
+            locations: vec![],
+            file_type: String::new(),
+            table_partition_cols: vec![],
+            if_not_exists: true,
+            or_replace: false,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options,
+            constraints: Constraints::new_unverified(constraints),
+            column_defaults: HashMap::default(),
+            temporary: false,
+        };
+        let duckdb_accelerator = DuckDBAccelerator::new();
+        super::create_table_provider(&duckdb_accelerator.duckdb_factory, &external_table, None)
+            .await
+            .expect("table should be created")
+    }
+
+    fn id_v_batch(rows: &[(i64, &str)]) -> RecordBatch {
+        RecordBatch::try_new(
+            id_v_schema(),
+            vec![
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    rows.iter().map(|(_, v)| *v).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .expect("to create RecordBatch")
+    }
+
+    async fn write_batches(
+        table: &Arc<dyn TableProvider>,
+        batches: Vec<RecordBatch>,
+        op: InsertOp,
+    ) -> datafusion::common::Result<Vec<RecordBatch>> {
+        let ctx = SessionContext::new();
+        let schema = batches[0].schema();
+        let exec = Arc::new(MockExec::new(batches.into_iter().map(Ok).collect(), schema));
+        let plan = table.insert_into(&ctx.state(), exec, op).await?;
+        collect(plan, ctx.task_ctx()).await
+    }
+
+    /// `(id, v)` rows the table holds, ordered by `id`.
+    async fn id_v_rows(table: &Arc<dyn TableProvider>) -> Vec<(i64, String)> {
+        let ctx = SessionContext::new();
+        let plan = table
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("to create scan plan");
+        let mut rows = Vec::new();
+        for batch in collect(plan, ctx.task_ctx()).await.expect("to scan") {
+            let ids = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id is Int64");
+            let vals = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("v is Utf8");
+            rows.extend((0..batch.num_rows()).map(|i| (ids.value(i), vals.value(i).to_string())));
+        }
+        rows.sort_unstable();
+        rows
+    }
+
+    /// Regression test for #14629: under `on_conflict: drop`, a full refresh
+    /// that repeats a key within one record batch keeps its first copy instead
+    /// of failing the refresh on the uniqueness check.
+    #[tokio::test]
+    async fn drop_keeps_the_first_copy_of_a_key_an_overwrite_repeats_within_a_batch() {
+        let table = drop_on_conflict_table("drop_within_batch").await;
+        write_batches(
+            &table,
+            vec![id_v_batch(&[(1, "a"), (2, "b"), (1, "c")])],
+            InsertOp::Overwrite,
+        )
+        .await
+        .expect("a repeated key must not fail a drop overwrite");
+
+        assert_eq!(
+            id_v_rows(&table).await,
+            vec![(1, "a".to_string()), (2, "b".to_string())]
+        );
+    }
+
+    /// Regression test for #14629: a key repeated in a later record batch
+    /// keeps its first copy. `DuckDB` inserts the whole write as one statement
+    /// over a parallel scan, so before the fix the copy that survived varied
+    /// run to run; repeating the write catches that.
+    #[tokio::test]
+    async fn drop_keeps_the_first_copy_of_a_key_an_overwrite_repeats_across_batches() {
+        let first: Vec<(i64, &str)> = (0..8192).map(|id| (id, "first")).collect();
+        for attempt in 0..20 {
+            let table = drop_on_conflict_table(&format!("drop_across_batches_{attempt}")).await;
+            write_batches(
+                &table,
+                vec![id_v_batch(&first), id_v_batch(&[(0, "last")])],
+                InsertOp::Overwrite,
+            )
+            .await
+            .expect("overwrite succeeds");
+
+            let rows = id_v_rows(&table).await;
+            assert_eq!(rows.len(), 8192, "attempt {attempt}");
+            assert_eq!(rows[0], (0, "first".to_string()), "attempt {attempt}");
+        }
+    }
+
+    /// A unique index on the `drop` key validates the rows that remain after
+    /// the repeats are dropped, not the repeats themselves.
+    #[tokio::test]
+    async fn drop_keeps_the_first_copy_of_a_key_a_unique_index_covers() {
+        let table = drop_on_conflict_table_with(
+            "drop_unique_index",
+            [("indexes".to_string(), "id:unique".to_string())]
+                .into_iter()
+                .collect(),
+            vec![Constraint::PrimaryKey(vec![0])],
+        )
+        .await;
+        write_batches(
+            &table,
+            vec![id_v_batch(&[(1, "a"), (2, "b"), (1, "c")])],
+            InsertOp::Overwrite,
+        )
+        .await
+        .expect("a repeated key must not fail a drop overwrite");
+
+        assert_eq!(
+            id_v_rows(&table).await,
+            vec![(1, "a".to_string()), (2, "b".to_string())]
+        );
+    }
+
+    /// `DuckDB` matches an `on_conflict` target to its column ignoring case,
+    /// so `do_nothing:ID` over a column `id` keeps the first copy of an `id`
+    /// rather than failing the write on a column it cannot find.
+    #[tokio::test]
+    async fn drop_resolves_a_target_spelled_in_another_case() {
+        let table = drop_on_conflict_table_with(
+            "drop_target_case",
+            [("on_conflict".to_string(), "do_nothing:ID".to_string())]
+                .into_iter()
+                .collect(),
+            vec![Constraint::PrimaryKey(vec![0])],
+        )
+        .await;
+        write_batches(
+            &table,
+            vec![id_v_batch(&[(1, "a"), (2, "b"), (1, "c")])],
+            InsertOp::Overwrite,
+        )
+        .await
+        .expect("a target spelled in another case must not fail the write");
+
+        assert_eq!(
+            id_v_rows(&table).await,
+            vec![(1, "a".to_string()), (2, "b".to_string())]
+        );
+    }
+
+    /// An append under `drop` keeps a stored row over an incoming copy of its
+    /// key, and the first of the copies the append itself repeats.
+    #[tokio::test]
+    async fn drop_append_keeps_stored_rows_and_the_first_new_copy() {
+        let table = drop_on_conflict_table("drop_append").await;
+        write_batches(&table, vec![id_v_batch(&[(5, "old")])], InsertOp::Overwrite)
+            .await
+            .expect("initial overwrite succeeds");
+        write_batches(
+            &table,
+            vec![
+                id_v_batch(&[(5, "new"), (7, "a")]),
+                id_v_batch(&[(7, "b"), (8, "c")]),
+            ],
+            InsertOp::Append,
+        )
+        .await
+        .expect("append succeeds");
+
+        assert_eq!(
+            id_v_rows(&table).await,
+            vec![
+                (5, "old".to_string()),
+                (7, "a".to_string()),
+                (8, "c".to_string())
+            ]
+        );
+    }
+
     #[tokio::test]
     async fn overwrite_index_failure_keeps_previous_duckdb_view() {
         let schema = Arc::new(Schema::new(vec![Field::new(
@@ -2682,7 +2939,7 @@ mod tests {
         let external_table = CreateExternalTable {
             schema: df_schema,
             name: TableReference::bare("indexed_overwrite_table"),
-            location: String::new(),
+            locations: vec![],
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
@@ -2784,7 +3041,7 @@ mod tests {
         let external_table = CreateExternalTable {
             schema: df_schema,
             name: TableReference::bare("test_table"),
-            location: String::new(),
+            locations: vec![],
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
@@ -3056,7 +3313,7 @@ mod tests {
         let external_table = CreateExternalTable {
             schema: df_schema,
             name: TableReference::bare("dict_test"),
-            location: String::new(),
+            locations: vec![],
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
@@ -3144,7 +3401,7 @@ mod tests {
         let external_table = CreateExternalTable {
             schema: df_schema,
             name: TableReference::bare("cast_test"),
-            location: String::new(),
+            locations: vec![],
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
@@ -3350,7 +3607,7 @@ mod tests {
         CreateExternalTable {
             schema: df_schema,
             name: TableReference::bare("t"),
-            location: String::new(),
+            locations: vec![],
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
@@ -3774,7 +4031,7 @@ mod tests {
         let external_table = CreateExternalTable {
             schema: df_schema,
             name: TableReference::bare("cache_concat_test"),
-            location: String::new(),
+            locations: vec![],
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
@@ -3867,7 +4124,7 @@ mod tests {
         let external_table = CreateExternalTable {
             schema: df_schema,
             name: TableReference::bare("cache_upsert_test"),
-            location: String::new(),
+            locations: vec![],
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,

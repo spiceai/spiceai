@@ -2,6 +2,8 @@
 # as opposed to `abfs[parquet].yaml` which tests ADLS Gen2 with hierarchical namespace enabled.
 #
 # The Standard V2 account does not have hierarchical namespace enabled (versioning and hierarchical namespace are mutually exclusive).
+# Azure Blob Storage bills per use, so this runs on the weekly schedule instead of daily.
+schedule: weekly
 tests:
   bench:
     spicepod_path: federated/abfs_standard_versioned[parquet].yaml

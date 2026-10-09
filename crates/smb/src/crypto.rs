@@ -118,7 +118,9 @@ mod tests {
     fn decode_hex_vec(hex: &str) -> Vec<u8> {
         assert_eq!(hex.len() % 2, 0);
         hex.as_bytes()
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|chunk| {
                 u8::from_str_radix(std::str::from_utf8(chunk).expect("test fixture"), 16)
                     .expect("test fixture")
@@ -129,7 +131,7 @@ mod tests {
     fn decode_hex_array<const N: usize>(hex: &str) -> [u8; N] {
         assert_eq!(hex.len(), N * 2);
         let mut out = [0u8; N];
-        for (i, chunk) in hex.as_bytes().chunks_exact(2).enumerate() {
+        for (i, chunk) in hex.as_bytes().as_chunks::<2>().0.iter().enumerate() {
             out[i] = u8::from_str_radix(std::str::from_utf8(chunk).expect("test fixture"), 16)
                 .expect("test fixture");
         }

@@ -1,7 +1,7 @@
-name: Configure apt mirrors and retries
+name: Configure apt mirrors and timeouts
 description: >-
-  Configures apt with retry settings and switches to Ubuntu mirrors
-  geographically close to our self-hosted runners (Pittsburgh Teraswitch
+  Configures apt to fail over quickly from an unresponsive mirror and
+  switches to Ubuntu mirrors geographically close to our self-hosted runners (Pittsburgh Teraswitch
   datacenter) to avoid transient archive.ubuntu.com mirror-sync failures.
   Safe no-op on non-Linux runners.
 
@@ -14,14 +14,16 @@ runs:
       run: |
         set -euo pipefail
 
-        # Retry transient failures, force IPv4, and keep per-request timeouts
-        # reasonable. archive.ubuntu.com's load balancer can return a stale
-        # mirror mid-update; retries + a closer primary mirror mitigate this.
-        sudo tee /etc/apt/apt.conf.d/99-spice-retries > /dev/null <<'EOF'
-        Acquire::Retries "5";
-        Acquire::Retries::Delay::Maximum "10";
-        Acquire::http::Timeout "30";
-        Acquire::https::Timeout "30";
+        # Give up on an unresponsive mirror after 10 seconds and use the next
+        # mirror or source. Retries run without a delay: Ubuntu 24.04's apt can
+        # wait forever when a delayed retry is queued behind other downloads
+        # from the same mirror. apt applies the last value in filename order, so
+        # this file must sort after the GitHub-hosted image's zz-retries.
+        sudo tee /etc/apt/apt.conf.d/zz-spice-acquire > /dev/null <<'EOF'
+        Acquire::Retries "3";
+        Acquire::Retries::Delay "false";
+        Acquire::http::Timeout "10";
+        Acquire::https::Timeout "10";
         Acquire::ForceIPv4 "true";
         EOF
 
@@ -45,7 +47,7 @@ runs:
         # sources format supports multiple URIs per source, and apt will
         # try them in order on transport errors. The classic
         # /etc/apt/sources.list format has no built-in failover, so only
-        # the primary is used there (the retry policy above still helps).
+        # the primary is used there.
         #
         # Verified on https://launchpad.net/ubuntu/+archivemirrors :
         #   - mirror.pit.teraswitch.com       (Pittsburgh, PA - Teraswitch)
@@ -57,7 +59,7 @@ runs:
         )
 
         # Security updates are only published on security.ubuntu.com; keep
-        # that as-is but add the same retry policy above.
+        # that as-is.
         PRIMARY="${ARCHIVE_MIRRORS[0]}"
         # Space-separated list used for deb822 URIs field (enables real
         # multi-URI failover on noble+).
@@ -97,14 +99,14 @@ runs:
 
         echo "apt primary archive mirror: ${PRIMARY}"
         echo "deb822 mirror failover list: ${ALL_MIRRORS}"
-        echo "apt retry policy installed at /etc/apt/apt.conf.d/99-spice-retries"
+        echo "apt acquire policy installed at /etc/apt/apt.conf.d/zz-spice-acquire"
 
     - name: Verify apt mirror configuration (Linux)
       if: runner.os == 'Linux'
       shell: bash
       run: |
-        echo "=== /etc/apt/apt.conf.d/99-spice-retries ==="
-        cat /etc/apt/apt.conf.d/99-spice-retries
+        echo "=== Effective apt acquire settings ==="
+        apt-config dump Acquire::Retries Acquire::http::Timeout Acquire::https::Timeout Acquire::ForceIPv4
 
         echo "=== Active URIs in ubuntu.sources (deb822) ==="
         if [ -f /etc/apt/sources.list.d/ubuntu.sources ]; then

@@ -252,7 +252,17 @@ mod tests {
             "typesafe_ai_api_key".to_string(),
             SecretString::from("sk-test"),
         );
-        TypeSafeModelLister::from_params(&params).expect("alias key");
+        let lister = TypeSafeModelLister::from_params(&params).expect("alias key");
+        assert_eq!(lister.api_key.expose_secret(), "sk-test");
+        assert_eq!(lister.base_url, "https://api.typesafe.ai");
+
+        // With both spellings set, the canonical `typesafe_api_key` wins.
+        params.insert(
+            "typesafe_api_key".to_string(),
+            SecretString::from("sk-canonical"),
+        );
+        let lister = TypeSafeModelLister::from_params(&params).expect("both keys");
+        assert_eq!(lister.api_key.expose_secret(), "sk-canonical");
     }
 
     /// The documented listing shape uses `aliases`; dropping it makes the

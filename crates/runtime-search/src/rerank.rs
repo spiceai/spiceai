@@ -42,6 +42,7 @@ use arrow::array::{Array, ArrayRef, Float32Array, LargeStringArray, RecordBatch,
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use async_trait::async_trait;
 use datafusion::catalog::{Session, TableFunctionImpl, TableProvider};
+use datafusion::common::TableReference;
 use datafusion::common::{Column, exec_err};
 use datafusion::datasource::{DefaultTableSource, TableType};
 use datafusion::error::{DataFusionError, Result as DataFusionResult};
@@ -57,7 +58,6 @@ use datafusion::physical_plan::{
 };
 use datafusion::prelude::Expr;
 use datafusion::scalar::ScalarValue;
-use datafusion::sql::TableReference;
 use datafusion_expr::TableProviderFilterPushDown;
 use datafusion_expr::expr::ScalarFunction;
 use datafusion_expr::{LogicalPlanBuilder, ScalarFunctionArgs, ScalarUDFImpl};
@@ -905,6 +905,19 @@ impl TableProvider for RerankUDTFProvider {
             "RerankUDTFProvider does not support truncate".to_string(),
         ))
     }
+
+    async fn merge_into(
+        &self,
+        _state: &dyn datafusion::catalog::Session,
+        _source: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+        _merge_schema: datafusion::common::DFSchemaRef,
+        _on: Expr,
+        _clauses: Vec<datafusion::logical_expr::dml::MergeIntoClause>,
+    ) -> DataFusionResult<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        Err(DataFusionError::NotImplemented(
+            "RerankUDTFProvider does not support merge_into".to_string(),
+        ))
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1004,6 +1017,17 @@ impl ExecutionPlan for RerankExec {
 
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -1229,10 +1253,10 @@ mod tests {
     use arrow::util::pretty::pretty_format_batches;
     use async_trait::async_trait;
     use datafusion::catalog::TableProvider;
+    use datafusion::common::TableReference;
     use datafusion::logical_expr::expr::FieldMetadata;
     use datafusion::logical_expr::{Volatility, create_udf};
     use datafusion::prelude::SessionContext;
-    use datafusion::sql::TableReference;
     use runtime_query_engine::query_engine::QueryEngine;
     use runtime_request_context::{Protocol, RequestContext};
     use std::collections::BTreeMap;

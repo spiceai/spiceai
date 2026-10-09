@@ -15,7 +15,7 @@ limitations under the License.
 */
 use std::collections::HashSet;
 
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use spicepod::semantic::{Column, FullTextSearchConfig, IndexStore};
 
 use crate::dataset::FullTextSearchDatasetConfig;

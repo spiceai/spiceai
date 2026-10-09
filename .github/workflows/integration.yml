@@ -101,10 +101,12 @@ jobs:
           persist-credentials: false
           fetch-depth: 1
 
-      # Cache Cargo dependencies
-      - name: Cache Cargo registry
+      # Cache Cargo dependencies. Saved by the "Save Cargo registry" step at the
+      # end of this job, and never from the merge queue (see there).
+      - name: Restore Cargo registry
+        id: cargo-registry
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index/
@@ -250,6 +252,20 @@ jobs:
           path: ./integration_tests.tar.zst
           retention-days: 3
           compression-level: 1
+
+      # Not from the merge queue: a cache saved there is scoped to the queue
+      # entry's temporary `gh-readonly-queue/...` ref, which later entries and
+      # trunk cannot restore from, so each save there stored ~3 GiB that was
+      # almost never read. Merge-queue runs restore the cache trunk saves.
+      - name: Save Cargo registry
+        if: needs.check_changes.outputs.relevant_changes == 'true' && github.event_name != 'merge_group' && steps.cargo-registry.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ steps.cargo-registry.outputs.cache-primary-key }}
 
   test-partitions:
     name: Run Integration Tests (part ${{ matrix.label }})
@@ -408,6 +424,22 @@ jobs:
             INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --partition '${{ matrix.partition }}' --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=runtime::integration) - test(spiceai_integration_test) - test(/^github::/)'
           fi
 
+      - name: Configure apt mirrors for the retention OOM test
+        if: needs.check_changes.outputs.relevant_changes == 'true' && matrix.partition == 'count:1/3'
+        uses: ./.github/actions/configure-apt
+
+      # The retention OOM test packages its own debug test binary as the Docker build context
+      # and runs `strip --strip-debug` on it first. This job installs no C toolchain, so without
+      # binutils the test stages the unstripped binary (several GiB), and every attempt spends
+      # its 360s ceiling transferring and exporting that context before the workload starts.
+      - name: Install binutils for the retention OOM test
+        if: needs.check_changes.outputs.relevant_changes == 'true' && matrix.partition == 'count:1/3'
+        timeout-minutes: 5
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends binutils
+          strip --version | head -1
+
       - name: Run retention OOM regression test
         if: needs.check_changes.outputs.relevant_changes == 'true' && matrix.partition == 'count:1/3'
         # Sized to hold the test's whole retry budget, not one pass of it: nextest
@@ -454,25 +486,65 @@ jobs:
   # Three jobs rather than a matrix: a skipped matrix job publishes one check
   # under its unexpanded template name (`Integration Tests (part ${{ matrix.label }})`),
   # and the ruleset requires the three expanded names on the pull request head.
+  #
+  # `needs.test-partitions.result` folds the three matrix legs into one value,
+  # so a failure in one part would turn all three checks red. When it is not a
+  # success, each gate reads its own leg's conclusion from the jobs API and
+  # reports that, so the red check names the part that actually failed. If the
+  # lookup does not yield exactly one conclusion, the gate falls back to the
+  # combined result: it can only ever be as strict as before, never laxer.
   test-part-1:
     name: Integration Tests (part 1)
     needs: [check_changes, test-partitions, test-github]
     if: ${{ always() && github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      actions: read
     steps:
       - name: Require integration and GitHub results
         env:
+          GH_TOKEN: ${{ github.token }}
+          PART: '1'
           CHANGE_CHECK_RESULT: ${{ needs.check_changes.result }}
           RELEVANT_CHANGES: ${{ needs.check_changes.outputs.relevant_changes }}
           PARTITIONS_RESULT: ${{ needs.test-partitions.result }}
           GITHUB_RESULT: ${{ needs.test-github.result }}
         run: |
-          test "$CHANGE_CHECK_RESULT" = success
-          if [ "$RELEVANT_CHANGES" = true ]; then
-            test "$PARTITIONS_RESULT" = success
-            test "$GITHUB_RESULT" = success
+          set -euo pipefail
+          if [ "$CHANGE_CHECK_RESULT" != success ]; then
+            echo "::error::check_changes concluded '$CHANGE_CHECK_RESULT', so it is unknown whether this commit needed the integration suite."
+            exit 1
           fi
+          [ "$RELEVANT_CHANGES" = true ] || exit 0
+          ok=true
+          if [ "$GITHUB_RESULT" != success ]; then
+            echo "::error::'GitHub Connector Integration Tests' concluded '$GITHUB_RESULT'. Its log names the failing tests."
+            ok=false
+          fi
+          leg="Run Integration Tests (part $PART)"
+          result="$PARTITIONS_RESULT"
+          subject="The three 'Run Integration Tests' parts together"
+          if [ "$result" != success ]; then
+            own=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" \
+              --jq ".jobs[] | select(.name == \"$leg\") | .conclusion // \"none\"") || own=""
+            if [ "$(grep -c . <<<"$own" || true)" = 1 ]; then
+              result="$own"
+              subject="'$leg'"
+            else
+              echo "::warning::Could not read the conclusion of '$leg' alone, so this check reports the combined result of all three parts."
+            fi
+          fi
+          if [ "$result" = success ]; then
+            [ "$PARTITIONS_RESULT" = success ] || echo "$subject passed. Another part failed and is reported by its own check."
+          else
+            case "$result" in
+              failure) echo "::error::$subject concluded 'failure'. The failed job's log names the failing tests." ;;
+              *) echo "::error::$subject concluded '$result', which happens when 'Build Test Binary' did not succeed or the run was cancelled." ;;
+            esac
+            ok=false
+          fi
+          [ "$ok" = true ]
 
   test-part-2:
     name: Integration Tests (part 2)
@@ -480,19 +552,52 @@ jobs:
     if: ${{ always() && github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      actions: read
     steps:
       - name: Require integration and GitHub results
         env:
+          GH_TOKEN: ${{ github.token }}
+          PART: '2'
           CHANGE_CHECK_RESULT: ${{ needs.check_changes.result }}
           RELEVANT_CHANGES: ${{ needs.check_changes.outputs.relevant_changes }}
           PARTITIONS_RESULT: ${{ needs.test-partitions.result }}
           GITHUB_RESULT: ${{ needs.test-github.result }}
         run: |
-          test "$CHANGE_CHECK_RESULT" = success
-          if [ "$RELEVANT_CHANGES" = true ]; then
-            test "$PARTITIONS_RESULT" = success
-            test "$GITHUB_RESULT" = success
+          set -euo pipefail
+          if [ "$CHANGE_CHECK_RESULT" != success ]; then
+            echo "::error::check_changes concluded '$CHANGE_CHECK_RESULT', so it is unknown whether this commit needed the integration suite."
+            exit 1
           fi
+          [ "$RELEVANT_CHANGES" = true ] || exit 0
+          ok=true
+          if [ "$GITHUB_RESULT" != success ]; then
+            echo "::error::'GitHub Connector Integration Tests' concluded '$GITHUB_RESULT'. Its log names the failing tests."
+            ok=false
+          fi
+          leg="Run Integration Tests (part $PART)"
+          result="$PARTITIONS_RESULT"
+          subject="The three 'Run Integration Tests' parts together"
+          if [ "$result" != success ]; then
+            own=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" \
+              --jq ".jobs[] | select(.name == \"$leg\") | .conclusion // \"none\"") || own=""
+            if [ "$(grep -c . <<<"$own" || true)" = 1 ]; then
+              result="$own"
+              subject="'$leg'"
+            else
+              echo "::warning::Could not read the conclusion of '$leg' alone, so this check reports the combined result of all three parts."
+            fi
+          fi
+          if [ "$result" = success ]; then
+            [ "$PARTITIONS_RESULT" = success ] || echo "$subject passed. Another part failed and is reported by its own check."
+          else
+            case "$result" in
+              failure) echo "::error::$subject concluded 'failure'. The failed job's log names the failing tests." ;;
+              *) echo "::error::$subject concluded '$result', which happens when 'Build Test Binary' did not succeed or the run was cancelled." ;;
+            esac
+            ok=false
+          fi
+          [ "$ok" = true ]
 
   test-part-3:
     name: Integration Tests (part 3)
@@ -500,19 +605,52 @@ jobs:
     if: ${{ always() && github.event_name != 'pull_request' }}
     runs-on: ubuntu-latest
     timeout-minutes: 5
+    permissions:
+      actions: read
     steps:
       - name: Require integration and GitHub results
         env:
+          GH_TOKEN: ${{ github.token }}
+          PART: '3'
           CHANGE_CHECK_RESULT: ${{ needs.check_changes.result }}
           RELEVANT_CHANGES: ${{ needs.check_changes.outputs.relevant_changes }}
           PARTITIONS_RESULT: ${{ needs.test-partitions.result }}
           GITHUB_RESULT: ${{ needs.test-github.result }}
         run: |
-          test "$CHANGE_CHECK_RESULT" = success
-          if [ "$RELEVANT_CHANGES" = true ]; then
-            test "$PARTITIONS_RESULT" = success
-            test "$GITHUB_RESULT" = success
+          set -euo pipefail
+          if [ "$CHANGE_CHECK_RESULT" != success ]; then
+            echo "::error::check_changes concluded '$CHANGE_CHECK_RESULT', so it is unknown whether this commit needed the integration suite."
+            exit 1
           fi
+          [ "$RELEVANT_CHANGES" = true ] || exit 0
+          ok=true
+          if [ "$GITHUB_RESULT" != success ]; then
+            echo "::error::'GitHub Connector Integration Tests' concluded '$GITHUB_RESULT'. Its log names the failing tests."
+            ok=false
+          fi
+          leg="Run Integration Tests (part $PART)"
+          result="$PARTITIONS_RESULT"
+          subject="The three 'Run Integration Tests' parts together"
+          if [ "$result" != success ]; then
+            own=$(gh api --paginate "repos/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID/attempts/$GITHUB_RUN_ATTEMPT/jobs?per_page=100" \
+              --jq ".jobs[] | select(.name == \"$leg\") | .conclusion // \"none\"") || own=""
+            if [ "$(grep -c . <<<"$own" || true)" = 1 ]; then
+              result="$own"
+              subject="'$leg'"
+            else
+              echo "::warning::Could not read the conclusion of '$leg' alone, so this check reports the combined result of all three parts."
+            fi
+          fi
+          if [ "$result" = success ]; then
+            [ "$PARTITIONS_RESULT" = success ] || echo "$subject passed. Another part failed and is reported by its own check."
+          else
+            case "$result" in
+              failure) echo "::error::$subject concluded 'failure'. The failed job's log names the failing tests." ;;
+              *) echo "::error::$subject concluded '$result', which happens when 'Build Test Binary' did not succeed or the run was cancelled." ;;
+            esac
+            ok=false
+          fi
+          [ "$ok" = true ]
 
   upload-integration-snapshots:
     name: Upload Integration Snapshots
@@ -661,8 +799,9 @@ jobs:
             --archive-file ./integration_tests/integration_tests.tar.zst \
             --test-threads 1 -E 'binary_id(=runtime::integration) & test(/^github::/)'
 
+      # Pull request and merge-queue checks keep no diagnostic artifacts.
       - name: Upload GitHub permission diagnostics
-        if: always()
+        if: always() && github.event_name != 'pull_request' && github.event_name != 'merge_group'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: github-api-permissions

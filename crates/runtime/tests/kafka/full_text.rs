@@ -30,8 +30,6 @@ use crate::{
     utils::{register_test_connectors, test_request_context},
 };
 
-const KAFKA_PORT: u16 = 19094;
-
 #[tokio::test]
 async fn kafka_full_text_index() -> anyhow::Result<()> {
     let _tracing = init_tracing(Some("integration=debug,info"));
@@ -39,7 +37,8 @@ async fn kafka_full_text_index() -> anyhow::Result<()> {
     test_request_context()
         .scope(async {
             let (running_container, producer) =
-                start_kafka_docker_container(KAFKA_PORT, &["stack_qa"]).await?;
+                start_kafka_docker_container(&["stack_qa"]).await?;
+            let port = running_container.host_port(19092)?;
 
             tracing::debug!("Container started");
 
@@ -47,7 +46,7 @@ async fn kafka_full_text_index() -> anyhow::Result<()> {
             let stack_qa_json: Vec<serde_json::Value> = stack_qa_json();
             send_messages_to_kafka(&producer, "stack_qa", &stack_qa_json).await?;
 
-            let mut ds = make_kafka_dataset("stack_qa", "stack_qa", KAFKA_PORT, None);
+            let mut ds = make_kafka_dataset("stack_qa", "stack_qa", port, None);
             ds.columns =
                 vec![Column::new("title").with_full_text_search(
                     FullTextSearchConfig::enabled().with_row_id("question_id"),

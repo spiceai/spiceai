@@ -775,9 +775,27 @@ mod tests {
 
     #[test]
     fn rejects_non_object_payload() {
-        let _ = parse_json_to_hashmap(r#"["a","b"]"#).expect_err("array is not an object");
-        let _ = parse_json_to_hashmap(r#""just a string""#).expect_err("string is not an object");
-        let _ = parse_json_to_hashmap("not json").expect_err("invalid JSON");
+        // Valid JSON that is not an object is refused as the wrong shape...
+        for payload in [r#"["a","b"]"#, r#""just a string""#] {
+            let err = parse_json_to_hashmap(payload)
+                .expect_err("JSON that is not an object must be refused");
+            assert!(
+                matches!(err, Error::InvalidJsonFormat {}),
+                "{payload}: {err:?}"
+            );
+            assert_eq!(
+                err.to_string(),
+                "Invalid AWS secret value: a JSON object is expected"
+            );
+        }
+        // ...and text that is not JSON at all as a parse failure.
+        let err = parse_json_to_hashmap("not json").expect_err("invalid JSON");
+        assert!(matches!(err, Error::UnableToParseJson { .. }), "{err:?}");
+        assert!(
+            err.to_string()
+                .starts_with("Unable to parse AWS secret as JSON: "),
+            "{err}"
+        );
     }
 
     /// Ensures a `{:?}` print of the config never surfaces the raw

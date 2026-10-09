@@ -34,7 +34,7 @@ use runtime_checkpoint_postgres::PostgresDatasetCheckpointer;
 use crate::utils::test_request_context;
 use crate::{
     configure_test_datafusion, init_tracing,
-    postgres::common::{self, get_pg_params, get_random_port},
+    postgres::common::{self, get_pg_params},
     utils::{register_test_connectors, runtime_ready_check},
 };
 
@@ -45,8 +45,8 @@ async fn test_acceleration_postgres_checkpoint() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
-            let port: usize = get_random_port()?;
-            let running_container = common::start_postgres_docker_container(port).await?;
+            let running_container = common::start_postgres_docker_container().await?;
+            let port = usize::from(running_container.host_port(5432)?);
 
             let pool = common::get_postgres_connection_pool(port, None).await?;
 
@@ -164,8 +164,8 @@ async fn test_postgres_checkpoint_set_schema_preserves_the_freshness_clock()
 -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("integration=debug,info"));
 
-    let port: usize = get_random_port()?;
-    let running_container = common::start_postgres_docker_container(port).await?;
+    let running_container = common::start_postgres_docker_container().await?;
+    let port = usize::from(running_container.host_port(5432)?);
 
     let pool = Arc::new(common::get_postgres_connection_pool(port, None).await?);
     let checkpointer =

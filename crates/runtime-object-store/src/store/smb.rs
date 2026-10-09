@@ -26,12 +26,14 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Utc};
+use dashmap::DashMap;
 use futures::StreamExt;
 use futures::stream::BoxStream;
 use object_store::{
     Attributes, CopyMode, CopyOptions, GetOptions, GetResult, GetResultPayload, ListResult,
     MultipartUpload, ObjectMeta, ObjectStore, PutMode, PutMultipartOptions, PutOptions, PutPayload,
-    PutResult, path::Path,
+    PutResult,
+    path::{Path, PathPart},
 };
 use smb::{ShareSession, SmbConfig, SmbPool, WalWriter};
 use tokio::sync::{Mutex as TokioMutex, OnceCell};
@@ -84,7 +86,10 @@ const DEFAULT_SMB_PORT: u16 = 445;
 struct SMBConfig {
     server: String,
     port: u16,
-    share: String,
+    /// The share named by the URL this store was built from. It is the share
+    /// `test_connection` probes and the one an empty location refers to; every
+    /// other location names its own share (see [`SMBConfig::locate`]).
+    default_share: String,
     username: String,
     password: String,
     timeout: Option<Duration>,
@@ -95,12 +100,20 @@ impl std::fmt::Debug for SMBConfig {
         f.debug_struct("SMBConfig")
             .field("server", &self.server)
             .field("port", &self.port)
-            .field("share", &self.share)
+            .field("default_share", &self.default_share)
             .field("username", &self.username)
             .field("password", &"[REDACTED]")
             .field("timeout", &self.timeout)
             .finish()
     }
+}
+
+/// Where a location lives: the share named by its first segment and the
+/// share-relative path handed to the SMB client.
+#[derive(Debug, PartialEq, Eq)]
+struct ShareLocation<'a> {
+    share: &'a str,
+    path: &'a str,
 }
 
 impl SMBConfig {
@@ -117,44 +130,75 @@ impl SMBConfig {
         }
     }
 
-    fn display_path(&self, subpath: &str) -> String {
-        let without_share = self.normalize_subpath(subpath);
-        if without_share.is_empty() {
-            format!("smb://{}/{}", self.server, self.share)
+    fn display_path(&self, share: &str, path: &str) -> String {
+        if path.is_empty() {
+            format!("smb://{}/{share}", self.server)
         } else {
-            format!("smb://{}/{}/{}", self.server, self.share, without_share)
+            format!("smb://{}/{share}/{path}", self.server)
         }
     }
 
-    /// `DataFusion` emits paths that include the share name as the first segment.
-    /// This strips that prefix so we forward the share-relative portion to the
-    /// internal SMB client. Only strips when the share name occupies a full
-    /// path segment — `share="data"` against `"database/file"` is left alone.
-    fn normalize_subpath<'a>(&self, subpath: &'a str) -> &'a str {
-        let trimmed = subpath.trim_start_matches('/');
-        let share = self.share.as_str();
-        if trimmed == share {
-            return "";
+    /// Resolve a location to the share it names and the share-relative path
+    /// handed to the SMB client.
+    ///
+    /// One store serves every share on its host. The registry keys stores by
+    /// `smb://<host>:<port>`, and the URL `DataFusion` looks a store up with
+    /// at query time carries no path, so the share cannot be part of the key:
+    /// a store fixed to the share of the URL that first built it would answer
+    /// a second dataset on the same host with the wrong share's files. Every
+    /// location therefore carries its share as its first segment
+    /// (`data/sales/sales.csv` for `smb://host/data/sales/sales.csv`), and a
+    /// listed location is named under that same share (see [`reroot`]), which
+    /// is how `ListingTableUrl` keeps it and later reads it back through
+    /// `get`. An empty location is the root of the default share.
+    fn locate<'a>(&'a self, location: &'a str) -> ShareLocation<'a> {
+        let trimmed = location.trim_start_matches(['/', '\\']);
+        if trimmed.is_empty() {
+            return ShareLocation {
+                share: self.default_share.as_str(),
+                path: "",
+            };
         }
-        if let Some(rest) = trimmed.strip_prefix(share)
-            && matches!(rest.as_bytes().first().copied(), Some(b'/' | b'\\'))
-        {
-            return rest.trim_start_matches(['/', '\\']);
+        match trimmed.split_once(['/', '\\']) {
+            Some((share, rest)) => ShareLocation {
+                share,
+                path: rest.trim_start_matches(['/', '\\']),
+            },
+            None => ShareLocation {
+                share: trimmed,
+                path: "",
+            },
         }
-        trimmed
-    }
-
-    fn key_for(&self, path: &Path) -> String {
-        self.normalize_subpath(path.as_ref()).to_string()
     }
 }
 
+/// Name a share-relative listed object under its share, keeping the
+/// already-encoded parts of its location as they are.
+fn reroot_meta(share: &str, meta: ObjectMeta) -> ObjectMeta {
+    ObjectMeta {
+        location: reroot(share, &meta.location),
+        ..meta
+    }
+}
+
+fn reroot(share: &str, location: &Path) -> Path {
+    std::iter::once(PathPart::from(share))
+        .chain(location.parts())
+        .collect()
+}
+
 /// Inner state shared across all `Clone`s of a given `SMBObjectStore`.
-/// Wrapping the `OnceCell` in an `Arc` ensures that clones reuse the cached
-/// `ShareSession` rather than each establishing their own connection pool.
+///
+/// Sessions are cached per share so clones reuse an established connection
+/// pool rather than each opening their own, and a share whose connection
+/// failed is retried on its next use (a `OnceCell` left uninitialized by a
+/// failed `get_or_try_init` accepts another attempt). Each share owns a
+/// pool of its own: a `ShareSession` re-issues its tree connect against a
+/// slot it reconnects, so two shares on one pool would leave the other's
+/// tree id dangling after a reconnect.
 struct Inner {
     config: SMBConfig,
-    share: OnceCell<Arc<ShareSession>>,
+    shares: DashMap<String, Arc<OnceCell<Arc<ShareSession>>>>,
 }
 
 #[derive(Clone)]
@@ -164,9 +208,16 @@ pub struct SMBObjectStore {
 
 impl std::fmt::Debug for SMBObjectStore {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let connected: Vec<String> = self
+            .inner
+            .shares
+            .iter()
+            .filter(|entry| entry.value().initialized())
+            .map(|entry| entry.key().clone())
+            .collect();
         f.debug_struct("SMBObjectStore")
             .field("config", &self.inner.config)
-            .field("share_initialized", &self.inner.share.initialized())
+            .field("shares_connected", &connected)
             .finish()
     }
 }
@@ -194,12 +245,12 @@ impl SMBObjectStore {
                 config: SMBConfig {
                     server,
                     port: port.unwrap_or(DEFAULT_SMB_PORT),
-                    share,
+                    default_share: share,
                     username,
                     password,
                     timeout,
                 },
-                share: OnceCell::new(),
+                shares: DashMap::new(),
             }),
         }
     }
@@ -208,52 +259,67 @@ impl SMBObjectStore {
         &self.inner.config
     }
 
-    async fn get_share(&self) -> object_store::Result<Arc<ShareSession>> {
-        let share = self
+    /// The session for `share`, connecting on first use.
+    async fn get_share(&self, share: &str) -> object_store::Result<Arc<ShareSession>> {
+        // Take the cell out of the map before awaiting: a `DashMap` guard held
+        // across the connect would block every other share on this store. The
+        // lookup comes first so a known share costs no key allocation.
+        let existing = self
             .inner
-            .share
-            .get_or_try_init(|| async {
-                let pool = SmbPool::connect(self.config().to_smb_config(), DEFAULT_POOL_SIZE)
-                    .await
-                    .map_err(|e| object_store::Error::Generic {
-                        store: STORE_NAME,
-                        source: format!(
-                            "Failed to connect to SMB server smb://{}/{}. Verify host/credentials. Details: {e}",
-                            self.config().server, self.config().share
-                        )
-                        .into(),
-                    })?;
-                let session = ShareSession::connect(pool, &self.config().share).await.map_err(|e| {
-                    object_store::Error::Generic {
-                        store: STORE_NAME,
-                        source: format!(
-                            "Failed to connect to SMB share smb://{}/{}. Details: {e}",
-                            self.config().server, self.config().share
-                        )
-                        .into(),
-                    }
-                })?;
-                Ok::<_, object_store::Error>(Arc::new(session))
-            })
-            .await?;
-        Ok(Arc::clone(share))
+            .shares
+            .get(share)
+            .map(|cell| Arc::clone(cell.value()));
+        let cell = existing.unwrap_or_else(|| {
+            Arc::clone(&self.inner.shares.entry(share.to_string()).or_default())
+        });
+        let session = cell.get_or_try_init(|| self.connect_share(share)).await?;
+        Ok(Arc::clone(session))
     }
 
-    /// Test the connection to the SMB share.
+    async fn connect_share(&self, share: &str) -> object_store::Result<Arc<ShareSession>> {
+        let config = self.config();
+        let pool = SmbPool::connect(config.to_smb_config(), DEFAULT_POOL_SIZE)
+            .await
+            .map_err(|e| object_store::Error::Generic {
+                store: STORE_NAME,
+                source: format!(
+                    "Failed to connect to SMB server smb://{}/{share}. Verify host/credentials. Details: {e}",
+                    config.server
+                )
+                .into(),
+            })?;
+        let session =
+            ShareSession::connect(pool, share)
+                .await
+                .map_err(|e| object_store::Error::Generic {
+                    store: STORE_NAME,
+                    source: format!(
+                        "Failed to connect to SMB share smb://{}/{share}. Details: {e}",
+                        config.server
+                    )
+                    .into(),
+                })?;
+        Ok(Arc::new(session))
+    }
+
+    /// Test the connection to the share this store was built from.
     ///
     /// # Errors
     ///
     /// Returns an error if the connection cannot be established or the share is not accessible.
     pub async fn test_connection(&self) -> object_store::Result<()> {
-        self.get_share().await.map(|_| ())
+        self.get_share(&self.config().default_share)
+            .await
+            .map(|_| ())
     }
 
     async fn list_dir_entries(
-        share: &ShareSession,
+        session: &ShareSession,
         config: &SMBConfig,
+        share: &str,
         dir_path: &str,
     ) -> object_store::Result<Vec<DirEntry>> {
-        match share.list_directory(dir_path).await {
+        match session.list_directory(dir_path).await {
             Ok((files, dirs)) => {
                 let mut entries = Vec::with_capacity(files.len() + dirs.len());
                 for file in files {
@@ -269,7 +335,7 @@ impl SMBObjectStore {
                 Ok(entries)
             }
             Err(e) => {
-                let display_path = config.display_path(dir_path);
+                let display_path = config.display_path(share, dir_path);
                 // Only swallow the specific server-reported "not a directory"
                 // signals — `STATUS_NOT_A_DIRECTORY` (mapped to
                 // `io::ErrorKind::NotADirectory`) and `STATUS_NO_SUCH_FILE`
@@ -300,18 +366,18 @@ impl SMBObjectStore {
         &self,
         prefix: Option<String>,
     ) -> object_store::Result<Vec<ObjectMeta>> {
-        let share = self.get_share().await?;
         let config = self.config();
         let prefix_str = prefix.unwrap_or_default();
-        let normalized = config.normalize_subpath(&prefix_str).to_string();
+        let ShareLocation { share, path } = config.locate(&prefix_str);
+        let session = self.get_share(share).await?;
 
         let mut results = Vec::new();
-        let mut queue = vec![normalized];
+        let mut queue = vec![path.to_string()];
 
         while let Some(dir_path) = queue.pop() {
-            let entries = Self::list_dir_entries(&share, config, &dir_path).await?;
+            let entries = Self::list_dir_entries(&session, config, share, &dir_path).await?;
             let (files, dirs) = process_directory_entries(&dir_path, entries);
-            results.extend(files);
+            results.extend(files.into_iter().map(|meta| reroot_meta(share, meta)));
             queue.extend(dirs);
         }
 
@@ -322,12 +388,16 @@ impl SMBObjectStore {
         &self,
         prefix: Option<&Path>,
     ) -> object_store::Result<ListResult> {
-        let share = self.get_share().await?;
+        let config = self.config();
         let prefix_str = prefix.map_or(String::new(), Path::to_string);
-        let normalized = self.config().normalize_subpath(&prefix_str).to_string();
+        let ShareLocation { share, path } = config.locate(&prefix_str);
+        let session = self.get_share(share).await?;
 
-        let entries = Self::list_dir_entries(&share, self.config(), &normalized).await?;
-        Ok(process_directory_entries_shallow(&normalized, entries))
+        let entries = Self::list_dir_entries(&session, config, share, path).await?;
+        Ok(reroot_listing(
+            share,
+            process_directory_entries_shallow(path, entries),
+        ))
     }
 
     /// Put the payload to the SMB share without a concat-copy.
@@ -385,6 +455,22 @@ impl SMBObjectStore {
     }
 }
 
+/// Name every object and common prefix of a share-relative listing under `share`.
+fn reroot_listing(share: &str, listing: ListResult) -> ListResult {
+    ListResult {
+        common_prefixes: listing
+            .common_prefixes
+            .into_iter()
+            .map(|prefix| reroot(share, &prefix))
+            .collect(),
+        objects: listing
+            .objects
+            .into_iter()
+            .map(|meta| reroot_meta(share, meta))
+            .collect(),
+    }
+}
+
 /// Map an `io::Error` from a put operation into an `object_store::Error`.
 /// `AlreadyExists` is preserved with the supplied path so callers (esp.
 /// `PutMode::Create` and `copy_if_not_exists`) get the typed
@@ -420,15 +506,15 @@ impl ObjectStore for SMBObjectStore {
             });
         }
 
-        let share = self.get_share().await?;
-        let key = self.config().key_for(location);
+        let ShareLocation { share, path } = self.config().locate(location.as_ref());
+        let session = self.get_share(share).await?;
 
         // `PutMode::Create` is enforced atomically inside `put_streaming` via
         // SMB `FILE_CREATE` (single-chunk fast path) or via WAL + rename
         // with `replace_if_exists=false` (multi-chunk path). The previous
         // head-then-write check had a TOCTOU window; the server-side
         // primitive closes it.
-        self.put_streaming(&share, &key, location, payload, opts.mode)
+        self.put_streaming(&session, path, location, payload, opts.mode)
             .await
     }
 
@@ -437,12 +523,12 @@ impl ObjectStore for SMBObjectStore {
         location: &Path,
         _opts: PutMultipartOptions,
     ) -> object_store::Result<Box<dyn MultipartUpload>> {
-        let share = self.get_share().await?;
-        let key = self.config().key_for(location);
+        let ShareLocation { share, path } = self.config().locate(location.as_ref());
+        let session = self.get_share(share).await?;
 
-        let writer = share.open_wal_write(&key).await.map_err(handle_error)?;
+        let writer = session.open_wal_write(path).await.map_err(handle_error)?;
 
-        Ok(Box::new(SMBMultipartUpload::new(share, writer)))
+        Ok(Box::new(SMBMultipartUpload::new(session, writer)))
     }
 
     async fn get_opts(
@@ -450,14 +536,14 @@ impl ObjectStore for SMBObjectStore {
         location: &Path,
         options: GetOptions,
     ) -> object_store::Result<GetResult> {
-        let share = self.get_share().await?;
-        let key = self.config().key_for(location);
+        let ShareLocation { share, path } = self.config().locate(location.as_ref());
+        let session = self.get_share(share).await?;
 
         // Head first so we can size-gate the read *before* buffering anything.
         // This costs one extra round trip vs. the unbounded compound path but
         // eliminates the OOM risk on oversized files.
-        let meta = share
-            .head_object(&key)
+        let meta = session
+            .head_object(path)
             .await
             .map_err(|e| map_head_error(e, location.to_string()))?;
 
@@ -480,8 +566,8 @@ impl ObjectStore for SMBObjectStore {
         let (start, end, _to_read) = resolve_range(options.range.as_ref(), meta.size);
         guard_read_size(end.saturating_sub(start))?;
 
-        let data = share
-            .get_object_range(&key, start, end)
+        let data = session
+            .get_object_range(path, start, end)
             .await
             .map_err(handle_error)?;
         let bytes_data = Bytes::from(data);
@@ -505,9 +591,9 @@ impl ObjectStore for SMBObjectStore {
                 let store = store.clone();
                 async move {
                     let location = res?;
-                    let share = store.get_share().await?;
-                    let key = store.config().key_for(&location);
-                    share.delete_object(&key).await.map_err(handle_error)?;
+                    let ShareLocation { share, path } = store.config().locate(location.as_ref());
+                    let session = store.get_share(share).await?;
+                    session.delete_object(path).await.map_err(handle_error)?;
                     Ok(location)
                 }
             })
@@ -551,18 +637,29 @@ impl ObjectStore for SMBObjectStore {
         to: &Path,
         options: CopyOptions,
     ) -> object_store::Result<()> {
-        let share = self.get_share().await?;
-        let src_key = self.config().key_for(from);
-        let dst_key = self.config().key_for(to);
+        let src = self.config().locate(from.as_ref());
+        let dst = self.config().locate(to.as_ref());
+        if src.share != dst.share {
+            // A server-side copy runs inside one tree connect, so it cannot
+            // cross shares.
+            return Err(object_store::Error::NotSupported {
+                source: format!(
+                    "SMB copy from share '{}' to share '{}' is not supported; copies stay within one share",
+                    src.share, dst.share
+                )
+                .into(),
+            });
+        }
+        let session = self.get_share(src.share).await?;
 
         match options.mode {
-            CopyMode::Overwrite => share
-                .copy_object(&src_key, &dst_key)
+            CopyMode::Overwrite => session
+                .copy_object(src.path, dst.path)
                 .await
                 .map(|_| ())
                 .map_err(handle_error),
-            CopyMode::Create => share
-                .copy_object_create_only(&src_key, &dst_key)
+            CopyMode::Create => session
+                .copy_object_create_only(src.path, dst.path)
                 .await
                 .map(|_| ())
                 .map_err(|e| map_put_error(e, to.to_string())),
@@ -743,31 +840,90 @@ mod tests {
         assert_eq!(store.config().port, 1445);
     }
 
-    #[test]
-    fn test_normalize_subpath_strips_share_prefix() {
-        let config = SMBConfig {
-            server: "192.168.1.100".to_string(),
+    fn fixture_config(default_share: &str) -> SMBConfig {
+        SMBConfig {
+            server: "server".to_string(),
             port: DEFAULT_SMB_PORT,
-            share: "myshare".to_string(),
+            default_share: default_share.to_string(),
             username: fixture_user(),
             password: fixture_password(),
             timeout: None,
-        };
+        }
+    }
 
+    fn at<'a>(share: &'a str, path: &'a str) -> ShareLocation<'a> {
+        ShareLocation { share, path }
+    }
+
+    #[test]
+    fn test_locate_reads_the_share_from_the_first_segment() {
+        let config = fixture_config("data");
         assert_eq!(
-            config.normalize_subpath("myshare/data/file.parquet"),
-            "data/file.parquet"
+            config.locate("data/sales/file.parquet"),
+            at("data", "sales/file.parquet")
         );
         assert_eq!(
-            config.normalize_subpath("data/file.parquet"),
-            "data/file.parquet"
+            config.locate("/data/sales/file.parquet"),
+            at("data", "sales/file.parquet")
         );
-        assert_eq!(config.normalize_subpath(""), "");
-        assert_eq!(config.normalize_subpath("myshare"), "");
+        assert_eq!(config.locate("/data/sales/"), at("data", "sales/"));
+        assert_eq!(config.locate("data"), at("data", ""));
         assert_eq!(
-            config.normalize_subpath("/myshare/data/file.parquet"),
-            "data/file.parquet"
+            config.locate("data\\sales\\x.csv"),
+            at("data", "sales\\x.csv")
         );
+        // A directory inside the share named like the share: only the first
+        // segment is the share.
+        assert_eq!(config.locate("data/data"), at("data", "data"));
+        // An empty location is the root of the default share.
+        assert_eq!(config.locate(""), at("data", ""));
+        assert_eq!(config.locate("/"), at("data", ""));
+    }
+
+    /// Regression test for #14550: a location on another share of the same
+    /// host is served from that share, not from the one the store was built
+    /// from.
+    #[test]
+    fn test_locate_serves_every_share_on_the_host() {
+        let config = fixture_config("data");
+        assert_eq!(config.locate("other/o.csv"), at("other", "o.csv"));
+        assert_eq!(config.locate("other"), at("other", ""));
+        assert_eq!(config.locate("database/file"), at("database", "file"));
+    }
+
+    /// Regression test for #14060: a listing of `data/sales` must return
+    /// locations under `data/sales/`, or `ListingTableUrl` drops every one.
+    #[test]
+    fn test_listing_locations_carry_the_share_segment() {
+        let config = fixture_config("data");
+        let ShareLocation { share, path } = config.locate("data/sales");
+        let modified = epoch_secs_to_datetime(0);
+        let listing = reroot_listing(
+            share,
+            process_directory_entries_shallow(
+                path,
+                vec![
+                    DirEntry::file("sales.parquet".to_string(), 10, modified),
+                    DirEntry::directory("sub".to_string()),
+                ],
+            ),
+        );
+        let requested = Path::from("data/sales");
+        assert_eq!(
+            listing.objects[0].location,
+            Path::from("data/sales/sales.parquet")
+        );
+        assert_eq!(listing.common_prefixes, vec![Path::from("data/sales/sub")]);
+        assert!(listing.objects[0].location.prefix_matches(&requested));
+        assert_eq!(listing.objects[0].size, 10);
+    }
+
+    #[test]
+    fn test_reroot_keeps_encoded_parts() {
+        let location = Path::from("sales/100% done.csv");
+        let rerooted = reroot("data", &location);
+        assert_eq!(rerooted, Path::from("data/sales/100% done.csv"));
+        assert_eq!(rerooted.as_ref(), "data/sales/100%25 done.csv");
     }
 
     #[test]
@@ -779,19 +935,15 @@ mod tests {
 
     #[test]
     fn test_display_path_formats() {
-        let config = SMBConfig {
-            server: "server".to_string(),
-            port: DEFAULT_SMB_PORT,
-            share: "share".to_string(),
-            username: fixture_user(),
-            password: fixture_password(),
-            timeout: None,
-        };
-        assert_eq!(config.display_path(""), "smb://server/share");
-        assert_eq!(config.display_path("share"), "smb://server/share");
+        let config = fixture_config("share");
+        assert_eq!(config.display_path("share", ""), "smb://server/share");
         assert_eq!(
-            config.display_path("share/dir/file"),
+            config.display_path("share", "dir/file"),
             "smb://server/share/dir/file"
+        );
+        assert_eq!(
+            config.display_path("other", "o.csv"),
+            "smb://server/other/o.csv"
         );
     }
 
@@ -799,7 +951,20 @@ mod tests {
     fn test_guard_read_size() {
         guard_read_size(1024).expect("small reads are allowed");
         guard_read_size(MAX_BUFFERED_READ).expect("exactly at cap is allowed");
-        assert!(guard_read_size(MAX_BUFFERED_READ + 1).is_err());
+        let err = guard_read_size(MAX_BUFFERED_READ + 1)
+            .expect_err("one byte over the cap must be refused");
+        let object_store::Error::Generic { store, source } = &err else {
+            panic!("expected a generic SMB store error, got {err:?}");
+        };
+        assert_eq!(*store, STORE_NAME);
+        assert_eq!(
+            source.to_string(),
+            "SMB read of 2147483649 bytes exceeds 2147483648-byte cap; reduce range or stream"
+        );
+        assert_eq!(
+            err.to_string(),
+            "Generic SMB error: SMB read of 2147483649 bytes exceeds 2147483648-byte cap; reduce range or stream"
+        );
     }
 
     // ── Multipart upload "already finalized" semantics ──────────────────

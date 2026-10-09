@@ -135,10 +135,10 @@ async fn bigint_primary_key_write_back_reaches_the_source() -> Result<(), anyhow
 
     test_request_context()
         .scope(async {
-            let port = common::get_random_port()?;
-            let _container = common::start_postgres_docker_container_with_logical_wal(port)
+            let container = common::start_postgres_docker_container_with_logical_wal()
                 .await
                 .map_err(|e| anyhow!("start container: {e}"))?;
+            let port = usize::from(container.host_port(5432)?);
 
             let mut source = common::connect(u16::try_from(port)?).await?;
             seed_counter(&source).await?;

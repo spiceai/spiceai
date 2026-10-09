@@ -19,6 +19,7 @@ use std::{fmt, sync::Arc};
 use crate::mssql::{ConnectionPoolSnafu, QuerySnafu, convert::rows_to_arrow};
 use arrow::datatypes::SchemaRef;
 use datafusion::{
+    common::TableReference,
     common::utils::quote_identifier,
     error::{DataFusionError, Result as DataFusionResult},
     execution::TaskContext,
@@ -30,7 +31,7 @@ use datafusion::{
         execution_plan::{Boundedness, EmissionType},
         stream::RecordBatchStreamAdapter,
     },
-    sql::{TableReference, unparser::Unparser},
+    sql::unparser::Unparser,
 };
 use futures::StreamExt;
 use snafu::ResultExt;
@@ -193,6 +194,20 @@ impl ExecutionPlan for SqlServerExecPlan {
 
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
+    }
+
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        datafusion::physical_plan::apply_expression_roots(
+            self.sort_exprs.iter().map(|sort_expr| &sort_expr.expr),
+            f,
+        )
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {

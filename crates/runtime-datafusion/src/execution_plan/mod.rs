@@ -14,14 +14,16 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use datafusion::catalog::Session;
+use datafusion::catalog::{Session, TableProvider};
 use datafusion::common::ToDFSchema;
 use datafusion::error::Result;
 use datafusion::execution::context::SessionState;
 use datafusion::logical_expr::{BinaryExpr, Expr, Operator};
 use datafusion::physical_expr::create_physical_expr;
-use datafusion::physical_plan::ExecutionPlan;
+use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
 use datafusion::physical_plan::filter::FilterExec;
+use datafusion::physical_plan::{ExecutionPlan, ExecutionPlanProperties};
+use datafusion::physical_planner::DefaultPhysicalPlanner;
 use std::sync::Arc;
 
 pub mod fallback_on_zero_results;
@@ -31,7 +33,7 @@ pub mod tee;
 
 #[derive(Clone)]
 pub struct TableScanParams {
-    state: SessionState,
+    state: Arc<SessionState>,
     projection: Option<Vec<usize>>,
     filters: Vec<Expr>,
     limit: Option<usize>,
@@ -53,12 +55,55 @@ impl TableScanParams {
             panic!("Failed to downcast Session to SessionState");
         };
         Self {
-            state: session_state.clone(),
+            state: Arc::new(session_state.clone()),
             projection: projection.cloned(),
             filters: filters.to_vec(),
             limit,
         }
     }
+
+    /// Builds a scan with residual filters and optimizes it into one output partition.
+    ///
+    /// Use this for scans created during execution, outside the query's physical
+    /// optimization pass. `filters_to_reapply` contains only predicates that the
+    /// provider does not enforce exactly, including any caller-isolation predicate.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if scanning, residual filtering or physical optimization fails.
+    pub async fn scan_and_optimize(
+        &self,
+        provider: &dyn TableProvider,
+        filters_to_reapply: &[Expr],
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        let input = provider
+            .scan(
+                self.state.as_ref(),
+                self.projection.as_ref(),
+                &self.filters,
+                // A provider cannot safely truncate rows before residual filtering.
+                self.limit.filter(|_| filters_to_reapply.is_empty()),
+            )
+            .await?;
+        let input = wrap_with_filter(input, self.state.as_ref(), filters_to_reapply)?;
+        optimize_single_partition_plan(input, &self.state)
+    }
+}
+
+/// Applies the caller's physical optimizer rules to a late-built subtree and
+/// coalesces every resulting partition into its single output stream.
+fn optimize_single_partition_plan(
+    plan: Arc<dyn ExecutionPlan>,
+    session_state: &SessionState,
+) -> Result<Arc<dyn ExecutionPlan>> {
+    let mut optimized =
+        DefaultPhysicalPlanner::default().optimize_physical_plan(plan, session_state, |_, _| {})?;
+
+    if optimized.output_partitioning().partition_count() > 1 {
+        optimized = Arc::new(CoalescePartitionsExec::new(optimized));
+    }
+
+    Ok(optimized)
 }
 
 /// Wraps an input `ExecutionPlan` with a `FilterExec` for the given filters.
@@ -103,6 +148,7 @@ pub fn wrap_with_filter(
         &joined_filters,
         &input_dfschema,
         session_state.execution_props(),
+        &datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext::default(),
     )?;
 
     let filtered_input = FilterExec::try_new(physical_expr, input)?;
@@ -134,6 +180,7 @@ pub(crate) fn filter_plan(
         &joined_filters,
         &input_dfschema,
         scan_params.state.execution_props(),
+        &datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext::default(),
     )?;
 
     let filtered_input = FilterExec::try_new(physical_expr, input)?;

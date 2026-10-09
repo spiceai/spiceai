@@ -181,7 +181,7 @@ impl ClusterHarness {
         let Some(registry) = self.executor_registry.as_ref() else {
             return counts;
         };
-        let table_ref = datafusion::sql::TableReference::parse_str(table);
+        let table_ref = datafusion::common::TableReference::parse_str(table);
         let Some(metadata) = registry
             .accelerations_partition_store()
             .get_cached_table_metadata(&table_ref)

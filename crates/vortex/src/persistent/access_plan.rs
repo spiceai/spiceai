@@ -9,8 +9,10 @@ use datafusion_common::Statistics;
 use datafusion_datasource::PartitionedFile;
 use datafusion_physical_expr::PhysicalExprRef;
 use object_store::ObjectMeta;
+use vortex::buffer::Buffer;
 use vortex::layout::scan::scan_builder::ScanBuilder;
 use vortex::scan::selection::Selection;
+use vortex::scan::strict_sorted_buffer::StrictSortedBuffer;
 
 /// Custom Vortex-specific information that can be provided by external indexes or other sources.
 ///
@@ -74,6 +76,7 @@ impl VortexAccessPlan {
 
 impl VortexAccessPlan {
     /// Returns the selection, if one was set.
+    #[must_use]
     pub fn selection(&self) -> Option<&Selection> {
         self.selection.as_ref()
     }
@@ -104,6 +107,7 @@ impl VortexAccessPlan {
     }
 
     /// Apply the plan to the scan's builder.
+    #[must_use]
     pub fn apply_to_builder<A>(&self, mut scan_builder: ScanBuilder<A>) -> ScanBuilder<A>
     where
         A: 'static + Send,
@@ -115,6 +119,29 @@ impl VortexAccessPlan {
         }
 
         scan_builder
+    }
+}
+
+/// A selection that reads exactly the rows at `positions`.
+///
+/// Vortex requires a by-index selection to be strictly increasing. Positions that are not
+/// (unsorted or repeated) select the same set of rows through a roaring bitmap instead, so
+/// the rows read never depend on the order `positions` arrive in.
+#[must_use]
+pub fn include_by_index(positions: &Buffer<u64>) -> Selection {
+    match StrictSortedBuffer::try_new(positions.clone()) {
+        Ok(rows) => Selection::IncludeByIndex(rows),
+        Err(_) => Selection::IncludeRoaring(positions.iter().copied().collect()),
+    }
+}
+
+/// A selection that reads every row except those at `positions`; see [`include_by_index`]
+/// for how positions that are not strictly increasing are handled.
+#[must_use]
+pub fn exclude_by_index(positions: &Buffer<u64>) -> Selection {
+    match StrictSortedBuffer::try_new(positions.clone()) {
+        Ok(rows) => Selection::ExcludeByIndex(rows),
+        Err(_) => Selection::ExcludeRoaring(positions.iter().copied().collect()),
     }
 }
 
@@ -135,16 +162,18 @@ fn intersect_selections(left: &Selection, right: &Selection) -> Selection {
     match (left, right) {
         (Selection::All, other) | (other, Selection::All) => other.clone(),
         (Selection::IncludeByIndex(rows), other) | (other, Selection::IncludeByIndex(rows)) => {
-            Selection::IncludeByIndex(
-                rows.iter()
+            include_by_index(
+                &rows
+                    .iter()
                     .copied()
                     .filter(|&position| selection_keeps(other, position))
                     .collect(),
             )
         }
         (Selection::IncludeRoaring(rows), other) | (other, Selection::IncludeRoaring(rows)) => {
-            Selection::IncludeByIndex(
-                rows.iter()
+            include_by_index(
+                &rows
+                    .iter()
                     .filter(|&position| selection_keeps(other, position))
                     .collect(),
             )
@@ -156,7 +185,7 @@ fn intersect_selections(left: &Selection, right: &Selection) -> Selection {
             let mut excluded: Vec<u64> = excluded_rows(left).chain(excluded_rows(right)).collect();
             excluded.sort_unstable();
             excluded.dedup();
-            Selection::ExcludeByIndex(excluded.into_iter().collect())
+            exclude_by_index(&excluded.into_iter().collect())
         }
     }
 }
@@ -173,8 +202,6 @@ fn excluded_rows(selection: &Selection) -> Box<dyn Iterator<Item = u64> + '_> {
 
 #[cfg(test)]
 mod tests {
-    use vortex::buffer::Buffer;
-
     use super::*;
 
     fn plan(selection: Option<Selection>) -> VortexAccessPlan {
@@ -201,10 +228,10 @@ mod tests {
         let selections = [
             None,
             Some(Selection::All),
-            Some(Selection::IncludeByIndex(include)),
-            Some(Selection::IncludeByIndex(Buffer::empty())),
-            Some(Selection::ExcludeByIndex(exclude)),
-            Some(Selection::ExcludeByIndex(exclude_other)),
+            Some(include_by_index(&include)),
+            Some(include_by_index(&Buffer::empty())),
+            Some(exclude_by_index(&exclude)),
+            Some(exclude_by_index(&exclude_other)),
             Some(Selection::IncludeRoaring(
                 roaring_rows.into_iter().collect(),
             )),
@@ -229,5 +256,20 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// Positions that are not strictly increasing still select exactly their set of rows.
+    #[test]
+    fn unsorted_or_repeated_positions_select_the_same_rows() {
+        let total = 8;
+        let unsorted: Buffer<u64> = [5u64, 1, 5, 3].into_iter().collect();
+        assert_eq!(
+            rows_read(&plan(Some(include_by_index(&unsorted))), total),
+            vec![1, 3, 5]
+        );
+        assert_eq!(
+            rows_read(&plan(Some(exclude_by_index(&unsorted))), total),
+            vec![0, 2, 4, 6, 7]
+        );
     }
 }

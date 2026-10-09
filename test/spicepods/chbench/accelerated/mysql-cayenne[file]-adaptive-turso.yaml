@@ -31,10 +31,22 @@ name: mysql-cayenne[file]-adaptive-turso
 #
 # sql_results / task_history stay off to match the baseline, so a
 # comparison isolates the effect of adaptive tuning, not caching/history overhead.
+#
+# DATALAKE (COLD) TIER: the six high-volume CDC tables (district, customer, new_order, oorder,
+# order_line, stock) also carry the datalake tier, so this config runs all three storage tiers:
+# RAM mem-tier -> warm local-disk Vortex -> cold object store. No datalake knob is an adaptive
+# actuator, and only the tier's location and credentials are set, so warm data moves on the
+# engine default trigger: 16 x the 512 MB cold file size (8 GiB) of warm data. Small scale
+# factors stay below it. warehouse and the full-refresh reference tables stay on the warm tier.
+# The cold store is the shared MinIO (`s3://benchmarks`). Each run writes under its own prefix,
+# the Actions run id, so the HTAP workflow can delete that run's objects afterwards without
+# touching a concurrent run's.
+# spiced does not resolve `${env:…}` in `cayenne_datalake_location` yet (#14711), so the HTAP
+# workflow substitutes the run id into it before spiced starts. A move holds the table's write
+# lock for its whole duration (#12849), so CDC apply on that table pauses while it runs.
 
 # All `refresh_mode: changes` datasets coalesce onto ONE shared binlog dump
-# (server_id derived from the connection identity - the engine default). The
-# -split variant pins distinct per-dataset server_ids for separate dumps.
+# (server_id derived from the connection identity - the engine default).
 mysql_connection_params: &mysql_params
   mysql_host: ${env:CHBENCH_MYSQL_HOST}
   mysql_tcp_port: 3306
@@ -90,7 +102,13 @@ datasets:
         cdc_prefetch_buffer: '16384'
         cdc_max_coalesced_envelopes: '16384'
         cdc_max_coalesced_bytes: '536870912'
-        cdc_max_coalesce_age_ms: '2000'
+        # A 500 ms linger is the knee of the freshness/query trade-off once per-shard PK-index rebuilds are
+        # off the apply path (#14555). Measured on MySQL SF-100 at 3 000 txn/s, 600 s, two runs per setting:
+        #   2000 ms: worst-table freshness P99 2 826 ms, query geomean 903 ms
+        #    500 ms: 1 416 ms, 934 ms (+3.4 %, within run spread)
+        #    250 ms: 1 190 ms, 973 ms (+7.7 %)
+        #      0 ms: one apply per transaction, half the query throughput
+        cdc_max_coalesce_age_ms: '500'
         # The only line that differs from the sqlite-default adaptive twin: select the Turso
         # metastore backend. This is a structural backend choice, not a tunable actuator, so it
         # does not pin any knob under adaptive tuning.
@@ -105,42 +123,52 @@ datasets:
     params:
       <<: *mysql_params
       mysql_replication_initial_snapshot: auto
-    acceleration: *cayenne_accel
+    acceleration: &cayenne_accel_cold
+      <<: *cayenne_accel
+      params:
+        <<: *cayenne_params
+        # Datalake (cold) tier: location and credentials only (see the header).
+        cayenne_datalake_location: s3://benchmarks/cayenne-datalake/${env:GITHUB_RUN_ID}/
+        cayenne_datalake_s3_auth: key
+        cayenne_datalake_s3_endpoint: ${secrets:S3_ENDPOINT}
+        cayenne_datalake_s3_key: ${secrets:S3_KEY}
+        cayenne_datalake_s3_secret: ${secrets:S3_SECRET}
+        cayenne_datalake_s3_allow_http: 'true'
 
   - from: mysql:customer
     name: customer
     params:
       <<: *mysql_params
       mysql_replication_initial_snapshot: auto
-    acceleration: *cayenne_accel
+    acceleration: *cayenne_accel_cold
 
   - from: mysql:new_order
     name: new_order
     params:
       <<: *mysql_params
       mysql_replication_initial_snapshot: auto
-    acceleration: *cayenne_accel
+    acceleration: *cayenne_accel_cold
 
   - from: mysql:oorder
     name: oorder
     params:
       <<: *mysql_params
       mysql_replication_initial_snapshot: auto
-    acceleration: *cayenne_accel
+    acceleration: *cayenne_accel_cold
 
   - from: mysql:order_line
     name: order_line
     params:
       <<: *mysql_params
       mysql_replication_initial_snapshot: auto
-    acceleration: *cayenne_accel
+    acceleration: *cayenne_accel_cold
 
   - from: mysql:stock
     name: stock
     params:
       <<: *mysql_params
       mysql_replication_initial_snapshot: auto
-    acceleration: *cayenne_accel
+    acceleration: *cayenne_accel_cold
 
   # ---- Static reference tables (no OLTP mutations, full refresh) ----
   # Same: the PK comes from schema inference (always on); on_conflict is seeded only

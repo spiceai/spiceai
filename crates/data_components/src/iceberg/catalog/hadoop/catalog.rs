@@ -471,8 +471,11 @@ impl Catalog for HadoopCatalog {
         let metadata_file_content = metadata_file.read().await?;
         let table_metadata = serde_json::from_slice::<TableMetadata>(&metadata_file_content)?;
 
+        // A table without its metadata location cannot be served to another
+        // Iceberg client, which reads the table from that file.
         Table::builder()
             .metadata(table_metadata)
+            .metadata_location(metadata_file.location())
             .identifier(table_identifier.clone())
             .file_io(self.file_io.clone())
             .runtime(Runtime::current())

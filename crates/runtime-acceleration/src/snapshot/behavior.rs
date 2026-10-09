@@ -30,6 +30,13 @@ const SNAPSHOTS_ENABLED: bool = true;
 #[cfg(not(feature = "snapshots"))]
 const SNAPSHOTS_ENABLED: bool = false;
 
+/// Whether this build of Spice includes acceleration snapshots. When it does not,
+/// [`SNAPSHOTS_ENTERPRISE_ONLY_MESSAGE`] explains where to get them.
+#[must_use]
+pub const fn snapshots_enabled() -> bool {
+    SNAPSHOTS_ENABLED
+}
+
 /// The behavior of snapshots for individual accelerated datasets.
 #[derive(Debug, Clone, Default)]
 pub enum SnapshotBehavior {

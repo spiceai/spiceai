@@ -300,6 +300,7 @@ mod tests {
         Decimal128Array, Float64Array, RecordBatch, StringViewArray, UInt64Array,
     };
     use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use datafusion::common::TableReference;
     use datafusion::config::ConfigOptions;
     use datafusion::execution::TaskContext;
     use datafusion::functions_aggregate::average::avg_udaf;
@@ -313,12 +314,12 @@ mod tests {
     use datafusion::physical_plan::coalesce_partitions::CoalescePartitionsExec;
     use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
     use datafusion::physical_plan::union::UnionExec;
+    use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
     use datafusion::physical_plan::{
         DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
         SendableRecordBatchStream, collect,
     };
     use datafusion::scalar::ScalarValue;
-    use datafusion::sql::TableReference;
     use datafusion_datasource::memory::MemorySourceConfig;
     use flight_client::cookie::CookieStore;
     use std::fmt;
@@ -488,7 +489,10 @@ mod tests {
             .into_iter()
             .map(|c| replace_pushdown_with_memory(Arc::clone(c), data))
             .collect::<Result<_>>()?;
-        plan.with_new_children(new_children)
+        plan.replace_children(
+            new_children,
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
     }
 
     fn plan_display(plan: &Arc<dyn ExecutionPlan>) -> String {
@@ -537,13 +541,10 @@ mod tests {
         )?;
 
         let optimized = optimize(plan)?;
-        insta::assert_snapshot!(plan_display(&optimized), @r#"
-        AggregateExec: mode=Final, gby=[l_returnflag@0 as l_returnflag], aggr=[sum(l_quantity), count(*)]
-          CoalescePartitionsExec
-            UnionExec
-              PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", SUM("l_quantity") AS "__agg_0", COUNT(1) AS "__agg_1" FROM foo.foo.lineitem GROUP BY "l_returnflag"
-              PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", SUM("l_quantity") AS "__agg_0", COUNT(1) AS "__agg_1" FROM foo.foo.lineitem GROUP BY "l_returnflag"
-        "#);
+        insta::assert_snapshot!(
+            "pushdown_sum_count_with_groupby_optimized_plan",
+            plan_display(&optimized)
+        );
 
         Ok(())
     }
@@ -565,13 +566,10 @@ mod tests {
         let plan = full_aggregate(union_input, &[], vec![Arc::new(sum_expr)])?;
 
         let optimized = optimize(plan)?;
-        insta::assert_snapshot!(plan_display(&optimized), @r#"
-        AggregateExec: mode=Final, gby=[], aggr=[sum(l_quantity)]
-          CoalescePartitionsExec
-            UnionExec
-              PartialAggregationFlightSqlExec sql=SELECT SUM("l_quantity") AS "__agg_0" FROM foo.foo.lineitem
-              PartialAggregationFlightSqlExec sql=SELECT SUM("l_quantity") AS "__agg_0" FROM foo.foo.lineitem
-        "#);
+        insta::assert_snapshot!(
+            "pushdown_global_aggregate_no_groupby_optimized_plan",
+            plan_display(&optimized)
+        );
 
         Ok(())
     }
@@ -602,13 +600,7 @@ mod tests {
         )?;
 
         let optimized = optimize(plan)?;
-        insta::assert_snapshot!(plan_display(&optimized), @r#"
-        AggregateExec: mode=Final, gby=[l_returnflag@0 as l_returnflag], aggr=[min(l_quantity), max(l_quantity)]
-          CoalescePartitionsExec
-            UnionExec
-              PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", MIN("l_quantity") AS "__agg_0", MAX("l_quantity") AS "__agg_1" FROM foo.foo.lineitem GROUP BY "l_returnflag"
-              PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", MIN("l_quantity") AS "__agg_0", MAX("l_quantity") AS "__agg_1" FROM foo.foo.lineitem GROUP BY "l_returnflag"
-        "#);
+        insta::assert_snapshot!("pushdown_min_max_optimized_plan", plan_display(&optimized));
 
         Ok(())
     }
@@ -634,13 +626,10 @@ mod tests {
         )?;
 
         let optimized = optimize(plan)?;
-        insta::assert_snapshot!(plan_display(&optimized), @r#"
-        AggregateExec: mode=Final, gby=[l_returnflag@0 as l_returnflag], aggr=[avg(l_quantity)]
-          CoalescePartitionsExec
-            UnionExec
-              PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", COUNT("l_quantity") AS "__agg_0", SUM("l_quantity") AS "__agg_1" FROM foo.foo.lineitem GROUP BY "l_returnflag"
-              PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", COUNT("l_quantity") AS "__agg_0", SUM("l_quantity") AS "__agg_1" FROM foo.foo.lineitem GROUP BY "l_returnflag"
-        "#);
+        insta::assert_snapshot!(
+            "pushdown_avg_decomposition_optimized_plan",
+            plan_display(&optimized)
+        );
 
         Ok(())
     }
@@ -672,13 +661,10 @@ mod tests {
 
         let optimized = optimize(plan)?;
         // Must produce both COUNT and SUM, not two COUNTs
-        insta::assert_snapshot!(plan_display(&optimized), @r#"
-        AggregateExec: mode=Final, gby=[l_returnflag@0 as l_returnflag], aggr=[avg(l_discount)]
-          CoalescePartitionsExec
-            UnionExec
-              PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", COUNT("l_discount") AS "__agg_0", SUM("l_discount") AS "__agg_1" FROM foo.foo.lineitem GROUP BY "l_returnflag"
-              PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", COUNT("l_discount") AS "__agg_0", SUM("l_discount") AS "__agg_1" FROM foo.foo.lineitem GROUP BY "l_returnflag"
-        "#);
+        insta::assert_snapshot!(
+            "pushdown_avg_column_name_contains_count_optimized_plan",
+            plan_display(&optimized)
+        );
 
         Ok(())
     }
@@ -723,13 +709,10 @@ mod tests {
         let executable = replace_pushdown_with_memory(optimized, &mut data)?;
         let result = execute_plan(executable).await?;
 
-        insta::assert_snapshot!(pretty(&result), @r"
-        +-----------------+
-        | avg(l_discount) |
-        +-----------------+
-        | 0.060000        |
-        +-----------------+
-        ");
+        insta::assert_snapshot!(
+            "result_avg_column_name_contains_count_result",
+            pretty(&result)
+        );
 
         Ok(())
     }
@@ -748,11 +731,10 @@ mod tests {
         let plan = full_aggregate(flight, &[(3, "l_returnflag")], vec![Arc::new(sum_expr)])?;
 
         let optimized = optimize(plan)?;
-        insta::assert_snapshot!(plan_display(&optimized), @r#"
-        AggregateExec: mode=Final, gby=[l_returnflag@0 as l_returnflag], aggr=[sum(l_quantity)]
-          CoalescePartitionsExec
-            PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", SUM("l_quantity") AS "__agg_0" FROM foo.foo.lineitem GROUP BY "l_returnflag"
-        "#);
+        insta::assert_snapshot!(
+            "pushdown_single_partition_no_union_optimized_plan",
+            plan_display(&optimized)
+        );
 
         Ok(())
     }
@@ -815,13 +797,10 @@ mod tests {
         )?;
 
         let optimized = optimize(plan)?;
-        insta::assert_snapshot!(plan_display(&optimized), @r#"
-        AggregateExec: mode=Final, gby=[l_returnflag@0 as l_returnflag], aggr=[sum(l_quantity)]
-          CoalescePartitionsExec
-            UnionExec
-              PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", SUM("l_quantity") AS "__agg_0" FROM foo.foo.lineitem WHERE (l_shipdate > 100) GROUP BY "l_returnflag"
-              PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", SUM("l_quantity") AS "__agg_0" FROM foo.foo.lineitem WHERE (l_shipdate > 100) GROUP BY "l_returnflag"
-        "#);
+        insta::assert_snapshot!(
+            "pushdown_preserves_filters_in_where_optimized_plan",
+            plan_display(&optimized)
+        );
 
         Ok(())
     }
@@ -847,13 +826,10 @@ mod tests {
         )?;
 
         let optimized = optimize(plan)?;
-        insta::assert_snapshot!(plan_display(&optimized), @r#"
-        AggregateExec: mode=Final, gby=[l_returnflag@0 as l_returnflag, l_linestatus@1 as l_linestatus], aggr=[sum(l_quantity)]
-          CoalescePartitionsExec
-            UnionExec
-              PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", "l_linestatus", SUM("l_quantity") AS "__agg_0" FROM foo.foo.lineitem GROUP BY "l_returnflag", "l_linestatus"
-              PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", "l_linestatus", SUM("l_quantity") AS "__agg_0" FROM foo.foo.lineitem GROUP BY "l_returnflag", "l_linestatus"
-        "#);
+        insta::assert_snapshot!(
+            "pushdown_multiple_group_by_cols_optimized_plan",
+            plan_display(&optimized)
+        );
 
         Ok(())
     }
@@ -885,13 +861,10 @@ mod tests {
 
         let optimized = optimize(plan)?;
         // SUM("l_quantity") appears only once (deduped); AVG reuses it + adds COUNT
-        insta::assert_snapshot!(plan_display(&optimized), @r#"
-        AggregateExec: mode=Final, gby=[l_returnflag@0 as l_returnflag], aggr=[sum(l_quantity), avg(l_quantity)]
-          CoalescePartitionsExec
-            UnionExec
-              PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", SUM("l_quantity") AS "__agg_0", COUNT("l_quantity") AS "__agg_1" FROM foo.foo.lineitem GROUP BY "l_returnflag"
-              PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", SUM("l_quantity") AS "__agg_0", COUNT("l_quantity") AS "__agg_1" FROM foo.foo.lineitem GROUP BY "l_returnflag"
-        "#);
+        insta::assert_snapshot!(
+            "pushdown_sum_and_avg_same_column_dedup_optimized_plan",
+            plan_display(&optimized)
+        );
 
         Ok(())
     }
@@ -940,11 +913,10 @@ mod tests {
 
         let optimized = optimize(agg)?;
         // The CSE column __common_expr_1 is inlined back to ("l_extendedprice" * "l_discount")
-        insta::assert_snapshot!(plan_display(&optimized), @r#"
-        UnionExec
-          PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", SUM(("l_extendedprice" * "l_discount")) AS "__agg_0" FROM foo.foo.lineitem GROUP BY "l_returnflag"
-          PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", SUM(("l_extendedprice" * "l_discount")) AS "__agg_0" FROM foo.foo.lineitem GROUP BY "l_returnflag"
-        "#);
+        insta::assert_snapshot!(
+            "pushdown_through_projection_exec_optimized_plan",
+            plan_display(&optimized)
+        );
 
         Ok(())
     }
@@ -989,6 +961,17 @@ mod tests {
         fn properties(&self) -> &Arc<PlanProperties> {
             &self.properties
         }
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(
+                &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+            ) -> datafusion::error::Result<
+                datafusion::common::tree_node::TreeNodeRecursion,
+            >,
+        ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+            Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+        }
+
         fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
             vec![]
         }
@@ -1251,22 +1234,9 @@ mod tests {
                 .build()?;
 
         let plan = full_aggregate(union_input, &[], vec![Arc::new(sum_expr)])?;
-        insta::assert_snapshot!(plan_display(&plan), @r#"
-        AggregateExec: mode=Final, gby=[], aggr=[sum(l_quantity)]
-          CoalescePartitionsExec
-            AggregateExec: mode=Partial, gby=[], aggr=[sum(l_quantity)]
-              UnionExec
-                FlightSqlExec sql=SELECT l_quantity, l_extendedprice, l_discount, l_returnflag, l_linestatus FROM foo.foo.lineitem
-                FlightSqlExec sql=SELECT l_quantity, l_extendedprice, l_discount, l_returnflag, l_linestatus FROM foo.foo.lineitem
-        "#);
+        insta::assert_snapshot!("result_sum_global_plan", plan_display(&plan));
         let optimized = optimize(plan)?;
-        insta::assert_snapshot!(plan_display(&optimized), @r#"
-        AggregateExec: mode=Final, gby=[], aggr=[sum(l_quantity)]
-          CoalescePartitionsExec
-            UnionExec
-              PartialAggregationFlightSqlExec sql=SELECT SUM("l_quantity") AS "__agg_0" FROM foo.foo.lineitem
-              PartialAggregationFlightSqlExec sql=SELECT SUM("l_quantity") AS "__agg_0" FROM foo.foo.lineitem
-        "#);
+        insta::assert_snapshot!("result_sum_global_optimized_plan", plan_display(&optimized));
 
         // The partial state schema for SUM(Decimal128(15,2)) is a single
         // Decimal128 accumulator field. Read it from the pushdown node.
@@ -1304,13 +1274,7 @@ mod tests {
         let executable = replace_pushdown_with_memory(optimized, &mut data)?;
         let result = execute_plan(executable).await?;
 
-        insta::assert_snapshot!(pretty(&result), @r#"
-        +-----------------+
-        | sum(l_quantity) |
-        +-----------------+
-        | 150.00          |
-        +-----------------+
-        "#);
+        insta::assert_snapshot!("result_sum_global_result", pretty(&result));
 
         Ok(())
     }
@@ -1332,22 +1296,12 @@ mod tests {
         .build()?;
 
         let plan = full_aggregate(union_input, &[], vec![Arc::new(count_expr)])?;
-        insta::assert_snapshot!(plan_display(&plan), @r#"
-        AggregateExec: mode=Final, gby=[], aggr=[count(*)]
-          CoalescePartitionsExec
-            AggregateExec: mode=Partial, gby=[], aggr=[count(*)]
-              UnionExec
-                FlightSqlExec sql=SELECT l_quantity, l_extendedprice, l_discount, l_returnflag, l_linestatus FROM foo.foo.lineitem
-                FlightSqlExec sql=SELECT l_quantity, l_extendedprice, l_discount, l_returnflag, l_linestatus FROM foo.foo.lineitem
-        "#);
+        insta::assert_snapshot!("result_count_global_plan", plan_display(&plan));
         let optimized = optimize(plan)?;
-        insta::assert_snapshot!(plan_display(&optimized), @r#"
-        AggregateExec: mode=Final, gby=[], aggr=[count(*)]
-          CoalescePartitionsExec
-            UnionExec
-              PartialAggregationFlightSqlExec sql=SELECT COUNT(1) AS "__agg_0" FROM foo.foo.lineitem
-              PartialAggregationFlightSqlExec sql=SELECT COUNT(1) AS "__agg_0" FROM foo.foo.lineitem
-        "#);
+        insta::assert_snapshot!(
+            "result_count_global_optimized_plan",
+            plan_display(&optimized)
+        );
 
         let partial_schema = optimized.children()[0].children()[0].schema();
         // COUNT partial state is Int64
@@ -1364,13 +1318,7 @@ mod tests {
         let executable = replace_pushdown_with_memory(optimized, &mut data)?;
         let result = execute_plan(executable).await?;
 
-        insta::assert_snapshot!(pretty(&result), @r#"
-        +----------+
-        | count(*) |
-        +----------+
-        | 5        |
-        +----------+
-        "#);
+        insta::assert_snapshot!("result_count_global_result", pretty(&result));
 
         Ok(())
     }
@@ -1398,22 +1346,15 @@ mod tests {
                 .build()?;
 
         let plan = full_aggregate(union_input, &[], vec![Arc::new(avg_expr)])?;
-        insta::assert_snapshot!(plan_display(&plan), @r#"
-        AggregateExec: mode=Final, gby=[], aggr=[avg(l_quantity)]
-          CoalescePartitionsExec
-            AggregateExec: mode=Partial, gby=[], aggr=[avg(l_quantity)]
-              UnionExec
-                FlightSqlExec sql=SELECT l_quantity, l_extendedprice, l_discount, l_returnflag, l_linestatus FROM foo.foo.lineitem
-                FlightSqlExec sql=SELECT l_quantity, l_extendedprice, l_discount, l_returnflag, l_linestatus FROM foo.foo.lineitem
-        "#);
+        insta::assert_snapshot!(
+            "result_avg_does_not_average_averages_plan",
+            plan_display(&plan)
+        );
         let optimized = optimize(plan)?;
-        insta::assert_snapshot!(plan_display(&optimized), @r#"
-        AggregateExec: mode=Final, gby=[], aggr=[avg(l_quantity)]
-          CoalescePartitionsExec
-            UnionExec
-              PartialAggregationFlightSqlExec sql=SELECT COUNT("l_quantity") AS "__agg_0", SUM("l_quantity") AS "__agg_1" FROM foo.foo.lineitem
-              PartialAggregationFlightSqlExec sql=SELECT COUNT("l_quantity") AS "__agg_0", SUM("l_quantity") AS "__agg_1" FROM foo.foo.lineitem
-        "#);
+        insta::assert_snapshot!(
+            "result_avg_does_not_average_averages_optimized_plan",
+            plan_display(&optimized)
+        );
 
         // AVG partial state is (count: UInt64, sum: <input_type>) — DataFusion's
         // Avg accumulator preserves the input type for the sum field.
@@ -1435,13 +1376,10 @@ mod tests {
         let executable = replace_pushdown_with_memory(optimized, &mut data)?;
         let result = execute_plan(executable).await?;
 
-        insta::assert_snapshot!(pretty(&result), @r"
-        +-----------------+
-        | avg(l_quantity) |
-        +-----------------+
-        | 30.000000       |
-        +-----------------+
-        ");
+        insta::assert_snapshot!(
+            "result_avg_does_not_average_averages_result",
+            pretty(&result)
+        );
 
         Ok(())
     }
@@ -1470,22 +1408,12 @@ mod tests {
             &[],
             vec![Arc::new(min_expr), Arc::new(max_expr)],
         )?;
-        insta::assert_snapshot!(plan_display(&plan), @r#"
-        AggregateExec: mode=Final, gby=[], aggr=[min(l_quantity), max(l_quantity)]
-          CoalescePartitionsExec
-            AggregateExec: mode=Partial, gby=[], aggr=[min(l_quantity), max(l_quantity)]
-              UnionExec
-                FlightSqlExec sql=SELECT l_quantity, l_extendedprice, l_discount, l_returnflag, l_linestatus FROM foo.foo.lineitem
-                FlightSqlExec sql=SELECT l_quantity, l_extendedprice, l_discount, l_returnflag, l_linestatus FROM foo.foo.lineitem
-        "#);
+        insta::assert_snapshot!("result_min_max_global_plan", plan_display(&plan));
         let optimized = optimize(plan)?;
-        insta::assert_snapshot!(plan_display(&optimized), @r#"
-        AggregateExec: mode=Final, gby=[], aggr=[min(l_quantity), max(l_quantity)]
-          CoalescePartitionsExec
-            UnionExec
-              PartialAggregationFlightSqlExec sql=SELECT MIN("l_quantity") AS "__agg_0", MAX("l_quantity") AS "__agg_1" FROM foo.foo.lineitem
-              PartialAggregationFlightSqlExec sql=SELECT MIN("l_quantity") AS "__agg_0", MAX("l_quantity") AS "__agg_1" FROM foo.foo.lineitem
-        "#);
+        insta::assert_snapshot!(
+            "result_min_max_global_optimized_plan",
+            plan_display(&optimized)
+        );
 
         let partial_schema = optimized.children()[0].children()[0].schema();
         // Partition 1: MIN=10.00 (1000), MAX=30.00 (3000)
@@ -1525,13 +1453,7 @@ mod tests {
         let executable = replace_pushdown_with_memory(optimized, &mut data)?;
         let result = execute_plan(executable).await?;
 
-        insta::assert_snapshot!(pretty(&result), @r#"
-        +-----------------+-----------------+
-        | min(l_quantity) | max(l_quantity) |
-        +-----------------+-----------------+
-        | 10.00           | 50.00           |
-        +-----------------+-----------------+
-        "#);
+        insta::assert_snapshot!("result_min_max_global_result", pretty(&result));
 
         Ok(())
     }
@@ -1575,22 +1497,12 @@ mod tests {
             &[(3, "l_returnflag")],
             vec![Arc::new(sum_expr), Arc::new(count_expr), Arc::new(avg_expr)],
         )?;
-        insta::assert_snapshot!(plan_display(&plan), @r#"
-        AggregateExec: mode=Final, gby=[l_returnflag@0 as l_returnflag], aggr=[sum(l_quantity), count(*), avg(l_quantity)]
-          CoalescePartitionsExec
-            AggregateExec: mode=Partial, gby=[l_returnflag@3 as l_returnflag], aggr=[sum(l_quantity), count(*), avg(l_quantity)]
-              UnionExec
-                FlightSqlExec sql=SELECT l_quantity, l_extendedprice, l_discount, l_returnflag, l_linestatus FROM foo.foo.lineitem
-                FlightSqlExec sql=SELECT l_quantity, l_extendedprice, l_discount, l_returnflag, l_linestatus FROM foo.foo.lineitem
-        "#);
+        insta::assert_snapshot!("result_grouped_sum_count_avg_plan", plan_display(&plan));
         let optimized = optimize(plan)?;
-        insta::assert_snapshot!(plan_display(&optimized), @r#"
-        AggregateExec: mode=Final, gby=[l_returnflag@0 as l_returnflag], aggr=[sum(l_quantity), count(*), avg(l_quantity)]
-          CoalescePartitionsExec
-            UnionExec
-              PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", SUM("l_quantity") AS "__agg_0", COUNT(1) AS "__agg_1", COUNT("l_quantity") AS "__agg_2" FROM foo.foo.lineitem GROUP BY "l_returnflag"
-              PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", SUM("l_quantity") AS "__agg_0", COUNT(1) AS "__agg_1", COUNT("l_quantity") AS "__agg_2" FROM foo.foo.lineitem GROUP BY "l_returnflag"
-        "#);
+        insta::assert_snapshot!(
+            "result_grouped_sum_count_avg_optimized_plan",
+            plan_display(&optimized)
+        );
 
         let partial_schema = optimized.children()[0].children()[0].schema();
 
@@ -1673,14 +1585,10 @@ mod tests {
         let result = execute_plan(executable).await?;
 
         // Row order is non-deterministic with GROUP BY, so sort before snapshotting.
-        insta::assert_snapshot!(pretty_sorted(&result), @r#"
-        +--------------+-----------------+----------+-----------------+
-        | l_returnflag | sum(l_quantity) | count(*) | avg(l_quantity) |
-        +--------------+-----------------+----------+-----------------+
-        | A            | 70.00           | 3        | 23.333333       |
-        | B            | 80.00           | 2        | 40.000000       |
-        +--------------+-----------------+----------+-----------------+
-        "#);
+        insta::assert_snapshot!(
+            "result_grouped_sum_count_avg_result",
+            pretty_sorted(&result)
+        );
 
         Ok(())
     }

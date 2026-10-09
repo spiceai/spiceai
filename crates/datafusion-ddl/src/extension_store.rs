@@ -26,9 +26,9 @@ limitations under the License.
 use std::collections::HashMap;
 use std::sync::{Arc, RwLock};
 
+use datafusion::common::{ResolvedTableReference, TableReference};
 use datafusion::error::{DataFusionError, Result as DFResult};
 use datafusion::sql::sqlparser::ast::Expr as SqlParserExpr;
-use datafusion::sql::{ResolvedTableReference, TableReference};
 use spicepod::acceleration::{self, Acceleration};
 use spicepod::component::dataset::TimeFormat as SpicepodTimeFormat;
 
@@ -308,7 +308,7 @@ fn parse_refresh_mode(value: &str) -> DFResult<acceleration::RefreshMode> {
 
 #[cfg(test)]
 mod tests {
-    use datafusion::sql::TableReference;
+    use datafusion::common::TableReference;
 
     use super::*;
 

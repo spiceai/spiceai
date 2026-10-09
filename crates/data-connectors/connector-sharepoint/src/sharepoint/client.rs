@@ -162,11 +162,9 @@ async fn resolve_drive_ptr(
         PublicDrivePtr::SiteId(id) => Ok(DrivePtr::SiteId(id.clone())),
         PublicDrivePtr::Me => Ok(DrivePtr::Me),
         PublicDrivePtr::DriveName(name) => {
-            let drives = get_drive_items(Arc::clone(&client)).await.map_err(|e| {
-                Error::MicrosoftGraphFailure {
-                    source: Box::new(e),
-                }
-            })?;
+            let drives = get_drive_items(Arc::clone(&client))
+                .await
+                .map_err(|source| Error::MicrosoftGraphFailure { source })?;
             let Some(drive_id) = drives.get(name) else {
                 tracing::warn!(
                     "Drive with name '{}' is not found. Available drives: {}.",
@@ -184,11 +182,9 @@ async fn resolve_drive_ptr(
             Ok(DrivePtr::DriveId(drive_id.clone()))
         }
         PublicDrivePtr::GroupName(name) => {
-            let groups = get_group_items(Arc::clone(&client)).await.map_err(|e| {
-                Error::MicrosoftGraphFailure {
-                    source: Box::new(e),
-                }
-            })?;
+            let groups = get_group_items(Arc::clone(&client))
+                .await
+                .map_err(|source| Error::MicrosoftGraphFailure { source })?;
             let Some(group_id) = groups.get(name) else {
                 tracing::warn!(
                     "Group with name '{}' is not found. Available groups: {}.",
@@ -230,11 +226,9 @@ async fn resolve_drive_ptr(
             Ok(DrivePtr::GroupId(group_id.clone()))
         }
         PublicDrivePtr::SiteName(name) => {
-            let sites = get_site_items(Arc::clone(&client)).await.map_err(|e| {
-                Error::MicrosoftGraphFailure {
-                    source: Box::new(e),
-                }
-            })?;
+            let sites = get_site_items(Arc::clone(&client))
+                .await
+                .map_err(|source| Error::MicrosoftGraphFailure { source })?;
             let Some(site_id) = sites.get(name) else {
                 tracing::warn!(
                     "Site '{}' is not found. Available sites: {}.",
@@ -351,14 +345,17 @@ impl SharepointClient {
     pub(crate) async fn get_drive_item_content(
         &self,
         item_id: &str,
-    ) -> Result<Bytes, GraphFailure> {
+    ) -> Result<Bytes, Box<GraphFailure>> {
         let resp = match self.drive_client() {
             DriveApi::Id(client) => client.item(item_id).get_items_content(),
             DriveApi::Default(client) => client.item(item_id).get_items_content(),
         }
         .send()
-        .await?;
-        resp.bytes().await.map_err(GraphFailure::ReqwestError)
+        .await
+        .map_err(Box::new)?;
+        resp.bytes()
+            .await
+            .map_err(|error| Box::new(GraphFailure::ReqwestError(error)))
     }
 
     /// Downloads the file content for each drive item. Assumes that each field in `items` is in the `drive`.
@@ -372,9 +369,7 @@ impl SharepointClient {
             let raw = self
                 .get_drive_item_content(&item.id)
                 .await
-                .map_err(|source| Error::MicrosoftGraphFailure {
-                    source: Box::new(source),
-                })?;
+                .map_err(|source| Error::MicrosoftGraphFailure { source })?;
 
             if let Some(formatter) = &formatter {
                 let doc = formatter
@@ -404,44 +399,62 @@ impl std::fmt::Debug for SharepointClient {
 }
 
 /// Returns a mapping of drive ids to drive names.
-async fn get_drive_items(graph: Arc<GraphClient>) -> Result<HashMap<String, String>, GraphFailure> {
-    let resp = graph
-        .drives()
-        .list_drive()
-        .select(&["id", "name"])
-        .send()
-        .await?
-        .json::<serde_json::Value>()
-        .await?;
+async fn get_drive_items(
+    graph: Arc<GraphClient>,
+) -> Result<HashMap<String, String>, Box<GraphFailure>> {
+    async {
+        let resp = graph
+            .drives()
+            .list_drive()
+            .select(&["id", "name"])
+            .send()
+            .await?
+            .json::<serde_json::Value>()
+            .await?;
 
-    process_list_objs(&resp, "name")
+        process_list_objs(&resp, "name")
+    }
+    .await
+    .map_err(Box::new)
 }
 
 /// Returns a mapping of group ids to group names.
-async fn get_group_items(graph: Arc<GraphClient>) -> Result<HashMap<String, String>, GraphFailure> {
-    let resp = graph
-        .groups()
-        .list_group()
-        .select(&["id", "displayName"])
-        .send()
-        .await?
-        .json::<serde_json::Value>()
-        .await?;
+async fn get_group_items(
+    graph: Arc<GraphClient>,
+) -> Result<HashMap<String, String>, Box<GraphFailure>> {
+    async {
+        let resp = graph
+            .groups()
+            .list_group()
+            .select(&["id", "displayName"])
+            .send()
+            .await?
+            .json::<serde_json::Value>()
+            .await?;
 
-    process_list_objs(&resp, "displayName")
+        process_list_objs(&resp, "displayName")
+    }
+    .await
+    .map_err(Box::new)
 }
 
 /// Returns a mapping of drive ids to drive names.
-async fn get_site_items(graph: Arc<GraphClient>) -> Result<HashMap<String, String>, GraphFailure> {
-    let resp = graph
-        .sites()
-        .list_site()
-        .select(&["id", "name"])
-        .send()
-        .await?
-        .json::<serde_json::Value>()
-        .await?;
-    process_list_objs(&resp, "name")
+async fn get_site_items(
+    graph: Arc<GraphClient>,
+) -> Result<HashMap<String, String>, Box<GraphFailure>> {
+    async {
+        let resp = graph
+            .sites()
+            .list_site()
+            .select(&["id", "name"])
+            .send()
+            .await?
+            .json::<serde_json::Value>()
+            .await?;
+        process_list_objs(&resp, "name")
+    }
+    .await
+    .map_err(Box::new)
 }
 
 /// Processes a list of objects returned by Microsoft Graph into a mapping of names to ids.

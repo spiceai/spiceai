@@ -6,10 +6,11 @@ use std::sync::Arc;
 
 use datafusion::{
     arrow::datatypes::SchemaRef,
+    common::TableReference,
     error::{DataFusionError, Result as DataFusionResult},
     logical_expr::LogicalPlan,
     physical_plan::{SendableRecordBatchStream, stream::RecordBatchStreamAdapter},
-    sql::{TableReference, unparser::dialect::Dialect},
+    sql::unparser::dialect::Dialect,
 };
 
 use super::{FlightTable, query_to_stream};

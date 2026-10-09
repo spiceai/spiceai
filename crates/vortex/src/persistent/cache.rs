@@ -8,12 +8,56 @@ use datafusion_execution::cache::cache_manager::FileMetadata;
 use datafusion_execution::cache::cache_manager::FileMetadataCache;
 use object_store::ObjectMeta;
 use object_store::path::Path;
+use vortex::dtype::StructFields;
 use vortex::file::Footer;
 use vortex::file::VortexFile;
 
 /// Cached Vortex file metadata for use with `DataFusion`'s [`FileMetadataCache`].
 pub struct CachedVortexMetadata {
     footer: Footer,
+    /// Fixed at construction: the cache adds this on insert and subtracts it
+    /// on eviction by calling [`FileMetadata::memory_size`] each time, so a
+    /// value that changed in between would corrupt its running total.
+    memory_size: usize,
+}
+
+/// Fixed per-entry cost of a cached footer: the entry itself and the parts of
+/// the layout tree that exist once per file.
+const FOOTER_BASE_BYTES: usize = 4 * 1024;
+
+/// Heap a cached footer retains per top-level column, once a scan has
+/// materialized that column's layout subtree (its zone-map schema and
+/// statistics are built per column).
+const FOOTER_BYTES_PER_COLUMN: usize = 2_560;
+
+/// Heap a cached footer retains per segment, once a scan has materialized the
+/// layout node that owns it.
+const FOOTER_BYTES_PER_SEGMENT: usize = 768;
+
+/// The heap a cached footer can retain, for the file-metadata cache to evict on.
+///
+/// `Footer::approx_byte_size` counts only the serialized flatbuffers. The
+/// footer also holds the deserialized segment map and file statistics, and its
+/// layout tree materializes child layouts lazily and keeps them, so an entry
+/// grows while scans read through it. Counting only the serialized bytes let
+/// the cache hold several times its configured limit
+/// (spiceai/spiceai#12917).
+///
+/// None of that is observable without materializing the tree, so this charges
+/// the fully-expanded size up front, from quantities the footer already knows:
+/// its column and segment counts. The constants are calibrated by
+/// `tests/footer_cache_accounting.rs`, which measures the heap an entry
+/// actually frees and fails if the estimate falls below it.
+fn footer_memory_size(footer: &Footer) -> usize {
+    let columns = footer
+        .dtype()
+        .as_struct_fields_opt()
+        .map_or(1, StructFields::nfields);
+    let segments = footer.segment_map().len();
+    FOOTER_BASE_BYTES
+        .saturating_add(footer.approx_byte_size().unwrap_or_default())
+        .saturating_add(columns.saturating_mul(FOOTER_BYTES_PER_COLUMN))
+        .saturating_add(segments.saturating_mul(FOOTER_BYTES_PER_SEGMENT))
 }
 
 impl CachedVortexMetadata {
@@ -25,7 +69,11 @@ impl CachedVortexMetadata {
     /// Create a cached metadata entry directly from a just-written file's footer,
     /// so the write path can populate the cache without reading the file back.
     pub fn from_footer(footer: Footer) -> Self {
-        Self { footer }
+        let memory_size = footer_memory_size(&footer);
+        Self {
+            footer,
+            memory_size,
+        }
     }
 
     /// Get the cached footer.
@@ -40,15 +88,11 @@ impl FileMetadata for CachedVortexMetadata {
     }
 
     fn memory_size(&self) -> usize {
-        self.footer
-            .approx_byte_size()
-            // 64KB is not an insane estimate...
-            // We just want to avoid returning zero and _never_ being evicted from the cache.
-            .unwrap_or(1024 * 64)
+        self.memory_size
     }
 
-    fn extra_info(&self) -> std::collections::HashMap<String, String> {
-        std::collections::HashMap::default()
+    fn extra_info(&self) -> datafusion_common::HashMap<String, String> {
+        datafusion_common::HashMap::default()
     }
 }
 
@@ -73,7 +117,7 @@ pub fn synthetic_object_meta(location: Path, size: u64) -> ObjectMeta {
 /// right-sizing telemetry (the accounted footer size is what fills the cache
 /// budget) shared by every population site.
 pub(crate) fn cache_footer(
-    cache: &Arc<dyn FileMetadataCache>,
+    cache: &Arc<FileMetadataCache>,
     meta: ObjectMeta,
     cached: Arc<CachedVortexMetadata>,
     src: &'static str,

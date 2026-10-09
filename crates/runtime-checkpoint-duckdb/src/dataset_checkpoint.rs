@@ -226,10 +226,11 @@ impl DuckDbDatasetCheckpointer {
             .execute(&update, duckdb::params![&schema_json, dataset_name])
             .map_err(store_error)?;
 
-        // A repair that only reached the WAL is invisible to a snapshot: the upload path
-        // copies the database file alone, and `DuckDBSnapshotEngine` inherits the no-op
-        // `SnapshotEngine::checkpoint_live`, so nothing else flushes it. Gate on the row
-        // count so an absent checkpoint stays untouched, as above.
+        // Anything that copies the database file alone sees only what has been folded
+        // out of the WAL. `DuckDBSnapshotEngine::checkpoint_live` does that under the
+        // write lock at snapshot time; checkpointing here keeps the file self-contained
+        // between snapshots as well. Gate on the row count so an absent checkpoint stays
+        // untouched, as above.
         if create_snapshot && rows_changed > 0 {
             duckdb_conn.execute("CHECKPOINT", []).map_err(store_error)?;
         }
@@ -950,9 +951,8 @@ mod tests {
     }
 
     /// A schema repair on a snapshot-enabled store must reach the database file, not just
-    /// the WAL: the upload path copies that file alone and `DuckDBSnapshotEngine` inherits
-    /// the no-op `SnapshotEngine::checkpoint_live`, so a WAL-resident repair would ship a
-    /// snapshot carrying the schema the repair replaced. Raised by Copilot on #13894.
+    /// the WAL, so that anything copying that file alone carries the repaired schema
+    /// rather than the one it replaced. Raised by Copilot on #13894.
     #[tokio::test]
     async fn set_schema_reaches_the_database_file_when_snapshots_are_enabled() {
         use duckdb::AccessMode;

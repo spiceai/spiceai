@@ -94,11 +94,11 @@ async fn spark_integration_test() -> Result<(), anyhow::Error> {
                     let results = arrow::util::pretty::pretty_format_batches(&result_batches)
                         .expect("should pretty print result batch");
                     insta::with_settings!({
-                        description => format!("Spark Integration Test Results"),
+                        description => "Spark Integration Test Results",
                         omit_expression => true,
                         snapshot_path => "../snapshots"
                     }, {
-                        insta::assert_snapshot!(format!("spark_select"), results);
+                        insta::assert_snapshot!("spark_select", results);
                     });
                 })),
             )];

@@ -29,6 +29,39 @@ use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::prelude::{ParquetReadOptions, SessionContext};
 use rusqlite::{Connection, types::ValueRef};
 
+/// A SQLite database holding a suite's tables, answering as an oracle.
+pub struct SqliteOracle {
+    _temp: tempfile::TempDir,
+    conn: Connection,
+}
+
+impl SqliteOracle {
+    /// Load the named parquet tables from `parquet_dir` — the files Cayenne
+    /// loads, so both sides compare the same rows.
+    pub async fn from_parquet(parquet_dir: &Path, tables: &[&str]) -> Self {
+        let (temp, conn) = load_sqlite_from_parquet(parquet_dir, tables).await;
+        Self { _temp: temp, conn }
+    }
+}
+
+impl super::oracle_lane::OracleEngine for SqliteOracle {
+    fn pair(&self) -> &'static str {
+        "cayenne-sqlite"
+    }
+
+    fn dialect(&self) -> super::dialect::Oracle {
+        super::dialect::Oracle::Sqlite
+    }
+
+    fn execute(&self, sql: &str) -> Result<Vec<RecordBatch>, String> {
+        sqlite_query_batches(&self.conn, sql)
+    }
+
+    fn exclusion(&self, entry: &super::inventory::InventoryEntry) -> Option<&'static str> {
+        entry.sqlite_exclusion
+    }
+}
+
 /// Open a temp SQLite DB and load named parquet tables from `parquet_dir`.
 pub async fn load_sqlite_from_parquet(
     parquet_dir: &Path,
@@ -36,9 +69,7 @@ pub async fn load_sqlite_from_parquet(
 ) -> (tempfile::TempDir, Connection) {
     let temp = tempfile::tempdir().expect("sqlite temp");
     let db_path = temp.path().join("parity.sqlite");
-    let conn = Connection::open(&db_path).expect("sqlite open");
-    conn.execute_batch("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF;")
-        .expect("sqlite pragma");
+    let conn = open_sqlite_oracle(&db_path);
 
     let ctx = SessionContext::new();
     for table in tables {
@@ -54,6 +85,10 @@ pub async fn load_sqlite_from_parquet(
             .unwrap_or_else(|e| panic!("sqlite load collect {table}: {e}"));
         create_and_insert(&conn, table, &batches);
     }
+    // Statistics for the planner, which otherwise guesses how selective each
+    // key index is: without them SQLite took 70s each on TPC-H Q5 and Q10 at
+    // SF 0.1. Like the indexes, they change how SQLite finds rows, never which.
+    conn.execute_batch("ANALYZE").expect("sqlite analyze");
     (temp, conn)
 }
 
@@ -61,13 +96,29 @@ pub async fn load_sqlite_from_parquet(
 pub fn load_sqlite_from_batches(tables: &[(&str, RecordBatch)]) -> (tempfile::TempDir, Connection) {
     let temp = tempfile::tempdir().expect("sqlite temp");
     let db_path = temp.path().join("parity.sqlite");
-    let conn = Connection::open(&db_path).expect("sqlite open");
-    conn.execute_batch("PRAGMA journal_mode=OFF; PRAGMA synchronous=OFF;")
-        .expect("sqlite pragma");
+    let conn = open_sqlite_oracle(&db_path);
     for (name, batch) in tables {
         create_and_insert(&conn, name, std::slice::from_ref(batch));
     }
     (temp, conn)
+}
+
+/// Open a SQLite database to serve as an oracle.
+///
+/// `case_sensitive_like` because SQLite's `LIKE` otherwise folds ASCII case, and
+/// DataFusion's does not: ClickBench Q23 filters `"Title" LIKE '%Google%'`. The
+/// rest only make it faster — SQLite's default page cache is 2 MiB, against a
+/// TPC-DS SF1 database of several GiB — and cannot change an answer.
+fn open_sqlite_oracle(db_path: &Path) -> Connection {
+    let conn = Connection::open(db_path).expect("sqlite open");
+    conn.execute_batch(
+        "PRAGMA journal_mode = OFF; PRAGMA synchronous = OFF; \
+         PRAGMA case_sensitive_like = ON; \
+         PRAGMA cache_size = -2000000; PRAGMA temp_store = MEMORY; \
+         PRAGMA mmap_size = 8589934592; PRAGMA threads = 4;",
+    )
+    .expect("sqlite pragma");
+    conn
 }
 
 fn create_and_insert(conn: &Connection, table: &str, batches: &[RecordBatch]) {
@@ -101,6 +152,28 @@ fn create_and_insert(conn: &Connection, table: &str, batches: &[RecordBatch]) {
         }
     }
     tx.commit().expect("sqlite commit");
+    index_key_columns(conn, table, &schema);
+}
+
+/// Index a loaded table's key columns.
+///
+/// SQLite runs a correlated subquery once per outer row, so without an index on
+/// the correlated key TPC-H Q20's `lineitem` lookup is a full scan per
+/// `partsupp` row — hours at SF1. An index changes how SQLite finds rows, never
+/// which rows a query returns, so it costs the oracle nothing in independence.
+fn index_key_columns(conn: &Connection, table: &str, schema: &Schema) {
+    for field in schema.fields() {
+        let name = field.name();
+        let is_key = ["key", "_sk", "_id", "ID"]
+            .iter()
+            .any(|suffix| name.ends_with(suffix));
+        if is_key && field.data_type().is_integer() {
+            conn.execute_batch(&format!(
+                "CREATE INDEX \"{table}_{name}\" ON {table} (\"{name}\")"
+            ))
+            .unwrap_or_else(|e| panic!("sqlite index {table}.{name}: {e}"));
+        }
+    }
 }
 
 fn create_table_sql(table: &str, schema: &Schema) -> String {
@@ -126,12 +199,22 @@ fn arrow_to_sqlite_type(dt: &DataType) -> &'static str {
         | DataType::UInt16
         | DataType::UInt32
         | DataType::UInt64 => "INTEGER",
-        DataType::Float16 | DataType::Float32 | DataType::Float64 => "REAL",
+        // SQLite has no DECIMAL. REAL keeps a decimal's arithmetic fractional —
+        // under TEXT or NUMERIC affinity a whole-valued one would be stored as an
+        // INTEGER and divide as one — and a lane compares what it computes within
+        // the float tolerance: SQLite accumulates `SUM(l_extendedprice)` in
+        // doubles where Cayenne keeps exact decimals.
+        DataType::Float16
+        | DataType::Float32
+        | DataType::Float64
+        | DataType::Decimal128(_, _)
+        | DataType::Decimal256(_, _) => "REAL",
         DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View => "TEXT",
         DataType::Binary | DataType::LargeBinary | DataType::BinaryView => "BLOB",
-        // Timestamps / dates stored as text for portable equality.
+        // Dates and timestamps are stored as ISO text, which SQLite's date
+        // functions read and which orders as the instants do; see
+        // `array_value_to_sqlite`.
         DataType::Timestamp(_, _) | DataType::Date32 | DataType::Date64 => "TEXT",
-        DataType::Decimal128(_, _) | DataType::Decimal256(_, _) => "TEXT",
         _ => "TEXT",
     }
 }
@@ -227,6 +310,47 @@ fn array_value_to_sqlite(array: &dyn Array, row: usize, col: usize) -> rusqlite:
             let a = array.as_any().downcast_ref::<BinaryArray>().expect("bin");
             rusqlite::types::Value::Blob(a.value(row).to_vec())
         }
+        DataType::Date32 => {
+            let a = array
+                .as_any()
+                .downcast_ref::<Date32Array>()
+                .expect("date32");
+            let date = a
+                .value_as_date(row)
+                .unwrap_or_else(|| panic!("Date32 out of range (column {col}, row {row})"));
+            rusqlite::types::Value::Text(date.format("%Y-%m-%d").to_string())
+        }
+        DataType::Date64 => {
+            let a = array
+                .as_any()
+                .downcast_ref::<Date64Array>()
+                .expect("date64");
+            let date = a
+                .value_as_date(row)
+                .unwrap_or_else(|| panic!("Date64 out of range (column {col}, row {row})"));
+            rusqlite::types::Value::Text(date.format("%Y-%m-%d").to_string())
+        }
+        DataType::Timestamp(_, _) => {
+            // The stored instant, with no zone applied — how Cayenne and the
+            // compare path render it too.
+            let naive = timestamp_as_naive(array, row)
+                .unwrap_or_else(|| panic!("timestamp out of range (column {col}, row {row})"));
+            rusqlite::types::Value::Text(super::dialect::sqlite_timestamp_text(naive))
+        }
+        DataType::Decimal128(_, scale) => {
+            let a = array
+                .as_any()
+                .downcast_ref::<Decimal128Array>()
+                .expect("decimal128");
+            rusqlite::types::Value::Real(decimal_to_f64(&a.value(row).to_string(), *scale))
+        }
+        DataType::Decimal256(_, scale) => {
+            let a = array
+                .as_any()
+                .downcast_ref::<Decimal256Array>()
+                .expect("decimal256");
+            rusqlite::types::Value::Real(decimal_to_f64(&a.value(row).to_string(), *scale))
+        }
         // Coercing an unconvertible type to a placeholder string would load
         // values into the oracle that the source data never had, so the
         // comparison could pass on corrupt data. Fail the load instead.
@@ -234,6 +358,59 @@ fn array_value_to_sqlite(array: &dyn Array, row: usize, col: usize) -> rusqlite:
             "cannot load Arrow type {other:?} into the SQLite oracle (column {col}, row {row}): \
              add an explicit conversion arm to `array_value_to_sqlite`"
         ),
+    }
+}
+
+/// The naive instant a timestamp cell holds, whatever its unit.
+fn timestamp_as_naive(array: &dyn Array, row: usize) -> Option<chrono::NaiveDateTime> {
+    use arrow::array::{
+        TimestampMicrosecondArray, TimestampMillisecondArray, TimestampNanosecondArray,
+        TimestampSecondArray,
+    };
+    use arrow::datatypes::TimeUnit;
+    let DataType::Timestamp(unit, _) = array.data_type() else {
+        return None;
+    };
+    let any = array.as_any();
+    match unit {
+        TimeUnit::Second => any
+            .downcast_ref::<TimestampSecondArray>()?
+            .value_as_datetime(row),
+        TimeUnit::Millisecond => any
+            .downcast_ref::<TimestampMillisecondArray>()?
+            .value_as_datetime(row),
+        TimeUnit::Microsecond => any
+            .downcast_ref::<TimestampMicrosecondArray>()?
+            .value_as_datetime(row),
+        TimeUnit::Nanosecond => any
+            .downcast_ref::<TimestampNanosecondArray>()?
+            .value_as_datetime(row),
+    }
+}
+
+/// A decimal's unscaled digits and scale as the nearest double. Parsed from the
+/// decimal text rather than divided as floats, so a value such as `0.07` lands
+/// on the double nearest 0.07 rather than on `7.0 / 100.0`'s rounding of it.
+fn decimal_to_f64(unscaled: &str, scale: i8) -> f64 {
+    let (sign, digits) = match unscaled.strip_prefix('-') {
+        Some(digits) => ("-", digits),
+        None => ("", unscaled),
+    };
+    let text = match usize::try_from(scale) {
+        Ok(scale) if scale > 0 => {
+            let padded = format!("{digits:0>width$}", width = scale + 1);
+            let (whole, fraction) = padded.split_at(padded.len() - scale);
+            format!("{sign}{whole}.{fraction}")
+        }
+        _ => format!("{sign}{digits}"),
+    };
+    let value: f64 = text
+        .parse()
+        .unwrap_or_else(|e| panic!("decimal {text} does not parse as a double: {e}"));
+    match usize::try_from(scale) {
+        Ok(_) => value,
+        // A negative scale multiplies the unscaled value by a power of ten.
+        Err(_) => value * 10_f64.powi(-i32::from(scale)),
     }
 }
 

@@ -719,7 +719,9 @@ pub fn parse_directory_entries(data: &[u8]) -> Vec<DirectoryEntry> {
         let name_bytes = &entry[name_start..name_end];
         let file_name = String::from_utf16_lossy(
             &name_bytes
-                .chunks_exact(2)
+                .as_chunks::<2>()
+                .0
+                .iter()
                 .map(|c| u16::from_le_bytes([c[0], c[1]]))
                 .collect::<Vec<_>>(),
         );

@@ -44,6 +44,9 @@ inputs:
         - 'install/**'
         - 'Cargo.toml'
         - 'Cargo.lock'
+        - 'version.txt'
+        - '**/*.snap'
+        - '**/*.proto'
         - 'go.mod'
         - 'go.sum'
         - 'Makefile'
@@ -72,6 +75,10 @@ inputs:
         - 'scripts/test_check_fork_patches.py'
         - 'scripts/check_bench_mysql_load_nulls.py'
         - 'scripts/test_check_bench_mysql_load_nulls.py'
+        # Imported by the guards above, so it changes what each of them enforces; its
+        # harness runs in `lint-rust` too.
+        - 'scripts/rust_guard_common.py'
+        - 'scripts/test_rust_guard_common.py'
         - 'docs/dev/fork_patches.md'
         - 'rust-toolchain'
         - 'rust-toolchain.toml'

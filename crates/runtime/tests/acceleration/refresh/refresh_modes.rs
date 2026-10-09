@@ -25,7 +25,6 @@ use crate::acceleration::refresh::common::{
     test_append_unix_seconds_for_engine,
 };
 use crate::postgres::common;
-use crate::postgres::common::get_random_port;
 use crate::{init_tracing, utils::test_request_context};
 use spicepod::param::Params;
 use std::sync::Arc;
@@ -51,8 +50,8 @@ fn get_postgres_acceleration_params(port: usize) -> Params {
 async fn test_refresh_append_for_engine(engine: &str) -> Result<(), anyhow::Error> {
     test_request_context()
         .scope(async {
-            let port: usize = get_random_port()?;
-            let running_container = common::start_postgres_docker_container(port).await?;
+            let running_container = common::start_postgres_docker_container().await?;
+            let port = usize::from(running_container.host_port(5432)?);
 
             let db_conn = initialize_postgres(port).await?;
 
@@ -108,8 +107,8 @@ async fn test_refresh_append_for_engine(engine: &str) -> Result<(), anyhow::Erro
 async fn test_refresh_full_for_engine(engine: &str) -> Result<(), anyhow::Error> {
     test_request_context()
         .scope(async {
-            let port: usize = get_random_port()?;
-            let running_container = common::start_postgres_docker_container(port).await?;
+            let running_container = common::start_postgres_docker_container().await?;
+            let port = usize::from(running_container.host_port(5432)?);
 
             let db_conn = initialize_postgres(port).await?;
 

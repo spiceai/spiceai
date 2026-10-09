@@ -43,6 +43,7 @@ use governor::Quota;
 use llms::chat::Chat;
 use runtime_datafusion_udfs::ai::{Ai, ChatModelStore, RateControllerStore};
 use runtime_rate_control::RateController;
+use runtime_status::RuntimeStatus;
 use tokio::sync::RwLock;
 
 /// Mock Chat implementation that tracks concurrent calls and simulates latency.
@@ -98,7 +99,7 @@ fn setup_ctx(
     let ctx = SessionContext::new();
 
     // Register UDF
-    let udf = Ai::new(model_store, rate_controllers);
+    let udf = Ai::new(model_store, rate_controllers, RuntimeStatus::new());
     ctx.register_udf(udf.into_async_udf().into_scalar_udf());
 
     // Create in-memory table

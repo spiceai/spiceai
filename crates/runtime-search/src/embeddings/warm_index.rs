@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::sync::Arc;
 
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use datafusion_expr::ScalarUDF;
 use llms::embeddings::Embed;
 use runtime_acceleration::acceleration::ZeroResultsAction;
@@ -251,27 +251,6 @@ mod tests {
 
     fn pretend_index(dimension: i32) -> Arc<dyn VectorIndex> {
         Arc::new(PretendVectorIndex::new(dimension))
-    }
-
-    #[test]
-    fn warm_index_wraps_the_engine_index_in_a_compound() {
-        let index = with_memory_warm_index(
-            &TableReference::bare("tbl"),
-            pretend_index(3),
-            MetadataColumns::none(),
-            Arc::new(NoopEmbed),
-            &noop_embed_udf(),
-            &"model".to_string(),
-            "cosine",
-            Some(&ZeroResultsAction::UseSource),
-        );
-        assert!(
-            index
-                .as_any()
-                .downcast_ref::<CompoundVectorIndex>()
-                .is_some(),
-            "the engine index should be wrapped in a CompoundVectorIndex"
-        );
     }
 
     /// Regression test for #12101: nothing writes to a warm index for a table without

@@ -54,8 +54,8 @@ use object_store::ObjectMeta;
 use object_store::ObjectStore;
 use object_store::path::Path;
 use vortex::VortexSessionDefault;
+use vortex::array::stats::StatsSet;
 use vortex::arrow::ArrowSessionExt;
-use vortex::arrow::FromArrowType;
 use vortex::dtype::DType;
 use vortex::dtype::Nullability;
 use vortex::dtype::PType;
@@ -926,7 +926,9 @@ impl FileFormat for VortexFormat {
                         })
                 })
             })
-            .buffer_unordered(state.config_options().execution.meta_fetch_concurrency)
+            .buffer_unordered(usize::from(
+                state.config_options().execution.meta_fetch_concurrency,
+            ))
             .try_collect::<Vec<_>>()
             .await?;
 
@@ -1052,22 +1054,30 @@ impl FileFormat for VortexFormat {
                     .zip(column_size)
                     .map(|(acc, size)| acc + size);
 
-                let target_dtype = DType::from_arrow(field.as_ref());
-                let min = stat_bound_to_df(
-                    Stat::Min,
-                    stats_set.get(Stat::Min),
-                    stats_dtype,
-                    &target_dtype,
-                    field.data_type(),
-                );
-
-                let max = stat_bound_to_df(
-                    Stat::Max,
-                    stats_set.get(Stat::Max),
-                    stats_dtype,
-                    &target_dtype,
-                    field.data_type(),
-                );
+                let target_dtype = session.arrow().from_arrow_field(field.as_ref()).map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "Failed to infer statistics for Vortex file {}: column '{}' has no Vortex type: {e}",
+                        object.location,
+                        field.name()
+                    ))
+                })?;
+                // Float bounds and sums leave NaN out; see `bounds_account_for_nan`.
+                let bounds_usable = bounds_account_for_nan(stats_set, stats_dtype);
+                let bound = |stat: Stat| {
+                    if bounds_usable {
+                        stat_bound_to_df(
+                            stat,
+                            stats_set.get(stat),
+                            stats_dtype,
+                            &target_dtype,
+                            field.data_type(),
+                        )
+                    } else {
+                        stats::Precision::Absent
+                    }
+                };
+                let min = bound(Stat::Min);
+                let max = bound(Stat::Max);
 
                 let null_count = stats_set.get_as::<usize>(Stat::NullCount, &PType::U64.into());
 
@@ -1078,13 +1088,13 @@ impl FileFormat for VortexFormat {
                 // arrow type: the sum of e.g. an `Int32` column is an `Int64` in
                 // DataFusion, and narrowing here would lose width or overflow.
                 let sum = match Stat::Sum.dtype(stats_dtype) {
-                    Some(sum_dtype) => scalar_stat_to_df(
+                    Some(sum_dtype) if bounds_usable => scalar_stat_to_df(
                         Stat::Sum,
                         stats_set.get(Stat::Sum),
                         stats_dtype,
                         &sum_dtype,
                     ),
-                    None => stats::Precision::Absent,
+                    _ => stats::Precision::Absent,
                 };
 
                 column_statistics.push(ColumnStatistics {
@@ -1216,6 +1226,23 @@ impl FileFormat for VortexFormat {
 
         Arc::new(source) as _
     }
+}
+
+/// Whether a column's min, max and sum can be used as `DataFusion` statistics.
+///
+/// Vortex leaves NaN out of a float column's min, max and sum, while `DataFusion`
+/// orders a NaN like any other value (`NaN = NaN`; a positive NaN sorts above
+/// `+inf`, a negative one below `-inf`) and sums it to NaN. Bounds that left a NaN
+/// out would let pruning skip the rows a NaN probe or an `x > c` matches, and let
+/// `MIN`/`MAX`/`SUM` be answered from metadata without them, so a float column's
+/// are usable only when its stats record that it holds no NaN.
+#[must_use]
+pub fn bounds_account_for_nan(stats: &StatsSet, dtype: &DType) -> bool {
+    !dtype.is_float()
+        || stats
+            .get_as::<u64>(Stat::NaNCount, &PType::U64.into())
+            .as_exact()
+            == Some(0)
 }
 
 /// A `Min` or `Max` bound, tagged as the column's own Arrow type.
@@ -1369,6 +1396,7 @@ mod tests {
     use crate::common_tests::TestSessionContext;
     use crate::convert::FromDataFusion;
     use datafusion_common::arrow::datatypes::i256;
+    use datafusion_physical_plan::{StatisticsArgs, StatisticsContext};
 
     #[test]
     fn decimal_bounds_preserve_arrow_width_and_statistical_precision() -> anyhow::Result<()> {
@@ -1542,6 +1570,22 @@ mod tests {
             .collect()
             .await?;
 
+        // The table's OPTIONS must reach the Vortex format the table reads with.
+        let provider = ctx.session.table_provider("my_tbl").await?;
+        let listing = provider
+            .downcast_ref::<datafusion::datasource::listing::ListingTable>()
+            .ok_or_else(|| anyhow::anyhow!("a Vortex external table is a listing table"))?;
+        let format = listing
+            .options()
+            .format
+            .downcast_ref::<VortexFormat>()
+            .ok_or_else(|| anyhow::anyhow!("the table must read with the Vortex format"))?;
+        assert_eq!(format.options().footer_initial_read_size_bytes, 12345);
+        assert_eq!(
+            format.options().scan_concurrency,
+            ScanConcurrency::Explicit(3)
+        );
+
         Ok(())
     }
 
@@ -1584,10 +1628,8 @@ mod tests {
         let state = ctx.session.state();
 
         // --- All columns: per-column byte_size present, total == sum ---------
-        let all = provider
-            .scan(&state, None, &[], None)
-            .await?
-            .partition_statistics(None)?;
+        let all_plan = provider.scan(&state, None, &[], None).await?;
+        let all = StatisticsContext::new().compute(&*all_plan, &StatisticsArgs::new())?;
         assert_eq!(all.num_rows.get_value(), Some(&n), "row count");
 
         let id_bytes = *all.column_statistics[0]
@@ -1625,10 +1667,10 @@ mod tests {
         // --- Projected scans: total reflects ONLY the projected columns ------
         // Project [id] (fixed-width): total is just the int column.
         let proj_id_cols = vec![0usize];
-        let proj_id = provider
+        let proj_id_plan = provider
             .scan(&state, Some(&proj_id_cols), &[], None)
-            .await?
-            .partition_statistics(None)?;
+            .await?;
+        let proj_id = StatisticsContext::new().compute(&*proj_id_plan, &StatisticsArgs::new())?;
         assert_eq!(
             proj_id.total_byte_size.get_value(),
             Some(&id_bytes),
@@ -1637,10 +1679,8 @@ mod tests {
 
         // Project [s] (variable-width survives, fat `data` dropped).
         let proj_s_cols = vec![1usize];
-        let proj_s = provider
-            .scan(&state, Some(&proj_s_cols), &[], None)
-            .await?
-            .partition_statistics(None)?;
+        let proj_s_plan = provider.scan(&state, Some(&proj_s_cols), &[], None).await?;
+        let proj_s = StatisticsContext::new().compute(&*proj_s_plan, &StatisticsArgs::new())?;
         assert_eq!(
             proj_s.total_byte_size.get_value(),
             Some(&s_bytes),

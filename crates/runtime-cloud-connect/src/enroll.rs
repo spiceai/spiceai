@@ -1851,13 +1851,31 @@ mod tests {
 
     #[test]
     fn parse_not_after_rejects_garbage() {
-        parse_not_after("http://test", "tomorrow-ish").expect_err("must fail");
+        let err = parse_not_after("http://test", "tomorrow-ish").expect_err("must fail");
+        // The parse-failure branch, carrying chrono's own reason for the rejection.
+        let chrono_error = chrono::DateTime::parse_from_rfc3339("tomorrow-ish")
+            .expect_err("chrono rejects the same input");
+        let Error::InvalidResponse { url, reason } = &err else {
+            panic!("expected InvalidResponse, got {err:?}");
+        };
+        assert_eq!(url, "http://test");
+        assert_eq!(
+            *reason,
+            format!("invalid not_after timestamp: {chrono_error}")
+        );
     }
 
     #[test]
     fn parse_not_after_rejects_pre_epoch() {
-        parse_not_after("http://test", "1899-01-01T00:00:00Z")
+        let err = parse_not_after("http://test", "1899-01-01T00:00:00Z")
             .expect_err("pre-epoch timestamps cannot be a cert expiry");
+        // A well-formed timestamp before 1970 takes the epoch branch, not the
+        // parse-failure one.
+        let Error::InvalidResponse { url, reason } = &err else {
+            panic!("expected InvalidResponse, got {err:?}");
+        };
+        assert_eq!(url, "http://test");
+        assert_eq!(reason, "not_after timestamp is before the Unix epoch");
     }
 
     #[test]

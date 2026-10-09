@@ -283,19 +283,86 @@ pub fn build_change_batch(
     column_map: &[usize],
     changes: &[DecodedChange],
 ) -> Result<ChangeBatch> {
+    build_change_batch_with(
+        &ChangeBatchSchemas::new(dataset_schema),
+        primary_keys,
+        column_map,
+        changes,
+    )
+}
+
+/// A dataset's schema with the two schemas every one of its change batches is
+/// built with: its fields all made nullable (see [`build_change_batch`]), and
+/// the `op` / `primary_keys` / `data` wrapper around them. A dataset's schema is
+/// fixed for the life of its replication member, so these are derived once per
+/// member rather than once per batch — the streaming path builds a batch for
+/// every committed source transaction that touches the table.
+pub(super) struct ChangeBatchSchemas {
+    dataset: SchemaRef,
+    nullable: SchemaRef,
+    wrapper: SchemaRef,
+    /// Fixed-width Arrow bytes of one row of `dataset` (the coalescing estimate's
+    /// per-row floor).
+    per_row_fixed: usize,
+}
+
+impl ChangeBatchSchemas {
+    pub(super) fn new(dataset_schema: &SchemaRef) -> Self {
+        let nullable = nullable_clone(dataset_schema);
+        let wrapper = Arc::new(changes_schema(&nullable));
+        let per_row_fixed = dataset_schema
+            .fields()
+            .iter()
+            .map(|f| super::changes::arrow_fixed_width(f.data_type()))
+            .sum();
+        Self {
+            dataset: Arc::clone(dataset_schema),
+            nullable,
+            wrapper,
+            per_row_fixed,
+        }
+    }
+
+    /// The dataset's own (declared-nullability) schema.
+    pub(super) fn dataset(&self) -> &SchemaRef {
+        &self.dataset
+    }
+
+    /// Fixed-width Arrow bytes of one row of the dataset's schema.
+    pub(super) fn per_row_fixed(&self) -> usize {
+        self.per_row_fixed
+    }
+}
+
+/// [`build_change_batch`] with the dataset's derived schemas supplied by the
+/// caller (see [`ChangeBatchSchemas`]).
+pub(super) fn build_change_batch_with(
+    schemas: &ChangeBatchSchemas,
+    primary_keys: &[String],
+    column_map: &[usize],
+    changes: &[DecodedChange],
+) -> Result<ChangeBatch> {
     let num_rows = changes.len();
-    let nullable_schema = nullable_clone(dataset_schema);
-    let wrapper_schema = changes_schema(&nullable_schema);
+    let dataset_schema = &schemas.dataset;
+    let nullable_schema = &schemas.nullable;
 
     let mut op_builder = StringBuilder::with_capacity(num_rows, num_rows * 2);
     let mut pk_offsets = Vec::<i32>::with_capacity(num_rows + 1);
     pk_offsets.push(0);
     let mut pk_values: Vec<&str> = Vec::with_capacity(num_rows.saturating_mul(primary_keys.len()));
 
+    // Sized to this batch: a streaming batch is usually one source transaction's
+    // rows for the table, far below the builders' default of 1 024 slots.
     let mut data_builders: Vec<FieldBuilder> = dataset_schema
         .fields()
         .iter()
-        .map(|f| FieldBuilder::new(f.data_type()))
+        .enumerate()
+        .map(|(field_idx, f)| {
+            let data_bytes = column_map.get(field_idx).map_or(0, |&source_idx| {
+                variable_width_bytes(f.data_type(), changes, source_idx)
+            });
+            FieldBuilder::with_capacity(f.data_type(), num_rows, data_bytes)
+        })
         .collect::<Result<Vec<_>>>()?;
 
     for change in changes {
@@ -338,7 +405,7 @@ pub fn build_change_batch(
     let data_struct = StructArray::new(nullable_schema.fields().clone(), data_columns, None);
 
     let record = RecordBatch::try_new(
-        Arc::new(wrapper_schema),
+        Arc::clone(&schemas.wrapper),
         vec![op_array, Arc::new(pk_list), Arc::new(data_struct)],
     )
     .map_err(|e| Error::SchemaMismatch {
@@ -401,50 +468,115 @@ pub(super) enum FieldBuilder {
     DictUtf8UInt32(StringDictionaryBuilder<UInt32Type>),
 }
 
+/// Most distinct values a dictionary column's builder reserves slots for up front.
+const DICTIONARY_VALUE_SLOTS: usize = 256;
+
+/// Bytes the values of a string, binary or dictionary column take in `changes`, so
+/// its builder reserves what the batch needs rather than a per-value guess: `Bytes`
+/// values by length, and other non-null values (rendered as text) at an estimated
+/// 16 bytes. Zero for fixed-width types, which have no data buffer.
+fn variable_width_bytes(
+    data_type: &DataType,
+    changes: &[DecodedChange],
+    source_idx: usize,
+) -> usize {
+    let variable_width = matches!(
+        data_type,
+        DataType::Utf8
+            | DataType::LargeUtf8
+            | DataType::Binary
+            | DataType::LargeBinary
+            | DataType::Dictionary(..)
+    );
+    if !variable_width {
+        return 0;
+    }
+    changes
+        .iter()
+        .filter_map(|change| change.row.get(source_idx))
+        .map(|value| match value {
+            Value::NULL => 0,
+            Value::Bytes(bytes) => bytes.len(),
+            _ => 16,
+        })
+        .fold(0, usize::saturating_add)
+}
+
 impl FieldBuilder {
+    /// A builder with the Arrow builders' default capacity (1 024 values).
+    #[cfg(test)]
     pub(super) fn new(data_type: &DataType) -> Result<Self> {
+        Self::with_capacity(data_type, 1024, 1024 * 16)
+    }
+
+    /// A builder sized for `capacity` values, with `bytes` of string/binary data
+    /// (see [`variable_width_bytes`]); the builders grow past either as needed.
+    pub(super) fn with_capacity(
+        data_type: &DataType,
+        capacity: usize,
+        bytes: usize,
+    ) -> Result<Self> {
+        // A dictionary stores each distinct value once, and a batch holds few.
+        let dictionary_values = capacity.min(DICTIONARY_VALUE_SLOTS);
+        let dictionary_bytes = bytes.min(dictionary_values.saturating_mul(16));
         Ok(match data_type {
-            DataType::Utf8 => Self::Utf8(StringBuilder::new()),
-            DataType::LargeUtf8 => Self::LargeUtf8(LargeStringBuilder::new()),
-            DataType::Binary => Self::Binary(BinaryBuilder::new()),
-            DataType::LargeBinary => Self::LargeBinary(LargeBinaryBuilder::new()),
-            DataType::Boolean => Self::Bool(BooleanBuilder::new()),
-            DataType::Int8 => Self::Int8(Int8Builder::new()),
-            DataType::Int16 => Self::Int16(Int16Builder::new()),
-            DataType::Int32 => Self::Int32(Int32Builder::new()),
-            DataType::Int64 => Self::Int64(Int64Builder::new()),
-            DataType::UInt8 => Self::UInt8(UInt8Builder::new()),
-            DataType::UInt16 => Self::UInt16(UInt16Builder::new()),
-            DataType::UInt32 => Self::UInt32(UInt32Builder::new()),
-            DataType::UInt64 => Self::UInt64(UInt64Builder::new()),
-            DataType::Float32 => Self::Float32(Float32Builder::new()),
-            DataType::Float64 => Self::Float64(Float64Builder::new()),
-            DataType::Date32 => Self::Date32(Date32Builder::new()),
+            DataType::Utf8 => Self::Utf8(StringBuilder::with_capacity(capacity, bytes)),
+            DataType::LargeUtf8 => {
+                Self::LargeUtf8(LargeStringBuilder::with_capacity(capacity, bytes))
+            }
+            DataType::Binary => Self::Binary(BinaryBuilder::with_capacity(capacity, bytes)),
+            DataType::LargeBinary => {
+                Self::LargeBinary(LargeBinaryBuilder::with_capacity(capacity, bytes))
+            }
+            DataType::Boolean => Self::Bool(BooleanBuilder::with_capacity(capacity)),
+            DataType::Int8 => Self::Int8(Int8Builder::with_capacity(capacity)),
+            DataType::Int16 => Self::Int16(Int16Builder::with_capacity(capacity)),
+            DataType::Int32 => Self::Int32(Int32Builder::with_capacity(capacity)),
+            DataType::Int64 => Self::Int64(Int64Builder::with_capacity(capacity)),
+            DataType::UInt8 => Self::UInt8(UInt8Builder::with_capacity(capacity)),
+            DataType::UInt16 => Self::UInt16(UInt16Builder::with_capacity(capacity)),
+            DataType::UInt32 => Self::UInt32(UInt32Builder::with_capacity(capacity)),
+            DataType::UInt64 => Self::UInt64(UInt64Builder::with_capacity(capacity)),
+            DataType::Float32 => Self::Float32(Float32Builder::with_capacity(capacity)),
+            DataType::Float64 => Self::Float64(Float64Builder::with_capacity(capacity)),
+            DataType::Date32 => Self::Date32(Date32Builder::with_capacity(capacity)),
             DataType::Time64(TimeUnit::Nanosecond) => {
-                Self::Time64Nanos(Time64NanosecondBuilder::new())
+                Self::Time64Nanos(Time64NanosecondBuilder::with_capacity(capacity))
             }
             DataType::Timestamp(TimeUnit::Microsecond, tz) => Self::TimestampMicros(
-                TimestampMicrosecondBuilder::new()
+                TimestampMicrosecondBuilder::with_capacity(capacity)
                     .with_data_type(DataType::Timestamp(TimeUnit::Microsecond, tz.clone())),
             ),
             DataType::Timestamp(TimeUnit::Nanosecond, tz) => Self::TimestampNanos(
-                TimestampNanosecondBuilder::new()
+                TimestampNanosecondBuilder::with_capacity(capacity)
                     .with_data_type(DataType::Timestamp(TimeUnit::Nanosecond, tz.clone())),
             ),
             DataType::Decimal128(precision, scale) => Self::Decimal128(
-                Decimal128Builder::new().with_data_type(data_type.clone()),
+                Decimal128Builder::with_capacity(capacity).with_data_type(data_type.clone()),
                 *precision,
                 *scale,
             ),
             DataType::Decimal256(precision, scale) => Self::Decimal256(
-                Decimal256Builder::new().with_data_type(data_type.clone()),
+                Decimal256Builder::with_capacity(capacity).with_data_type(data_type.clone()),
                 *precision,
                 *scale,
             ),
             DataType::Dictionary(key, value) if **value == DataType::Utf8 => match **key {
-                DataType::UInt8 => Self::DictUtf8UInt8(StringDictionaryBuilder::new()),
-                DataType::UInt16 => Self::DictUtf8UInt16(StringDictionaryBuilder::new()),
-                DataType::UInt32 => Self::DictUtf8UInt32(StringDictionaryBuilder::new()),
+                DataType::UInt8 => Self::DictUtf8UInt8(StringDictionaryBuilder::with_capacity(
+                    capacity,
+                    dictionary_values.min(usize::from(u8::MAX)),
+                    dictionary_bytes,
+                )),
+                DataType::UInt16 => Self::DictUtf8UInt16(StringDictionaryBuilder::with_capacity(
+                    capacity,
+                    dictionary_values,
+                    dictionary_bytes,
+                )),
+                DataType::UInt32 => Self::DictUtf8UInt32(StringDictionaryBuilder::with_capacity(
+                    capacity,
+                    dictionary_values,
+                    dictionary_bytes,
+                )),
                 ref other => {
                     return DecodeSnafu {
                         message: format!(
@@ -1228,6 +1360,51 @@ mod tests {
             .expect("i32");
         assert_eq!(ids.value(0), 7);
         assert_eq!(ids.value(1), 8);
+    }
+
+    #[test]
+    fn build_change_batch_memory_sized_to_row_count() {
+        // Regression guard: the data-struct builders must be sized to the
+        // transaction's row count. Default-capacity Arrow builders reserve
+        // 1024 elements per column, so a 1-row change on a wide schema both
+        // allocated and reported ~100 KB from `get_array_memory_size()`,
+        // inflating the Cayenne mem-tier accounting by orders of magnitude.
+        use arrow::datatypes::Field;
+        let mut fields = vec![Field::new("id", DataType::Int64, false)];
+        fields.extend((0..12).map(|i| Field::new(format!("v{i}"), DataType::Int64, true)));
+        let schema: SchemaRef = Arc::new(Schema::new(fields));
+        let column_map: Vec<usize> = (0..13).collect();
+        let changes = vec![DecodedChange {
+            op: ChangeOp::Create,
+            row: (0..13).map(Value::Int).collect(),
+        }];
+        let batch = build_change_batch(&schema, &["id".to_string()], &column_map, &changes)
+            .expect("batch builds");
+        assert_eq!(batch.record.num_rows(), 1);
+        let size = batch.record.get_array_memory_size();
+        assert!(
+            size < 16 * 1024,
+            "1-row change batch reports {size} bytes; data builders are likely \
+             no longer sized to num_rows (default-capacity Arrow builders \
+             reserve 1024 elements per column)"
+        );
+    }
+
+    #[test]
+    fn change_batch_data_fields_are_nullable_whatever_the_dataset_declares() {
+        use arrow::datatypes::Field;
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("name", DataType::Utf8, false),
+        ]));
+        let changes = vec![DecodedChange {
+            op: ChangeOp::Update,
+            row: vec![Value::Int(1), Value::Bytes(b"one".to_vec())],
+        }];
+        let batch = build_change_batch(&schema, &["id".to_string()], &[0, 1], &changes)
+            .expect("batch builds");
+        let data = batch.data_batch();
+        assert!(data.schema().fields().iter().all(|f| f.is_nullable()));
     }
 
     #[test]

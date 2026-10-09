@@ -33,7 +33,7 @@ Sort: l_year ASC NULLS LAST
                       Filter: stock.s_i_id < Int64(1000)
                         TableScan: stock projection=[s_w_id, s_i_id]
                   Projection: item.i_id
-                    Filter: item.i_data LIKE Utf8("%b") AND item.i_id < Int64(1000)
+                    Filter: item.i_id < Int64(1000) AND item.i_data LIKE Utf8("%b")
                       TableScan: item projection=[i_id, i_data]
               TableScan: supplier projection=[su_suppkey, su_nationkey]
           SubqueryAlias: n2

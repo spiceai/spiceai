@@ -42,6 +42,68 @@ spice-sqlite-accel         —                  ✅ (runtime)        —
 2. **Accelerator gates** — each Spice accelerator matches a standalone oracle on
    the same data + SQL.
 
+Cayenne against each oracle, by suite:
+
+| Suite | DuckDB | SQLite | chDB |
+|-------|--------|--------|------|
+| TPC-H | ✅ SF1 | ✅ SF 0.1 (`CAYENNE_PARITY_SQLITE_TPCH_SF`) | ✅ SF1 |
+| TPC-DS | ✅ SF1 (`dsdgen`) | ✅ SF 0.1 (`tpcdsgen`, `CAYENNE_PARITY_SQLITE_TPCDS_SF`) | ✅ SF1 (`tpcdsgen`) |
+| ClickBench | ✅ reduced `hits` | ✅ reduced `hits` | ✅ reduced `hits` |
+| CH-benCHmark | ✅ full/append/changes | ✅ full | ✅ full/append/changes |
+| SSB | ✅ | ✅ | — |
+| SQLLancer, micro | ✅ | ✅ | ✅ |
+
+Two engines disagreeing say *someone* is wrong; three say who. SQLite and
+ClickHouse share no code or lineage with DataFusion, so they are where a bug
+Cayenne inherits from DataFusion shows up — a DuckDB mismatch that Cayenne's own
+DataFusion baseline agrees with is reported as a failure, never excused.
+
+## Asking an oracle the same question
+
+The suites are written for DataFusion. `support/dialect.rs` rewrites each query
+for SQLite or ClickHouse on the parsed statement — it never plans the query in
+DataFusion, since an oracle fed DataFusion's reading would agree with Cayenne on
+exactly the bugs it is there to catch. Every rule keeps the query's meaning or
+refuses: a construct an oracle cannot express (SQLite has no `ROLLUP`,
+`stddev_samp` or regular expressions) is named by `untranslatable`, and the
+inventory records that name as the cell's exclusion.
+
+| Oracle | What differs from DataFusion | How the lane asks it |
+|--------|------------------------------|----------------------|
+| both | `NULL` placement when an `ORDER BY` states none | every `ORDER BY` states DataFusion's: last ascending, first descending |
+| both | `0.06 + 0.01` is a double, below the `0.07` a row holds (TPC-H Q6) | literal decimal arithmetic folded exactly |
+| both | a join predicate inside every `OR` branch becomes a cross product (TPC-H Q19) | common conjuncts factored out of the `OR` |
+| SQLite | no `DATE`, `DECIMAL` or `INTERVAL` | dates stored as ISO text, compared with ISO literals and `date()` arithmetic; decimals stored and cast as `REAL` |
+| SQLite | `LIKE` folds ASCII case | `PRAGMA case_sensitive_like` |
+| ClickHouse | an outer join's unmatched side is `0`, not `NULL` (TPC-H Q13); `SUM` of nothing is `0`; bare `UNION` is an error | session settings in `support/chdb_engine.rs` |
+| ClickHouse | `/` is floating-point on integers and keeps only the dividend's scale on decimals | `intDiv` for integers, doubles otherwise |
+| ClickHouse | `DATE` wraps before 1970 | dates cast as `Date32` |
+| DuckDB | `/` on integers returns a double | `SET integer_division = true` |
+
+A lane prints the rewritten SQL beside any mismatch it reports.
+
+## Fixtures
+
+Every lane loads Cayenne and its oracle from the same parquet files.
+
+| Suite | Generator |
+|-------|-----------|
+| TPC-H | `tpchgen`, in-process (`support/tpch_data.rs`) |
+| TPC-DS | DuckDB's `dsdgen` for the DuckDB lane; `tpcdsgen`'s C-compatible mode for the SQLite and chDB lanes, whose processes cannot drive DuckDB (`support/tpcds_data.rs`). Row counts, keys and dimensions such as `item` agree; fact-table measures do not (SF1 `store_sales`: 2,880,404 rows in both, `sum(ss_quantity)` 138,963,631 against 138,943,711), so a query can select rows from one and none from the other. |
+| ClickBench | the reduced, ranking-deterministic `hits` table (`support/clickbench_data.rs`), or `CLICKBENCH_HITS_PARQUET` |
+| CH-benCHmark | a synthetic TPC-C warehouse with TPC-H's nations, built in-process so every query's filters select rows (`support/chbench_data.rs`) |
+
+## Empty answers are not passes
+
+Two engines that both return nothing agree, and have compared nothing. A cell
+whose two answers hold no value — no rows, or only `NULL` — is `Vacuous`, not
+`Pass`, and a lane fails on it unless the inventory's `empty_result_review`
+names why that query's answer is empty on the fixture the lane loaded. A review
+names its fixtures (`inventory::fixture`): TPC-DS Q13 selects nothing from
+`tpcdsgen`'s SF 0.1 rows and answers at SF1, so an empty Q13 fails the SF1 lanes.
+The census lists those reviewed holes per fixture; each is a query to reach with
+better data, not coverage.
+
 ## Out of scope here
 
 | Concern | Where it lives instead |
@@ -59,8 +121,8 @@ spice-sqlite-accel         —                  ✅ (runtime)        —
 | `result_correctness_inventory_test` | (none) | — | Inventory completeness + pure `compare_query_result_batches` |
 | `result_correctness_standalone_engines_test` | `result-correctness-duckdb` | **standalone DuckDB ↔ standalone SQLite** (no Spice) | micro, SSB, SQLLancer |
 | `result_correctness_vs_duckdb_test` | `result-correctness-duckdb` | Cayenne ↔ standalone DuckDB | TPC-H/DS SF1, ClickBench, CH-benCH × modes, SSB, SpiceBench, SQLLancer, micro |
-| `result_correctness_vs_chdb_test` | `result-correctness-chdb` | Cayenne ↔ standalone chDB | SQLLancer + micro |
-| `result_correctness_vs_sqlite_test` | (none) | Cayenne ↔ standalone SQLite | SSB, SQLLancer, micro |
+| `result_correctness_vs_chdb_test` | `result-correctness-chdb` | Cayenne ↔ standalone chDB | TPC-H/DS SF1, ClickBench, CH-benCH × modes, SQLLancer, micro |
+| `result_correctness_vs_sqlite_test` | (none) | Cayenne ↔ standalone SQLite | TPC-H/DS SF 0.1, ClickBench, CH-benCH full load, SSB, SQLLancer, micro |
 
 ### Runtime crate (`crates/runtime/tests/result_correctness.rs`)
 
@@ -105,8 +167,11 @@ CAYENNE_PARITY_TPCH_SF=1 CAYENNE_PARITY_TPCDS_SF=1 CAYENNE_PARITY_CHBENCH_SF=1 \
 cargo test -p cayenne --features result-correctness-chdb \
   --test result_correctness_vs_chdb_test
 
-# Cayenne ↔ standalone SQLite
-cargo test -p cayenne --test result_correctness_vs_sqlite_test
+# Cayenne ↔ standalone SQLite. TPC-H and TPC-DS run at SF 0.1 unless
+# CAYENNE_PARITY_SQLITE_TPCH_SF / CAYENNE_PARITY_SQLITE_TPCDS_SF say otherwise,
+# which keeps this binary, gated by `make nextest`, inside the gate's per-test
+# ceiling; the DuckDB and chDB lanes compare SF1.
+cargo test -p cayenne --test result_correctness_vs_sqlite_test -- --test-threads=1
 
 # Spice DuckDB / SQLite accelerators ↔ standalone oracles
 cargo test -p runtime --features duckdb,sqlite --test result_correctness -- --nocapture

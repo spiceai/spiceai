@@ -35,10 +35,17 @@ limitations under the License.
 //! `AcceleratedTable` the attempt built but had not registered aborts its
 //! refresh tasks when dropped; one it had registered is the registration the
 //! Spicepod change goes on to replace or remove, like any loaded dataset's.
+//!
+//! The one attempt that is waited for rather than dropped is a snapshot
+//! dataset's restore of its first snapshot (`Runtime::resolve_snapshot_source`):
+//! an archive is extracted on a blocking thread that dropping would not stop,
+//! and that would go on writing after the locks keeping other restores out of
+//! its files were released. `supersede` then waits for the restore to finish or
+//! fail, and the load stops before it registers the dataset.
 
 use std::{collections::HashMap, sync::Arc};
 
-use datafusion::sql::{ResolvedTableReference, TableReference};
+use datafusion::common::{ResolvedTableReference, TableReference};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 use tokio_util::sync::CancellationToken;
 
@@ -125,9 +132,15 @@ impl DatasetLoad {
 
     /// Resolves when this load is superseded. The load must then be dropped,
     /// together with any attempt it is running: [`DatasetLoads::supersede`]
-    /// waits for that attempt's guard.
+    /// waits for that attempt's guard. An attempt whose work cannot be dropped
+    /// part-way finishes it instead, and must not register what it built.
     pub(crate) async fn superseded(&self) {
         self.token.cancelled().await;
+    }
+
+    /// Whether this load has been superseded.
+    pub(crate) fn is_superseded(&self) -> bool {
+        self.token.is_cancelled()
     }
 }
 

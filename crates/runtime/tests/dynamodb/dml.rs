@@ -37,12 +37,6 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::time::sleep;
 
-const PORT_DML_INSERT: u16 = 8010;
-const PORT_DML_DELETE: u16 = 8011;
-const PORT_DML_INSERT_DELETE: u16 = 8012;
-const PORT_DML_TYPES: u16 = 8013;
-const PORT_DML_COMPOSITE_DELETE: u16 = 8014;
-
 fn get_client(port: u16, access_key: &str, secret_key: &str) -> Client {
     let config = SdkConfig::builder()
         .endpoint_url(format!("http://localhost:{port}"))
@@ -231,8 +225,9 @@ async fn dynamodb_dml_insert() -> anyhow::Result<()> {
 
     test_request_context()
         .scope(async {
-            let running_container = start_dynamodb_docker_container(PORT_DML_INSERT).await?;
-            let client = get_client(PORT_DML_INSERT, "foo", "bar");
+            let running_container = start_dynamodb_docker_container().await?;
+            let port = running_container.host_port(8000)?;
+            let client = get_client(port, "foo", "bar");
 
             create_table(&client, table_name).await;
 
@@ -245,7 +240,7 @@ async fn dynamodb_dml_insert() -> anyhow::Result<()> {
                 .send()
                 .await?;
 
-            let rt = setup_runtime(table_name, PORT_DML_INSERT).await?;
+            let rt = setup_runtime(table_name, port).await?;
 
             // Verify seed data
             let result = run_query(&rt, &format!("SELECT * FROM {table_name} ORDER BY id")).await?;
@@ -292,8 +287,9 @@ async fn dynamodb_dml_delete() -> anyhow::Result<()> {
 
     test_request_context()
         .scope(async {
-            let running_container = start_dynamodb_docker_container(PORT_DML_DELETE).await?;
-            let client = get_client(PORT_DML_DELETE, "foo", "bar");
+            let running_container = start_dynamodb_docker_container().await?;
+            let port = running_container.host_port(8000)?;
+            let client = get_client(port, "foo", "bar");
 
             create_table(&client, table_name).await;
 
@@ -308,7 +304,7 @@ async fn dynamodb_dml_delete() -> anyhow::Result<()> {
                     .await?;
             }
 
-            let rt = setup_runtime(table_name, PORT_DML_DELETE).await?;
+            let rt = setup_runtime(table_name, port).await?;
 
             // Verify all 4 rows exist
             let result = run_query(&rt, &format!("SELECT * FROM {table_name} ORDER BY id")).await?;
@@ -356,8 +352,9 @@ async fn dynamodb_dml_insert_then_delete() -> anyhow::Result<()> {
     test_request_context()
         .scope(async {
             let running_container =
-                start_dynamodb_docker_container(PORT_DML_INSERT_DELETE).await?;
-            let client = get_client(PORT_DML_INSERT_DELETE, "foo", "bar");
+                start_dynamodb_docker_container().await?;
+            let port = running_container.host_port(8000)?;
+            let client = get_client(port, "foo", "bar");
 
             create_table(&client, table_name).await;
 
@@ -370,7 +367,7 @@ async fn dynamodb_dml_insert_then_delete() -> anyhow::Result<()> {
                 .send()
                 .await?;
 
-            let rt = setup_runtime(table_name, PORT_DML_INSERT_DELETE).await?;
+            let rt = setup_runtime(table_name, port).await?;
 
             // Insert rows via SQL
             run_query(
@@ -432,8 +429,9 @@ async fn dynamodb_dml_insert_multiple_types() -> anyhow::Result<()> {
 
     test_request_context()
         .scope(async {
-            let running_container = start_dynamodb_docker_container(PORT_DML_TYPES).await?;
-            let client = get_client(PORT_DML_TYPES, "foo", "bar");
+            let running_container = start_dynamodb_docker_container().await?;
+            let port = running_container.host_port(8000)?;
+            let client = get_client(port, "foo", "bar");
 
             create_table(&client, table_name).await;
 
@@ -449,7 +447,7 @@ async fn dynamodb_dml_insert_multiple_types() -> anyhow::Result<()> {
                 .send()
                 .await?;
 
-            let rt = setup_runtime(table_name, PORT_DML_TYPES).await?;
+            let rt = setup_runtime(table_name, port).await?;
 
             // Verify seed data
             let result = run_query(&rt, &format!("SELECT * FROM {table_name} ORDER BY id")).await?;
@@ -501,9 +499,9 @@ async fn dynamodb_dml_delete_composite_key_tuple_in() -> anyhow::Result<()> {
 
     test_request_context()
         .scope(async {
-            let running_container =
-                start_dynamodb_docker_container(PORT_DML_COMPOSITE_DELETE).await?;
-            let client = get_client(PORT_DML_COMPOSITE_DELETE, "foo", "bar");
+            let running_container = start_dynamodb_docker_container().await?;
+            let port = running_container.host_port(8000)?;
+            let client = get_client(port, "foo", "bar");
 
             create_composite_key_table(&client, table_name).await;
 
@@ -524,7 +522,7 @@ async fn dynamodb_dml_delete_composite_key_tuple_in() -> anyhow::Result<()> {
                     .await?;
             }
 
-            let rt = setup_runtime(table_name, PORT_DML_COMPOSITE_DELETE).await?;
+            let rt = setup_runtime(table_name, port).await?;
 
             // Verify all 4 rows exist
             let result =

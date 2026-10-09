@@ -3,23 +3,18 @@ name: testoperator dispatch htap
 on:
   schedule:
     # htap-sf1000-adaptive, every 8 hours (0000, 0800, 1600) — the high-value SF1000 adaptive
-    # config for frequent adaptive trend data (spiceai-dev-xlarge-runners). 8h is the tightest
-    # cadence that still fits the serialized SF1000 xlarge queue in a day at a 30-minute HTAP
-    # window (16 runs/day across adaptive + daily + cold batches, ~20h occupancy with slack
-    # for slow/cold/mysql arms).
+    # configs (mysql + postgres, which also run the Cayenne datalake tier) for frequent adaptive
+    # trend data (spiceai-dev-xlarge-runners). With the daily batch below that is 8 runs/day on
+    # the serialized SF1000 xlarge queue at a 30-minute HTAP window, leaving slack for slow arms.
     - cron: '0 */8 * * *'
-    # htap-sf1000 (other configs), once daily (0400) — the remaining SF1000 configs
-    # (adaptive-turso, duckdb baseline) on the xlarge pool. 0400 sits after the 0000 adaptive
-    # batch (~4h) so it usually starts on an idle slot rather than queueing immediately.
+    # htap-sf1000 (the turso-metastore adaptive configs), once daily (0400) on the xlarge pool.
+    # 0400 sits after the 0000 adaptive batch so it usually starts on an idle slot rather than
+    # queueing immediately.
     - cron: '0 4 * * *'
     # htap-sf1, twice daily (0600, 1800) — HTAP CH-benCHmark SF1 (spiceai-dev-large-runners).
     # SF1 uses a different runner pool and a unique concurrency group, so it does not serialize
     # with the SF1000 xlarge queue.
     - cron: '0 6,18 * * *'
-    # htap-sf1000-cold, once daily (1200) — HTAP CH-benCHmark SF1000 adaptive cold-object-store
-    # tier (spiceai-dev-xlarge-runners). 1200 is between the 0800 and 1600 adaptive slots; it
-    # shares the SF1000 serialized run concurrency group, so it queues, never contends.
-    - cron: '0 12 * * *'
 
   workflow_dispatch:
     inputs:
@@ -37,7 +32,6 @@ on:
           - 'sf100'
           - 'sf1000'
           - 'sf1000-adaptive'
-          - 'sf1000-cold'
 
 jobs:
   dispatch-htap:
@@ -115,7 +109,6 @@ jobs:
               '0 */8 * * *')                  SF=sf1000-adaptive ;;
               '0 4 * * *')                    SF=sf1000 ;;
               '0 6,18 * * *')                 SF=sf1 ;;
-              '0 12 * * *')                   SF=sf1000-cold ;;
               *)                              SF= ;;   # unrecognized cron — dispatch nothing
             esac
           fi

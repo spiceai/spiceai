@@ -44,6 +44,9 @@ limitations under the License.
 
 mod common;
 
+// `SplitMix64` so the generated data is identical across arms and across runs.
+use common::lookup_index::SplitMix64;
+
 use std::sync::Arc;
 
 use arrow::array::{Int32Array, Int64Array};
@@ -71,19 +74,6 @@ const DATE_SPAN_DAYS: i32 = 2557;
 /// Selective probe window, ~1.2% of the span — the TPC-H q14 shape (one month).
 const PROBE_WINDOW_DAYS: i32 = 30;
 const PROBE_LO: i32 = 900;
-
-/// `SplitMix64` so the generated data is identical across arms and across runs.
-struct SplitMix64(u64);
-
-impl SplitMix64 {
-    fn next_u64(&mut self) -> u64 {
-        self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
-        let mut z = self.0;
-        z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
-        z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
-        z ^ (z >> 31)
-    }
-}
 
 fn lineitem_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![

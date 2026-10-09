@@ -8,7 +8,7 @@ runtime:
       enabled: true
       item_ttl: 5s
   source_rate_control:
-    github_concurrent_connections_limit: 5 # Defaults to 4
+    github_concurrent_connections_limit: 2 # Defaults to 4
   dataset_load_parallelism: 1
 
 datasets:

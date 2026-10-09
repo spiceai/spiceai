@@ -32,6 +32,10 @@ inputs:
     description: 'Name of the artifact to upload (defaults to spiced)'
     required: false
     default: 'spiced'
+  artifact_retention_days:
+    description: 'Days to keep the uploaded artifact. Empty keeps the repository default; set 1 when the artifact only hands binaries to later jobs of the same run.'
+    required: false
+    default: ''
   use_makefile:
     description: 'Whether to use the Makefile for building (recommended for most builds). Note: Makefile always produces release builds; rust_profile is ignored when use_makefile is true.'
     required: false
@@ -333,6 +337,7 @@ runs:
       with:
         name: ${{ inputs.artifact_name }}
         path: spiced${{ steps.detect-os.outputs.ext }}
+        retention-days: ${{ inputs.artifact_retention_days }}
 
     - name: Upload spiced and spice CLI artifacts
       if: inputs.upload_artifact == 'true' && inputs.build_cli == 'true'
@@ -342,3 +347,4 @@ runs:
         path: |
           spiced${{ steps.detect-os.outputs.ext }}
           spice${{ steps.detect-os.outputs.ext }}
+        retention-days: ${{ inputs.artifact_retention_days }}

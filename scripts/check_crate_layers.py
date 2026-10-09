@@ -25,8 +25,6 @@
 from __future__ import annotations
 
 import argparse
-import json
-import subprocess
 import sys
 from pathlib import Path
 
@@ -43,7 +41,7 @@ except ModuleNotFoundError:
     )
     raise SystemExit(2)
 
-REPO = Path(__file__).resolve().parent.parent
+from rust_guard_common import REPO, cargo_metadata  # noqa: E402
 
 
 def load_layers() -> dict:
@@ -58,30 +56,6 @@ def load_layers() -> dict:
         # Malformed manifest is a config error (exit 2), not a layering violation.
         print(f"error: layers.toml is not valid TOML: {e}", file=sys.stderr)
         raise SystemExit(2)
-
-
-def load_metadata() -> dict:
-    try:
-        out = subprocess.run(
-            # --locked: this is a fast, side-effect-free lint guard; fail rather
-            # than let cargo mutate Cargo.lock, keeping CI/dev runs deterministic.
-            ["cargo", "metadata", "--format-version", "1", "--no-deps", "--locked"],
-            cwd=REPO,
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-    except FileNotFoundError:
-        print("error: `cargo` not found on PATH — is the Rust toolchain installed?", file=sys.stderr)
-        raise SystemExit(2)
-    except subprocess.CalledProcessError as e:
-        # Surface cargo's own diagnostics (e.g. a stale Cargo.lock, which --locked
-        # refuses to update) instead of a Python traceback, and exit cleanly.
-        print(f"error: `cargo metadata` failed (exit {e.returncode}).", file=sys.stderr)
-        if e.stderr:
-            print(e.stderr.strip(), file=sys.stderr)
-        raise SystemExit(2)
-    return json.loads(out.stdout)
 
 
 def rel(manifest_path: str) -> str:
@@ -121,7 +95,7 @@ def main() -> int:
             return 2
     order: list[str] = cfg["order"]
 
-    meta = load_metadata()
+    meta = cargo_metadata()
     pkgs = meta["packages"]
     names = {p["name"] for p in pkgs}
     path_of = {p["name"]: rel(p["manifest_path"]) for p in pkgs}

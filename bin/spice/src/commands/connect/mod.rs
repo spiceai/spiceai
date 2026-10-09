@@ -50,11 +50,6 @@ pub struct ConnectArgs {
     /// Spicepod path in `<org>/<pod>` form.
     #[arg(value_name = "ORG/POD")]
     pub target: Option<ConnectTarget>,
-
-    /// The global `--cloud-region`, forwarded by the dispatcher for the
-    /// deprecated pod-add behavior.
-    #[arg(skip)]
-    pub cloud_region: Option<String>,
 }
 
 /// A positional value may contain credential-like input, so derived CLI

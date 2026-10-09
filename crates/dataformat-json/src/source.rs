@@ -18,6 +18,7 @@
 //! Execution plan for reading JSON files
 
 use std::io::{BufReader, Read, Seek, SeekFrom};
+use std::ops::Range;
 use std::sync::Arc;
 use std::task::Poll;
 
@@ -28,13 +29,16 @@ use crate::{
 };
 use crate::{extract_flattened_from_nested, project_nested_schema};
 
+use datafusion::common::exec_datafusion_err;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::{DataFusionError, Result};
+use datafusion::physical_plan::{PhysicalExpr, apply_expression_roots};
 
 use datafusion_datasource::decoder::{DecoderDeserializer, deserialize_stream};
 use datafusion_datasource::file_compression_type::FileCompressionType;
 use datafusion_datasource::file_stream::{FileOpenFuture, FileOpener};
 use datafusion_datasource::projection::{ProjectionOpener, SplitProjection};
-use datafusion_datasource::{PartitionedFile, RangeCalculation, TableSchema, calculate_range};
+use datafusion_datasource::{FileRange, PartitionedFile, TableSchema};
 
 use arrow::datatypes::SchemaRef;
 use arrow::json::ReaderBuilder;
@@ -43,7 +47,8 @@ use datafusion_datasource::file::FileSource;
 use datafusion_datasource::file_scan_config::FileScanConfig;
 use datafusion_physical_expr::projection::ProjectionExprs;
 use futures::{StreamExt, TryStreamExt};
-use object_store::{GetOptions, GetResultPayload, ObjectStore};
+use object_store::path::Path;
+use object_store::{GetOptions, GetRange, GetResultPayload, ObjectStore};
 
 /// A [`FileOpener`] that opens a JSON file and yields a [`FileOpenFuture`]
 pub struct SpiceJsonOpener {
@@ -174,6 +179,13 @@ impl FileSource for SpiceJsonSource {
 
     fn projection(&self) -> Option<&ProjectionExprs> {
         Some(&self.projection.source)
+    }
+
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        apply_expression_roots(self.projection.source.iter(), f)
     }
 
     fn table_schema(&self) -> &TableSchema {
@@ -523,4 +535,94 @@ impl FileOpener for SpiceJsonOpener {
             }
         }))
     }
+}
+
+/// The result of [`calculate_range`]: either the byte range to read, or a signal that the
+/// partition holds no complete line and the opener should return an empty stream.
+enum RangeCalculation {
+    Range(Option<Range<u64>>),
+    TerminateEarly,
+}
+
+/// Aligns a [`PartitionedFile`]'s byte range to line boundaries, so a file split across
+/// partitions is read as whole lines rather than truncated ones.
+///
+/// Vendored from `datafusion_datasource::calculate_range` (`DataFusion` 54), which `DataFusion`
+/// 55 replaced with `AlignedBoundaryStream`. That type streams the aligned bytes instead of
+/// returning the range, and this opener needs the range up front: it reads the local-file
+/// payload with `seek` + `take` and buffers it for SODA and `json_pointer` handling.
+async fn calculate_range(
+    file: &PartitionedFile,
+    store: &Arc<dyn ObjectStore>,
+    terminator: Option<u8>,
+) -> Result<RangeCalculation> {
+    let location = &file.object_meta.location;
+    let file_size = file.object_meta.size;
+    let newline = terminator.unwrap_or(b'\n');
+
+    match file.range {
+        None => Ok(RangeCalculation::Range(None)),
+        Some(FileRange { start, end }) => {
+            let start: u64 = start.try_into().map_err(|_| {
+                exec_datafusion_err!("Expect start range to fit in u64, got {start}")
+            })?;
+            let end: u64 = end
+                .try_into()
+                .map_err(|_| exec_datafusion_err!("Expect end range to fit in u64, got {end}"))?;
+
+            let start_delta = if start == 0 {
+                0
+            } else {
+                find_first_newline(store, location, start - 1, file_size, newline).await?
+            };
+
+            if start + start_delta > end {
+                return Ok(RangeCalculation::TerminateEarly);
+            }
+
+            let end_delta = if end == file_size {
+                0
+            } else {
+                find_first_newline(store, location, end - 1, file_size, newline).await?
+            };
+
+            let range = start + start_delta..end + end_delta;
+
+            if range.start >= range.end {
+                return Ok(RangeCalculation::TerminateEarly);
+            }
+
+            Ok(RangeCalculation::Range(Some(range)))
+        }
+    }
+}
+
+/// Returns the position of the first `newline` byte in `start..end` of the object at
+/// `location`, relative to `start`, or the number of bytes scanned when there is none.
+async fn find_first_newline(
+    object_store: &Arc<dyn ObjectStore>,
+    location: &Path,
+    start: u64,
+    end: u64,
+    newline: u8,
+) -> Result<u64> {
+    let options = GetOptions {
+        range: Some(GetRange::Bounded(start..end)),
+        ..Default::default()
+    };
+
+    let result = object_store.get_opts(location, options).await?;
+    let mut result_stream = result.into_stream();
+
+    let mut index = 0;
+
+    while let Some(chunk) = result_stream.next().await.transpose()? {
+        if let Some(position) = chunk.iter().position(|&byte| byte == newline) {
+            return Ok(index + position as u64);
+        }
+
+        index += chunk.len() as u64;
+    }
+
+    Ok(index)
 }

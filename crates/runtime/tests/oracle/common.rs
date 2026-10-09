@@ -68,12 +68,11 @@ pub fn make_oracle_cloud_dataset(path: &str, name: &str) -> Dataset {
 
 #[instrument]
 pub async fn start_oracle_docker_container(
-    container_name: &'static str,
-    port: u16,
-) -> Result<RunningContainer<'static>, anyhow::Error> {
+    container_name: &str,
+) -> Result<RunningContainer, anyhow::Error> {
     let running_container = ContainerRunnerBuilder::new(container_name)
         .image(ORACLE_IMAGE.to_string())
-        .add_port_binding(1521, port)
+        .publish_port(1521)
         .add_env_var("ORACLE_PASSWORD", ORACLE_ROOT_PASSWORD)
         .healthcheck(HealthConfig {
             test: Some(vec!["CMD-SHELL".to_string(), "healthcheck.sh".to_string()]),

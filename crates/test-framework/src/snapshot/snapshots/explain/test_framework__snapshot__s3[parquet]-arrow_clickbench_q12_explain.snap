@@ -12,8 +12,8 @@ description: "Query: clickbench_q12"
 |               |         Filter: hits.MobilePhoneModel != LargeUtf8("")                                                                                                    |
 |               |           TableScan: hits projection=[UserID, MobilePhone, MobilePhoneModel]                                                                              |
 | physical_plan | SortPreservingMergeExec: [u@2 DESC], fetch=10                                                                                                             |
-|               |   SortExec: TopK(fetch=10), expr=[u@2 DESC], preserve_partitioning=[true]                                                                                 |
-|               |     ProjectionExec: expr=[MobilePhone@0 as MobilePhone, MobilePhoneModel@1 as MobilePhoneModel, count(alias1)@2 as u]                                     |
+|               |   ProjectionExec: expr=[MobilePhone@0 as MobilePhone, MobilePhoneModel@1 as MobilePhoneModel, count(alias1)@2 as u]                                       |
+|               |     SortExec: TopK(fetch=10), expr=[count(alias1)@2 DESC], preserve_partitioning=[true]                                                                   |
 |               |       AggregateExec: mode=FinalPartitioned, gby=[MobilePhone@0 as MobilePhone, MobilePhoneModel@1 as MobilePhoneModel], aggr=[count(alias1)]              |
 |               |         RepartitionExec: partitioning=Hash([MobilePhone@0, MobilePhoneModel@1], 16), input_partitions=16                                                  |
 |               |           AggregateExec: mode=Partial, gby=[MobilePhone@0 as MobilePhone, MobilePhoneModel@1 as MobilePhoneModel], aggr=[count(alias1)]                   |

@@ -19,12 +19,9 @@ use std::sync::Arc;
 
 use crate::{
     Result, Runtime, UnableToInitializeLlmSnafu,
-    model::{ResponsesApiSupport, try_to_chat_model, try_to_responses_model},
+    model::{LoadedChatModel, ResponsesApiSupport, try_to_chat_model, try_to_responses_model},
 };
-use llms::{
-    chat::{Chat, try_map_boxed_error_to_box},
-    responses::Responses,
-};
+use llms::{chat::try_map_boxed_error_to_box, responses::Responses};
 use secrecy::SecretString;
 use snafu::ResultExt;
 use spicepod::component::model::Model as SpicepodModel;
@@ -36,7 +33,7 @@ impl Runtime {
         m: SpicepodModel,
         params: HashMap<String, SecretString>,
     ) -> Result<(
-        Arc<dyn Chat>,
+        LoadedChatModel,
         Option<Arc<dyn Responses>>,
         ResponsesApiSupport,
     )> {
@@ -47,6 +44,7 @@ impl Runtime {
             .context(UnableToInitializeLlmSnafu)?;
 
         completions_model
+            .chat
             .health()
             .await
             .boxed()

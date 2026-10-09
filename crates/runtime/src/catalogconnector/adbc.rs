@@ -36,15 +36,15 @@ use data_components::adbc_helpers::{
 };
 use data_components::catalog_filter::TableSelector;
 use datafusion::catalog::{CatalogProvider, SchemaProvider};
+use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
 use datafusion::error::Result as DFResult;
-use datafusion::sql::TableReference;
 use datafusion_table_providers::adbc::AdbcTableFactory;
 use datafusion_table_providers::sql::db_connection_pool::adbcpool::{
     ADBCPool, AdbcConnectionPoolBuilder,
 };
 use futures::stream::{self, StreamExt};
-use runtime_datafusion::function_support::bigquery_can_evaluate_expression;
+use runtime_datafusion::function_support::expression_support_for_engine;
 use runtime_udfs_api::deny_spice_functions_for_table_providers;
 use snafu::prelude::*;
 use std::any::Any;
@@ -53,7 +53,6 @@ use std::sync::{Arc, RwLock};
 use std::time::Instant;
 
 pub const PREFIX: &str = "adbc";
-const BIGQUERY_DRIVER: &str = "bigquery";
 
 pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("driver")
@@ -245,12 +244,13 @@ where
     <D::ConnectionType as adbc_core::Connection>::StatementType:
         datafusion_table_providers::sql::db_connection_pool::dbconnection::adbcconn::CancellableStatement,
 {
+    // The engine's per-expression gate rides on the plain policy: a cast the
+    // engine evaluates differently from DataFusion stays local on this route
+    // as on the engine's own connector (issue #14482).
     let function_support = deny_spice_functions_for_table_providers();
-    let function_support = match driver_name {
-        BIGQUERY_DRIVER => {
-            function_support.with_expression_support(Arc::new(bigquery_can_evaluate_expression))
-        }
-        _ => function_support,
+    let function_support = match expression_support_for_engine(driver_name) {
+        Some(gate) => function_support.with_expression_support(gate),
+        None => function_support,
     };
     AdbcTableFactory::new(pool)
         .with_federation_enabled(federation_enabled)

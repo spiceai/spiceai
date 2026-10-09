@@ -20,9 +20,10 @@ use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_expr::utils::collect_columns;
 use datafusion_physical_plan::expressions as df_expr;
 use itertools::Itertools;
-use vortex::arrow::FromArrowType;
+use vortex::arrow::ArrowSession;
 use vortex::dtype::DType;
 use vortex::dtype::Nullability;
+use vortex::dtype::half::f16;
 use vortex::expr::Expression;
 use vortex::expr::and_collect;
 use vortex::expr::cast;
@@ -160,7 +161,13 @@ impl DefaultExpressionConvertor {
         };
         // Match the DataFusion return field (UInt64, nullability from the list argument)
         // so a pushed `array_length` has the same type the plan already expects.
-        let return_dtype = DType::from_arrow((scalar_fn.return_type(), nullability));
+        let return_dtype = ArrowSession::default()
+            .from_arrow_datatype(scalar_fn.return_type(), nullability)
+            .map_err(|e| {
+                exec_datafusion_err!(
+                    "Failed to convert array_length return type to a Vortex dtype: {e}"
+                )
+            })?;
         Ok(cast(list_length(input), return_dtype))
     }
 
@@ -215,6 +222,9 @@ impl DefaultExpressionConvertor {
         };
 
         if let Some(base_expr) = case_expr.expr() {
+            // `DataFusion` matches a simple `CASE` operand against each `WHEN`
+            // value by bits, `-0.0` and `0.0` apart as in Vortex, unlike its
+            // `=` (see `compare_with_float_zero`).
             let base_expr = self.convert(base_expr.as_ref())?;
             for (when_expr, then_expr) in case_expr.when_then_expr().iter().rev() {
                 let when_expr = self.convert(when_expr.as_ref())?;
@@ -234,6 +244,74 @@ impl DefaultExpressionConvertor {
         }
 
         Ok(else_expr)
+    }
+
+    /// `left operator right` when one side is a floating-point zero literal,
+    /// rewritten so it holds for exactly the rows `DataFusion` keeps; `None`
+    /// for any other comparison, which converts as it is.
+    ///
+    /// `DataFusion` compares floats with `-0.0` and `0.0` equal (both operands
+    /// have their zeros normalized first), while Vortex compares them by IEEE
+    /// 754 total order, where `-0.0` sorts just below `0.0`. The two orders
+    /// agree on every comparison with a non-zero value, so only a comparison
+    /// with a zero needs both zeros spelled out. A comparison of two
+    /// non-literal floats has no such rewrite and is not pushed down (see
+    /// [`can_binary_be_pushed_down`]).
+    fn compare_with_float_zero(
+        &self,
+        operator: Operator,
+        left: &Arc<dyn PhysicalExpr>,
+        right: &Arc<dyn PhysicalExpr>,
+    ) -> DFResult<Option<Expression>> {
+        let (operand, operator) = if is_float_zero_literal(right) {
+            (left, operator)
+        } else if is_float_zero_literal(left) {
+            // `0 < x` is `x > 0`.
+            let swapped = match operator {
+                Operator::Lt => Operator::Gt,
+                Operator::Lte => Operator::Gte,
+                Operator::Gt => Operator::Lt,
+                Operator::Gte => Operator::Lte,
+                other => other,
+            };
+            (right, swapped)
+        } else {
+            return Ok(None);
+        };
+        let zero = if is_float_zero_literal(right) {
+            right
+        } else {
+            left
+        };
+        let Some((negative, positive)) = float_zeros(zero)? else {
+            return Ok(None);
+        };
+        let operand = self.convert(operand.as_ref())?;
+        let compare = |operator, zero: &Scalar| {
+            Binary.new_expr(operator, [operand.clone(), lit(zero.clone())])
+        };
+        Ok(Some(match operator {
+            Operator::Eq => Binary.new_expr(
+                Operator::Or,
+                [
+                    compare(Operator::Eq, &negative),
+                    compare(Operator::Eq, &positive),
+                ],
+            ),
+            Operator::NotEq => Binary.new_expr(
+                Operator::And,
+                [
+                    compare(Operator::NotEq, &negative),
+                    compare(Operator::NotEq, &positive),
+                ],
+            ),
+            Operator::Lt => compare(Operator::Lt, &negative),
+            Operator::Lte => compare(Operator::Lte, &positive),
+            Operator::Gt => compare(Operator::Gt, &positive),
+            Operator::Gte => compare(Operator::Gte, &negative),
+            // Arithmetic on a zero is not a comparison.
+            _ => return Ok(None),
+        }))
     }
 
     /// Converts an `IN` list, exactly or as a predicate (see [`InListUse`]).
@@ -265,6 +343,14 @@ impl DefaultExpressionConvertor {
                 }
             })
             .try_collect()?;
+        // `DataFusion` holds `-0.0` and `0.0` equal and Vortex does not (see
+        // `compare_with_float_zero`), so a list holding one zero holds both.
+        let mut list_elements = list_elements;
+        for element in in_list.list() {
+            if let Some((negative, positive)) = float_zeros(element)? {
+                list_elements.extend([negative, positive]);
+            }
+        }
 
         let Some(first_element) = list_elements.first() else {
             return Ok(lit(Scalar::from(in_list.negated())));
@@ -353,9 +439,14 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
         // TODO(joe): Don't return an error when we have an unsupported node, bubble up "TRUE" as in keep
         //  for that node, up to any `and` or `or` node.
         if let Some(binary_expr) = df.downcast_ref::<df_expr::BinaryExpr>() {
+            let operator = try_operator_from_df(*binary_expr.op())?;
+            if let Some(compared) =
+                self.compare_with_float_zero(operator, binary_expr.left(), binary_expr.right())?
+            {
+                return Ok(compared);
+            }
             let left = self.convert(binary_expr.left().as_ref())?;
             let right = self.convert(binary_expr.right().as_ref())?;
-            let operator = try_operator_from_df(*binary_expr.op())?;
 
             return Ok(Binary.new_expr(operator, [left, right]));
         }
@@ -384,7 +475,11 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
         }
 
         if let Some(cast_expr) = df.downcast_ref::<df_expr::CastExpr>() {
-            let cast_dtype = DType::from_arrow((cast_expr.cast_type(), Nullability::Nullable));
+            let cast_dtype = ArrowSession::default()
+                .from_arrow_datatype(cast_expr.cast_type(), Nullability::Nullable)
+                .map_err(|e| {
+                    exec_datafusion_err!("Failed to convert cast type to a Vortex dtype: {e}")
+                })?;
             let child = self.convert(cast_expr.expr().as_ref())?;
             return Ok(cast(child, cast_dtype));
         }
@@ -611,8 +706,7 @@ fn can_be_pushed_down_impl(df_expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> 
     } else if let Some(col) = expr.downcast_ref::<df_expr::Column>() {
         schema
             .field_with_name(col.name())
-            .ok()
-            .is_some_and(|field| supported_data_types(field.data_type()))
+            .is_ok_and(|field| supported_data_types(field.data_type()))
     } else if let Some(like) = expr.downcast_ref::<df_expr::LikeExpr>() {
         can_be_pushed_down_impl(like.expr(), schema)
             && can_be_pushed_down_impl(like.pattern(), schema)
@@ -769,8 +863,91 @@ fn is_convertible_case_expr(case_expr: &df_expr::CaseExpr) -> bool {
 fn can_binary_be_pushed_down(binary: &df_expr::BinaryExpr, schema: &Schema) -> bool {
     let is_op_supported = try_operator_from_df(*binary.op()).is_ok();
     is_op_supported
+        && !compares_two_float_expressions(*binary.op(), binary.left(), binary.right(), schema)
         && can_be_pushed_down_impl(binary.left(), schema)
         && can_be_pushed_down_impl(binary.right(), schema)
+}
+
+/// Whether `left op right` compares two floating-point operands neither of
+/// which is a literal. Vortex orders `-0.0` below `0.0` and `DataFusion` holds
+/// them equal, and with no literal to spell both zeros out (see
+/// `compare_with_float_zero`), such a comparison is left to `DataFusion`.
+fn compares_two_float_expressions(
+    op: DFOperator,
+    left: &Arc<dyn PhysicalExpr>,
+    right: &Arc<dyn PhysicalExpr>,
+    schema: &Schema,
+) -> bool {
+    matches!(
+        op,
+        DFOperator::Eq
+            | DFOperator::NotEq
+            | DFOperator::Lt
+            | DFOperator::LtEq
+            | DFOperator::Gt
+            | DFOperator::GtEq
+    ) && left.downcast_ref::<df_expr::Literal>().is_none()
+        && right.downcast_ref::<df_expr::Literal>().is_none()
+        && [left, right].iter().any(|operand| {
+            operand
+                .data_type(schema)
+                .is_ok_and(|data_type| is_float(&data_type))
+        })
+}
+
+fn is_float(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::Dictionary(_, value) => is_float(value),
+        other => other.is_floating(),
+    }
+}
+
+/// Whether `expr` is a literal `0.0` or `-0.0` of a floating-point type.
+fn is_float_zero_literal(expr: &Arc<dyn PhysicalExpr>) -> bool {
+    expr.downcast_ref::<df_expr::Literal>()
+        .is_some_and(|literal| float_zeros_of(literal.value()).is_some())
+}
+
+/// Both zeros of `value`'s type, negative first, when `value` is a
+/// floating-point zero.
+fn float_zeros_of(value: &ScalarValue) -> Option<(ScalarValue, ScalarValue)> {
+    match value {
+        ScalarValue::Float16(Some(v)) if *v == f16::ZERO => Some((
+            ScalarValue::Float16(Some(f16::NEG_ZERO)),
+            ScalarValue::Float16(Some(f16::ZERO)),
+        )),
+        ScalarValue::Float32(Some(v)) if *v == 0.0 => Some((
+            ScalarValue::Float32(Some(-0.0)),
+            ScalarValue::Float32(Some(0.0)),
+        )),
+        ScalarValue::Float64(Some(v)) if *v == 0.0 => Some((
+            ScalarValue::Float64(Some(-0.0)),
+            ScalarValue::Float64(Some(0.0)),
+        )),
+        ScalarValue::Dictionary(key, value) => float_zeros_of(value).map(|(negative, positive)| {
+            (
+                ScalarValue::Dictionary(key.clone(), Box::new(negative)),
+                ScalarValue::Dictionary(key.clone(), Box::new(positive)),
+            )
+        }),
+        _ => None,
+    }
+}
+
+/// Both zeros of a floating-point zero literal's type as Vortex scalars,
+/// negative first; `None` when `expr` is no such literal.
+fn float_zeros(expr: &Arc<dyn PhysicalExpr>) -> DFResult<Option<(Scalar, Scalar)>> {
+    let Some((negative, positive)) = expr
+        .downcast_ref::<df_expr::Literal>()
+        .and_then(|literal| float_zeros_of(literal.value()))
+    else {
+        return Ok(None);
+    };
+    let to_scalar = |value: &ScalarValue| {
+        Scalar::from_df(value)
+            .map_err(|e| exec_datafusion_err!("Failed to convert literal to a Vortex scalar: {e}"))
+    };
+    Ok(Some((to_scalar(&negative)?, to_scalar(&positive)?)))
 }
 
 fn contains_decimal_to_floating_cast(df_expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
@@ -1022,8 +1199,10 @@ mod tests {
         let expr_convertor = DefaultExpressionConvertor::default();
         let col_expr = Arc::new(df_expr::Column::new("test", 0)) as Arc<dyn PhysicalExpr>;
         let result = make_vortex_predicate(&expr_convertor, &[col_expr])
-            .expect("single predicate conversion should succeed");
-        assert!(result.is_some());
+            .expect("single predicate conversion should succeed")
+            .expect("a non-empty conjunction converts to an expression");
+        // A lone predicate is the converted column itself, not wrapped in a conjunction.
+        assert_eq!(result.to_string(), get_item("test", root()).to_string());
     }
 
     #[test]
@@ -1032,9 +1211,13 @@ mod tests {
         let col1 = Arc::new(df_expr::Column::new("col1", 0)) as Arc<dyn PhysicalExpr>;
         let col2 = Arc::new(df_expr::Column::new("col2", 1)) as Arc<dyn PhysicalExpr>;
         let result = make_vortex_predicate(&expr_convertor, &[col1, col2])
-            .expect("multiple predicate conversion should succeed");
-        assert!(result.is_some());
-        // Result should be an AND expression combining the two columns
+            .expect("multiple predicate conversion should succeed")
+            .expect("a non-empty conjunction converts to an expression");
+        // Every predicate filters the scan, so the result is the AND of both columns.
+        assert_eq!(
+            result.to_string(),
+            vortex::expr::and(get_item("col1", root()), get_item("col2", root())).to_string()
+        );
     }
 
     #[rstest]
@@ -1164,7 +1347,9 @@ mod tests {
         );
         let session = VortexSession::default();
         let pruning_expr = result
-            .falsify(&scope, &session)
+            .bind(&scope)
+            .expect("converted IN-list should bind to the scope")
+            .falsify(&session)
             .expect("falsify should not error")
             .expect("converted IN-list should support min/max pruning");
 
@@ -1976,36 +2161,68 @@ mod tests {
         assert!(!can_be_pushed_down_impl(&like_expr, &test_schema));
     }
 
-    // https://github.com/vortex-data/vortex/issues/6211
-    #[tokio::test]
-    async fn test_cast_int_to_string() -> anyhow::Result<()> {
-        let ctx = TestSessionContext::default();
+    /// The values of the single column `sql` returns, rendered as text.
+    async fn single_column_as_text(
+        ctx: &TestSessionContext,
+        sql: &str,
+    ) -> anyhow::Result<Vec<Option<String>>> {
+        let batches = ctx.session.sql(sql).await?.collect().await?;
+        let mut values = Vec::new();
+        for batch in &batches {
+            anyhow::ensure!(
+                batch.num_columns() == 1,
+                "expected one column from `{sql}`, got {}",
+                batch.num_columns()
+            );
+            let text = datafusion::arrow::compute::cast(batch.column(0), &DataType::Utf8)?;
+            let text = text
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::StringArray>()
+                .ok_or_else(|| anyhow::anyhow!("a cast to Utf8 must yield a StringArray"))?;
+            values.extend(text.iter().map(|value| value.map(str::to_string)));
+        }
+        Ok(values)
+    }
 
+    /// Writes a one-row file with `id = 1` and checks every shape of an
+    /// integer-to-string cast over it returns that one row: the cast as an aliased
+    /// projection under a filter, the cast inside the filter, and the bare cast
+    /// projection that, with projection pushdown, is evaluated by the Vortex scan.
+    async fn assert_cast_int_to_string_results(ctx: &TestSessionContext) -> anyhow::Result<()> {
         ctx.session
             .sql(r#"copy (select 1 as id) to 'example.vortex'"#)
-            .await?
-            .show()
-            .await?;
-
-        ctx.session
-            .sql(r#"select cast(id as string) as sid from 'example.vortex' where id > 0"#)
-            .await?
-            .show()
-            .await?;
-
-        ctx.session
-            .sql(r#"select id from 'example.vortex' where cast (id as string) == '1'"#)
-            .await?
-            .show()
-            .await?;
-
-        // This fails as it pushes string cast to the scan
-        ctx.session
-            .sql(r#"select cast(id as string) from 'example.vortex'"#)
             .await?
             .collect()
             .await?;
 
+        assert_eq!(
+            single_column_as_text(
+                ctx,
+                r#"select cast(id as string) as sid from 'example.vortex' where id > 0"#
+            )
+            .await?,
+            vec![Some("1".to_string())]
+        );
+        assert_eq!(
+            single_column_as_text(
+                ctx,
+                r#"select id from 'example.vortex' where cast (id as string) == '1'"#
+            )
+            .await?,
+            vec![Some("1".to_string())]
+        );
+        assert_eq!(
+            single_column_as_text(ctx, r#"select cast(id as string) from 'example.vortex'"#)
+                .await?,
+            vec![Some("1".to_string())]
+        );
         Ok(())
+    }
+
+    // https://github.com/vortex-data/vortex/issues/6211
+    #[tokio::test]
+    async fn test_cast_int_to_string() -> anyhow::Result<()> {
+        // Projection pushdown off (the format's default): the casts run above the scan.
+        assert_cast_int_to_string_results(&TestSessionContext::default()).await
     }
 }

@@ -23,6 +23,7 @@ use aws_sdk_credential_bridge;
 use chrono::TimeZone;
 use datafusion::catalog::Session;
 use datafusion::catalog::memory::DataSourceExec;
+use datafusion::common::TableReference;
 use datafusion::common::tree_node::TreeNode;
 use datafusion::common::{DFSchema, exec_err};
 use datafusion::config::TableParquetOptions;
@@ -45,10 +46,6 @@ use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::{ExecutionPlan, PhysicalExpr};
 use datafusion::scalar::ScalarValue;
-use datafusion::sql::TableReference;
-use delta_kernel::engine::default::DefaultEngine;
-use delta_kernel::engine::default::executor::tokio::TokioBackgroundExecutor;
-use delta_kernel::engine::default::storage::store_from_url_opts;
 use delta_kernel::expressions::{BinaryExpressionOp, DecimalData, Expression, Scalar};
 use delta_kernel::scan::ScanBuilder;
 use delta_kernel::scan::state::ScanFile;
@@ -56,6 +53,9 @@ use delta_kernel::schema::{DecimalType, PrimitiveType};
 use delta_kernel::snapshot::Snapshot;
 use delta_kernel::table_features::ColumnMappingMode;
 use delta_kernel::{ExpressionRef, Predicate, SnapshotRef};
+use delta_kernel_default_engine::DefaultEngine;
+use delta_kernel_default_engine::executor::tokio::TokioBackgroundExecutor;
+use delta_kernel_default_engine::storage::store_from_url_opts;
 use indexmap::IndexMap;
 use object_store::ObjectMeta;
 use pruning::{can_be_evaluted_for_partition_pruning, prune_partitions};
@@ -99,6 +99,15 @@ pub enum Error {
     ))]
     SnapshotLockError {
         source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
+    #[snafu(display(
+        "Failed to load Delta Lake table '{table_url}': column '{column}' has Delta type {data_type}, which Spice cannot read yet. Remove the column from the table or read it through a view that casts it. See: https://spiceai.org/docs/components/data-connectors/delta-lake"
+    ))]
+    UnsupportedColumnType {
+        table_url: String,
+        column: String,
+        data_type: String,
     },
 
     #[snafu(display("Failed to create object store for Delta Lake table {table_url}: {source}"))]
@@ -306,6 +315,15 @@ impl DeltaTable {
             "Initializing Delta Lake table at '{table_url}'",
         );
 
+        if let Some((column, data_type)) = first_unsupported_column(&delta_schema) {
+            return UnsupportedColumnTypeSnafu {
+                table_url: table_url.to_string(),
+                column,
+                data_type,
+            }
+            .fail();
+        }
+
         let arrow_schema = Self::get_logical_schema(&snapshot);
 
         let physical_schema_mapping = if column_mapping_mode == ColumnMappingMode::None {
@@ -416,10 +434,14 @@ impl DeltaTable {
                 })
                 .collect::<Vec<_>>()
         });
-        let table_schema = datafusion_datasource::TableSchema::new(
-            Arc::clone(schema),
-            partition_cols.iter().map(|f| Arc::new(f.clone())).collect(),
-        );
+        let table_schema = datafusion_datasource::TableSchema::builder(Arc::clone(schema))
+            .with_table_partition_cols(
+                partition_cols
+                    .iter()
+                    .map(|f| Arc::new(f.clone()))
+                    .collect::<Vec<_>>(),
+            )
+            .build();
         tracing::trace!(
             table_parquet_options = ?self.table_parquet_options,
             "Creating Delta Lake ParquetSource"
@@ -881,6 +903,32 @@ impl PhysicalExpr for RelabelFieldsExpr {
         write!(f, "{self}")
     }
 }
+/// Finds the first column (by dotted path) whose Delta type Spice does not map to an
+/// Arrow type yet: `void`, and the year-month and day-time interval types.
+///
+/// The Delta kernel reads these as `Null`, `Int32` months and `Int64` microseconds.
+/// Exposing an interval column as a plain integer would be a silent change of meaning,
+/// so a table carrying one is refused with a named error instead, as it was before the
+/// kernel understood these types.
+fn first_unsupported_column(schema: &delta_kernel::schema::StructType) -> Option<(String, String)> {
+    fn walk(path: &str, data_type: &delta_kernel::schema::DataType) -> Option<(String, String)> {
+        use delta_kernel::schema::{DataType as D, PrimitiveType as P};
+        match data_type {
+            D::Primitive(P::Void | P::IntervalYearMonth | P::IntervalDayTime) => {
+                Some((path.to_string(), data_type.to_string()))
+            }
+            D::Primitive(_) | D::Variant(_) => None,
+            D::Array(array) => walk(&format!("{path}.element"), array.element_type()),
+            D::Struct(fields) => fields
+                .fields()
+                .find_map(|f| walk(&format!("{path}.{}", f.name()), f.data_type())),
+            D::Map(map) => walk(&format!("{path}.key"), map.key_type())
+                .or_else(|| walk(&format!("{path}.value"), map.value_type())),
+        }
+    }
+    schema.fields().find_map(|f| walk(f.name(), f.data_type()))
+}
+
 #[expect(clippy::cast_possible_wrap)]
 fn map_delta_data_type_to_arrow_data_type(
     delta_data_type: &delta_kernel::schema::DataType,
@@ -889,8 +937,13 @@ fn map_delta_data_type_to_arrow_data_type(
     match delta_data_type {
         delta_kernel::schema::DataType::Primitive(primitive_type) => match primitive_type {
             delta_kernel::schema::PrimitiveType::String => DataType::Utf8,
-            delta_kernel::schema::PrimitiveType::Long => DataType::Int64,
-            delta_kernel::schema::PrimitiveType::Integer => DataType::Int32,
+            // The interval types are refused up front by `first_unsupported_column`;
+            // they appear here, as the Arrow types the Delta kernel reads them into,
+            // only so this match stays exhaustive.
+            delta_kernel::schema::PrimitiveType::Long
+            | delta_kernel::schema::PrimitiveType::IntervalDayTime => DataType::Int64,
+            delta_kernel::schema::PrimitiveType::Integer
+            | delta_kernel::schema::PrimitiveType::IntervalYearMonth => DataType::Int32,
             delta_kernel::schema::PrimitiveType::Short => DataType::Int16,
             delta_kernel::schema::PrimitiveType::Byte => DataType::Int8,
             delta_kernel::schema::PrimitiveType::Float => DataType::Float32,
@@ -907,6 +960,8 @@ fn map_delta_data_type_to_arrow_data_type(
             delta_kernel::schema::PrimitiveType::Decimal(d) => {
                 DataType::Decimal128(d.precision(), d.scale() as i8)
             }
+            // Refused up front by `first_unsupported_column` (see above).
+            delta_kernel::schema::PrimitiveType::Void => DataType::Null,
         },
         delta_kernel::schema::DataType::Array(array_type) => DataType::List(Arc::new(Field::new(
             "item",
@@ -1718,6 +1773,53 @@ fn handle_delta_error(delta_error: delta_kernel::Error) -> Error {
 
 #[cfg(test)]
 mod tests {
+    mod unsupported_column_types {
+        use super::super::first_unsupported_column;
+        use delta_kernel::schema::{
+            ArrayType, DataType as DeltaType, PrimitiveType, StructField, StructType,
+        };
+
+        fn schema(fields: Vec<StructField>) -> StructType {
+            StructType::try_new(fields).expect("a valid test schema")
+        }
+
+        #[test]
+        fn a_schema_of_supported_types_passes() {
+            let s = schema(vec![
+                StructField::new("id", DeltaType::INTEGER, false),
+                StructField::new("name", DeltaType::STRING, true),
+            ]);
+            assert_eq!(first_unsupported_column(&s), None);
+        }
+
+        #[test]
+        fn an_interval_column_is_named_with_its_type() {
+            let s = schema(vec![
+                StructField::new("id", DeltaType::INTEGER, false),
+                StructField::new(
+                    "span",
+                    DeltaType::Primitive(PrimitiveType::IntervalYearMonth),
+                    true,
+                ),
+            ]);
+            assert_eq!(
+                first_unsupported_column(&s),
+                Some(("span".to_string(), "interval year to month".to_string()))
+            );
+        }
+
+        #[test]
+        fn a_nested_void_column_is_named_by_its_path() {
+            let s = schema(vec![StructField::new(
+                "events",
+                ArrayType::new(DeltaType::Primitive(PrimitiveType::Void), true),
+                true,
+            )]);
+            let (column, _) = first_unsupported_column(&s).expect("the void element is found");
+            assert_eq!(column, "events.element");
+        }
+    }
+
     use arrow::array::{ArrayRef, Int32Array, StructArray};
     use arrow::datatypes::Fields;
     use datafusion::logical_expr::{Operator, col, lit, not};

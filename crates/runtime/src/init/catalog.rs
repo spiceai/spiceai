@@ -128,7 +128,6 @@ impl Runtime {
         Ok(catalog_connector)
     }
 
-    #[expect(clippy::result_large_err)]
     fn catalogs_iter(
         self: Arc<Self>,
         app: &Arc<App>,

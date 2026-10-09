@@ -30,7 +30,7 @@ limitations under the License.
 use std::collections::{HashMap, HashSet};
 
 use bytes::Bytes;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use tokio::sync::RwLock;
 
 use crate::context::PartitionExprResolver;

@@ -17,6 +17,7 @@ limitations under the License.
 //! [`PartialAggregationFlightSqlExec`] — an [`ExecutionPlan`] that pushes a partial
 //! aggregation into a `FlightSQL` query, replacing the original scan + local aggregation.
 
+use datafusion::physical_plan::{StatisticsArgs, StatisticsContext};
 use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::sync::{Arc, LazyLock};
@@ -25,20 +26,22 @@ use datafusion::arrow::array::ArrayRef;
 use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::arrow::record_batch::RecordBatch;
+use datafusion::common::TableReference;
 use datafusion::common::stats::Precision;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::common::{DataFusionError, Result, Statistics};
 use datafusion::execution::TaskContext;
 use datafusion::logical_expr::Expr;
 use datafusion::physical_expr::aggregate::AggregateFunctionExpr;
 use datafusion::physical_expr::{EquivalenceProperties, PhysicalExpr};
 use datafusion::physical_plan::aggregates::PhysicalGroupBy;
+use datafusion::physical_plan::apply_expression_roots;
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
     SendableRecordBatchStream,
 };
-use datafusion::sql::TableReference;
 
 use data_components::flightsql::{
     FlightSqlClient, FlightSqlExec, query_to_stream, trace_parent_from_task_context,
@@ -209,8 +212,8 @@ impl PartialAggregationFlightSqlExec {
     /// could not compare it against a join's other side.
     fn derive_statistics(source: &FlightSqlExec, output_schema: &SchemaRef) -> Statistics {
         let stats = Statistics::new_unknown(output_schema);
-        match source
-            .partition_statistics(None)
+        match StatisticsContext::new()
+            .compute(source, &StatisticsArgs::new())
             .ok()
             .and_then(|s| s.num_rows.get_value().copied())
         {
@@ -257,6 +260,29 @@ impl DisplayAs for PartialAggregationFlightSqlExec {
 impl ExecutionPlan for PartialAggregationFlightSqlExec {
     fn name(&self) -> &'static str {
         "PartialAggregationFlightSqlExec"
+    }
+
+    /// Visits the grouping and aggregate expressions and the column substitutions, which
+    /// together are rendered into the SQL this node sends to the remote.
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        let group_by = self.group_by.input_exprs();
+        let aggregates = self.aggr_exprs.iter().flat_map(|aggr| {
+            let expressions = aggr.all_expressions();
+            expressions
+                .args
+                .into_iter()
+                .chain(expressions.order_by_exprs)
+        });
+        apply_expression_roots(
+            group_by
+                .into_iter()
+                .chain(aggregates)
+                .chain(self.column_substitutions.iter().map(Arc::clone)),
+            f,
+        )
     }
 
     fn schema(&self) -> SchemaRef {
