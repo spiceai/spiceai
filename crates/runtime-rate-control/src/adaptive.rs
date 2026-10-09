@@ -424,6 +424,16 @@ impl AdaptiveController {
         weight_of(self.admission_coefficient())
     }
 
+    /// The weight [`Self::acquire_weight`] will read `after` from now if no
+    /// further outcome is recorded. It never rises: the window decays toward
+    /// empty, which raises the coefficient toward 1.
+    #[must_use]
+    pub fn weight_after(&self, after: Duration) -> f64 {
+        let (requests, accepts) = self.decayed_window();
+        let remaining = 0.5_f64.powf(after.as_secs_f64() / self.half_life.as_secs_f64());
+        weight_of(self.coefficient_of(requests * remaining, accepts * remaining))
+    }
+
     /// How long until, with no further outcomes, [`Self::acquire_weight`]
     /// falls to `weight`: zero if it already has, and `None` if decay alone
     /// never takes it there. The window only decays toward empty, which raises
@@ -431,11 +441,7 @@ impl AdaptiveController {
     /// is never reached while the origin is throttled.
     #[must_use]
     pub fn decays_to_weight_in(&self, weight: f64) -> Option<Duration> {
-        let (requests, accepts) = {
-            let mut state = self.state.lock();
-            state.window.decay_to(Instant::now(), self.half_life);
-            (state.window.requests, state.window.accepts)
-        };
+        let (requests, accepts) = self.decayed_window();
         if weight_of(self.coefficient_of(requests, accepts)) <= weight {
             return Some(Duration::ZERO);
         }
@@ -457,6 +463,13 @@ impl AdaptiveController {
             return Some(Duration::ZERO);
         }
         Duration::try_from_secs_f64(self.half_life.as_secs_f64() * -fraction.log2()).ok()
+    }
+
+    /// The window's request and accept counts, decayed to now.
+    fn decayed_window(&self) -> (f64, f64) {
+        let mut state = self.state.lock();
+        state.window.decay_to(Instant::now(), self.half_life);
+        (state.window.requests, state.window.accepts)
     }
 }
 

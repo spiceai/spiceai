@@ -117,9 +117,17 @@ pub(crate) struct AdmissionQueue {
     head: Mutex<()>,
     /// Requests in the queue, its head included.
     waiting: AtomicUsize,
+    /// Signalled when the head's charge may have fallen or its limit freed:
+    /// an outcome was recorded, or permits were returned.
+    changed: Notify,
 }
 
 impl AdmissionQueue {
+    /// Wake the head to re-read its charge and try its limit again.
+    pub(crate) fn recheck(&self) {
+        self.changed.notify_waiters();
+    }
+
     /// Where a request that has just arrived stands: in the queue when others
     /// are already waiting, so it cannot overtake them, and outside it
     /// otherwise, free to take the limit at once if the limit allows.
@@ -192,9 +200,8 @@ pub(crate) struct LocalQuota {
     limiter: GovernorRateLimiter,
     /// The bucket size in cells: the most one request can be charged.
     capacity: u32,
-    /// How often a request waiting on this bucket re-reads its charge. `None`
-    /// when the charge cannot change while it waits.
-    reread: Option<Duration>,
+    /// How long the bucket takes to gain one cell.
+    cell_interval: Duration,
 }
 
 impl fmt::Debug for LocalQuota {
@@ -202,24 +209,28 @@ impl fmt::Debug for LocalQuota {
         formatter
             .debug_struct("LocalQuota")
             .field("capacity", &self.capacity)
-            .field("reread", &self.reread)
+            .field("cell_interval", &self.cell_interval)
             .finish_non_exhaustive()
     }
 }
 
 impl LocalQuota {
-    pub(crate) fn new(quota: Quota, reread: Option<Duration>) -> Self {
+    pub(crate) fn new(quota: Quota) -> Self {
         Self {
             limiter: RateLimiter::direct_with_clock(quota, TokioClock),
             capacity: quota.burst_size().get(),
-            reread,
+            cell_interval: quota.replenish_interval(),
         }
     }
 
-    /// Take `cells(capacity)` cells from the bucket, and return how many were
-    /// taken. If the bucket does not hold them, wait in `place`'s queue and
-    /// then at its head until it does. `cells` is read again each time the
-    /// request tries, so a charge that falls while it waits takes effect.
+    /// Take `cells(capacity, Duration::ZERO)` cells from the bucket, and return
+    /// how many were taken. If the bucket does not hold them, wait in `place`'s
+    /// queue and then at its head until it does.
+    ///
+    /// `cells(capacity, after)` is the charge `after` from now if nothing else
+    /// changes, which never rises. The head sleeps until the first moment that
+    /// charge fits what the bucket will hold, and wakes sooner when an outcome
+    /// may have lowered it ([`AdmissionQueue::recheck`]).
     ///
     /// Every request that waits on this bucket uses the same queue, so the
     /// cells the head waits for are never taken by a request behind it.
@@ -231,10 +242,18 @@ impl LocalQuota {
     pub(crate) async fn take(
         &self,
         place: &mut Place<'_>,
-        cells: impl Fn(u32) -> u32,
+        cells: impl Fn(u32, Duration) -> u32,
     ) -> Result<u32> {
         loop {
-            let weight = cells(self.capacity);
+            // At the head, listen before reading the charge, so an outcome
+            // between the read and the wait still wakes this request.
+            let changed = place.queue.changed.notified();
+            tokio::pin!(changed);
+            if place.at_head() {
+                changed.as_mut().enable();
+            }
+
+            let weight = cells(self.capacity, Duration::ZERO);
             let Some(nonzero) = NonZeroU32::new(weight) else {
                 return Ok(0);
             };
@@ -245,14 +264,53 @@ impl LocalQuota {
             else {
                 return Ok(weight);
             };
-            if place.at_head() {
-                let ready_in = not_until.wait_time_from(TokioClock.now());
-                let wait = self.reread.map_or(ready_in, |reread| ready_in.min(reread));
-                tokio::time::sleep(wait).await;
-            } else {
+            if !place.at_head() {
                 place.wait_for_head().await;
+                continue;
+            }
+
+            let ready_in = not_until.wait_time_from(TokioClock.now());
+            let fits_in = self.first_fit(weight, ready_in, &cells);
+            // The floor keeps a fit that rounding puts a hair early from
+            // spinning.
+            let _changed_or_fits =
+                tokio::time::timeout(fits_in.max(Duration::from_millis(1)), changed).await;
+        }
+    }
+
+    /// The first moment, to the millisecond, at which the charge `cells`
+    /// projects fits what the bucket will hold.
+    ///
+    /// The bucket holds `weight` cells `ready_in` from now and gains one every
+    /// `cell_interval`, so `t` from now it holds
+    /// `weight - (ready_in - t) / cell_interval`. The charge never rises and
+    /// the bucket never shrinks, so the fit flips once, from no to yes, and a
+    /// bisection over `0..=ready_in` finds when.
+    fn first_fit(
+        &self,
+        weight: u32,
+        ready_in: Duration,
+        cells: impl Fn(u32, Duration) -> u32,
+    ) -> Duration {
+        // A charge that will not have fallen by then leaves nothing to search.
+        if cells(self.capacity, ready_in) >= weight {
+            return ready_in;
+        }
+        let fits = |after: Duration| {
+            let short =
+                ready_in.saturating_sub(after).as_secs_f64() / self.cell_interval.as_secs_f64();
+            f64::from(cells(self.capacity, after)) <= f64::from(weight) - short
+        };
+        let (mut early, mut late) = (Duration::ZERO, ready_in);
+        while late.saturating_sub(early) > Duration::from_millis(1) {
+            let middle = early + late.saturating_sub(early) / 2;
+            if fits(middle) {
+                late = middle;
+            } else {
+                early = middle;
             }
         }
+        late
     }
 }
 
@@ -264,9 +322,6 @@ pub(crate) struct ConcurrencyLimit {
     /// The semaphore size in permits: the most one request can hold.
     capacity: u32,
     queue: AdmissionQueue,
-    /// Signalled whenever a request returns its permits or reports an outcome,
-    /// so the head re-reads its charge against what is now free.
-    changed: Notify,
 }
 
 impl ConcurrencyLimit {
@@ -275,7 +330,6 @@ impl ConcurrencyLimit {
             semaphore: Arc::new(Semaphore::new(permits)),
             capacity: u32::try_from(permits).unwrap_or(u32::MAX),
             queue: AdmissionQueue::default(),
-            changed: Notify::new(),
         })
     }
 
@@ -287,7 +341,7 @@ impl ConcurrencyLimit {
     /// reports an outcome, which moves the adaptive coefficient, and when it
     /// returns its permits.
     pub(crate) fn recheck(&self) {
-        self.changed.notify_waiters();
+        self.queue.recheck();
     }
 
     /// Wait, in arrival order, until `permits(capacity)` permits are free, then
@@ -318,7 +372,7 @@ impl ConcurrencyLimit {
         loop {
             // Listen before reading the semaphore, so a change between the
             // read and the wait still wakes this request.
-            let changed = self.changed.notified();
+            let changed = self.queue.changed.notified();
             tokio::pin!(changed);
             changed.as_mut().enable();
 

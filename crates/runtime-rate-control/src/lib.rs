@@ -459,12 +459,10 @@ impl RateControllerBuilder {
             ConcurrencyLimit::new(max_concurrent_requests.saturating_mul(resolution as usize))
         });
 
-        // The caller's weight is fixed for the request, so there is nothing to
-        // re-read while it waits.
         let weighted_rate_limiter = self
             .weighted_quota
             .as_ref()
-            .map(|q| LocalQuota::new(q.quota, None));
+            .map(|q| LocalQuota::new(q.quota));
 
         // Persistence path: each named quota becomes a LeasedBucket. We do NOT
         // also build a local governor limiter for that quota — the lease
@@ -516,16 +514,10 @@ impl RateControllerBuilder {
                     adaptive: cluster_adaptive,
                 }));
             } else {
-                // A healthy request's charge refills in one replenish interval of
-                // the configured quota, so a request waiting on an adaptive
-                // charge re-reads it that often: no healthy request could have
-                // been admitted in between. Without adaptive control the charge
-                // is always one cell.
-                let reread = (resolution > 1).then(|| quota_def.quota.replenish_interval());
-                local_limiters.push(LocalQuota::new(
-                    scale_quota_rate(quota_def.quota, resolution),
-                    reread,
-                ));
+                local_limiters.push(LocalQuota::new(scale_quota_rate(
+                    quota_def.quota,
+                    resolution,
+                )));
             }
         }
 
@@ -897,8 +889,8 @@ impl RateController {
         let mut place = self.quota_queue.arrive().await;
         for quota in &self.local_limiters {
             let charged = quota
-                .take(&mut place, |capacity| {
-                    clamp_weight(self.adaptive_desired_weight(), capacity)
+                .take(&mut place, |capacity, after| {
+                    clamp_weight(self.adaptive_desired_weight_after(after), capacity)
                 })
                 .await?;
             if let Some(tally) = &mut tally {
@@ -907,7 +899,7 @@ impl RateController {
         }
         if let Some((weight, quota)) = weighted {
             tracing::debug!("Acquiring weighted rate limiter for weight {weight}");
-            quota.take(&mut place, |_| weight).await?;
+            quota.take(&mut place, |_, _| weight).await?;
         }
         Ok(())
     }
@@ -970,12 +962,13 @@ impl RateController {
     pub fn record_outcome(&self, outcome: RequestOutcome) {
         if let Some(adaptive) = &self.adaptive {
             adaptive.record(outcome);
-            // The charge for a concurrency slot may have moved, and the request
-            // reporting it can hold its slot for a while longer (reading the
-            // body), so let a queued request re-read its charge now.
+            // The charge may have moved, and the request reporting it can hold
+            // its slot for a while longer (reading the body), so let each
+            // queue's head re-read its charge now.
             if let Some(concurrency) = &self.concurrency {
                 concurrency.recheck();
             }
+            self.quota_queue.recheck();
         }
         for bucket in &self.leased_buckets {
             bucket.record_outcome(outcome);
@@ -1023,11 +1016,17 @@ impl RateController {
     /// to its own (already `resolution`-scaled) capacity via [`clamp_weight`] at
     /// the point of acquisition.
     fn adaptive_desired_weight(&self) -> f64 {
+        self.adaptive_desired_weight_after(Duration::ZERO)
+    }
+
+    /// [`Self::adaptive_desired_weight`] `after` from now if no further outcome
+    /// is recorded. It never rises.
+    fn adaptive_desired_weight_after(&self, after: Duration) -> f64 {
         f64::from(self.resolution)
             * self
                 .adaptive
                 .as_ref()
-                .map_or(1.0, |adaptive| adaptive.acquire_weight())
+                .map_or(1.0, |adaptive| adaptive.weight_after(after))
     }
 
     /// Acquire a permit with a specific weight. See [`Self::acquire`] for

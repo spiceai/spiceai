@@ -220,10 +220,9 @@ async fn requests_queued_through_an_outage_are_admitted_after_it() {
     }
 }
 
-/// A request queued for the quota is not overtaken by one that arrives after it
-/// at a lighter charge. That overtaking is what stranded requests queued
-/// during an outage: requests arriving after the recovery took each cell as it
-/// refilled.
+/// A request queued for the quota is not overtaken by one that arrives as the
+/// cell it waits for refills, before the queued request has run. That
+/// overtaking, repeated, is what stranded requests queued during an outage.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
 async fn a_later_request_does_not_overtake_one_queued_for_the_quota() {
     let controller = RateControllerBuilder::new()
@@ -231,32 +230,35 @@ async fn a_later_request_does_not_overtake_one_queued_for_the_quota() {
             "requests_per_second",
             Quota::per_second(NonZeroU32::new(10).expect("non-zero")),
         )
-        .with_adaptive(adaptive(Duration::from_secs(5)), ORIGIN)
         .build();
 
-    // Half the bucket is spent and the origin fails, so the next request asks
-    // for the whole bucket and waits for the other half to refill.
-    for _ in 0..5 {
+    // The burst is spent, so the next request queues for the cell that
+    // refills in 100ms.
+    for _ in 0..10 {
         drop(controller.acquire().await.expect("within the burst"));
-    }
-    for _ in 0..100 {
-        controller.record_outcome(RequestOutcome::Failure);
     }
     let admitted = Arc::new(Mutex::new(Vec::new()));
     let first = spawn_acquire(&controller, &admitted, "first");
     tokio::task::yield_now().await;
 
-    // The origin recovers, and a request arrives at the healthy charge, which
-    // the half-full bucket could serve at once.
-    tokio::time::sleep(Duration::from_millis(10)).await;
-    for _ in 0..1000 {
-        controller.record_outcome(RequestOutcome::Success);
-    }
-    assert_healthy(&controller);
-    let second = spawn_acquire(&controller, &admitted, "second");
+    // The cell refills and another request arrives before the queued one runs.
+    tokio::time::advance(Duration::from_millis(100)).await;
+    let second = controller.acquire();
+    tokio::pin!(second);
+    assert!(futures::poll!(second.as_mut()).is_pending());
 
-    let _permits = admit_both(first, second).await;
-    assert_eq!(*admitted.lock(), ["first", "second"]);
+    // The queued request takes the refilled cell; the later one waits for the
+    // next.
+    let first = tokio::time::timeout(Duration::from_millis(50), first)
+        .await
+        .expect("the queued request takes the refilled cell")
+        .expect("the task should not panic");
+    assert_eq!(*admitted.lock(), ["first"]);
+    let second = tokio::time::timeout(Duration::from_millis(150), second)
+        .await
+        .expect("the later request takes the next cell")
+        .expect("the acquire should succeed");
+    drop((first, second));
 }
 
 /// A request waiting for concurrency slots is admitted once the adaptive
@@ -452,18 +454,6 @@ fn spawn_acquire(
     })
 }
 
-/// Wait for both acquires, bounded so a request that is never admitted fails
-/// the test instead of hanging it, and hold both permits.
-async fn admit_both(first: JoinHandle<Permit>, second: JoinHandle<Permit>) -> [Permit; 2] {
-    let admit = |task: JoinHandle<Permit>| async move {
-        tokio::time::timeout(Duration::from_secs(1), task)
-            .await
-            .expect("the request is admitted")
-            .expect("the task should not panic")
-    };
-    [admit(first).await, admit(second).await]
-}
-
 /// A request that waits for a concurrency slot while the origin is failing is
 /// charged the healthy count once it recovers, rather than the whole limit it
 /// asked for when it arrived.
@@ -542,7 +532,7 @@ async fn a_quota_wait_takes_the_charge_in_force_when_admitted() {
         async move { controller.acquire().await }
     });
 
-    // The origin recovers between two re-reads.
+    // The origin recovers while the request waits.
     let recovery = Duration::from_millis(5500);
     tokio::time::sleep(recovery).await;
     assert!(!queued.is_finished(), "the bucket is still nearly empty");
@@ -555,12 +545,84 @@ async fn a_quota_wait_takes_the_charge_in_force_when_admitted() {
         .await
         .expect("the task should not panic")
         .expect("the waiting request is admitted at the healthy charge");
-    // Admitted at its next re-read, within one healthy interval (1s) of the
-    // recovery.
+    // Admitted as soon as the recovery is reported, not once the bucket holds
+    // the whole minute's budget it asked for.
     let admitted_after = queued_at.elapsed();
     assert!(
-        admitted_after > recovery && admitted_after <= recovery + Duration::from_secs(1),
+        (recovery..recovery + Duration::from_millis(10)).contains(&admitted_after),
         "admitted {admitted_after:?} after it queued, recovery was at {recovery:?}"
+    );
+}
+
+/// A per-minute quota with one healthy charge left, and an origin that has
+/// failed eight times: the next request is charged nine healthy charges.
+async fn quota_with_one_healthy_charge_left(acquire_bound: Duration) -> Arc<RateController> {
+    let per_minute = 10;
+    let controller = RateControllerBuilder::new()
+        .add_quota_with_name(
+            "requests_per_minute",
+            Quota::per_minute(NonZeroU32::new(per_minute).expect("non-zero")),
+        )
+        .with_adaptive(adaptive(Duration::from_secs(5)), ORIGIN)
+        .with_acquire_timeout(acquire_bound)
+        .build();
+    for _ in 0..per_minute - 1 {
+        drop(controller.acquire().await.expect("within the burst"));
+    }
+    for _ in 0..8 {
+        controller.record_outcome(RequestOutcome::Failure);
+    }
+    controller
+}
+
+/// A request waiting on a quota re-reads its charge as soon as an outcome is
+/// reported. At 10 per minute a healthy charge refills every 6s, longer than
+/// this request's acquire bound, so it cannot wait for the bucket to tell it.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_quota_wait_is_admitted_as_soon_as_an_outcome_lowers_its_charge() {
+    let controller = quota_with_one_healthy_charge_left(Duration::from_secs(5)).await;
+    let queued_at = Instant::now();
+    let queued = tokio::spawn({
+        let controller = Arc::clone(&controller);
+        async move { controller.acquire().await }
+    });
+    tokio::task::yield_now().await;
+
+    // The origin recovers: the healthy charge fits the cells already there.
+    for _ in 0..1000 {
+        controller.record_outcome(RequestOutcome::Success);
+    }
+    assert_healthy(&controller);
+    queued
+        .await
+        .expect("the task should not panic")
+        .expect("the bucket already holds a healthy charge");
+    let waited = queued_at.elapsed();
+    assert!(
+        waited < Duration::from_millis(10),
+        "admitted after {waited:?}"
+    );
+}
+
+/// A request waiting on a quota is admitted the moment its charge, falling as
+/// the adaptive window decays, meets what the refilling bucket holds, with no
+/// outcome to wake it.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_quota_wait_is_admitted_when_its_decaying_charge_meets_the_refilling_bucket() {
+    let controller = quota_with_one_healthy_charge_left(Duration::from_millis(11_500)).await;
+
+    // The charge is 100 + 800 * 0.5^(t / 5s) cells, rounded; the bucket holds
+    // 100 cells and gains one every 60ms. They meet at 10.78s, when both are
+    // about 279 cells.
+    let queued_at = Instant::now();
+    controller
+        .acquire()
+        .await
+        .expect("the charge meets the bucket before the acquire bound");
+    let waited = queued_at.elapsed();
+    assert!(
+        (Duration::from_millis(10_770)..Duration::from_millis(10_800)).contains(&waited),
+        "admitted after {waited:?}"
     );
 }
 
