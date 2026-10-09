@@ -830,6 +830,16 @@ impl RateController {
         }
     }
 
+    /// How long until the adaptive charge, with no further outcomes, falls to
+    /// `units` of a `resolution`-scaled limit. `None` when only an outcome or
+    /// a released permit can lower it, which includes having no adaptive
+    /// control at all.
+    fn adaptive_charge_falls_to_in(&self, units: u32) -> Option<Duration> {
+        self.adaptive
+            .as_ref()?
+            .decays_to_weight_in(f64::from(units) / f64::from(self.resolution))
+    }
+
     /// Wait for every rate limit: the local quotas in arrival order, then the
     /// cluster leased buckets. Each above-baseline charge goes to `tally`.
     async fn wait_for_rate_limiters(
@@ -1092,7 +1102,10 @@ impl RateController {
         // this semaphore's capacity.
         let concurrency = if let Some(limit) = &self.concurrency {
             match limit
-                .acquire(|capacity| clamp_weight(self.adaptive_desired_weight(), capacity))
+                .acquire(
+                    |capacity| clamp_weight(self.adaptive_desired_weight(), capacity),
+                    |free| self.adaptive_charge_falls_to_in(free),
+                )
                 .await
             {
                 Ok(permit) => {

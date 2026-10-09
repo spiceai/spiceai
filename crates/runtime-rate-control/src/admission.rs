@@ -292,11 +292,13 @@ impl ConcurrencyLimit {
 
     /// Wait, in arrival order, until `permits(capacity)` permits are free, then
     /// hold them until the returned permit drops. `permits` is read again each
-    /// time [`Self::recheck`] wakes the request.
+    /// time the request at the head wakes.
     ///
-    /// The head needs no timer: it is waiting only because requests in flight
-    /// hold permits, and each of them wakes it when it reports its outcome and
-    /// again when it returns them.
+    /// The head is waiting only because requests in flight hold permits, and
+    /// each of them wakes it when it reports its outcome and again when it
+    /// returns them. A request can stay in flight for a long time, though, so
+    /// the head also wakes when `falls_to_in(free)` says the charge, with
+    /// nothing else changing, will have fallen to the `free` permits.
     ///
     /// # Errors
     ///
@@ -304,6 +306,7 @@ impl ConcurrencyLimit {
     pub(crate) async fn acquire(
         self: &Arc<Self>,
         permits: impl Fn(u32) -> u32,
+        falls_to_in: impl Fn(u32) -> Option<Duration>,
     ) -> Result<ConcurrencyPermit, TryAcquireError> {
         let mut place = self.queue.arrive().await;
         if !place.at_head() {
@@ -320,7 +323,22 @@ impl ConcurrencyLimit {
             changed.as_mut().enable();
 
             match self.try_acquire(permits(self.capacity)) {
-                Err(TryAcquireError::NoPermits) => changed.await,
+                Err(TryAcquireError::NoPermits) => {
+                    let free =
+                        u32::try_from(self.semaphore.available_permits()).unwrap_or(u32::MAX);
+                    match falls_to_in(free) {
+                        // The floor keeps a charge that rounding holds a hair
+                        // above the free permits from spinning.
+                        Some(fits_in) => {
+                            let _changed_or_fits = tokio::time::timeout(
+                                fits_in.max(Duration::from_millis(1)),
+                                changed,
+                            )
+                            .await;
+                        }
+                        None => changed.await,
+                    }
+                }
                 admitted_or_closed => return admitted_or_closed,
             }
         }

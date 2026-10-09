@@ -259,50 +259,140 @@ async fn a_later_request_does_not_overtake_one_queued_for_the_quota() {
     assert_eq!(*admitted.lock(), ["first", "second"]);
 }
 
-/// A request queued for a concurrency slot is not overtaken by one that arrives
-/// after it at a lighter charge, and re-reads its own charge as soon as a
-/// request in flight reports an outcome.
+/// A request waiting for concurrency slots is admitted once the adaptive
+/// window's decay alone makes its charge fit the slots that are free, even
+/// while the requests in flight report nothing and return nothing.
 #[tokio::test(flavor = "current_thread", start_paused = true)]
-async fn a_later_request_does_not_overtake_one_queued_for_concurrency() {
+async fn a_concurrency_wait_is_admitted_when_decay_alone_makes_room() {
     let window = Duration::from_secs(5);
     let controller = RateControllerBuilder::new()
         .with_max_concurrent_requests(4)
         .with_adaptive(adaptive(window), ORIGIN)
+        .with_acquire_timeout(Duration::from_secs(30))
         .build();
 
-    // One request is in flight when the origin starts failing, so the next
-    // request asks for all four slots and waits.
+    // One slow request is in flight when the origin starts failing, so the
+    // next request asks for all four slots while three are free.
     let in_flight = controller.acquire().await.expect("the first request");
     for _ in 0..100 {
         controller.record_outcome(RequestOutcome::Failure);
     }
+    let queued_at = Instant::now();
+    let queued = tokio::spawn({
+        let controller = Arc::clone(&controller);
+        async move { controller.acquire().await }
+    });
+
+    // With 100 failures and a 5s half-life, the charge falls to the three free
+    // slots once the coefficient reaches 1/3: when the window holds
+    // (1 - 1/3) / (100 / 3) = 1/50 of its failures, 5s * log2(50) = 28.2s on.
+    let admitted = queued
+        .await
+        .expect("the task should not panic")
+        .expect("decay makes room before the 30s acquire bound");
+    let waited = queued_at.elapsed();
+    assert!(
+        (Duration::from_millis(28_200)..Duration::from_millis(28_300)).contains(&waited),
+        "admitted after {waited:?}"
+    );
+    assert_eq!(
+        controller.available_permits(),
+        Some(0),
+        "the request holds the three free slots it was charged"
+    );
+    drop(admitted);
+    drop(in_flight);
+}
+
+/// A request waiting for concurrency slots re-reads its charge as soon as a
+/// request in flight reports an outcome, since that request can hold its own
+/// slot a while longer, reading the response.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_concurrency_wait_rereads_its_charge_when_an_outcome_is_reported() {
+    let controller = RateControllerBuilder::new()
+        .with_max_concurrent_requests(4)
+        .with_adaptive(adaptive(Duration::from_secs(5)), ORIGIN)
+        .with_acquire_timeout(Duration::from_secs(30))
+        .build();
+
+    // One request is in flight when the origin starts failing, so the next
+    // request asks for all four slots while three are free.
+    let in_flight = controller.acquire().await.expect("the first request");
+    for _ in 0..100 {
+        controller.record_outcome(RequestOutcome::Failure);
+    }
+    let queued_at = Instant::now();
+    let queued = tokio::spawn({
+        let controller = Arc::clone(&controller);
+        async move { controller.acquire().await }
+    });
+
+    // A second later the origin recovers. The request in flight reports
+    // success but keeps its slot.
+    let recovery = Duration::from_secs(1);
+    tokio::time::sleep(recovery).await;
+    for _ in 0..1000 {
+        controller.record_outcome(RequestOutcome::Success);
+    }
+    assert_healthy(&controller);
+
+    let admitted = queued
+        .await
+        .expect("the task should not panic")
+        .expect("the acquire should succeed");
+    let waited = queued_at.elapsed();
+    assert!(
+        (recovery..recovery + Duration::from_millis(10)).contains(&waited),
+        "admitted after {waited:?}; the outcome at {recovery:?} should have admitted it"
+    );
+    assert_eq!(
+        controller.available_permits(),
+        Some(2),
+        "the request holds one slot, as a healthy request does"
+    );
+    drop(admitted);
+    drop(in_flight);
+}
+
+/// A request queued for a concurrency slot is not overtaken by one that
+/// arrives as the slot frees, before the queued request has run.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_later_request_does_not_overtake_one_queued_for_concurrency() {
+    let controller = RateControllerBuilder::new()
+        .with_max_concurrent_requests(1)
+        .build();
+
+    // The only slot is taken, so the next request queues for it.
+    let in_flight = controller.acquire().await.expect("the first request");
     let admitted = Arc::new(Mutex::new(Vec::new()));
     let first = spawn_acquire(&controller, &admitted, "first");
     tokio::task::yield_now().await;
 
-    // The failures age out of the window, so a request arriving now asks for
-    // one slot, and three are free. It has to wait its turn.
-    tokio::time::advance(window * 12).await;
-    let second = spawn_acquire(&controller, &admitted, "second");
-    tokio::task::yield_now().await;
-    assert_eq!(
-        controller.available_permits(),
-        Some(3),
-        "the later request must not take a slot ahead of the queued one"
+    // The slot frees and another request arrives before the queued one runs.
+    drop(in_flight);
+    let second = controller.acquire();
+    tokio::pin!(second);
+    assert!(
+        futures::poll!(second.as_mut()).is_pending(),
+        "the later request must wait behind the queued one"
     );
-
-    // The request in flight reports success: the queued request re-reads its
-    // charge and is admitted, then the later one.
-    controller.record_outcome(RequestOutcome::Success);
-    let permits = admit_both(first, second).await;
-    assert_eq!(*admitted.lock(), ["first", "second"]);
     assert_eq!(
         controller.available_permits(),
         Some(1),
-        "each of the three requests holds one slot"
+        "the later request must not take the slot ahead of the queued one"
     );
-    drop(permits);
-    drop(in_flight);
+
+    let first = tokio::time::timeout(Duration::from_secs(1), first)
+        .await
+        .expect("the queued request is admitted")
+        .expect("the task should not panic");
+    assert_eq!(*admitted.lock(), ["first"]);
+    drop(first);
+    let second = tokio::time::timeout(Duration::from_secs(1), second)
+        .await
+        .expect("the later request is admitted once the slot frees again")
+        .expect("the acquire should succeed");
+    drop(second);
 }
 
 /// Acquire a permit on a new task and record `name` the moment it is admitted.
