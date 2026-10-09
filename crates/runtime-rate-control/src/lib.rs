@@ -834,10 +834,15 @@ impl RateController {
     /// `units` of a `resolution`-scaled limit. `None` when only an outcome or
     /// a released permit can lower it, which includes having no adaptive
     /// control at all.
+    ///
+    /// The charge is rounded to whole units ([`clamp_weight`]), so it fits
+    /// `units` once its exact value is below `units + 0.5`. The exact charge
+    /// only approaches the healthy `resolution`, so a target of exactly
+    /// `units` would never be reached when one healthy slot is free.
     fn adaptive_charge_falls_to_in(&self, units: u32) -> Option<Duration> {
         self.adaptive
             .as_ref()?
-            .decays_to_weight_in(f64::from(units) / f64::from(self.resolution))
+            .decays_to_weight_in((f64::from(units) + 0.5) / f64::from(self.resolution))
     }
 
     /// Wait for every rate limit: the local quotas in arrival order, then the

@@ -283,16 +283,17 @@ async fn a_concurrency_wait_is_admitted_when_decay_alone_makes_room() {
         async move { controller.acquire().await }
     });
 
-    // With 100 failures and a 5s half-life, the charge falls to the three free
-    // slots once the coefficient reaches 1/3: when the window holds
-    // (1 - 1/3) / (100 / 3) = 1/50 of its failures, 5s * log2(50) = 28.2s on.
+    // With 100 failures and a 5s half-life, the charge rounds to the three
+    // free slots once it falls below 300.5 permits, at coefficient 100 / 300.5:
+    // when the window holds (1 - c) / (100 * c) = 1/49.9 of its failures,
+    // 5s * log2(49.9) = 28.2s on.
     let admitted = queued
         .await
         .expect("the task should not panic")
         .expect("decay makes room before the 30s acquire bound");
     let waited = queued_at.elapsed();
     assert!(
-        (Duration::from_millis(28_200)..Duration::from_millis(28_300)).contains(&waited),
+        (Duration::from_millis(28_190)..Duration::from_millis(28_250)).contains(&waited),
         "admitted after {waited:?}"
     );
     assert_eq!(
@@ -300,6 +301,44 @@ async fn a_concurrency_wait_is_admitted_when_decay_alone_makes_room() {
         Some(0),
         "the request holds the three free slots it was charged"
     );
+    drop(admitted);
+    drop(in_flight);
+}
+
+/// The charge is rounded to whole permits, so decay makes it fit one free
+/// healthy slot although the exact charge never falls all the way to the
+/// healthy one.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_concurrency_wait_is_admitted_to_one_free_slot_once_its_charge_rounds_to_it() {
+    let window = Duration::from_secs(5);
+    let controller = RateControllerBuilder::new()
+        .with_max_concurrent_requests(10)
+        .with_adaptive(adaptive(window), ORIGIN)
+        .with_acquire_timeout(Duration::from_mins(2))
+        .build();
+
+    // At coefficient 1/9 a slow request takes nine of the ten slots, leaving
+    // one, and nothing it does afterwards wakes the next request.
+    for _ in 0..8 {
+        controller.record_outcome(RequestOutcome::Failure);
+    }
+    let in_flight = controller.acquire().await.expect("the first request");
+    assert_eq!(controller.available_permits(), Some(1));
+
+    // The charge rounds to the one free slot (100 permits) once it falls below
+    // 100.5, at coefficient c = 100 / 100.5: when the window holds
+    // (1 - c) / (8 * c) = 1/1600 of its failures, 5s * log2(1600) = 53.2s on.
+    let queued_at = Instant::now();
+    let admitted = controller
+        .acquire()
+        .await
+        .expect("decay brings the rounded charge to the free slot before the bound");
+    let waited = queued_at.elapsed();
+    assert!(
+        (Duration::from_millis(53_190)..Duration::from_millis(53_250)).contains(&waited),
+        "admitted after {waited:?}"
+    );
+    assert_eq!(controller.available_permits(), Some(0));
     drop(admitted);
     drop(in_flight);
 }
