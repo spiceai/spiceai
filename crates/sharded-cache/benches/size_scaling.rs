@@ -90,13 +90,19 @@ impl Rng {
     }
 }
 
+/// Latencies the report counts exactly, in nanoseconds: 100 µs, 1 ms, 5 ms.
+const THRESHOLDS: [u64; 3] = [100_000, 1_000_000, 5_000_000];
+
 /// Log-linear latency histogram: exact below 64 ns, then 32 sub-buckets per
-/// power of two (about 3% resolution). The maximum is kept exactly.
+/// power of two (about 3% resolution). The maximum and the counts at or above
+/// each of [`THRESHOLDS`] are kept exactly: a threshold falls inside a bucket,
+/// so counting from its bucket would include samples up to 3% below it.
 #[derive(Clone)]
 struct Histogram {
     counts: Vec<u64>,
     total: u64,
     max: u64,
+    at_least: [u64; THRESHOLDS.len()],
 }
 
 const SUB_BITS: u32 = 5;
@@ -108,6 +114,7 @@ impl Histogram {
             counts: vec![0; 64 + 58 * SUBS],
             total: 0,
             max: 0,
+            at_least: [0; THRESHOLDS.len()],
         }
     }
 
@@ -135,6 +142,9 @@ impl Histogram {
         self.counts[Self::index(v)] += 1;
         self.total += 1;
         self.max = self.max.max(v);
+        for (count, &threshold) in self.at_least.iter_mut().zip(&THRESHOLDS) {
+            *count += u64::from(v >= threshold);
+        }
     }
 
     fn merge(&mut self, other: &Self) {
@@ -143,6 +153,9 @@ impl Histogram {
         }
         self.total += other.total;
         self.max = self.max.max(other.max);
+        for (a, b) in self.at_least.iter_mut().zip(&other.at_least) {
+            *a += b;
+        }
     }
 
     fn quantile(&self, q: f64) -> u64 {
@@ -155,10 +168,6 @@ impl Histogram {
             }
         }
         self.max
-    }
-
-    fn count_at_least(&self, v: u64) -> u64 {
-        self.counts[Self::index(v)..].iter().sum()
     }
 }
 
@@ -380,9 +389,9 @@ fn hist_row(label: &str, n: usize, h: &Histogram) {
         fmt_ns(h.quantile(0.999)),
         fmt_ns(h.quantile(0.9999)),
         fmt_ns(h.max),
-        h.count_at_least(100_000),
-        h.count_at_least(1_000_000),
-        h.count_at_least(5_000_000),
+        h.at_least[0],
+        h.at_least[1],
+        h.at_least[2],
     );
 }
 
