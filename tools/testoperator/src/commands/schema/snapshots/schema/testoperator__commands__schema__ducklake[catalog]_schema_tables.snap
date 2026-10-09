@@ -1,0 +1,31 @@
+---
+source: tools/testoperator/src/commands/schema/mod.rs
+description: "Schema tables for ducklake[catalog]"
+---
++---------------+--------------------+--------------+------------+
+| table_catalog | table_schema       | table_name   | table_type |
++---------------+--------------------+--------------+------------+
+| ducklake      | information_schema | columns      | VIEW       |
+| ducklake      | information_schema | df_settings  | VIEW       |
+| ducklake      | information_schema | parameters   | VIEW       |
+| ducklake      | information_schema | routines     | VIEW       |
+| ducklake      | information_schema | schemata     | VIEW       |
+| ducklake      | information_schema | tables       | VIEW       |
+| ducklake      | information_schema | views        | VIEW       |
+| ducklake      | main               | customer     | BASE TABLE |
+| ducklake      | main               | lineitem     | BASE TABLE |
+| ducklake      | main               | nation       | BASE TABLE |
+| ducklake      | main               | orders       | BASE TABLE |
+| ducklake      | main               | part         | BASE TABLE |
+| ducklake      | main               | partsupp     | BASE TABLE |
+| ducklake      | main               | region       | BASE TABLE |
+| ducklake      | main               | supplier     | BASE TABLE |
+| spice         | information_schema | columns      | VIEW       |
+| spice         | information_schema | df_settings  | VIEW       |
+| spice         | information_schema | parameters   | VIEW       |
+| spice         | information_schema | routines     | VIEW       |
+| spice         | information_schema | schemata     | VIEW       |
+| spice         | information_schema | tables       | VIEW       |
+| spice         | information_schema | views        | VIEW       |
+| spice         | runtime            | task_history | BASE TABLE |
++---------------+--------------------+--------------+------------+
