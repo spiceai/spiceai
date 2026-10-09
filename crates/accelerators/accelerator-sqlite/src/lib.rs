@@ -1515,8 +1515,12 @@ mod tests {
         // `SQLiteSqlExec` is in every plan over this table, so the filter's
         // presence has to be read off the SQL it carries, and the absence of a
         // local `FilterExec` pins that the engine did not re-apply it above.
+        let pushed_sql = plan
+            .lines()
+            .find(|line| line.contains("SQLiteSqlExec sql="))
+            .expect("the plan should scan through SQLiteSqlExec");
         assert!(
-            plan.contains("SQLiteSqlExec sql=SELECT") && plan.contains("WHERE (`l_shipdate`"),
+            pushed_sql.contains("WHERE") && pushed_sql.contains("l_shipdate"),
             "the date filter should be pushed into the SQLite scan, got plan:\n{plan}"
         );
         assert!(
