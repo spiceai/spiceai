@@ -209,6 +209,33 @@ async fn runtime_tuning_defaults_to_auto() {
     );
 }
 
+/// A hot reload that only adds a retired parameter re-resolves the same table with an
+/// otherwise identical config, and must still tell the operator the parameter has no effect.
+#[tokio::test(flavor = "multi_thread")]
+async fn retired_param_added_by_a_reload_warns_once() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let before = spicepod("rt_reload", dir.path(), "", "");
+    assert!(!dynamic_tuning_of("rt_reload", &before, dir.path()).await);
+    let warning = "Dataset 'rt_reload' sets `cayenne_tuning`, which is no longer a dataset parameter, so it has no effect. Set `runtime.adaptive_tuning` instead. See: https://spiceai.org/docs/reference/spicepod/runtime";
+    assert_eq!(logged().matches(warning).count(), 0);
+
+    let after = spicepod(
+        "rt_reload",
+        dir.path(),
+        "",
+        "        cayenne_tuning: enabled\n",
+    );
+    assert!(!dynamic_tuning_of("rt_reload", &after, dir.path()).await);
+    // The same dataset loading again, as a retry or another reload would, does not repeat it.
+    assert!(!dynamic_tuning_of("rt_reload", &after, dir.path()).await);
+    let logs = logged();
+    assert_eq!(
+        logs.matches(warning).count(),
+        1,
+        "a retired parameter added by a reload must warn once, logs: {logs}"
+    );
+}
+
 #[tokio::test(flavor = "multi_thread")]
 async fn unprefixed_retired_dataset_params_are_not_applied_and_warn_once() {
     let dir = tempfile::tempdir().expect("temp dir");

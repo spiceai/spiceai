@@ -793,6 +793,35 @@ fn auto_tuned_config_is_newly_resolved(table_name: &str, fingerprint: u64) -> bo
     true
 }
 
+/// The retired-parameter warnings for `table_name` that have not been emitted yet: once per
+/// table per retired key, however often the table is re-resolved by an init retry or a hot
+/// reload, and again for a key a reload newly adds.
+fn unreported_retired_param_warnings<S: std::hash::BuildHasher>(
+    table_name: &str,
+    params: &HashMap<String, String, S>,
+) -> Vec<String> {
+    static REPORTED: LazyLock<std::sync::Mutex<std::collections::HashSet<(String, String)>>> =
+        LazyLock::new(|| std::sync::Mutex::new(std::collections::HashSet::new()));
+
+    let mut reported = REPORTED
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    spicepod::component::runtime::RETIRED_DATASET_TUNING_PARAMS
+        .iter()
+        .filter(|key| params.contains_key(**key))
+        .filter(|key| reported.insert((table_name.to_string(), (**key).to_string())))
+        .flat_map(|key| {
+            let only_this_key = HashMap::from([((*key).to_string(), String::new())]);
+            spicepod::component::runtime::retired_tuning_param_warnings(
+                "dataset",
+                table_name,
+                &only_this_key,
+                &[key],
+            )
+        })
+        .collect()
+}
+
 /// Default `WithinLag` for `refresh_mode: changes`, in milliseconds.
 const DEFAULT_CHANGES_SCAN_VIEW_LAG_MS: u64 = 1000;
 
@@ -2341,18 +2370,14 @@ impl CayenneAccelerator {
             let metastore_dir = Self::resolve_metadata_dir(source.acceleration());
             let fingerprint =
                 auto_tuned_config_fingerprint(table_name, &metastore_dir, &hw, workload, &config);
+            // A retired dataset parameter is not read, so say so once rather than leave the
+            // operator assuming it took effect. It never changes the resolved config, so it
+            // is deduplicated by its own key rather than by the config fingerprint below: a
+            // reload that only adds one must still warn.
+            for warning in unreported_retired_param_warnings(table_name, &acceleration.params) {
+                tracing::warn!(target: "spiced::acceleration::cayenne", "{warning}");
+            }
             if auto_tuned_config_is_newly_resolved(table_name, fingerprint) {
-                // A retired dataset parameter is not read, so say so once rather
-                // than leave the operator assuming it took effect.
-                for warning in spicepod::component::runtime::retired_tuning_param_warnings(
-                    "dataset",
-                    table_name,
-                    &acceleration.params,
-                    spicepod::component::runtime::RETIRED_DATASET_TUNING_PARAMS,
-                ) {
-                    tracing::warn!(target: "spiced::acceleration::cayenne", "{warning}");
-                }
-
                 // A `target_*` SLO with the closed loop off does nothing, and it is easy
                 // to set one and assume it took effect.
                 if targets_are_inert {
@@ -7070,6 +7095,39 @@ mod tests {
 
         // Tables are independent: one table's line never suppresses another's.
         assert!(auto_tuned_config_is_newly_resolved(OTHER, 1));
+    }
+
+    #[test]
+    fn retired_param_warnings_are_reported_once_per_table_and_key() {
+        // Table names are process-global keys; keep them unique to this test.
+        const TABLE: &str = "retired_dedupe_table";
+        let params = |keys: &[&str]| -> HashMap<String, String> {
+            keys.iter()
+                .map(|k| ((*k).to_string(), "x".to_string()))
+                .collect()
+        };
+
+        // First sighting warns, naming the key as written.
+        let first = unreported_retired_param_warnings(TABLE, &params(&["cayenne_tuning"]));
+        assert_eq!(first.len(), 1);
+        assert!(first[0].contains("sets `cayenne_tuning`"), "{first:?}");
+        // A repeat (an init retry, or a reload that changed nothing) does not.
+        assert!(unreported_retired_param_warnings(TABLE, &params(&["cayenne_tuning"])).is_empty());
+        // A retired key newly added to the existing table warns; the old one stays quiet.
+        let added =
+            unreported_retired_param_warnings(TABLE, &params(&["cayenne_tuning", "goal_qph"]));
+        assert_eq!(added.len(), 1);
+        assert!(added[0].contains("sets `goal_qph`"), "{added:?}");
+        // Another table with the same key is independent.
+        assert_eq!(
+            unreported_retired_param_warnings("retired_dedupe_other", &params(&["cayenne_tuning"]))
+                .len(),
+            1
+        );
+        // No retired key, nothing to report.
+        assert!(
+            unreported_retired_param_warnings(TABLE, &params(&["cayenne_file_path"])).is_empty()
+        );
     }
 
     #[test]
