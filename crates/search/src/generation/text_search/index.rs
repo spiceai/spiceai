@@ -293,6 +293,13 @@ impl Index for FullTextDatabaseIndex {
         true
     }
 
+    fn requires_rebuild(&self) -> bool {
+        // An in-memory index starts every process empty, and a file-backed one is empty when
+        // its directory was not carried over. Either way it holds none of the accelerator's
+        // rows until they are replayed through `compute_index` (#14618).
+        self.reader.searcher().num_docs() == 0
+    }
+
     async fn on_write_start(&self, window: WriteWindow) -> Result<(), DataFusionError> {
         // A stream-attached index never defers: its change/append stream calls
         // `compute_index` outside this lifecycle, and the shared writer cannot commit one
@@ -303,7 +310,12 @@ impl Index for FullTextDatabaseIndex {
         // length of the refresh, and would discard stream documents staged alongside it.
         // A stream-attached index is told about deletions explicitly by its stream, so it does
         // not depend on the replace-window clear to drop rows the source removed.
-        if self.stream_attached.load(Ordering::Acquire) {
+        //
+        // A `Rebuild` window is the exception: it runs before any stream attaches, so nothing
+        // else stages into the writer while it is open. Deferring it is what keeps a replay
+        // that fails part-way from committing a partial index that `requires_rebuild` would
+        // then report as complete.
+        if self.stream_attached.load(Ordering::Acquire) && window != WriteWindow::Rebuild {
             return Ok(());
         }
 
@@ -1121,6 +1133,117 @@ mod tests {
             false,
         )
         .expect("Failed to create FullTextDatabaseIndex")
+    }
+
+    /// Regression test for #14618: an index holding no documents asks to be rebuilt from its
+    /// accelerator, and stops asking once it holds them.
+    #[tokio::test]
+    async fn an_index_requires_a_rebuild_only_while_it_holds_no_documents() {
+        let index = new_test_index();
+        assert!(
+            index.requires_rebuild(),
+            "a new in-memory index holds none of the accelerator's rows"
+        );
+
+        index
+            .compute_index(vec![batch(&[1, 2], &["alpha", "beta"])])
+            .await
+            .expect("failed to compute_index");
+        index.reader.reload().expect("failed to reload the reader");
+
+        assert!(
+            !index.requires_rebuild(),
+            "an index that holds documents must not be replayed into again"
+        );
+    }
+
+    /// A file-backed index reopened from a surviving directory already holds its documents,
+    /// so a warm restart must not replay the accelerator into it.
+    #[tokio::test]
+    async fn a_reopened_file_index_does_not_require_a_rebuild() {
+        let dir = tempfile::tempdir().expect("failed to create a temp dir");
+        let open = || {
+            FullTextDatabaseIndex::try_new(
+                create_test_table(),
+                vec!["content".to_string()],
+                Some(vec!["id".to_string()]),
+                Some(dir.path().to_path_buf()),
+                &["content".to_string()],
+                false,
+            )
+            .expect("Failed to create FullTextDatabaseIndex")
+        };
+
+        let first = open();
+        assert!(first.requires_rebuild(), "a new index directory is empty");
+        first
+            .compute_index(vec![batch(&[1], &["alpha"])])
+            .await
+            .expect("failed to compute_index");
+        drop(first);
+
+        assert!(
+            !open().requires_rebuild(),
+            "the reopened index already holds the committed document"
+        );
+    }
+
+    /// A stream-attached index commits every write as it arrives, except inside a rebuild
+    /// window: a startup replay that fails part-way must leave a file-backed index empty, so
+    /// the next startup still sees it needs a rebuild instead of trusting a partial one.
+    #[tokio::test]
+    async fn a_failed_rebuild_of_a_stream_attached_index_commits_nothing() {
+        let dir = tempfile::tempdir().expect("failed to create a temp dir");
+        let open = || {
+            FullTextDatabaseIndex::try_new(
+                create_test_table(),
+                vec!["content".to_string()],
+                Some(vec!["id".to_string()]),
+                Some(dir.path().to_path_buf()),
+                &["content".to_string()],
+                true,
+            )
+            .expect("Failed to create FullTextDatabaseIndex")
+        };
+
+        let first = open();
+        first
+            .on_write_start(WriteWindow::Rebuild)
+            .await
+            .expect("on_write_start failed");
+        first
+            .compute_index(vec![batch(&[1], &["alpha"])])
+            .await
+            .expect("failed to compute_index");
+        // A later batch of the replay fails, so the window is rolled back.
+        first
+            .on_write_failed()
+            .await
+            .expect("on_write_failed failed");
+        drop(first);
+
+        let reopened = open();
+        assert!(
+            reopened.requires_rebuild(),
+            "the batch staged before the failure must not have been committed"
+        );
+
+        reopened
+            .on_write_start(WriteWindow::Rebuild)
+            .await
+            .expect("on_write_start failed");
+        reopened
+            .compute_index(vec![batch(&[1, 2], &["alpha", "beta"])])
+            .await
+            .expect("failed to compute_index");
+        reopened
+            .on_write_complete()
+            .await
+            .expect("on_write_complete failed");
+        assert!(
+            !reopened.requires_rebuild(),
+            "a completed rebuild window commits the replayed documents"
+        );
     }
 
     const EXPUNGE_FIXTURE_IDS: [i32; 8] = [1, 2, 3, 4, 5, 6, 7, 8];

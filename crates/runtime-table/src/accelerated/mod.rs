@@ -72,6 +72,7 @@ pub mod caching_eviction;
 mod caching_scan_tests;
 pub mod checkpoint_primary_key;
 pub mod federation;
+pub(crate) mod index_rebuild;
 pub mod refresh;
 pub mod refresh_completion;
 pub mod refresh_task;
@@ -226,6 +227,15 @@ pub enum Error {
 
     #[snafu(display("No primary keys defined for dataset {dataset_name}"))]
     NoPrimaryKeysDefined { dataset_name: String },
+
+    #[snafu(display(
+        "Failed to rebuild the search index of dataset '{dataset_name}' from its acceleration, so searches over it would return no results. Cause: {}",
+        format_datafusion_error(source)
+    ))]
+    FailedToRebuildIndex {
+        dataset_name: String,
+        source: DataFusionError,
+    },
 
     #[snafu(transparent)]
     PkFilterExpr {

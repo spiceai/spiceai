@@ -1010,6 +1010,57 @@ impl Refresher {
         }
     }
 
+    /// Replays the rows the accelerator holds through every index of this dataset that
+    /// reports [`spice_table::Index::requires_rebuild`].
+    ///
+    /// Holds the accelerator write lock, so no write lands in the accelerator between the
+    /// scan and the indexes it feeds.
+    async fn rebuild_indexes_from_accelerator(&self) -> super::Result<()> {
+        let indexes = crate::accelerated::refresh_task::collect_all_indexes(
+            &self.accelerator,
+            &self.federated,
+        );
+        if !indexes.iter().any(|index| index.requires_rebuild()) {
+            return Ok(());
+        }
+
+        let _write_guard = self.accelerator_write_mutex.lock().await;
+        let start = std::time::Instant::now();
+        let dataset_name = self.dataset_name.clone();
+        let accelerator = Arc::clone(&self.accelerator);
+        let rebuild = async move {
+            super::index_rebuild::rebuild_indexes_from_accelerator(
+                &dataset_name,
+                &accelerator,
+                &indexes,
+            )
+            .await
+        };
+        let result = match &self.cpu_runtime {
+            Some(cpu_runtime) => cpu_runtime
+                .spawn(rebuild)
+                .await
+                .unwrap_or_else(|e| Err(datafusion::error::DataFusionError::External(Box::new(e)))),
+            None => rebuild.await,
+        };
+
+        match result {
+            Ok(Some(rows)) => {
+                tracing::debug!(
+                    "Rebuilt the search index of dataset '{}' from {rows} accelerated row(s) in {}ms.",
+                    self.dataset_name,
+                    start.elapsed().as_millis()
+                );
+                Ok(())
+            }
+            Ok(None) => Ok(()),
+            Err(source) => Err(super::Error::FailedToRebuildIndex {
+                dataset_name: self.dataset_name.to_string(),
+                source,
+            }),
+        }
+    }
+
     /// Starts the refresh loop for `acceleration_refresh_mode`, returning the
     /// spawned task handle when the mode runs one.
     ///
@@ -1023,6 +1074,13 @@ impl Refresher {
         acceleration_refresh_mode: AccelerationRefreshMode,
     ) -> super::Result<Option<tokio::task::JoinHandle<()>>> {
         let dataset_name = self.dataset_name.clone();
+
+        // Before any refresh or change stream writes to it, give every index that holds none
+        // of the accelerator's rows the ones it already has. The refresh that follows a
+        // restart loads only what the accelerator is missing, or nothing at all, so an index
+        // that starts empty would otherwise never catch up (#14618).
+        self.rebuild_indexes_from_accelerator().await?;
+
         let time_column = self.refresh.read().await.time_column.clone();
         let initial_refresh_delay = {
             let refresh = self.refresh.read().await;

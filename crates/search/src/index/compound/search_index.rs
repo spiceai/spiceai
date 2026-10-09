@@ -184,6 +184,12 @@ impl Index for CompoundSearchIndex {
         COMPOUND_WRITE_COMPLETE_FAILURE_IS_FATAL
     }
 
+    fn requires_rebuild(&self) -> bool {
+        // A rebuild replays rows through `compute_index`, which writes both halves, so the
+        // compound needs one whenever either half does.
+        self.primary.requires_rebuild() || self.secondary.requires_rebuild()
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
