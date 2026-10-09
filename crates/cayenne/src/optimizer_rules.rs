@@ -6129,19 +6129,22 @@ mod tests {
     /// Regression test for #14521.
     #[test]
     fn rewrites_large_inner_hash_join_over_memory_mode_scans_under_memory_gate() {
-        let schema = order_line_schema();
-        // 4,096 rows × 24 bytes × the 2.5 hash-table factor ≈ 240 KiB of build.
-        let left = memory_mode_cayenne_exec(&schema, 4096);
-        let right = memory_mode_cayenne_exec(&schema, 4096);
+        // Distinct schemas and key names, so this is not the Q4/Q11/Q74
+        // `year_total` self-join the unknown-size path exempts.
+        let left_schema = channel_schema("ss_item_sk", "ss_qty");
+        let right_schema = channel_schema("ws_item_sk", "ws_qty");
+        // 8,192 rows × 16 bytes × the 2.5 hash-table factor ≈ 320 KiB of build.
+        let left = memory_mode_cayenne_exec(&left_schema, 8192);
+        let right = memory_mode_cayenne_exec(&right_schema, 8192);
         let join = Arc::new(hash_join_with_join_type(
             left,
             right,
-            "order_id",
-            "order_id",
+            "ss_item_sk",
+            "ws_item_sk",
             JoinType::Inner,
             NullEquality::NullEqualsNothing,
         ));
-        // 1 MiB pool × 0.125 = 128 KiB gate, below the ~240 KiB build.
+        // 1 MiB pool × 0.125 = 128 KiB gate, below the ~320 KiB build.
         let config = config_with_cayenne_optimizer(None, Some(0.125), Some(1024 * 1024));
 
         let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
@@ -6157,18 +6160,19 @@ mod tests {
     /// join: the gate, not the table's mode, decides the rewrite.
     #[test]
     fn leaves_memory_mode_inner_hash_join_when_build_estimate_fits_memory_gate() {
-        let schema = order_line_schema();
-        let left = memory_mode_cayenne_exec(&schema, 4096);
-        let right = memory_mode_cayenne_exec(&schema, 4096);
+        let left_schema = channel_schema("ss_item_sk", "ss_qty");
+        let right_schema = channel_schema("ws_item_sk", "ws_qty");
+        let left = memory_mode_cayenne_exec(&left_schema, 8192);
+        let right = memory_mode_cayenne_exec(&right_schema, 8192);
         let join = Arc::new(hash_join_with_join_type(
             left,
             right,
-            "order_id",
-            "order_id",
+            "ss_item_sk",
+            "ws_item_sk",
             JoinType::Inner,
             NullEquality::NullEqualsNothing,
         ));
-        // 64 MiB pool × 0.125 = 8 MiB gate, far above the ~240 KiB build.
+        // 64 MiB pool × 0.125 = 8 MiB gate, far above the ~320 KiB build.
         let config = config_with_cayenne_optimizer(None, Some(0.125), Some(64 * 1024 * 1024));
 
         let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
@@ -6178,6 +6182,68 @@ mod tests {
             "a memory-mode join whose build side fits the gate should stay a hash join, got {}",
             displayable(optimized.as_ref()).indent(true)
         );
+    }
+
+    /// A file-mode scan with a `FilterExec` above its file source carries no
+    /// file-scan identity either: the identity walk stops at any node outside
+    /// its allowlist, and a retention filter or a live deletion filter leaves
+    /// this same shape. Such a join used to take the path meant for the
+    /// unaccelerated `__test_reference` oracle scans, which coalesces every
+    /// outer join to one sorter; it now takes the Cayenne branch, where a
+    /// non-aggregate build side of unknown size keeps its hash join, as every
+    /// identity-bearing Cayenne scan already does.
+    #[test]
+    fn routes_a_left_join_over_an_identity_less_cayenne_file_scan_through_the_cayenne_gate()
+    -> DFResult<()> {
+        let left_schema = channel_schema("ss_item_sk", "ss_ticket_number");
+        let right_schema = channel_schema("sr_item_sk", "sr_ticket_number");
+        let filtered = Arc::new(datafusion_physical_plan::filter::FilterExec::try_new(
+            datafusion_physical_expr::expressions::binary(
+                col("ss_ticket_number", left_schema.as_ref())?,
+                datafusion::logical_expr::Operator::Gt,
+                lit(0_i64),
+                left_schema.as_ref(),
+            )?,
+            sized_file_exec(
+                &left_schema,
+                "store_sales.vortex",
+                OVERSIZED_ORACLE_BUILD_ROWS,
+            ),
+        )?);
+        let cayenne_scan = CayenneAccelerationExec::new(filtered);
+        assert!(
+            cayenne_scan.scan_identity().is_none(),
+            "a filter above the file source leaves the scan without an identity"
+        );
+        let left = hash_repartition(Arc::new(cayenne_scan), "ss_item_sk", 4);
+        let right = hash_repartition(
+            sized_file_exec(
+                &right_schema,
+                "store_returns.parquet",
+                OVERSIZED_ORACLE_BUILD_ROWS,
+            ),
+            "sr_item_sk",
+            4,
+        );
+        let join = Arc::new(hash_join_with_join_type(
+            left,
+            right,
+            "ss_item_sk",
+            "sr_item_sk",
+            JoinType::Left,
+            NullEquality::NullEqualsNothing,
+        ));
+        let config =
+            config_with_cayenne_optimizer(None, Some(0.125), Some(107 * 1024 * 1024 * 1024));
+
+        let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
+
+        assert!(
+            optimized.is::<HashJoinExec>(),
+            "an outer join whose Cayenne build side has unknown size and no aggregate keeps its hash join, got {}",
+            displayable(optimized.as_ref()).indent(true)
+        );
+        Ok(())
     }
 
     /// q97-style: a large *full outer* join is rewritten too.
