@@ -1195,14 +1195,34 @@ impl HashIndex {
         }
     }
 
-    /// Rebuilds the index from partitions.
+    /// Rebuilds the index from partitions. A repeated key keeps its last row.
     ///
     /// # Errors
     ///
     /// Returns an error if key extraction fails for any batch.
     pub fn rebuild(&self, partitions: &[Vec<RecordBatch>]) -> Result<()> {
         self.clear();
+        self.insert_all(partitions, false)
+    }
 
+    /// Rebuilds the index from partitions, refusing a repeated key.
+    ///
+    /// An entry holds one row, so an index over a column whose values repeat would
+    /// answer a lookup with one of the rows. This rebuild fails on such data and
+    /// leaves the index empty, so a caller can stop using it instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::DuplicateKey`](crate::Error::DuplicateKey) if a non-null key
+    /// is in more than one row, [`Error::HashCollision`](crate::Error::HashCollision)
+    /// if two different keys share a hash, or an error if key extraction fails.
+    pub fn rebuild_strict(&self, partitions: &[Vec<RecordBatch>]) -> Result<()> {
+        self.clear();
+        self.insert_all(partitions, true)
+            .inspect_err(|_| self.clear())
+    }
+
+    fn insert_all(&self, partitions: &[Vec<RecordBatch>], strict: bool) -> Result<()> {
         for (partition_idx, partition) in partitions.iter().enumerate() {
             for (batch_idx, batch) in partition.iter().enumerate() {
                 if batch.num_rows() == 0 {
@@ -1237,7 +1257,27 @@ impl HashIndex {
 
                     let location = RowLocation::new(partition_u32, batch_u32, row_u32);
 
-                    self.insert_or_replace(hash, location);
+                    if !strict {
+                        self.insert_or_replace(hash, location);
+                    } else if let InsertResult::HashCollision(existing) =
+                        self.insert(hash, location)
+                    {
+                        // Same bytes: the key repeats. Different bytes: two keys share a hash,
+                        // which this table cannot hold either.
+                        let existing_batch =
+                            &partitions[existing.partition as usize][existing.batch as usize];
+                        let existing_extractor =
+                            create_key_extractor(existing_batch, &self.key_columns)?;
+                        return match (
+                            extractor.key_bytes(row),
+                            existing_extractor.key_bytes(existing.row as usize),
+                        ) {
+                            (Some(current), Some(existing)) if current == existing => {
+                                Err(crate::Error::DuplicateKey)
+                            }
+                            _ => Err(crate::Error::HashCollision { hash }),
+                        };
+                    }
                 }
             }
         }

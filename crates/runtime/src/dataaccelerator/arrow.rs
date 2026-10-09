@@ -27,7 +27,7 @@ use runtime_table_partition::expression::PartitionedBy;
 use snafu::prelude::*;
 use std::{any::Any, sync::Arc};
 
-use crate::component::dataset::acceleration::{Engine, RefreshMode};
+use crate::component::dataset::acceleration::{Engine, IndexType, RefreshMode};
 use crate::parameters::ParameterSpec;
 
 use super::{AccelerationSource, AcceleratorEngineRegistry, DataAccelerator};
@@ -122,6 +122,22 @@ impl DataAccelerator for ArrowAccelerator {
         {
             cmd.options
                 .insert("sort_columns".to_string(), sort_cols_str.clone());
+        }
+
+        // Arrow treats a `unique` index like `enabled`: it does not reject a repeated
+        // row on write, and an index over repeated values stops serving lookups. Say
+        // so at registration, as Cayenne does, rather than let a slow lookup say it.
+        if let Some(source) = source
+            && let Some(acceleration) = source.acceleration()
+            && acceleration
+                .indexes
+                .values()
+                .any(|index_type| matches!(index_type, IndexType::Unique))
+        {
+            tracing::warn!(
+                "Dataset '{}' (arrow): a `unique` entry in `indexes` speeds up lookups but does not constrain writes, so duplicate rows are not rejected; while a value repeats, lookups on that column read the whole table. Set `primary_key` with `on_conflict` to deduplicate on a column set.",
+                source.name()
+            );
         }
 
         enable_hash_index_for_primary_key_or_indexes(&mut cmd);

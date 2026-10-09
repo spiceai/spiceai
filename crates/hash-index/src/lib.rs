@@ -49,7 +49,6 @@ limitations under the License.
 mod bloom;
 mod extract;
 mod index;
-mod multi;
 mod sbbf;
 mod sbbf_layout;
 
@@ -65,7 +64,6 @@ pub use index::{
     RowLocation, XxHash3BuildHasher, XxHash3Hasher, hash_key, hash_key_128, hash_key_bytes,
     hash_key_bytes_oneshot, hash_key_i64, index_threshold,
 };
-pub use multi::MultiHashIndex;
 pub use sbbf::SplitBlockBloomFilter;
 
 use snafu::prelude::*;

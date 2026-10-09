@@ -24,6 +24,7 @@ use datafusion::{
     logical_expr::CreateExternalTable,
 };
 use datafusion_table_providers::util::on_conflict::OnConflict;
+use hash_index::HashIndexBuilder;
 use std::sync::Arc;
 
 use self::indexed::SecondaryIndex;
@@ -70,9 +71,10 @@ fn extract_primary_key_columns(
 /// Represents an index type from the spicepod configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexType {
-    /// A standard index that allows duplicates.
+    /// A standard index. On Arrow it serves lookups while the column's values are
+    /// distinct; a repeated value disables it until a refresh removes the repeat.
     Enabled,
-    /// A unique index; duplicate keys are rejected on write.
+    /// Declared unique. Arrow does not enforce it on write and treats it as `Enabled`.
     Unique,
 }
 
@@ -169,13 +171,15 @@ impl TableProviderFactory for ArrowFactory {
             }
 
             let mut indexed_table =
-                IndexedMemTable::try_new(Arc::clone(&schema), vec![], primary_key_columns)?;
+                IndexedMemTable::try_new(Arc::clone(&schema), vec![], primary_key_columns)?
+                    .with_table_name(cmd.name.to_string());
 
             // Create secondary indexes from parsed config
             if !indexes_config.is_empty() {
                 let mut secondary_indexes = Vec::new();
 
-                for (columns, _) in indexes_config {
+                for (columns, index_type) in indexes_config {
+                    let is_unique = index_type == IndexType::Unique;
                     let index_name = columns.join("_");
 
                     // Warn about compound secondary indexes not being used for query optimization yet
@@ -187,7 +191,25 @@ impl TableProviderFactory for ArrowFactory {
                         );
                     }
 
-                    secondary_indexes.push(SecondaryIndex::new(index_name, columns));
+                    // Build hash index for secondary columns
+                    // Note: For empty table, we create the index structure; it will be populated on insert.
+                    // Either index type is rebuilt strictly after each write (see IndexedMemTable::rebuild_index).
+                    let partitions: Vec<Vec<arrow::array::RecordBatch>> = vec![];
+                    let hash_index = HashIndexBuilder::new(columns.clone())
+                        .allow_duplicates(false)
+                        .build(&partitions)
+                        .map_err(|e| {
+                            DataFusionError::Execution(format!(
+                                "Failed to build secondary index '{index_name}': {e}"
+                            ))
+                        })?;
+
+                    secondary_indexes.push(SecondaryIndex::new(
+                        index_name,
+                        columns,
+                        is_unique,
+                        Arc::new(hash_index),
+                    ));
                 }
 
                 indexed_table = indexed_table.with_secondary_indexes(secondary_indexes);
@@ -940,14 +962,16 @@ mod tests {
     }
 
     /// Runs `sql` as the runtime's sinks write: rebuilding the indexes afterwards.
-    async fn write(
-        ctx: &SessionContext,
-        table: &Arc<dyn TableProvider>,
-        sql: &str,
-    ) -> DataFusionResult<()> {
-        ctx.sql(sql).await?.collect().await?;
-        crate::index_maintenance::perform_index_maintenance(table.as_ref()).await?;
-        Ok(())
+    async fn write(ctx: &SessionContext, table: &Arc<dyn TableProvider>, sql: &str) {
+        ctx.sql(sql)
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect("write");
+        crate::index_maintenance::perform_index_maintenance(table.as_ref())
+            .await
+            .expect("index maintenance");
     }
 
     async fn query(ctx: &SessionContext, sql: &str) -> String {
@@ -964,63 +988,63 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_enabled_index_returns_every_row_of_a_repeated_key() {
+    async fn test_enabled_index_serves_lookups_while_keys_are_distinct() {
         let (ctx, table) = sender_table("enabled").await;
         write(
             &ctx,
             &table,
-            "INSERT INTO t VALUES ('a', 1), ('b', 2), ('a', 3), (NULL, 4)",
-        )
-        .await
-        .expect("insert");
-
-        let plan = query(
-            &ctx,
-            "EXPLAIN SELECT n FROM t WHERE sender_id = 'a' ORDER BY n",
+            "INSERT INTO t VALUES ('a', 1), ('b', 2), (NULL, 3)",
         )
         .await;
+
+        let plan = query(&ctx, "EXPLAIN SELECT n FROM t WHERE sender_id = 'a'").await;
         assert!(
             plan.contains("IndexedLookupExec: indexed_scan on [sender_id]"),
-            "lookup must use the index: {plan}"
+            "an enabled index must serve the lookup: {plan}"
         );
-        let rows = query(&ctx, "SELECT n FROM t WHERE sender_id = 'a' ORDER BY n").await;
-        assert_eq!(rows, "+---+\n| n |\n+---+\n| 1 |\n| 3 |\n+---+");
-        let missing = query(&ctx, "SELECT count(*) AS c FROM t WHERE sender_id = 'z'").await;
-        assert!(missing.contains("| 0 |"), "{missing}");
+        let hit = query(&ctx, "SELECT n FROM t WHERE sender_id = 'a'").await;
+        assert!(hit.contains("| 1 |"), "{hit}");
+        let miss = query(&ctx, "SELECT count(*) AS c FROM t WHERE sender_id = 'z'").await;
+        assert!(miss.contains("| 0 |"), "{miss}");
     }
 
+    /// A `unique` index used to answer a lookup on a repeated key with one of its rows.
     #[tokio::test]
-    async fn test_unique_index_rejects_duplicate_keys_and_keeps_existing_rows() {
-        let (ctx, table) = sender_table("unique").await;
-        write(
-            &ctx,
-            &table,
-            "INSERT INTO t VALUES ('a', 1), ('b', 2), (NULL, 3), (NULL, 4)",
-        )
-        .await
-        .expect("distinct keys and repeated nulls are accepted");
+    async fn test_repeated_key_disables_the_index_until_a_refresh_removes_it() {
+        for index_type in ["unique", "enabled"] {
+            let (ctx, table) = sender_table(index_type).await;
+            let indexed = (table.as_ref() as &dyn std::any::Any)
+                .downcast_ref::<IndexedMemTable>()
+                .expect("indexed table");
 
-        for (sql, key) in [
-            ("INSERT INTO t VALUES ('a', 5)", "a"),
-            ("INSERT INTO t VALUES ('c', 5), ('c', 6)", "c"),
-            ("INSERT OVERWRITE t VALUES ('d', 5), ('d', 6)", "d"),
-        ] {
-            let err = write(&ctx, &table, sql)
-                .await
-                .expect_err("duplicate key must be rejected");
+            write(
+                &ctx,
+                &table,
+                "INSERT INTO t VALUES ('a', 1), ('b', 2), ('a', 3)",
+            )
+            .await;
             assert!(
-                err.to_string().contains(&format!(
-                    "Duplicate value ({key}) for unique index on (sender_id)"
-                )),
-                "{sql}: {err}"
+                !indexed.secondary_indexes()[0].is_usable(),
+                "{index_type}: a repeated key must disable the index"
             );
-        }
+            let plan = query(&ctx, "EXPLAIN SELECT n FROM t WHERE sender_id = 'a'").await;
+            assert!(
+                !plan.contains("IndexedLookupExec"),
+                "{index_type}: lookups must scan the table: {plan}"
+            );
+            assert_eq!(
+                query(&ctx, "SELECT n FROM t WHERE sender_id = 'a' ORDER BY n").await,
+                "+---+\n| n |\n+---+\n| 1 |\n| 3 |\n+---+",
+                "{index_type}: every row of the key"
+            );
 
-        let rows = query(&ctx, "SELECT sender_id, n FROM t ORDER BY n").await;
-        assert_eq!(
-            rows,
-            "+-----------+---+\n| sender_id | n |\n+-----------+---+\n| a         | 1 |\n| b         | 2 |\n|           | 3 |\n|           | 4 |\n+-----------+---+",
-            "rejected writes must leave the table unchanged"
-        );
+            write(&ctx, &table, "INSERT OVERWRITE t VALUES ('a', 1), ('b', 2)").await;
+            assert!(
+                indexed.secondary_indexes()[0].is_usable(),
+                "{index_type}: distinct keys make the index usable again"
+            );
+            let plan = query(&ctx, "EXPLAIN SELECT n FROM t WHERE sender_id = 'a'").await;
+            assert!(plan.contains("IndexedLookupExec"), "{index_type}: {plan}");
+        }
     }
 }
