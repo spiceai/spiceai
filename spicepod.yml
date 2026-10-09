@@ -50,3 +50,14 @@ datasets:
     time_column: updated_at
     time_format: timestamp
     acceleration: *github_acceleration
+
+  # Reviews carry PullRequestReview.state. pulls.review_comments does not.
+  # on_registration: a pull request with more than 100 reviews fails this scan.
+  - from: github:github.com/spiceai/spiceai/reviews
+    name: reviews
+    description: github.com/spiceai/spiceai pull request reviews
+    params: *github_params
+    ready_state: on_registration
+    time_column: submitted_at
+    time_format: timestamp
+    acceleration: *github_acceleration
