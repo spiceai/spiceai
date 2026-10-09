@@ -23,6 +23,15 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Snafu, Debug)]
 #[snafu(visibility(pub(crate)))]
 pub enum Error {
+    #[snafu(display(
+        "Failed to resolve '{}' against the working directory: {source}",
+        path.display()
+    ))]
+    AbsolutePath {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
     #[snafu(display("Failed to read '{}': {source}", path.display()))]
     ReadFile {
         path: PathBuf,
@@ -170,8 +179,36 @@ pub enum Error {
         source: datafusion::error::DataFusionError,
     },
 
+    #[snafu(display("Mode B could not serve the TPC-H tables through spiced: {detail}"))]
+    ModeBServe { detail: String },
+
     #[snafu(display(
-        "Mode B FlightSQL engine is a stub: start `spiced` with TPC-H datasets and invoke CommandStatementSubstraitPlan (see tools/substrait-compliance/README.md). {detail}"
+        "Mode B needs generated tables to serve through spiced; pass --scale-factor, and --spiced-path for the spiced binary"
     ))]
-    ModeBNotImplemented { detail: String },
+    ModeBNeedsGeneratedData,
+
+    #[snafu(display("Failed to write parquet '{}': {source}", path.display()))]
+    WriteParquet {
+        path: PathBuf,
+        source: datafusion::parquet::errors::ParquetError,
+    },
+
+    #[snafu(display(
+        "`{flag}` applies to Mode B only, and Mode A would ignore it. Pass `--mode mode-b`, or \
+         drop `{flag}`"
+    ))]
+    ModeBOnlyFlag { flag: &'static str },
+
+    #[snafu(display(
+        "The baseline report '{}' passed none of the cases this run selected, so comparing \
+         against it would check nothing. Pass a baseline that passed them",
+        path.display()
+    ))]
+    BaselineVacuous { path: PathBuf },
+
+    #[snafu(display(
+        "Failed to read the baseline report '{}': {detail}",
+        path.display()
+    ))]
+    Baseline { path: PathBuf, detail: String },
 }

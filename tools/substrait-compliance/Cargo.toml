@@ -1,5 +1,5 @@
 [package]
-description = "Substrait compliance harness: IBM suite Mode A (DataFusion) and Mode B (FlightSQL) stub"
+description = "Substrait compliance harness: IBM suite Mode A (DataFusion) and Mode B (spiced over FlightSQL)"
 edition.workspace = true
 license-file.workspace = true
 name = "spice-substrait-compliance"
@@ -16,11 +16,15 @@ chrono = { workspace = true, features = ["serde"] }
 clap = { workspace = true, features = ["derive"] }
 datafusion.workspace = true
 datafusion-substrait.workspace = true
+futures.workspace = true
 prost.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 snafu.workspace = true
+tempfile.workspace = true
+test-framework = { path = "../../crates/test-framework" }
 tokio = { workspace = true, features = ["fs", "macros", "rt-multi-thread"] }
+tonic.workspace = true
 tpchgen.workspace = true
 yaml = { path = "../../crates/yaml" }
 

@@ -14,37 +14,60 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Mode B: product path through Spice `FlightSQL` `CommandStatementSubstraitPlan`.
+//! Mode B: the product path. `spiced` serves the TPC-H tables as Spicepod
+//! datasets — accelerated the way `--acceleration-engine`, `--acceleration-mode`
+//! and `--layout` ask, or federated from parquet — and runs each suite plan sent
+//! as a `FlightSQL` `CommandStatementSubstraitPlan`
+//! (`crates/runtime/src/flight/flightsql/statement_substrait_plan.rs`:
+//! `get_flight_info` / `do_get` → `from_substrait_plan` → `QueryBuilder`).
+//! Answers are compared with the same goldens as Mode A.
 //!
-//! Long-term CI should use this path, not Mode A. This module wires the
-//! `FlightSQL` command the runtime already accepts and leaves the live
-//! `spiced` bring-up as follow-up work.
-//!
-//! Server handlers:
-//! `crates/runtime/src/flight/flightsql/statement_substrait_plan.rs`
-//! (`get_flight_info` / `do_get` → `from_substrait_plan` → `QueryBuilder`).
-//!
-//! Remaining work before this is a real engine:
-//! - Start `spiced` with a Spicepod that mounts the IBM TPC-H CSVs as
-//!   datasets named so Isthmus plans resolve (`LINEITEM`, `ORDERS`, …).
-//! - Connect a `FlightSQL` client (see `crates/flight_client`) to the runtime
-//!   Flight endpoint (default `50051`).
-//! - `GetFlightInfo(FlightDescriptor::new_cmd(command_bytes))` then `DoGet`
-//!   the ticket; reuse [`crate::compare`] on the collected batches.
-//! - Map Spice catalog names (`spice.public.lineitem`) onto the unqualified
-//!   names the IBM plans use.
+//! The suite's Isthmus plans read uppercase names and Spice registers datasets
+//! under lowercase ones, so the tables are written with lowercase names and
+//! each plan's read names are lowercased to match ([`crate::plan_names`]).
 
+use std::fs::File;
+use std::num::NonZeroU32;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use arrow::datatypes::Schema;
+use arrow::record_batch::RecordBatch;
+use arrow_flight::FlightDescriptor;
+use arrow_flight::decode::FlightRecordBatchStream;
+use arrow_flight::error::FlightError;
+use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::sql::{CommandStatementSubstraitPlan, ProstMessageExt, SubstraitPlan};
 use bytes::Bytes;
+use datafusion::parquet::arrow::ArrowWriter;
 use datafusion_substrait::substrait::proto::{Plan, Version};
+use futures::TryStreamExt;
 use prost::Message;
+use snafu::ResultExt;
+use test_framework::{
+    app::AppBuilder,
+    constants::FLIGHT_URL,
+    layout::{Layout, apply_layout, benchmark_tables},
+    queries::QuerySet,
+    spiced::{SpicedInstance, StartRequest},
+    spicepod::{
+        acceleration::{Acceleration, Mode},
+        component::dataset::Dataset,
+    },
+    spicepod_utils::from_app,
+};
+use tonic::transport::Channel;
 
+use crate::compare::TableData;
+use crate::datagen::GeneratedTable;
 use crate::error::{self, Result};
+use crate::mode_a::{batches_to_table, case_result, unverifiable};
+use crate::plan_names::lowercase_read_names;
 use crate::report::{CaseResult, TestStatus};
 use crate::suite::LoadedCase;
 
 pub const ENGINE_NAME: &str = "Spice FlightSQL";
-pub const ENGINE_VERSION: &str = "stub";
 
 /// IBM v0.1.1 q01/q22 plans declare this Substrait release. Used when the
 /// plan bytes do not decode to a `Plan.version` (or decode as `0.0.0`).
@@ -95,48 +118,266 @@ pub fn command_bytes(plan_bytes: &[u8]) -> Vec<u8> {
         .encode_to_vec()
 }
 
-/// Product-path engine. Execute is intentionally unimplemented until a
-/// `spiced` fixture owns the TPC-H catalog.
-pub struct FlightSqlComplianceEngine {
-    pub endpoint: String,
+/// How `spiced` serves the TPC-H tables.
+pub struct ServingOptions {
+    pub spiced_path: PathBuf,
+    /// How each dataset is accelerated; `None` serves the parquet files
+    /// federated.
+    pub acceleration: Option<AccelerationOptions>,
+    pub ready_wait: Duration,
 }
 
-impl FlightSqlComplianceEngine {
+pub struct AccelerationOptions {
+    pub engine: String,
+    pub mode: Mode,
+    pub layout: Option<Layout>,
+}
+
+impl ServingOptions {
+    /// What the report names as the engine, e.g.
+    /// `Spice FlightSQL (cayenne, file, layout primary_key,sort)`.
     #[must_use]
-    pub fn new(endpoint: impl Into<String>) -> Self {
-        Self {
-            endpoint: endpoint.into(),
+    pub fn engine_description(&self) -> String {
+        match &self.acceleration {
+            None => format!("{ENGINE_NAME} (federated parquet)"),
+            Some(acceleration) => {
+                let mode = match acceleration.mode {
+                    Mode::Memory => "memory",
+                    _ => "file",
+                };
+                match &acceleration.layout {
+                    None => format!("{ENGINE_NAME} ({}, {mode})", acceleration.engine),
+                    Some(layout) => {
+                        format!(
+                            "{ENGINE_NAME} ({}, {mode}, layout {layout})",
+                            acceleration.engine
+                        )
+                    }
+                }
+            }
         }
     }
+}
 
-    pub fn run_case(&self, case: &LoadedCase) -> Result<CaseResult> {
-        // Prove the command encodes; do not pretend a result was verified.
-        let _cmd = command_bytes(&case.plan_bytes);
-        error::ModeBNotImplementedSnafu {
-            detail: format!(
-                "would send CommandStatementSubstraitPlan for '{}' to {}",
-                case.id, self.endpoint
-            ),
-        }
-        .fail()
-    }
+/// A `spiced` serving the TPC-H tables, stopped when dropped.
+pub struct SpicedEngine {
+    spiced: SpicedInstance,
+    client: FlightServiceClient<Channel>,
+}
 
-    /// One SKIP per case; borrows the cases, whose plan bytes are only measured.
-    pub fn stub_results(cases: &[&LoadedCase]) -> Vec<CaseResult> {
-        cases
+impl SpicedEngine {
+    /// Write `tables` into `data_dir` as parquet, start `spiced` on them as
+    /// `options` asks, and connect to its Flight endpoint.
+    pub async fn start(
+        options: &ServingOptions,
+        tables: &[GeneratedTable],
+        data_dir: &Path,
+    ) -> Result<Self> {
+        write_parquet(tables, data_dir)?;
+        let mut datasets: Vec<Dataset> = tables
             .iter()
-            .map(|case| CaseResult {
-                test_id: case.id.clone(),
-                description: case.description.clone(),
-                status: TestStatus::Skipped,
-                execution_time_ms: 0,
-                error_message: Some(format!(
-                    "Mode B stub: CommandStatementSubstraitPlan encodes ({} plan bytes) but is not sent to spiced yet",
-                    case.plan_bytes.len()
-                )),
+            .map(|table| {
+                dataset(
+                    table.table.file_stem,
+                    data_dir,
+                    options.acceleration.as_ref(),
+                )
             })
-            .collect()
+            .collect();
+        if let Some(AccelerationOptions {
+            layout: Some(layout),
+            ..
+        }) = &options.acceleration
+        {
+            let keys = benchmark_tables(&QuerySet::Tpch).ok_or_else(|| {
+                serve_error("the TPC-H layout keys are missing from test_framework::layout")
+            })?;
+            let applied = apply_layout(&mut datasets, keys, layout)
+                .map_err(|e| serve_error(format!("layout '{layout}': {e:#}")))?;
+            for dataset in applied {
+                println!("  layout {dataset}");
+            }
+        }
+        let app = datasets
+            .into_iter()
+            .fold(
+                AppBuilder::new("substrait-compliance"),
+                AppBuilder::with_dataset,
+            )
+            .build();
+        let request = StartRequest::new(options.spiced_path.clone(), from_app(app))
+            .map_err(|e| serve_error(format!("prepare spiced: {e:#}")))?;
+        let mut spiced = SpicedInstance::start(request)
+            .await
+            .map_err(|e| serve_error(format!("start spiced: {e:#}")))?;
+        spiced
+            .wait_for_ready(options.ready_wait)
+            .await
+            .map_err(|e| serve_error(format!("wait for spiced to load the tables: {e:#}")))?;
+        let channel = Channel::from_static(FLIGHT_URL)
+            .connect()
+            .await
+            .map_err(|e| serve_error(format!("connect to {FLIGHT_URL}: {e}")))?;
+        Ok(Self {
+            spiced,
+            client: FlightServiceClient::new(channel),
+        })
     }
+
+    /// The `spiced` version, for the report.
+    #[must_use]
+    pub fn version(&self) -> String {
+        self.spiced.version().to_string()
+    }
+
+    /// Run each case `iterations` times, comparing every execution with the
+    /// golden. A case passes only when every execution does; the first that
+    /// does not decides its result. Repeating catches answers that change once
+    /// the first execution has warmed a cache or an index.
+    pub async fn run_suite(
+        &mut self,
+        cases: &[&LoadedCase],
+        iterations: NonZeroU32,
+    ) -> Vec<CaseResult> {
+        let mut results = Vec::with_capacity(cases.len());
+        for case in cases {
+            let start = Instant::now();
+            if case.expected.is_none() {
+                results.push(unverifiable(case, start));
+                continue;
+            }
+            let mut result = case_result(case, start, self.execute(case).await);
+            for iteration in 2..=iterations.get() {
+                if result.status != TestStatus::Passed {
+                    break;
+                }
+                result = case_result(case, start, self.execute(case).await);
+                if result.status != TestStatus::Passed {
+                    result.error_message = result.error_message.map(|message| {
+                        format!(
+                            "execution {iteration} of {iterations}, after {} that passed: {message}",
+                            iteration - 1
+                        )
+                    });
+                }
+            }
+            results.push(result);
+        }
+        results
+    }
+
+    async fn execute(&mut self, case: &LoadedCase) -> std::result::Result<TableData, String> {
+        let mut plan = Plan::decode(case.plan_bytes.as_slice()).map_err(|e| {
+            format!(
+                "Failed to decode Substrait plan {}: {e}",
+                case.plan_path.display()
+            )
+        })?;
+        lowercase_read_names(&mut plan);
+        let descriptor = FlightDescriptor::new_cmd(command_bytes(&plan.encode_to_vec()));
+        let info = self
+            .client
+            .get_flight_info(descriptor)
+            .await
+            .map_err(|status| format!("GetFlightInfo: {}", status.message()))?
+            .into_inner();
+        let schema = info
+            .clone()
+            .try_decode_schema()
+            .map_err(|e| format!("FlightInfo schema: {e}"))?;
+        let mut batches = Vec::new();
+        for endpoint in info.endpoint {
+            let ticket = endpoint
+                .ticket
+                .ok_or_else(|| "FlightInfo endpoint carries no ticket".to_string())?;
+            let stream = self
+                .client
+                .do_get(ticket)
+                .await
+                .map_err(|status| format!("DoGet: {}", status.message()))?
+                .into_inner();
+            let mut decoded = FlightRecordBatchStream::new_from_flight_data(
+                stream.map_err(|status| FlightError::Tonic(Box::new(status))),
+            );
+            while let Some(batch) = decoded
+                .try_next()
+                .await
+                .map_err(|e| format!("DoGet stream: {e}"))?
+            {
+                batches.push(batch);
+            }
+        }
+        Ok(batches_to_table(&batches, &schema))
+    }
+}
+
+impl Drop for SpicedEngine {
+    fn drop(&mut self) {
+        if let Err(e) = self.spiced.stop() {
+            eprintln!("Failed to stop spiced: {e:#}");
+        }
+    }
+}
+
+fn serve_error(detail: impl Into<String>) -> error::Error {
+    error::ModeBServeSnafu {
+        detail: detail.into(),
+    }
+    .build()
+}
+
+/// The dataset that serves `stem`'s parquet file, accelerated as `acceleration`
+/// asks.
+fn dataset(stem: &str, data_dir: &Path, acceleration: Option<&AccelerationOptions>) -> Dataset {
+    let path = data_dir.join(format!("{stem}.parquet"));
+    let mut dataset = Dataset::new(format!("file:{}", path.display()), stem);
+    if let Some(acceleration) = acceleration {
+        dataset.acceleration = Some(Acceleration {
+            enabled: true,
+            engine: Some(acceleration.engine.clone()),
+            mode: acceleration.mode.clone(),
+            ..Acceleration::default()
+        });
+    }
+    dataset
+}
+
+/// Write each table as `<dir>/<table>.parquet`, rows in generation order, with
+/// its column names lowercased the way Spice resolves them.
+pub fn write_parquet(tables: &[GeneratedTable], dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir).context(error::WriteFileSnafu { path: dir })?;
+    for table in tables {
+        let schema = Arc::new(Schema::new(
+            table
+                .schema
+                .fields()
+                .iter()
+                .map(|field| {
+                    field
+                        .as_ref()
+                        .clone()
+                        .with_name(field.name().to_lowercase())
+                })
+                .collect::<Vec<_>>(),
+        ));
+        let path = dir.join(format!("{}.parquet", table.table.file_stem));
+        let file = File::create(&path).context(error::WriteFileSnafu { path: &path })?;
+        let mut writer = ArrowWriter::try_new(file, Arc::clone(&schema), None)
+            .context(error::WriteParquetSnafu { path: &path })?;
+        for batch in table.partitions.iter().flatten() {
+            let batch = RecordBatch::try_new(Arc::clone(&schema), batch.columns().to_vec())
+                .map_err(|e| {
+                    serve_error(format!("rename the columns of {}: {e}", path.display()))
+                })?;
+            writer
+                .write(&batch)
+                .context(error::WriteParquetSnafu { path: &path })?;
+        }
+        writer
+            .close()
+            .context(error::WriteParquetSnafu { path: &path })?;
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -179,23 +420,5 @@ mod tests {
             SUITE_SUBSTRAIT_VERSION
         );
         assert_eq!(SUITE_SUBSTRAIT_VERSION, "0.81.0");
-    }
-
-    #[test]
-    fn run_case_is_explicitly_unimplemented() {
-        let engine = FlightSqlComplianceEngine::new("http://127.0.0.1:50051");
-        let case = LoadedCase {
-            id: "q01".to_string(),
-            description: "fixture".to_string(),
-            plan_path: std::path::PathBuf::from("plans/q01.bin"),
-            plan_bytes: vec![0x0a, 0x00],
-            input_tables: Vec::new(),
-            expected: None,
-        };
-        let err = engine.run_case(&case).expect_err("stub must not execute");
-        assert!(
-            err.to_string().contains("CommandStatementSubstraitPlan"),
-            "{err}"
-        );
     }
 }

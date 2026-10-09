@@ -119,41 +119,10 @@ impl ModeAEngine {
 
     async fn run_case(&self, case: &LoadedCase) -> CaseResult {
         let start = Instant::now();
-        let Some(expected) = case.expected.as_ref() else {
-            return CaseResult {
-                test_id: case.id.clone(),
-                description: case.description.clone(),
-                status: TestStatus::Skipped,
-                execution_time_ms: elapsed_ms(start),
-                error_message: Some("No expected output — cannot verify correctness".to_string()),
-            };
-        };
-
-        match self.execute(case).await {
-            Ok(actual) => match compare(&actual, expected) {
-                None => CaseResult {
-                    test_id: case.id.clone(),
-                    description: case.description.clone(),
-                    status: TestStatus::Passed,
-                    execution_time_ms: elapsed_ms(start),
-                    error_message: None,
-                },
-                Some(mismatch) => CaseResult {
-                    test_id: case.id.clone(),
-                    description: case.description.clone(),
-                    status: TestStatus::Failed,
-                    execution_time_ms: elapsed_ms(start),
-                    error_message: Some(mismatch.to_string()),
-                },
-            },
-            Err(err) => CaseResult {
-                test_id: case.id.clone(),
-                description: case.description.clone(),
-                status: TestStatus::Error,
-                execution_time_ms: elapsed_ms(start),
-                error_message: Some(err),
-            },
+        if case.expected.is_none() {
+            return unverifiable(case, start);
         }
+        case_result(case, start, self.execute(case).await)
     }
 
     async fn execute(&self, case: &LoadedCase) -> std::result::Result<TableData, String> {
@@ -182,6 +151,41 @@ impl ModeAEngine {
         let batches = df.collect().await.map_err(|e| format!("collect: {e}"))?;
 
         Ok(batches_to_table(&batches, &schema))
+    }
+}
+
+/// The result of a case with no golden: skipped, since nothing can certify it.
+pub(crate) fn unverifiable(case: &LoadedCase, start: Instant) -> CaseResult {
+    CaseResult {
+        test_id: case.id.clone(),
+        description: case.description.clone(),
+        status: TestStatus::Skipped,
+        execution_time_ms: elapsed_ms(start),
+        error_message: Some("No expected output — cannot verify correctness".to_string()),
+    }
+}
+
+/// The result of a case that has a golden, from the table it produced (or why
+/// it produced none): passed when the table matches the golden.
+pub(crate) fn case_result(
+    case: &LoadedCase,
+    start: Instant,
+    executed: std::result::Result<TableData, String>,
+) -> CaseResult {
+    let (status, error_message) = match (executed, case.expected.as_ref()) {
+        (Ok(actual), Some(expected)) => match compare(&actual, expected) {
+            None => (TestStatus::Passed, None),
+            Some(mismatch) => (TestStatus::Failed, Some(mismatch.to_string())),
+        },
+        (Ok(_), None) => return unverifiable(case, start),
+        (Err(err), _) => (TestStatus::Error, Some(err)),
+    };
+    CaseResult {
+        test_id: case.id.clone(),
+        description: case.description.clone(),
+        status,
+        execution_time_ms: elapsed_ms(start),
+        error_message,
     }
 }
 
@@ -242,7 +246,10 @@ fn ensure_inputs_registered(case: &LoadedCase, tables: Tables) -> std::result::R
     Ok(())
 }
 
-fn batches_to_table(batches: &[RecordBatch], schema: &arrow::datatypes::Schema) -> TableData {
+pub(crate) fn batches_to_table(
+    batches: &[RecordBatch],
+    schema: &arrow::datatypes::Schema,
+) -> TableData {
     let columns = schema
         .fields()
         .iter()

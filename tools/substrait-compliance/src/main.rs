@@ -18,27 +18,31 @@ limitations under the License.
 //!
 //! Mode A runs the IBM TPC-H suite against the workspace `DataFusion` fork
 //! (`datafusion-substrait` consumer), over the suite's SF 0.01 CSVs or, with
-//! `--scale-factor`, over tables `tpchgen` generates at that scale. Mode B
-//! encodes `FlightSQL` `CommandStatementSubstraitPlan` commands and skips
-//! execution until a `spiced` fixture exists.
+//! `--scale-factor`, over tables `tpchgen` generates at that scale. Mode B runs
+//! the same plans through `spiced` — `FlightSQL` `CommandStatementSubstraitPlan`
+//! — over those generated tables, accelerated and laid out as asked.
 
 mod compare;
 mod datagen;
 mod error;
 mod mode_a;
 mod mode_b;
+mod plan_names;
 mod report;
 mod schema;
 mod suite;
 
+use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use clap::{Parser, ValueEnum};
 use datafusion::prelude::SessionConfig;
 use snafu::{ResultExt, ensure};
+use test_framework::layout::Layout;
+use test_framework::spicepod::acceleration::Mode as Mode_;
 
 use crate::error::Result;
 use crate::report::ComplianceReport;
@@ -57,9 +61,16 @@ enum Mode {
     /// `DataFusion` consumer baseline (IBM `examples/datafusion-rust` shape).
     #[value(name = "mode-a")]
     ModeA,
-    /// `FlightSQL` `CommandStatementSubstraitPlan` stub (product path).
+    /// `spiced` over `FlightSQL` `CommandStatementSubstraitPlan` (the product path).
     #[value(name = "mode-b")]
     ModeB,
+}
+
+/// How Mode B's datasets are stored.
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum AccelerationMode {
+    File,
+    Memory,
 }
 
 impl Mode {
@@ -83,7 +94,7 @@ impl Mode {
 #[derive(Parser, Debug)]
 #[command(
     name = "spice-substrait-compliance",
-    about = "Run IBM/substrait-compliance TPC-H against the Spice DataFusion fork (Mode A) or stub the FlightSQL product path (Mode B)"
+    about = "Run IBM/substrait-compliance TPC-H against the Spice DataFusion fork (Mode A) or through spiced's FlightSQL product path (Mode B)"
 )]
 struct Args {
     /// IBM test-suite directory (the `test-suites/tpch` folder).
@@ -111,9 +122,46 @@ struct Args {
     #[arg(long)]
     out_csv: Option<PathBuf>,
 
-    /// `FlightSQL` endpoint used only by Mode B (not contacted yet).
-    #[arg(long, default_value = "http://127.0.0.1:50051")]
-    flightsql_endpoint: String,
+    /// Mode B: the `spiced` binary that serves the generated tables.
+    #[arg(long)]
+    spiced_path: Option<PathBuf>,
+
+    /// Mode B: the acceleration engine of every TPC-H dataset (`cayenne`,
+    /// `duckdb`, `arrow`, `sqlite`, …), or `none` to serve the parquet files
+    /// federated.
+    #[arg(long, default_value = "cayenne")]
+    acceleration_engine: String,
+
+    /// Mode B: how the accelerated datasets are stored.
+    #[arg(long, value_enum, default_value_t = AccelerationMode::File)]
+    acceleration_mode: AccelerationMode,
+
+    /// Mode B: an acceleration layout for every dataset (`testoperator
+    /// --layout`): features from `primary_key`, `indexes`, `sort`, `cluster`,
+    /// `time_column` and `partition`, joined by commas.
+    #[arg(long)]
+    layout: Option<Layout>,
+
+    /// Mode B: where to write the generated tables as parquet. Default: a
+    /// temporary directory.
+    #[arg(long)]
+    data_dir: Option<PathBuf>,
+
+    /// Mode B: seconds to wait for `spiced` to load the tables.
+    #[arg(long, default_value_t = 900)]
+    ready_wait: u64,
+
+    /// Mode B: how many times to run each plan. Every execution is compared
+    /// with the golden, so an answer that changes once a cache or an index is
+    /// warm fails the case.
+    #[arg(long, default_value_t = NonZeroU32::MIN)]
+    iterations: NonZeroU32,
+
+    /// An earlier report of the same suite. The run fails (exit 1) when a case
+    /// that passed there does not pass here: how a layout run is held to the
+    /// results of the default layout.
+    #[arg(long)]
+    baseline: Option<PathBuf>,
 
     /// TPC-H scale factor. Omit to run the suite's own SF 0.01 CSVs against
     /// its goldens; set, Mode A generates the tables in memory with `tpchgen`
@@ -192,7 +240,7 @@ async fn run() -> Result<ExitCode> {
         .out_csv
         .clone()
         .unwrap_or_else(|| args.mode.default_output("csv"));
-    let expected_dir = resolve_expected_dir(args.scale_factor, args.expected)?;
+    let expected_dir = resolve_expected_dir(args.scale_factor, args.expected.clone())?;
     let suite = load_tpch_suite(&args.suite, expected_dir.as_deref())?;
     println!(
         "Loaded IBM suite '{}' v{} ({} cases) from {}",
@@ -221,6 +269,7 @@ async fn run() -> Result<ExitCode> {
     let start = Utc::now();
     let (engine_name, engine_version, mode_name, results) = match args.mode {
         Mode::ModeA => {
+            reject_mode_b_flags(&args)?;
             let engine = match args.scale_factor {
                 None => {
                     let data_dir = suite.root.join("data");
@@ -252,16 +301,54 @@ async fn run() -> Result<ExitCode> {
             )
         }
         Mode::ModeB => {
-            let engine = mode_b::FlightSqlComplianceEngine::new(&args.flightsql_endpoint);
-            for case in &selected {
-                // Encode so a missing prost/FlightSQL type fails the stub itself.
-                let _ = engine.run_case(case);
-            }
+            let (Some(scale_factor), Some(spiced_path)) = (args.scale_factor, &args.spiced_path)
+            else {
+                return error::ModeBNeedsGeneratedDataSnafu.fail();
+            };
+            // `spiced` runs in a temporary directory of its own, so neither its
+            // binary nor the data directory its datasets read may be relative to
+            // this process's working directory.
+            let spiced_path = std::path::absolute(spiced_path)
+                .context(error::AbsolutePathSnafu { path: spiced_path })?;
+            let options = mode_b::ServingOptions {
+                spiced_path,
+                acceleration: (args.acceleration_engine != "none").then(|| {
+                    mode_b::AccelerationOptions {
+                        engine: args.acceleration_engine.clone(),
+                        mode: match args.acceleration_mode {
+                            AccelerationMode::File => Mode_::File,
+                            AccelerationMode::Memory => Mode_::Memory,
+                        },
+                        layout: args.layout.clone(),
+                    }
+                }),
+                ready_wait: Duration::from_secs(args.ready_wait),
+            };
+            let started = Instant::now();
+            let parts = SessionConfig::new().target_partitions();
+            let tables = datagen::generate(scale_factor, parts).await?;
+            let temp_dir;
+            let data_dir = if let Some(dir) = &args.data_dir {
+                std::path::absolute(dir).context(error::AbsolutePathSnafu { path: dir })?
+            } else {
+                temp_dir = tempfile::tempdir().context(error::WriteFileSnafu {
+                    path: std::env::temp_dir(),
+                })?;
+                temp_dir.path().to_path_buf()
+            };
+            println!(
+                "Serving TPC-H SF {scale_factor} (tpchgen, {:.1}s) from {} through {}",
+                started.elapsed().as_secs_f64(),
+                data_dir.display(),
+                options.engine_description()
+            );
+            let mut engine = mode_b::SpicedEngine::start(&options, &tables, &data_dir).await?;
+            let results = engine.run_suite(&selected, args.iterations).await;
             (
-                mode_b::ENGINE_NAME.to_string(),
-                mode_b::ENGINE_VERSION.to_string(),
+                options.engine_description(),
+                engine.version(),
                 args.mode.name().to_string(),
-                mode_b::FlightSqlComplianceEngine::stub_results(&selected),
+                results,
             )
         }
     };
@@ -289,10 +376,10 @@ async fn run() -> Result<ExitCode> {
             suite_ref: SUITE_REF.to_string(),
             datafusion_pin: format!("spiceai/datafusion@{DATAFUSION_FORK_REV}"),
             scale_factor: args.scale_factor.or(suite.scale_factor),
-            data_source: match (args.mode, args.scale_factor) {
-                (Mode::ModeB, _) => "none",
-                (Mode::ModeA, None) => "suite",
-                (Mode::ModeA, Some(_)) => "tpchgen",
+            data_source: if args.scale_factor.is_some() {
+                "tpchgen"
+            } else {
+                "suite"
             }
             .to_string(),
             expected_source,
@@ -319,9 +406,85 @@ async fn run() -> Result<ExitCode> {
     println!("Wrote {}", out_json.display());
     println!("Wrote {}", out_csv.display());
 
-    // Report-only: never fail the process on a low pass rate. A non-zero
-    // exit is reserved for harness I/O / load errors (already returned).
+    // A low pass rate alone never fails the process: the suite still has cases
+    // the consumer cannot run. A case that passed in `--baseline` and does not
+    // pass now does, since the only difference is what this run varied.
+    if let Some(baseline) = &args.baseline {
+        let regressions = baseline_regressions(baseline, &report.results)?;
+        if !regressions.is_empty() {
+            println!(
+                "\n{} case(s) passed in {} but not here:",
+                regressions.len(),
+                baseline.display()
+            );
+            for (test_id, status) in &regressions {
+                println!("  {test_id}: {status}");
+            }
+            return Ok(ExitCode::FAILURE);
+        }
+        println!("No case that passed in {} fails here", baseline.display());
+    }
     Ok(ExitCode::SUCCESS)
+}
+
+/// Refuse a Mode A run that names a Mode B-only flag, which it would ignore.
+fn reject_mode_b_flags(args: &Args) -> Result<()> {
+    let flag = if args.spiced_path.is_some() {
+        Some("--spiced-path")
+    } else if args.layout.is_some() {
+        Some("--layout")
+    } else if args.data_dir.is_some() {
+        Some("--data-dir")
+    } else if args.iterations != NonZeroU32::MIN {
+        Some("--iterations")
+    } else {
+        None
+    };
+    match flag {
+        Some(flag) => error::ModeBOnlyFlagSnafu { flag }.fail(),
+        None => Ok(()),
+    }
+}
+
+/// The cases that passed in the `baseline` report but not in `results`, with
+/// their status here. A baseline that passed none of `results` compares
+/// nothing, so it is an error rather than a clean comparison.
+fn baseline_regressions(
+    baseline: &Path,
+    results: &[report::CaseResult],
+) -> Result<Vec<(String, &'static str)>> {
+    let text =
+        std::fs::read_to_string(baseline).context(error::ReadFileSnafu { path: baseline })?;
+    let report: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| baseline_error(baseline, &e.to_string()))?;
+    let cases = report["results"]
+        .as_array()
+        .ok_or_else(|| baseline_error(baseline, "it has no `results` array"))?;
+    let passed: std::collections::BTreeSet<&str> = cases
+        .iter()
+        .filter(|case| case["status"] == "passed")
+        .filter_map(|case| case["test_id"].as_str())
+        .collect();
+    let compared: Vec<&report::CaseResult> = results
+        .iter()
+        .filter(|result| passed.contains(result.test_id.as_str()))
+        .collect();
+    if compared.is_empty() {
+        return error::BaselineVacuousSnafu { path: baseline }.fail();
+    }
+    Ok(compared
+        .into_iter()
+        .filter(|result| result.status != report::TestStatus::Passed)
+        .map(|result| (result.test_id.clone(), result.status.as_str()))
+        .collect())
+}
+
+fn baseline_error(path: &Path, detail: &str) -> error::Error {
+    error::BaselineSnafu {
+        path: path.to_path_buf(),
+        detail: detail.to_string(),
+    }
+    .build()
 }
 
 /// `--write-data`: generate the tables at `scale_factor` and write them as the
@@ -403,6 +566,77 @@ mod tests {
             matches!(err, crate::error::Error::InvalidScaleFactor { .. }),
             "{err}"
         );
+    }
+
+    fn case(test_id: &str, status: crate::report::TestStatus) -> crate::report::CaseResult {
+        crate::report::CaseResult {
+            test_id: test_id.to_string(),
+            description: String::new(),
+            status,
+            execution_time_ms: 0,
+            error_message: None,
+        }
+    }
+
+    fn baseline_file(statuses: &[(&str, &str)]) -> tempfile::NamedTempFile {
+        let results: Vec<serde_json::Value> = statuses
+            .iter()
+            .map(|(test_id, status)| serde_json::json!({"test_id": test_id, "status": status}))
+            .collect();
+        let file = tempfile::NamedTempFile::new().expect("create the baseline file");
+        std::fs::write(
+            file.path(),
+            serde_json::json!({ "results": results }).to_string(),
+        )
+        .expect("write the baseline file");
+        file
+    }
+
+    /// A case that passed in the baseline and does not pass here is a
+    /// regression; a case the baseline did not pass is not compared.
+    #[test]
+    fn a_case_that_passed_in_the_baseline_and_fails_here_is_a_regression() {
+        use crate::report::TestStatus::{Error, Failed, Passed};
+        let baseline = baseline_file(&[("q01", "passed"), ("q02", "passed"), ("q03", "failed")]);
+        let results = [case("q01", Failed), case("q02", Passed), case("q03", Error)];
+        let regressions = super::baseline_regressions(baseline.path(), &results)
+            .expect("the baseline passed cases this run selected");
+        assert_eq!(regressions, vec![("q01".to_string(), "failed")]);
+    }
+
+    /// A baseline that passed none of the selected cases would let any run
+    /// through, so it must refuse rather than report no regressions.
+    #[test]
+    fn a_baseline_that_passed_none_of_the_selected_cases_is_refused() {
+        use crate::report::TestStatus::Passed;
+        let baseline = baseline_file(&[("q01", "error"), ("q02", "passed")]);
+        let err = super::baseline_regressions(baseline.path(), &[case("q01", Passed)])
+            .expect_err("a vacuous baseline");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "The baseline report '{}' passed none of the cases this run selected, so comparing \
+                 against it would check nothing. Pass a baseline that passed them",
+                baseline.path().display()
+            )
+        );
+    }
+
+    #[test]
+    fn mode_a_refuses_a_mode_b_flag_it_would_ignore() {
+        use clap::Parser as _;
+        let args =
+            super::Args::try_parse_from(["spice-substrait-compliance", "--layout", "primary_key"])
+                .expect("clap accepts the layout");
+        let err = super::reject_mode_b_flags(&args).expect_err("--layout with Mode A");
+        assert_eq!(
+            err.to_string(),
+            "`--layout` applies to Mode B only, and Mode A would ignore it. Pass `--mode mode-b`, \
+             or drop `--layout`"
+        );
+        let args = super::Args::try_parse_from(["spice-substrait-compliance", "--iterations", "1"])
+            .expect("clap accepts one iteration");
+        super::reject_mode_b_flags(&args).expect("one iteration is the Mode A default");
     }
 
     #[test]
