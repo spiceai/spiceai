@@ -5198,6 +5198,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "serde_path_to_error",
  "snafu",
  "tokio",
  "tracing",
