@@ -1195,7 +1195,7 @@
       ]
     },
     "AdaptiveTuning": {
-      "description": "Turns adaptive tuning on or off for the whole runtime.\n\n`disabled` (the default) derives Cayenne's knobs statically from the host and, where\navailable, the inferred schema. `enabled` additionally runs Cayenne's closed-loop\ncontroller, which moves them within the statically derived bounds. The\n`runtime.params.target_*` setpoints steer the controller and never turn it on.\n\nThe value is matched ignoring case and surrounding whitespace. Anything else fails the\nSpicepod load.",
+      "description": "Turns adaptive tuning on or off for the whole runtime.\n\n`disabled` (the default) derives Cayenne's knobs statically from the host and, where\navailable, the inferred schema. `enabled` additionally runs Cayenne's closed-loop\ncontroller, which moves them within the statically derived bounds. The\n`runtime.params.target_*` setpoints steer the controller and never turn it on.\n\nOnly the exact values `enabled` and `disabled` are accepted, matching the published\nschema. Anything else, including a different case or surrounding whitespace, fails the\nSpicepod load.",
       "oneOf": [
         {
           "description": "Derive the knobs statically. No closed loop.",
