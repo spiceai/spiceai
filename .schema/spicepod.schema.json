@@ -573,6 +573,10 @@
             "type": "string"
           }
         },
+        "adaptive_tuning": {
+          "description": "Turns adaptive tuning on or off for the whole runtime. `disabled` (default) derives\nCayenne's knobs statically; `enabled` also runs its closed-loop controller.",
+          "$ref": "#/$defs/AdaptiveTuning"
+        },
         "task_history": {
           "$ref": "#/$defs/TaskHistory"
         },
@@ -1187,6 +1191,21 @@
           "description": "Counters use cumulative, histograms use delta.",
           "type": "string",
           "const": "low_memory"
+        }
+      ]
+    },
+    "AdaptiveTuning": {
+      "description": "Turns adaptive tuning on or off for the whole runtime.\n\n`disabled` (the default) derives Cayenne's knobs statically from the host and, where\navailable, the inferred schema. `enabled` additionally runs Cayenne's closed-loop\ncontroller, which moves them within the statically derived bounds. The\n`runtime.params.target_*` setpoints steer the controller and never turn it on.\n\nThe value is matched ignoring case and surrounding whitespace. Anything else fails the\nSpicepod load.",
+      "oneOf": [
+        {
+          "description": "Derive the knobs statically. No closed loop.",
+          "type": "string",
+          "const": "disabled"
+        },
+        {
+          "description": "Run the closed-loop controller (preview).",
+          "type": "string",
+          "const": "enabled"
         }
       ]
     },
@@ -9526,31 +9545,6 @@
         },
         "cayenne_cdc_mem_tier_shards": {
           "description": "Number of PK-hash shards the in-RAM CDC tier is partitioned into, in cdc_durability: memory mode only (non-partitioned, key-based merge-on-read tables). Each shard is an independent serial validate->append domain keyed by the RowConverter OwnedRow bytes, so disjoint keys validate and append in parallel within one apply (intra-apply fan-out) while a key's whole version history — upserts AND delete tombstones — stays confined to its one owning shard (last-writer-wins preserved). Checkpoints are always all-shards-atomic on a single source-position axis. Default 1 (the byte-identical serial path). Raise (e.g. 4) on update/insert-heavy CDC tables to lift the per-apply serialization ceiling.",
-          "type": "string"
-        },
-        "cayenne_tuning": {
-          "description": "Auto-tuning mode. 'auto': derive the correct configuration values from the detected environment (cgroup-aware cores + memory, storage class) and the inferred schema (cardinality, row width, primary key) — no closed loop. 'adaptive': additionally run a per-table closed-feedback controller that measures the live CDC ingest rate, delete fraction, and arrival burstiness AND the runtime's whole-system response (apply latency vs offered load, read amplification that slows queries, cgroup-aware memory pressure) and adapts the inline-memtable flush caps, the in-memory CDC tier byte cap, compaction cadence/trigger, and write concurrency over time, within the environment-derived [floor, ceiling]. DEFAULT: 'auto'. Nothing else turns the closed loop on — 'adaptive' is entered only by setting it here, and a configured cayenne_goal_* SLO is ignored (with a warning) until you do. Schema inference is always attempted and sharpens the 'adaptive' warm-start (inferred cardinality/size) but is not required for it — without inferred metadata the controller relearns the row width from observed ingest and converges from the hardware-derived warm-start. In BOTH modes an explicit per-parameter value (e.g. cayenne_segment_cache_mb: 512) overrides the derived value; under 'adaptive' an explicitly-set actuator is pinned (the loop will not move it).",
-          "type": "string",
-          "default": "auto",
-          "enum": [
-            "auto",
-            "adaptive"
-          ]
-        },
-        "cayenne_goal_replication_lag": {
-          "description": "Goal-driven adaptive tuning: target end-to-end CDC replication lag as a duration (e.g. '5s'). Best set GLOBALLY at runtime.params (cayenne_goal_replication_lag) and overridden here per-dataset. Requires cayenne_tuning: adaptive — under the 'auto' default the goal is ignored. With the loop enabled, it converges toward this SLO in small, bounded steps.",
-          "type": "string"
-        },
-        "cayenne_goal_freshness": {
-          "description": "Goal-driven adaptive tuning: target data freshness — age of the newest queryable data — as a duration (e.g. '30s'). Settable globally at runtime.params and overridden here per-dataset. Requires cayenne_tuning: adaptive.",
-          "type": "string"
-        },
-        "cayenne_goal_query_latency": {
-          "description": "Goal-driven adaptive tuning: target p99 query latency on this table as a duration (e.g. '10s' or '250ms'). Settable globally at runtime.params and overridden here per-dataset. Requires cayenne_tuning: adaptive.",
-          "type": "string"
-        },
-        "cayenne_goal_convergence_window": {
-          "description": "Advanced: the control-loop pacing window — the time budget over which the loop steps toward the configured cayenne_goal_* SLOs, as a duration (e.g. '1m'). Default 60s. This paces HOW fast the loop chases the goals, not a target outcome; it is a per-dataset knob, not part of the global SLO surface.",
           "type": "string"
         },
         "cdc_prefetch_buffer": {
