@@ -105,9 +105,38 @@ limitations under the License.
 //! The budget itself is never written back. Only the counts are shared; each
 //! replica derives the budget from them and holds it for the life of the
 //! window, so a tick cannot move the budget under a grant already issued.
+//!
+//! ## Replicas that configure different limits
+//!
+//! A limiter is keyed by its quota name *and* its configured limit
+//! (`requests_per_second:burst=10:replenish_ns=100000000`), so replicas that
+//! set different limits for one quota — a rolling deployment that changes
+//! `requests_per_second_limit`, say — each write their own limiter into the
+//! same file. Each replica therefore reads every limiter of its quota, not
+//! only its own, and treats them as one budget:
+//!
+//! ```text
+//! burst   = min(own burst, burst of every sibling limiter some replica is leasing)
+//! granted = Σ grants of the window across own and sibling limiters
+//! demand  = own demand / Σ demand across own and sibling limiters
+//! ```
+//!
+//! The lowest limit is the only one that exceeds no replica's configuration.
+//! A sibling counts while a replica holds a lease under it for the window or
+//! one of the two before it (see [`PersistedLimiter::is_leasing`]), so a
+//! replica that stops stops holding the cluster to its limit three windows
+//! after its last refresh. Grants already written stand, so a replica that
+//! starts with a lower limit holds the cluster to it from the second window
+//! after it first leases. Each replica logs a warning naming the origin and
+//! the limits when they start to differ, and a note when they agree again.
+//!
+//! Replicas that agree on a limit share one key, and so one limiter. A replica
+//! of a version that does not read siblings sees only its own limiter: it is
+//! not held to a lower limit, and the replicas that read siblings count its
+//! grants and give way to them.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -272,6 +301,130 @@ impl PersistedRateControlState {
         limiter.burst_per_window = burst;
         limiter
     }
+
+    /// The other limiters of `own_key`'s quota: the same quota name, written
+    /// by replicas that configure a different limit for it.
+    fn siblings<'a>(
+        &'a self,
+        own_key: &'a str,
+    ) -> impl Iterator<Item = (LimiterKey<'a>, &'a PersistedLimiter)> + 'a {
+        let own_name = LimiterKey::parse(own_key).map(|key| key.name);
+        self.limiters.iter().filter_map(move |(key, limiter)| {
+            if key == own_key {
+                return None;
+            }
+            let parsed = LimiterKey::parse(key)?;
+            (Some(parsed.name) == own_name).then_some((parsed, limiter))
+        })
+    }
+}
+
+/// A persisted limiter key, `{name}:burst={limit}:replenish_ns={interval}`,
+/// taken apart.
+///
+/// The key carries the configured limit, so replicas that set different limits
+/// for one quota write different keys into one file. The name is what ties them
+/// back together.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LimiterKey<'a> {
+    /// The quota, e.g. `requests_per_second`.
+    name: &'a str,
+    /// The configured limit: the quota's burst size, which is the value the
+    /// user set (`requests_per_second_limit: 10` is a burst of 10).
+    limit: u64,
+}
+
+impl<'a> LimiterKey<'a> {
+    fn parse(key: &'a str) -> Option<Self> {
+        let (name, rest) = key.split_once(":burst=")?;
+        let limit = rest.split(':').next()?.parse().ok()?;
+        Some(Self { name, limit })
+    }
+
+    /// The setting the user configures this quota with. The quota names come
+    /// from HTTP rate control, the only caller that leases quotas: the quota
+    /// `requests_per_second` is set by `requests_per_second_limit`.
+    fn setting(self) -> String {
+        format!("{}_limit", self.name)
+    }
+}
+
+/// What the sibling limiters of a quota hold for one window: the replicas that
+/// lease the same quota under a different configured limit.
+#[derive(Debug)]
+struct SiblingReading {
+    /// The per-window burst the cluster is held to: the lowest of this
+    /// replica's and every live sibling's.
+    burst: u64,
+    /// The distinct limits live siblings configure, for the log line.
+    limits: BTreeSet<u64>,
+    /// Tokens live siblings granted in the window.
+    granted: u64,
+    /// Live siblings' demand over the lookback. `mine` is zero: this replica
+    /// leases only under its own limiter.
+    demand: DemandSample,
+    /// Upstream outcomes recorded under every sibling, live or not: they were
+    /// observed against the same origin.
+    outcomes: OutcomeSample,
+}
+
+impl SiblingReading {
+    /// Read the siblings of `own_key` for `window_id`. `own_burst` is this
+    /// replica's configured burst; the demand of live siblings is classified
+    /// against the burst the cluster is held to, which every replica derives
+    /// the same way.
+    fn read(
+        state: &PersistedRateControlState,
+        own_key: &str,
+        own_burst: u64,
+        instance: &str,
+        window_id: u64,
+        now_window: u64,
+        adaptive: Option<LeasedAdaptiveConfig>,
+    ) -> Self {
+        let siblings: Vec<_> = state.siblings(own_key).collect();
+        let live: Vec<_> = siblings
+            .iter()
+            .filter(|(_, limiter)| limiter.is_leasing(window_id))
+            .collect();
+
+        let burst = live
+            .iter()
+            .map(|(_, limiter)| limiter.burst_per_window)
+            .fold(own_burst, u64::min);
+
+        let mut demand = DemandSample::default();
+        for (_, limiter) in &live {
+            demand.accumulate(limiter.ewma_demand(
+                instance,
+                now_window,
+                burst,
+                DEMAND_EWMA_LOOKBACK_WINDOWS,
+            ));
+        }
+
+        let mut outcomes = OutcomeSample::default();
+        if let Some(adaptive) = adaptive {
+            for (_, limiter) in &siblings {
+                outcomes.merge(limiter.ewma_outcomes(
+                    window_id,
+                    OUTCOME_EWMA_LOOKBACK_WINDOWS,
+                    adaptive.half_life_windows,
+                ));
+            }
+        }
+
+        Self {
+            burst,
+            limits: live.iter().map(|(key, _)| key.limit).collect(),
+            granted: live
+                .iter()
+                .map(|(_, limiter)| limiter.granted_in(window_id))
+                .sum(),
+            demand,
+            outcomes,
+        }
+    }
 }
 
 impl PersistedLimiter {
@@ -299,6 +452,30 @@ impl PersistedLimiter {
         self.windows
             .entry(window_id.to_string())
             .or_insert_with(|| PersistedWindow::new(burst_if_absent))
+    }
+
+    /// Tokens granted under this limiter in `window_id`, across replicas.
+    fn granted_in(&self, window_id: u64) -> u64 {
+        self.windows
+            .get(&window_id.to_string())
+            .map_or(0, PersistedWindow::total_granted)
+    }
+
+    /// Whether a replica is leasing under this limiter for `window_id`.
+    ///
+    /// Every refresh leases the current window and pre-leases the next, so a
+    /// running replica holds a lease in `window_id` or the window before it,
+    /// whichever window it last refreshed in. Two windows back also counts, so
+    /// a replica whose clock runs up to a window behind still counts. A replica
+    /// that stopped drops out three windows after its last refresh.
+    fn is_leasing(&self, window_id: u64) -> bool {
+        (0..=2)
+            .filter_map(|age| window_id.checked_sub(age))
+            .any(|id| {
+                self.windows
+                    .get(&id.to_string())
+                    .is_some_and(|window| !window.leases.is_empty())
+            })
     }
 
     /// Exponentially weighted (recent weighted highest) demand over the previous `lookback_windows`
@@ -403,8 +580,12 @@ impl PersistedWindow {
 
     /// `budget_remaining` is a cache of `burst - total_granted`; recompute it
     /// from the surviving leases rather than trust the stored value.
-    fn recompute_budget_remaining(&mut self, burst: u64) {
-        self.budget_remaining = burst.saturating_sub(self.total_granted());
+    /// `granted_by_siblings` is what the window's sibling limiters hold out of
+    /// the same budget.
+    fn recompute_budget_remaining(&mut self, burst: u64, granted_by_siblings: u64) {
+        self.budget_remaining = burst
+            .saturating_sub(self.total_granted())
+            .saturating_sub(granted_by_siblings);
     }
 
     /// Demand this window signals for `instance`, and for the cluster.
@@ -643,6 +824,13 @@ impl OutcomeSample {
         }
     }
 
+    /// Add a sample weighted over the same windows, such as a sibling
+    /// limiter's.
+    fn merge(&mut self, other: Self) {
+        self.requests += other.requests;
+        self.accepts += other.accepts;
+    }
+
     /// The fraction of the configured cluster budget to admit, in `[0, 1]`.
     ///
     /// `k` is `1 / (1 - failure_threshold)`. Both `+1`s sit inside the fraction,
@@ -831,10 +1019,11 @@ impl LeasedBucketMetrics {
     }
 
     /// The whole part of the cluster budget of the most recently leased window,
-    /// after the coefficient. Equal to the configured burst while the origin is
-    /// healthy. The fraction the whole part drops is carried by the replicas and
-    /// is reported by [`Self::adaptive_admission_ratio`], so a deeply throttled
-    /// cluster can read zero here and still send.
+    /// after the coefficient. Equal to the lowest burst the replicas leasing the
+    /// quota configure while the origin is healthy. The fraction the whole part
+    /// drops is carried by the replicas and is reported by
+    /// [`Self::adaptive_admission_ratio`], so a deeply throttled cluster can
+    /// read zero here and still send.
     #[must_use]
     pub fn cluster_effective_burst(&self) -> u64 {
         self.cluster_effective_burst.load(Ordering::Relaxed)
@@ -1106,6 +1295,9 @@ pub(crate) struct LeasedBucket {
     /// The fraction of the cluster budget this replica carries between windows.
     /// Local to this replica, and never written to the shared file.
     remainder_bank: SyncMutex<RemainderBank>,
+    /// The limits other replicas configure for this quota, as last logged.
+    /// Empty while every replica agrees. Touched once per refresh tick.
+    reported_sibling_limits: SyncMutex<BTreeSet<u64>>,
 }
 
 /// The cluster budget for one window after the adaptive coefficient, split into
@@ -1227,37 +1419,60 @@ impl RemainderBank {
     }
 }
 
-/// Holds this replica's derived budget for the life of each window it leases.
+/// What a window's budget is derived from, as this replica first read it.
+#[derive(Debug, Clone, Copy)]
+struct HeldBudget {
+    /// The burst the cluster was held to.
+    burst: u64,
+    /// The adaptive coefficient, or `None` without adaptive settings.
+    coefficient: Option<f64>,
+}
+
+impl HeldBudget {
+    /// The window's budget, given the burst the cluster is held to now.
+    ///
+    /// Never above the held burst, so a sibling that stops mid-window does not
+    /// raise a budget already leased against. A replica that configures a
+    /// lower limit can start leasing mid-window, though, and the budget then
+    /// falls to it at once — at the held coefficient, so an adaptive throttle
+    /// carries over to the lower burst.
+    fn at(self, burst: u64) -> ClusterBudget {
+        let burst = self.burst.min(burst);
+        self.coefficient.map_or_else(
+            || ClusterBudget::full(burst),
+            |coefficient| ClusterBudget::scaled(burst, coefficient),
+        )
+    }
+}
+
+/// Holds what this replica derived each window's budget from for the life of
+/// the window.
 ///
 /// Two slots: a tick leases the current window and pre-leases the next, so a
 /// third window is never live at once.
 #[derive(Debug, Default)]
 struct BudgetMemo {
-    slots: [Option<(u64, ClusterBudget)>; 2],
+    slots: [Option<(u64, HeldBudget)>; 2],
 }
 
 impl BudgetMemo {
-    /// The budget already fixed for `window_id`, else `derive()`'s value,
+    /// The budget already held for `window_id`, else `derive()`'s value,
     /// stored against it. Evicts the older window when both slots are taken.
-    fn get_or_derive(
-        &mut self,
-        window_id: u64,
-        derive: impl FnOnce() -> ClusterBudget,
-    ) -> ClusterBudget {
-        if let Some((_, budget)) = self.slots.iter().flatten().find(|(id, _)| *id == window_id) {
-            return *budget;
+    fn get_or_derive(&mut self, window_id: u64, derive: impl FnOnce() -> HeldBudget) -> HeldBudget {
+        if let Some((_, held)) = self.slots.iter().flatten().find(|(id, _)| *id == window_id) {
+            return *held;
         }
-        let budget = derive();
-        // A budget holds a float and so is not ordered; compare the slots on
-        // window id, which is what "older" meant all along.
-        let window_of = |slot: &Option<(u64, ClusterBudget)>| slot.map_or(0, |(id, _)| id);
+        let held = derive();
+        // A held budget holds a float and so is not ordered; compare the slots
+        // on window id, which is what "older" meant all along.
+        let window_of = |slot: &Option<(u64, HeldBudget)>| slot.map_or(0, |(id, _)| id);
         let victim = self
             .slots
             .iter()
             .position(Option::is_none)
             .unwrap_or_else(|| usize::from(window_of(&self.slots[1]) < window_of(&self.slots[0])));
-        self.slots[victim] = Some((window_id, budget));
-        budget
+        self.slots[victim] = Some((window_id, held));
+        held
     }
 }
 
@@ -1283,6 +1498,7 @@ impl LeasedBucket {
             throttle_log: SyncMutex::new(PhaseChangeLog::new(ThrottleState::Healthy, hold)),
             budget_memo: SyncMutex::new(BudgetMemo::default()),
             remainder_bank: SyncMutex::new(RemainderBank::default()),
+            reported_sibling_limits: SyncMutex::new(BTreeSet::new()),
             config,
         })
     }
@@ -1514,6 +1730,7 @@ impl LeasedBucket {
                 started.elapsed(),
             );
             self.report_throttle(current.throttle);
+            self.report_sibling_limits(&current.sibling_limits);
             if dirty {
                 // Only a write can have changed what waiters are owed.
                 self.notify.notify_waiters();
@@ -1537,51 +1754,68 @@ impl LeasedBucket {
         local_demand_hint: u64,
     ) -> WindowOutcome {
         let instance = self.config.instance_id.as_str();
-        let burst = self.config.burst_per_window;
+        let configured_burst = self.config.burst_per_window;
         let window_ms = duration_millis_u64(self.config.window_duration);
         let window_end_ms = (window_id + 1).saturating_mul(window_ms);
         let now_window = window_id_for(now, self.config.window_duration);
 
-        let limiter = state.limiter_entry(&self.config.limiter_key, burst);
+        // Replicas that configure a different limit for this quota lease under
+        // their own limiters. Read them before taking a mutable borrow on ours:
+        // together they are one budget, held to the lowest configured limit.
+        let siblings = SiblingReading::read(
+            state,
+            &self.config.limiter_key,
+            configured_burst,
+            instance,
+            window_id,
+            now_window,
+            self.config.adaptive,
+        );
+        let burst = siblings.burst;
+
+        let limiter = state.limiter_entry(&self.config.limiter_key, configured_burst);
 
         // This replica's reading of the shared counts: `Some` exactly when the
         // bucket has adaptive settings. Every replica reads the same published outcomes, so
         // they converge on the same coefficient without any of it being
         // written back — the counts are the shared state, the budget is not.
         let reading = self.config.adaptive.map(|adaptive| {
-            let outcomes = limiter.ewma_outcomes(
+            let mut outcomes = limiter.ewma_outcomes(
                 window_id,
                 OUTCOME_EWMA_LOOKBACK_WINDOWS,
                 adaptive.half_life_windows,
             );
+            outcomes.merge(siblings.outcomes);
             (adaptive, outcomes)
         });
 
         // Read the smoothed demand signal before taking a mutable borrow on
         // the window below.
         //
-        // `classified_demand` measures want against the *configured* burst, not
-        // the throttled one — a saturated replica wants at least a full budget
-        // whatever the cluster is currently allowed. The share it wins, and the
+        // `classified_demand` measures want against the configured burst the
+        // cluster is held to, not the throttled one — a saturated replica wants
+        // at least a full budget whatever the cluster is currently allowed. The share it wins, and the
         // clamps around it, are of the effective budget: that is the permission
         // actually being divided up.
-        let demand_sample =
+        let mut demand_sample =
             limiter.ewma_demand(instance, now_window, burst, DEMAND_EWMA_LOOKBACK_WINDOWS);
+        demand_sample.accumulate(siblings.demand);
 
         // The budget this window is leased against, derived once and then held
         // for the life of the window. A later tick must not move it: this
         // replica's grant is already in the file, and a budget recomputed from
         // fresher counts would republish a `budget_remaining` that contradicts
         // the leases already written. Same reason the grant itself is
-        // first-write-wins.
-        let budget = self.budget_memo.lock().get_or_derive(window_id, || {
-            reading.map_or_else(
-                || ClusterBudget::full(burst),
-                |(adaptive, outcomes)| {
-                    ClusterBudget::scaled(burst, outcomes.coefficient(adaptive.k))
-                },
-            )
-        });
+        // first-write-wins. The one exception is a lower limit appearing
+        // mid-window, which lowers the budget at once; see [`HeldBudget::at`].
+        let budget = self
+            .budget_memo
+            .lock()
+            .get_or_derive(window_id, || HeldBudget {
+                burst,
+                coefficient: reading.map(|(adaptive, outcomes)| outcomes.coefficient(adaptive.k)),
+            })
+            .at(burst);
 
         // Bank this replica's share of the fraction the whole part dropped, and
         // ask what the bank can fund on top of the demand-weighted slice. The
@@ -1602,14 +1836,16 @@ impl LeasedBucket {
         // Only the current window can hold expired leases; a future window's
         // lease cannot have expired yet.
         window.drop_expired(now);
-        window.recompute_budget_remaining(budget.whole);
+        window.recompute_budget_remaining(budget.whole, siblings.granted);
 
         let my_existing = window.granted_for(instance);
         let max_possible_for_me = replica_ceiling(
             budget.whole,
             carried,
             burst,
-            window.granted_by_others(instance),
+            window
+                .granted_by_others(instance)
+                .saturating_add(siblings.granted),
         );
 
         // Pick the new grant.
@@ -1649,7 +1885,7 @@ impl LeasedBucket {
             },
         );
 
-        window.recompute_budget_remaining(budget.whole);
+        window.recompute_budget_remaining(budget.whole, siblings.granted);
 
         // Decided on the ratio, not on the whole part: with the fraction
         // carried, a budget whose whole part equals the configured burst can
@@ -1664,6 +1900,7 @@ impl LeasedBucket {
                 near_boundary: outcomes
                     .is_near_boundary(adaptive.k, ratio < FULL_ADMISSION_COEFFICIENT),
             }),
+            sibling_limits: siblings.limits,
             dirty: published,
         }
     }
@@ -1693,6 +1930,41 @@ impl LeasedBucket {
                     .map_or(0.0, |adaptive| adaptive.failure_threshold),
             );
         }
+    }
+
+    /// Log a change in the limits other replicas configure for this quota.
+    fn report_sibling_limits(&self, sibling_limits: &BTreeSet<u64>) {
+        match self.sibling_limits_change(sibling_limits) {
+            Some(SiblingLimitsChange::Differ(warning)) => tracing::warn!("{warning}"),
+            Some(SiblingLimitsChange::Agree(notice)) => tracing::info!("{notice}"),
+            None => {}
+        }
+    }
+
+    /// What to log about the limits other replicas configure for this quota,
+    /// or `None` when they have not changed since the last report.
+    ///
+    /// Warns when they start to differ from this replica's, or change while
+    /// they do, naming every value, and notes once they agree again. Reported
+    /// on a change only, not on every tick.
+    fn sibling_limits_change(&self, sibling_limits: &BTreeSet<u64>) -> Option<SiblingLimitsChange> {
+        {
+            let mut reported = self.reported_sibling_limits.lock();
+            if *reported == *sibling_limits {
+                return None;
+            }
+            reported.clone_from(sibling_limits);
+        }
+        let key = LimiterKey::parse(&self.config.limiter_key)?;
+        Some(if sibling_limits.is_empty() {
+            SiblingLimitsChange::Agree(limits_agree_notice(&self.config.origin, key))
+        } else {
+            SiblingLimitsChange::Differ(limits_differ_warning(
+                &self.config.origin,
+                key,
+                sibling_limits,
+            ))
+        })
     }
 
     fn note_failure(&self) {
@@ -1759,6 +2031,9 @@ struct WindowOutcome {
     /// The adaptive state of the window that was just leased, or `None`
     /// without adaptive settings.
     throttle: Option<ClusterThrottle>,
+    /// The limits replicas leasing under sibling limiters configure for the
+    /// window. Empty while every replica configures this one's.
+    sibling_limits: BTreeSet<u64>,
     /// Whether the persisted state was modified and must therefore be written
     /// back. Two reasons we'd skip a write: (a) we already had a lease at the
     /// desired size in this window from a previous tick, or (b) demand is
@@ -1797,6 +2072,48 @@ impl ClusterThrottle {
         } else {
             Damping::Immediate
         }
+    }
+}
+
+/// A change in the limits other replicas configure for a quota, with the line
+/// that reports it.
+#[derive(Debug, PartialEq, Eq)]
+enum SiblingLimitsChange {
+    /// They differ from this replica's limit: a warning.
+    Differ(String),
+    /// They agree with it again: a note.
+    Agree(String),
+}
+
+/// The warning a replica logs while other replicas sharing the state location
+/// configure a different limit for one of its quotas.
+fn limits_differ_warning(origin: &str, key: LimiterKey<'_>, others: &BTreeSet<u64>) -> String {
+    let setting = key.setting();
+    let own = key.limit;
+    let lowest = others.iter().copied().fold(own, u64::min);
+    let others = list_values(others);
+    format!(
+        "Instances sharing cluster rate control for origin '{origin}' set `{setting}` to different values (this instance: {own}; other instances: {others}), so the cluster is held to the lowest value, {lowest}, until every instance sets the same one. Set the same `{setting}` on every instance that shares `runtime.state.location`. See: https://spiceai.org/docs/reference/spicepod/runtime#runtimesource_rate_control"
+    )
+}
+
+/// The note a replica logs once every replica it shares a quota with agrees on
+/// the limit again, closing the warning [`limits_differ_warning`] opened.
+fn limits_agree_notice(origin: &str, key: LimiterKey<'_>) -> String {
+    let setting = key.setting();
+    let limit = key.limit;
+    format!(
+        "Instances sharing cluster rate control for origin '{origin}' now all set `{setting}` to {limit}, so the cluster is held to {limit}."
+    )
+}
+
+/// `10`, `10 and 15`, `5, 10 and 15`.
+fn list_values(values: &BTreeSet<u64>) -> String {
+    let values: Vec<String> = values.iter().map(u64::to_string).collect();
+    match values.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+        Some((last, _)) => last.clone(),
+        None => String::new(),
     }
 }
 
@@ -1904,6 +2221,7 @@ mod tests {
     use insta::assert_snapshot;
     use object_store::memory::InMemory;
     use serde_json::Value;
+    use std::num::NonZeroU32;
 
     /// A populated state covering every persisted field: a limiter with one
     /// window and two leases, one reporting counts and one idle.
@@ -3426,6 +3744,416 @@ mod tests {
         let granted_a = a.metrics.lease_granted();
         let granted_b = b.metrics.lease_granted();
         assert!(granted_a + granted_b <= 10, "{granted_a}+{granted_b} > 10");
+    }
+
+    /// The key a quota is persisted under parses back to the quota's name and
+    /// the configured limit: the name is what ties replicas that configure
+    /// different limits back to one budget.
+    #[test]
+    fn limiter_keys_parse_back_to_the_quota_and_the_configured_limit() {
+        for (name, quota, limit) in [
+            (
+                "requests_per_second",
+                governor::Quota::per_second(NonZeroU32::new(10).expect("non-zero")),
+                10,
+            ),
+            (
+                "requests_per_minute",
+                governor::Quota::per_minute(NonZeroU32::new(600).expect("non-zero")),
+                600,
+            ),
+        ] {
+            let key = crate::QuotaDefinition::new(Some(name.to_string()), quota)
+                .persistence_key("unused");
+            assert_eq!(
+                LimiterKey::parse(&key),
+                Some(LimiterKey { name, limit }),
+                "{key}"
+            );
+        }
+        assert_eq!(LimiterKey::parse("requests_per_second"), None);
+        assert_eq!(
+            LimiterKey::parse("requests_per_second:burst=ten:replenish_ns=1"),
+            None
+        );
+    }
+
+    /// Only limiters of the same quota are siblings: a per-minute limiter in
+    /// the same file is a separate budget and must never cap the per-second one.
+    #[test]
+    fn siblings_are_the_other_limits_of_the_same_quota_only() {
+        let mut state = PersistedRateControlState::fresh(Duration::from_secs(1));
+        for (key, burst) in [
+            ("requests_per_second:burst=20:replenish_ns=50000000", 20),
+            ("requests_per_second:burst=10:replenish_ns=100000000", 10),
+            ("requests_per_minute:burst=60:replenish_ns=1000000000", 1),
+        ] {
+            state.limiter_entry(key, burst);
+        }
+
+        let siblings: Vec<_> = state
+            .siblings("requests_per_second:burst=20:replenish_ns=50000000")
+            .map(|(key, limiter)| (key, limiter.burst_per_window))
+            .collect();
+        assert_eq!(
+            siblings,
+            vec![(
+                LimiterKey {
+                    name: "requests_per_second",
+                    limit: 10
+                },
+                10
+            )]
+        );
+    }
+
+    /// The warning names the origin, the setting, this replica's value and every
+    /// other one, and the value the cluster is held to; the notice that closes
+    /// it names the value the replicas agree on.
+    #[test]
+    fn limit_log_lines_name_the_origin_the_setting_and_every_value() {
+        let origin = "http://127.0.0.1:37081";
+        let key = LimiterKey {
+            name: "requests_per_second",
+            limit: 20,
+        };
+        assert_eq!(
+            limits_differ_warning(origin, key, &BTreeSet::from([10])),
+            "Instances sharing cluster rate control for origin 'http://127.0.0.1:37081' set `requests_per_second_limit` to different values (this instance: 20; other instances: 10), so the cluster is held to the lowest value, 10, until every instance sets the same one. Set the same `requests_per_second_limit` on every instance that shares `runtime.state.location`. See: https://spiceai.org/docs/reference/spicepod/runtime#runtimesource_rate_control"
+        );
+        assert_eq!(
+            limits_differ_warning(origin, key, &BTreeSet::from([30, 25, 40])),
+            "Instances sharing cluster rate control for origin 'http://127.0.0.1:37081' set `requests_per_second_limit` to different values (this instance: 20; other instances: 25, 30 and 40), so the cluster is held to the lowest value, 20, until every instance sets the same one. Set the same `requests_per_second_limit` on every instance that shares `runtime.state.location`. See: https://spiceai.org/docs/reference/spicepod/runtime#runtimesource_rate_control"
+        );
+        assert_eq!(
+            limits_agree_notice(origin, key),
+            "Instances sharing cluster rate control for origin 'http://127.0.0.1:37081' now all set `requests_per_second_limit` to 20, so the cluster is held to 20."
+        );
+    }
+
+    /// A change in the other replicas' limits is reported once: a warning
+    /// naming them when they start to differ or change, a note when they agree
+    /// again, and nothing on the ticks in between.
+    #[tokio::test]
+    async fn limit_changes_are_reported_once() {
+        let bucket = per_second_bucket(&Arc::new(InMemory::new()), "a", 20, Duration::from_secs(1));
+        let key = LimiterKey {
+            name: "requests_per_second",
+            limit: 20,
+        };
+        let differ = |others: &[u64]| {
+            Some(SiblingLimitsChange::Differ(limits_differ_warning(
+                "https://example.com",
+                key,
+                &others.iter().copied().collect(),
+            )))
+        };
+        let agree = Some(SiblingLimitsChange::Agree(limits_agree_notice(
+            "https://example.com",
+            key,
+        )));
+
+        let reports: Vec<_> = [&[][..], &[10], &[10], &[10, 15], &[10, 15], &[], &[]]
+            .into_iter()
+            .map(|others| bucket.sibling_limits_change(&others.iter().copied().collect()))
+            .collect();
+        assert_eq!(
+            reports,
+            vec![
+                None,
+                differ(&[10]),
+                None,
+                differ(&[10, 15]),
+                None,
+                agree,
+                None
+            ]
+        );
+    }
+
+    /// The config of a bucket for the per-second quota at `limit`, keyed the
+    /// way the controller keys it, leasing `limit` tokens per window from
+    /// `store`.
+    fn per_second_config(
+        store: &Arc<InMemory>,
+        instance: &str,
+        limit: u32,
+        window: Duration,
+    ) -> LeasedBucketConfig {
+        let quota = crate::QuotaDefinition::new(
+            Some("requests_per_second".to_string()),
+            governor::Quota::per_second(NonZeroU32::new(limit).expect("non-zero limit")),
+        );
+        let mut config = config_for(u64::from(limit), instance, window);
+        config.store = Arc::clone(store) as Arc<dyn ObjectStore>;
+        config.limiter_key = quota.persistence_key("unused");
+        config
+    }
+
+    fn per_second_bucket(
+        store: &Arc<InMemory>,
+        instance: &str,
+        limit: u32,
+        window: Duration,
+    ) -> Arc<LeasedBucket> {
+        LeasedBucket::new(per_second_config(store, instance, limit, window))
+    }
+
+    /// Tokens every limiter in the shared file holds for `window_id`.
+    async fn cluster_granted(bucket: &LeasedBucket, window_id: u64) -> u64 {
+        bucket
+            .read_state()
+            .await
+            .expect("read the shared state")
+            .expect("the shared state exists")
+            .limiters
+            .values()
+            .map(|limiter| limiter.granted_in(window_id))
+            .sum()
+    }
+
+    /// Lease as a replica with requests waiting on it.
+    async fn refresh_with_demand(bucket: &Arc<LeasedBucket>) {
+        bucket.inner.lock().await.attempted_this_window = 50;
+        bucket.refresh_lease().await.expect("lease refresh");
+    }
+
+    /// Tokens `instance` holds in `window_id`, under whichever limiter.
+    async fn granted_to(bucket: &LeasedBucket, window_id: u64, instance: &str) -> u64 {
+        bucket
+            .read_state()
+            .await
+            .expect("read the shared state")
+            .expect("the shared state exists")
+            .limiters
+            .values()
+            .filter_map(|limiter| limiter.windows.get(&window_id.to_string()))
+            .map(|window| window.granted_for(instance))
+            .sum()
+    }
+
+    /// A rolling deployment that lowers a limit: replicas configured at 20 and
+    /// at 10 for one quota lease under different keys of one file, and are held
+    /// together to the lower limit rather than each to its own, sharing it by
+    /// demand. Once the replica at 10 stops, the one at 20 leases against its
+    /// own limit again.
+    ///
+    /// The two refresh in alternating order: when the replica at 20 pre-leases
+    /// first, the one at 10 holds a lease only in the window before, and must
+    /// still count.
+    ///
+    /// Regression test for #14913: each configuration leased only against its
+    /// own key, so the cluster sent the sum of both limits.
+    #[tokio::test]
+    async fn replicas_configuring_different_limits_are_held_to_the_lowest() {
+        let window = Duration::from_millis(200);
+        let store = Arc::new(InMemory::new());
+        let high = per_second_bucket(&store, "high", 20, window);
+        let low = per_second_bucket(&store, "low", 10, window);
+
+        // The replica at 20 runs alone and holds most of its own limit.
+        let start = window_id_for(SystemTime::now(), window) + 1;
+        for target in start..start + 2 {
+            wait_for_window(target, window).await;
+            refresh_with_demand(&high).await;
+        }
+        assert_eq!(
+            cluster_granted(&high, start + 1).await,
+            max_lease_per_replica(20)
+        );
+
+        // The replica at 10 joins. Grants already issued stand, so the window
+        // it joins in keeps the earlier grant; from the next window on the two
+        // together hold at most 10. Each replica's demand-weighted share rounds
+        // down, so one token can go unclaimed.
+        let joined = start + 2;
+        for target in joined..joined + 6 {
+            wait_for_window(target, window).await;
+            let order = if (target - joined).is_multiple_of(2) {
+                [&low, &high]
+            } else {
+                [&high, &low]
+            };
+            for bucket in order {
+                refresh_with_demand(bucket).await;
+            }
+            for window_id in [target, target + 1] {
+                if window_id == joined {
+                    continue;
+                }
+                let granted = cluster_granted(&high, window_id).await;
+                assert!(
+                    (9..=10).contains(&granted),
+                    "window {window_id}: replicas configured at 20 and 10 hold {granted} tokens, expected 9 or 10"
+                );
+            }
+        }
+
+        // Each replica has reported the other's limit.
+        assert_eq!(*high.reported_sibling_limits.lock(), BTreeSet::from([10]));
+        assert_eq!(*low.reported_sibling_limits.lock(), BTreeSet::from([20]));
+
+        // Both have asked for the same since the replica at 10 joined, so
+        // neither is left with the scraps of the other's grant.
+        let low_stopped = joined + 5;
+        for instance in ["high", "low"] {
+            let granted = granted_to(&high, low_stopped + 1, instance).await;
+            assert!(
+                granted >= 3,
+                "{instance} holds {granted} of the 10 tokens of window {}",
+                low_stopped + 1
+            );
+        }
+
+        // The replica at 10 stops. Three windows after its last refresh it no
+        // longer holds the cluster to its limit.
+        for target in low_stopped + 1..=low_stopped + 4 {
+            wait_for_window(target, window).await;
+            refresh_with_demand(&high).await;
+        }
+        assert_eq!(high.metrics.lease_granted(), max_lease_per_replica(20));
+
+        // The replica left reports that every replica it shares the quota with
+        // agrees with it again; see `limit_changes_are_reported_once`.
+        assert_eq!(*high.reported_sibling_limits.lock(), BTreeSet::new());
+    }
+
+    /// Replicas that start together, with requests waiting and no history,
+    /// each claim the whole budget they see. The second to lease counts what
+    /// the first, under the other limit, already holds.
+    #[tokio::test]
+    async fn replicas_starting_together_count_each_others_grants() {
+        let window = Duration::from_millis(200);
+        let store = Arc::new(InMemory::new());
+        let high = per_second_bucket(&store, "high", 20, window);
+        let low = per_second_bucket(&store, "low", 10, window);
+
+        let start = window_id_for(SystemTime::now(), window) + 1;
+        wait_for_window(start, window).await;
+        refresh_with_demand(&low).await;
+        refresh_with_demand(&high).await;
+
+        for window_id in [start, start + 1] {
+            assert_eq!(
+                (
+                    granted_to(&high, window_id, "low").await,
+                    granted_to(&high, window_id, "high").await
+                ),
+                (max_lease_per_replica(10), 10 - max_lease_per_replica(10)),
+                "window {window_id}"
+            );
+        }
+    }
+
+    /// Upstream failures recorded under one limit throttle the replicas under
+    /// the other as well. They were observed against the same origin, and a
+    /// replica that ignored them would keep leasing the budget the failing one
+    /// gave up.
+    #[tokio::test]
+    async fn outcomes_recorded_under_one_limit_throttle_the_other() {
+        let window = Duration::from_millis(150);
+        let store = Arc::new(InMemory::new());
+        let adaptive_bucket = |instance, limit| {
+            let mut config = per_second_config(&store, instance, limit, window);
+            config.adaptive = Some(adaptive_config(1.0));
+            LeasedBucket::new(config)
+        };
+        let high = adaptive_bucket("high", 20);
+        let low = adaptive_bucket("low", 10);
+
+        // Three windows in which only the replica at 10 reaches the origin, and
+        // sees 2 successes to 8 failures: well past the 50% threshold.
+        for _ in 0..3 {
+            for bucket in [&low, &high] {
+                bucket.refresh_lease().await.expect("lease");
+            }
+            for _ in 0..2 {
+                low.record_outcome(RequestOutcome::Success);
+            }
+            for _ in 0..8 {
+                low.record_outcome(RequestOutcome::Failure);
+            }
+            tokio::time::sleep(window + Duration::from_millis(20)).await;
+        }
+        // Write back the tail counts of the last window, then have both
+        // replicas lease against the same settled state.
+        for bucket in [&low, &high] {
+            bucket.refresh_lease().await.expect("lease");
+        }
+        tokio::time::sleep(window + Duration::from_millis(20)).await;
+        for _ in 0..2 {
+            for bucket in [&low, &high] {
+                bucket.refresh_lease().await.expect("lease");
+            }
+        }
+
+        assert!(
+            high.is_throttling() && low.is_throttling(),
+            "both replicas must throttle: high {:?}, low {:?}",
+            high.admission_coefficient(),
+            low.admission_coefficient()
+        );
+        let (burst_high, burst_low) = (
+            high.metrics.cluster_effective_burst(),
+            low.metrics.cluster_effective_burst(),
+        );
+        assert!(
+            burst_high.abs_diff(burst_low) <= 1 && burst_high < 10,
+            "both replicas lease the throttled lower limit, got high {burst_high} and low {burst_low}"
+        );
+    }
+
+    /// A held budget falls to a lower burst at the coefficient it was derived
+    /// at, and never rises above the burst it was derived at.
+    #[test]
+    fn a_held_budget_follows_a_lower_burst_at_its_coefficient() {
+        let throttled = HeldBudget {
+            burst: 20,
+            coefficient: Some(0.45),
+        };
+        let lowered = throttled.at(10);
+        assert_eq!(lowered.whole, 4);
+        assert!((lowered.remainder - 0.5).abs() < 1e-9, "{lowered:?}");
+        let raised = throttled.at(30);
+        assert_eq!(raised.whole, 9);
+        assert!(raised.remainder.abs() < 1e-9, "{raised:?}");
+
+        let unthrottled = HeldBudget {
+            burst: 20,
+            coefficient: None,
+        };
+        assert_eq!(unthrottled.at(10).whole, 10);
+        assert_eq!(unthrottled.at(30).whole, 20);
+    }
+
+    /// A sibling counts while some replica holds a lease under it in the window
+    /// or one of the two before it, and not once its last lease is older.
+    #[test]
+    fn a_sibling_is_leasing_for_three_windows_from_its_last_lease() {
+        let lease = PersistedLease {
+            granted: 0,
+            consumed: 0,
+            attempted: 0,
+            ok: None,
+            failed: None,
+            expires_at_unix_ms: 0,
+            updated_at_unix_ms: 0,
+        };
+        let mut limiter = PersistedLimiter::new(10);
+        limiter.window_entry(100, 10);
+        assert!(
+            !limiter.is_leasing(100),
+            "a window without a lease is not evidence of a replica"
+        );
+        limiter
+            .window_entry(100, 10)
+            .leases
+            .insert("a".to_string(), lease);
+
+        let leasing: Vec<u64> = (98..=104)
+            .filter(|window_id| limiter.is_leasing(*window_id))
+            .collect();
+        assert_eq!(leasing, vec![100, 101, 102]);
     }
 
     #[tokio::test]
