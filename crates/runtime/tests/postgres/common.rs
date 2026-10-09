@@ -24,10 +24,11 @@ use secrecy::SecretString;
 use tokio_postgres::NoTls;
 use tracing::instrument;
 
+use test_framework::source_versions::{Source, source_image};
+
 use crate::docker::{ContainerRunnerBuilder, RunningContainer, wait_for_tcp_port};
 
 pub const PG_PASSWORD: &str = "runtime-integration-test-pw";
-const PG_IMAGE: &str = "docker.io/library/postgres:latest";
 const PG_DOCKER_CONTAINER: &str = "runtime-integration-test-postgres";
 const PG_CONTAINER_START_TIMEOUT: Duration = Duration::from_mins(3);
 const PG_HOST_PORT_READY_TIMEOUT: Duration = Duration::from_mins(1);
@@ -75,7 +76,7 @@ pub async fn connect(port: u16) -> Result<tokio_postgres::Client, anyhow::Error>
 #[instrument]
 pub async fn start_postgres_docker_container() -> Result<RunningContainer, anyhow::Error> {
     let running_container = ContainerRunnerBuilder::new(PG_DOCKER_CONTAINER)
-        .image(PG_IMAGE.to_string())
+        .image(source_image(Source::Postgres)?)
         .publish_port(5432)
         .add_env_var("POSTGRES_PASSWORD", PG_PASSWORD)
         .healthcheck(HealthConfig {
@@ -109,7 +110,7 @@ pub async fn start_postgres_docker_container() -> Result<RunningContainer, anyho
 pub async fn start_postgres_docker_container_with_logical_wal()
 -> Result<RunningContainer, anyhow::Error> {
     let running_container = ContainerRunnerBuilder::new(&format!("{PG_DOCKER_CONTAINER}-repl"))
-        .image(PG_IMAGE.to_string())
+        .image(source_image(Source::Postgres)?)
         .publish_port(5432)
         .add_env_var("POSTGRES_PASSWORD", PG_PASSWORD)
         .command([

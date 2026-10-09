@@ -17,7 +17,10 @@ limitations under the License.
 use clap::{ArgAction, Parser, ValueEnum};
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use std::path::PathBuf;
-use test_framework::TestType;
+use test_framework::{
+    TestType, anyhow,
+    source_versions::{Source, source_versions},
+};
 
 use super::dataset::{QueryOverridesArg, QuerySetArg};
 use super::search::SearchDatasetArg;
@@ -71,7 +74,8 @@ pub struct DispatchArgs {
 pub enum Schedule {
     #[default]
     Daily,
-    /// For tests whose source is a hosted service.
+    /// For tests whose source is a hosted service, and for the runs of a
+    /// benchmark on every supported release line of its source database.
     Weekly,
 }
 
@@ -186,6 +190,12 @@ pub struct BenchArgs {
     pub scale_factor: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub scrape_spiced_metrics: Option<bool>,
+    /// The `PostgreSQL` release line the bench workflow starts as its local
+    /// `postgres_tpch` source: one of the `postgres` versions in
+    /// `test/source_versions.json`, or `all` for one run on each of them. Unset
+    /// runs the workflow's default line.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub postgres_version: Option<String>,
 }
 
 /// Custom deserializer that accepts either a single item or a vector of items
@@ -226,11 +236,49 @@ where
     }
 }
 
+/// The `postgres_version` that expands to every listed `PostgreSQL` line.
+pub const ALL_SOURCE_VERSIONS: &str = "all";
+
 impl BenchArgs {
     #[must_use]
     pub fn with_update_snapshots(mut self, update_snapshots: UpdateSnapshots) -> Self {
         self.update_snapshots = Some(update_snapshots);
         self
+    }
+
+    /// The runs this entry dispatches: one per listed `PostgreSQL` line for
+    /// `postgres_version: all`, otherwise just this one.
+    ///
+    /// # Errors
+    ///
+    /// When `postgres_version` names a version `test/source_versions.json` does
+    /// not list, so a typo or a retired line fails the dispatch instead of
+    /// starting an unsupported server.
+    pub fn expand_source_versions(&self) -> anyhow::Result<Vec<Self>> {
+        let Some(requested) = self.postgres_version.as_deref() else {
+            return Ok(vec![self.clone()]);
+        };
+        let listed = source_versions(Source::Postgres)?;
+        let versions: Vec<&str> = listed
+            .versions
+            .iter()
+            .map(|listed| listed.version.as_str())
+            .collect();
+        if requested == ALL_SOURCE_VERSIONS {
+            return Ok(versions
+                .into_iter()
+                .map(|version| Self {
+                    postgres_version: Some(version.to_string()),
+                    ..self.clone()
+                })
+                .collect());
+        }
+        anyhow::ensure!(
+            versions.contains(&requested),
+            "postgres_version {requested} is not a supported PostgreSQL version; test/source_versions.json lists {}, or use `{ALL_SOURCE_VERSIONS}`",
+            versions.join(", ")
+        );
+        Ok(vec![self.clone()])
     }
 }
 
@@ -542,6 +590,68 @@ pub struct WorkflowArgs<T: Serialize> {
 mod tests {
     use super::*;
     use test_framework::queries::QuerySet;
+
+    /// `postgres_version: all` is what keeps the weekly source-version runs in
+    /// step with `test/source_versions.json`, and a refused version is what keeps
+    /// a typo or a retired line from starting an unsupported server.
+    #[test]
+    fn bench_postgres_version_expands_to_the_listed_lines() {
+        let yaml = "
+tests:
+  bench:
+    - spicepod_path: federated/postgres[catalog].yaml
+      query_set: tpch
+      runner_type: spiceai-dev-runners
+      postgres_version: all
+    - spicepod_path: federated/postgres[catalog].yaml
+      query_set: tpch
+      runner_type: spiceai-dev-runners
+      postgres_version: '13'
+    - spicepod_path: federated/postgres[catalog].yaml
+      query_set: tpch
+      runner_type: spiceai-dev-runners
+";
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
+        let listed: Vec<String> = source_versions(Source::Postgres)
+            .expect("the version list parses")
+            .versions
+            .iter()
+            .map(|listed| listed.version.clone())
+            .collect();
+
+        let runs = test_file.tests.bench[0]
+            .expand_source_versions()
+            .expect("`all` expands");
+        assert_eq!(
+            runs.iter()
+                .map(|run| run.postgres_version.clone().expect("each run names its line"))
+                .collect::<Vec<_>>(),
+            listed
+        );
+        let inputs = serde_json::to_value(&runs[0]).expect("Failed to serialize");
+        assert_eq!(inputs["postgres_version"], listed[0]);
+
+        assert_eq!(
+            test_file.tests.bench[1]
+                .expand_source_versions()
+                .expect_err("13 is not a supported line")
+                .to_string(),
+            format!(
+                "postgres_version 13 is not a supported PostgreSQL version; test/source_versions.json lists {}, or use `all`",
+                listed.join(", ")
+            )
+        );
+
+        let unset = test_file.tests.bench[2]
+            .expand_source_versions()
+            .expect("an unset version is one run");
+        assert_eq!(unset.len(), 1);
+        let inputs = serde_json::to_value(&unset[0]).expect("Failed to serialize");
+        assert!(
+            inputs.get("postgres_version").is_none(),
+            "an unset version must not become a workflow input: {inputs}"
+        );
+    }
 
     #[test]
     fn test_single_section_deserialization() {

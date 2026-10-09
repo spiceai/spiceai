@@ -72,6 +72,11 @@ on:
         required: false
         default: ''
         type: string
+      source_version:
+        description: 'Source database release line, one of its versions in test/source_versions.json; empty = PostgreSQL 16 or MySQL 8.4. Only for runners that start the source in Docker: the in-cluster sources on spiceai-dev-xlarge-runners have fixed versions.'
+        required: false
+        default: ''
+        type: string
 
 # Serialize ALL SF100 + SF1000 CH-benCHmark runs across every variant (sqlite/turso cdc-tuned,
 # adaptive, duckdb): they share ONE concurrency group keyed only by scale factor, so
@@ -121,6 +126,16 @@ jobs:
           esac
           echo "SOURCE_TYPE=${SOURCE_TYPE}" >> $GITHUB_OUTPUT
           echo "Derived source_type=${SOURCE_TYPE} from spicepod $(basename "${SPICEPOD_PATH}")"
+
+      # Refuse a version the run could not honour rather than report results for a
+      # different server than the one asked for.
+      - name: Check the source version can be honoured
+        if: github.event.inputs.source_version != '' && github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners'
+        env:
+          SOURCE_VERSION: ${{ github.event.inputs.source_version }}
+        run: |
+          echo "::error::source_version=${SOURCE_VERSION} needs a runner that starts the source in Docker; the in-cluster sources on spiceai-dev-xlarge-runners have fixed versions. Pick another runner_type, or leave source_version empty."
+          exit 1
 
       - name: Validate spicepod file exists
         run: |
@@ -220,6 +235,8 @@ jobs:
       - name: Setup CH-benCH PostgreSQL
         if: steps.set_spicepod_path.outputs.SOURCE_TYPE != 'mysql' && github.event.inputs.runner_type != 'spiceai-dev-xlarge-runners'
         uses: ./.github/actions/setup-chbench-postgres
+        with:
+          version: ${{ github.event.inputs.source_version || '16' }}
 
       # MySQL source: on spiceai-dev-xlarge-runners a dedicated in-cluster MySQL
       # pod is used (chbench-mysql.dataplatform.svc.cluster.local, like Postgres),
@@ -227,6 +244,8 @@ jobs:
       - name: Setup CH-benCH MySQL
         if: steps.set_spicepod_path.outputs.SOURCE_TYPE == 'mysql' && github.event.inputs.runner_type != 'spiceai-dev-xlarge-runners'
         uses: ./.github/actions/setup-chbench-mysql
+        with:
+          version: ${{ github.event.inputs.source_version || '8.4' }}
 
       # The xlarge PG pod is long-lived, so cache a pristine seed as a Postgres
       # template database and restore chbench from it (FILE_COPY, seconds) instead

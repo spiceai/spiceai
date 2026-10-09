@@ -1,0 +1,12 @@
+# postgres[catalog].yaml on every supported PostgreSQL line in
+# test/source_versions.json, validated against the TPC-H answer files.
+# postgres[catalog].yaml itself runs daily on the bench workflow's default line.
+schedule: weekly
+tests:
+  bench:
+    spicepod_path: federated/postgres[catalog].yaml
+    query_set: tpch
+    query_overrides: postgres-catalog
+    runner_type: spiceai-dev-runners
+    validate_results: true
+    postgres_version: all

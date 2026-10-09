@@ -31,6 +31,7 @@ pub mod pki;
 pub mod process;
 pub mod queries;
 pub mod snapshot;
+pub mod source_versions;
 pub mod spiced;
 pub mod spicepod_utils;
 pub mod spicetest;

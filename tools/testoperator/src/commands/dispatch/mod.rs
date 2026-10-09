@@ -78,15 +78,18 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
         match test_type {
             TestType::Benchmark => {
                 for bench in &test_file.tests.bench {
-                    tests_to_dispatch.push((
-                        path,
-                        serde_json::json!(WorkflowArgs {
-                            specific_args: bench
-                                .clone()
-                                .with_update_snapshots(update_snapshots.into()),
-                            spiced_commit: spiced_commit.clone(),
-                        }),
-                    ));
+                    let runs = bench
+                        .expand_source_versions()
+                        .map_err(|e| anyhow::anyhow!("Failed to read {}: {e}", path.display()))?;
+                    for run in runs {
+                        tests_to_dispatch.push((
+                            path,
+                            serde_json::json!(WorkflowArgs {
+                                specific_args: run.with_update_snapshots(update_snapshots.into()),
+                                spiced_commit: spiced_commit.clone(),
+                            }),
+                        ));
+                    }
                 }
             }
             TestType::Load => {

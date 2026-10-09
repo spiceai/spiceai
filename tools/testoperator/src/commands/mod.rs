@@ -1016,6 +1016,21 @@ mod tests {
         );
     }
 
+    /// Whether `testoperator_run_bench.yml` starts its local `postgres_tpch`
+    /// service for this run — the condition on that service's image, which is
+    /// the only source `postgres_version` changes.
+    fn reads_the_local_postgres_source(
+        query_set: &str,
+        scale_factor: &str,
+        spicepod: &str,
+    ) -> bool {
+        spicepod.contains("postgres")
+            && !spicepod.contains("ducklake")
+            && (((query_set.starts_with("tpch") || query_set == "tpcds")
+                && (scale_factor == "1" || scale_factor == "10"))
+                || (query_set == "clickbench" && spicepod.contains("s3[parquet]-postgres")))
+    }
+
     /// Every scale factor 1 TPC-H, TPC-DS and `ClickBench` benchmark dispatch
     /// validates its results against an oracle it can actually resolve, except
     /// those in `BENCH_DISPATCHES_THAT_SKIP_RESULT_VALIDATION`. Benchmarks at
@@ -1061,7 +1076,25 @@ mod tests {
                     }
                     continue;
                 }
-                for bench in &dispatch.tests.bench {
+                for throughput in &dispatch.tests.throughput {
+                    assert_eq!(
+                        throughput.postgres_version,
+                        None,
+                        "{} sets `postgres_version` on a throughput test; only the bench workflow takes it",
+                        dispatch_path.display()
+                    );
+                }
+                let runs = dispatch
+                    .tests
+                    .bench
+                    .iter()
+                    .flat_map(|bench| {
+                        bench
+                            .expand_source_versions()
+                            .unwrap_or_else(|e| panic!("{}: {e}", dispatch_path.display()))
+                    })
+                    .collect::<Vec<_>>();
+                for bench in &runs {
                     let dispatch_name = dispatch_path.display();
 
                     // The workflow inputs, exactly as `testoperator dispatch` sends them.
@@ -1085,6 +1118,16 @@ mod tests {
                         Some(true),
                         "{dispatch_name} must set `validate_results: true` on its scale factor 1 bench test"
                     );
+                    if bench.postgres_version.is_some() {
+                        assert!(
+                            reads_the_local_postgres_source(
+                                query_set,
+                                scale_factor,
+                                &bench.spicepod_path.to_string_lossy()
+                            ),
+                            "{dispatch_name} sets `postgres_version`, but testoperator_run_bench.yml starts its local postgres_tpch service only for a `postgres` spicepod (not DuckLake) on TPC-H or TPC-DS at scale factor 1 or 10, or for ClickBench's s3[parquet]-postgres, so the version would not apply"
+                        );
+                    }
                     let spicepod_path = repo_root
                         .join("test/spicepods")
                         .join(query_set.split('[').next().unwrap_or(query_set))

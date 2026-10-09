@@ -50,8 +50,8 @@ use crate::mysql::common;
 
 /// Pinned image for the pre-8.2 positioning branch (`SHOW MASTER STATUS`
 /// fallback). The modern `SHOW BINARY LOG STATUS` branch is exercised by the
-/// rest of this suite via `mysql:latest` (always an 8.2+ version), so it needs
-/// no separate pin here.
+/// rest of this suite on the `MySQL` LTS lines in `test/source_versions.json`
+/// (all 8.2+), so it needs no separate pin here.
 const MYSQL_IMAGE_8_0: &str = "docker.io/library/mysql:8.0";
 
 /// In-memory [`PositionStore`] standing in for the accelerator sidecar.
@@ -634,8 +634,8 @@ async fn resume_with_stale_backlog_is_not_ready_until_caught_up() -> Result<(), 
 /// Minimal cold-bootstrap → Ready → live-insert flow. Reaching Ready proves
 /// `fetch_head_position` succeeded on this server version. Run here on a pinned
 /// 8.0 to exercise the `SHOW MASTER STATUS` fallback; the modern
-/// `SHOW BINARY LOG STATUS` branch is covered by the rest of the suite on
-/// `mysql:latest`.
+/// `SHOW BINARY LOG STATUS` branch is covered by the rest of the suite on the
+/// `MySQL` LTS lines.
 async fn bootstrap_and_stream_once(port: u16, server_id: u32) -> Result<(), anyhow::Error> {
     let pool = setup_source_table(port).await?;
     let store: Arc<MemoryPositionStore> = Arc::new(MemoryPositionStore::default());
@@ -683,8 +683,8 @@ async fn bootstrap_and_stream_once(port: u16, server_id: u32) -> Result<(), anyh
 
 /// Version matrix — pre-8.2: positioning must fall back to `SHOW MASTER STATUS`
 /// (8.0 does not have `SHOW BINARY LOG STATUS`). The modern `SHOW BINARY LOG
-/// STATUS` branch is covered by the rest of this suite on `mysql:latest`, so it
-/// gets no duplicate pin here.
+/// STATUS` branch is covered by the rest of this suite on the `MySQL` LTS lines,
+/// so it gets no duplicate pin here.
 #[tokio::test(flavor = "multi_thread")]
 async fn bootstrap_streams_on_mysql_8_0() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("data_components::mysql_replication=debug,info"));
