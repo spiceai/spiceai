@@ -140,19 +140,27 @@ pub struct ContentBlockToolUse {
 #[serde(tag = "type")]
 pub(crate) enum Delta {
     #[serde(rename = "text_delta")]
-    TextDelta { text: String },
+    Text { text: String },
     #[serde(rename = "input_json_delta")]
-    InputJsonDelta { partial_json: String },
+    InputJson { partial_json: String },
+    /// A thinking block streams as `thinking_delta`s followed by one `signature_delta`. Models that
+    /// think by default send them even though the request never sets `thinking`.
+    #[serde(rename = "thinking_delta")]
+    Thinking { thinking: String },
+    #[serde(rename = "signature_delta")]
+    Signature { signature: String },
 }
 
 impl Delta {
+    /// The `OpenAI` delta for this packet, or `None` for a thinking block's deltas: thinking is not
+    /// exposed to the caller, as on the non-streaming path, so they produce no chunk.
     pub fn into_completion(
         self,
         role: Option<&MessageRole>,
         tool_content: Option<&ContentBlockToolUse>,
-    ) -> ChatCompletionStreamResponseDelta {
+    ) -> Option<ChatCompletionStreamResponseDelta> {
         match (self, tool_content) {
-            (Delta::TextDelta { text }, _) => ChatCompletionStreamResponseDelta {
+            (Delta::Text { text }, _) => Some(ChatCompletionStreamResponseDelta {
                 content: Some(text),
                 function_call: None,
                 tool_calls: None,
@@ -162,13 +170,13 @@ impl Delta {
                     Some(MessageRole::User) => Some(Role::User),
                     None => None,
                 },
-            },
+            }),
             (
-                Delta::InputJsonDelta { partial_json },
+                Delta::InputJson { partial_json },
                 Some(ContentBlockToolUse {
                     id, name: _name, ..
                 }),
-            ) => ChatCompletionStreamResponseDelta {
+            ) => Some(ChatCompletionStreamResponseDelta {
                 content: None,
                 function_call: None,
                 tool_calls: Some(vec![ChatCompletionMessageToolCallChunk {
@@ -186,11 +194,11 @@ impl Delta {
                     Some(MessageRole::User) => Some(Role::User),
                     None => None,
                 },
-            },
+            }),
 
             // This should never happen, but we need to handle it as an 'empty' response.
-            (Delta::InputJsonDelta { partial_json: _ }, None) => {
-                ChatCompletionStreamResponseDelta {
+            (Delta::InputJson { partial_json: _ }, None) => {
+                Some(ChatCompletionStreamResponseDelta {
                     content: None,
                     function_call: None,
                     tool_calls: None,
@@ -200,8 +208,10 @@ impl Delta {
                         Some(MessageRole::User) => Some(Role::User),
                         None => None,
                     },
-                }
+                })
             }
+
+            (Delta::Thinking { .. } | Delta::Signature { .. }, _) => None,
         }
     }
 }
@@ -303,6 +313,12 @@ pub fn transform_stream(
                         let tool_idx = *state.tool_id_to_tool_delta_idx.get(&index).unwrap_or(&0);
                         state.tool_id_to_tool_delta_idx.insert(index, tool_idx + 1);
 
+                        // A thinking block's deltas have no `OpenAI` counterpart and yield no chunk.
+                        let delta = delta.into_completion(
+                            state.role.as_ref(),
+                            state.tool_id_to_content_block.get(&index),
+                        )?;
+
                         Some(create_anthropic_stream_response(
                             &state.id.clone().unwrap_or_default(),
                             &state.model.clone().unwrap_or_default(),
@@ -311,10 +327,7 @@ pub fn transform_stream(
                                 index: 0,
                                 logprobs: None,
                                 finish_reason: None,
-                                delta: delta.into_completion(
-                                    state.role.as_ref(),
-                                    state.tool_id_to_content_block.get(&index),
-                                ),
+                                delta,
                             }),
                         ))
                     }
