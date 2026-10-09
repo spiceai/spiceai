@@ -111,6 +111,10 @@ jobs:
               - 'crates/data_components/src/postgres_replication/**'
               - 'crates/data_components/src/mysql/**'
               - 'crates/data_components/src/mysql_replication/**'
+              - 'crates/runtime/src/catalogconnector/postgres.rs'
+              - 'crates/runtime/src/catalogconnector/postgres_accelerated.rs'
+              - 'crates/runtime/src/catalogconnector/mysql.rs'
+              - 'crates/accelerators/accelerator-postgres/**'
               - 'crates/vendor/pgwire-replication/**'
               - 'crates/runtime/tests/docker/**'
               # Every test module the source-versions filters below select.
