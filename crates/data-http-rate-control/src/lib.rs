@@ -373,19 +373,19 @@ fn format_failure_threshold(failure_threshold: f64) -> String {
 
 /// Parse a percentage, the `33.3` of `33.3%`, into the fraction it denotes.
 ///
-/// A plain decimal is parsed with its exponent shifted (`33.3e-2`), so it
-/// rounds once, to the same float as its fraction spelling `0.333`. Dividing
-/// the parsed `33.3` by 100 rounds twice and lands an ulp away, and components
-/// sharing an origin compare thresholds exactly.
+/// A decimal is parsed with its exponent lowered by two (`33.3e-2`, and
+/// `3.33e1` as `3.33e-1`), so it rounds once, to the same float as its fraction
+/// spelling `0.333`. Dividing the parsed `33.3` by 100 rounds twice and lands
+/// an ulp away, and components sharing an origin compare thresholds exactly.
 fn parse_percentage(percent: &str) -> Result<f64, ParseFloatError> {
     let percent = percent.trim();
-    if percent
+    let (mantissa, exponent) = percent.split_once(['e', 'E']).unwrap_or((percent, "0"));
+    let is_decimal = mantissa
         .bytes()
-        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'.' | b'+' | b'-'))
-    {
-        format!("{percent}e-2").parse()
-    } else {
-        percent.parse::<f64>().map(|value| value / 100.0)
+        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'.' | b'+' | b'-'));
+    match exponent.parse::<i64>() {
+        Ok(exponent) if is_decimal => format!("{mantissa}e{}", exponent.saturating_sub(2)).parse(),
+        _ => percent.parse::<f64>().map(|value| value / 100.0),
     }
 }
 
@@ -2181,6 +2181,9 @@ mod tests {
             (" 25 ", "0.25"),
             ("99.9999", "0.999999"),
             ("+5.", "0.05"),
+            ("3.33e1", "0.333"),
+            ("0.0333E+3", "0.333"),
+            ("250e-1", "0.25"),
         ] {
             let parsed = parse_percentage(percentage).expect("a plain decimal parses");
             let expected: f64 = fraction.parse().expect("test fraction parses");
