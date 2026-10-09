@@ -109,6 +109,11 @@ impl CayenneChangeSinkBackend {
     /// A checkpoint must cover buffered work before durable writes can supersede
     /// it. Rebuildable writes need no source callback; a real CDC callback must
     /// finish its outstanding acknowledgements before being removed.
+    ///
+    /// A durable write with no callback installed checkpoints only when the
+    /// tier still holds rows, so a source that cannot defer acknowledgements
+    /// (a MySQL snapshot) does not wait on a checkpoint of an empty tier for
+    /// every burst it writes.
     async fn select_recovery_path(&self, recovery: Recovery) -> Result<()> {
         let buffered = self.table.is_cdc_memory_mode() && !self.table.is_memory_resident_mode();
         let observer = if recovery == Recovery::Replayable && buffered {
@@ -118,7 +123,9 @@ impl CayenneChangeSinkBackend {
         };
         if let Some(observer) = observer {
             self.table.install_slot_advancer(observer);
-        } else if buffered && (recovery != Recovery::Rebuildable || self.table.has_slot_advancer())
+        } else if buffered
+            && (self.table.has_slot_advancer()
+                || (recovery != Recovery::Rebuildable && self.table.has_buffered_mem_tier_rows()))
         {
             self.table
                 .checkpoint_mem_tier()

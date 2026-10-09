@@ -10120,6 +10120,14 @@ impl CayenneTableProvider {
         self.slot_advancer.lock().is_some()
     }
 
+    /// Whether the in-memory CDC tier holds rows, or a sealed shadow of them, that
+    /// no durable checkpoint has superseded yet. A durable write needs a covering
+    /// checkpoint first only while this is true.
+    #[must_use]
+    pub fn has_buffered_mem_tier_rows(&self) -> bool {
+        !self.mem_tier.is_empty() || self.mem_tier_shadow_present.load(Ordering::Acquire)
+    }
+
     /// Whether CDC appends engage the in-memory tier: a `cdc_durability: memory`
     /// table whose runtime has installed a slot advancer.
     #[must_use]
