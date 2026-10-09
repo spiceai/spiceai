@@ -435,6 +435,63 @@ async fn a_quota_wait_takes_the_charge_in_force_when_admitted() {
     );
 }
 
+/// A request that one quota charges above the healthy baseline has paid for the
+/// origin's failures, and is counted in `adaptive_throttled_total` even when a
+/// later quota then keeps it waiting past its acquire bound.
+#[tokio::test(flavor = "current_thread", start_paused = true)]
+async fn a_throttled_charge_is_counted_when_a_later_quota_times_out() {
+    let per_minute = 10;
+    let controller = RateControllerBuilder::new()
+        .add_quota_with_name(
+            "requests_per_second",
+            Quota::per_second(NonZeroU32::new(100).expect("non-zero")),
+        )
+        .add_quota_with_name(
+            "requests_per_minute",
+            Quota::per_minute(NonZeroU32::new(per_minute).expect("non-zero")),
+        )
+        .with_adaptive(adaptive(Duration::from_secs(5)), ORIGIN)
+        .with_acquire_timeout(Duration::from_secs(1))
+        .build();
+
+    // Spend the per-minute burst, then fail about half the requests: the
+    // coefficient settles near 0.5, so the next request is charged about twice
+    // the healthy count. The per-second quota has room for that; the per-minute
+    // quota will not for seconds.
+    for _ in 0..per_minute {
+        drop(controller.acquire().await.expect("within the burst"));
+    }
+    for request in 0..100 {
+        controller.record_outcome(if request < 44 {
+            RequestOutcome::Success
+        } else {
+            RequestOutcome::Failure
+        });
+    }
+    let coefficient = controller
+        .admission_coefficient()
+        .expect("adaptive control is enabled");
+    assert!(
+        (0.4..0.6).contains(&coefficient),
+        "the origin should be half throttled, got coefficient {coefficient}"
+    );
+    let throttled_before = controller.metrics().adaptive_throttled_total();
+
+    let error = controller
+        .acquire()
+        .await
+        .expect_err("the per-minute quota has nothing left for a second");
+    assert!(
+        matches!(error, Error::AcquireTimeout { .. }),
+        "expected an acquire timeout, got {error:?}"
+    );
+    assert_eq!(
+        controller.metrics().adaptive_throttled_total() - throttled_before,
+        1,
+        "the per-second quota charged the request above the healthy baseline"
+    );
+}
+
 fn assert_healthy(controller: &RateController) {
     let coefficient = controller
         .admission_coefficient()

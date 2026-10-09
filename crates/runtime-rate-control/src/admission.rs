@@ -19,9 +19,17 @@ limitations under the License.
 //! A request waits for a concurrency slot, then for cells from each local
 //! quota. Each of the two stages has an [`AdmissionQueue`]: a request that has
 //! to wait joins it, and only the request at its head waits on the limit
-//! itself, so requests are admitted in the order they started waiting. A
-//! request admitted at once while nobody is waiting never joins the queue, so
-//! an uncontended limit costs no lock.
+//! itself, so a request is admitted after every request that joined the queue
+//! before it. A request that arrives while the queue is empty tries the limit
+//! at once and skips the queue if the limit admits it, so an uncontended limit
+//! costs no lock.
+//!
+//! That first try and the join after a failed one are two steps, so another
+//! request's first try can be admitted between them. Only a request whose own
+//! arrival overlaps can pass this way; once a request has joined, nothing
+//! passes it. Making the two steps one would put every try behind the queue's
+//! lock, and under contention that lock's first-in, first-out handoff becomes
+//! the bottleneck.
 //!
 //! The request at the head reads its charge when it gets there and re-reads it
 //! while it waits, so it pays what the adaptive admission coefficient asks for

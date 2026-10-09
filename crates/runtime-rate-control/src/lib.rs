@@ -632,6 +632,31 @@ impl RateControllerMetrics {
     }
 }
 
+/// Counts one request in [`RateControllerMetrics::adaptive_throttled_total`],
+/// once, the moment a limit charges it above the healthy baseline. Counting at
+/// the charge rather than when the acquire returns keeps a request that paid
+/// and then failed on a later limit, such as by timing out, in the count.
+struct ThrottleTally<'a> {
+    metrics: &'a RateControllerMetrics,
+    counted: bool,
+}
+
+impl<'a> ThrottleTally<'a> {
+    fn new(metrics: &'a RateControllerMetrics) -> Self {
+        Self {
+            metrics,
+            counted: false,
+        }
+    }
+
+    fn charged(&mut self, above_baseline: bool) {
+        if above_baseline && !self.counted {
+            self.counted = true;
+            self.metrics.record_adaptive_throttle();
+        }
+    }
+}
+
 pub struct RateController {
     jitter_config: JitterConfig,
     /// Local-only governor limiters (in-memory mode).
@@ -716,16 +741,17 @@ impl Permit {
     pub async fn until_ready(&self) -> Result<()> {
         let controller = &self.rate_controller;
         let wait_start = Instant::now();
+        // The request was counted as throttled, if at all, when it was admitted.
         let result = within(
             controller.acquire_timeout,
             &controller.target,
-            controller.wait_for_rate_limiters(self.weight),
+            controller.wait_for_rate_limiters(self.weight, None),
         )
         .await;
 
         let wait_duration = wait_start.elapsed();
         match result {
-            Ok(_charged_above_baseline) => {
+            Ok(()) => {
                 self.rate_controller
                     .metrics
                     .record_wait_duration(wait_duration);
@@ -805,10 +831,13 @@ impl RateController {
     }
 
     /// Wait for every rate limit: the local quotas in arrival order, then the
-    /// cluster leased buckets. Returns whether a local quota charged this
-    /// request above the healthy baseline.
-    async fn wait_for_rate_limiters(&self, weight: Option<u32>) -> Result<bool> {
-        let charged_above_baseline = self.take_local_quotas(weight).await?;
+    /// cluster leased buckets. Each above-baseline charge goes to `tally`.
+    async fn wait_for_rate_limiters(
+        &self,
+        weight: Option<u32>,
+        tally: Option<&mut ThrottleTally<'_>>,
+    ) -> Result<()> {
+        self.take_local_quotas(weight, tally).await?;
 
         // Cluster leased buckets: each acquire consumes one token, may wait.
         // Always exactly one token: a leased bucket throttles by leasing
@@ -823,13 +852,13 @@ impl RateController {
                 },
             })?;
         }
-        Ok(charged_above_baseline)
+        Ok(())
     }
 
     /// Take this request's cells from every local quota, and `weight` cells
     /// from the weighted quota, waiting in the quota queue for any that are
-    /// not free. Returns whether an adaptive charge was above the healthy
-    /// baseline.
+    /// not free. Each adaptive charge above the healthy baseline goes to
+    /// `tally` as soon as it is taken.
     ///
     /// Adaptive control scales every configured limit by charging more cells
     /// per request (the healthy baseline is `resolution` cells for the
@@ -838,29 +867,34 @@ impl RateController {
     /// deeply another can throttle. The charge is read when the request tries a
     /// quota and re-read while it waits at the head of the queue, so it
     /// reflects the origin's health when the request is admitted.
-    async fn take_local_quotas(&self, weight: Option<u32>) -> Result<bool> {
+    async fn take_local_quotas(
+        &self,
+        weight: Option<u32>,
+        mut tally: Option<&mut ThrottleTally<'_>>,
+    ) -> Result<()> {
         let weighted = weight
             .filter(|weight| *weight > 0)
             .zip(self.weighted_rate_limiter.as_ref());
         if self.local_limiters.is_empty() && weighted.is_none() {
-            return Ok(false);
+            return Ok(());
         }
 
         let mut place = self.quota_queue.arrive().await;
-        let mut charged_above_baseline = false;
         for quota in &self.local_limiters {
             let charged = quota
                 .take(&mut place, |capacity| {
                     clamp_weight(self.adaptive_desired_weight(), capacity)
                 })
                 .await?;
-            charged_above_baseline |= charged > self.resolution;
+            if let Some(tally) = &mut tally {
+                tally.charged(charged > self.resolution);
+            }
         }
         if let Some((weight, quota)) = weighted {
             tracing::debug!("Acquiring weighted rate limiter for weight {weight}");
             quota.take(&mut place, |_| weight).await?;
         }
-        Ok(charged_above_baseline)
+        Ok(())
     }
 
     #[expect(
@@ -1040,20 +1074,12 @@ impl RateController {
         let self_cloned = Arc::clone(self);
         let wait_start = Instant::now();
 
-        // Count this request once in `adaptive_throttled_total` as soon as it
-        // pays for the origin's failures, which the admission-coefficient gauge
-        // (intensity) does not count. Cluster mode throttles by leasing against
-        // a smaller budget; local mode by charging a limiter more than the
-        // healthy baseline (`resolution` cells), and the charge is only known
-        // once the request reaches the head of that limiter's queue.
-        let mut throttled = false;
-        let mut count_throttle = |paid: bool| {
-            if paid && !throttled {
-                throttled = true;
-                self.metrics.record_adaptive_throttle();
-            }
-        };
-        count_throttle(
+        // The requests that paid for the origin's failures, which the
+        // admission-coefficient gauge (intensity) does not count. Cluster mode
+        // throttles by leasing against a smaller budget; local mode by charging
+        // a limit more than the healthy baseline (`resolution` cells).
+        let mut tally = ThrottleTally::new(&self.metrics);
+        tally.charged(
             self.leased_buckets
                 .iter()
                 .any(|bucket| bucket.is_throttling()),
@@ -1070,7 +1096,7 @@ impl RateController {
                 .await
             {
                 Ok(permit) => {
-                    count_throttle(permit.permits() > self.resolution);
+                    tally.charged(permit.permits() > self.resolution);
                     Some(permit)
                 }
                 Err(source) => {
@@ -1082,12 +1108,9 @@ impl RateController {
             None
         };
 
-        match self.wait_for_rate_limiters(weight).await {
-            Ok(charged_above_baseline) => count_throttle(charged_above_baseline),
-            Err(error) => {
-                self.metrics.record_acquire_error(wait_start.elapsed());
-                return Err(error);
-            }
+        if let Err(error) = self.wait_for_rate_limiters(weight, Some(&mut tally)).await {
+            self.metrics.record_acquire_error(wait_start.elapsed());
+            return Err(error);
         }
 
         let jitter_wait = rand::random_range(self.jitter_config.min..=self.jitter_config.max);
