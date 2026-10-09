@@ -95,10 +95,12 @@ pub(crate) async fn post(
     span.in_scope(|| tracing::info!(target: "task_history", model = %req.model, "labels"));
     crate::task_history::correlation::record_task_history_trace_id(&span, &context);
 
-    // Every response but a 200 emits an ERROR event, which is what marks the
-    // `ai_evaluate` row as failed: the exporter derives `error_message` from ERROR
-    // events only. Task history copies that text without the redaction applied to
-    // `input` / `captured_output`, so it never carries provider-supplied text.
+    // From here on, every response but a 200 emits an ERROR event, which is what marks
+    // the `ai_evaluate` row as failed: the exporter derives `error_message` from ERROR
+    // events only. A body refused above never starts the task, so it leaves no row, as
+    // on `/v1/chat/completions`. Task history copies the ERROR text without the
+    // redaction applied to `input` / `captured_output`, so it never carries
+    // provider-supplied text.
     async move {
     if let Err(e) = evaluate_api::check_questions(&req.model, &req.questions) {
         tracing::error!(target: "task_history", "{}", e.telemetry_message());
