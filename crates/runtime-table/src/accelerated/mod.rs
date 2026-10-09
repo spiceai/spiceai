@@ -1920,6 +1920,30 @@ impl AcceleratedTable {
             }
         }
 
+        // An explicit-empty request body is a POST whose response the cache
+        // stores exactly as it stores a GET's, so the cache cannot answer it
+        // without risking the other method's response. Ask the source, as the
+        // unaccelerated dataset does, and cache nothing.
+        if is_caching_mode && caching::sends_explicit_empty_request_body(filters) {
+            // Every source column, aligned by name: `projection` indexes this
+            // layer's schema, which need not match the source's.
+            let federated_provider = self.federated.table_provider().await;
+            let plan = federated_provider.scan(state, None, filters, limit).await?;
+            return Ok(Arc::new(SchemaCastScanExec::new(
+                plan,
+                self.scan_output_schema(projection),
+            )));
+        }
+
+        // A GET lookup must not match the POST entries cached for the same
+        // path. Without filters the scan lists the whole cache and makes no
+        // request, so nothing is pinned.
+        let identity_filters: Vec<Expr> = if is_caching_mode && !filters.is_empty() {
+            caching::request_identity_filters(filters, &self.accelerator.schema())
+        } else {
+            Vec::new()
+        };
+
         // For caching mode, scope the accelerator scan to the current
         // request's namespace by appending a `__spice_cache_namespace = $ns_id`
         // predicate. The federated source still receives only the user's
@@ -1956,6 +1980,7 @@ impl AcceleratedTable {
         if let Some(nf) = namespace_filter {
             storage_filters.push(nf);
         }
+        storage_filters.extend(identity_filters);
         let scan_filters: &[Expr] = if is_caching_mode {
             &storage_filters
         } else {
@@ -2102,24 +2127,32 @@ impl AcceleratedTable {
             }
         };
 
-        // Compute the target schema based on user's original projection.
-        // SchemaCastScanExec strips extra columns (like _fetched_at added for caching)
-        // and casts types. The schema should match what the user requested.
-        //
-        // Drop the extended-inference hints (`spice.inferred_*`) from this physical
-        // scan-output schema. They stay on the logical `TableProvider::schema()`
-        // chain — so `MetadataEnrichedTableProvider` still surfaces the inferred
-        // row-count/byte-size as table statistics and an accelerator keeps its
-        // tuning warm-start — but their values vary per table, and DataFusion
-        // builds a join's output schema by merging its inputs' schema-level
-        // metadata in input order. Leaving them here lets `join_selection`'s
-        // build/probe swap flip the surviving values, so the rule's output schema
-        // no longer equals its input and the physical-optimizer schema invariant
-        // fails. See `data_components::inferred_schema`.
+        Ok(Arc::new(SchemaCastScanExec::new(
+            plan,
+            self.scan_output_schema(projection),
+        )))
+    }
+
+    /// The schema a scan of this layer returns for the user's original
+    /// projection. `SchemaCastScanExec` aligns a plan to it, stripping extra
+    /// columns (like `_fetched_at` added for caching) and casting types, so
+    /// the output matches what the user requested.
+    ///
+    /// Drop the extended-inference hints (`spice.inferred_*`) from this physical
+    /// scan-output schema. They stay on the logical `TableProvider::schema()`
+    /// chain — so `MetadataEnrichedTableProvider` still surfaces the inferred
+    /// row-count/byte-size as table statistics and an accelerator keeps its
+    /// tuning warm-start — but their values vary per table, and `DataFusion`
+    /// builds a join's output schema by merging its inputs' schema-level
+    /// metadata in input order. Leaving them here lets `join_selection`'s
+    /// build/probe swap flip the surviving values, so the rule's output schema
+    /// no longer equals its input and the physical-optimizer schema invariant
+    /// fails. See `data_components::inferred_schema`.
+    fn scan_output_schema(&self, projection: Option<&Vec<usize>>) -> SchemaRef {
         let full_schema = self.schema();
         let mut metadata = full_schema.metadata().clone();
         data_components::inferred_schema::strip_inferred_metadata(&mut metadata);
-        let target_schema = match projection {
+        match projection {
             Some(indices) => {
                 let projected_fields: Vec<_> = indices
                     .iter()
@@ -2131,9 +2164,7 @@ impl AcceleratedTable {
                 full_schema.fields().clone(),
                 metadata,
             )),
-        };
-
-        Ok(Arc::new(SchemaCastScanExec::new(plan, target_schema)))
+        }
     }
 }
 
@@ -2964,9 +2995,17 @@ mod tests {
 
         // Taken after the build, which is the only order a caller can manage:
         // the table has to exist before its refresher can be reached.
-        tokio::time::timeout(Duration::from_secs(5), completion.next().wait())
+        let outcome = tokio::time::timeout(Duration::from_secs(5), completion.next().wait())
             .await
             .expect("a scheduler must release a waiter for a refresh it will never run");
+        // Released by the scheduler's `close()` with no refresh recorded locally —
+        // not by a terminal failure, and not by a local refresh, which warmup
+        // would then mistake for distributed data being queryable.
+        assert_eq!(outcome, RefreshCompletionOutcome::Answered);
+        assert!(
+            completion.closed_without_a_refresh(),
+            "the scheduler closes the signal without recording a refresh"
+        );
     }
 
     /// The contrast that keeps the test above honest: off the scheduler path a
@@ -3468,7 +3507,11 @@ mod tests {
     ///
     /// Taking the lock where the plan is *built* would not have shown up here:
     /// the rows move when the plan executes, which is what this drives.
-    #[tokio::test]
+    ///
+    /// Paused time: the 250 ms sleep below elapses only once every other task is
+    /// idle, so the spawned write has either finished or parked on the lock by
+    /// then — the check no longer depends on how fast the runner is.
+    #[tokio::test(start_paused = true)]
     async fn test_a_direct_insert_waits_for_the_accelerator_write_lock() {
         let (table, accelerator, write_mutex) =
             table_with_write_lock(WriteMode::AcceleratorOnly).await;
@@ -3481,9 +3524,8 @@ mod tests {
 
         let write = tokio::spawn(datafusion::physical_plan::collect(plan, ctx.task_ctx()));
 
-        // Long enough that a write which does not wait would have finished:
-        // the unguarded path completed this insert in well under a
-        // millisecond, and the assertion below is what proves it now waits.
+        // A write that does not wait runs to completion before the paused clock
+        // can advance; one that waits is parked on the lock.
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         assert!(
@@ -3518,7 +3560,11 @@ mod tests {
     /// snapshot holding the lock ahead of it — and the next on-change snapshot
     /// would read an unchanged marker and skip, leaving the acknowledged write
     /// out of every snapshot until some later mutation moved it again.
-    #[tokio::test]
+    ///
+    /// Paused time: the 250 ms sleep elapses only once the spawned write is idle
+    /// — parked on the lock — so the marker is checked against a write that has
+    /// provably reached it.
+    #[tokio::test(start_paused = true)]
     async fn test_a_waiting_write_does_not_move_the_freshness_marker_early() {
         let (table, accelerator, write_mutex) =
             table_with_write_lock(WriteMode::AcceleratorOnly).await;
@@ -3581,7 +3627,9 @@ mod tests {
     /// The same gap, on the other two write verbs that reach the accelerator —
     /// a snapshot taken beside an unserialized `DELETE` or `UPDATE` captures a
     /// row set no point in time produced just as an `INSERT` does.
-    #[tokio::test]
+    ///
+    /// Paused time, as above: the sleep elapses only once the delete has parked.
+    #[tokio::test(start_paused = true)]
     async fn test_a_direct_delete_waits_for_the_accelerator_write_lock() {
         let (table, accelerator, write_mutex) =
             table_with_write_lock(WriteMode::AcceleratorOnly).await;

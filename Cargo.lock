@@ -17959,6 +17959,7 @@ dependencies = [
  "object_store 0.13.2",
  "object_store_occ",
  "opentelemetry",
+ "opentelemetry_sdk",
  "parking_lot",
  "prost 0.14.3",
  "runtime-datafusion",
@@ -18160,6 +18161,7 @@ name = "runtime-metrics"
 version = "2.4.0-unstable"
 dependencies = [
  "opentelemetry",
+ "opentelemetry_sdk",
  "runtime-api-types",
  "snafu",
  "telemetry",

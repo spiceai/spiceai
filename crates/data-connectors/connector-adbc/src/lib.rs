@@ -2231,7 +2231,15 @@ adbc.bigquery.sql.auth_credentials={\"client_email\":\"b@example.iam.gserviceacc
     #[test]
     fn test_query_federation_invalid_value() {
         let params = make_params(vec![("query_federation", "invalid")]);
-        is_query_federation_enabled(&params).expect_err("should error on invalid value");
+        let err = is_query_federation_enabled(&params).expect_err("should error on invalid value");
+        assert!(
+            matches!(&err, Error::InvalidQueryFederation { value } if value == "invalid"),
+            "expected InvalidQueryFederation naming the rejected value, got: {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "Invalid 'query_federation' value 'invalid'. Expected 'enabled' or 'disabled'."
+        );
     }
 
     fn bigquery_identity<'a>(

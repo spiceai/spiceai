@@ -1199,8 +1199,10 @@ mod tests {
         let expr_convertor = DefaultExpressionConvertor::default();
         let col_expr = Arc::new(df_expr::Column::new("test", 0)) as Arc<dyn PhysicalExpr>;
         let result = make_vortex_predicate(&expr_convertor, &[col_expr])
-            .expect("single predicate conversion should succeed");
-        assert!(result.is_some());
+            .expect("single predicate conversion should succeed")
+            .expect("a non-empty conjunction converts to an expression");
+        // A lone predicate is the converted column itself, not wrapped in a conjunction.
+        assert_eq!(result.to_string(), get_item("test", root()).to_string());
     }
 
     #[test]
@@ -1209,9 +1211,13 @@ mod tests {
         let col1 = Arc::new(df_expr::Column::new("col1", 0)) as Arc<dyn PhysicalExpr>;
         let col2 = Arc::new(df_expr::Column::new("col2", 1)) as Arc<dyn PhysicalExpr>;
         let result = make_vortex_predicate(&expr_convertor, &[col1, col2])
-            .expect("multiple predicate conversion should succeed");
-        assert!(result.is_some());
-        // Result should be an AND expression combining the two columns
+            .expect("multiple predicate conversion should succeed")
+            .expect("a non-empty conjunction converts to an expression");
+        // Every predicate filters the scan, so the result is the AND of both columns.
+        assert_eq!(
+            result.to_string(),
+            vortex::expr::and(get_item("col1", root()), get_item("col2", root())).to_string()
+        );
     }
 
     #[rstest]
@@ -2155,36 +2161,68 @@ mod tests {
         assert!(!can_be_pushed_down_impl(&like_expr, &test_schema));
     }
 
-    // https://github.com/vortex-data/vortex/issues/6211
-    #[tokio::test]
-    async fn test_cast_int_to_string() -> anyhow::Result<()> {
-        let ctx = TestSessionContext::default();
+    /// The values of the single column `sql` returns, rendered as text.
+    async fn single_column_as_text(
+        ctx: &TestSessionContext,
+        sql: &str,
+    ) -> anyhow::Result<Vec<Option<String>>> {
+        let batches = ctx.session.sql(sql).await?.collect().await?;
+        let mut values = Vec::new();
+        for batch in &batches {
+            anyhow::ensure!(
+                batch.num_columns() == 1,
+                "expected one column from `{sql}`, got {}",
+                batch.num_columns()
+            );
+            let text = datafusion::arrow::compute::cast(batch.column(0), &DataType::Utf8)?;
+            let text = text
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::StringArray>()
+                .ok_or_else(|| anyhow::anyhow!("a cast to Utf8 must yield a StringArray"))?;
+            values.extend(text.iter().map(|value| value.map(str::to_string)));
+        }
+        Ok(values)
+    }
 
+    /// Writes a one-row file with `id = 1` and checks every shape of an
+    /// integer-to-string cast over it returns that one row: the cast as an aliased
+    /// projection under a filter, the cast inside the filter, and the bare cast
+    /// projection that, with projection pushdown, is evaluated by the Vortex scan.
+    async fn assert_cast_int_to_string_results(ctx: &TestSessionContext) -> anyhow::Result<()> {
         ctx.session
             .sql(r#"copy (select 1 as id) to 'example.vortex'"#)
-            .await?
-            .show()
-            .await?;
-
-        ctx.session
-            .sql(r#"select cast(id as string) as sid from 'example.vortex' where id > 0"#)
-            .await?
-            .show()
-            .await?;
-
-        ctx.session
-            .sql(r#"select id from 'example.vortex' where cast (id as string) == '1'"#)
-            .await?
-            .show()
-            .await?;
-
-        // This fails as it pushes string cast to the scan
-        ctx.session
-            .sql(r#"select cast(id as string) from 'example.vortex'"#)
             .await?
             .collect()
             .await?;
 
+        assert_eq!(
+            single_column_as_text(
+                ctx,
+                r#"select cast(id as string) as sid from 'example.vortex' where id > 0"#
+            )
+            .await?,
+            vec![Some("1".to_string())]
+        );
+        assert_eq!(
+            single_column_as_text(
+                ctx,
+                r#"select id from 'example.vortex' where cast (id as string) == '1'"#
+            )
+            .await?,
+            vec![Some("1".to_string())]
+        );
+        assert_eq!(
+            single_column_as_text(ctx, r#"select cast(id as string) from 'example.vortex'"#)
+                .await?,
+            vec![Some("1".to_string())]
+        );
         Ok(())
+    }
+
+    // https://github.com/vortex-data/vortex/issues/6211
+    #[tokio::test]
+    async fn test_cast_int_to_string() -> anyhow::Result<()> {
+        // Projection pushdown off (the format's default): the casts run above the scan.
+        assert_cast_int_to_string_results(&TestSessionContext::default()).await
     }
 }

@@ -1570,6 +1570,22 @@ mod tests {
             .collect()
             .await?;
 
+        // The table's OPTIONS must reach the Vortex format the table reads with.
+        let provider = ctx.session.table_provider("my_tbl").await?;
+        let listing = provider
+            .downcast_ref::<datafusion::datasource::listing::ListingTable>()
+            .ok_or_else(|| anyhow::anyhow!("a Vortex external table is a listing table"))?;
+        let format = listing
+            .options()
+            .format
+            .downcast_ref::<VortexFormat>()
+            .ok_or_else(|| anyhow::anyhow!("the table must read with the Vortex format"))?;
+        assert_eq!(format.options().footer_initial_read_size_bytes, 12345);
+        assert_eq!(
+            format.options().scan_concurrency,
+            ScanConcurrency::Explicit(3)
+        );
+
         Ok(())
     }
 

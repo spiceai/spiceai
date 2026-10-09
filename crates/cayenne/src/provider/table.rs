@@ -45220,8 +45220,6 @@ mod tests {
     #[rstest]
     #[case::binary(get_arrow_binary_record_batch(), "binary")]
     #[case::large_binary(get_arrow_large_binary_record_batch(), "large_binary")]
-    #[ignore = "Vortex does not support FixedSizeBinary yet. Planned: https://github.com/vortex-data/vortex/issues/2116"]
-    #[case::fixed_size_binary(get_arrow_fixed_sized_binary_record_batch(), "fixed_size_binary")]
     #[case::int(get_arrow_int_record_batch(), "int")]
     #[case::float(get_arrow_float_record_batch(), "float")]
     #[case::float16(get_arrow_float16_record_batch(), "float16")]
@@ -45233,10 +45231,6 @@ mod tests {
     #[case::date(get_arrow_date_record_batch(), "date")]
     #[case::struct_type(get_arrow_struct_record_batch(), "struct")]
     #[case::decimal(get_arrow_decimal_record_batch(), "decimal")]
-    #[ignore = "Vortex does not support Interval yet. See: https://github.com/vortex-data/vortex/issues/2116"]
-    #[case::interval(get_arrow_interval_record_batch(), "interval")]
-    #[ignore = "Vortex does not support Duration yet. Not on roadmap: https://github.com/vortex-data/vortex/issues/2116"]
-    #[case::duration(get_arrow_duration_record_batch(), "duration")]
     #[case::list(get_arrow_list_record_batch(), "list")]
     #[case::null(get_arrow_null_record_batch(), "null")]
     #[case::list_of_structs(get_arrow_list_of_structs_record_batch(), "list_of_structs")]
@@ -45258,6 +45252,49 @@ mod tests {
             &format!("{table_name}_types"),
         )
         .await;
+    }
+
+    /// The round-trip fixtures for the types Vortex has no encoding for. A Cayenne table
+    /// cannot store them, so creating one refuses each such column by name and type rather
+    /// than accepting a table no write can succeed against. When Vortex gains one of these
+    /// types, `vortex_encodes_exactly_the_types_not_listed_as_unsupported` fails and its
+    /// fixture moves back into `test_arrow_cayenne_roundtrip`.
+    #[rstest]
+    #[case::fixed_size_binary(
+        get_arrow_fixed_sized_binary_record_batch(),
+        "'fixed_size_binary' (type: FixedSizeBinary(16))"
+    )]
+    #[case::interval(
+        get_arrow_interval_record_batch(),
+        "'interval_daytime' (type: Interval(DayTime)), 'interval_monthday_nano' (type: \
+         Interval(MonthDayNano)), 'interval_yearmonth' (type: Interval(YearMonth))"
+    )]
+    #[case::duration(
+        get_arrow_duration_record_batch(),
+        "'duration_nano' (type: Duration(Nanosecond)), 'duration_micro' (type: \
+         Duration(Microsecond)), 'duration_milli' (type: Duration(Millisecond)), \
+         'duration_sec' (type: Duration(Second))"
+    )]
+    fn test_arrow_cayenne_roundtrip_refuses_types_vortex_cannot_encode(
+        #[case] arrow_result: (RecordBatch, SchemaRef),
+        #[case] refused_columns: &str,
+    ) {
+        let (_, schema) = arrow_result;
+        let err = crate::transform_schema_for_vortex(
+            schema.as_ref(),
+            datafusion_table_providers::UnsupportedTypeAction::Error,
+        )
+        .expect_err("a column Vortex cannot encode must be refused when the table is created");
+        let expected = format!(
+            "Unsupported data type(s) in schema: {refused_columns}. By default, unsupported \
+             types cause an error. To convert top-level unsupported columns to strings, set \
+             'unsupported_type_action: string'; nested unsupported types must be removed or \
+             rewritten to preserve data correctness."
+        );
+        assert!(
+            matches!(&err, DataFusionError::Execution(message) if *message == expected),
+            "{err:?}"
+        );
     }
 
     /// Helper: build a single-column Int64 `RecordBatch` and the matching `RowConverter`.

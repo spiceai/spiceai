@@ -1807,28 +1807,84 @@ mod tests {
         );
     }
 
+    /// The cause a refused regexp call names for its flags argument.
+    const FLAG_REFUSAL: &str = "it sets a flag; case-insensitive matching follows each engine's own Unicode case-folding tables and the other flags RE2 reads differently or rejects";
+
+    /// The cause a refused `regexp_count` names for a pattern that can match
+    /// the empty string.
+    const EMPTY_MATCH_REFUSAL: &str =
+        "it can match the empty string, which DuckDB counts differently from DataFusion";
+
+    /// The cause a refused regexp call names for a pattern using a Perl class.
+    const PERL_CLASS_REFUSAL: &str = "it uses a Perl class (`\\d`, `\\w`, `\\s`), which is Unicode-aware in DataFusion and ASCII-only in RE2";
+
+    /// The planning message `unparser` refuses `call` with. Any other outcome
+    /// (a rendering, or an error of another kind) fails the test.
+    fn refusal_message(unparser: &Unparser<'_>, call: &Expr) -> String {
+        match unparser.expr_to_sql(call) {
+            Err(DataFusionError::Plan(message)) => message,
+            other => panic!("{call} must be refused with a planning error, got {other:?}"),
+        }
+    }
+
+    /// Why `screen_regexp_count_pattern` refuses `pattern`, in the refusal's
+    /// `Debug` spelling (`MayMatchEmpty`, `Syntax(PerlClass)`). The refusal
+    /// types have no `PartialEq`, and the spelling lets a table pin each
+    /// pattern to the one reason it is refused for.
+    fn count_refusal(pattern: &str) -> String {
+        match screen_regexp_count_pattern(pattern) {
+            Ok(_) => panic!("`{pattern}` must be refused"),
+            Err(refusal) => format!("{refusal:?}"),
+        }
+    }
+
     /// The shapes the handler refuses are refused by the unparser itself, not
     /// only by the per-call check that consults it: a flags argument `DuckDB`
     /// would reject remotely (it requires a non-NULL constant), a pattern that
-    /// can match the empty string, and a pattern read from a column.
+    /// can match the empty string, and a pattern read from a column. Each
+    /// refusal names its own cause, so a refusal for an unrelated reason cannot
+    /// pass for it.
     #[test]
     fn regexp_count_refuses_what_duckdb_would_count_differently() {
         let dialect = new_duckdb_dialect();
         let unparser = Unparser::new(dialect.as_ref());
 
-        for flags in [col("f"), lit(ScalarValue::Utf8(None)), lit("m"), lit("i")] {
-            let call = regexp_count(col("s"), lit("a"), Some(lit(1)), Some(flags.clone()));
-            assert!(
-                unparser.expr_to_sql(&call).is_err(),
-                "flags {flags:?} have no DuckDB rendering and must be refused"
+        // A flags value that cannot be read at unparse time is named as empty.
+        for (flags, named) in [
+            (col("f"), ""),
+            (lit(ScalarValue::Utf8(None)), ""),
+            (lit("m"), "m"),
+            (lit("i"), "i"),
+        ] {
+            let call = regexp_count(col("s"), lit("a"), Some(lit(1)), Some(flags));
+            assert_eq!(
+                refusal_message(&unparser, &call),
+                format!(
+                    "Flags `{named}` are not supported for regular expression function regexp_extract_all with DuckDB: {FLAG_REFUSAL}"
+                ),
+                "{call}"
             );
         }
-        for pattern in [lit("a*"), lit(""), col("p")] {
-            let call = regexp_count(col("s"), pattern.clone(), None, None);
-            assert!(
-                unparser.expr_to_sql(&call).is_err(),
-                "pattern {pattern:?} has no faithful DuckDB rendering and must be refused"
-            );
+        for (pattern, expected) in [
+            (
+                lit("a*"),
+                format!(
+                    "Pattern `a*` is not supported for regular expression function regexp_extract_all with DuckDB: {EMPTY_MATCH_REFUSAL}"
+                ),
+            ),
+            (
+                lit(""),
+                format!(
+                    "Pattern `` is not supported for regular expression function regexp_extract_all with DuckDB: {EMPTY_MATCH_REFUSAL}"
+                ),
+            ),
+            (
+                col("p"),
+                "Only string literal patterns are supported for regular expression function regexp_extract_all with DuckDB".to_string(),
+            ),
+        ] {
+            let call = regexp_count(col("s"), pattern, None, None);
+            assert_eq!(refusal_message(&unparser, &call), expected, "{call}");
         }
     }
 
@@ -1870,71 +1926,105 @@ mod tests {
             "(a{2}){3}b{500}",
             "(a+){1000}",
         ] {
-            assert!(
-                screen_regexp_count_pattern(pattern).is_ok(),
-                "`{pattern}` is counted identically and must render"
-            );
+            if let Err(refusal) = screen_regexp_count_pattern(pattern) {
+                panic!(
+                    "`{pattern}` is counted identically and must render, but was refused: {refusal}"
+                );
+            }
         }
-        for pattern in ["a*", "a?", "a{0,}", "", "^", "\\b", "a|\\b", "(", "[a&&b]"] {
-            assert!(
-                screen_regexp_count_pattern(pattern).is_err(),
+
+        // Each refused pattern is pinned to the reason it is refused for, so a
+        // refusal for an unrelated reason cannot stand in for the one claimed.
+        for (pattern, reason) in [
+            ("a*", "MayMatchEmpty"),
+            ("a?", "MayMatchEmpty"),
+            ("a{0,}", "MayMatchEmpty"),
+            ("", "MayMatchEmpty"),
+            ("^", "MayMatchEmpty"),
+            // Never matches, so it has no minimum match length to measure.
+            ("[^\\x00-\\x{10FFFF}]", "MayMatchEmpty"),
+            // Zero-width, but refused as a word boundary before any length is
+            // measured.
+            ("\\b", "Syntax(WordBoundary)"),
+            ("a|\\b", "Syntax(WordBoundary)"),
+            ("(", "Syntax(Unparseable)"),
+            // Never matches, but refused for its class-set operation first.
+            ("[a&&b]", "Syntax(ClassSetOperation)"),
+        ] {
+            assert_eq!(
+                count_refusal(pattern),
+                reason,
                 "`{pattern}` can match the empty string, never matches, or does not compile"
             );
         }
-        for pattern in [
-            "\\d", "\\w", "\\s", "\\D", "[\\d]", "[a\\w]", "\\ba", "a\\B", "\\<a", "a\\>",
+        for (pattern, reason) in [
+            ("\\d", "Syntax(PerlClass)"),
+            ("\\w", "Syntax(PerlClass)"),
+            ("\\s", "Syntax(PerlClass)"),
+            ("\\D", "Syntax(PerlClass)"),
+            ("[\\d]", "Syntax(PerlClass)"),
+            ("[a\\w]", "Syntax(PerlClass)"),
+            ("\\ba", "Syntax(WordBoundary)"),
+            ("a\\B", "Syntax(WordBoundary)"),
+            ("\\<a", "Syntax(WordBoundary)"),
+            ("a\\>", "Syntax(WordBoundary)"),
         ] {
-            assert!(
-                screen_regexp_count_pattern(pattern).is_err(),
+            assert_eq!(
+                count_refusal(pattern),
+                reason,
                 "`{pattern}` is Unicode-aware in the kernel and ASCII-only in RE2, so it must stay local"
             );
         }
-        for pattern in [
-            "[a&&a]",
-            "[a--b]",
-            "[a~~b]",
-            "[a[b]]",
-            "(?x)a b",
-            "(?s)a",
-            "(?m)a",
-            "(?i)k",
-            "(?i:k)a",
-            "(?-i)a",
-            "(?i-s)a",
-            "a++",
-            "a{1}{2}",
-            "a*?+",
-            "a{01}",
-            "a{1, 2}",
-            "a{1 }",
-            "a{ 1}",
-            "a{1,02}",
-            "[Kk]",
-            "[kK]",
-            "([Kk]|a)",
-            "[Ss]|a",
-            "[K-Kk]",
-            "[KkK]",
-            "([SsS]|a)",
-            "[kk-kK]",
-            "[^\\x00-\\x4A\\x4C-\\x6A\\x6C-\\x{10FFFF}]|a",
-            "(?P<n>a)",
-            "(?<n>a)",
-            "\\p{Nd}",
-            "\\pL",
-            "[\\p{Nd}]",
-            "[[:alpha:]]",
-            "\\u0041",
-            "\\U00000041",
-            "\\u{41}",
-            "a{1001}",
-            "a{2,1001}",
-            "(a{100}){11}",
-            "((a{10}){10}){11}",
-            "(a{100,}){11}",
+        for (pattern, reason) in [
+            ("[a&&a]", "Syntax(ClassSetOperation)"),
+            ("[a--b]", "Syntax(ClassSetOperation)"),
+            ("[a~~b]", "Syntax(ClassSetOperation)"),
+            ("[a[b]]", "Syntax(NestedOrEmptyClass)"),
+            ("(?x)a b", "Syntax(Flag)"),
+            ("(?s)a", "Syntax(Flag)"),
+            ("(?m)a", "Syntax(Flag)"),
+            ("(?i)k", "Syntax(Flag)"),
+            ("(?i:k)a", "Syntax(Flag)"),
+            ("(?-i)a", "Syntax(Flag)"),
+            ("(?i-s)a", "Syntax(Flag)"),
+            ("a++", "Syntax(StackedRepetition)"),
+            ("a{1}{2}", "Syntax(StackedRepetition)"),
+            ("a*?+", "Syntax(StackedRepetition)"),
+            ("a{01}", "Syntax(RepetitionSpelling)"),
+            ("a{1, 2}", "Syntax(RepetitionSpelling)"),
+            ("a{1 }", "Syntax(RepetitionSpelling)"),
+            ("a{ 1}", "Syntax(RepetitionSpelling)"),
+            ("a{1,02}", "Syntax(RepetitionSpelling)"),
+            ("[Kk]", "Syntax(CaseFoldPair)"),
+            ("[kK]", "Syntax(CaseFoldPair)"),
+            ("([Kk]|a)", "Syntax(CaseFoldPair)"),
+            ("[Ss]|a", "Syntax(CaseFoldPair)"),
+            ("[K-Kk]", "Syntax(CaseFoldPair)"),
+            ("[KkK]", "Syntax(CaseFoldPair)"),
+            ("([SsS]|a)", "Syntax(CaseFoldPair)"),
+            ("[kk-kK]", "Syntax(CaseFoldPair)"),
+            (
+                "[^\\x00-\\x4A\\x4C-\\x6A\\x6C-\\x{10FFFF}]|a",
+                "Syntax(CaseFoldPair)",
+            ),
+            ("(?P<n>a)", "Syntax(NamedGroup)"),
+            ("(?<n>a)", "Syntax(NamedGroup)"),
+            ("\\p{Nd}", "Syntax(UnicodeProperty)"),
+            ("\\pL", "Syntax(UnicodeProperty)"),
+            ("[\\p{Nd}]", "Syntax(UnicodeProperty)"),
+            ("[[:alpha:]]", "Syntax(AsciiClass)"),
+            ("\\u0041", "Syntax(Escape)"),
+            ("\\U00000041", "Syntax(Escape)"),
+            ("\\u{41}", "Syntax(Escape)"),
+            ("a{1001}", "Syntax(RepetitionBound)"),
+            ("a{2,1001}", "Syntax(RepetitionBound)"),
+            ("(a{100}){11}", "Syntax(RepetitionBound)"),
+            ("((a{10}){10}){11}", "Syntax(RepetitionBound)"),
+            ("(a{100,}){11}", "Syntax(RepetitionBound)"),
         ] {
-            assert!(
-                screen_regexp_count_pattern(pattern).is_err(),
+            assert_eq!(
+                count_refusal(pattern),
+                reason,
                 "`{pattern}` is syntax RE2 reads differently, rejects, or that is unmeasured, so it must stay local"
             );
         }
@@ -1955,37 +2045,58 @@ mod tests {
     #[test]
     fn regexp_like_and_replace_render_only_patterns_both_engines_read_alike() {
         for pattern in ["a*", "a?", "a{0,}"] {
-            assert!(
-                screen_regexp_pattern(pattern).is_ok(),
-                "`{pattern}` can match the empty string, which only the count screen refuses"
-            );
-            assert!(
-                screen_regexp_count_pattern(pattern).is_err(),
+            if let Err(refusal) = screen_regexp_pattern(pattern) {
+                panic!(
+                    "`{pattern}` can match the empty string, which only the count screen refuses, but was refused: {refusal}"
+                );
+            }
+            assert_eq!(
+                count_refusal(pattern),
+                "MayMatchEmpty",
                 "`{pattern}` must still be refused for the count, or the two screens have merged"
             );
         }
 
         let dialect = new_duckdb_dialect();
         let unparser = Unparser::new(dialect.as_ref());
-        for call in [
-            regexp_like(col("s"), lit("\\d"), None),
-            regexp_like(col("s"), col("p"), None),
-            regexp_replace(col("s"), lit("\\w"), lit("X"), None),
-            regexp_replace(col("s"), col("p"), lit("X"), None),
+        for (call, expected) in [
+            (
+                regexp_like(col("s"), lit("\\d"), None),
+                format!(
+                    "Pattern `\\d` is not supported for regular expression function regexp_matches with DuckDB: {PERL_CLASS_REFUSAL}"
+                ),
+            ),
+            (
+                regexp_like(col("s"), col("p"), None),
+                "Only string literal patterns are supported for regular expression function regexp_matches with DuckDB".to_string(),
+            ),
+            (
+                regexp_replace(col("s"), lit("\\w"), lit("X"), None),
+                format!(
+                    "Pattern `\\w` is not supported for regular expression function regexp_replace with DuckDB: {PERL_CLASS_REFUSAL}"
+                ),
+            ),
+            (
+                regexp_replace(col("s"), col("p"), lit("X"), None),
+                "Only string literal patterns are supported for regular expression function regexp_replace with DuckDB".to_string(),
+            ),
         ] {
-            assert!(
-                unparser.expr_to_sql(&call).is_err(),
-                "{call} has no faithful DuckDB rendering and must be refused"
-            );
+            assert_eq!(refusal_message(&unparser, &call), expected, "{call}");
         }
-        for call in [
-            regexp_like(col("s"), lit("a*"), None),
-            regexp_replace(col("s"), lit("(a)(b)"), lit("X"), None),
+        for (call, expected) in [
+            (
+                regexp_like(col("s"), lit("a*"), None),
+                r#"regexp_matches("s", 'a*')"#,
+            ),
+            (
+                regexp_replace(col("s"), lit("(a)(b)"), lit("X"), None),
+                r#"regexp_replace("s", '(a)(b)', 'X')"#,
+            ),
         ] {
-            assert!(
-                unparser.expr_to_sql(&call).is_ok(),
-                "{call} is read alike by both engines and must keep federating"
-            );
+            let rendered = unparser.expr_to_sql(&call).unwrap_or_else(|e| {
+                panic!("{call} is read alike by both engines and must keep federating: {e}")
+            });
+            assert_eq!(rendered.to_string(), expected);
         }
     }
 

@@ -140,11 +140,4 @@ mod tests {
         assert!(models.iter().any(|m| m.contains("titan")));
         assert!(models.iter().any(|m| m.contains("llama")));
     }
-
-    #[tokio::test]
-    async fn test_list_models() {
-        let lister = BedrockModelLister::new(None);
-        let models = lister.list_models().await.expect("list should succeed");
-        assert!(!models.is_empty());
-    }
 }

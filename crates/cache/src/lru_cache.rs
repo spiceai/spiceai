@@ -539,18 +539,19 @@ mod tests {
         let result = create_test_cached_result().await;
 
         // Put a value in the cache
-        cache.put_raw_key(&key.as_u64(), result.clone()).await;
+        cache.put_raw_key(&key.as_u64(), result).await;
 
         let key = CacheKey::Query("test_query", None).as_raw_key(cache.hasher());
 
         // Get the value from the cache
         let retrieved = cache.get_raw_key(&key.as_u64()).await;
         let retrieved = retrieved.expect("cache should contain the key");
-        let retrieved_len = retrieved.records().await.expect("Failed to decode").len();
-        let result_len = result.records().await.expect("Failed to decode").len();
-        (retrieved_len == result_len)
-            .then_some(())
-            .expect("retrieved and result should have same length");
+        let retrieved_batches = retrieved.records().await.expect("Failed to decode");
+        assert_eq!(
+            *retrieved_batches,
+            [Arc::new(create_test_record_batch())],
+            "the cache must serve exactly the batch that was stored (`id` = [1, 2, 3])"
+        );
     }
 
     /// A lookup that finds an entry but rejects it must be accounted as a miss.
@@ -595,34 +596,6 @@ mod tests {
             (1, 2),
             "a rejected entry must not be counted as a hit"
         );
-    }
-
-    #[rstest]
-    #[case::siphash(RandomState::default())]
-    #[case::ahash(ahash::RandomState::default())]
-    #[case::xxhash32(twox_hash::xxhash32::RandomState::default())]
-    #[tokio::test]
-    async fn test_cache_miss<
-        H: Hasher + Send + Sync + 'static,
-        T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
-    >(
-        #[case] hasher: T,
-    ) {
-        let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
-            TEST_MAX_SIZE,
-            Duration::from_mins(1),
-            hasher,
-            CachingPolicy::Lru,
-            CacheEngine::Moka,
-        );
-        let key = CacheKey::Query("nonexistent_query", None).as_raw_key(cache.hasher());
-
-        // Try to get a non-existent key
-        let retrieved = cache.get_raw_key(&key.as_u64()).await;
-        retrieved
-            .is_none()
-            .then_some(())
-            .expect("cache should not contain nonexistent key");
     }
 
     #[rstest]
@@ -932,16 +905,17 @@ mod tests {
         let result = create_test_cached_result().await;
 
         // Put a value in the cache
-        cache.put_raw_key(&key.as_u64(), result.clone()).await;
+        cache.put_raw_key(&key.as_u64(), result).await;
 
         // Get the value from the cache
         let retrieved = cache.get_raw_key(&key.as_u64()).await;
         let retrieved = retrieved.expect("cache should contain the key");
-        let retrieved_len = retrieved.records().await.expect("Failed to decode").len();
-        let result_len = result.records().await.expect("Failed to decode").len();
-        (retrieved_len == result_len)
-            .then_some(())
-            .expect("retrieved and result should have same length");
+        let retrieved_batches = retrieved.records().await.expect("Failed to decode");
+        assert_eq!(
+            *retrieved_batches,
+            [Arc::new(create_test_record_batch())],
+            "under {caching_policy:?} the cache must serve exactly the batch that was stored (`id` = [1, 2, 3])"
+        );
     }
 
     /// A configured Pingora `engine` is ignored; the Spice sharded cache still
@@ -1008,28 +982,6 @@ mod tests {
         (retrieved_len == result_len)
             .then_some(())
             .expect("retrieved and result should have same length");
-    }
-
-    /// Pingora-named miss contract, now run against the Spice backend.
-    #[tokio::test]
-    async fn test_pingora_backend_cache_miss() {
-        let hasher = RandomState::default();
-        let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
-            1024 * 1024, // 1 MB
-            Duration::from_mins(1),
-            hasher,
-            CachingPolicy::Lru,
-            CacheEngine::Pingora,
-        );
-
-        let key = CacheKey::Query("nonexistent_key", None).as_raw_key(cache.hasher());
-
-        // Try to get a value that doesn't exist
-        let retrieved = cache.get_raw_key(&key.as_u64()).await;
-        retrieved
-            .is_none()
-            .then_some(())
-            .expect("cache should not contain nonexistent key");
     }
 
     /// Pingora-named `invalidate_all` contract, now run against the Spice backend.

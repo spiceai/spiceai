@@ -254,7 +254,9 @@ pub fn duckdb_can_translate(call: &ScalarFunction, scope: Option<&DFSchema>) -> 
 /// The clauses the unparser cannot carry are refused for every backend, by
 /// `runtime_udfs_api::aggregate_clauses_survive_unparsing`: `IGNORE NULLS`, and an
 /// `ORDER BY` the answer depends on. For `DuckDB` that `ORDER BY` still federates
-/// where [`duckdb_renders_aggregate_order_by`] says the dialect renders it.
+/// where [`duckdb_renders_aggregate_order_by`] says the dialect renders it. A
+/// decimal `avg`, which `DuckDB` answers as a `DOUBLE`, is refused by operand type
+/// in `crate::function_support::duckdb_can_evaluate_expression` (issue #14492).
 #[must_use]
 pub fn duckdb_can_translate_aggregate(call: &AggregateFunction) -> bool {
     !call.func.name().eq_ignore_ascii_case("approx_distinct")

@@ -360,8 +360,22 @@ mod tests {
             task_embed.embed(input.clone())
         );
 
-        left.expect("left embed should succeed");
-        right.expect("right embed should succeed");
+        let left = left.expect("left embed should succeed");
+        let right = right.expect("right embed should succeed");
+        // One upstream call, and the caller that waited on it gets its result
+        // too, not an empty or different vector.
         assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(*left, vec![vec![1.0, 2.0]]);
+        assert_eq!(*right, vec![vec![1.0, 2.0]]);
+
+        // Coalescing spans only requests in flight together: once both have
+        // finished, the same input goes upstream again instead of being served
+        // the earlier result.
+        let again = task_embed
+            .embed(input)
+            .await
+            .expect("a later embed should succeed");
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+        assert_eq!(*again, vec![vec![1.0, 2.0]]);
     }
 }

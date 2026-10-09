@@ -1,0 +1,7 @@
+---
+source: crates/datafusion-optimizer-rules/src/physical_plan/flightsql/aggregate_pushdown.rs
+expression: plan_display(&optimized)
+---
+UnionExec
+  PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", SUM(("l_extendedprice" * "l_discount")) AS "__agg_0" FROM foo.foo.lineitem GROUP BY "l_returnflag"
+  PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", SUM(("l_extendedprice" * "l_discount")) AS "__agg_0" FROM foo.foo.lineitem GROUP BY "l_returnflag"

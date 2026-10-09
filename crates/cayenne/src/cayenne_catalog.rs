@@ -6212,12 +6212,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn test_catalog_creation() {
-        let _catalog = CayenneCatalog::new("sqlite://./test.db").expect("Failed to create catalog");
-        // Tests will be added once implementation is complete
-    }
-
     /// The upserts replaced `INSERT OR REPLACE`, which rewrote the whole row.
     /// `DO UPDATE` writes only the columns it names, so each upsert must insert
     /// every column of its table and set every non-key column from the new row —
@@ -11347,8 +11341,15 @@ mod tests {
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
-        // Should not panic; exercises the logging path for primary_key change.
-        log_configuration_differences("test_table", &stored, &options);
+        let warnings =
+            captured_warnings(|| log_configuration_differences("test_table", &stored, &options));
+        assert_eq!(
+            warnings,
+            vec![configuration_change_warning(
+                "test_table",
+                r#"primary_key: [] -> ["id"]"#
+            )]
+        );
     }
 
     #[test]
@@ -11376,8 +11377,16 @@ mod tests {
             partition_column: None,
             vortex_config: crate::metadata::VortexConfig::default(),
         };
-        // Should not panic; exercises the logging path for on_conflict change.
-        log_configuration_differences("test_table", &stored, &options);
+        // The primary key is unchanged, so only `on_conflict` is listed.
+        let warnings =
+            captured_warnings(|| log_configuration_differences("test_table", &stored, &options));
+        assert_eq!(
+            warnings,
+            vec![configuration_change_warning(
+                "test_table",
+                "on_conflict: none -> do_nothing_all"
+            )]
+        );
     }
 
     #[test]
@@ -11409,8 +11418,76 @@ mod tests {
             partition_column: Some("region".to_string()),
             vortex_config: changed_vortex,
         };
-        // Should not panic; exercises the logging path when many fields change at once.
-        log_configuration_differences("test_table", &stored, &options);
+        // Every changed field, in the order the warning lists them; the unchanged schema is
+        // not among them.
+        let warnings =
+            captured_warnings(|| log_configuration_differences("test_table", &stored, &options));
+        assert_eq!(
+            warnings,
+            vec![configuration_change_warning(
+                "test_table",
+                r#"primary_key: [] -> ["id"], on_conflict: none -> do_nothing_all, partition_column: None -> Some("region"), sort_columns: [] -> ["id"], base_path: "table-root-old" -> "table-root-new""#
+            )]
+        );
+    }
+
+    /// The warning [`log_configuration_differences`] emits for `changed_fields`.
+    fn configuration_change_warning(table: &str, changed_fields: &str) -> String {
+        format!(
+            "Configuration for table '{table}' has changed but the existing acceleration was not \
+             recreated. Changed fields: [{changed_fields}]. The acceleration will continue using \
+             the previously stored configuration. To apply the new configuration, delete the \
+             existing acceleration and restart."
+        )
+    }
+
+    /// The message of every `WARN`-or-worse event emitted on this thread while `emit` runs.
+    fn captured_warnings(emit: impl FnOnce()) -> Vec<String> {
+        /// Records each event's `message` field.
+        #[derive(Clone, Default)]
+        struct WarningCapture(Arc<parking_lot::Mutex<Vec<String>>>);
+
+        /// Formats an event's `message` field into the borrowed string.
+        struct MessageField<'a>(&'a mut String);
+
+        impl tracing::field::Visit for MessageField<'_> {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    use std::fmt::Write as _;
+                    // Writing into a `String` cannot fail.
+                    let _ = write!(self.0, "{value:?}");
+                }
+            }
+        }
+
+        impl tracing::Subscriber for WarningCapture {
+            fn enabled(&self, metadata: &tracing::Metadata<'_>) -> bool {
+                *metadata.level() <= tracing::Level::WARN
+            }
+
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+
+            fn event(&self, event: &tracing::Event<'_>) {
+                let mut message = String::new();
+                event.record(&mut MessageField(&mut message));
+                self.0.lock().push(message);
+            }
+
+            fn enter(&self, _: &tracing::span::Id) {}
+
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+
+        let capture = WarningCapture::default();
+        tracing::subscriber::with_default(capture.clone(), emit);
+        let mut warnings = capture.0.lock();
+        std::mem::take(&mut *warnings)
     }
 
     #[tokio::test]

@@ -4870,9 +4870,18 @@ mod tests {
     #[test]
     fn test_temporal_scalar_as_nanos_rejects_an_out_of_range_value() {
         let array: ArrayRef = Arc::new(TimestampSecondArray::from(vec![i64::MAX]));
+        let err = temporal_scalar_as_nanos(&array).expect_err(
+            "a seconds value too large to hold in nanoseconds must not read as no watermark",
+        );
+        // The strict (`safe: false`) seconds-to-nanoseconds cast is what rejects it,
+        // not some unrelated failure on the way.
         assert!(
-            temporal_scalar_as_nanos(&array).is_err(),
-            "a seconds value too large to hold in nanoseconds must not read as no watermark"
+            matches!(
+                &err,
+                ArrowError::ArithmeticOverflow(message)
+                    if message == "Overflow happened on: 9223372036854775807 * 1000000000"
+            ),
+            "expected the nanosecond scaling to overflow, got: {err}"
         );
     }
 
