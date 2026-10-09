@@ -161,25 +161,6 @@ async fn await_manifest_rows(
     }
 }
 
-/// The key a per-file statistics row is stored under: the object-store location,
-/// which is the store-relative path. The manifest carries only the bare filename.
-fn statistics_row_key(
-    data_path: &std::path::Path,
-    table_id: &str,
-    file: &cayenne::metadata::SnapshotFile,
-) -> String {
-    format!(
-        "{}/{}/{}/{}",
-        data_path
-            .to_string_lossy()
-            .trim_start_matches('/')
-            .trim_end_matches('/'),
-        table_id,
-        file.snapshot_id,
-        file.file_path
-    )
-}
-
 async fn file_scan_byte_size_statistics_do_not_depend_on_their_source(
     fixture: common::TestFixture,
 ) -> TestResult<()> {
@@ -328,7 +309,7 @@ async fn a_blob_without_byte_sizes_is_re_inferred_from_its_footer(
     let files = await_manifest_rows(&fixture, &table_id).await?;
     let scan_snapshot_id = files[0].snapshot_id.clone();
     let stats_key = |file: &cayenne::metadata::SnapshotFile| {
-        statistics_row_key(&fixture.data_path, &table_id, file)
+        common::statistics_row_key(&fixture.data_path, &table_id, file)
     };
     for file in &files {
         fixture
@@ -490,7 +471,7 @@ async fn a_widened_table_still_serves_its_files_from_the_persisted_blob(
     let stored_schema = table.schema();
     let files = await_manifest_rows(&fixture, &table_id).await?;
     let stats_key = |file: &cayenne::metadata::SnapshotFile| {
-        statistics_row_key(&fixture.data_path, &table_id, file)
+        common::statistics_row_key(&fixture.data_path, &table_id, file)
     };
     let mut poisoned = 0;
     for file in &files {

@@ -1,0 +1,10 @@
+---
+source: crates/vortex/src/persistent/opener.rs
+expression: "pretty_format_batches_with_options(&data, &format_opts)?.to_string()"
+---
++-------+--------------------------+
+| c     | b                        |
+| Int32 | Dictionary(UInt32, Utf8) |
++-------+--------------------------+
+| 2     | test                     |
++-------+--------------------------+

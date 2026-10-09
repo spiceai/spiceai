@@ -20,9 +20,17 @@ limitations under the License.
 //! The probe side learns its keys after the physical plan is built. This node
 //! waits for the completed dynamic filter, resolves its index selection, and
 //! removes covered files that cannot contain candidates before constructing
-//! the executable scan. Uncovered files remain in the scan. Every execution
-//! partition shares the same narrowed plan and its file queue; partition
-//! count and ordering remain those advertised by the original plan.
+//! the executable scan. Uncovered files remain in the scan. Partition count and
+//! ordering remain those advertised by the original plan.
+//!
+//! The first partition to start chooses the scan, and every partition of the
+//! execution runs that one. A file scan's partitions drain one queue of files
+//! per plan, so partitions that ran different plans — the unrestricted scan and
+//! a narrowed one, or two narrowings of the same selection — would each read
+//! files the other's queue also holds and return their rows twice. The
+//! provider's answer can change between partitions: a later generation of the
+//! filter, or a probe for another filter that replaces the provider's cached
+//! one, resolves the same keys to a new selection.
 
 use std::fmt;
 use std::sync::Arc;
@@ -48,22 +56,16 @@ use datafusion_datasource::file_scan_config::{FileScanConfig, FileScanConfigBuil
 use datafusion_datasource::source::DataSourceExec;
 use datafusion_physical_expr::PhysicalExpr;
 use futures::{StreamExt, TryStreamExt};
-use parking_lot::Mutex;
+use tokio::sync::OnceCell;
 
 use super::lookup_index::{DynamicLookupAccessPlanProvider, RuntimeLookupSelection};
-
-struct RestrictedScan {
-    selection: Arc<RuntimeLookupSelection>,
-    plan: Arc<dyn ExecutionPlan>,
-}
 
 /// See the module documentation.
 pub(crate) struct RuntimeRestrictedScanExec {
     input: Arc<dyn ExecutionPlan>,
     provider: Arc<DynamicLookupAccessPlanProvider>,
-    /// The narrowed scan, built once per resolved selection and shared by
-    /// every partition.
-    restricted: Arc<Mutex<Option<RestrictedScan>>>,
+    /// The scan every partition runs, chosen by the first to start.
+    scan: Arc<OnceCell<Arc<dyn ExecutionPlan>>>,
 }
 
 impl RuntimeRestrictedScanExec {
@@ -74,7 +76,7 @@ impl RuntimeRestrictedScanExec {
         Self {
             input,
             provider,
-            restricted: Arc::default(),
+            scan: Arc::default(),
         }
     }
 
@@ -87,37 +89,37 @@ impl RuntimeRestrictedScanExec {
         Ok(Arc::new(Self::new(input, Arc::clone(&self.provider))))
     }
 
-    /// The scan to run: `input` narrowed to the files the selection may
-    /// match, or `input` itself when the index cannot answer the filter.
+    /// The scan the next partition to start runs.
+    #[cfg(test)]
+    pub(crate) async fn chosen_scan(&self) -> Result<Arc<dyn ExecutionPlan>> {
+        Self::scan(
+            Arc::clone(&self.input),
+            Arc::clone(&self.provider),
+            Arc::clone(&self.scan),
+        )
+        .await
+    }
+
+    /// The scan every partition runs: `input` narrowed to the files the
+    /// selection may match, or `input` itself when the index cannot answer the
+    /// filter when the first partition starts.
     async fn scan(
         input: Arc<dyn ExecutionPlan>,
         provider: Arc<DynamicLookupAccessPlanProvider>,
-        restricted: Arc<Mutex<Option<RestrictedScan>>>,
+        scan: Arc<OnceCell<Arc<dyn ExecutionPlan>>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        let Some(config) = file_scan(&input) else {
-            return Ok(input);
-        };
-        let predicate: Option<Arc<dyn PhysicalExpr>> = config.file_source().filter();
-        let Some(selection) = provider.selection(predicate.as_ref()).await else {
-            return Ok(input);
-        };
-        // Every partition must run the same narrowed scan: its partitions
-        // share one queue of files, so a second scan built for another
-        // partition would read the same files again.
-        let mut restricted = restricted.lock();
-        match restricted.as_ref() {
-            Some(cached) if Arc::ptr_eq(&cached.selection, &selection) => {
-                Ok(Arc::clone(&cached.plan))
+        scan.get_or_try_init(|| async {
+            let Some(config) = file_scan(&input) else {
+                return Ok(Arc::clone(&input));
+            };
+            let predicate: Option<Arc<dyn PhysicalExpr>> = config.file_source().filter();
+            match provider.selection(predicate.as_ref()).await {
+                Some(selection) => narrowed(&input, &selection),
+                None => Ok(Arc::clone(&input)),
             }
-            _ => {
-                let plan = narrowed(&input, &selection)?;
-                *restricted = Some(RestrictedScan {
-                    selection,
-                    plan: Arc::clone(&plan),
-                });
-                Ok(plan)
-            }
-        }
+        })
+        .await
+        .cloned()
     }
 }
 
@@ -245,9 +247,9 @@ impl ExecutionPlan for RuntimeRestrictedScanExec {
         let schema = self.schema();
         let input = Arc::clone(&self.input);
         let provider = Arc::clone(&self.provider);
-        let restricted = Arc::clone(&self.restricted);
+        let scan = Arc::clone(&self.scan);
         let stream = futures::stream::once(async move {
-            let plan = Self::scan(input, provider, restricted).await?;
+            let plan = Self::scan(input, provider, scan).await?;
             plan.execute(partition, context)
         })
         .try_flatten()
@@ -256,8 +258,8 @@ impl ExecutionPlan for RuntimeRestrictedScanExec {
     }
 
     fn metrics(&self) -> Option<MetricsSet> {
-        match self.restricted.lock().as_ref() {
-            Some(cached) => cached.plan.metrics(),
+        match self.scan.get() {
+            Some(plan) => plan.metrics(),
             None => self.input.metrics(),
         }
     }

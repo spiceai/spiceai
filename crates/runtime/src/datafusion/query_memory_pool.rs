@@ -227,8 +227,29 @@ mod tests {
             .register(&memory);
         scan.try_grow(pool_size)
             .expect("unspillable consumers use the full pool");
-        scan.try_grow(1)
+        let err = scan
+            .try_grow(1)
             .expect_err("unspillable still cannot exceed the pool");
+        assert!(
+            matches!(
+                err,
+                datafusion::error::DataFusionError::ResourcesExhausted(_)
+            ),
+            "expected ResourcesExhausted, got {err:?}"
+        );
+        let message = err.to_string();
+        assert!(
+            message.starts_with(
+                "Resources exhausted: Failed to allocate additional 1.0 B for cayenne_scan \
+                 with 4.0 KB already allocated for this reservation - 0.0 B remain available \
+                 for the total memory pool: greedy_spill_headroom(used: 4.0 KB, \
+                 spillable_used: 0.0 B, pool_size: 4.0 KB, "
+            ),
+            "unexpected error: {message}"
+        );
+        // The rejected grow leaves both the pool and the reservation unchanged.
+        assert_eq!(memory.reserved(), pool_size);
+        assert_eq!(scan.size(), pool_size);
     }
 
     #[test]

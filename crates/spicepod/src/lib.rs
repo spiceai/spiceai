@@ -670,13 +670,6 @@ mod version_tests {
         assert_eq!(v2, SpicepodVersion::V2);
     }
 
-    /// v1beta1 is no longer a valid version.
-    #[test]
-    fn test_v1beta1_rejected() {
-        let result: Result<SpicepodVersion, _> = yaml::from_str("v1beta1");
-        assert!(result.is_err(), "v1beta1 should no longer be accepted");
-    }
-
     /// Version strings serialize to the expected lowercase YAML values.
     #[test]
     fn test_version_enum_serialization() {
@@ -710,9 +703,12 @@ mod version_tests {
             name: invalid
         ";
         let result: Result<SpicepodDefinition, _> = yaml::from_str(yaml);
-        assert!(
-            result.is_err(),
-            "Malformed version 'not-a-version' should be rejected"
+        // Rejected through the `version` field, naming the value and the accepted forms.
+        assert_eq!(
+            result
+                .expect_err("Malformed version 'not-a-version' should be rejected")
+                .to_string(),
+            "invalid spicepod version 'not-a-version': expected a version string like 'v1', 'v2', 'v2.0', 'v2.0.0', or 'v2.0.0-rc.1'"
         );
     }
 

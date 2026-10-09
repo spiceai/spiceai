@@ -96,6 +96,14 @@ mod tests {
     #[test]
     fn unsupported_types_return_error() {
         let dt = DataType::Duration(TimeUnit::Second);
-        arrow_datatype_to_sql(&dt).expect_err("Duration should be unsupported");
+        let err = arrow_datatype_to_sql(&dt).expect_err("Duration should be unsupported");
+        assert!(
+            matches!(
+                &err,
+                datafusion::error::DataFusionError::Execution(message)
+                    if message == "Unsupported Arrow type for forwarded DDL: Duration(s)"
+            ),
+            "{err:?}"
+        );
     }
 }

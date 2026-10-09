@@ -1159,6 +1159,7 @@ mod tests {
     use std::num::NonZeroU32;
 
     use super::*;
+    use futures::FutureExt;
     use object_store::memory::InMemory;
 
     #[tokio::test]
@@ -1168,10 +1169,17 @@ mod tests {
             .with_max_concurrent_requests(5)
             .add_quota(Quota::per_second(NonZeroU32::new(10).expect("non-zero")))
             .build();
+        assert_eq!(rate_controller.available_permits(), Some(5));
 
         let permit = rate_controller.acquire().await.expect("acquire");
         assert!(permit.semaphore.is_some());
+        assert_eq!(rate_controller.available_permits(), Some(4));
         drop(permit);
+        assert_eq!(
+            rate_controller.available_permits(),
+            Some(5),
+            "dropping a permit returns its slot"
+        );
 
         let permits = (0..5)
             .map(|_| rate_controller.acquire())
@@ -1180,17 +1188,27 @@ mod tests {
             .await
             .expect("acquire all");
 
-        tokio::select! {
-            _ = rate_controller.acquire() => panic!("semaphore should have blocked"),
-            () = tokio::time::sleep(Duration::from_millis(200)) => {}
-        }
+        // The cap is reached: no slot is left, so a sixth acquire waits for one.
+        // Bounded by time rather than checked on its first poll: the
+        // controller's acquire ends in its jitter sleep, and even a zero-length
+        // sleep is pending on its first poll, so a first-poll check would pass
+        // whether or not the cap held. Nothing frees a slot while it waits.
+        assert_eq!(rate_controller.available_permits(), Some(0));
+        let blocked =
+            tokio::time::timeout(Duration::from_millis(50), rate_controller.acquire()).await;
+        assert!(
+            blocked.is_err(),
+            "semaphore should have blocked, got {blocked:?}"
+        );
 
         drop(results.pop().expect("at least one"));
+        assert_eq!(rate_controller.available_permits(), Some(1));
 
-        tokio::time::timeout(Duration::from_secs(1), rate_controller.acquire())
+        let _sixth = tokio::time::timeout(Duration::from_secs(1), rate_controller.acquire())
             .await
             .expect("should not time out")
             .expect("acquire ok");
+        assert_eq!(rate_controller.available_permits(), Some(0));
     }
 
     #[tokio::test]
@@ -1235,8 +1253,33 @@ mod tests {
         );
     }
 
+    /// Waits until a new rate-control window has just begun, so what follows
+    /// runs well inside a single window. Windows are aligned to the Unix epoch,
+    /// as the leased buckets align them.
+    async fn wait_for_window_start(window: Duration) {
+        let window_ms = u64::try_from(window.as_millis()).expect("window fits in u64");
+        let current_window = || {
+            let since_epoch = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("system clock is after the Unix epoch");
+            u64::try_from(since_epoch.as_millis()).expect("milliseconds fit in u64") / window_ms
+        };
+        let start = current_window();
+        // Bounded, so a clock that never advances fails the test instead of
+        // hanging it.
+        let deadline = tokio::time::Instant::now() + window * 10;
+        while current_window() == start {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "window {start} never ended"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
     #[tokio::test]
     async fn cluster_mode_acquire_blocks_when_lease_exhausted() {
+        let window = Duration::from_millis(200);
         let store: Arc<dyn ObjectStore> = Arc::new(InMemory::new());
         let controller = RateControllerBuilder::new()
             .with_jitter(JitterConfig::zero())
@@ -1250,26 +1293,35 @@ mod tests {
                 "test/origin",
                 "https://example.com".to_string(),
                 "a".to_string(),
-                Duration::from_millis(200),
+                window,
             )
             .build();
 
+        // Lease at the top of a fresh window, so the drain and the check below
+        // finish long before the window rolls and promotes the pre-leased next
+        // window, which would let the blocked acquire through.
+        wait_for_window_start(window).await;
         controller
             .refresh_and_persist_state_snapshot()
             .await
             .expect("first lease");
 
-        // Drain the lease.
+        // A 2/s quota over a 200 ms window is a one-token budget, all of it
+        // leased to the only replica. Drain it.
         let granted = controller.leased_bucket_metrics()[0].1.lease_granted();
-        for _ in 0..granted {
-            controller.acquire().await.expect("acquire within lease");
-        }
+        assert_eq!(granted, 1);
+        controller.acquire().await.expect("acquire within lease");
 
-        // Next acquire must block.
-        tokio::select! {
-            _ = controller.acquire() => panic!("should have blocked, lease was {granted}"),
-            () = tokio::time::sleep(Duration::from_millis(50)) => {}
-        }
+        // With the lease drained, the next acquire cannot complete on its
+        // first poll: it has to wait for the next window. The bucket is polled
+        // directly because the controller's acquire ends in its jitter sleep,
+        // and even a zero-length sleep is pending on its first poll, so a
+        // controller-level poll would read as blocked whatever the lease said.
+        let blocked = controller.leased_buckets[0].acquire().now_or_never();
+        assert!(
+            blocked.is_none(),
+            "should have blocked, lease was {granted}, got {blocked:?}"
+        );
     }
 
     const TEST_ORIGIN: &str = "https://origin.example.com";

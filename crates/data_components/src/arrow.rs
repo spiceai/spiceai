@@ -581,8 +581,16 @@ mod tests {
             ("col2", arrow::datatypes::DataType::Utf8),
         ]);
 
-        let result = parse_indexes_option("(col1,invalid):unique", &schema);
-        let _ = result.expect_err("expected error for invalid column");
+        let err = parse_indexes_option("(col1,invalid):unique", &schema)
+            .expect_err("expected error for invalid column");
+        assert!(
+            matches!(
+                &err,
+                DataFusionError::Configuration(message)
+                    if message == "Index column 'invalid' not found in schema"
+            ),
+            "the compound key must be rejected as a configuration error naming 'invalid', got: {err:?}"
+        );
     }
 
     #[test]

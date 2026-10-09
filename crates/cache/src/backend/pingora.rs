@@ -1313,11 +1313,21 @@ mod tests {
         backend.insert(key, TestValue::new("value")).await;
 
         // Should be accessible immediately
-        assert!(backend.get(&key).await.is_some());
+        assert_eq!(
+            backend.get(&key).await,
+            Some(Arc::new(TestValue::new("value"))),
+            "a fresh entry must serve the value that was inserted"
+        );
 
-        // Should still be accessible after short delay
+        // Should still be accessible after short delay. A hit is served by removing the
+        // entry and re-admitting it, so this second read also proves the first one put
+        // the same value back.
         tokio::time::sleep(Duration::from_millis(50)).await;
-        assert!(backend.get(&key).await.is_some());
+        assert_eq!(
+            backend.get(&key).await,
+            Some(Arc::new(TestValue::new("value"))),
+            "an entry inside its TTL must keep serving the value that was inserted"
+        );
     }
 
     #[tokio::test]

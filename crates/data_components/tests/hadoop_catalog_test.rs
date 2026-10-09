@@ -384,6 +384,17 @@ mod tests {
             "{catalog_name} - The table should be readonly"
         );
 
+        // An Iceberg client handed this table reads it from its metadata file,
+        // so the loaded table has to name that file.
+        let metadata_location = table
+            .metadata_location()
+            .expect("Should know the metadata file the table was loaded from");
+        assert!(
+            metadata_location.contains(&format!("/{table_name}/metadata/"))
+                && metadata_location.ends_with(".metadata.json"),
+            "{catalog_name} - The metadata location should be the table's metadata file, found: {metadata_location}"
+        );
+
         // Read rows from the table
         let table_scan = table
             .scan()
