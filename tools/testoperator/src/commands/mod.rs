@@ -1016,19 +1016,44 @@ mod tests {
         );
     }
 
-    /// Whether `testoperator_run_bench.yml` starts its local `postgres_tpch`
-    /// service for this run — the condition on that service's image, which is
-    /// the only source `postgres_version` changes.
+    /// Whether `testoperator_run_bench.yml` starts a local `PostgreSQL` whose
+    /// version `postgres_version` sets: its `postgres_tpch` service (the
+    /// condition on that service's image), or the CH-benCH source.
     fn reads_the_local_postgres_source(
         query_set: &str,
         scale_factor: &str,
         spicepod: &str,
     ) -> bool {
-        spicepod.contains("postgres")
-            && !spicepod.contains("ducklake")
-            && (((query_set.starts_with("tpch") || query_set == "tpcds")
-                && (scale_factor == "1" || scale_factor == "10"))
-                || (query_set == "clickbench" && spicepod.contains("s3[parquet]-postgres")))
+        query_set == "chbench"
+            || (spicepod.contains("postgres")
+                && !spicepod.contains("ducklake")
+                && (((query_set.starts_with("tpch") || query_set == "tpcds")
+                    && (scale_factor == "1" || scale_factor == "10"))
+                    || (query_set == "clickbench" && spicepod.contains("s3[parquet]-postgres"))))
+    }
+
+    /// Every CH-benCH HTAP dispatch config names source versions its source
+    /// lists, so a weekly source-version run cannot start an unsupported or
+    /// retired server.
+    #[test]
+    fn htap_dispatches_expand_to_listed_source_versions() {
+        let dispatch_root = Path::new(env!("CARGO_MANIFEST_DIR")).join("dispatch/chbench");
+        let mut runs = 0;
+        for dispatch_path in
+            scan_directory_for_yamls(&dispatch_root).expect("should scan the dispatch directory")
+        {
+            let dispatch_file =
+                std::fs::File::open(&dispatch_path).expect("should open the dispatch file");
+            let dispatch: DispatchTestFile =
+                yaml::from_reader(dispatch_file).expect("should parse the dispatch file");
+            for htap in &dispatch.tests.htap {
+                runs += htap
+                    .expand_runs()
+                    .unwrap_or_else(|e| panic!("{}: {e}", dispatch_path.display()))
+                    .len();
+            }
+        }
+        assert!(runs > 0, "should find CH-benCH HTAP dispatches");
     }
 
     /// Every scale factor 1 TPC-H, TPC-DS and `ClickBench` benchmark dispatch

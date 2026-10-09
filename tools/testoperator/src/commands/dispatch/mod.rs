@@ -171,13 +171,18 @@ pub async fn dispatch(args: DispatchArgs) -> Result<()> {
             }
             TestType::Htap => {
                 for htap in &test_file.tests.htap {
-                    tests_to_dispatch.push((
-                        path,
-                        serde_json::json!(WorkflowArgs {
-                            specific_args: htap.clone(),
-                            spiced_commit: spiced_commit.clone(),
-                        }),
-                    ));
+                    let runs = htap
+                        .expand_runs()
+                        .map_err(|e| anyhow::anyhow!("Failed to read {}: {e}", path.display()))?;
+                    for run in runs {
+                        tests_to_dispatch.push((
+                            path,
+                            serde_json::json!(WorkflowArgs {
+                                specific_args: run,
+                                spiced_commit: spiced_commit.clone(),
+                            }),
+                        ));
+                    }
                 }
             }
             TestType::Search => {

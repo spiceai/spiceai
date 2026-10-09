@@ -568,6 +568,65 @@ pub struct HtapDispatchArgs {
     /// Optional target OLTP transaction rate for the OLTP workload (txn/s).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rate: Option<u32>,
+    /// The source database's release line: one of the versions
+    /// `test/source_versions.json` lists for the spicepod's source (`MySQL` for
+    /// a `mysql*` spicepod, otherwise `PostgreSQL`), or `all` for one run on each
+    /// of them. Unset runs the workflow's default line.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source_version: Option<String>,
+}
+
+impl HtapDispatchArgs {
+    /// The source database the HTAP workflow starts for this spicepod: it reads
+    /// the source from the file name, `mysql*` for `MySQL`, so this does too.
+    fn source(&self) -> Source {
+        let file_name = self
+            .spicepod_path
+            .file_name()
+            .map(|name| name.to_string_lossy())
+            .unwrap_or_default();
+        if file_name.starts_with("mysql") {
+            Source::MySql
+        } else {
+            Source::Postgres
+        }
+    }
+
+    /// The runs this entry dispatches: one per listed release line of its
+    /// source for `source_version: all`, otherwise just this one.
+    ///
+    /// # Errors
+    ///
+    /// When `source_version` names a version `test/source_versions.json` does
+    /// not list for the spicepod's source.
+    pub fn expand_runs(&self) -> anyhow::Result<Vec<Self>> {
+        let Some(requested) = self.source_version.as_deref() else {
+            return Ok(vec![self.clone()]);
+        };
+        let source = self.source();
+        let listed = source_versions(source)?;
+        let versions: Vec<&str> = listed
+            .versions
+            .iter()
+            .map(|listed| listed.version.as_str())
+            .collect();
+        if requested == ALL_SOURCE_VERSIONS {
+            return Ok(versions
+                .into_iter()
+                .map(|version| Self {
+                    source_version: Some(version.to_string()),
+                    ..self.clone()
+                })
+                .collect());
+        }
+        anyhow::ensure!(
+            versions.contains(&requested),
+            "source_version {requested} is not a supported {} version; test/source_versions.json lists {}, or use `{ALL_SOURCE_VERSIONS}`",
+            source.key(),
+            versions.join(", ")
+        );
+        Ok(vec![self.clone()])
+    }
 }
 
 fn default_queryset() -> String {
@@ -590,6 +649,51 @@ pub struct WorkflowArgs<T: Serialize> {
 mod tests {
     use super::*;
     use test_framework::queries::QuerySet;
+
+    /// An HTAP entry's versions are its spicepod's source's: `MySQL` for a
+    /// `mysql*` spicepod, as the HTAP workflow reads it, `PostgreSQL` otherwise.
+    #[test]
+    fn htap_source_version_expands_to_the_spicepod_source_lines() {
+        let yaml = "
+tests:
+  htap:
+    - spicepod_path: accelerated/mysql-cayenne[file].yaml
+      runner_type: spiceai-dev-large-runners
+      source_version: all
+    - spicepod_path: accelerated/postgres-cayenne[file].yaml
+      runner_type: spiceai-dev-large-runners
+      source_version: '8.4'
+";
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
+        let listed = |source| -> Vec<String> {
+            source_versions(source)
+                .expect("the version list parses")
+                .versions
+                .iter()
+                .map(|listed| listed.version.clone())
+                .collect()
+        };
+
+        let runs = test_file.tests.htap[0]
+            .expand_runs()
+            .expect("`all` expands");
+        assert_eq!(
+            runs.iter()
+                .map(|run| run.source_version.clone().expect("each run names its line"))
+                .collect::<Vec<_>>(),
+            listed(Source::MySql)
+        );
+        assert_eq!(
+            test_file.tests.htap[1]
+                .expand_runs()
+                .expect_err("8.4 is a MySQL line, not a PostgreSQL one")
+                .to_string(),
+            format!(
+                "source_version 8.4 is not a supported postgres version; test/source_versions.json lists {}, or use `all`",
+                listed(Source::Postgres).join(", ")
+            )
+        );
+    }
 
     /// `postgres_version: all` is what keeps the weekly source-version runs in
     /// step with `test/source_versions.json`, and a refused version is what keeps
@@ -624,7 +728,10 @@ tests:
             .expect("`all` expands");
         assert_eq!(
             runs.iter()
-                .map(|run| run.postgres_version.clone().expect("each run names its line"))
+                .map(|run| run
+                    .postgres_version
+                    .clone()
+                    .expect("each run names its line"))
                 .collect::<Vec<_>>(),
             listed
         );

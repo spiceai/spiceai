@@ -15,6 +15,10 @@ on:
     # SF1 uses a different runner pool and a unique concurrency group, so it does not serialize
     # with the SF1000 xlarge queue.
     - cron: '0 6,18 * * *'
+    # htap-sf1-source-versions, weekly (Sunday 0200) — the SF1 PostgreSQL and MySQL Cayenne
+    # configs on every source release line in test/source_versions.json (7 runs), on the
+    # same large runners as htap-sf1, which start the source in Docker at a chosen version.
+    - cron: '0 2 * * 0'
 
   workflow_dispatch:
     inputs:
@@ -32,6 +36,7 @@ on:
           - 'sf100'
           - 'sf1000'
           - 'sf1000-adaptive'
+          - 'sf1-source-versions'
 
 jobs:
   dispatch-htap:
@@ -109,6 +114,7 @@ jobs:
               '0 */8 * * *')                  SF=sf1000-adaptive ;;
               '0 4 * * *')                    SF=sf1000 ;;
               '0 6,18 * * *')                 SF=sf1 ;;
+              '0 2 * * 0')                    SF=sf1-source-versions ;;
               *)                              SF= ;;   # unrecognized cron — dispatch nothing
             esac
           fi
