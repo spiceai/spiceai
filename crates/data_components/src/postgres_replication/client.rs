@@ -298,14 +298,12 @@ mod tests {
                 "attempt {attempt} should log at DEBUG, not WARN",
             );
         }
-    }
-
-    #[test]
-    fn reconnect_log_helper_handles_saturating_attempt_count() {
-        // Helper should be callable across the full u32 range (including
-        // the saturated max value) without panicking — the production
-        // counter uses `saturating_add` so it can sit at u32::MAX for an
-        // arbitrarily long outage.
-        log_transient_reconnect(u32::MAX, "events", "connection refused", 500);
+        // The production counter uses `saturating_add`, so an arbitrarily long
+        // outage parks it at `u32::MAX`; that saturated count must stay at
+        // DEBUG rather than wrapping back into the WARN range.
+        assert!(
+            !reconnect_logs_at_warn(u32::MAX),
+            "a saturated attempt count should log at DEBUG, not WARN",
+        );
     }
 }

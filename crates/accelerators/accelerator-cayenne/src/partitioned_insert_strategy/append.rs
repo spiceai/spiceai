@@ -232,6 +232,7 @@ impl DataSink for CayennePartitionedAppendSink {
         let _coordinator_guard = Arc::clone(&self.coordinator_lock).lock_owned().await;
 
         let target_partitions = context.session_config().target_partitions();
+        let superseded = util::session_state::superseded_rows(context.session_config());
 
         // Phase 1: fan input out to per-partition writer tasks that each call
         // begin_staged_append → prepare (writes the per-partition staging
@@ -258,7 +259,11 @@ impl DataSink for CayennePartitionedAppendSink {
                     s
                 } else {
                     let (handle, tx) = self
-                        .prepare_new_provider_for_partition(values, target_partitions)
+                        .prepare_new_provider_for_partition(
+                            values,
+                            target_partitions,
+                            superseded.clone(),
+                        )
                         .await?;
 
                     senders.insert(key.clone(), tx.clone());
@@ -818,6 +823,7 @@ impl CayennePartitionedAppendSink {
         &self,
         partition_values: Vec<ScalarValue>,
         target_partitions: usize,
+        superseded: Option<Arc<util::session_state::SupersededRows>>,
     ) -> Result<
         (
             JoinHandle<cayenne::provider::Result<PreparedStagedAppend>>,
@@ -840,7 +846,9 @@ impl CayennePartitionedAppendSink {
                 "This Cayenne partition does not support atomic deferred append".to_string(),
             ));
         }
-        let cayenne_owned = cayenne.clone_for_write_operations();
+        let cayenne_owned = cayenne
+            .clone_for_write_operations()
+            .with_superseded_rows(superseded);
         let (tx, rx) = mpsc::channel::<datafusion::common::Result<RecordBatch>>(
             PARTITION_WRITER_CHANNEL_DEPTH,
         );

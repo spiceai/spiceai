@@ -48,9 +48,13 @@ on:
         default: false
 
 concurrency:
-  # Allow only one workflow per any non-trunk branch.
-  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref_name }}-${{ github.ref_name == 'trunk' && github.sha || 'any-sha' }}
-  cancel-in-progress: true
+  # A newer run cancels the one in progress for the same pull request, merge group, non-trunk
+  # branch or manually dispatched trunk commit. Trunk pushes share one group and never cancel
+  # the running build on `spiceai-macos-large`: a newer push replaces only the run still waiting.
+  # The trunk commit is the merge-group commit that already passed this workflow;
+  # the jobs that run only on push cover the first and latest commit of a burst of merges.
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref_name }}-${{ (github.ref_name == 'trunk' && github.event_name != 'push') && github.sha || 'any-sha' }}
+  cancel-in-progress: ${{ github.ref_name != 'trunk' || github.event_name != 'push' }}
 
 env:
   # CI performance optimizations
@@ -108,6 +112,10 @@ jobs:
                 target_arch: "x86_64"
               }, {
                 name: "macOS aarch64 (Apple Silicon)",
+                // `spiceai-macos-large` on every event, trunk pushes included. A three-hour
+                // build on a `spiceai-macos` mini runs past its 180-minute step bound where
+                // the host is shared (#14557), and starves the short macOS test jobs below
+                // that sit on that pool to avoid exactly this neighbour (#13761).
                 builder: "spiceai-macos-large",
                 runner: "macos-15",
                 target_os: "darwin",
@@ -163,7 +171,7 @@ jobs:
         uses: ./.github/actions/install-protoc
 
       - name: Set up spiceio
-        if: matrix.target.builder == 'spiceai-macos-large' && env.HAS_SPICEIO_SECRET == 'true'
+        if: matrix.target.target_os == 'darwin' && env.HAS_SPICEIO_SECRET == 'true'
         id: setup-spiceio
         uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
         with:
@@ -199,7 +207,7 @@ jobs:
         # that a wedge here is cut by *this step* — which attributes the failure to the
         # compile — rather than by the job bound, which GitHub renders as the whole job
         # being cancelled. It buys no diagnostics on this leg: the `always()` steps below
-        # are all gated to `spiceai-macos-large`, so a Linux build has none to run.
+        # are all gated to macOS, so a Linux build has none to run.
         timeout-minutes: 150
         uses: ./.github/actions/build-spiced
         with:
@@ -207,6 +215,10 @@ jobs:
           build_cli: 'true'
           upload_artifact: 'true'
           artifact_name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+          # The binaries only hand off to this run's test jobs, so they need not
+          # outlive it; at the repository's 30-day default each run kept its
+          # two builds (~600 MiB) stored for a month.
+          artifact_retention_days: '1'
 
       - name: Build spiced and spice CLI (macOS)
         if: matrix.target.target_os == 'darwin'
@@ -222,10 +234,11 @@ jobs:
           build_cli: 'true'
           upload_artifact: 'true'
           artifact_name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+          artifact_retention_days: '1'
           spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
 
       - name: Show sccache stats
-        if: always() && matrix.target.builder == 'spiceai-macos-large' && env.SCCACHE_SETUP == 'true'
+        if: always() && matrix.target.target_os == 'darwin' && env.SCCACHE_SETUP == 'true'
         # `always()`: this is the one step that reports cache health, and without it
         # it is skipped on exactly the failures it would explain (#12420). The `||`
         # keeps a diagnostic from ever deciding a verdict — when the cache backend is
@@ -234,11 +247,12 @@ jobs:
           sccache --show-stats || echo "::warning::sccache --show-stats failed, so the cache server is not answering either. Read a build failure in this job as a possible cache-backend outage rather than a code failure."
 
       - name: Kill spiceio
-        if: always() && matrix.target.builder == 'spiceai-macos-large' && steps.setup-spiceio.outputs.pid != ''
+        if: always() && matrix.target.target_os == 'darwin' && steps.setup-spiceio.outputs.pid != ''
         run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
 
+      # Pull request and merge-queue checks keep no diagnostic artifacts.
       - name: Upload spiceio logs
-        if: always() && matrix.target.builder == 'spiceai-macos-large'
+        if: always() && matrix.target.target_os == 'darwin' && github.event_name != 'pull_request' && github.event_name != 'merge_group'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: spiceio-e2e-build-logs
@@ -364,16 +378,14 @@ jobs:
               },
               {
                 name: "macOS aarch64 (Apple Silicon)",
-                // The standard pool, not `spiceai-macos-large`: these two
-                // jobs are minutes long and every wait inside them is bounded
-                // (60s readiness, then 30s/30s/60s in the expect scripts), so
-                // what decides them is the size of whatever shares their Mac
-                // mini. A host carries several runner instances, and sharing
-                // one with a three-hour build starved this job badly enough
-                // that `spiced --version` took 186s against 0.1-0.3s on an
-                // uncontended host, blowing those bounds (#13761). The pool
-                // split bounds the neighbour rather than removing it.
-                runner: "spiceai-macos",
+                // `spiceai-macos-large`, like `test_hf_model`: both gate the
+                // merge queue through `E2E Test CI`, and on the `spiceai-macos`
+                // minis this 2.4-minute leg queued 83 min at p90 for a runner
+                // (merge_group, 2026-09-29..10-06). Every wait inside it is
+                // bounded (60s readiness, then 30s/30s/60s in the expect
+                // scripts), so a host starved by a neighbouring build fails it
+                // rather than slowing it (#13761).
+                runner: "spiceai-macos-large",
                 target_os: "darwin",
                 target_arch: "aarch64"
               }
@@ -439,6 +451,10 @@ jobs:
           url: ${{ env.SPICE_HTTP_ENDPOINT }}/v1/ready
           timeout: '60'
 
+      - name: Configure apt mirrors (Linux)
+        if: matrix.target.target_os == 'linux'
+        uses: ./.github/actions/configure-apt
+
       - name: Install expect (linux)
         if: matrix.target.target_os == 'linux'
         run: |
@@ -446,7 +462,7 @@ jobs:
           sudo apt-get install -y expect
 
       - name: Install expect (macOS)
-        if: matrix.target.target_os == 'darwin' && matrix.target.runner != 'spiceai-macos'
+        if: matrix.target.target_os == 'darwin' && !startsWith(matrix.target.runner, 'spiceai-macos')
         run: |
           if command -v expect >/dev/null 2>&1; then
             expect -v
@@ -482,8 +498,12 @@ jobs:
       fail-fast: false
       matrix:
         target:
+          # A self-hosted Mac for Metal and for the Hugging Face cache in $HOME
+          # (see below); the large pool because this leg gates the merge queue,
+          # and on the `spiceai-macos` minis it queued 88 min at p90 for a runner
+          # (merge_group, 2026-09-29..10-06).
           - name: 'macOS aarch64 (Apple Silicon)'
-            runner: 'spiceai-macos'
+            runner: 'spiceai-macos-large'
             target_os: 'darwin'
             target_arch: 'aarch64'
     steps:
@@ -640,6 +660,10 @@ jobs:
           url: ${{ env.SPICE_HTTP_ENDPOINT }}/v1/ready
           timeout: '300'
 
+      - name: Configure apt mirrors (Linux)
+        if: matrix.target.target_os == 'linux'
+        uses: ./.github/actions/configure-apt
+
       - name: Install expect (linux)
         if: matrix.target.target_os == 'linux'
         run: |
@@ -647,7 +671,7 @@ jobs:
           sudo apt-get install -y expect
 
       - name: Install expect (macOS)
-        if: matrix.target.target_os == 'darwin' && matrix.target.runner != 'spiceai-macos'
+        if: matrix.target.target_os == 'darwin' && !startsWith(matrix.target.runner, 'spiceai-macos')
         run: |
           if command -v expect >/dev/null 2>&1; then
             expect -v
@@ -920,6 +944,78 @@ jobs:
         with:
           working-directory: test_app
 
+  test_cold_start_unkeyed_append:
+    name: 'Cold start: unkeyed Cayenne append loads without rewriting itself'
+    # The nightly `testoperator run cold-start` workflow times every acceleration shape
+    # against the previous release; this is its timing-free bound, cheap enough for the
+    # merge queue. A load into an empty table must not trigger a full compaction.
+    if: github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch'
+    runs-on: spiceai-dev-runners
+    needs:
+      - build
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: download artifacts - build_linux_x86_64
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: build_linux_x86_64
+          path: ./build
+
+      - name: Install spice
+        uses: ./.github/actions/install-spice
+        with:
+          build-path: ./build
+
+      - name: Install MinIO
+        uses: ./.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Check for the fixture
+        run: |
+          if ! mc stat spice-minio/benchmarks/cold_start/audit_events_3m/_SEEDED >/dev/null 2>&1; then
+            echo "The cold-start fixture is missing from MinIO; run the 'testoperator run cold-start' workflow once to seed it."
+            exit 1
+          fi
+
+      - name: Start spiced
+        run: |
+          mkdir -p cold_start_app
+          cp 'test/spicepods/cold_start/delta_lake-cayenne[file]-append_unkeyed_sorted.yaml' cold_start_app/spicepod.yaml
+          cd cold_start_app
+          spiced --cpu-cores 2 --metrics 127.0.0.1:9095 &> spice.log &
+        env:
+          S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Wait for the dataset to be ready
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          working-directory: cold_start_app
+          timeout: '600'
+
+      - name: Check the load committed no full compaction and holds every row
+        run: |
+          set -o pipefail
+          full=$(curl -sf http://127.0.0.1:9095/metrics \
+            | awk '/^cayenne_compaction_outcome_total\{/ && /kind="full"/ && /outcome="committed"/ && /table="audit_events"/ {sum += $NF} END {print sum + 0}')
+          rows=$(curl -sf -X POST -H 'Content-Type: text/plain' --data 'SELECT COUNT(*) AS n FROM audit_events' \
+            http://127.0.0.1:8090/v1/sql | tr -dc '0-9')
+          echo "full compactions before ready: ${full}; rows: ${rows}"
+          test "${full}" = 0
+          test "${rows}" = 2940086
+
+      - name: Stop spice and check logs
+        if: always()
+        uses: ./.github/actions/stop-spice
+        with:
+          working-directory: cold_start_app
+
   test_quickstart_data_postgres:
     name: 'Test PostgreSQL quickstart (${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}; acceleration: ${{ matrix.acceleration.engine }})'
     runs-on: ${{ matrix.target.runner }}
@@ -1142,6 +1238,10 @@ jobs:
         with:
           pg-db: testdb
 
+      - name: Configure apt mirrors (Linux)
+        if: matrix.target.target_os == 'linux'
+        uses: ./.github/actions/configure-apt
+
       - name: Install MySQL (Linux)
         if: matrix.target.target_os == 'linux'
         run: |
@@ -1156,8 +1256,18 @@ jobs:
       - name: Install MySQL (MacOS)
         if: matrix.target.target_os == 'darwin'
         run: |
+          # Homebrew's API and bottle hosts fail transiently; retry each network step.
+          retry() {
+            for attempt in 1 2 3; do
+              "$@" && return 0
+              echo "::warning::'$*' failed (attempt ${attempt}/3)"
+              sleep $((attempt * 15))
+            done
+            return 1
+          }
           # macos-15 runner bug requires 'brew update': https://github.com/actions/runner-images/issues/11855#issuecomment-2754201066
-          brew update
+          # A stale index only matters if the install below fails, so don't fail on it here.
+          retry brew update || echo "::warning::brew update failed; installing with the image's formula index"
           # The macos-15 image points bin/openssl at the deprecated openssl@1.1 with a plain
           # symlink that Homebrew does not own, so `brew unlink openssl@1.1` leaves it in
           # place. When a mysql@8.4 bottle needs a newer openssl@3, brew upgrades it but
@@ -1167,16 +1277,25 @@ jobs:
           if [[ "$(readlink "$openssl_link")" == */openssl@1.1/* ]]; then
             rm "$openssl_link"
           fi
-          brew install mysql@8.4
+          retry brew install mysql@8.4
           brew link mysql@8.4 --force --overwrite
           brew services start mysql@8.4
-          sleep 5
+          for attempt in {1..30}; do
+            mysqladmin ping --silent && break
+            sleep 1
+          done
           mysql -e "CREATE USER test_user@localhost IDENTIFIED BY 'password';"
           mysql -e "GRANT ALL PRIVILEGES ON testdb.* TO 'test_user'@'localhost'; FLUSH PRIVILEGES;"
           mysql -e "CREATE DATABASE IF NOT EXISTS testdb;" -utest_user -ppassword
 
       - name: Wait for MySQL to start
-        run: sleep 10
+        run: |
+          for attempt in {1..30}; do
+            mysqladmin ping -h localhost --silent && exit 0
+            sleep 1
+          done
+          echo "::error::MySQL is not accepting connections on localhost after 30s"
+          exit 1
 
       - name: Check MySQL
         run: echo 'SELECT VERSION();' | mysql -h localhost -utest_user -ppassword
@@ -1333,6 +1452,10 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Configure apt mirrors (Linux)
+        if: matrix.target.target_os == 'linux'
+        uses: ./.github/actions/configure-apt
+
       - name: Install Clickhouse
         if: matrix.target.target_os == 'linux'
         run: |
@@ -1342,7 +1465,10 @@ jobs:
           sudo apt-get update
           sudo DEBIAN_FRONTEND=noninteractive apt-get install -y clickhouse-common-static=${CLICKHOUSE_VERSION} clickhouse-server=${CLICKHOUSE_VERSION} clickhouse-client=${CLICKHOUSE_VERSION}
           sudo -u clickhouse /usr/bin/clickhouse-server --config=/etc/clickhouse-server/config.xml --daemon  -- --tcp_port=9001
-          sleep 5
+          for attempt in {1..30}; do
+            clickhouse client --port 9001 --query="SELECT 1" >/dev/null 2>&1 && break
+            sleep 1
+          done
           clickhouse client --port 9001 -udefault --query="CREATE USER test_user IDENTIFIED BY 'password';"
           clickhouse client --port 9001 -udefault --query="GRANT ALL PRIVILEGES ON testdb.* TO 'test_user';"
           clickhouse client --port 9001 -utest_user --password password --query="CREATE DATABASE IF NOT EXISTS testdb;"
@@ -1352,18 +1478,27 @@ jobs:
         run: |
           CLICKHOUSE_VERSION="26.3.9.8-lts"
           BASE_URL="https://github.com/ClickHouse/ClickHouse/releases/download/v${CLICKHOUSE_VERSION}"
-          curl -fsSL "${BASE_URL}/clickhouse-macos-aarch64" -o clickhouse-macos-aarch64
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 "${BASE_URL}/clickhouse-macos-aarch64" -o clickhouse-macos-aarch64
           mv clickhouse-macos-aarch64 clickhouse
           chmod +x clickhouse
           sudo ./clickhouse install --noninteractive
           sudo clickhouse server --config=/etc/clickhouse-server/config.xml --daemon  -- --tcp_port=9001
-          sleep 5
+          for attempt in {1..30}; do
+            clickhouse client --port 9001 --query="SELECT 1" >/dev/null 2>&1 && break
+            sleep 1
+          done
           clickhouse client --port 9001 -udefault --query="CREATE USER test_user IDENTIFIED BY 'password';"
           clickhouse client --port 9001 -udefault --query="GRANT ALL PRIVILEGES ON testdb.* TO 'test_user';"
           clickhouse client --port 9001 -utest_user --password password --query="CREATE DATABASE IF NOT EXISTS testdb;"
 
       - name: Wait for Clickhouse to start
-        run: sleep 10
+        run: |
+          for attempt in {1..30}; do
+            clickhouse client --port 9001 --query="SELECT 1" >/dev/null 2>&1 && exit 0
+            sleep 1
+          done
+          echo "::error::ClickHouse is not accepting connections on port 9001 after 30s"
+          exit 1
 
       - name: Check Clickhouse
         run: clickhouse client --port 9001 -utest_user --password password --query="SELECT version();"
@@ -1891,8 +2026,9 @@ jobs:
           python3 test/github/check_live.py --endpoint "${SPICE_HTTP_ENDPOINT}" \
             --artifacts github-live-results
 
+      # Pull request and merge-queue checks keep no diagnostic artifacts.
       - name: Upload GitHub test evidence
-        if: always()
+        if: always() && github.event_name != 'pull_request' && github.event_name != 'merge_group'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: github-connector-results-${{ matrix.target.target_os }}-${{ matrix.target.target_arch }}
@@ -1908,9 +2044,56 @@ jobs:
         with:
           working-directory: test_app
 
+  hf_connector_live:
+    name: 'Test Hugging Face connector against the live Hub'
+    # Reads pinned commits of public datasets through the Hub and compares every answer
+    # with one recorded from DuckDB's own `hf://` reader (test/huggingface/check_live.py).
+    if: github.event_name == 'merge_group' || github.event_name == 'workflow_dispatch'
+    runs-on: spiceai-dev-runners
+    needs:
+      - build
+    timeout-minutes: 20
+    concurrency:
+      group: huggingface-connector-live-hub
+      queue: max
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: download artifacts - build_linux_x86_64
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: build_linux_x86_64
+          path: ./build
+
+      - name: Install spice
+        uses: ./.github/actions/install-spice
+        with:
+          build-path: ./build
+
+      # Anonymous Hub requests share a per-IP quota across the runner pool; the token,
+      # when the secret is available, gives this job its own.
+      - name: Query live Hugging Face datasets and compare the answers
+        env:
+          HF_TOKEN: ${{ secrets.SPICE_SECRET_HF_TOKEN }}
+        run: |
+          python3 test/huggingface/check_live.py --spiced "$(command -v spiced)" \
+            --artifacts hf-live-results
+
+      # Pull request and merge-queue checks keep no diagnostic artifacts.
+      - name: Upload Hugging Face test evidence
+        if: always() && github.event_name != 'pull_request' && github.event_name != 'merge_group'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: huggingface-connector-results
+          path: hf-live-results/
+
   mssql_connector_quickstart:
     name: 'Test MS SQL connector on ${{ matrix.target.name }}'
-    runs-on: ${{ matrix.target.runner }}
+    # The Microsoft apt list below is the Ubuntu 24.04 repository. ubuntu-latest
+    # moves on its own, so this Linux-only job stays on ubuntu-24.04.
+    runs-on: ubuntu-24.04
     needs:
       - build
       - setup-matrix
@@ -1936,12 +2119,17 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
+      - name: Configure apt mirrors
+        uses: ./.github/actions/configure-apt
+
       - name: Install mssql-tools
         run: |
-          curl https://packages.microsoft.com/keys/microsoft.asc | sudo tee /etc/apt/trusted.gpg.d/microsoft.asc
-          curl https://packages.microsoft.com/config/ubuntu/22.04/prod.list | sudo tee /etc/apt/sources.list.d/mssql-release.list
+          # Ubuntu 24.04 prod.list pins signed-by to this keyring path.
+          curl -fsSL https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor | sudo tee /usr/share/keyrings/microsoft-prod.gpg >/dev/null
+          sudo chmod 644 /usr/share/keyrings/microsoft-prod.gpg
+          curl -fsSL https://packages.microsoft.com/config/ubuntu/24.04/prod.list | sudo tee /etc/apt/sources.list.d/mssql-release.list
           sudo apt-get update
-          sudo apt-get install -y mssql-tools18 unixodbc-dev
+          sudo ACCEPT_EULA=Y apt-get install -y mssql-tools18 unixodbc-dev
           # echo 'export PATH="$PATH:/opt/mssql-tools18/bin"' >> ~/.bashrc
           # source ~/.bashrc
 
@@ -2169,7 +2357,7 @@ jobs:
 
       - name: Install DuckDB CLI
         run: |
-          curl -fsSL "https://github.com/duckdb/duckdb/releases/download/v0.10.2/duckdb_cli-linux-amd64.zip" -o duckdb_cli.zip
+          curl -fsSL --retry 5 --retry-all-errors --retry-delay 5 "https://github.com/duckdb/duckdb/releases/download/v0.10.2/duckdb_cli-linux-amd64.zip" -o duckdb_cli.zip
           echo "b5bad3ec8bf689885f8270ebd8e0f507e4f671f37dabf6127c09b19960389f96  duckdb_cli.zip" | sha256sum -c
           unzip duckdb_cli.zip
           chmod +x ./duckdb
@@ -2527,10 +2715,12 @@ jobs:
       - test_local_acceleration
       - test_results_caching
       - gh_connector_quickstart
+      - hf_connector_live
       - mssql_connector_quickstart
       - databricks_delta_catalog_connector_quickstart
       - graceful_shutdown_test_append
       - graceful_shutdown_test_full
+      - test_cold_start_unkeyed_append
     steps:
       - name: Verify all E2E jobs succeeded
         # Named rather than left to the runner default: this gate is the required

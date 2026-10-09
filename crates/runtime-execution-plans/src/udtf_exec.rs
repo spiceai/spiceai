@@ -35,9 +35,10 @@ use datafusion::physical_plan::filter_pushdown::{
 use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, Distribution, EmptyRecordBatchStream, ExecutionPlan,
-    ExecutionPlanProperties, Partitioning, PhysicalExpr, PlanProperties, SortOrderPushdownResult,
-    expressions::PhysicalSortExpr,
+    ChildStats, DisplayAs, DisplayFormatType, Distribution, EmptyRecordBatchStream, ExecutionPlan,
+    ExecutionPlanProperties, InputDistributionRequirements, Partitioning, PhysicalExpr,
+    PlanProperties, ReplaceChildrenOptions, SortOrderPushdownResult, StatisticsArgs,
+    StatisticsContext, expressions::PhysicalSortExpr,
 };
 use runtime_proto::UdtfArgs;
 use std::any::Any;
@@ -126,6 +127,15 @@ impl UdtfExec {
     }
 }
 
+impl UdtfExec {
+    fn with_inner(&self, children: Vec<Arc<dyn ExecutionPlan>>) -> Result<Arc<dyn ExecutionPlan>> {
+        let [inner]: [Arc<dyn ExecutionPlan>; 1] = children.try_into().map_err(|_| {
+            DataFusionError::Execution("UdtfExec expects exactly one child".to_string())
+        })?;
+        Ok(Arc::new(Self::new(self.args.clone(), inner)))
+    }
+}
+
 impl DisplayAs for UdtfExec {
     fn fmt_as(&self, t: DisplayFormatType, f: &mut fmt::Formatter) -> fmt::Result {
         match t {
@@ -175,6 +185,14 @@ impl ExecutionPlan for UdtfExec {
         vec![Distribution::UnspecifiedDistribution]
     }
 
+    fn input_distribution_requirements(&self) -> InputDistributionRequirements {
+        InputDistributionRequirements::new(vec![Distribution::UnspecifiedDistribution])
+    }
+
+    fn dynamic_expressions_produced(&self) -> Vec<Arc<dyn PhysicalExpr>> {
+        Vec::new()
+    }
+
     fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>> {
         vec![None]
     }
@@ -187,25 +205,44 @@ impl ExecutionPlan for UdtfExec {
         vec![false]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         // Return inner as a child so optimizers can traverse it
         vec![&self.inner]
+    }
+
+    /// Always rebuilds through `new`, which derives the properties from the inner
+    /// plan; that is correct whichever mode is requested.
+    fn replace_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+        _options: ReplaceChildrenOptions,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.with_inner(children)
     }
 
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        if children.len() == 1 {
-            Ok(Arc::new(Self::new(
-                self.args.clone(),
-                Arc::clone(&children[0]),
-            )))
-        } else {
-            Err(DataFusionError::Execution(
-                "UdtfExec expects exactly one child".to_string(),
-            ))
-        }
+        self.with_inner(children)
+    }
+
+    fn with_new_children_and_same_properties(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.with_inner(children)
     }
 
     fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>> {
@@ -234,7 +271,25 @@ impl ExecutionPlan for UdtfExec {
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
-        self.inner.partition_statistics(partition)
+        StatisticsContext::new().compute(
+            self.inner.as_ref(),
+            &StatisticsArgs::new().with_partition(partition),
+        )
+    }
+
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        vec![ChildStats::At(partition)]
+    }
+
+    /// Execution delegates to the inner plan, so its statistics are this node's.
+    fn statistics_from_inputs(
+        &self,
+        input_stats: &[Arc<Statistics>],
+        _args: &StatisticsArgs,
+    ) -> Result<Arc<Statistics>> {
+        input_stats.first().map(Arc::clone).ok_or_else(|| {
+            DataFusionError::Execution("UdtfExec expects exactly one child".to_string())
+        })
     }
 
     fn supports_limit_pushdown(&self) -> bool {
@@ -292,6 +347,15 @@ impl ExecutionPlan for UdtfExec {
     ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
         Ok(SortOrderPushdownResult::Unsupported)
     }
+
+    /// `None` defers to Spice's physical extension codec, which serializes this
+    /// node as its UDTF arguments and re-invokes the UDTF on the remote side.
+    fn try_to_proto(
+        &self,
+        _ctx: &datafusion::physical_plan::proto::ExecutionPlanEncodeCtx<'_>,
+    ) -> Result<Option<datafusion_proto::protobuf::PhysicalPlanNode>> {
+        Ok(None)
+    }
 }
 
 /// A placeholder execution plan used during deserialization.
@@ -314,6 +378,21 @@ impl PlaceholderExec {
             datafusion::physical_plan::execution_plan::Boundedness::Bounded,
         ));
         Self { schema, properties }
+    }
+}
+
+impl PlaceholderExec {
+    fn with_no_children(
+        self: Arc<Self>,
+        children: &[Arc<dyn ExecutionPlan>],
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        if children.is_empty() {
+            Ok(self)
+        } else {
+            Err(DataFusionError::Execution(
+                "PlaceholderExec expects no children".to_string(),
+            ))
+        }
     }
 }
 
@@ -360,6 +439,15 @@ impl ExecutionPlan for PlaceholderExec {
         vec![]
     }
 
+    /// A leaf: no children, so no distribution requirements.
+    fn input_distribution_requirements(&self) -> InputDistributionRequirements {
+        InputDistributionRequirements::new(vec![])
+    }
+
+    fn dynamic_expressions_produced(&self) -> Vec<Arc<dyn PhysicalExpr>> {
+        Vec::new()
+    }
+
     fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>> {
         vec![]
     }
@@ -372,21 +460,41 @@ impl ExecutionPlan for PlaceholderExec {
         vec![]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
+    }
+
+    fn replace_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+        _options: ReplaceChildrenOptions,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.with_no_children(&children)
     }
 
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        if children.is_empty() {
-            Ok(self)
-        } else {
-            Err(DataFusionError::Execution(
-                "PlaceholderExec expects no children".to_string(),
-            ))
-        }
+        self.with_no_children(&children)
+    }
+
+    fn with_new_children_and_same_properties(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.with_no_children(&children)
     }
 
     fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>> {
@@ -418,6 +526,19 @@ impl ExecutionPlan for PlaceholderExec {
     }
 
     fn partition_statistics(&self, _partition: Option<usize>) -> Result<Arc<Statistics>> {
+        Ok(Arc::new(Statistics::new_unknown(&self.schema)))
+    }
+
+    /// A leaf: there are no children whose statistics to request.
+    fn child_stats_requests(&self, _partition: Option<usize>) -> Vec<ChildStats> {
+        Vec::new()
+    }
+
+    fn statistics_from_inputs(
+        &self,
+        _input_stats: &[Arc<Statistics>],
+        _args: &StatisticsArgs,
+    ) -> Result<Arc<Statistics>> {
         Ok(Arc::new(Statistics::new_unknown(&self.schema)))
     }
 
@@ -475,6 +596,14 @@ impl ExecutionPlan for PlaceholderExec {
     ) -> Result<SortOrderPushdownResult<Arc<dyn ExecutionPlan>>> {
         Ok(SortOrderPushdownResult::Unsupported)
     }
+
+    /// Not serializable: a deserialization stand-in that must be replaced before execution.
+    fn try_to_proto(
+        &self,
+        _ctx: &datafusion::physical_plan::proto::ExecutionPlanEncodeCtx<'_>,
+    ) -> Result<Option<datafusion_proto::protobuf::PhysicalPlanNode>> {
+        Ok(None)
+    }
 }
 
 #[cfg(test)]
@@ -512,7 +641,12 @@ mod tests {
         assert_eq!(children_len, 1);
         assert_eq!(exec.maintains_input_order().len(), children_len);
         assert_eq!(exec.required_input_ordering().len(), children_len);
-        assert_eq!(exec.required_input_distribution().len(), children_len);
+        assert_eq!(
+            exec.input_distribution_requirements()
+                .into_per_child()
+                .len(),
+            children_len
+        );
         assert_eq!(exec.benefits_from_input_partitioning().len(), children_len);
     }
 
@@ -523,5 +657,30 @@ mod tests {
             .expect("default invariants should pass for UdtfExec");
         exec.check_invariants(InvariantLevel::Executable)
             .expect("default invariants should pass for UdtfExec");
+    }
+
+    /// `UdtfExec` executes its inner plan, so it must report the inner plan's
+    /// statistics through `StatisticsContext`, the path `DataFusion` 55's optimizer uses.
+    #[test]
+    fn statistics_are_the_inner_plans() {
+        use datafusion::arrow::array::Int32Array;
+        use datafusion::arrow::record_batch::RecordBatch;
+        use datafusion::common::stats::Precision;
+        use datafusion::datasource::memory::MemorySourceConfig;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![1, 2, 3]))],
+        )
+        .expect("valid batch");
+        let inner = MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None)
+            .expect("valid memory exec");
+        let exec = UdtfExec::new(test_udtf_args(), inner);
+
+        let stats = StatisticsContext::new()
+            .compute(&exec, &StatisticsArgs::new())
+            .expect("statistics");
+        assert_eq!(stats.num_rows, Precision::Exact(3));
     }
 }

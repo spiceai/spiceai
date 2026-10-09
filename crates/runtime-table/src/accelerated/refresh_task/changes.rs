@@ -13,110 +13,224 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 */
+mod ingress;
+mod policy;
+
 use super::DatasetMetricLabels;
 use super::RefreshTask;
-use super::{collect_all_indexes, indexes_from_federated};
 use crate::accelerated::refresh::Refresh;
 use crate::accelerated::refresh_completion::RefreshCompletion;
-use crate::accelerated::refresh_task::deletion::{
-    build_batch_delete_expr_from_change_batch, build_pk_only_batch_from_change_batch,
-};
-#[cfg(not(windows))]
-use crate::accelerated::write::{CayenneWriteTarget, dual_write::extract_cayenne_write_target};
-use arrow::array::{
-    Array, ArrayRef, Int32Array, Int64Array, RecordBatch, StringArray, UInt32Array,
-};
-use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+use arrow::array::RecordBatch;
+#[cfg(test)]
+use arrow::array::{Array, Int32Array, Int64Array, StringArray};
+#[cfg(test)]
+use arrow::datatypes::DataType;
+use arrow::datatypes::{Field, Schema, SchemaRef};
+#[cfg(test)]
 use arrow_tools::record_batch::try_cast_to;
+#[cfg(test)]
 use arrow_tools::schema_evolution::{self, EvolutionContext, SchemaEvolution};
 use cache::Caching;
-#[cfg(not(windows))]
-use cayenne::{CayenneCdcWrite, CayenneTableProvider};
-use data_components::arrow::{IndexedMemTable, write::MemTable};
-use data_components::cdc::{self, ChangeBatch, ChangeOperation, ChangesStream};
-use data_components::index_maintenance::perform_index_maintenance;
+use data_components::cdc::{self, ChangesStream};
+#[cfg(test)]
+use data_components::cdc::{ChangeBatch, ChangeOperation};
 #[cfg(any(feature = "debezium", feature = "kafka"))]
 use data_components::kafka::{
     Error as KafkaError, rdkafka::error::KafkaError as RdKafkaError,
     rdkafka::types::RDKafkaErrorCode,
 };
-use datafusion::datasource::TableProvider;
+use datafusion::common::TableReference;
+#[cfg(test)]
 use datafusion::error::DataFusionError;
-use datafusion::execution::SessionState;
+#[cfg(test)]
+use datafusion::execution::{SessionState, context::SessionContext};
 #[cfg(test)]
 use datafusion::logical_expr::Expr;
-use datafusion::logical_expr::dml::InsertOp;
+#[cfg(test)]
 use datafusion::logical_expr::lit;
-use datafusion::physical_plan::ExecutionPlan;
+#[cfg(test)]
+use datafusion::physical_plan::collect;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
-use datafusion::sql::TableReference;
-use datafusion::{execution::context::SessionContext, physical_plan::collect};
-use futures::{StreamExt, stream};
-use runtime_acceleration::dataupdate::{
-    StreamingDataUpdate, StreamingDataUpdateExecutionPlan, UpdateType,
+#[cfg(test)]
+use futures::StreamExt;
+use futures::stream;
+#[cfg(all(test, not(windows)))]
+use runtime_acceleration::change_sink::provider::partitioned_widening_refusal;
+#[cfg(test)]
+use runtime_acceleration::change_sink::provider::{
+    cdc::{ChangeOperationType, contiguous_row_span, encode_primary_key, group_into_sub_batches},
+    delete_matching_rows_from_arrow_provider,
+    deletion::build_pk_only_batch_from_change_batch,
 };
+#[cfg(test)]
+use runtime_acceleration::change_sink::source_policy::{CdcPolicy, SchemaDecision};
+#[cfg(test)]
+use runtime_acceleration::change_sink::{
+    ChangeBatch as LogicalChangeBatch, Publication, Recovery, SchemaEvolutionSupport, WriteOptions,
+};
+use runtime_acceleration::change_sink::{ChangeSink, DurabilityObserver, StorageDurability};
+use runtime_acceleration::dataupdate::{StreamingDataUpdate, UpdateType};
 use runtime_component::dataset::OnSchemaChange;
 use runtime_component::dataset::acceleration::RefreshMode;
-use runtime_component::schema_evolution::{
-    SCHEMA_EVOLUTION_APPLIED, SCHEMA_EVOLUTION_DETECTED, SCHEMA_EVOLUTION_FAILED,
-    emit_schema_evolution_event, evolution_allowed, schema_evolution_labels, widening_plan_kind,
-};
-use runtime_datafusion::error::{find_datafusion_root, format_datafusion_error};
-use runtime_datafusion::execution_plan::schema_cast::SchemaCastScanExec;
+#[cfg(test)]
+use runtime_component::schema_evolution::{evolution_allowed, widening_plan_kind};
+#[cfg(test)]
+use runtime_datafusion::error::find_datafusion_root;
+use runtime_datafusion::error::format_datafusion_error;
 use runtime_metrics::acceleration as metrics;
 use runtime_status as status;
+#[cfg(all(test, not(windows)))]
 use runtime_table_partition::provider::PartitionTableProvider;
 #[cfg(test)]
 use snafu::OptionExt;
+#[cfg(test)]
 use snafu::ResultExt;
-use spice_table::{LayerWalk, SpiceTable, find_concrete};
+#[cfg(test)]
+use spice_table::SpiceTable;
 use std::collections::{HashMap, VecDeque};
-use std::hash::BuildHasherDefault;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Weak};
 use std::time::{Duration, Instant, SystemTime};
 use telemetry::timing::MultiTimeMeasurement;
 use tokio::sync::RwLock;
 
-type PendingApplyFinalize = tokio::task::JoinHandle<crate::accelerated::Result<()>>;
+#[cfg(test)]
+type PendingApplyFinalize = Publication;
 
+#[cfg(test)]
 struct PendingFinalizeCommit {
     finalize: PendingApplyFinalize,
     committers: Vec<Box<dyn cdc::CommitChange + Send + Sync>>,
     ready_after_finalize: bool,
+    durability: StorageDurability,
 }
 
-/// Source committers deferred by the in-memory CDC durability mode
-/// (`cdc_durability: memory`), tagged with the mem-tier epoch they belong to.
-///
-/// In memory mode the source slot ack is NOT advanced per-batch. Instead each
-/// applied batch's committers are pushed here tagged with the batch's mem-tier
-/// epoch, and they run (advancing the slot) only when a Cayenne checkpoint
-/// reports that epoch durable via [`CayenneSlotAdvancer::on_checkpoint_durable`].
-/// This upholds the load-bearing invariant — the slot advances ONLY after the
-/// covering checkpoint's Vortex+metastore writes are durable — so a crash that
-/// discards the RAM tier always leaves the slot at or below the last durable
-/// epoch and the source re-streams the un-checkpointed tail (exactly-once via
-/// the PK-idempotent apply). Shared (`Arc`) between the apply loop (which pushes)
-/// and the slot advancer installed on the provider (which drains).
+/// Real source committers tagged with local storage fences. Entries are enqueued
+/// only after successful publication and acknowledged only after durability.
 type DeferredCommitQueue =
     Arc<tokio::sync::Mutex<VecDeque<(u64, Vec<Box<dyn cdc::CommitChange + Send + Sync>>)>>>;
 
-/// The runtime's [`cayenne::SlotAdvancer`] implementation. Installed on a
-/// memory-mode Cayenne provider; when a checkpoint reports an epoch durable it
-/// drains every deferred committer with `epoch <= durable_epoch` from the shared
-/// [`DeferredCommitQueue`] and runs each `commit()` in order, advancing the
-/// source slot — exactly as the per-batch committer would have, only gated
-/// behind the durable fence.
-struct CayenneSlotAdvancer {
+type DeferredCommitDrain =
+    futures::future::BoxFuture<'static, std::result::Result<(), cdc::CommitError>>;
+
+struct SourceDurabilityObserver {
     queue: DeferredCommitQueue,
+    durable_fence: AtomicU64,
+    durability_known: AtomicBool,
+    pending_count: Arc<AtomicUsize>,
+    // Retain the in-flight source call and its durable prefix across waiter
+    // cancellation. The queue lock is never held during a source network call.
+    drain: tokio::sync::Mutex<Option<DeferredCommitDrain>>,
     dataset_name: TableReference,
     runtime_status: Arc<status::RuntimeStatus>,
 }
 
+impl SourceDurabilityObserver {
+    fn new(dataset_name: TableReference, runtime_status: Arc<status::RuntimeStatus>) -> Self {
+        Self {
+            queue: Arc::new(tokio::sync::Mutex::new(VecDeque::new())),
+            durable_fence: AtomicU64::new(0),
+            durability_known: AtomicBool::new(false),
+            pending_count: Arc::new(AtomicUsize::new(0)),
+            drain: tokio::sync::Mutex::new(None),
+            dataset_name,
+            runtime_status,
+        }
+    }
+
+    async fn enqueue(&self, fence: u64, committers: Vec<Box<dyn cdc::CommitChange + Send + Sync>>) {
+        if committers.is_empty() {
+            return;
+        }
+        {
+            let mut queue = self.queue.lock().await;
+            // The oldest queued fence must stay fixed so an in-progress
+            // checkpoint can release it even while newer publications arrive.
+            // Only a compatible singleton tail behind that head can absorb.
+            let merged = if queue.len() > 1
+                && let (Some((tail_fence, tail)), [incoming]) =
+                    (queue.back_mut(), committers.as_slice())
+                && let [retained] = tail.as_mut_slice()
+                && retained.supports_deferral()
+                && incoming.supports_deferral()
+                && retained.as_any().is_some()
+                && incoming.as_any().is_some()
+                && retained.try_absorb(incoming.as_ref())
+            {
+                *tail_fence = (*tail_fence).max(fence);
+                true
+            } else {
+                false
+            };
+            if merged {
+                drop(committers);
+            } else {
+                self.pending_count
+                    .fetch_add(committers.len(), Ordering::AcqRel);
+                queue.push_back((fence, committers));
+            }
+        }
+        // A checkpoint may finish before the publication receipt reaches the
+        // source. Retry against its remembered fence, including on an idle source.
+        self.retry().await;
+    }
+
+    fn pending_count(&self) -> usize {
+        self.pending_count.load(Ordering::Acquire)
+    }
+
+    async fn retry(&self) {
+        if self.durability_known.load(Ordering::Acquire) {
+            self.on_durable(self.durable_fence.load(Ordering::Acquire))
+                .await;
+        }
+    }
+
+    async fn finish_drain(&self, drain: &mut Option<DeferredCommitDrain>) -> bool {
+        let Some(pending) = drain.as_mut() else {
+            return true;
+        };
+        let result = pending.await;
+        *drain = None;
+        if let Err(e) = result {
+            if !self.runtime_status.is_shutdown() {
+                tracing::warn!(
+                    "Deferred CDC commit failed for {} (source slot will retry before any later immediate commit): {e}",
+                    self.dataset_name
+                );
+            }
+            return false;
+        }
+        true
+    }
+
+    async fn is_empty(&self, trace: Option<&CdcFlushTrace<'_>>, stage: &'static str) -> bool {
+        // A detached ready prefix still counts as pending acknowledgement.
+        let drain_start = Instant::now();
+        let drain = self.drain.lock().await;
+        if let Some(trace) = trace {
+            trace.record(stage, "observer_drain_lock", drain_start);
+        }
+        let queue_start = Instant::now();
+        // A retained requeue future can already own the next queue-lock permit.
+        let empty = drain.is_none() && self.queue.lock().await.is_empty();
+        if let Some(trace) = trace {
+            trace.record(stage, "observer_queue_lock", queue_start);
+        }
+        empty
+    }
+}
+
 #[async_trait::async_trait]
-impl cayenne::SlotAdvancer for CayenneSlotAdvancer {
-    async fn on_checkpoint_durable(&self, durable_epoch: u64) {
+impl DurabilityObserver for SourceDurabilityObserver {
+    async fn on_durable(&self, fence: u64) {
+        self.durable_fence.fetch_max(fence, Ordering::AcqRel);
+        self.durability_known.store(true, Ordering::Release);
+        let mut drain = self.drain.lock().await;
+        if !self.finish_drain(&mut drain).await {
+            return;
+        }
+        let durable_epoch = self.durable_fence.load(Ordering::Acquire);
         // Pull out every committer whose epoch is now durable, preserving FIFO
         // order. Hold the lock only to splice out the ready prefix, not across
         // the (network) commits.
@@ -134,8 +248,7 @@ impl cayenne::SlotAdvancer for CayenneSlotAdvancer {
             ready
         };
 
-        // Cross-epoch coalescing is legal here (unlike at push time): every
-        // committer in `ready` is at or below the durable fence, so folding the
+        // Every committer in `ready` is at or below the durable fence, so folding the
         // whole prefix to a single max-LSN commit and acking once is equivalent
         // to acking each epoch in turn — O(epochs) work becomes one `fetch_max`.
         // A dataset's deferred queue holds a single committer type, so this is
@@ -144,48 +257,62 @@ impl cayenne::SlotAdvancer for CayenneSlotAdvancer {
         // Order-sensitive or fallible sources are left with their per-epoch
         // structure completely untouched, preserving the in-order,
         // requeue-on-failure drain byte for byte.
-        let mut ready = if prefix_is_coalescable(&ready) {
+        let ready = if prefix_is_coalescable(&ready) {
             // `prefix_is_coalescable` guaranteed a non-empty prefix, so `max` is
             // always `Some` here; `unwrap_or(0)` is just the lint-clean spelling
             // of that (this crate denies `unwrap`/`expect` in non-test code). The
             // fold only ever reduces a non-empty input, so `folded` is non-empty.
             let max_epoch = ready.iter().map(|(epoch, _)| *epoch).max().unwrap_or(0);
+            let count = ready
+                .iter()
+                .map(|(_, committers)| committers.len())
+                .sum::<usize>();
             let folded = fold_committers(ready.into_iter().flat_map(|(_, cs)| cs).collect());
+            self.pending_count
+                .fetch_sub(count - folded.len(), Ordering::AcqRel);
             VecDeque::from([(max_epoch, folded)])
         } else {
             ready
         };
 
-        while let Some((epoch, committers)) = ready.pop_front() {
-            let mut committers = committers.into_iter();
-            while let Some(committer) = committers.next() {
-                if let Err(e) = committer.commit().await {
-                    let mut uncommitted = vec![committer];
-                    uncommitted.extend(committers);
-                    let mut to_requeue = VecDeque::new();
-                    to_requeue.push_back((epoch, uncommitted));
-                    to_requeue.append(&mut ready);
-
-                    let mut queue = self.queue.lock().await;
-                    while let Some(item) = to_requeue.pop_back() {
-                        queue.push_front(item);
-                    }
-
-                    // A failed source ack must remain queued. A later immediate
-                    // commit is required to observe the non-empty queue and stop
-                    // rather than advancing the source past this durable-but-not-
-                    // acked checkpoint.
-                    if !self.runtime_status.is_shutdown() {
-                        tracing::warn!(
-                            "Deferred CDC commit failed for {} (source slot will retry before any later immediate commit): {e}",
-                            self.dataset_name
-                        );
-                    }
-                    return;
-                }
-            }
+        if !ready.is_empty() {
+            *drain = Some(Box::pin(commit_deferred_prefix(
+                Arc::clone(&self.queue),
+                Arc::clone(&self.pending_count),
+                ready,
+            )));
+            self.finish_drain(&mut drain).await;
         }
     }
+}
+
+async fn commit_deferred_prefix(
+    queue: DeferredCommitQueue,
+    pending_count: Arc<AtomicUsize>,
+    mut ready: VecDeque<(u64, Vec<Box<dyn cdc::CommitChange + Send + Sync>>)>,
+) -> std::result::Result<(), cdc::CommitError> {
+    while let Some((epoch, committers)) = ready.pop_front() {
+        let mut committers = committers.into_iter();
+        while let Some(committer) = committers.next() {
+            if let Err(error) = committer.commit().await {
+                let mut uncommitted = vec![committer];
+                uncommitted.extend(committers);
+                let mut to_requeue = VecDeque::new();
+                to_requeue.push_back((epoch, uncommitted));
+                to_requeue.append(&mut ready);
+
+                // Requeue before reporting the failure so no later source
+                // acknowledgement can skip the failed durable prefix.
+                let mut queue = queue.lock().await;
+                while let Some(item) = to_requeue.pop_back() {
+                    queue.push_front(item);
+                }
+                return Err(error);
+            }
+            pending_count.fetch_sub(1, Ordering::AcqRel);
+        }
+    }
+    Ok(())
 }
 
 /// Whether the whole deferred-drain prefix opts into coalescing — i.e. every
@@ -225,34 +352,19 @@ fn fold_committers(
     let mut folded: Vec<Box<dyn cdc::CommitChange + Send + Sync>> =
         Vec::with_capacity(committers.len());
     for committer in committers {
-        if let Some(last) = folded.last_mut() {
-            if last.try_absorb(committer.as_ref()) {
-                continue;
-            }
-            // Within a single dataset's run every coalesce-capable committer
-            // targets the same stream position (e.g. one Postgres member slot),
-            // so two of the same concrete type must always absorb; a failure
-            // means two members' commits were routed into one dataset's run — an
-            // upstream (pump) bug, not something to paper over here.
-            debug_assert!(
-                !matches!(
-                    (last.as_any(), committer.as_any()),
-                    (Some(a), Some(b)) if a.type_id() == b.type_id()
-                ),
-                "two coalesce-capable committers of the same type failed to absorb"
-            );
+        // The same committer type can carry different source identities.
+        // A refused merge retains both commits in their original order.
+        if let Some(last) = folded.last_mut()
+            && last.try_absorb(committer.as_ref())
+        {
+            continue;
         }
         folded.push(committer);
     }
     folded
 }
 
-#[cfg(not(windows))]
-async fn deferred_commit_queue_is_empty(queue: &DeferredCommitQueue) -> bool {
-    queue.lock().await.is_empty()
-}
-
-#[cfg(not(windows))]
+#[cfg(test)]
 fn committers_all_support_deferral(
     committers: &[Box<dyn cdc::CommitChange + Send + Sync>],
 ) -> bool {
@@ -262,34 +374,66 @@ fn committers_all_support_deferral(
             .all(|committer| committer.supports_deferral())
 }
 
-/// Op-granular durable-path decision for one coalesced burst:
-/// - `Truncate`/`Unknown` rows always force the durable path (whole burst).
-/// - `Delete` rows force it only when the sink cannot absorb key deletes in
-///   RAM (`sink_absorbs_in_memory_deletes`, the Cayenne
-///   `supports_in_memory_cdc_deletes` capability) or the row carries no
-///   primary key (nothing to tombstone — the keyless durable path deletes by
-///   full-row match).
-/// - `Upsert` rows never force it.
-#[cfg(not(windows))]
+/// Truncate, unknown operations, and unsupported deferred deletes require a
+/// publication barrier and the target's synchronous write path.
+#[cfg(test)]
 fn change_batch_requires_durable_cdc_path(
     change_batch: &ChangeBatch,
     sink_absorbs_in_memory_deletes: bool,
 ) -> bool {
-    (0..change_batch.record.num_rows()).any(|row| {
-        match ChangeOperationType::from_operation(&change_batch.op(row)) {
-            ChangeOperationType::Truncate | ChangeOperationType::Unknown => true,
-            ChangeOperationType::Delete => {
-                !sink_absorbs_in_memory_deletes || !change_batch.has_primary_keys(row)
-            }
-            ChangeOperationType::Upsert => false,
+    (0..change_batch.record.num_rows()).any(|row| match change_batch.op(row) {
+        ChangeOperation::Truncate | ChangeOperation::Unknown(_) => true,
+        ChangeOperation::Delete => {
+            !sink_absorbs_in_memory_deletes || !change_batch.has_primary_keys(row)
         }
+        ChangeOperation::Create | ChangeOperation::Update | ChangeOperation::Read => false,
     })
 }
 
-#[cfg(not(windows))]
-async fn checkpoint_pending_memory_cdc_commits(
-    cayenne: &CayenneTableProvider,
-    queue: &DeferredCommitQueue,
+struct CdcFlushTrace<'a> {
+    dataset: &'a TableReference,
+    id: u64,
+    started: Instant,
+}
+
+impl<'a> CdcFlushTrace<'a> {
+    fn new(dataset: &'a TableReference) -> Option<Self> {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+        if !tracing::enabled!(target: "changesink_diagnostic", tracing::Level::DEBUG) {
+            return None;
+        }
+        let id = NEXT_ID.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        if id == 1025 {
+            tracing::debug!(target: "changesink_diagnostic", limit = 1024, "CDC flush phase trace limit reached; further calls are not traced");
+        }
+        if id > 1024 {
+            return None;
+        }
+        tracing::debug!(target: "changesink_diagnostic", dataset = %dataset, flush_id = id, "CDC flush phase trace started");
+        Some(Self {
+            dataset,
+            id,
+            started: Instant::now(),
+        })
+    }
+
+    fn record(&self, stage: &'static str, phase: &'static str, start: Instant) {
+        tracing::debug!(
+            target: "changesink_diagnostic",
+            dataset = %self.dataset,
+            flush_id = self.id,
+            stage,
+            phase,
+            elapsed_ms = start.elapsed().as_secs_f64() * 1000.0,
+            since_start_ms = self.started.elapsed().as_secs_f64() * 1000.0,
+            "CDC flush phase completed"
+        );
+    }
+}
+
+async fn flush_pending_source_commits(
+    sink: &ChangeSink,
+    observer: &SourceDurabilityObserver,
     dataset_name: &TableReference,
     runtime_status: &status::RuntimeStatus,
 ) -> Option<String> {
@@ -298,32 +442,27 @@ async fn checkpoint_pending_memory_cdc_commits(
     // `items_after_statements`).
     const MAX_CHECKPOINT_ATTEMPTS: usize = 3;
 
-    if deferred_commit_queue_is_empty(queue).await {
+    let trace = CdcFlushTrace::new(dataset_name);
+    if observer.is_empty(trace.as_ref(), "initial_check").await {
         return None;
     }
 
-    // A queue still non-empty AFTER a successful checkpoint is, in practice,
-    // transient rather than a real invariant violation: the apply loop enqueues a
-    // batch's committer only AFTER `write_change` returns its epoch, so the
-    // covering checkpoint can fire (and drain nothing) before the committer is
-    // queued — the late-enqueue race. `checkpoint_mem_tier` re-fires the slot
-    // advancer for the last durable epoch even on an empty tier (Cayenne #11644
-    // fix), which releases such a committer; but a concurrent background
-    // checkpoint or a straggler epoch can still need one more checkpoint to seal.
-    // Retry a bounded number of times before declaring failure — the only
-    // correctness requirement is that the source slot must NOT advance past a
-    // still-un-durable RAM batch, and waiting (re-checkpointing) preserves that
-    // trivially. Only a queue that survives every attempt is fatal (#11644).
+    // Retry transient source acknowledgements and storage fences before allowing
+    // a later immediate commit. A nonempty queue must never be skipped.
     for attempt in 1..=MAX_CHECKPOINT_ATTEMPTS {
-        match cayenne.checkpoint_mem_tier().await {
-            Ok(_) => {
-                if deferred_commit_queue_is_empty(queue).await {
-                    return None;
+        let flush_start = Instant::now();
+        let flush_result = sink.flush().await;
+        if let Some(trace) = &trace {
+            trace.record("flush", "sink_flush", flush_start);
+        }
+        match flush_result {
+            Ok(()) => {
+                let retry_start = Instant::now();
+                observer.retry().await;
+                if let Some(trace) = &trace {
+                    trace.record("retry", "observer_retry", retry_start);
                 }
-                if runtime_status.is_shutdown() {
-                    tracing::debug!(
-                        "Deferred CDC commits remain for {dataset_name} during shutdown after mem-tier checkpoint"
-                    );
+                if observer.is_empty(trace.as_ref(), "post_retry_check").await {
                     return None;
                 }
                 if attempt < MAX_CHECKPOINT_ATTEMPTS {
@@ -333,16 +472,14 @@ async fn checkpoint_pending_memory_cdc_commits(
                 }
             }
             Err(e) => {
-                if runtime_status.is_shutdown() {
-                    tracing::debug!(
-                        "Failed to checkpoint in-memory CDC tier for {dataset_name} during shutdown: {e}"
-                    );
-                    return None;
-                }
                 let error_message = format!(
-                    "Failed to checkpoint in-memory CDC tier for {dataset_name} before advancing source commit: {e}"
+                    "Failed to flush CDC changes for {dataset_name} before advancing source commit: {e}"
                 );
-                tracing::error!("{error_message}");
+                if runtime_status.is_shutdown() {
+                    tracing::debug!("{error_message}");
+                } else {
+                    tracing::error!("{error_message}");
+                }
                 return Some(error_message);
             }
         }
@@ -353,43 +490,6 @@ async fn checkpoint_pending_memory_cdc_commits(
     );
     tracing::error!("{error_message}");
     Some(error_message)
-}
-
-pub(super) struct CdcInsertPlanCache {
-    target_schema: SchemaRef,
-    streaming_plan: Arc<StreamingDataUpdateExecutionPlan>,
-    insert_plan: Arc<dyn ExecutionPlan>,
-}
-
-impl CdcInsertPlanCache {
-    async fn try_new(
-        accelerator: &Arc<dyn TableProvider>,
-        session_state: &SessionState,
-        target_schema: SchemaRef,
-    ) -> Result<Self, DataFusionError> {
-        let streaming_plan = Arc::new(StreamingDataUpdateExecutionPlan::new_empty(Arc::clone(
-            &target_schema,
-        )));
-        let streaming_exec: Arc<dyn ExecutionPlan> =
-            Arc::<StreamingDataUpdateExecutionPlan>::clone(&streaming_plan);
-        let cast_plan: Arc<dyn ExecutionPlan> = Arc::new(SchemaCastScanExec::new(
-            streaming_exec,
-            Arc::clone(&target_schema),
-        ));
-        let insert_plan = accelerator
-            .insert_into(session_state, cast_plan, InsertOp::Append)
-            .await?;
-
-        Ok(Self {
-            target_schema,
-            streaming_plan,
-            insert_plan,
-        })
-    }
-
-    fn matches_schema(&self, schema: &SchemaRef) -> bool {
-        self.target_schema.as_ref() == schema.as_ref()
-    }
 }
 
 struct ApplyContext<'a> {
@@ -405,62 +505,34 @@ struct ApplyContext<'a> {
     caching: Option<&'a Weak<Caching>>,
     refresh_completion: Option<&'a RefreshCompletion>,
     initial_load_completed: &'a Arc<AtomicBool>,
+    #[cfg(test)]
     write_ctx: &'a SessionContext,
+    #[cfg(test)]
     write_session_state: &'a SessionState,
     commit_timeout: Duration,
+    #[cfg(test)]
     pending_finalize: &'a mut Option<PendingFinalizeCommit>,
     pending_commit: &'a mut Option<tokio::task::JoinHandle<Result<(), String>>>,
-    /// Shared queue of source committers DEFERRED by in-memory CDC durability
-    /// (`cdc_durability: memory`). When a write returns a mem-tier epoch, its
-    /// committers are pushed here (tagged with the epoch) instead of committed
-    /// now; the [`CayenneSlotAdvancer`] drains them after the covering
-    /// checkpoint is durable. `None` for file-mode streams (committers spawn
-    /// immediately, as before).
-    deferred_commits: Option<&'a DeferredCommitQueue>,
+    /// Source acknowledgement gated by the target's deferred durability fences.
+    deferred_commits: Option<&'a Arc<SourceDurabilityObserver>>,
 }
 
+#[cfg(test)]
 struct WriteChangeOutcome {
     result: WriteChangeResult,
     pending_finalize: Option<PendingApplyFinalize>,
-    /// Highest Cayenne in-memory CDC tier epoch this write landed in
-    /// (`cdc_durability: memory`), or `None` for every durable-path write. When
-    /// set, [`RefreshTask::apply_envelope_run`] DEFERS the source commit: instead
-    /// of advancing the slot now, it queues this batch's committers tagged with
-    /// the epoch, and runs them only when a checkpoint reports the epoch durable.
-    in_memory_epoch: Option<u64>,
-}
-
-impl WriteChangeOutcome {
-    fn new(result: WriteChangeResult, pending_finalize: Option<PendingApplyFinalize>) -> Self {
-        Self {
-            result,
-            pending_finalize,
-            in_memory_epoch: None,
-        }
-    }
-
-    fn with_in_memory_epoch(mut self, epoch: Option<u64>) -> Self {
-        self.in_memory_epoch = epoch;
-        self
-    }
-}
-
-/// Per-upsert-sub-batch outcome: the optional backgrounded finalize plus the
-/// optional in-memory CDC tier epoch the batch landed in.
-struct UpsertOutcome {
-    pending_finalize: Option<PendingApplyFinalize>,
-    in_memory_epoch: Option<u64>,
+    durability: StorageDurability,
 }
 
 /// Outcome of applying one coalesced same-schema group of a run.
+#[cfg(test)]
 enum CoalescedRunOutcome {
     /// Written (and committers handed off); continue with the next group.
     Applied,
-    /// The group was skipped without acking (concat failure) — the rest of
-    /// the run must also be skipped so later commits can't advance the source
-    /// offset past the unapplied envelopes. The stream itself continues.
-    SkipRun,
-    /// Fatal: stop the stream.
+    /// Fatal: drop unacked committers and stop the stream. Required whenever
+    /// a group is discarded without acknowledging — continuing would let a
+    /// later burst ack past the gap, and a source that tracks delivered
+    /// envelopes (MySQL shared dump) would skip the window on reconnect.
     Stop,
 }
 
@@ -511,9 +583,8 @@ macro_rules! extract_primary_key {
 /// `tracing::warn!` so misconfiguration is visible rather than silent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CdcConfig {
-    /// Channel depth between the CDC source-stream reader and the apply
-    /// loop. Each slot holds one decoded `ChangeEnvelope`, so peak
-    /// prefetch memory is `prefetch_buffer * max_batch_bytes`.
+    /// Admission depth for the table owner's data queue. Inputs retain their
+    /// lazy representation until the owner prepares a bounded burst.
     pub prefetch_buffer: usize,
     /// Hard upper bound on the number of `ChangeEnvelope`s coalesced into
     /// a single accelerator write. Coalescing amortizes per-envelope
@@ -523,7 +594,7 @@ pub struct CdcConfig {
     /// exceed this on its own; otherwise the next envelope is carried into the
     /// next burst before we allocate a concatenated batch.
     pub max_coalesced_bytes: usize,
-    /// CDC apply-loop linger window in milliseconds. When `> 0`, the drain
+    /// CDC owner linger window in milliseconds. When `> 0`, the drain
     /// keeps accumulating envelopes into a single coalesced write until
     /// `max_coalesced_envelopes` / `max_coalesced_bytes` is reached, or this
     /// window elapses — whichever comes first. The window is measured from the
@@ -573,7 +644,6 @@ const CDC_COMMIT_TIMEOUT_MS_MAX: usize = 3_600_000;
 // monolithic predicate this cap exists to avoid).
 const CDC_DELETE_SUBBATCH_MAX_DEFAULT: usize = 2_048;
 const CDC_DELETE_SUBBATCH_MAX_MAX: usize = 65_536;
-const CAYENNE_CDC_SYNCHRONOUS_FALLBACK_WARNING_KEY_LIMIT: usize = 1024;
 
 #[derive(Debug, Default)]
 struct BoundedWarningKeys {
@@ -618,11 +688,6 @@ impl Default for CdcConfig {
 /// first config.
 static CDC_CONFIG: std::sync::OnceLock<CdcConfig> = std::sync::OnceLock::new();
 
-#[cfg(not(windows))]
-static CAYENNE_CDC_SYNCHRONOUS_FALLBACK_WARNING_KEYS: std::sync::LazyLock<
-    parking_lot::Mutex<BoundedWarningKeys>,
-> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(BoundedWarningKeys::default()));
-
 const SCHEMA_EVOLUTION_WARNING_KEY_LIMIT: usize = 1024;
 
 /// Once-per-(dataset, change) gate for schema-evolution warnings so the apply
@@ -646,79 +711,6 @@ pub struct CdcSchemaEvolution {
     /// Column names referenced by the dataset's primary key / unique / index
     /// constraints — the classifier's constraint guard.
     pub constraint_columns: Vec<String>,
-}
-
-/// The apply-time refusal a partitioned Cayenne acceleration gets when the CDC stream
-/// widens under it. Pure so the wording — which is the operator's only account of why
-/// the dataset stopped — is asserted in a test rather than only read in review.
-///
-/// `mode: file` is the one configuration a restart does not repair: it reopens the stored
-/// table with its partition children intact, so registration re-classifies and refuses
-/// again — pointing it at a restart would send an operator round a loop that cannot
-/// terminate. The other three modes each come back rebuilt against the new schema, by
-/// different routes: `file_update` because `recreates_on_schema_mismatch` is true for it
-/// whatever the engine or the partitioning, so registration drops the acceleration and
-/// recreates it instead of asking the engine to evolve in place; `file_create` because the
-/// accelerator deletes the data directory and its metastore slice at bootstrap; and
-/// `memory` because nothing was persisted to reopen. Sending those three to the manual
-/// remedy would cost an operator a needless drop and recreate.
-///
-/// That rebuild restores the *schema* under all three, but none of them restores the *rows*
-/// unconditionally, and the two reasons differ. `file_create` and `memory` are ephemeral to
-/// replication, but only `connector-postgres` acts on that: `accelerator_is_ephemeral` matches
-/// Cayenne on `Memory | FileCreate` and forces a resume snapshot, and only when the connector's
-/// initial snapshot is already enabled — `disabled` is preserved as an explicit opt-out. No other
-/// connector consults the acceleration mode. `connector-mysql` discards a resumable position under
-/// `always` and no other value (#13021), and `connector-dynamodb` `auto` reuses a persisted
-/// checkpoint the same way — so on those two an ephemeral acceleration comes back holding only
-/// later changes even under `auto`, which is why `always` is the portable answer below.
-/// `file_update` is classified *persistent*, so
-/// no resume snapshot is forced for it at all, while its recreate still empties the table: under
-/// `auto` it comes back holding only later changes (#13546). `always` is therefore the one
-/// setting that makes the restart row-safe under every mode *where the connector has it*, which
-/// is why the message names the setting rather than a mode carve-out. Saying this is load-bearing
-/// because the sentence two earlier promises the acceleration still holds every row it held
-/// before.
-///
-/// That qualification is not pedantry: the setting exists on only half the sources that reach
-/// here, which is why the message names both arms rather than the parameter alone. The refusal is
-/// connector-blind by construction —
-/// `install_cdc_schema_evolution` keys on `RefreshMode::Changes` alone, and the refusal itself on
-/// `CayenneWriteTarget::Partitioned`, a property of the acceleration — so every changes-capable
-/// source reaches this string. Of the six, `connector-postgres`, `connector-mysql` and
-/// `connector-dynamodb` declare `replication_initial_snapshot`; Debezium, `MongoDB` and `cdc_ingest`
-/// declare no initial-snapshot parameter at all. Naming the setting without that second arm would
-/// send half of them to a key their connector does not have, having promised their history back.
-// Only reachable from the `#[cfg(not(windows))]` CDC guard below, so gated with it —
-// otherwise this is dead code on Windows and `-D warnings` fails the build there.
-#[cfg(not(windows))]
-#[must_use]
-fn partitioned_widening_refusal(dataset: &str, change: &str) -> String {
-    format!(
-        "widening schema change detected on the CDC stream for '{dataset}' ({change}), \
-         but a partitioned Cayenne acceleration cannot evolve its schema in place, so the change was refused \
-         rather than applied lossily. No part of the batch was applied and the source keeps its position, \
-         so the acceleration still holds every row it held before it. \
-         Under `mode: file_update`, `mode: file_create` and `mode: memory`, restart Spice to apply it: the acceleration comes back \
-         rebuilt against the new schema — dropped and recreated, started from an empty directory, or never persisted at all. \
-         Under all three that restart rebuilds the schema, but it reloads the rows only where the source can replay them. \
-         Where the connector takes an initial-snapshot setting — `pg_replication_initial_snapshot`, \
-         `mysql_replication_initial_snapshot` and `dynamodb_replication_initial_snapshot` — \
-         set it to `always` before restarting if the acceleration has to come back with its history — it is the only value \
-         that snapshots under every mode on every one of them. `auto` skips the snapshot under `mode: file_update` on \
-         PostgreSQL, and skips it under every mode on MySQL and DynamoDB, which resume from their recorded position \
-         without consulting the acceleration mode; `disabled` skips it under every mode on all three. \
-         Where it does not — Debezium, MongoDB \
-         and `cdc_ingest` have no such setting — the acceleration comes back holding only what the change stream delivers \
-         from its resume position onward, and restoring its history means replaying the source from an earlier position or \
-         reloading the dataset with a full refresh. \
-         Under `mode: file` a restart reopens the stored table and refuses again — drop and recreate the dataset against the \
-         new source schema, dropping `partition_by` in the same change if partitioning is no longer wanted. \
-         Removing `partition_by` on its own does not recover it: the unpartitioned table is a different Cayenne table from \
-         the partition children the rows were written to, and changing that setting recreates nothing, so the acceleration \
-         would come back holding none of them. \
-         See: https://spiceai.org/docs/components/data-accelerators/cayenne"
-    )
 }
 
 static CDC_SCHEMA_EVOLUTION: std::sync::LazyLock<
@@ -807,7 +799,7 @@ pub fn set_cdc_config(config: CdcConfig) {
 /// Returns the active CDC tunables, computing them on first access from
 /// (in order) the spicepod-installed config, env-var overrides, then
 /// built-in defaults.
-fn cdc_config() -> CdcConfig {
+pub(crate) fn cdc_config() -> CdcConfig {
     if let Some(cfg) = CDC_CONFIG.get() {
         return *cfg;
     }
@@ -1151,749 +1143,17 @@ impl RefreshTask {
         refresh_completion: Option<RefreshCompletion>,
         initial_load_completed: Arc<AtomicBool>,
     ) -> crate::accelerated::Result<()> {
-        let dataset_name = self.dataset_name.clone();
-        // Prebuilt dataset metric labels reused by this stream's hot record sites
-        // (reader send-wait, apply cycle, coalesce flush, burst, fixed-cost
-        // phases). Clone is an `Arc` refcount bump — see `DatasetMetricLabels`.
-        let metric_labels = self.dataset_metric_labels.clone();
-        let sql = refresh.read().await.display_sql();
-
-        self.set_refresh_status(sql.as_deref(), status::ComponentStatus::Refreshing)
-            .await;
-
-        // Pipeline source-stream reads with apply+commit by running the source
-        // in its own task on the refresh runtime and feeding a bounded channel.
-        // While the apply loop writes batch N to the accelerator and commits
-        // its source-side offset, the reader task can already be pulling and
-        // decoding batch N+1 (network/CPU work that would otherwise be idle).
-        // The bounded channel provides natural backpressure: when the apply
-        // loop is the bottleneck, the reader parks on `send` and stops pulling.
-        // That bounds the number of envelopes in flight, not their size — a full
-        // channel holds `prefetch_buffer` batches of whatever width the source
-        // produces, which at a large scale factor can be a substantial and
-        // otherwise unmeasured share of the process. `cdc_prefetch_buffer_bytes`
-        // estimates it.
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<
-            Result<cdc::ChangeEnvelope, cdc::StreamError>,
-        >(cdc_cfg.prefetch_buffer);
-        // Weak handle so the apply loop can read the channel's live occupancy
-        // (`max_capacity - capacity`) for the backpressure gauge without keeping a
-        // strong `Sender` alive — an extra strong sender would stop `rx.recv()`
-        // ever returning `None`, hanging end-of-stream. `upgrade()` only succeeds
-        // while the reader's real sender lives, so it can never resurrect a closed
-        // channel.
-        let tx_probe = tx.downgrade();
-        // Estimated size of what is queued in the channel above. The capacity
-        // bound counts envelopes, so this is not derivable from occupancy: a
-        // mid-range envelope count can hold anything from kilobytes to gigabytes
-        // depending on how wide the source's batches are. The reader adds an
-        // envelope's encoded size as it hands it over and the apply loop
-        // subtracts it on receipt, so the value tracks what is queued ahead of
-        // apply. `encoded_len` is a decode-free estimate, not measured resident
-        // bytes — see `CDC_PREFETCH_BUFFER_BYTES` for what it does and does not
-        // claim.
-        let prefetch_bytes = Arc::new(AtomicU64::new(0));
-        let reader_prefetch_bytes = Arc::clone(&prefetch_bytes);
-        // Zeroes the gauge once this stream is gone, however it goes (see
-        // `PrefetchBytesGaugeReset`). Held for the whole function so the reset
-        // also covers the finalize/commit drain below, not just the apply loop.
-        let _prefetch_gauge_reset = PrefetchBytesGaugeReset {
-            labels: metric_labels.clone(),
-        };
-
-        let reader_dataset = dataset_name.clone();
-        let reader_metric_labels = metric_labels.clone();
-        let reader_handle = tokio::spawn(async move {
-            let mut stream = changes_stream;
-            let send_labels = reader_metric_labels.dataset();
-            // `select!` on `tx.closed()` lets the reader exit promptly even
-            // when it is parked in `stream.next()`. This matters at shutdown:
-            // when the parent task is aborted, its locals (including `rx`)
-            // are dropped, which closes `tx`. Without this select, a reader
-            // blocked on the source (e.g., a Postgres replication recv) would
-            // remain alive holding the source connection until the next item
-            // happens to arrive. With it, the reader notices the consumer is
-            // gone and tears down its source connection immediately.
-            loop {
-                tokio::select! {
-                    biased;
-                    () = tx.closed() => {
-                        tracing::debug!(
-                            "CDC consumer for {reader_dataset} dropped; reader exiting"
-                        );
-                        return;
-                    }
-                    item = stream.next() => {
-                        let Some(item) = item else { return; };
-                        // Charge the envelope before handing it over: once `send`
-                        // returns the apply loop may already have taken it and
-                        // subtracted, and crediting afterwards could then drive
-                        // the counter negative. `encoded_len` does not force a
-                        // deferred envelope to build.
-                        let queued_bytes = match &item {
-                            Ok(envelope) => envelope.encoded_len() as u64,
-                            Err(_) => 0,
-                        };
-                        reader_prefetch_bytes.fetch_add(queued_bytes, Ordering::Relaxed);
-                        // Time blocked on send: non-zero => the prefetch channel is
-                        // full and the apply loop can't drain fast enough (apply-bound).
-                        let send_start = Instant::now();
-                        let send_res = tx.send(item).await;
-                        if send_res.is_err() {
-                            // Nobody will receive it, so nobody will subtract it.
-                            discharge_prefetch_bytes(&reader_prefetch_bytes, queued_bytes);
-                        }
-                        metrics::CDC_READER_SEND_WAIT_MS.record(elapsed_ms(send_start), send_labels);
-                        if send_res.is_err() {
-                            tracing::debug!(
-                                "CDC consumer for {reader_dataset} dropped; reader exiting"
-                            );
-                            return;
-                        }
-                    }
-                }
-            }
-        });
-
-        // The previous burst's source-side commit task. Commits are network
-        // round-trips to the source (PG `Standby Status Update`, Kafka offset
-        // commit, DynamoDB shard checkpoint) that don't need to gate the next
-        // apply once the accelerator write has succeeded. Before publishing a
-        // new commit task we drain the previous one with `commit_timeout`, so
-        // commit(N) overlaps apply(N+1) without accumulating an unbounded chain
-        // of tasks if the source-side commit path stalls. Commit task errors
-        // are returned through `join_pending_commit` so source offsets cannot
-        // silently stop advancing.
-        let mut pending_commit: Option<tokio::task::JoinHandle<Result<(), String>>> = None;
-        let mut pending_finalize: Option<PendingFinalizeCommit> = None;
-        // Previous iteration's recv-start, for the apply-cadence metric
-        // (`cdc_apply_cycle_ms`): the period between successive burst applies.
-        let mut prev_recv_start: Option<Instant> = None;
-        let mut carried_item: Option<Result<cdc::ChangeEnvelope, cdc::StreamError>> = None;
-        // Receipt time of `carried_item`, captured when it is carried so the next
-        // iteration attributes its wait from true receipt rather than after it sat
-        // through this burst's apply. `_ms` (wall clock) feeds the arrival-lag gauge;
-        // `_at` (monotonic) feeds the coalesce batch-age. Only read when the next burst
-        // starts from the carry; always set together alongside `carried_item`.
-        let mut carried_received_ms: Option<i64> = None;
-        let mut carried_received_at: Option<Instant> = None;
-        let mut last_cycle_start = Instant::now();
-        let write_ctx = util::session_state::session_context();
-        let write_session_state = write_ctx.state();
-        let recv_wait_labels = metric_labels.dataset();
-
-        // In-memory CDC durability (`cdc_durability: memory`): if this stream's
-        // Cayenne provider is memory-capable, set up the deferred-commit queue.
-        // The slot advancer is installed per all-deferrable upsert-only burst and
-        // cleared for durable-only bursts, so non-replayable sources and deletes
-        // never buffer un-acked rows in RAM.
-        //
-        // Excludes `mode: memory` (memory-resident) tables: they never checkpoint
-        // to durable Vortex, so the deferred committers' durability fence
-        // (`on_checkpoint_durable`) would never fire — the queue would grow
-        // unbounded and the source slot would stall. Memory mode is ephemeral
-        // (reload-from-source on restart), so its in-RAM CDC writes take the
-        // immediate-commit path below (`in_memory_epoch` with no queue), advancing
-        // the slot right after the write — correct because a restart re-snapshots.
-        let deferred_commits: Option<DeferredCommitQueue> = {
-            #[cfg(not(windows))]
-            {
-                self.cayenne_accelerator()
-                    .filter(|cayenne| {
-                        cayenne.is_cdc_memory_mode() && !cayenne.is_memory_resident_mode()
-                    })
-                    .map(|_cayenne| {
-                        Arc::new(tokio::sync::Mutex::new(VecDeque::new())) as DeferredCommitQueue
-                    })
-            }
-            #[cfg(windows)]
-            {
-                None
-            }
-        };
-
-        loop {
-            // Time how long the apply loop blocks waiting for the next batch
-            // from the source-reader channel. Large => source-bound (slot read /
-            // WAL decode can't keep up); near-zero => apply-bound (the
-            // accelerator write is the bottleneck). Carried-item iterations
-            // record ~0, which is correct — no wait occurred. Pairs with
-            // CDC_APPLY_BURST_DURATION_MS for full per-batch attribution.
-            let recv_start = Instant::now();
-            // Apply cadence: period between successive burst recv-starts (ground-truths
-            // the per-stage attribution, which overstates the cycle where phases overlap).
-            if let Some(prev) = prev_recv_start {
-                metrics::CDC_APPLY_CYCLE_MS.record(elapsed_ms(prev), recv_wait_labels);
-            }
-            prev_recv_start = Some(recv_start);
-            let from_carried = carried_item.is_some();
-            let next_item = match carried_item.take() {
-                Some(item) => Some(item),
-                // While waiting for the next source item, also drive any deferred
-                // Stage-B finalize from the previous durable burst to completion.
-                // The finalize task runs on its own, but its post-finalize side
-                // effects (dataset-ready signal, cache invalidation, and the
-                // source-offset commit of the finalized burst's committers) are
-                // otherwise only applied on the NEXT burst or at end-of-stream. On
-                // an idle source — e.g. between the initial snapshot and the first
-                // live change in an HTAP workload — that next burst never comes, so
-                // without draining the finalize here the dataset would never report
-                // ready and the source slot would never advance. `biased` polls the
-                // source first, so a busy stream always prefers progress on new data
-                // and keeps the finalize pipelined (joined by the next write); only
-                // a genuinely idle wait drains the finalize early.
-                None => loop {
-                    let Some(mut pending) = pending_finalize.take() else {
-                        break rx.recv().await;
-                    };
-                    tokio::select! {
-                        biased;
-                        item = rx.recv() => {
-                            // Source produced an item first: keep the finalize
-                            // deferred (the upcoming write path joins it) and
-                            // process the item, preserving Stage-A/Stage-B overlap.
-                            pending_finalize = Some(pending);
-                            break item;
-                        }
-                        join_result = &mut pending.finalize => {
-                            let finalize_error = classify_finalize_result(
-                                join_result,
-                                &dataset_name,
-                                self.runtime_status.is_shutdown(),
-                            );
-                            if let Some(error_message) = finalize_error {
-                                self.set_refresh_status(
-                                    sql.as_deref(),
-                                    status::ComponentStatus::error_with_message(error_message),
-                                )
-                                .await;
-                                rx.close();
-                                reader_handle.abort();
-                                break None;
-                            }
-                            let mut context = ApplyContext {
-                                refresh_sql: sql.as_deref(),
-                                dataset_name: &dataset_name,
-                                refresh: &refresh,
-                                metric_labels: &metric_labels,
-                                caching: caching.as_ref(),
-                                refresh_completion: refresh_completion.as_ref(),
-                                initial_load_completed: &initial_load_completed,
-                                write_ctx: &write_ctx,
-                                write_session_state: &write_session_state,
-                                commit_timeout: cdc_cfg.commit_timeout,
-                                pending_finalize: &mut pending_finalize,
-                                pending_commit: &mut pending_commit,
-                                deferred_commits: deferred_commits.as_ref(),
-                            };
-                            if !self
-                                .run_finalize_side_effects(
-                                    &mut context,
-                                    pending.committers,
-                                    pending.ready_after_finalize,
-                                )
-                                .await
-                            {
-                                rx.close();
-                                reader_handle.abort();
-                                break None;
-                            }
-                            // Finalize drained (pending_finalize is now None);
-                            // loop back to wait for the next item without it.
-                        }
-                    }
-                },
-            };
-            metrics::CDC_SOURCE_RECV_WAIT_MS.record(elapsed_ms(recv_start), recv_wait_labels);
-            // Discharge what this receive took out, before sampling, so the byte
-            // gauge and the envelope occupancy below describe the same thing: the
-            // backlog still queued, not counting the item now in hand.
-            //
-            // A CARRIED item is deliberately not discharged here: it left the
-            // channel on the previous iteration's `try_recv` and was discharged
-            // there. Charging it out twice drove the counter below zero, and an
-            // unsigned wrap made the gauge read ~1.8e19.
-            if !from_carried && let Some(item) = next_item.as_ref() {
-                discharge_prefetch_bytes(&prefetch_bytes, cdc_item_budget_bytes(item) as u64);
-            }
-            // Sample prefetch-channel occupancy at the moment the apply loop wakes
-            // (the just-received `first` is out of the buffer; whatever remains is
-            // the backlog the reader has queued ahead). Near capacity => apply-bound.
-            if let Some(tx) = tx_probe.upgrade() {
-                let capacity = tx.max_capacity() as u64;
-                let occupancy = capacity.saturating_sub(tx.capacity() as u64);
-                metrics::CDC_PREFETCH_BUFFER_OCCUPANCY.record(occupancy, recv_wait_labels);
-                metrics::CDC_PREFETCH_BUFFER_CAPACITY.record(capacity, recv_wait_labels);
-                // Sampled next to the envelope count deliberately: read together
-                // they say whether a full channel is holding a little or a lot,
-                // which the count alone cannot.
-                metrics::CDC_PREFETCH_BUFFER_BYTES
-                    .record(prefetch_bytes.load(Ordering::Relaxed), recv_wait_labels);
-            }
-            let Some(first) = next_item else {
-                break;
-            };
-            // Staleness of this envelope AT ARRIVAL (now − its source commit ts):
-            // lag already present before the accelerator acts, separating source-side
-            // lag from lag the apply path adds (`cdc_source_arrival_lag_ms`).
-            if let Ok(env) = &first
-                // Exclude heartbeats: their server-clock timestamp would advance the
-                // received frontier past data not actually received mid-backlog,
-                // corrupting the rate ladder (see ChangeBatch::is_heartbeat).
-                && !env.is_heartbeat()
-                && let Some(commit_ts_ms) = env.source_commit_ts_ms()
-            {
-                // Ingress frontier (received commit ts) is recorded once per burst in
-                // `apply_burst` using the freshest commit timestamp across the coalesced
-                // burst, so it can be compared to the applied frontier (egress) without
-                // ever appearing to lag it.
-                //
-                // Arrival lag is per-burst-first: a carried first was received on the
-                // PREVIOUS iteration, so use its captured receipt time; a fresh first is
-                // arriving now. Measuring a carried item at process time would fold this
-                // burst's apply wait into its arrival lag and — because byte-cap pressure
-                // carries an item on nearly every burst — systematically under-sample the
-                // histogram in exactly the backlogged regime the metric is meant to diagnose.
-                let received_ms = if from_carried {
-                    carried_received_ms
-                } else {
-                    util::time::system_time_to_unix_ms(std::time::SystemTime::now())
-                };
-                if let Some(now_ms) = received_ms {
-                    // `saturating_sub` guards against overflow; `.max(0)` clamps future timestamps
-                    // (clock skew / bad source clock) to 0 so we never record negative arrival lag.
-                    #[expect(
-                        clippy::cast_precision_loss,
-                        reason = "arrival lag in ms as f64 for the histogram; sub-ms precision is irrelevant at second/minute-scale backlogs"
-                    )]
-                    let arrival_lag_ms = now_ms.saturating_sub(commit_ts_ms).max(0) as f64;
-                    metrics::CDC_SOURCE_ARRIVAL_LAG_MS.record(arrival_lag_ms, recv_wait_labels);
-                }
-            }
-            // First envelope of this burst is now in hand; time from here until the
-            // apply below is the per-batch queued/coalescing latency
-            // (`cdc_coalesce_batch_age_ms`). `flush_reason` records what ended the
-            // coalesce (`cdc_coalesce_flush_total`). A carried first was received on the
-            // previous iteration and waited through the prior burst's apply, so anchor
-            // its batch age at that captured receipt rather than "now" (which would
-            // undercount the queued term exactly under byte-cap backlog).
-            let batch_first_received = if from_carried {
-                carried_received_at.unwrap_or_else(Instant::now)
-            } else {
-                Instant::now()
-            };
-            let mut linger_hit_deadline = false;
-            let mut shutdown_flush = false;
-            // Coalesce a contiguous run of buffered envelopes into one
-            // accelerator write, in two phases.
-            //
-            // Phase 1 (always): a non-blocking `try_recv` loop with no `await`,
-            // draining whatever is already buffered. With `max_coalesce_age_ms
-            // == 0` (default) this is the entire drain, so low load applies a
-            // single envelope immediately
-            //
-            // Phase 2 (linger, only when `max_coalesce_age_ms > 0`): keep
-            // awaiting more envelopes until the envelope cap, the byte budget, or
-            // a deadline anchored at the START of the previous apply
-            // (`last_cycle_start`) is reached.
-            let mut burst: Vec<Result<cdc::ChangeEnvelope, cdc::StreamError>> =
-                Vec::with_capacity(8);
-            let mut burst_bytes = cdc_item_budget_bytes(&first);
-            burst.push(first);
-            let max_burst = cdc_cfg.max_coalesced_envelopes;
-            let max_burst_bytes = cdc_cfg.max_coalesced_bytes;
-            // Set when the source-reader channel closes mid-linger: apply the
-            // buffered burst, then exit the outer loop (the `rx.recv()` at the
-            // top would otherwise observe the same end-of-stream next iteration).
-            let mut channel_closed = false;
-
-            while burst.len() < max_burst {
-                match rx.try_recv() {
-                    Ok(item) => {
-                        let item_bytes = cdc_item_budget_bytes(&item);
-                        // Out of the channel, so out of the channel's byte count —
-                        // whether it joins this burst or is carried to the next.
-                        // A carried item is discharged HERE and not again when the
-                        // next iteration picks it up.
-                        discharge_prefetch_bytes(&prefetch_bytes, item_bytes as u64);
-                        if burst_bytes > 0
-                            && item_bytes > 0
-                            && burst_bytes.saturating_add(item_bytes) > max_burst_bytes
-                        {
-                            carried_item = Some(item);
-                            carried_received_ms =
-                                util::time::system_time_to_unix_ms(std::time::SystemTime::now());
-                            carried_received_at = Some(Instant::now());
-                            break;
-                        }
-                        burst_bytes = burst_bytes.saturating_add(item_bytes);
-                        burst.push(item);
-                    }
-                    Err(_) => break,
-                }
-            }
-
-            // Don't linger when the burst is already at/over the byte budget:
-            if cdc_cfg.max_coalesce_age_ms > 0
-                && carried_item.is_none()
-                && burst.len() < max_burst
-                && burst_bytes < max_burst_bytes
-            {
-                // METRIC 4 (`cdc_linger_wait_ms`): wall-clock spent in the Phase-2
-                // linger window accumulating envelopes before applying the burst.
-                // Recorded only on this branch — when linger is disabled
-                // (`max_coalesce_age_ms == 0`, the default) there is no wait to
-                // attribute and the histogram stays empty.
-                let linger_start = Instant::now();
-                let deadline =
-                    last_cycle_start + Duration::from_millis(cdc_cfg.max_coalesce_age_ms);
-                while burst.len() < max_burst && burst_bytes < max_burst_bytes {
-                    // Flush immediately on shutdown rather than waiting out the
-                    // window — teardown must not block on intentional linger.
-                    if self.runtime_status.is_shutdown() {
-                        shutdown_flush = true;
-                        break;
-                    }
-                    let remaining = deadline.saturating_duration_since(Instant::now());
-                    if remaining.is_zero() {
-                        linger_hit_deadline = true;
-                        break;
-                    }
-                    // `rx.recv()` is cancel-safe, so a timeout drops no envelope.
-                    match tokio::time::timeout(remaining, rx.recv()).await {
-                        Ok(Some(item)) => {
-                            let item_bytes = cdc_item_budget_bytes(&item);
-                            // Out of the channel, so out of the channel's byte
-                            // count — burst or carried, it is no longer queued.
-                            // A carried item is discharged HERE, once.
-                            discharge_prefetch_bytes(&prefetch_bytes, item_bytes as u64);
-                            if burst_bytes > 0
-                                && item_bytes > 0
-                                && burst_bytes.saturating_add(item_bytes) > max_burst_bytes
-                            {
-                                carried_item = Some(item);
-                                carried_received_ms = util::time::system_time_to_unix_ms(
-                                    std::time::SystemTime::now(),
-                                );
-                                carried_received_at = Some(Instant::now());
-                                break;
-                            }
-                            burst_bytes = burst_bytes.saturating_add(item_bytes);
-                            burst.push(item);
-                        }
-                        Ok(None) => {
-                            channel_closed = true;
-                            break;
-                        }
-                        // The linger window elapsed with no further envelope — this
-                        // is a deadline flush (the common low-volume case), the same
-                        // outcome as the `remaining.is_zero()` check above.
-                        Err(_elapsed) => {
-                            linger_hit_deadline = true;
-                            break;
-                        }
-                    }
-                }
-                metrics::CDC_LINGER_WAIT_MS.record(elapsed_ms(linger_start), recv_wait_labels);
-            }
-
-            // Attribute what ended coalescing and how long the head-of-batch
-            // envelope was queued, before the write begins. Priority: a carried
-            // item means the next envelope overflowed the byte budget; else a full
-            // burst is the envelope cap; else channel-close / shutdown / the linger
-            // deadline; else Phase-1 drained the buffer (or linger was disabled).
-            let flush_reason = if carried_item.is_some() {
-                "byte_cap"
-            } else if burst.len() >= max_burst {
-                "envelope_cap"
-            } else if channel_closed {
-                "channel_closed"
-            } else if shutdown_flush {
-                "shutdown"
-            } else if linger_hit_deadline {
-                "deadline"
-            } else {
-                "buffer_drained"
-            };
-            metrics::CDC_COALESCE_BATCH_AGE_MS
-                .record(elapsed_ms(batch_first_received), recv_wait_labels);
-            metrics::CDC_COALESCE_FLUSH_TOTAL.add(1, &metric_labels.tagged("reason", flush_reason));
-
-            // Mark the start of this burst's processing cycle: the next burst's
-            // linger deadline is measured from here, so the apply below counts as
-            // accumulation age.
-            last_cycle_start = Instant::now();
-
-            let mut apply_context = ApplyContext {
-                refresh_sql: sql.as_deref(),
-                dataset_name: &dataset_name,
-                refresh: &refresh,
-                metric_labels: &metric_labels,
-                caching: caching.as_ref(),
-                refresh_completion: refresh_completion.as_ref(),
-                initial_load_completed: &initial_load_completed,
-                write_ctx: &write_ctx,
-                write_session_state: &write_session_state,
-                commit_timeout: cdc_cfg.commit_timeout,
-                pending_finalize: &mut pending_finalize,
-                pending_commit: &mut pending_commit,
-                deferred_commits: deferred_commits.as_ref(),
-            };
-            // Which cap closed this burst — the tuning signal for `cdc_max_coalesced_envelopes` /
-            // `cdc_max_coalesced_bytes` / `cdc_max_coalesce_age_ms`
-            let close_reason = if burst.len() >= max_burst {
-                "envelope_cap"
-            } else if carried_item.is_some() || burst_bytes >= max_burst_bytes {
-                "byte_cap"
-            } else if channel_closed {
-                "stream_end"
-            } else if self.runtime_status.is_shutdown() {
-                // The linger loop exits early on shutdown; without this arm those
-                // bursts would misreport as `age_deadline` and skew tuning signals.
-                "shutdown"
-            } else if cdc_cfg.max_coalesce_age_ms > 0 {
-                "age_deadline"
-            } else {
-                "drained"
-            };
-            if !self
-                .apply_burst(&mut apply_context, burst, close_reason)
-                .await
-            {
-                rx.close();
-                reader_handle.abort();
-                break;
-            }
-            if channel_closed {
-                break;
-            }
-        }
-
-        if let Some(pending) = pending_finalize.take() {
-            if let Some(error_message) = join_pending_finalize(
-                pending.finalize,
-                &dataset_name,
-                self.runtime_status.is_shutdown(),
-            )
-            .await
-            {
-                self.set_refresh_status(
-                    sql.as_deref(),
-                    status::ComponentStatus::error_with_message(error_message),
-                )
-                .await;
-            } else {
-                let mut context = ApplyContext {
-                    refresh_sql: sql.as_deref(),
-                    dataset_name: &dataset_name,
-                    refresh: &refresh,
-                    metric_labels: &metric_labels,
-                    caching: caching.as_ref(),
-                    refresh_completion: refresh_completion.as_ref(),
-                    initial_load_completed: &initial_load_completed,
-                    write_ctx: &write_ctx,
-                    write_session_state: &write_session_state,
-                    commit_timeout: cdc_cfg.commit_timeout,
-                    pending_finalize: &mut pending_finalize,
-                    pending_commit: &mut pending_commit,
-                    deferred_commits: deferred_commits.as_ref(),
-                };
-                self.run_finalize_side_effects(
-                    &mut context,
-                    pending.committers,
-                    pending.ready_after_finalize,
-                )
-                .await;
-            }
-        }
-
-        // Drain the final in-flight commit before reporting end-of-stream so
-        // we don't leave the source-side offset un-acked.
-        if let Some(prev) = pending_commit.take()
-            && let Some(error_message) = join_pending_commit(
-                prev,
-                &dataset_name,
-                self.runtime_status.is_shutdown(),
-                cdc_cfg.commit_timeout,
-            )
-            .await
-        {
-            self.set_refresh_status(
-                sql.as_deref(),
-                status::ComponentStatus::error_with_message(error_message),
-            )
-            .await;
-        }
-
-        // rx returned None: the reader dropped its sender. Three causes:
-        //   1) source stream returned None (clean end-of-stream),
-        //   2) reader saw `tx.closed()` and exited (consumer was dropped),
-        //   3) reader panicked.
-        // (1) and (2) join Ok; (3) joins Err with `is_panic()` true. We must
-        // surface (3) loudly — silently swallowing it would leave the dataset
-        // appearing healthy/ready while CDC ingestion has stopped. Cancelled
-        // joins are expected during shutdown and do not need to escalate.
-        match reader_handle.await {
-            Ok(()) => {
-                if !self.runtime_status.is_shutdown() {
-                    tracing::warn!("Changes stream ended for dataset {dataset_name}");
-                }
-            }
-            Err(e) if e.is_cancelled() => {
-                tracing::debug!(
-                    "CDC reader task for {dataset_name} was cancelled (likely shutdown)"
-                );
-            }
-            Err(e) if !self.runtime_status.is_shutdown() => {
-                let err_msg = format!("CDC reader task ended unexpectedly: {e}");
-                tracing::error!("{err_msg} (dataset={dataset_name})");
-                self.set_refresh_status(
-                    sql.as_deref(),
-                    status::ComponentStatus::error_with_message(err_msg),
-                )
-                .await;
-            }
-            Err(_) => {
-                // Shutdown in progress and reader did not exit cleanly —
-                // expected during teardown; nothing to escalate.
-            }
-        }
-
-        Ok(())
+        self.consume_changes(
+            cdc_cfg,
+            refresh,
+            changes_stream,
+            caching,
+            refresh_completion,
+            initial_load_completed,
+        )
+        .await
     }
 
-    /// Apply a single coalesced burst of CDC items drained from the prefetch
-    /// channel. Splits the burst into contiguous runs of `Ok` envelopes
-    /// (which can be coalesced into one accelerator write) and `Err` items
-    /// (handled one-by-one as today). Within an `Ok` run we concatenate the
-    /// underlying `RecordBatch`es into a single `ChangeBatch` and call
-    /// `write_change` once — turning N small writes into one larger write
-    /// and amortizing the per-envelope `SessionContext` + `insert_into`
-    /// planning cost. After a successful write we append the run's committers
-    /// to the ordered background commit chain so source acknowledgements stay
-    /// monotonic without blocking catch-up apply work.
-    async fn apply_burst(
-        &self,
-        context: &mut ApplyContext<'_>,
-        burst: Vec<Result<cdc::ChangeEnvelope, cdc::StreamError>>,
-        close_reason: &'static str,
-    ) -> bool {
-        let burst_start = Instant::now();
-        let burst_envelopes = u64::try_from(burst.len()).unwrap_or(u64::MAX);
-        let burst_bytes = burst
-            .iter()
-            .map(cdc_item_budget_bytes)
-            .fold(0_usize, usize::saturating_add);
-        let labels = context.metric_labels.dataset();
-        metrics::CDC_APPLY_BURST_ENVELOPES.record(burst_envelopes, labels);
-        metrics::CDC_APPLY_BURST_BYTES
-            .record(u64::try_from(burst_bytes).unwrap_or(u64::MAX), labels);
-        // CDC_APPLY_BURST_ROWS_TOTAL is recorded from the built batches in
-        // `apply_envelope_run` (exact applied-row count) — `num_rows_hint()`
-        // over-counts a PK-changing UPDATE's delete+upsert as two rows.
-
-        // Freshest upstream commit timestamp in this burst, for the CDC
-        // replication-lag gauge. Computed here (before the burst is consumed by the
-        // apply loop below) but RECORDED only after the burst's Ok runs apply
-        // successfully — the gauge reflects APPLIED data, so a failed apply must not
-        // report artificially fresh lag. `source_commit_ts_ms` is stamped by the
-        // source connector (Postgres commit time, MongoDB change-stream cluster
-        // time, Debezium source ts); the max over the burst is the most recent.
-        // Sources that don't stamp a timestamp leave it `None`.
-        let max_commit_ts_ms = burst
-            .iter()
-            .filter_map(|item| item.as_ref().ok())
-            // Exclude heartbeats: a keepalive interleaved in a backlogged burst carries
-            // the server clock, which would inflate the applied frontier + lag gauge
-            // (applied appearing to outrun received). See ChangeBatch::is_heartbeat.
-            .filter(|env| !env.is_heartbeat())
-            .filter_map(cdc::ChangeEnvelope::source_commit_ts_ms)
-            .max();
-        if let Some(ts) = max_commit_ts_ms {
-            metrics::CDC_RECEIVED_COMMIT_UNIX_TIME_MS.record(ts, labels);
-        }
-
-        // Walk the burst preserving arrival order, processing contiguous
-        // runs of Ok envelopes together and Err items individually so error
-        // handling and ordering semantics match the pre-coalesce behavior.
-        let mut iter = burst.into_iter().peekable();
-        while let Some(item) = iter.next() {
-            match item {
-                Ok(first_env) => {
-                    let mut envelopes = Vec::with_capacity(8);
-                    envelopes.push(first_env);
-                    while let Some(Ok(_)) = iter.peek() {
-                        let Some(Ok(next)) = iter.next() else {
-                            unreachable!("peeked Ok above");
-                        };
-                        envelopes.push(next);
-                    }
-
-                    if !self.apply_envelope_run(context, envelopes).await {
-                        metrics::CDC_APPLY_BURST_DURATION_MS
-                            .record(elapsed_ms(burst_start), labels);
-                        return false;
-                    }
-                }
-                Err(e) => {
-                    // Transient errors (e.g., Kafka poll timeout) keep the
-                    // refresh status healthy; fatal errors flip status to
-                    // Error but we do not abort the loop, matching the
-                    // pre-coalesce contract.
-                    if handle_stream_error(&e, context.dataset_name) == StreamErrorType::Transient {
-                        continue;
-                    }
-
-                    let error_message = format_datafusion_error(&e);
-                    self.set_refresh_status(
-                        context.refresh_sql,
-                        status::ComponentStatus::error_with_message(error_message),
-                    )
-                    .await;
-                }
-            }
-        }
-        // Per-burst row count is not logged here: it's the exact
-        // `CDC_APPLY_BURST_ROWS_TOTAL` metric recorded in `apply_envelope_run`
-        // (from the built batches), not the pre-apply `num_rows_hint` upper bound.
-        tracing::debug!(
-            dataset = %context.dataset_name,
-            envelopes = burst_envelopes,
-            bytes = burst_bytes,
-            close_reason,
-            apply_ms = elapsed_ms(burst_start),
-            "Applied coalesced CDC change burst"
-        );
-        metrics::CDC_APPLY_BURST_DURATION_MS.record(elapsed_ms(burst_start), labels);
-
-        // Record CDC progress only now that the burst's Ok runs have applied (the
-        // early `return false` above skips it, so a failed apply never reports fresh
-        // progress). The raw applied-commit watermark is emitted whenever the burst
-        // carried a source timestamp; the derived lag additionally needs a readable
-        // wall clock (skipped on pre-epoch / overflow rather than reporting a
-        // misleading 0ms).
-        if let Some(max_commit_ts_ms) = max_commit_ts_ms {
-            metrics::CDC_APPLIED_COMMIT_UNIX_TIME_MS.record(max_commit_ts_ms, labels);
-            if let Some(now_ms) = util::time::system_time_to_unix_ms(std::time::SystemTime::now()) {
-                metrics::CDC_REPLICATION_LAG_MS
-                    .record(now_ms.saturating_sub(max_commit_ts_ms).max(0), labels);
-            }
-        }
-        true
-    }
-
-    /// Run the post-finalize side effects for a deferred Stage-B finalize that
-    /// has already completed successfully: signal dataset readiness (when this
-    /// burst carried the initial-load marker), invalidate cached query results,
-    /// and hand the burst's now-durable source committers to the ordered
-    /// background commit chain so the source offset/slot advances.
-    ///
-    /// Shared by every site that drains a [`PendingFinalizeCommit`]: the next
-    /// burst's write path, the idle-source race at the top of the apply loop,
-    /// and the end-of-stream drain. The caller is responsible for joining the
-    /// finalize task itself (and surfacing any finalize error) before calling
-    /// this; here the finalize is known to have succeeded. Returns `false` when
-    /// a fatal commit error was surfaced and the stream should stop.
     /// Signal the dataset Ready: flip `initial_load_completed`, wake readiness
     /// waiters, then publish the `Ready` component status — in that order, so a
     /// waiter woken by the completion observes the completed flag. The single
@@ -2015,6 +1275,7 @@ impl RefreshTask {
         context: &mut ApplyContext<'_>,
         committers: Vec<Box<dyn cdc::CommitChange + Send + Sync>>,
         ready_after_finalize: bool,
+        durability: StorageDurability,
     ) -> bool {
         if ready_after_finalize {
             self.signal_dataset_ready(context).await;
@@ -2033,26 +1294,17 @@ impl RefreshTask {
             );
         }
 
-        if !committers.is_empty() {
-            #[cfg(not(windows))]
-            if let Some(queue) = context.deferred_commits
-                && let Some(cayenne) = self.cayenne_accelerator()
-                && let Some(error_message) = checkpoint_pending_memory_cdc_commits(
-                    cayenne,
-                    queue,
-                    context.dataset_name,
-                    &self.runtime_status,
-                )
-                .await
-            {
-                self.set_refresh_status(
-                    context.refresh_sql,
-                    status::ComponentStatus::error_with_message(error_message),
-                )
-                .await;
-                return false;
-            }
+        self.acknowledge_published(context, committers, durability)
+            .await
+    }
 
+    async fn acknowledge_published(
+        &self,
+        context: &mut ApplyContext<'_>,
+        committers: Vec<Box<dyn cdc::CommitChange + Send + Sync>>,
+        durability: StorageDurability,
+    ) -> bool {
+        if !committers.is_empty() {
             if let Some(previous_commit) = context.pending_commit.take() {
                 let commit_wait_start = Instant::now();
                 if let Some(error_message) = join_pending_commit(
@@ -2073,17 +1325,98 @@ impl RefreshTask {
                 record_cdc_fixed_cost(context.metric_labels, "commit_wait", commit_wait_start);
             }
 
-            *context.pending_commit = Some(spawn_ordered_commit_task(
-                committers,
-                Arc::clone(&self.runtime_status),
-                context.dataset_name.clone(),
-            ));
+            if let StorageDurability::Deferred(fence) = durability {
+                let Some(observer) = context.deferred_commits else {
+                    self.set_refresh_status(
+                        context.refresh_sql,
+                        status::ComponentStatus::error_with_message(
+                            "Deferred CDC write has no source durability observer".to_string(),
+                        ),
+                    )
+                    .await;
+                    return false;
+                };
+                observer.enqueue(fence, committers).await;
+            } else {
+                if let Some(observer) = context.deferred_commits
+                    && let Some(error_message) = flush_pending_source_commits(
+                        self.change_sink().await,
+                        observer,
+                        context.dataset_name,
+                        &self.runtime_status,
+                    )
+                    .await
+                {
+                    self.set_refresh_status(
+                        context.refresh_sql,
+                        status::ComponentStatus::error_with_message(error_message),
+                    )
+                    .await;
+                    return false;
+                }
+                // NotPromised retains the provider's publication-based source
+                // acknowledgement policy; it does not assert storage durability.
+                *context.pending_commit = Some(spawn_ordered_commit_task(
+                    committers,
+                    Arc::clone(&self.runtime_status),
+                    context.dataset_name.clone(),
+                ));
+            }
+        }
+        true
+    }
+
+    /// Drain storage and source completion before a full-refresh overwrite that
+    /// does not submit row changes through the sink.
+    async fn prepare_rebuild(&self, context: &mut ApplyContext<'_>) -> bool {
+        // The source metadata FIFO is drained before entering this barrier.
+        if let Some(commit) = context.pending_commit.take()
+            && let Some(message) = join_pending_commit(
+                commit,
+                context.dataset_name,
+                self.runtime_status.is_shutdown(),
+                context.commit_timeout,
+            )
+            .await
+        {
+            self.set_refresh_status(
+                context.refresh_sql,
+                status::ComponentStatus::error_with_message(message),
+            )
+            .await;
+            return false;
+        }
+        let sink = self.change_sink().await;
+        if let Err(error) = sink.flush().await {
+            self.set_refresh_status(
+                context.refresh_sql,
+                status::ComponentStatus::error_with_message(format_datafusion_error(&error)),
+            )
+            .await;
+            return false;
+        }
+        if let Some(observer) = context.deferred_commits
+            && let Some(error_message) = flush_pending_source_commits(
+                sink,
+                observer,
+                context.dataset_name,
+                &self.runtime_status,
+            )
+            .await
+        {
+            self.set_refresh_status(
+                context.refresh_sql,
+                status::ComponentStatus::error_with_message(error_message),
+            )
+            .await;
+            return false;
         }
         true
     }
 
     /// Apply a contiguous run of successful envelopes as a single coalesced
     /// write, then append their commits to the ordered background commit chain.
+    #[cfg(test)]
     async fn apply_envelope_run(
         &self,
         context: &mut ApplyContext<'_>,
@@ -2099,6 +1432,9 @@ impl RefreshTask {
         // would never happen. See `trim_to_rebuild_signal` for why the prefix
         // goes with it.
         let history_unavailable = trim_to_rebuild_signal(&mut envelopes);
+        if history_unavailable && !self.prepare_rebuild(context).await {
+            return false;
+        }
 
         // Read after the trim and before the retain. After, because a readiness
         // flag from a discarded envelope must not reach `signal_dataset_ready`,
@@ -2120,22 +1456,9 @@ impl RefreshTask {
         // offsets) require this ordering.
         let any_ready = envelopes.iter().any(cdc::ChangeEnvelope::is_dataset_ready);
 
-        // Strip zero-row readiness heartbeats from the write/durability path
-        // (#12007). Lag-based readiness (#11777) makes CDC connectors emit a
-        // heartbeat roughly every second on a caught-up source; the heartbeat's
-        // committer is a no-op by construction, but a no-op committer does not
-        // support deferral, so leaving heartbeats in the burst forced
-        // `requires_durable_cdc_path` — a mem-tier checkpoint plus a durable
-        // write transition per heartbeat. Under load those once-a-second forced
-        // checkpoints raced Cayenne's pipelined Stage-B staged-append finalize,
-        // and its staged-WAL crash recovery "recovered" (double-published or
-        // rolled back) in-flight appends — duplicating rows. A heartbeat's only
-        // observable effect is its ready flag, already folded into `any_ready`
-        // above; dropping its committer is exact because `is_no_op_heartbeat`
-        // requires `CommitChange::is_no_op` (nothing to acknowledge). Zero-row
-        // envelopes carrying a REAL committer (e.g. the MySQL snapshot-boundary
-        // envelope persisting the initial resume token) are not heartbeats
-        // under that predicate and keep durability-then-commit ordering.
+        // Readiness heartbeats carry no source acknowledgement and must not force
+        // storage flushes. Zero-row envelopes with real committers retain their
+        // publication and durability ordering.
         envelopes.retain(|env| !env.is_no_op_heartbeat());
 
         // Readiness-only run: every envelope was a heartbeat. A classic
@@ -2234,7 +1557,12 @@ impl RefreshTask {
         if batches.is_empty() {
             rebuild_committers.append(&mut committers);
             return self
-                .run_finalize_side_effects(context, rebuild_committers, any_ready)
+                .run_finalize_side_effects(
+                    context,
+                    rebuild_committers,
+                    any_ready,
+                    StorageDurability::NotPromised,
+                )
                 .await;
         }
 
@@ -2245,7 +1573,12 @@ impl RefreshTask {
         // rows are already present — making the next backfill append them again.
         if !rebuild_committers.is_empty()
             && !self
-                .run_finalize_side_effects(context, rebuild_committers, false)
+                .run_finalize_side_effects(
+                    context,
+                    rebuild_committers,
+                    false,
+                    StorageDurability::NotPromised,
+                )
                 .await
         {
             return false;
@@ -2255,8 +1588,9 @@ impl RefreshTask {
         // requires equal schemas. When the dataset's policy allows evolution,
         // split the run into contiguous same-schema groups applied in order —
         // the common case stays a single group. With `block` (or no installed
-        // settings) the run is one group and a mixed-schema concat keeps
-        // today's error/skip behavior verbatim.
+        // settings) the run is one group and a mixed-schema concat fails the
+        // write path and stops the stream so the source redelivers after the
+        // member re-registers.
         let split_on_schema_change = cdc_schema_evolution_for(context.dataset_name)
             .is_some_and(|evolution| !matches!(evolution.policy, OnSchemaChange::Block));
         let groups = group_run_by_schema(batches, committers, split_on_schema_change);
@@ -2266,7 +1600,7 @@ impl RefreshTask {
             // batches (no extra build — `into_parts` already built them);
             // `num_rows_hint()` would over-count a PK-changing UPDATE as two
             // rows. Computed before `apply_coalesced_run` consumes the batches,
-            // but recorded only AFTER the group applies, so a SkipRun/Stop
+            // but recorded only AFTER the group applies, so a Stop
             // failure can't inflate the throughput metric with rows that were
             // never written.
             let group_rows = group_batches
@@ -2286,10 +1620,6 @@ impl RefreshTask {
                     metrics::CDC_APPLY_BURST_ROWS_TOTAL
                         .add(group_rows, context.metric_labels.dataset());
                 }
-                // A skipped group's committers were dropped without acking —
-                // later groups must not apply (their commits would advance the
-                // source offset past the skipped, unapplied envelopes).
-                CoalescedRunOutcome::SkipRun => return true,
                 CoalescedRunOutcome::Stop => return false,
             }
         }
@@ -2300,6 +1630,7 @@ impl RefreshTask {
     /// accelerator write, then hand the group's committers to the ordered
     /// background commit chain. Split out of [`Self::apply_envelope_run`] so
     /// mixed-schema runs can apply per contiguous same-schema group.
+    #[cfg(test)]
     async fn apply_coalesced_run(
         &self,
         context: &mut ApplyContext<'_>,
@@ -2334,63 +1665,46 @@ impl RefreshTask {
                         status::ComponentStatus::error_with_message(error_message),
                     )
                     .await;
-                    // Drop committers without acking — the source will
-                    // re-send these envelopes on reconnect, and CDC apply
-                    // is idempotent at the upsert/delete level.
-                    return CoalescedRunOutcome::SkipRun;
+                    // Drop committers without acking and stop the stream. A
+                    // continued stream would leave a source delivered
+                    // watermark ahead of this unapplied window; reconnect
+                    // replay would then skip it. Stopping drops the receiver
+                    // so the member re-registers and delivered resets with
+                    // committed (see `AckSlot::routes`).
+                    return CoalescedRunOutcome::Stop;
                 }
             }
         };
         record_cdc_fixed_cost(context.metric_labels, "coalesce", coalesce_start);
 
-        #[cfg(not(windows))]
-        let can_defer_current_burst = committers_all_support_deferral(&committers);
-        // Capability probe: a key-mode memory-tier Cayenne sink absorbs Delete
-        // events as RAM tombstones (deferring their durability to the covering
-        // checkpoint exactly like upserts), so delete-bearing bursts stay on
-        // the mem path instead of flipping the table durable per burst. Every
-        // other sink reports `false` (here: no Cayenne provider resolves) and
-        // keeps the old behavior.
-        #[cfg(not(windows))]
-        let sink_absorbs_in_memory_deletes = self
-            .cayenne_accelerator()
-            .is_some_and(CayenneTableProvider::supports_in_memory_cdc_deletes);
-        #[cfg(not(windows))]
-        let requires_durable_cdc_path = !can_defer_current_burst
+        let sink = self.change_sink().await;
+        let requires_durable_cdc_path = !committers_all_support_deferral(&committers)
             || change_batch_requires_durable_cdc_path(
                 &coalesced_batch,
-                sink_absorbs_in_memory_deletes,
+                sink.capabilities().deferred_deletes,
             );
-
-        #[cfg(not(windows))]
-        if let Some(queue) = context.deferred_commits
-            && let Some(cayenne) = self.cayenne_accelerator()
+        if requires_durable_cdc_path
+            && let Some(observer) = context.deferred_commits
+            && let Some(error_message) = flush_pending_source_commits(
+                sink,
+                observer,
+                context.dataset_name,
+                &self.runtime_status,
+            )
+            .await
         {
-            if requires_durable_cdc_path {
-                if let Some(error_message) = checkpoint_pending_memory_cdc_commits(
-                    cayenne,
-                    queue,
-                    context.dataset_name,
-                    &self.runtime_status,
-                )
-                .await
-                {
-                    self.set_refresh_status(
-                        context.refresh_sql,
-                        status::ComponentStatus::error_with_message(error_message),
-                    )
-                    .await;
-                    return CoalescedRunOutcome::Stop;
-                }
-                cayenne.clear_slot_advancer();
-            } else {
-                cayenne.install_slot_advancer(Arc::new(CayenneSlotAdvancer {
-                    queue: Arc::clone(queue),
-                    dataset_name: context.dataset_name.clone(),
-                    runtime_status: Arc::clone(&self.runtime_status),
-                }));
-            }
+            self.set_refresh_status(
+                context.refresh_sql,
+                status::ComponentStatus::error_with_message(error_message),
+            )
+            .await;
+            return CoalescedRunOutcome::Stop;
         }
+        let recovery = if requires_durable_cdc_path {
+            Recovery::Durable
+        } else {
+            Recovery::Replayable
+        };
 
         let write_start = Instant::now();
         match self
@@ -2398,6 +1712,7 @@ impl RefreshTask {
                 coalesced_batch,
                 context.write_ctx,
                 context.write_session_state,
+                recovery,
             )
             .await
         {
@@ -2427,6 +1742,7 @@ impl RefreshTask {
                             context,
                             previous_pending.committers,
                             previous_pending.ready_after_finalize,
+                            previous_pending.durability,
                         )
                         .await
                     {
@@ -2453,80 +1769,18 @@ impl RefreshTask {
                     );
                 }
 
-                let mut committers = Some(committers);
-
                 if let Some(finalize) = write_outcome.pending_finalize {
                     *context.pending_finalize = Some(PendingFinalizeCommit {
                         finalize,
-                        committers: committers.take().unwrap_or_default(),
+                        committers,
                         ready_after_finalize: mark_ready,
+                        durability: write_outcome.durability,
                     });
-                }
-
-                if let Some(committers) = committers {
-                    if let Some(previous_commit) = context.pending_commit.take() {
-                        let commit_wait_start = Instant::now();
-                        if let Some(error_message) = join_pending_commit(
-                            previous_commit,
-                            context.dataset_name,
-                            self.runtime_status.is_shutdown(),
-                            context.commit_timeout,
-                        )
-                        .await
-                        {
-                            self.set_refresh_status(
-                                context.refresh_sql,
-                                status::ComponentStatus::error_with_message(error_message),
-                            )
-                            .await;
-                            return CoalescedRunOutcome::Stop;
-                        }
-                        record_cdc_fixed_cost(
-                            context.metric_labels,
-                            "commit_wait",
-                            commit_wait_start,
-                        );
-                    }
-
-                    // In-memory CDC durability: DEFER this batch's committers behind
-                    // the covering checkpoint rather than advancing the slot now. The
-                    // batch's data is in RAM only; the slot must not advance until a
-                    // checkpoint reports its epoch durable, or a crash would lose the
-                    // un-acked-but-slot-advanced tail. Push the committers tagged with
-                    // the epoch onto the shared queue; the `CayenneSlotAdvancer`
-                    // drains and runs them after the durable checkpoint fence.
-                    if let (Some(epoch), Some(queue)) =
-                        (write_outcome.in_memory_epoch, context.deferred_commits)
-                    {
-                        if !committers.is_empty() {
-                            queue.lock().await.push_back((epoch, committers));
-                        }
-                    } else {
-                        #[cfg(not(windows))]
-                        if let Some(queue) = context.deferred_commits
-                            && let Some(cayenne) = self.cayenne_accelerator()
-                            && let Some(error_message) = checkpoint_pending_memory_cdc_commits(
-                                cayenne,
-                                queue,
-                                context.dataset_name,
-                                &self.runtime_status,
-                            )
-                            .await
-                        {
-                            self.set_refresh_status(
-                                context.refresh_sql,
-                                status::ComponentStatus::error_with_message(error_message),
-                            )
-                            .await;
-                            return CoalescedRunOutcome::Stop;
-                        }
-
-                        *context.pending_commit = Some(spawn_ordered_commit_task(
-                            committers,
-                            Arc::clone(&self.runtime_status),
-                            context.dataset_name.clone(),
-                        ));
-                    }
+                } else if !self
+                    .acknowledge_published(context, committers, write_outcome.durability)
+                    .await
+                {
+                    return CoalescedRunOutcome::Stop;
                 }
             }
             Err(e) => {
@@ -2554,303 +1808,78 @@ impl RefreshTask {
     ) -> crate::accelerated::Result<WriteChangeResult> {
         let ctx = SessionContext::new();
         let session_state = ctx.state();
-        self.write_change_with_context(change_batch, &ctx, &session_state)
-            .await
-            .map(|outcome| outcome.result)
+        let outcome = self
+            .write_change_with_context(change_batch, &ctx, &session_state, Recovery::Durable)
+            .await?;
+        if let Some(publication) = outcome.pending_finalize {
+            publication
+                .wait()
+                .await
+                .context(crate::accelerated::FailedToWriteDataSnafu)?;
+        }
+        Ok(outcome.result)
     }
 
+    #[cfg(test)]
     async fn write_change_with_context(
         &self,
         change_batch: ChangeBatch,
-        ctx: &SessionContext,
-        session_state: &SessionState,
+        _ctx: &SessionContext,
+        _session_state: &SessionState,
+        recovery: Recovery,
     ) -> crate::accelerated::Result<WriteChangeOutcome> {
-        let dataset_name = self.dataset_name.clone();
-
-        let sub_batches = group_into_sub_batches(&change_batch);
-
-        tracing::trace!(
-            "Processing append/change stream batch: dataset={}, rows={}, sub-batches={}",
-            self.dataset_name,
-            change_batch.record.num_rows(),
-            sub_batches.len()
-        );
-
-        // Mid-stream schema evolution (policy != block) is a whole-burst
-        // decision, and it has to be settled before any sub-batch is applied.
-        // `group_into_sub_batches` emits a `Delete` ahead of the `Upsert` that
-        // recreates the same key and flushes a `Truncate` as a barrier, so a
-        // refusal raised from inside the upsert would arrive after those
-        // destructive halves had committed. Nothing recovers from that: the
-        // refusal stops the run without acknowledging, the source redelivers the
-        // same burst, the same split re-applies the same destructive half, and
-        // the refusal fires again, so the rows the burst was replacing never
-        // come back however many times it is retried. Deciding here leaves the
-        // acceleration untouched, which is what makes redelivery a safe outcome
-        // and lets the operator's recovery run against an intact table.
-        //
-        // The burst is a *coalesced* batch of source envelopes
-        // (`concat_change_batches`), so this one decision covers every envelope
-        // in the run and none of their committers ack.
-        //
-        // Gated on the burst carrying an upsert. A delete-only or truncate-only
-        // burst never reads the incoming data schema (`process_delete_batch` and
-        // `process_truncate` work from the primary keys alone), so a widening it
-        // does not carry into the acceleration is not its refusal to raise —
-        // classifying it would stall replication for a burst that applies
-        // cleanly and whose ack covers a burst applied in full.
-        //
-        // The input is `change_batch.data_schema()`, a burst-wide value that does
-        // not vary with the sub-batch, and the target it is compared against is
-        // only changed by an upsert — so classifying once per burst reaches the
-        // same verdict as classifying per upsert sub-batch. It reads the schema
-        // off the data column rather than through `data_batch()`, so classifying
-        // a burst no longer builds a `RecordBatch` that `process_upsert_batch`
-        // immediately builds again.
-        if sub_batches
-            .iter()
-            .any(|(op_type, _)| matches!(op_type, ChangeOperationType::Upsert))
-        {
+        // Classify the whole input before submission: a delete or truncate in
+        // this batch must not run before a later upsert's schema is refused.
+        // Delete-only inputs do not write the incoming data schema.
+        if (0..change_batch.record.num_rows()).any(|row| {
+            matches!(
+                change_batch.op(row),
+                ChangeOperation::Create | ChangeOperation::Update | ChangeOperation::Read
+            )
+        }) {
             self.maybe_evolve_schema_for_cdc(&change_batch.data_schema())
                 .await?;
         }
 
-        let mut had_change = false;
-        let mut pending_finalize: Option<PendingApplyFinalize> = None;
-        // Highest in-memory CDC tier epoch across this coalesced write's upsert
-        // sub-batches (`cdc_durability: memory`). The slot deferral keys on the
-        // max: draining committers up to the highest epoch covers every earlier
-        // one (epochs are monotone). `None` if no sub-batch took the RAM path.
-        //
-        // SINGLE EPOCH AXIS (sharded mem tier, cayenne §3.4 Fix 1): the epoch
-        // cayenne returns is ONE monotone per-apply quantity regardless of the
-        // mem-tier shard count — at N==1 it is the single `MemTier::epoch`, and at
-        // N>1 it is a shared per-apply slot-ack epoch stamped identically across all
-        // shards (NOT a per-shard max, which would be incommensurable across
-        // bursts). A given table's shard count is fixed for its lifetime, so this
-        // axis is consistent within one table's FIFO commit queue. The cayenne
-        // checkpoint reports the MAX captured epoch on the SAME axis (safe because
-        // the capture is all-shards-atomic over each shard's full prefix; a MIN
-        // would under-ack and stall the slot), so this `max`-then-`on_checkpoint_durable`
-        // (`<=` FIFO drain) is correct unchanged for both N==1 and N>1.
-        let mut max_in_memory_epoch: Option<u64> = None;
-        for (op_type, row_indices) in sub_batches {
-            if let Some(finalize) = pending_finalize.take()
-                && let Some(error_message) = join_pending_finalize(
-                    finalize,
-                    &self.dataset_name,
-                    self.runtime_status.is_shutdown(),
-                )
-                .await
-            {
-                return Err(crate::accelerated::Error::FailedToWriteData {
-                    source: DataFusionError::Execution(error_message),
-                });
-            }
-
-            match op_type {
-                ChangeOperationType::Delete => {
-                    let op_start = Instant::now();
-                    let absorbed_epoch = self
-                        .process_delete_batch(&change_batch, &row_indices, ctx, session_state)
-                        .await?;
-                    // An absorbed delete is RAM-only until the covering
-                    // checkpoint, so its epoch must defer this burst's source
-                    // commit exactly like an in-memory upsert sub-batch.
-                    if let Some(epoch) = absorbed_epoch {
-                        max_in_memory_epoch =
-                            Some(max_in_memory_epoch.map_or(epoch, |cur| cur.max(epoch)));
-                    }
-                    tracing::trace!(
-                        dataset = %dataset_name,
-                        op = "delete",
-                        rows = row_indices.len(),
-                        duration_ms = elapsed_ms(op_start),
-                        "Append/change stream sub-batch processed"
-                    );
-                    had_change = true;
-                }
-                ChangeOperationType::Upsert => {
-                    let op_start = Instant::now();
-                    let outcome = self
-                        .process_upsert_batch(&change_batch, &row_indices, ctx, session_state)
-                        .await?;
-                    pending_finalize = outcome.pending_finalize;
-                    if let Some(epoch) = outcome.in_memory_epoch {
-                        max_in_memory_epoch =
-                            Some(max_in_memory_epoch.map_or(epoch, |cur| cur.max(epoch)));
-                    }
-                    tracing::trace!(
-                        dataset = %dataset_name,
-                        op = "upsert",
-                        rows = row_indices.len(),
-                        duration_ms = elapsed_ms(op_start),
-                        "Append/change stream batch sub-batch processed"
-                    );
-                    had_change = true;
-                }
-                ChangeOperationType::Truncate => {
-                    self.process_truncate(ctx, session_state).await?;
-                    had_change = true;
-                }
-                ChangeOperationType::Unknown => {
-                    tracing::error!("Unknown change operation type for {dataset_name}");
-                }
-            }
-        }
-
-        if let Some(ref callback) = self.on_stream_batch_process_callback {
-            let mut callback_guard = callback.lock().await;
-            let future = callback_guard();
-            future.await;
-        }
-
-        if had_change {
-            Ok(
-                WriteChangeOutcome::new(WriteChangeResult::DataWritten, pending_finalize)
-                    .with_in_memory_epoch(max_in_memory_epoch),
+        let receipt = self
+            .change_sink()
+            .await
+            .submit(
+                LogicalChangeBatch::cdc(change_batch),
+                WriteOptions {
+                    recovery,
+                    delete_batch_size: self.cdc_delete_subbatch_max(),
+                },
             )
-        } else {
-            Ok(WriteChangeOutcome::new(WriteChangeResult::NoChange, None))
-        }
-    }
-
-    async fn process_upsert_batch(
-        &self,
-        change_batch: &ChangeBatch,
-        row_indices: &[usize],
-        ctx: &SessionContext,
-        session_state: &SessionState,
-    ) -> crate::accelerated::Result<UpsertOutcome> {
-        let data_batch = change_batch.data_batch();
-
-        // Schema evolution for this burst — evolving Cayenne live, or surfacing
-        // the detected change loudly for engines that need a restart — has
-        // already run in `write_change_with_context`, ahead of every sub-batch,
-        // so it is settled before the narrowing cast below can silently drop the
-        // change and before any destructive sub-batch of the same burst commits.
-        let target_schema = self.accelerator.schema();
-
-        let selected_batch = select_rows(&data_batch, row_indices)?;
-        // CDC sources may produce a nullable schema even for fields declared NOT NULL in the
-        // accelerator (e.g. Postgres DELETE rows where non-PK columns are absent from the WAL
-        // old-tuple). Promote those fields to non-nullable so the batch dtype matches
-        // acceleration schema. SchemaCastScanExec handles type coercion;
-        // this step only adjusts nullability metadata.
-        let selected_batch =
-            try_cast_to(selected_batch, Arc::clone(&target_schema)).map_err(|e| {
-                crate::accelerated::Error::FailedToBuildRecordBatch {
-                    source: arrow::error::ArrowError::SchemaError(e.to_string()),
-                }
-            })?;
-
-        let record_batch_stream = Box::pin(RecordBatchStreamAdapter::new(
-            selected_batch.schema(),
-            Box::pin(stream::once(async move { Ok(selected_batch) })),
-        ));
-
-        #[cfg(not(windows))]
-        if let Some(cayenne) = self.cayenne_accelerator() {
-            let task_ctx = ctx.task_ctx();
-            let cayenne_write = cayenne
-                .write_cdc_append_stream_with_source_commit_ts(
-                    record_batch_stream,
-                    change_batch.source_commit_ts_ms(),
-                    &task_ctx,
-                )
-                .await
-                .map_err(DataFusionError::from)
-                .map_err(find_datafusion_root)
-                .context(crate::accelerated::FailedToWriteDataSnafu)?;
-
-            self.update_last_updated_at();
-
-            // In-memory CDC tier epoch (`cdc_durability: memory`), captured before
-            // `cayenne_write` is consumed. `None` for durable-path writes.
-            let in_memory_epoch = cayenne_write.in_memory_epoch();
-
-            if cayenne_write.has_pending_finalize() {
-                // A pending finalize is the durable Stage-B path — never memory
-                // mode (an in-memory-staged write has nothing to finalize), so no
-                // epoch to defer here.
-                record_cdc_apply_path(&self.dataset_metric_labels, "durable_append");
-                return Ok(UpsertOutcome {
-                    pending_finalize: Some(spawn_cayenne_finalize(cayenne_write)),
-                    in_memory_epoch: None,
-                });
-            }
-            record_cdc_apply_path(&self.dataset_metric_labels, "inmem_append");
-
-            cayenne_write
-                .finish()
-                .await
-                .map_err(DataFusionError::from)
-                .map_err(find_datafusion_root)
-                .context(crate::accelerated::FailedToWriteDataSnafu)?;
-
-            return Ok(UpsertOutcome {
-                pending_finalize: None,
-                in_memory_epoch,
-            });
-        }
-
-        #[cfg(not(windows))]
-        self.warn_if_cayenne_cdc_synchronous_fallback();
-
-        let _lock_guard = self.accelerator_write_mutex.lock().await;
-
-        let (streaming_plan, insert_plan) = {
-            let mut cache_guard = self.cdc_insert_plan_cache.lock().await;
-            let rebuild_cache = cache_guard
-                .as_ref()
-                .is_none_or(|cache| !cache.matches_schema(&target_schema));
-            if rebuild_cache {
-                *cache_guard = Some(
-                    CdcInsertPlanCache::try_new(
-                        &self.accelerator,
-                        session_state,
-                        Arc::clone(&target_schema),
-                    )
-                    .await
-                    .map_err(find_datafusion_root)
-                    .context(crate::accelerated::FailedToWriteDataSnafu)?,
-                );
-            }
-
-            let cache = cache_guard.as_ref().ok_or_else(|| {
-                crate::accelerated::Error::FailedToWriteData {
-                    source: DataFusionError::Execution(
-                        "CDC insert plan cache was not initialized".to_string(),
-                    ),
-                }
-            })?;
-            cache
-                .streaming_plan
-                .set_stream(record_batch_stream)
-                .map_err(find_datafusion_root)
-                .context(crate::accelerated::FailedToWriteDataSnafu)?;
-            (
-                Arc::clone(&cache.streaming_plan),
-                Arc::clone(&cache.insert_plan),
-            )
-        };
-
-        let collect_result = collect(insert_plan, ctx.task_ctx())
             .await
             .map_err(find_datafusion_root)
-            .context(crate::accelerated::FailedToWriteDataSnafu);
-        streaming_plan
-            .clear_stream()
-            .map_err(find_datafusion_root)
             .context(crate::accelerated::FailedToWriteDataSnafu)?;
-        collect_result?;
-        perform_change_write_maintenance(&self.accelerator).await?;
-
-        self.update_last_updated_at();
-
-        Ok(UpsertOutcome {
-            pending_finalize: None,
-            in_memory_epoch: None,
+        // Ready can contain a completed failure. Observe it before source effects.
+        let pending_finalize = if receipt.publication.is_ready() {
+            receipt
+                .published()
+                .await
+                .map_err(find_datafusion_root)
+                .context(crate::accelerated::FailedToWriteDataSnafu)?;
+            None
+        } else {
+            Some(receipt.publication)
+        };
+        if receipt.changed {
+            self.update_last_updated_at();
+        }
+        if let Some(ref callback) = self.on_stream_batch_process_callback {
+            let mut callback_guard = callback.lock().await;
+            callback_guard().await;
+        }
+        Ok(WriteChangeOutcome {
+            result: if receipt.changed {
+                WriteChangeResult::DataWritten
+            } else {
+                WriteChangeResult::NoChange
+            },
+            pending_finalize,
+            durability: receipt.durability,
         })
     }
 
@@ -2862,217 +1891,34 @@ impl RefreshTask {
     /// before any of the burst's sub-batches is applied, so a refusal here leaves
     /// the acceleration untouched.
     ///
-    /// - Cayenne + allowed widening ⇒ evolve LIVE via the provider's
-    ///   `evolve_schema_live` (fence + flush + metastore update + in-memory
-    ///   schema swap, idempotent) and continue — the narrowing cast in
-    ///   `process_upsert_batch` becomes a pass-through to the evolved schema. A
-    ///   failed evolve stops the stream; the source redelivers and the
-    ///   idempotent evolve self-heals.
-    /// - Other engines ⇒ NO mid-life engine DDL: keep today's narrowing cast,
-    ///   warn once, count the failure — restart-time evolution applies it.
-    /// - `fail` policy ⇒ terminal actionable error.
-    /// - `block` policy / no installed settings ⇒ return immediately (today's
-    ///   code path verbatim).
-    async fn maybe_evolve_schema_for_cdc(
-        &self,
-        incoming_data_schema: &SchemaRef,
-    ) -> crate::accelerated::Result<()> {
-        let Some(evolution) = cdc_schema_evolution_for(&self.dataset_name) else {
-            return Ok(());
-        };
-        if matches!(evolution.policy, OnSchemaChange::Block) {
-            return Ok(());
-        }
-        let target_schema = self.accelerator.schema();
-        // The accelerated table holds the engine's own creation-time rewrite by
-        // construction (DuckDB stores every TIMESTAMPTZ at microsecond precision), so the
-        // comparison has to be made against what the engine would store from this input.
-        // Without it the classifier reads that permanent rewrite as `Incompatible` drift
-        // on every CDC batch, and `on_schema_change: fail` stops replication for a schema
-        // that never changed.
-        //
-        // The match test is rule-aware rather than rebuilding the schema up front: this
-        // runs once per upsert-bearing burst and almost always matches, and rewriting one
-        // `DataType` for the few columns that differ is cheaper than allocating a whole
-        // `Schema` that is then discarded.
-        if cdc_data_schema_matches(
-            &target_schema,
-            incoming_data_schema,
-            self.engine_type_rewrites,
-        ) {
-            return Ok(());
-        }
-        let normalized_incoming: SchemaRef = if self.engine_type_rewrites.is_empty() {
-            Arc::clone(incoming_data_schema)
-        } else {
-            Arc::new(arrow_tools::type_rewrite::apply_rules(
-                incoming_data_schema,
-                self.engine_type_rewrites,
-            ))
-        };
-        let incoming_data_schema = &normalized_incoming;
-        let aligned = align_nullability_for_classify(&target_schema, incoming_data_schema);
-        let ctx = EvolutionContext {
-            constraint_columns: &evolution.constraint_columns,
-        };
-        let dataset = self.dataset_name.to_string();
-        match schema_evolution::classify(&target_schema, &aligned, &ctx) {
-            SchemaEvolution::Identical => Ok(()),
-            SchemaEvolution::Widening(plan) => {
-                let kind = widening_plan_kind(&plan);
-                let change = plan.describe();
-                SCHEMA_EVOLUTION_DETECTED
-                    .add(1, &schema_evolution_labels(&dataset, kind, "cdc_stream"));
-                if matches!(evolution.policy, OnSchemaChange::Fail) {
-                    SCHEMA_EVOLUTION_FAILED
-                        .add(1, &schema_evolution_labels(&dataset, kind, "fail_policy"));
-                    emit_schema_evolution_event(&dataset, "fail_policy", &change, true);
-                    return Err(crate::accelerated::Error::FailedToWriteData {
-                        source: DataFusionError::Execution(format!(
-                            "schema change detected on the CDC stream for {dataset} ({change}) and `on_schema_change: fail` is set. \
-                             Revert the source schema change, or set `on_schema_change: append_new_columns`/`sync_all_columns` to evolve"
-                        )),
-                    });
-                }
-                if !evolution_allowed(evolution.policy, &plan) {
-                    SCHEMA_EVOLUTION_FAILED.add(
-                        1,
-                        &schema_evolution_labels(&dataset, kind, "blocked_by_policy"),
-                    );
-                    if schema_evolution_first_warn(format!("{dataset}|policy|{change}")) {
-                        tracing::warn!(
-                            dataset = %dataset,
-                            "widening schema change detected on the CDC stream ({change}) but `on_schema_change: {}` only evolves added columns; values continue to be cast to the current schema. Set `on_schema_change: sync_all_columns` to evolve types",
-                            evolution.policy
-                        );
-                        emit_schema_evolution_event(&dataset, "blocked_by_policy", &change, true);
-                    }
-                    return Ok(());
-                }
-                #[cfg(not(windows))]
-                if let Some(cayenne) = self.cayenne_accelerator() {
-                    cayenne
-                        .evolve_schema_live(&plan)
-                        .await
-                        .map_err(DataFusionError::from)
-                        .map_err(find_datafusion_root)
-                        .context(crate::accelerated::FailedToWriteDataSnafu)?;
-                    SCHEMA_EVOLUTION_APPLIED
-                        .add(1, &schema_evolution_labels(&dataset, kind, "cdc_live"));
-                    tracing::info!(
-                        dataset = %dataset,
-                        "applied live schema evolution from the CDC stream: {change}"
-                    );
-                    emit_schema_evolution_event(&dataset, "cdc_live", &change, false);
-                    return Ok(());
-                }
-                // A partitioned Cayenne acceleration reaches here because
-                // `cayenne_accelerator()` cannot resolve a provider through the
-                // partition fan-out, not because the engine cannot evolve. The
-                // "cast and carry on" fallback below is only safe when a restart
-                // repairs the divergence, and for this target a restart that
-                // *reopens* the stored table does not: the accelerator pins the
-                // partitioned provider to `SchemaEvolutionMode::Disabled` when it
-                // builds it, so registration re-classifies and refuses again
-                // (#12999). Only `mode: file` reopens. The other three come back
-                // rebuilt against the new schema — `file_update` because
-                // `recreates_on_schema_mismatch` holds for it whatever the engine,
-                // so registration calls `evolve_accelerated_table_schema` first and
-                // reaches the drop-and-recreate once the partitioned accelerator
-                // refuses in-place evolution; `file_create` because the accelerator
-                // deletes the data directory and its metastore slice at bootstrap;
-                // `memory` because nothing was persisted to reopen. The refusal
-                // itself is not mode-conditional — the guard below returns the error
-                // for every mode, because the apply cannot widen a partitioned
-                // target under any of them. The mode gates *recovery*, which is why
-                // the message names modes rather than the write target: the mode is
-                // what the operator can read off their own spicepod.
-                #[cfg(not(windows))]
-                if matches!(
-                    extract_cayenne_write_target(&self.accelerator),
-                    Some(CayenneWriteTarget::Partitioned(_))
-                ) {
-                    SCHEMA_EVOLUTION_FAILED.add(
-                        1,
-                        &schema_evolution_labels(&dataset, kind, "partitioned_unsupported"),
-                    );
-                    emit_schema_evolution_event(&dataset, "partitioned_unsupported", &change, true);
-                    return Err(crate::accelerated::Error::FailedToWriteData {
-                        source: DataFusionError::Execution(partitioned_widening_refusal(
-                            &dataset, &change,
-                        )),
-                    });
-                }
-                SCHEMA_EVOLUTION_FAILED.add(
-                    1,
-                    &schema_evolution_labels(&dataset, kind, "restart_required"),
-                );
-                if schema_evolution_first_warn(format!("{dataset}|restart|{change}")) {
-                    tracing::warn!(
-                        dataset = %dataset,
-                        "widening schema change detected on the CDC stream ({change}) but this acceleration engine cannot evolve mid-stream; incoming values are cast to the current schema (new columns dropped) until restart. Restart Spice to apply the evolution"
-                    );
-                    emit_schema_evolution_event(&dataset, "restart_required", &change, true);
-                }
-                Ok(())
-            }
-            SchemaEvolution::Incompatible { reason } => {
-                SCHEMA_EVOLUTION_DETECTED.add(
-                    1,
-                    &schema_evolution_labels(&dataset, "incompatible", "cdc_stream"),
-                );
-                if matches!(evolution.policy, OnSchemaChange::Fail) {
-                    SCHEMA_EVOLUTION_FAILED.add(
-                        1,
-                        &schema_evolution_labels(&dataset, "incompatible", "fail_policy"),
-                    );
-                    emit_schema_evolution_event(&dataset, "fail_policy", &reason, true);
-                    return Err(crate::accelerated::Error::FailedToWriteData {
-                        source: DataFusionError::Execution(format!(
-                            "incompatible schema change detected on the CDC stream for {dataset}: {reason}. `on_schema_change: fail` is set"
-                        )),
-                    });
-                }
-                SCHEMA_EVOLUTION_FAILED.add(
-                    1,
-                    &schema_evolution_labels(&dataset, "incompatible", "incompatible"),
-                );
-                if schema_evolution_first_warn(format!("{dataset}|incompatible|{reason}")) {
-                    tracing::warn!(
-                        dataset = %dataset,
-                        "incompatible schema change detected on the CDC stream: {reason}. Values continue to be cast to the current schema"
-                    );
-                    emit_schema_evolution_event(&dataset, "incompatible", &reason, true);
-                }
-                Ok(())
-            }
+    /// Live-capable sinks evolve before submission. Targets requiring recreation
+    /// refuse the input. Restart-capable targets keep their current schema and
+    /// warn. The `fail` policy always rejects drift; `block` keeps the schema.
+    fn cdc_policy(&self) -> policy::RefreshCdcPolicy {
+        policy::RefreshCdcPolicy {
+            dataset: self.dataset_name.clone(),
+            settings: cdc_schema_evolution_for(&self.dataset_name),
+            type_rewrites: self.engine_type_rewrites,
         }
     }
 
-    /// Resolve the inner [`CayenneTableProvider`] from the accelerator, peeling
-    /// the wrappers it is created behind. Non-partitioned Cayenne tables are
-    /// wrapped in `PolyTableProvider` (read/write split), optionally
-    /// `UpsertDedupTableProvider` (when `remove_duplicates`/`last_write_wins` is
-    /// set), and `IndexLayer` (vector indexes). A direct downcast to
-    /// `CayenneTableProvider` misses through any of these, so without peeling the
-    /// CDC apply silently falls back to the synchronous `insert_into` path and
-    /// loses pipelined finalization (backgrounded publish, no blocking
-    /// `apply_on_conflict_deletions`).
-    ///
-    /// Uses [`LayerWalk::Write`], which steps only through wrappers whose
-    /// `insert_into` is a pass-through (`PolyTableProvider` to its writer side,
-    /// `IndexLayer`), as each layer's `route` declares.
-    ///
-    /// NOTE: `UpsertDedupTableProvider` is opaque to the write walk. Unlike
-    /// `PolyTableProvider` (delegates writes) and `IndexLayer`
-    /// (`insert_into` is a pass-through), it *rewrites* the write on insert
-    /// (dedup / last-write-wins via `UpsertDedupExec`). Routing CDC past it to the
-    /// inner provider would bypass that transform, so a dedup-configured table
-    /// instead stays on the synchronous path (through the wrapper, preserving its
-    /// semantics) and emits the fallback warning below.
-    #[cfg(not(windows))]
-    fn cayenne_accelerator(&self) -> Option<&CayenneTableProvider> {
-        find_concrete::<CayenneTableProvider>(self.accelerator.as_ref(), LayerWalk::Write)
+    #[cfg(test)]
+    async fn maybe_evolve_schema_for_cdc(
+        &self,
+        incoming: &SchemaRef,
+    ) -> crate::accelerated::Result<()> {
+        let policy = self.cdc_policy();
+        let sink = self.change_sink().await;
+        if let SchemaDecision::Evolve(plan) = policy
+            .classify(incoming, &self.accelerator.schema(), sink.capabilities())
+            .context(crate::accelerated::FailedToWriteDataSnafu)?
+        {
+            sink.evolve_schema(&plan)
+                .await
+                .context(crate::accelerated::FailedToWriteDataSnafu)?;
+            policy.applied(&plan);
+        }
+        Ok(())
     }
 
     /// Effective per-plan delete-key cap for this dataset: the process-global
@@ -3088,327 +1934,11 @@ impl RefreshTask {
         };
         effective.delete_subbatch_max.max(1)
     }
-
-    /// Warn once per table when the CDC apply takes the synchronous fallback for
-    /// a Cayenne-engine dataset — i.e. [`Self::cayenne_accelerator`] could not
-    /// unwrap the inner provider through its wrappers, so pipelined finalization
-    /// is silently disabled. For non-Cayenne accelerators the synchronous path is
-    /// expected, so this stays quiet.
-    #[cfg(not(windows))]
-    fn warn_if_cayenne_cdc_synchronous_fallback(&self) {
-        // Mirrors the per-engine-module `SPICE_ACCELERATOR_METADATA_KEY` (defined
-        // privately in each accelerator module); the accelerator's schema
-        // metadata carries the engine name.
-        const ACCELERATOR_METADATA_KEY: &str = "spice.accelerator";
-        let is_cayenne = self
-            .accelerator
-            .schema()
-            .metadata()
-            .get(ACCELERATOR_METADATA_KEY)
-            .map(String::as_str)
-            == Some("cayenne");
-        if !is_cayenne {
-            return;
-        }
-        let first_for_table = CAYENNE_CDC_SYNCHRONOUS_FALLBACK_WARNING_KEYS
-            .lock()
-            .insert_new(
-                self.dataset_name.to_string(),
-                CAYENNE_CDC_SYNCHRONOUS_FALLBACK_WARNING_KEY_LIMIT,
-            );
-        if first_for_table {
-            tracing::warn!(
-                dataset = %self.dataset_name,
-                "Cayenne CDC fell back to the synchronous write path: cayenne_accelerator() could not unwrap the inner CayenneTableProvider through its provider wrappers. Pipelined finalization (backgrounded publish, no blocking apply_on_conflict_deletions) is DISABLED for this table — an unrecognized provider wrapper likely needs peeling in cayenne_accelerator()."
-            );
-        }
-    }
-
-    async fn process_truncate(
-        &self,
-        ctx: &SessionContext,
-        session_state: &SessionState,
-    ) -> crate::accelerated::Result<()> {
-        let dataset_name = &self.dataset_name;
-        tracing::info!("Processing TRUNCATE for {dataset_name}");
-
-        let _lock_guard = self.accelerator_write_mutex.lock().await;
-        // Some accelerator impls (notably DuckDB) treat an empty filter list as
-        // a no-op to guard against accidental full-table deletes. To get
-        // uniform "wipe the whole table" semantics we pass an always-true
-        // literal, which is emitted as `DELETE FROM <table> WHERE TRUE` and
-        // applied consistently across engines.
-        let delete_plan = self
-            .accelerator
-            .delete_from(session_state, vec![lit(true)])
-            .await
-            .map_err(find_datafusion_root)
-            .context(crate::accelerated::FailedToWriteDataSnafu)?;
-        collect(delete_plan, ctx.task_ctx())
-            .await
-            .map_err(find_datafusion_root)
-            .context(crate::accelerated::FailedToWriteDataSnafu)?;
-        perform_change_write_maintenance(&self.accelerator).await?;
-
-        self.update_last_updated_at();
-        Ok(())
-    }
-
-    /// Apply one Delete sub-batch. Returns the Cayenne in-memory CDC tier
-    /// epoch when the deletes were ABSORBED as RAM tombstones
-    /// (`cdc_durability: memory`, key-mode) — the caller must defer the
-    /// burst's source commit on that epoch exactly like an in-memory upsert —
-    /// or `None` when the deletes were applied durably (the historical path).
-    async fn process_delete_batch(
-        &self,
-        change_batch: &ChangeBatch,
-        row_indices: &[usize],
-        ctx: &SessionContext,
-        session_state: &SessionState,
-    ) -> crate::accelerated::Result<Option<u64>> {
-        let dataset_name = &self.dataset_name;
-
-        if row_indices.is_empty() {
-            return Ok(None);
-        }
-
-        // Distribution of delete-burst sizes — the count of primary-keyed rows,
-        // i.e. the keys that feed the chunked durable `delete_from`. Recorded
-        // once per sub-batch on both the absorb and durable paths so the fleet
-        // can see how large delete bursts get — i.e. whether
-        // `cdc_delete_subbatch_max` ever binds. Keyless delete rows carry no key
-        // (they take the row-match path, not `delete_from`) and are excluded, so
-        // a mixed keyed+keyless burst is not over-counted as keys.
-        let keyed_count = row_indices
-            .iter()
-            .filter(|&&row| change_batch.has_primary_keys(row))
-            .count();
-        metrics::CDC_KEYS_PER_DELETE_BURST.record(
-            u64::try_from(keyed_count).unwrap_or(u64::MAX),
-            self.dataset_metric_labels.dataset(),
-        );
-
-        // In-memory absorption: when the burst-level gate kept this burst on
-        // the mem path, the slot advancer is armed and a capable Cayenne sink
-        // turns the delete rows into mem-tier tombstones, deferring their
-        // durability to the covering checkpoint. Any fall-through (capability
-        // lost, inextractable keys, budget refusal after spill) lands on the
-        // durable path below — safe in either ack mode, since durable deletes
-        // never sit ahead of the source slot — and records the reason so the
-        // eventual composite-key absorb fix can be aimed at the right cause.
-        #[cfg(not(windows))]
-        let fallthrough_reason: &'static str = 'absorb: {
-            let Some(cayenne) = self.cayenne_accelerator() else {
-                break 'absorb "no_capability";
-            };
-            if !cayenne.supports_in_memory_cdc_deletes() {
-                break 'absorb "no_capability";
-            }
-            if !cayenne.has_slot_advancer() {
-                break 'absorb "no_advancer";
-            }
-            if !row_indices
-                .iter()
-                .all(|&row| change_batch.has_primary_keys(row))
-            {
-                break 'absorb "inextractable_keys";
-            }
-            let selected_batch = select_rows(&change_batch.data_batch(), row_indices)?;
-            let absorbed = cayenne
-                .write_cdc_delete_keys_in_memory(&selected_batch)
-                .await
-                .map_err(DataFusionError::from)
-                .map_err(find_datafusion_root)
-                .context(crate::accelerated::FailedToWriteDataSnafu)?;
-            if let Some(epoch) = absorbed {
-                tracing::trace!(
-                    dataset = %dataset_name,
-                    rows = row_indices.len(),
-                    epoch,
-                    "Delete sub-batch absorbed into the in-memory CDC tier"
-                );
-                record_cdc_apply_path(&self.dataset_metric_labels, "inmem_delete");
-                self.update_last_updated_at();
-                return Ok(Some(epoch));
-            }
-            // Gate passed but the sink declined the RAM write. In practice this
-            // is the mem-tier byte budget refusing after a spill attempt; a
-            // deeper key-extraction miss (all rows carried PKs at this layer) is
-            // far rarer, so attribute the fall-through to `budget`.
-            "budget"
-        };
-
-        // On Windows the in-memory absorb path is compiled out entirely, so
-        // every delete is durable — attribute it to the missing capability.
-        #[cfg(windows)]
-        let fallthrough_reason: &'static str = "no_capability";
-
-        metrics::CDC_DELETE_ABSORB_FALLTHROUGH.add(
-            1,
-            &self
-                .dataset_metric_labels
-                .tagged("reason", fallthrough_reason),
-        );
-
-        // Durable delete fallback (in-memory absorb declined, e.g. deletes cleared
-        // the slot-advancer). This synchronous path — lock wait, delete, then
-        // whole-burst maintenance — is far more expensive than in-memory absorption
-        // and, before these sub-phases, was invisible in the write-phase breakdown
-        // (it is not a cayenne write_phase). Decompose it so a table pinned here
-        // (new_order) shows WHERE its apply time goes.
-        record_cdc_apply_path(&self.dataset_metric_labels, "durable_delete");
-        let (keyless_rows, keyed_rows): (Vec<_>, Vec<_>) = row_indices
-            .iter()
-            .copied()
-            .partition(|row| !change_batch.has_primary_keys(*row));
-
-        let mut wrote = false;
-        // Serialized with every other writer (and compaction); under contention this
-        // acquire alone can dominate a delete burst.
-        let lock_start = Instant::now();
-        let _lock_guard = self.accelerator_write_mutex.lock().await;
-        record_cdc_fixed_cost(
-            &self.dataset_metric_labels,
-            "durable_delete_lock_wait",
-            lock_start,
-        );
-        let apply_start = Instant::now();
-
-        if !keyless_rows.is_empty() {
-            let selected_batch = select_rows(&change_batch.data_batch(), &keyless_rows)?;
-            if delete_matching_rows_from_arrow_provider(&self.accelerator, &selected_batch)
-                .await?
-                .is_some()
-            {
-                wrote = true;
-            } else {
-                return Err(crate::accelerated::Error::NoPrimaryKeysDefined {
-                    dataset_name: dataset_name.to_string(),
-                });
-            }
-        }
-
-        // Cap the number of keys per durable `delete_from`: a burst of N keyed
-        // rows becomes ⌈N/cap⌉ independent, interruptible plans instead of one
-        // monolithic OR-tree predicate (the ~89s / ~50k-comparison execution
-        // that pegged prefetch and tripped walsender timeouts). The keys across
-        // chunks are distinct PKs, so each is deleted exactly once and
-        // cross-chunk ordering is not load-bearing; all chunks run under the
-        // single `_lock_guard` held for this call, so the burst stays isolated.
-        let cap = self.cdc_delete_subbatch_max();
-        let dataset_name_str = dataset_name.to_string();
-        for chunk in keyed_rows.chunks(cap) {
-            let combined = build_batch_delete_expr_from_change_batch(
-                change_batch,
-                chunk,
-                dataset_name_str.as_str(),
-            )?;
-
-            if let Some(combined) = combined {
-                // The CDC apply loop discards the "rows affected" count. Cayenne can
-                // handle key-delete CDC batches through a count-skipping path; non-
-                // Cayenne accelerators and shapes Cayenne declines fall back to the
-                // generic `delete_from` below. The predicate handed to either path
-                // is this chunk's (≤ `cap` keys), so the per-plan bound holds on
-                // both the fast and fallback paths.
-                let handled_by_cayenne_cdc_path = {
-                    #[cfg(not(windows))]
-                    {
-                        if let Some(cayenne) = self.cayenne_accelerator() {
-                            cayenne
-                                .delete_from_cdc_fast(std::slice::from_ref(&combined))
-                                .await
-                                .map_err(find_datafusion_root)
-                                .context(crate::accelerated::FailedToWriteDataSnafu)?
-                                .is_some()
-                        } else {
-                            false
-                        }
-                    }
-                    #[cfg(windows)]
-                    {
-                        false
-                    }
-                };
-
-                if handled_by_cayenne_cdc_path {
-                    // Cayenne's fast CDC-delete path bypasses `TableProvider::delete_from`
-                    // entirely, so it never reaches `IndexLayer::delete_from`'s
-                    // index-aware handling on either side — drive index deletion explicitly
-                    // here instead, across both the accelerator and federated sides (an
-                    // external-store vector/search index, e.g. S3 Vectors, is attached only
-                    // on the federated side; see `collect_all_indexes`). Best-effort: an index
-                    // failure is logged, not propagated, so it can't block the (already-applied)
-                    // accelerator-side delete above.
-                    if let Some(keys) = build_pk_only_batch_from_change_batch(change_batch, chunk)?
-                    {
-                        for index in collect_all_indexes(&self.accelerator, &self.federated) {
-                            if let Err(e) = index.delete_by_keys(keys.clone()).await {
-                                tracing::error!(
-                                    "Index '{}' failed to delete entries for a CDC delete via the Cayenne fast path (best-effort, continuing): {e}",
-                                    index.name()
-                                );
-                            }
-                        }
-                    }
-                } else {
-                    let delete_plan = self
-                        .accelerator
-                        .delete_from(session_state, vec![combined])
-                        .await
-                        .map_err(find_datafusion_root)
-                        .context(crate::accelerated::FailedToWriteDataSnafu)?;
-                    collect(delete_plan, ctx.task_ctx())
-                        .await
-                        .map_err(find_datafusion_root)
-                        .context(crate::accelerated::FailedToWriteDataSnafu)?;
-
-                    // `self.accelerator.delete_from` above already drives any
-                    // `IndexLayer` wrapping the accelerator itself (e.g. the DuckDB
-                    // vector engine) through its own index-aware handling. It cannot reach an
-                    // index attached only on the federated side (e.g. S3 Vectors, Elasticsearch)
-                    // — that's a distinct `TableProvider` chain — so drive those explicitly here.
-                    // Best-effort: logged, not propagated.
-                    if let Some(keys) = build_pk_only_batch_from_change_batch(change_batch, chunk)?
-                    {
-                        for index in indexes_from_federated(&self.federated) {
-                            if let Err(e) = index.delete_by_keys(keys.clone()).await {
-                                tracing::error!(
-                                    "Index '{}' failed to delete entries for a CDC delete (best-effort, continuing): {e}",
-                                    index.name()
-                                );
-                            }
-                        }
-                    }
-                }
-                wrote = true;
-            }
-        }
-        record_cdc_fixed_cost(
-            &self.dataset_metric_labels,
-            "durable_delete_apply",
-            apply_start,
-        );
-
-        if wrote {
-            // Whole-burst maintenance (compaction trigger) runs synchronously here —
-            // a prime contributor to a long durable-delete burst; time it separately.
-            let maint_start = Instant::now();
-            perform_change_write_maintenance(&self.accelerator).await?;
-            record_cdc_fixed_cost(
-                &self.dataset_metric_labels,
-                "durable_delete_maintenance",
-                maint_start,
-            );
-            self.update_last_updated_at();
-        }
-
-        Ok(None)
-    }
 }
 
 /// One equal-schema group from [`group_run_by_schema`]: the batches and their
 /// matching commit handles, kept in arrival order.
+#[cfg(test)]
 type SchemaGroupedRun = (
     Vec<ChangeBatch>,
     Vec<Box<dyn cdc::CommitChange + Send + Sync>>,
@@ -3420,6 +1950,7 @@ type SchemaGroupedRun = (
 /// produces exactly one boundary: every batch before the source adopted the
 /// wider schema, then every batch after. With `split == false` the whole run
 /// is a single group — zero-cost for the `block` policy.
+#[cfg(test)]
 fn group_run_by_schema(
     batches: Vec<ChangeBatch>,
     committers: Vec<Box<dyn cdc::CommitChange + Send + Sync>>,
@@ -3453,8 +1984,9 @@ fn group_run_by_schema(
 /// `insert_into` call. All batches in a single CDC stream share the same
 /// `changes_schema(table_schema)`, so the schema check inside
 /// `arrow::compute::concat_batches` will not fail in normal operation; if it
-/// does we surface the error and let the caller skip committing those
-/// envelopes (the source will redeliver them).
+/// does we surface the error and the caller stops the stream so the source
+/// redelivers after the member re-registers.
+#[cfg(test)]
 fn concat_change_batches(batches: &[ChangeBatch]) -> crate::accelerated::Result<ChangeBatch> {
     debug_assert!(
         !batches.is_empty(),
@@ -3468,9 +2000,9 @@ fn concat_change_batches(batches: &[ChangeBatch]) -> crate::accelerated::Result<
     // The coalesced batch keeps the newest constituent commit timestamp: it rides
     // the batch into the accelerator (`write_cdc_append_stream_with_source_commit_ts`),
     // where it feeds the replication-lag and freshness signals the adaptive tuner's
-    // goals are stated against. Same rule as the burst frontier in `apply_burst`:
-    // the max is the most recent, and zero-row envelopes are excluded because their
-    // timestamp is not evidence that data up to that point was received.
+    // goals are stated against. The max is the most recent, and zero-row envelopes
+    // are excluded because their timestamp is not evidence that data up to that
+    // point was received.
     let source_commit_ts_ms = batches
         .iter()
         .filter(|batch| !batch.is_heartbeat())
@@ -3488,65 +2020,6 @@ fn concat_change_batches(batches: &[ChangeBatch]) -> crate::accelerated::Result<
         })
 }
 
-fn cdc_item_budget_bytes(item: &Result<cdc::ChangeEnvelope, cdc::StreamError>) -> usize {
-    // A coalescing byte-budget proxy, NOT a true in-memory Arrow size:
-    // `encoded_len` answers WITHOUT forcing a build — a deferred (e.g. Postgres)
-    // envelope from a schema-aware estimate of its buffered wire size, a built
-    // one from its actual Arrow size. Used only to bound how much a single burst
-    // accumulates before applying; the real Arrow build is deferred to apply
-    // time (`into_parts_offloaded_burst`), off the source's shared read path.
-    item.as_ref().map_or(0, cdc::ChangeEnvelope::encoded_len)
-}
-
-/// Zeroes `cdc_prefetch_buffer_bytes` for one dataset when the CDC stream that
-/// feeds it goes away.
-///
-/// The gauge is only ever recorded from inside the apply loop, so its last
-/// reading outlives that loop. Every exit — a `break` out to the finalize drain,
-/// or the whole future being dropped mid-`await` when the refresh task is
-/// cancelled — drops the receiver and everything still queued behind it, but
-/// leaves the exported value describing a backlog that no longer exists. An
-/// operator reading a torn-down dataset would see prefetch memory that was
-/// already freed, which is the same class of lie the gauge exists to stop
-/// telling. `Drop` is what covers the cancellation path; resetting at each
-/// `break` would not, since an aborted task never reaches one.
-struct PrefetchBytesGaugeReset {
-    labels: DatasetMetricLabels,
-}
-
-impl Drop for PrefetchBytesGaugeReset {
-    fn drop(&mut self) {
-        metrics::CDC_PREFETCH_BUFFER_BYTES.record(0, self.labels.dataset());
-    }
-}
-
-/// Subtract from the CDC prefetch byte counter without wrapping.
-///
-/// Charge and discharge are meant to be symmetric, but `u64::fetch_sub` past
-/// zero wraps to ~1.8e19, which turns a small accounting slip into a reading no
-/// operator can interpret — and which looks nothing like "slightly wrong". A
-/// gauge that fails should fail toward zero, where the error stays proportional
-/// to the mistake, so saturate rather than wrap.
-fn discharge_prefetch_bytes(counter: &AtomicU64, bytes: u64) {
-    let previous = counter.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
-        Some(current.saturating_sub(bytes))
-    });
-    // Saturating in release is the right failure mode for a gauge, but it also
-    // HIDES the bug that motivated it: discharging one envelope twice used to
-    // wrap the counter to ~1.8e19, and saturation would instead quietly clamp to
-    // zero and look plausible. Every charge has exactly one discharge, so a
-    // discharge larger than the balance is a real accounting error - fail loudly
-    // where a test can see it, and stay soft where an operator would only see a
-    // gauge.
-    debug_assert!(
-        previous.is_ok_and(|balance| balance >= bytes),
-        "CDC prefetch byte counter underflowed: discharged {bytes} against a balance of \
-         {previous:?}. Each envelope must be discharged exactly once - a carried item \
-         is discharged at the try_recv that removed it, not again when the next \
-         iteration adopts it."
-    );
-}
-
 fn elapsed_ms(start: Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1000.0
 }
@@ -3555,195 +2028,36 @@ fn record_cdc_fixed_cost(labels: &DatasetMetricLabels, phase: &'static str, star
     metrics::CDC_APPLY_FIXED_COST_MS.record(elapsed_ms(start), &labels.tagged("phase", phase));
 }
 
-/// Count which apply path a change sub-batch took. `inmem_append` / `inmem_delete`
-/// defer durability to the checkpoint (cheap); `durable_append` / `durable_delete`
-/// take the synchronous durable path (whole-burst commit + maintenance) — the
-/// expensive path a table is forced onto when a burst can't defer (e.g. deletes
-/// clear the slot-advancer). Reveals WHY a table's apply time is high, which the
-/// phase-coverage gap can only hint at.
-fn record_cdc_apply_path(labels: &DatasetMetricLabels, path: &'static str) {
-    metrics::CDC_APPLY_PATH_TOTAL.add(1, &labels.tagged("path", path));
-}
-
-fn select_rows(
-    data_batch: &RecordBatch,
-    row_indices: &[usize],
-) -> crate::accelerated::Result<RecordBatch> {
-    if let Some((offset, length)) = contiguous_row_span(row_indices) {
-        return Ok(data_batch.slice(offset, length));
-    }
-
-    let indices = row_indices
-        .iter()
-        .map(|&i| {
-            u32::try_from(i).map_err(|e| {
-                arrow::error::ArrowError::InvalidArgumentError(format!(
-                    "CDC row index {i} exceeds UInt32 take index range: {e}"
-                ))
-            })
-        })
-        .collect::<Result<Vec<_>, _>>()
-        .context(crate::accelerated::FailedToBuildRecordBatchSnafu)?;
-    let indices_array = UInt32Array::from(indices);
-
-    let selected_columns: Vec<ArrayRef> = data_batch
-        .columns()
-        .iter()
-        .map(|col| arrow::compute::take(col.as_ref(), &indices_array, None))
-        .collect::<Result<Vec<_>, _>>()
-        .context(crate::accelerated::FailedToBuildRecordBatchSnafu)?;
-
-    RecordBatch::try_new(data_batch.schema(), selected_columns)
-        .context(crate::accelerated::FailedToBuildRecordBatchSnafu)
-}
-
-async fn delete_matching_rows_from_arrow_provider(
-    provider: &Arc<dyn TableProvider>,
-    rows: &RecordBatch,
-) -> crate::accelerated::Result<Option<u64>> {
-    // Peel any layers stacked on the accelerator to reach the provider that
-    // actually holds the rows.
-    if let Some(table) = provider.downcast_ref::<SpiceTable>() {
-        return Box::pin(delete_matching_rows_from_arrow_provider(
-            table.below(),
-            rows,
-        ))
-        .await;
-    }
-
-    if let Some(table) = provider.downcast_ref::<MemTable>() {
-        return table
-            .delete_matching_rows(rows)
-            .await
-            .map(Some)
-            .map_err(find_datafusion_root)
-            .context(crate::accelerated::FailedToWriteDataSnafu);
-    }
-
-    if let Some(table) = provider.downcast_ref::<IndexedMemTable>() {
-        return table
-            .delete_matching_rows(rows)
-            .await
-            .map(Some)
-            .map_err(find_datafusion_root)
-            .context(crate::accelerated::FailedToWriteDataSnafu);
-    }
-
-    if let Some(partitioned) = provider.downcast_ref::<PartitionTableProvider>() {
-        let mut deleted = 0_u64;
-        let mut matched_arrow_provider = false;
-        for partition_provider in partitioned.partition_table_providers().await {
-            if let Some(partition_deleted) = Box::pin(delete_matching_rows_from_arrow_provider(
-                &partition_provider,
-                rows,
-            ))
-            .await?
-            {
-                deleted += partition_deleted;
-                matched_arrow_provider = true;
-            }
-        }
-
-        return Ok(matched_arrow_provider.then_some(deleted));
-    }
-
-    Ok(None)
-}
-
-async fn perform_change_write_maintenance(
-    provider: &Arc<dyn TableProvider>,
-) -> crate::accelerated::Result<()> {
-    // Peel any layers stacked on the accelerator to reach the provider that
-    // actually performs maintenance.
-    if let Some(table) = provider.downcast_ref::<SpiceTable>() {
-        return Box::pin(perform_change_write_maintenance(table.below())).await;
-    }
-
-    if let Some(partitioned) = provider.downcast_ref::<PartitionTableProvider>() {
-        for partition_provider in partitioned.partition_table_providers().await {
-            Box::pin(perform_change_write_maintenance(&partition_provider)).await?;
-        }
-        return Ok(());
-    }
-
-    perform_index_maintenance(provider.as_ref())
-        .await
-        .map(|_| ())
-        .map_err(find_datafusion_root)
-        .context(crate::accelerated::FailedToWriteDataSnafu)
-}
-
-fn contiguous_row_span(row_indices: &[usize]) -> Option<(usize, usize)> {
-    let first = *row_indices.first()?;
-    if row_indices
-        .iter()
-        .enumerate()
-        .all(|(offset, &row)| row == first + offset)
-    {
-        Some((first, row_indices.len()))
-    } else {
-        None
-    }
-}
-
-#[cfg(not(windows))]
-fn spawn_cayenne_finalize(cayenne_write: CayenneCdcWrite) -> PendingApplyFinalize {
-    tokio::spawn(async move {
-        cayenne_write
-            .finish()
-            .await
-            .map(|_| ())
-            .map_err(DataFusionError::from)
-            .map_err(find_datafusion_root)
-            .context(crate::accelerated::FailedToWriteDataSnafu)
-    })
-}
-
+#[cfg(test)]
 async fn join_pending_finalize(
     handle: PendingApplyFinalize,
     dataset_name: &TableReference,
     is_shutdown: bool,
 ) -> Option<String> {
-    classify_finalize_result(handle.await, dataset_name, is_shutdown)
+    classify_finalize_result(handle.wait().await, dataset_name, is_shutdown)
 }
 
-/// Classify a resolved CDC finalize join result into an optional error message,
-/// treating shutdown-time failures/cancellations as expected. Split out from
-/// [`join_pending_finalize`] so the idle-source race in the apply loop — which
-/// resolves the finalize [`tokio::task::JoinHandle`] via `select!` rather than
-/// awaiting it directly — can share the exact same classification.
+/// Publication failure must never release source committers, including during
+/// shutdown. The sink retains ownership of storage work independently.
+#[cfg(test)]
 fn classify_finalize_result(
-    result: std::result::Result<crate::accelerated::Result<()>, tokio::task::JoinError>,
+    result: Result<(), DataFusionError>,
     dataset_name: &TableReference,
     is_shutdown: bool,
 ) -> Option<String> {
-    match result {
-        Ok(Ok(())) => None,
-        Ok(Err(e)) if is_shutdown => {
-            tracing::debug!("CDC apply finalizer for {dataset_name} failed during shutdown: {e}");
-            None
-        }
-        Ok(Err(e)) => {
-            let error_message = format!("CDC apply finalizer for {dataset_name} failed: {e}");
-            tracing::error!("{error_message}");
-            Some(error_message)
-        }
-        Err(e) if e.is_cancelled() && is_shutdown => {
-            tracing::debug!(
-                "CDC apply finalizer for {dataset_name} was cancelled (likely shutdown)"
-            );
-            None
-        }
-        Err(e) => {
-            let error_message =
-                format!("CDC apply finalizer for {dataset_name} ended unexpectedly: {e}");
-            tracing::error!("{error_message}");
-            Some(error_message)
-        }
+    let Err(error) = result else {
+        return None;
+    };
+    let message = format!("CDC apply finalizer for {dataset_name} failed: {error}");
+    if is_shutdown {
+        tracing::debug!("{message}");
+    } else {
+        tracing::error!("{message}");
     }
+    Some(message)
 }
 
-/// Await an in-flight commit task spawned by `apply_envelope_run`. Surfaces
+/// Await an in-flight source acknowledgement task. Surfaces
 /// panics loudly (we must never silently swallow a commit-task panic — that
 /// would leave the dataset healthy while source-side offsets stop advancing)
 /// but treats cancellation during shutdown as expected.
@@ -3802,13 +2116,9 @@ fn spawn_ordered_commit_task(
     commit_dataset: TableReference,
 ) -> tokio::task::JoinHandle<Result<(), String>> {
     tokio::spawn(async move {
-        // Safe catch-up mode: this task is spawned only after the accelerator
-        // write is safe to acknowledge. For Cayenne staged appends, the
-        // committers are held until the apply finalizer has made the replacement
-        // files visible; for non-staged writes, the write return itself is the
-        // visibility point. `apply_envelope_run` drains the previous commit task
-        // with timeout/backpressure before spawning this one, so source progress
-        // is acknowledged in order.
+        // Publication and any required durability fence precede this task.
+        // The source drains its previous commit task before spawning the next,
+        // so a later acknowledgement cannot pass an earlier failed write.
         for committer in committers {
             if let Err(e) = committer.commit().await
                 && !runtime_status.is_shutdown()
@@ -3864,334 +2174,6 @@ pub(crate) fn get_primary_key_value_at_row(
     }
 }
 
-/// An active batch accumulating row indices for a single operation type.
-/// Tracks primary keys so that same-PK collisions within the bucket apply
-/// last-write-wins deduplication (the newer row replaces the older one)
-struct OpBatchAccumulator {
-    rows: Vec<usize>,
-    needs_sort: bool,
-    /// Maps encoded PK to index into `rows`, enabling replacement on same-bucket PK collision.
-    pk_to_pos: HashMap<Vec<u8>, usize, BuildHasherDefault<twox_hash::XxHash3_64>>,
-}
-
-impl OpBatchAccumulator {
-    fn new() -> Self {
-        Self {
-            rows: Vec::new(),
-            needs_sort: false,
-            pk_to_pos: HashMap::default(),
-        }
-    }
-
-    /// Returns `true` if `pk` is already tracked in this bucket.
-    fn contains_pk(&self, pk: &[u8]) -> bool {
-        self.pk_to_pos.contains_key(pk)
-    }
-
-    /// Insert `row_id` under `pk`. If the PK already exists in this bucket,
-    /// the previous row index is replaced in-place (last-write-wins).
-    /// See [`group_into_sub_batches`] for the rationale.
-    fn insert_or_replace(&mut self, pk: Vec<u8>, row_id: usize) {
-        if let Some(&pos) = self.pk_to_pos.get(&pk) {
-            // Same-bucket collision: replace the earlier row with the newer
-            // one. The old row is superseded because CDC rows carry the
-            // full row state.
-            if pos + 1 < self.rows.len() {
-                self.needs_sort = true;
-            }
-            self.rows[pos] = row_id;
-        } else {
-            let pos = self.rows.len();
-            self.rows.push(row_id);
-            self.pk_to_pos.insert(pk, pos);
-        }
-    }
-
-    /// Drain accumulated rows into `out` under the given operation type and
-    /// reset PK tracking.
-    fn flush_into(
-        &mut self,
-        op: ChangeOperationType,
-        out: &mut Vec<(ChangeOperationType, Vec<usize>)>,
-    ) {
-        if !self.rows.is_empty() {
-            if self.needs_sort {
-                self.rows.sort_unstable();
-                self.needs_sort = false;
-            }
-            out.push((op, std::mem::take(&mut self.rows)));
-            self.pk_to_pos.clear();
-        }
-    }
-}
-
-/// Groups rows into sub-batches based on operation type and primary key
-/// conflicts across active operation buckets.
-///
-/// Uses a streaming conflict-window algorithm with **last-write-wins
-/// deduplication**: two active buckets (upsert, delete) accumulate rows
-/// concurrently. When an incoming row's PK already exists in the *other*
-/// bucket, that bucket is flushed to preserve cross-operation ordering.
-/// When the PK collides within the *same* bucket the earlier row index is
-/// replaced in-place — CDC rows are full-state snapshots, so only the
-/// latest row per PK is required and intermediate states can be safely dropped.
-///
-/// For deletes a same-bucket PK collision is unexpected in practice (a
-/// source would have to emit two consecutive deletes for the same key
-/// without an intervening upsert), but is still safe — deleting the same
-/// PK twice is idempotent. We use the same replace path for both operation
-/// types to keep the logic simple.
-///
-/// Truncate and Unknown act as barriers that flush everything.
-#[must_use]
-fn group_into_sub_batches(change_batch: &ChangeBatch) -> Vec<(ChangeOperationType, Vec<usize>)> {
-    let num_rows = change_batch.record.num_rows();
-    if num_rows == 0 {
-        return vec![];
-    }
-
-    // Extract data batch and PK column indices once, instead of per-row.
-    let data_batch = change_batch.data_batch();
-    let pk_column_names = change_batch.primary_keys(0);
-    let pk_col_indices: Vec<usize> = pk_column_names
-        .iter()
-        .filter_map(|name| data_batch.schema().index_of(name).ok())
-        .collect();
-    let has_pks = !pk_col_indices.is_empty();
-
-    let mut upserts = OpBatchAccumulator::new();
-    let mut deletes = OpBatchAccumulator::new();
-    let mut out: Vec<(ChangeOperationType, Vec<usize>)> = Vec::new();
-
-    for row_id in 0..num_rows {
-        let op = change_batch.op(row_id);
-        let op_type = ChangeOperationType::from_operation(&op);
-
-        // Truncate and Unknown are barriers — flush everything, emit the
-        // barrier row, and continue.
-        if op_type == ChangeOperationType::Truncate || op_type == ChangeOperationType::Unknown {
-            upserts.flush_into(ChangeOperationType::Upsert, &mut out);
-            deletes.flush_into(ChangeOperationType::Delete, &mut out);
-            out.push((op_type, vec![row_id]));
-            continue;
-        }
-
-        // When PKs are available, use last-write-wins within the same
-        // bucket (CDC rows are full-state snapshots so only the latest
-        // row per PK matters) and flush only on *cross-bucket* conflicts
-        // to preserve inter-operation ordering.
-        if has_pks {
-            let primary_key = encode_primary_key(&data_batch, &pk_col_indices, row_id);
-
-            // Cross-bucket conflict: the *other* bucket already has this
-            // PK, so flush it to preserve operation ordering.
-            match op_type {
-                ChangeOperationType::Upsert => {
-                    if deletes.contains_pk(&primary_key) {
-                        deletes.flush_into(ChangeOperationType::Delete, &mut out);
-                    }
-                }
-                ChangeOperationType::Delete => {
-                    if upserts.contains_pk(&primary_key) {
-                        upserts.flush_into(ChangeOperationType::Upsert, &mut out);
-                    }
-                }
-                ChangeOperationType::Truncate | ChangeOperationType::Unknown => {
-                    unreachable!("unexpected op type {op_type:?} after barrier check")
-                }
-            }
-
-            // Same-bucket collision: replace the old row (last-write-wins).
-            let batch = match op_type {
-                ChangeOperationType::Upsert => &mut upserts,
-                ChangeOperationType::Delete => &mut deletes,
-                ChangeOperationType::Truncate | ChangeOperationType::Unknown => {
-                    unreachable!("unexpected op type {op_type:?} after barrier check")
-                }
-            };
-            batch.insert_or_replace(primary_key, row_id);
-        } else {
-            // No PKs — fall back to grouping consecutive same-op rows
-            // (can't detect conflicts without keys).
-            match op_type {
-                ChangeOperationType::Upsert => {
-                    deletes.flush_into(ChangeOperationType::Delete, &mut out);
-                    upserts.rows.push(row_id);
-                }
-                ChangeOperationType::Delete => {
-                    upserts.flush_into(ChangeOperationType::Upsert, &mut out);
-                    deletes.rows.push(row_id);
-                }
-                ChangeOperationType::Truncate | ChangeOperationType::Unknown => {
-                    unreachable!("unexpected op type {op_type:?} after barrier check")
-                }
-            }
-        }
-    }
-
-    // Flush remaining active batches.
-    upserts.flush_into(ChangeOperationType::Upsert, &mut out);
-    deletes.flush_into(ChangeOperationType::Delete, &mut out);
-
-    out
-}
-
-fn encode_primary_key(
-    data_batch: &RecordBatch,
-    pk_col_indices: &[usize],
-    row_id: usize,
-) -> Vec<u8> {
-    let mut key = Vec::with_capacity(pk_col_indices.len().saturating_mul(16));
-    for &col_idx in pk_col_indices {
-        key.extend_from_slice(&col_idx.to_le_bytes());
-        encode_array_value(data_batch.column(col_idx).as_ref(), row_id, &mut key);
-    }
-    key
-}
-
-macro_rules! encode_primitive_value {
-    ($array:expr, $row_id:expr, $array_type:ty, $key:expr) => {{
-        if let Some(array) = $array.as_any().downcast_ref::<$array_type>() {
-            $key.extend_from_slice(&array.value($row_id).to_le_bytes());
-            return;
-        }
-    }};
-}
-
-fn encode_bytes(bytes: &[u8], key: &mut Vec<u8>) {
-    key.extend_from_slice(&bytes.len().to_le_bytes());
-    key.extend_from_slice(bytes);
-}
-
-fn encode_array_value(array: &dyn Array, row_id: usize, key: &mut Vec<u8>) {
-    if array.is_null(row_id) {
-        key.push(0);
-        return;
-    }
-    key.push(1);
-
-    match array.data_type() {
-        DataType::Boolean => {
-            if let Some(array) = array.as_any().downcast_ref::<arrow::array::BooleanArray>() {
-                key.push(u8::from(array.value(row_id)));
-                return;
-            }
-        }
-        DataType::Int8 => {
-            encode_primitive_value!(array, row_id, arrow::array::Int8Array, key);
-        }
-        DataType::Int16 => {
-            encode_primitive_value!(array, row_id, arrow::array::Int16Array, key);
-        }
-        DataType::Int32 => {
-            encode_primitive_value!(array, row_id, Int32Array, key);
-        }
-        DataType::Int64 => {
-            encode_primitive_value!(array, row_id, Int64Array, key);
-        }
-        DataType::UInt8 => {
-            encode_primitive_value!(array, row_id, arrow::array::UInt8Array, key);
-        }
-        DataType::UInt16 => {
-            encode_primitive_value!(array, row_id, arrow::array::UInt16Array, key);
-        }
-        DataType::UInt32 => {
-            encode_primitive_value!(array, row_id, UInt32Array, key);
-        }
-        DataType::UInt64 => {
-            encode_primitive_value!(array, row_id, arrow::array::UInt64Array, key);
-        }
-        DataType::Float32 => {
-            if let Some(array) = array.as_any().downcast_ref::<arrow::array::Float32Array>() {
-                key.extend_from_slice(&array.value(row_id).to_bits().to_le_bytes());
-                return;
-            }
-        }
-        DataType::Float64 => {
-            if let Some(array) = array.as_any().downcast_ref::<arrow::array::Float64Array>() {
-                key.extend_from_slice(&array.value(row_id).to_bits().to_le_bytes());
-                return;
-            }
-        }
-        DataType::Utf8 => {
-            if let Some(array) = array.as_any().downcast_ref::<StringArray>() {
-                encode_bytes(array.value(row_id).as_bytes(), key);
-                return;
-            }
-        }
-        DataType::LargeUtf8 => {
-            if let Some(array) = array
-                .as_any()
-                .downcast_ref::<arrow::array::LargeStringArray>()
-            {
-                encode_bytes(array.value(row_id).as_bytes(), key);
-                return;
-            }
-        }
-        DataType::Date32 => {
-            encode_primitive_value!(array, row_id, arrow::array::Date32Array, key);
-        }
-        DataType::Date64 => {
-            encode_primitive_value!(array, row_id, arrow::array::Date64Array, key);
-        }
-        DataType::Time32(_) => {
-            if let Some(array) = array
-                .as_any()
-                .downcast_ref::<arrow::array::Time32SecondArray>()
-            {
-                key.extend_from_slice(&array.value(row_id).to_le_bytes());
-                return;
-            }
-            encode_primitive_value!(array, row_id, arrow::array::Time32MillisecondArray, key);
-        }
-        DataType::Time64(_) => {
-            if let Some(array) = array
-                .as_any()
-                .downcast_ref::<arrow::array::Time64MicrosecondArray>()
-            {
-                key.extend_from_slice(&array.value(row_id).to_le_bytes());
-                return;
-            }
-            encode_primitive_value!(array, row_id, arrow::array::Time64NanosecondArray, key);
-        }
-        DataType::Timestamp(_, _) => {
-            if let Some(array) = array
-                .as_any()
-                .downcast_ref::<arrow::array::TimestampSecondArray>()
-            {
-                key.extend_from_slice(&array.value(row_id).to_le_bytes());
-                return;
-            }
-            if let Some(array) = array
-                .as_any()
-                .downcast_ref::<arrow::array::TimestampMillisecondArray>()
-            {
-                key.extend_from_slice(&array.value(row_id).to_le_bytes());
-                return;
-            }
-            if let Some(array) = array
-                .as_any()
-                .downcast_ref::<arrow::array::TimestampMicrosecondArray>()
-            {
-                key.extend_from_slice(&array.value(row_id).to_le_bytes());
-                return;
-            }
-            encode_primitive_value!(array, row_id, arrow::array::TimestampNanosecondArray, key);
-        }
-        DataType::Decimal128(_, _) => {
-            encode_primitive_value!(array, row_id, arrow::array::Decimal128Array, key);
-        }
-        _ => {}
-    }
-
-    if let Ok(value) = arrow::util::display::array_value_to_string(array, row_id) {
-        key.push(0xfe);
-        encode_bytes(value.as_bytes(), key);
-    } else {
-        key.push(0xff);
-    }
-}
-
 /// Trim a run to start at its [`cdc::ChangeEnvelope::history_unavailable`]
 /// signal, reporting whether it had one.
 ///
@@ -4214,6 +2196,7 @@ fn encode_array_value(array: &dyn Array, row_id: usize, key: &mut Vec<u8>) {
 /// signals are subsumed by it just as the leading ones are.
 ///
 /// A no-op on every ordinary run, which carries no signal at all.
+#[cfg(test)]
 fn trim_to_rebuild_signal(envelopes: &mut Vec<cdc::ChangeEnvelope>) -> bool {
     let Some(signal) = envelopes
         .iter()
@@ -4229,28 +2212,6 @@ fn trim_to_rebuild_signal(envelopes: &mut Vec<cdc::ChangeEnvelope>) -> bool {
 pub enum WriteChangeResult {
     DataWritten,
     NoChange,
-}
-
-// Used to group batch changes into sub-batches
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ChangeOperationType {
-    Upsert, // Create, Update, or Read
-    Delete,
-    Truncate,
-    Unknown,
-}
-
-impl ChangeOperationType {
-    fn from_operation(op: &ChangeOperation) -> Self {
-        match op {
-            ChangeOperation::Create | ChangeOperation::Update | ChangeOperation::Read => {
-                Self::Upsert
-            }
-            ChangeOperation::Delete => Self::Delete,
-            ChangeOperation::Truncate => Self::Truncate,
-            ChangeOperation::Unknown(_) => Self::Unknown,
-        }
-    }
 }
 
 #[derive(PartialEq)]
@@ -4315,6 +2276,9 @@ fn handle_stream_error(err: &cdc::StreamError, dataset_name: &TableReference) ->
 
 #[cfg(test)]
 mod tests {
+    use super::ingress::{
+        PREBUILD_GROUP_MAX_BYTES, PREBUILD_GROUP_MAX_ENVELOPES, SourceItem, take_ready_group,
+    };
     use super::*;
     use arrow::array::{ArrayRef, Int32Array, ListArray, StringArray, StructArray};
     use arrow::datatypes::{DataType, Field, Schema};
@@ -4322,6 +2286,7 @@ mod tests {
     use data_components::arrow::write::MemTable;
     use data_components::cdc::changes_schema;
     use datafusion::datasource::TableProvider;
+    use futures::FutureExt;
     use spice_table::IndexLayer;
 
     use std::sync::Arc;
@@ -5269,7 +3234,7 @@ mod tests {
         let federated = Arc::new(FederatedTable::new_unchecked(Arc::clone(&accelerator)));
         RefreshTaskBuilder::new(
             runtime_status::RuntimeStatus::new(),
-            datafusion::sql::TableReference::bare(name.to_string()),
+            datafusion::common::TableReference::bare(name.to_string()),
             federated,
             None,
             accelerator,
@@ -5292,7 +3257,7 @@ mod tests {
         let federated = Arc::new(FederatedTable::new_unchecked(federated));
         RefreshTaskBuilder::new(
             runtime_status::RuntimeStatus::new(),
-            datafusion::sql::TableReference::bare(name.to_string()),
+            datafusion::common::TableReference::bare(name.to_string()),
             federated,
             None,
             accelerator,
@@ -5353,7 +3318,7 @@ mod tests {
         let federated = Arc::new(FederatedTable::new_unchecked(Arc::clone(&accelerator)));
         RefreshTaskBuilder::new(
             runtime_status::RuntimeStatus::new(),
-            datafusion::sql::TableReference::bare("test".to_string()),
+            datafusion::common::TableReference::bare("test".to_string()),
             federated,
             None,
             accelerator,
@@ -5405,7 +3370,7 @@ mod tests {
                 MemTable::try_new(Arc::clone(&stored), vec![vec![]])
                     .expect("mem table should be created"),
             );
-            let dataset = datafusion::sql::TableReference::bare(name.to_string());
+            let dataset = datafusion::common::TableReference::bare(name.to_string());
             install_cdc_schema_evolution(
                 &dataset,
                 CdcSchemaEvolution {
@@ -5488,7 +3453,7 @@ mod tests {
 
         let dataset = "cdc_map_entries_accepted";
         install_cdc_schema_evolution(
-            &datafusion::sql::TableReference::bare(dataset.to_string()),
+            &datafusion::common::TableReference::bare(dataset.to_string()),
             CdcSchemaEvolution {
                 policy: OnSchemaChange::Fail,
                 constraint_columns: vec![],
@@ -5504,6 +3469,38 @@ mod tests {
             .expect(
                 "an entries declaration the Arrow map layout forbids is not a schema change and must not fail the write",
             );
+
+        // Control: a genuinely different map — its values `Utf8` -> `Int64` — reaches
+        // the classifier on the same task and `on_schema_change: fail` rejects it, so
+        // the pass above is the entries rule (#13549) and not an early return.
+        let int_values = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Field::new("keys", DataType::Utf8, false),
+                        Field::new("values", DataType::Int64, true),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        );
+        let changed = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("headers", int_values, true),
+        ]));
+        let Err(e) = task.maybe_evolve_schema_for_cdc(&changed).await else {
+            panic!("expected `on_schema_change: fail` to reject a map whose value type changed")
+        };
+        let message = e.to_string();
+        assert!(
+            message.contains(
+                "incompatible schema change detected on the CDC stream for cdc_map_entries_accepted"
+            ) && message.contains("The type of `headers` changed from"),
+            "unexpected error: {message}"
+        );
     }
 
     #[tokio::test]
@@ -5538,14 +3535,14 @@ mod tests {
             create_test_change_batch(vec!["c"], &[vec!["id"]], vec![2], vec![Some("Bob")]);
 
         assert_eq!(
-            task.write_change_with_context(first_batch, &ctx, &session_state)
+            task.write_change_with_context(first_batch, &ctx, &session_state, Recovery::Durable)
                 .await
                 .expect("first write_change should succeed")
                 .result,
             WriteChangeResult::DataWritten
         );
         assert_eq!(
-            task.write_change_with_context(second_batch, &ctx, &session_state)
+            task.write_change_with_context(second_batch, &ctx, &session_state, Recovery::Durable)
                 .await
                 .expect("second write_change should succeed")
                 .result,
@@ -6066,17 +4063,420 @@ mod tests {
                 .as_any()
                 .and_then(<dyn std::any::Any>::downcast_ref::<FoldableCommitter>)
             {
-                Some(other) => {
+                Some(other) if Arc::ptr_eq(&self.log, &other.log) => {
                     self.value = self.value.max(other.value);
                     true
                 }
-                None => false,
+                _ => false,
             }
         }
 
         fn as_any(&self) -> Option<&dyn std::any::Any> {
             Some(self)
         }
+    }
+
+    fn deferred_foldable(
+        value: u64,
+        log: &Arc<TokioMutex<Vec<u64>>>,
+    ) -> Box<dyn cdc::CommitChange + Send + Sync> {
+        Box::new(FoldableCommitter {
+            value,
+            log: Arc::clone(log),
+        })
+    }
+
+    fn deferred_observer() -> SourceDurabilityObserver {
+        SourceDurabilityObserver::new(
+            TableReference::bare("test"),
+            runtime_status::RuntimeStatus::new(),
+        )
+    }
+
+    #[tokio::test]
+    async fn deferred_metadata_keeps_oldest_fence_and_covers_merged_tail() {
+        let observer = deferred_observer();
+        let log = Arc::new(TokioMutex::new(Vec::new()));
+        for fence in 1..=384 {
+            observer
+                .enqueue(fence, vec![deferred_foldable(fence, &log)])
+                .await;
+            assert!(observer.pending_count() <= 2);
+        }
+        assert!(log.lock().await.is_empty(), "publication is not durability");
+        {
+            let queue = observer.queue.lock().await;
+            assert_eq!(queue.iter().map(|(f, _)| *f).collect::<Vec<_>>(), [1, 384]);
+        }
+        observer.on_durable(1).await;
+        assert_eq!(*log.lock().await, [1]);
+        for fence in 385..=768 {
+            observer
+                .enqueue(fence, vec![deferred_foldable(fence, &log)])
+                .await;
+            assert!(observer.pending_count() <= 2);
+        }
+        observer.on_durable(384).await;
+        assert_eq!(
+            *log.lock().await,
+            [1, 384],
+            "the next oldest fence stays fixed"
+        );
+        observer.on_durable(767).await;
+        assert_eq!(
+            *log.lock().await,
+            [1, 384],
+            "a partial tail fence cannot acknowledge it"
+        );
+        observer.on_durable(768).await;
+        assert_eq!(*log.lock().await, [1, 384, 768]);
+        assert_eq!(observer.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn deferred_metadata_continuous_publication_does_not_starve_acknowledgement() {
+        let observer = deferred_observer();
+        let log = Arc::new(TokioMutex::new(Vec::new()));
+        for fence in 1..=10_000 {
+            observer
+                .enqueue(fence, vec![deferred_foldable(fence, &log)])
+                .await;
+            assert!(
+                observer.pending_count() <= 2,
+                "fixed retained metadata bound"
+            );
+            if fence % 32 == 0 {
+                let durable = fence - 16;
+                observer.on_durable(durable).await;
+                let log = log.lock().await;
+                let last = *log.last().expect("an old fixed fence is durable");
+                assert!(last <= durable, "never acknowledge beyond durability");
+                assert!(
+                    fence - last <= 64,
+                    "old checkpoints must make progress under continuous input"
+                );
+            }
+        }
+        observer.on_durable(10_000).await;
+        assert_eq!(log.lock().await.last(), Some(&10_000));
+        assert_eq!(observer.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn deferred_metadata_preserves_mixed_failure_order() {
+        let observer = deferred_observer();
+        let log = Arc::new(TokioMutex::new(Vec::new()));
+        let failures = CommitLog::new();
+        observer.enqueue(1, vec![deferred_foldable(1, &log)]).await;
+        observer
+            .enqueue(
+                2,
+                vec![Box::new(DeferrableTrackingCommitter {
+                    id: 2,
+                    log: Arc::clone(&failures),
+                    outcome: Err("retry me".into()),
+                })],
+            )
+            .await;
+        for fence in 3..=4 {
+            observer
+                .enqueue(fence, vec![deferred_foldable(fence, &log)])
+                .await;
+        }
+        observer
+            .enqueue(
+                5,
+                vec![Box::new(DeferrableTrackingCommitter {
+                    id: 5,
+                    log: Arc::clone(&failures),
+                    outcome: Ok(()),
+                })],
+            )
+            .await;
+        assert_eq!(observer.pending_count(), 4);
+        observer.on_durable(5).await;
+        observer.retry().await;
+        assert_eq!(
+            *log.lock().await,
+            [1],
+            "a failed predecessor fences the folded tail"
+        );
+        assert_eq!(failures.ids().await, [2, 2]);
+        assert_eq!(observer.pending_count(), 3);
+        let queue = observer.queue.lock().await;
+        assert_eq!(queue.iter().map(|(f, _)| *f).collect::<Vec<_>>(), [2, 4, 5]);
+    }
+
+    #[tokio::test]
+    async fn deferred_metadata_preserves_incompatible_source_identity() {
+        let observer = deferred_observer();
+        let first = Arc::new(TokioMutex::new(Vec::new()));
+        let second = Arc::new(TokioMutex::new(Vec::new()));
+        observer
+            .enqueue(1, vec![deferred_foldable(1, &first)])
+            .await;
+        observer
+            .enqueue(2, vec![deferred_foldable(2, &first)])
+            .await;
+        observer
+            .enqueue(3, vec![deferred_foldable(3, &second)])
+            .await;
+        assert_eq!(observer.pending_count(), 3);
+        observer.on_durable(3).await;
+        assert_eq!(*first.lock().await, [2]);
+        assert_eq!(*second.lock().await, [3]);
+        assert_eq!(observer.pending_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn deferred_metadata_leaves_multi_committer_epochs_intact() {
+        let observer = deferred_observer();
+        let log = Arc::new(TokioMutex::new(Vec::new()));
+        observer.enqueue(1, vec![deferred_foldable(1, &log)]).await;
+        observer
+            .enqueue(
+                2,
+                vec![deferred_foldable(2, &log), deferred_foldable(3, &log)],
+            )
+            .await;
+        observer.enqueue(3, vec![deferred_foldable(4, &log)]).await;
+        assert_eq!(observer.pending_count(), 4);
+        let queue = observer.queue.lock().await;
+        assert_eq!(
+            queue.iter().map(|(f, c)| (*f, c.len())).collect::<Vec<_>>(),
+            [(1, 1), (2, 2), (3, 1)]
+        );
+    }
+
+    #[tokio::test]
+    async fn deferred_metadata_late_enqueue_retries_durable_fence() {
+        let observer = deferred_observer();
+        let log = Arc::new(TokioMutex::new(Vec::new()));
+        observer.on_durable(10).await;
+        for fence in 1..=10 {
+            observer
+                .enqueue(fence, vec![deferred_foldable(fence, &log)])
+                .await;
+            assert_eq!(observer.pending_count(), 0);
+            assert_eq!(log.lock().await.last(), Some(&fence));
+        }
+    }
+
+    struct SuspendedDeferredCommitter {
+        id: i32,
+        log: Arc<CommitLog>,
+        attempts: Arc<AtomicUsize>,
+        entered: Arc<tokio::sync::Notify>,
+        release: Arc<tokio::sync::Notify>,
+        failed: Arc<tokio::sync::Notify>,
+        fail_first: bool,
+    }
+
+    #[async_trait]
+    impl CommitChange for SuspendedDeferredCommitter {
+        async fn commit(&self) -> Result<(), CommitError> {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+            if attempt == 0 {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            let fails = self.fail_first && attempt == 0;
+            self.log.events.lock().await.push((
+                self.id,
+                if fails {
+                    Err("retry source".into())
+                } else {
+                    Ok(())
+                },
+            ));
+            if fails {
+                self.failed.notify_one();
+                return Err(CommitError::UnableToCommitChange {
+                    source: "retry source".into(),
+                });
+            }
+            Ok(())
+        }
+
+        fn supports_deferral(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn deferred_metadata_cancelled_drain_resumes_source_future_in_order() {
+        let observer = Arc::new(deferred_observer());
+        let log = CommitLog::new();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        for id in 1..=4 {
+            let committer: Box<dyn CommitChange + Send + Sync> = if id == 2 {
+                Box::new(SuspendedDeferredCommitter {
+                    id,
+                    log: Arc::clone(&log),
+                    attempts: Arc::clone(&attempts),
+                    entered: Arc::clone(&entered),
+                    release: Arc::clone(&release),
+                    failed: Arc::new(tokio::sync::Notify::new()),
+                    fail_first: false,
+                })
+            } else {
+                Box::new(DeferrableTrackingCommitter {
+                    id,
+                    log: Arc::clone(&log),
+                    outcome: Ok(()),
+                })
+            };
+            observer
+                .enqueue(u64::try_from(id).expect("fence"), vec![committer])
+                .await;
+        }
+        let task_observer = Arc::clone(&observer);
+        let task = tokio::spawn(async move { task_observer.on_durable(3).await });
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("second source call suspends");
+        task.abort();
+        assert!(
+            task.await
+                .expect_err("cancelled drain waiter")
+                .is_cancelled()
+        );
+        assert_eq!(log.ids().await, [1]);
+        assert_eq!(observer.pending_count(), 3);
+        assert!(!observer.is_empty(None, "cancelled").await);
+        release.notify_one();
+        observer.retry().await;
+        assert_eq!(log.ids().await, [1, 2, 3]);
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "resume, do not restart the source call"
+        );
+        assert_eq!(observer.pending_count(), 1);
+        assert!(!observer.is_empty(None, "not_durable").await);
+        observer.on_durable(4).await;
+        assert_eq!(log.ids().await, [1, 2, 3, 4]);
+        assert_eq!(observer.pending_count(), 0);
+        assert!(observer.is_empty(None, "complete").await);
+    }
+
+    #[tokio::test]
+    async fn deferred_metadata_cancelled_failure_requeue_retains_prefix() {
+        let observer = Arc::new(deferred_observer());
+        let log = CommitLog::new();
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let release = Arc::new(tokio::sync::Notify::new());
+        let failed = Arc::new(tokio::sync::Notify::new());
+        observer
+            .enqueue(
+                1,
+                vec![Box::new(SuspendedDeferredCommitter {
+                    id: 1,
+                    log: Arc::clone(&log),
+                    attempts: Arc::clone(&attempts),
+                    entered: Arc::clone(&entered),
+                    release: Arc::clone(&release),
+                    failed: Arc::clone(&failed),
+                    fail_first: true,
+                })],
+            )
+            .await;
+        observer
+            .enqueue(
+                2,
+                vec![Box::new(DeferrableTrackingCommitter {
+                    id: 2,
+                    log: Arc::clone(&log),
+                    outcome: Ok(()),
+                })],
+            )
+            .await;
+        let task_observer = Arc::clone(&observer);
+        let task = tokio::spawn(async move { task_observer.on_durable(2).await });
+        tokio::time::timeout(Duration::from_secs(5), entered.notified())
+            .await
+            .expect("source call suspends");
+        let queue = observer.queue.lock().await;
+        assert!(queue.is_empty(), "durable prefix is owned by the drain");
+        release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), failed.notified())
+            .await
+            .expect("source call failed before requeue");
+        task.abort();
+        assert!(
+            task.await
+                .expect_err("cancelled requeue waiter")
+                .is_cancelled()
+        );
+        drop(queue);
+        assert_eq!(observer.pending_count(), 2);
+        assert!(!observer.is_empty(None, "requeue_pending").await);
+        observer.retry().await;
+        assert_eq!(
+            attempts.load(Ordering::SeqCst),
+            1,
+            "finish the interrupted requeue first"
+        );
+        assert_eq!(observer.pending_count(), 2);
+        {
+            let queue = observer.queue.lock().await;
+            assert_eq!(
+                queue.iter().map(|(fence, _)| *fence).collect::<Vec<_>>(),
+                [1, 2]
+            );
+        }
+        observer.retry().await;
+        assert_eq!(log.ids().await, [1, 1, 2]);
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(observer.pending_count(), 0);
+        assert!(observer.is_empty(None, "complete").await);
+    }
+
+    #[tokio::test]
+    async fn deferred_metadata_cancelled_enqueue_retains_published_acknowledgement() {
+        let observer = Arc::new(deferred_observer());
+        let log = Arc::new(TokioMutex::new(Vec::new()));
+        observer.enqueue(1, vec![deferred_foldable(1, &log)]).await;
+        observer.enqueue(2, vec![deferred_foldable(2, &log)]).await;
+        observer.on_durable(0).await;
+        let drain = observer.drain.lock().await;
+        let task_observer = Arc::clone(&observer);
+        let task_log = Arc::clone(&log);
+        let task = tokio::spawn(async move {
+            task_observer
+                .enqueue(3, vec![deferred_foldable(3, &task_log)])
+                .await;
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while observer
+                .queue
+                .lock()
+                .await
+                .back()
+                .is_none_or(|(fence, _)| *fence != 3)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("enqueue reaches its durability retry");
+        task.abort();
+        assert!(
+            task.await
+                .expect_err("enqueue waiter cancelled")
+                .is_cancelled()
+        );
+        drop(drain);
+        assert!(log.lock().await.is_empty());
+        assert_eq!(observer.pending_count(), 2);
+        observer.on_durable(2).await;
+        assert_eq!(*log.lock().await, [1]);
+        observer.on_durable(3).await;
+        assert_eq!(*log.lock().await, [1, 3]);
+        assert_eq!(observer.pending_count(), 0);
     }
 
     #[test]
@@ -6178,12 +4578,15 @@ mod tests {
                     as Box<dyn cdc::CommitChange + Send + Sync>],
             ));
         }
-        let advancer = CayenneSlotAdvancer {
+        let advancer = SourceDurabilityObserver {
             queue: Arc::clone(&queue),
-            dataset_name: TableReference::bare("test"),
-            runtime_status: runtime_status::RuntimeStatus::new(),
+            pending_count: Arc::new(AtomicUsize::new(4)),
+            ..SourceDurabilityObserver::new(
+                TableReference::bare("test"),
+                runtime_status::RuntimeStatus::new(),
+            )
         };
-        <CayenneSlotAdvancer as cayenne::SlotAdvancer>::on_checkpoint_durable(&advancer, 4).await;
+        advancer.on_durable(4).await;
         assert_eq!(
             *log.lock().await,
             vec![40],
@@ -6330,12 +4733,15 @@ mod tests {
             })],
         ));
 
-        let advancer = CayenneSlotAdvancer {
+        let advancer = SourceDurabilityObserver {
             queue: Arc::clone(&queue),
-            dataset_name: TableReference::bare("test"),
-            runtime_status: runtime_status::RuntimeStatus::new(),
+            pending_count: Arc::new(AtomicUsize::new(4)),
+            ..SourceDurabilityObserver::new(
+                TableReference::bare("test"),
+                runtime_status::RuntimeStatus::new(),
+            )
         };
-        <CayenneSlotAdvancer as cayenne::SlotAdvancer>::on_checkpoint_durable(&advancer, 5).await;
+        advancer.on_durable(5).await;
 
         assert_eq!(
             log.ids().await,
@@ -6353,36 +4759,34 @@ mod tests {
         assert_eq!(queue[1].0, 6);
     }
 
-    /// A1-T3 — the checkpoint↔push ordering seam. A periodic mem-tier checkpoint
-    /// can fire `on_checkpoint_durable(N)` AFTER the tier reached epoch N but
-    /// BEFORE the apply loop has pushed batch N's committers onto the queue (the
-    /// push at `changes.rs` happens after `append_to_mem_tier` returns the epoch).
-    /// The advancer must only DELAY such a committer's ack — draining whatever is
-    /// present at or below the durable epoch and leaving the rest for a later
-    /// drain — never advance the slot for an unqueued epoch and never double-ack.
-    #[cfg(not(windows))]
+    /// A storage fence can become durable before publication lets the source
+    /// enqueue its committer. Enqueue must retry that fence even on an idle source.
     #[tokio::test]
-    async fn test_slot_advancer_delays_committers_pushed_after_checkpoint() {
+    async fn test_observer_acks_committers_pushed_after_durability() {
         let log = CommitLog::new();
         let queue: DeferredCommitQueue = Arc::new(TokioMutex::new(VecDeque::new()));
-        let advancer = CayenneSlotAdvancer {
+        let advancer = SourceDurabilityObserver {
             queue: Arc::clone(&queue),
-            dataset_name: TableReference::bare("test"),
-            runtime_status: runtime_status::RuntimeStatus::new(),
+            ..SourceDurabilityObserver::new(
+                TableReference::bare("test"),
+                runtime_status::RuntimeStatus::new(),
+            )
         };
 
         // Epoch 1's committers ARE queued; epoch 2's are not yet (the apply loop
         // hasn't pushed them). A checkpoint that snapshotted `flushed_epoch = 2`
         // fires ahead of the push.
-        queue.lock().await.push_back((
-            1,
-            vec![Box::new(DeferrableTrackingCommitter {
-                id: 1,
-                log: Arc::clone(&log),
-                outcome: Ok(()),
-            })],
-        ));
-        <CayenneSlotAdvancer as cayenne::SlotAdvancer>::on_checkpoint_durable(&advancer, 2).await;
+        advancer
+            .enqueue(
+                1,
+                vec![Box::new(DeferrableTrackingCommitter {
+                    id: 1,
+                    log: Arc::clone(&log),
+                    outcome: Ok(()),
+                })],
+            )
+            .await;
+        advancer.on_durable(2).await;
 
         // Only epoch 1 acked (it was present and <= 2); epoch 2 is NOT acked early
         // because its committers were not yet queued.
@@ -6396,22 +4800,21 @@ mod tests {
             "the drained prefix is removed; nothing was invented for the unqueued epoch"
         );
 
-        // Now the apply loop pushes epoch 2's committers (after its data became
-        // durable). The NEXT checkpoint (or queue-non-empty re-check) drains them —
-        // exactly-once, no double-ack of epoch 1.
-        queue.lock().await.push_back((
-            2,
-            vec![Box::new(DeferrableTrackingCommitter {
-                id: 2,
-                log: Arc::clone(&log),
-                outcome: Ok(()),
-            })],
-        ));
-        <CayenneSlotAdvancer as cayenne::SlotAdvancer>::on_checkpoint_durable(&advancer, 2).await;
+        advancer
+            .enqueue(
+                2,
+                vec![Box::new(DeferrableTrackingCommitter {
+                    id: 2,
+                    log: Arc::clone(&log),
+                    outcome: Ok(()),
+                })],
+            )
+            .await;
+        advancer.on_durable(2).await;
         assert_eq!(
             log.ids().await,
             vec![1, 2],
-            "the late-pushed committer acks on the next drain; epoch 1 is not re-acked"
+            "enqueue observes the durable fence without acknowledging epoch 1 again"
         );
         assert!(queue.lock().await.is_empty(), "queue fully drained");
     }
@@ -6775,6 +5178,17 @@ mod tests {
         fn properties(&self) -> &Arc<PlanProperties> {
             self.inner.properties()
         }
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(
+                &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+            ) -> datafusion::error::Result<
+                datafusion::common::tree_node::TreeNodeRecursion,
+            >,
+        ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+            Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+        }
+
         fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
             vec![&self.inner]
         }
@@ -7430,11 +5844,12 @@ mod tests {
         );
     }
 
-    /// Without an evolution policy installed, a mixed-schema run keeps
-    /// today's behavior verbatim: the concat fails, the run is skipped with
-    /// no commits (the source redelivers), and the dataset status is error.
+    /// Without an evolution policy installed, a mixed-schema run fails
+    /// concat, commits nothing, marks the dataset error, and stops the
+    /// stream so a source that tracks delivered envelopes can re-register
+    /// and redeliver the window.
     #[tokio::test]
-    async fn test_apply_envelope_run_mixed_schemas_without_policy_keeps_error_skip() {
+    async fn test_apply_envelope_run_mixed_schemas_without_policy_stops_stream() {
         let dataset_name = TableReference::bare("schema_evo_mixed_block");
         let metric_labels = DatasetMetricLabels::new(&dataset_name);
         let task = make_refresh_task_named(
@@ -7478,8 +5893,8 @@ mod tests {
             .await;
 
         assert!(
-            applied,
-            "concat failure skips the run but does not stop the stream"
+            !applied,
+            "concat failure must stop the stream so later commits cannot skip an uncommitted gap"
         );
         assert!(
             context.pending_commit.is_none(),
@@ -7521,11 +5936,8 @@ mod tests {
     /// wrong reason — the run would abort on the failed write rather than on
     /// the refusal.
     ///
-    /// `direct_writes` mirrors what the accelerator opts into: the Cayenne
-    /// *accelerator* builds its creator `.with_direct_partition_writes()`, while
-    /// a `CREATE TABLE … PARTITIONED BY` one does not — and that flag is what
-    /// [`extract_cayenne_write_target`] reads to tell a Cayenne partitioned
-    /// write target from any other partitioned provider.
+    /// `direct_writes` selects the partition write behavior independently of the
+    /// sink's schema-evolution capability.
     #[cfg(not(windows))]
     #[derive(Debug)]
     struct MemPartitionCreator {
@@ -7568,14 +5980,8 @@ mod tests {
     /// builds one: the partition provider, optionally behind the upsert-dedup
     /// wrapper, under a `PolyTableProvider` and then an index layer.
     ///
-    /// Every layer here is load-bearing for the resolution under test —
-    /// [`extract_cayenne_write_target`] crosses the index layer to find the
-    /// poly layer, follows its *writer* rather than the layer below it, and
-    /// unwraps the dedup wrapper. A fixture that skipped the poly layer would
-    /// resolve to `None` and quietly stop testing the refusal.
-    ///
-    /// `direct_writes` picks whether the partitions are a Cayenne
-    /// accelerator's (see [`MemPartitionCreator`]).
+    /// Writes must pass through every layer, including deduplication. Schema
+    /// policy comes from the sink bound to this composed target.
     #[cfg(not(windows))]
     async fn partitioned_accelerator(dedup: bool, direct_writes: bool) -> Arc<dyn TableProvider> {
         let partitioned = Arc::new(
@@ -7647,8 +6053,16 @@ mod tests {
     async fn apply_widened_envelope(
         name: &str,
         accelerator: Arc<dyn TableProvider>,
+        schema_evolution: SchemaEvolutionSupport,
     ) -> (bool, Vec<i32>, bool) {
-        apply_widened_burst(name, accelerator, create_widened_change_batch(1, 30), None).await
+        apply_widened_burst(
+            name,
+            accelerator,
+            create_widened_change_batch(1, 30),
+            None,
+            schema_evolution,
+        )
+        .await
     }
 
     /// Apply one widened CDC burst under `on_schema_change: append_new_columns`,
@@ -7664,6 +6078,7 @@ mod tests {
         accelerator: Arc<dyn TableProvider>,
         burst: ChangeBatch,
         seed: Option<ChangeBatch>,
+        schema_evolution: SchemaEvolutionSupport,
     ) -> (bool, Vec<i32>, bool) {
         let dataset_name = TableReference::bare(name.to_string());
         let metric_labels = DatasetMetricLabels::new(&dataset_name);
@@ -7675,7 +6090,27 @@ mod tests {
             },
         );
 
-        let task = make_refresh_task_named(name, accelerator);
+        let task = make_refresh_task_named(name, Arc::clone(&accelerator));
+        let mut sink_context = runtime_acceleration::change_sink::ChangeSinkContext::new(
+            dataset_name.clone(),
+            accelerator,
+        );
+        sink_context.write_lock = Arc::clone(&task.accelerator_write_mutex);
+        let backend = runtime_acceleration::change_sink::provider::ProviderChangeSinkBackend::new(
+            sink_context,
+        )
+        .with_schema_evolution(schema_evolution);
+        assert!(
+            task.change_sink
+                .set(ChangeSink::new(
+                    Arc::new(backend),
+                    SessionContext::new(),
+                    &tokio::runtime::Handle::current(),
+                    1,
+                ))
+                .is_ok(),
+            "fixture binds exactly one sink before writing"
+        );
 
         // Seeded through the same apply path the burst under test uses, and before
         // the widening policy can refuse anything: a seed that silently failed to
@@ -7761,6 +6196,7 @@ mod tests {
             let (applied, committed, status_is_error) = apply_widened_envelope(
                 &format!("schema_evo_partitioned_cayenne_dedup_{dedup}"),
                 partitioned_accelerator(dedup, true).await,
+                SchemaEvolutionSupport::Recreate,
             )
             .await;
 
@@ -7822,6 +6258,7 @@ mod tests {
                     vec![7],
                     vec![Some("row")],
                 )),
+                SchemaEvolutionSupport::Recreate,
             )
             .await;
 
@@ -7873,6 +6310,7 @@ mod tests {
                     vec![7],
                     vec![Some("row")],
                 )),
+                SchemaEvolutionSupport::Recreate,
             )
             .await;
 
@@ -7910,8 +6348,12 @@ mod tests {
                 partitioned_accelerator(false, false).await,
             ),
         ] {
-            let (applied, committed, status_is_error) =
-                apply_widened_envelope(&format!("schema_evo_{case}"), accelerator).await;
+            let (applied, committed, status_is_error) = apply_widened_envelope(
+                &format!("schema_evo_{case}"),
+                accelerator,
+                SchemaEvolutionSupport::Restart,
+            )
+            .await;
 
             assert_eq!(
                 committed,
@@ -8700,21 +7142,9 @@ mod tests {
         assert_eq!(log.ids().await, vec![1, 2, 3, 4, 5, 6]);
     }
 
-    /// Regression test for the CDC prefetch byte counter.
-    ///
-    /// An envelope pulled from the channel but deferred past the burst byte cap
-    /// is stashed in `carried_item` and adopted by the NEXT iteration. It leaves
-    /// the channel exactly once, at the `try_recv` that removed it, so it must be
-    /// discharged exactly once. Discharging it again when the outer receive
-    /// adopted it drove the counter below zero, and the unsigned wrap made
-    /// `cdc_prefetch_buffer_bytes` report ~1.8e19 for every table with carry-over
-    /// activity - which is how it was found, on a lab run rather than here.
-    ///
-    /// `max_coalesced_bytes: 1` puts every envelope after the first over budget,
-    /// so this drives the carry path on every iteration. The accounting invariant
-    /// is enforced by the `debug_assert!` in `discharge_prefetch_bytes`, which is
-    /// live in test builds: a double discharge panics here rather than saturating
-    /// quietly to zero and looking plausible.
+    /// An envelope deferred past the burst byte cap is carried into the next
+    /// burst. `max_coalesced_bytes: 1` puts every envelope after the first over
+    /// budget, so this drives the carry path on every iteration.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn carried_envelopes_are_discharged_from_the_prefetch_counter_exactly_once() {
         let task = make_refresh_task(make_mem_table() as Arc<dyn TableProvider>);
@@ -8848,17 +7278,34 @@ mod tests {
         );
     }
 
+    /// A CDC delete keyed on a `NULL` string primary key is refused rather than
+    /// turned into `name IN ('')`, which would delete whatever row holds an empty
+    /// key. Drives the production delete-predicate builder the CDC apply uses.
     #[test]
-    fn test_get_primary_key_value_null_utf8_returns_error() {
-        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
-        let name_array: ArrayRef = Arc::new(StringArray::from(vec![Option::<&str>::None]));
-        let batch =
-            RecordBatch::try_new(schema, vec![name_array]).expect("Failed to create RecordBatch");
+    fn a_cdc_delete_with_a_null_utf8_primary_key_is_an_error() {
+        use runtime_acceleration::change_sink::provider::deletion::build_batch_delete_expr_from_change_batch;
 
-        let result = get_primary_key_value(&batch, "name");
+        let change_batch =
+            create_test_change_batch(vec!["d"], &[vec!["name"]], vec![1], vec![None]);
+
+        let err = build_batch_delete_expr_from_change_batch(&change_batch, &[0], "test_dataset")
+            .expect_err("a NULL primary key must not become a delete predicate");
+        let datafusion::error::DataFusionError::External(source) = &err else {
+            panic!("expected the predicate builder's NULL-key error, got: {err}");
+        };
         assert!(
-            result.is_err(),
-            "NULL primary key should return an error, not silently produce empty string"
+            matches!(
+                source.downcast_ref::<data_components::pk_filter_expr::Error>(),
+                Some(data_components::pk_filter_expr::Error::PrimaryKeyNullValue {
+                    field_name,
+                    row: 0,
+                }) if field_name == "name"
+            ),
+            "expected the NULL-key error for 'name' at row 0, got: {err}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "External error: Primary key column 'name' has NULL value at row 0"
         );
     }
 
@@ -8873,5 +7320,534 @@ mod tests {
         assert!(result.is_ok(), "Non-null PK should succeed");
         let (str_val, _expr) = result.expect("already asserted Ok");
         assert_eq!(str_val, "42");
+    }
+
+    // ----- the reader's build groups -----
+
+    /// The consume loop's source: a change stream whose panic ends it as an item.
+    fn caught(stream: cdc::ChangesStream) -> impl futures::Stream<Item = SourceItem> + Unpin {
+        std::panic::AssertUnwindSafe(stream).catch_unwind()
+    }
+
+    /// A deferred [`cdc::ChangeRows`] that builds a one-row batch.
+    struct OneRow {
+        encoded_len: usize,
+    }
+
+    impl cdc::ChangeRows for OneRow {
+        fn is_empty(&self) -> bool {
+            false
+        }
+        fn num_rows_hint(&self) -> usize {
+            1
+        }
+        fn encoded_len(&self) -> usize {
+            self.encoded_len
+        }
+        fn source_commit_ts_ms(&self) -> Option<i64> {
+            None
+        }
+        fn is_heartbeat(&self) -> bool {
+            false
+        }
+        fn build(self: Box<Self>) -> Result<cdc::ChangeBatch, cdc::ChangeBatchError> {
+            let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+            let data = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int32Array::from(vec![1])) as ArrayRef],
+            )
+            .expect("one-row batch");
+            cdc::wrap_data_as_change_batch(&schema, &data)
+        }
+    }
+
+    fn deferred_envelope_of(encoded_len: usize) -> cdc::ChangeEnvelope {
+        cdc::ChangeEnvelope::new_from_rows(
+            Box::new(cdc::NoOpCommitter),
+            Box::new(OneRow { encoded_len }),
+            false,
+        )
+    }
+
+    fn deferred_envelope() -> cdc::ChangeEnvelope {
+        deferred_envelope_of(8)
+    }
+
+    fn eager_envelope() -> cdc::ChangeEnvelope {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        let data = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int32Array::from(vec![1])) as ArrayRef],
+        )
+        .expect("one-row batch");
+        cdc::ChangeEnvelope::new(
+            Box::new(cdc::NoOpCommitter),
+            cdc::wrap_data_as_change_batch(&schema, &data).expect("change batch"),
+            false,
+        )
+    }
+
+    #[test]
+    fn an_eager_envelope_is_not_held_for_a_build_group() {
+        let mut stream = caught(Box::pin(futures::stream::iter(vec![
+            Ok(deferred_envelope()),
+            Ok(deferred_envelope()),
+        ])));
+        let (group, ended, _overflow) = take_ready_group(
+            Ok(eager_envelope()),
+            &mut stream,
+            PREBUILD_GROUP_MAX_ENVELOPES,
+        );
+        assert_eq!(group.len(), 1);
+        assert!(!ended);
+    }
+
+    #[test]
+    fn a_build_group_takes_what_is_ready_and_reports_the_end_of_the_stream() {
+        let mut stream = caught(Box::pin(futures::stream::iter(vec![
+            Ok(deferred_envelope()),
+            Err(cdc::StreamError::External("transient".to_string())),
+            Ok(eager_envelope()),
+        ])));
+        let (group, ended, _overflow) = take_ready_group(
+            Ok(deferred_envelope()),
+            &mut stream,
+            PREBUILD_GROUP_MAX_ENVELOPES,
+        );
+        assert_eq!(group.len(), 4);
+        assert!(
+            group[2].is_err(),
+            "a stream error keeps its place in the group"
+        );
+        assert!(ended);
+    }
+
+    #[test]
+    fn a_build_group_stops_at_what_is_not_ready_yet() {
+        let ready = futures::stream::iter(vec![Ok(deferred_envelope()), Ok(deferred_envelope())]);
+        let mut stream = caught(Box::pin(ready.chain(futures::stream::pending())));
+        let (group, ended, _overflow) = take_ready_group(
+            Ok(deferred_envelope()),
+            &mut stream,
+            PREBUILD_GROUP_MAX_ENVELOPES,
+        );
+        assert_eq!(group.len(), 3);
+        assert!(!ended);
+    }
+
+    #[test]
+    fn a_build_group_takes_no_more_than_the_room_it_is_given() {
+        let mut stream = caught(Box::pin(futures::stream::iter(
+            (0..10).map(|_| Ok(deferred_envelope())),
+        )));
+        let (group, ended, _overflow) = take_ready_group(Ok(deferred_envelope()), &mut stream, 4);
+        assert_eq!(group.len(), 4);
+        assert!(!ended);
+    }
+
+    #[test]
+    fn a_build_group_stops_at_its_byte_budget() {
+        // Each envelope estimates a third of the budget: the group closes before
+        // appending an envelope that would push the combined size over the limit,
+        // and carries that envelope for the next group.
+        let third = PREBUILD_GROUP_MAX_BYTES / 3 + 1;
+        let mut stream = caught(Box::pin(futures::stream::iter(
+            (0..10).map(move |_| Ok(deferred_envelope_of(third))),
+        )));
+        let (group, ended, overflow) = take_ready_group(
+            Ok(deferred_envelope_of(third)),
+            &mut stream,
+            PREBUILD_GROUP_MAX_ENVELOPES,
+        );
+        assert_eq!(group.len(), 2);
+        assert!(
+            overflow.is_some(),
+            "third envelope is carried for the next group"
+        );
+        assert!(!ended);
+    }
+
+    #[test]
+    fn a_build_group_does_not_combine_two_near_limit_envelopes() {
+        // Two ready ~7 MiB envelopes must not form a 14 MiB group over the 8 MiB
+        // bound; the second is carried alone into the next group.
+        let near = 7 * 1024 * 1024;
+        let mut stream = caught(Box::pin(futures::stream::iter(vec![Ok(
+            deferred_envelope_of(near),
+        )])));
+        let (group, ended, overflow) = take_ready_group(
+            Ok(deferred_envelope_of(near)),
+            &mut stream,
+            PREBUILD_GROUP_MAX_ENVELOPES,
+        );
+        assert_eq!(group.len(), 1);
+        assert!(overflow.is_some());
+        assert!(!ended);
+        let (group2, ended2, overflow2) = take_ready_group(
+            overflow
+                .expect("carried")
+                .expect("an envelope, not a panic"),
+            &mut stream,
+            PREBUILD_GROUP_MAX_ENVELOPES,
+        );
+        assert_eq!(group2.len(), 1);
+        assert!(overflow2.is_none());
+        // The carried envelope alone is under the byte budget, so the second call
+        // polls the stream again and observes it is exhausted.
+        assert!(ended2);
+    }
+
+    #[test]
+    fn a_build_group_allows_an_individually_oversized_envelope_alone() {
+        let over = PREBUILD_GROUP_MAX_BYTES + 1;
+        let mut stream = caught(Box::pin(futures::stream::iter(vec![Ok(
+            deferred_envelope_of(8),
+        )])));
+        let (group, ended, overflow) = take_ready_group(
+            Ok(deferred_envelope_of(over)),
+            &mut stream,
+            PREBUILD_GROUP_MAX_ENVELOPES,
+        );
+        assert_eq!(group.len(), 1);
+        // `first` alone already meets the budget, so the loop does not poll; the
+        // follow-on stays in the stream for the next group.
+        assert!(overflow.is_none());
+        assert!(!ended);
+        assert!(stream.next().now_or_never().flatten().is_some());
+    }
+
+    /// What a deferred envelope's build does in the pipeline tests below.
+    #[derive(Clone, Copy)]
+    enum TestBuild {
+        Succeeds,
+        Fails,
+        Panics,
+    }
+
+    /// A deferred [`cdc::ChangeRows`] carrying one tracked row; counts its builds.
+    struct TrackedRows {
+        id: i32,
+        build: TestBuild,
+        builds: Arc<AtomicUsize>,
+    }
+
+    impl cdc::ChangeRows for TrackedRows {
+        fn is_empty(&self) -> bool {
+            false
+        }
+        fn num_rows_hint(&self) -> usize {
+            1
+        }
+        fn encoded_len(&self) -> usize {
+            8
+        }
+        fn source_commit_ts_ms(&self) -> Option<i64> {
+            None
+        }
+        fn is_heartbeat(&self) -> bool {
+            false
+        }
+        fn build(self: Box<Self>) -> Result<cdc::ChangeBatch, cdc::ChangeBatchError> {
+            self.builds.fetch_add(1, AtomicOrdering::SeqCst);
+            match self.build {
+                TestBuild::Succeeds => Ok(create_test_change_batch(
+                    vec!["c"],
+                    &[vec!["id"]],
+                    vec![self.id],
+                    vec![Some("row")],
+                )),
+                TestBuild::Fails => Err(cdc::ChangeBatchError::DeferredBuild {
+                    message: "test build failure".to_string(),
+                }),
+                TestBuild::Panics => panic!("test build panicked"),
+            }
+        }
+    }
+
+    fn make_deferred_tracked_envelope(
+        id: i32,
+        log: &Arc<CommitLog>,
+        builds: &Arc<AtomicUsize>,
+        build: TestBuild,
+    ) -> ChangeEnvelope {
+        ChangeEnvelope::new_from_rows(
+            Box::new(TrackingCommitter {
+                id,
+                log: Arc::clone(log),
+                outcome: Ok(()),
+            }),
+            Box::new(TrackedRows {
+                id,
+                build,
+                builds: Arc::clone(builds),
+            }),
+            false,
+        )
+    }
+
+    /// Holds the first `insert_into` until `builds` reaches `needed`, and records
+    /// whether it gave up waiting instead.
+    #[derive(Debug)]
+    struct FirstWriteHeldForBuilds {
+        inner: Arc<dyn TableProvider>,
+        builds: Arc<AtomicUsize>,
+        needed: usize,
+        writes_started: Arc<AtomicUsize>,
+        gave_up: Arc<AtomicBool>,
+    }
+
+    #[async_trait]
+    impl TableProvider for FirstWriteHeldForBuilds {
+        fn schema(&self) -> arrow::datatypes::SchemaRef {
+            self.inner.schema()
+        }
+        fn table_type(&self) -> datafusion::datasource::TableType {
+            self.inner.table_type()
+        }
+        async fn scan(
+            &self,
+            state: &dyn Session,
+            projection: Option<&Vec<usize>>,
+            filters: &[Expr],
+            limit: Option<usize>,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            self.inner.scan(state, projection, filters, limit).await
+        }
+        async fn insert_into(
+            &self,
+            state: &dyn Session,
+            input: Arc<dyn ExecutionPlan>,
+            insert_op: InsertOp,
+        ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+            if self.writes_started.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+                let deadline = std::time::Instant::now() + Duration::from_secs(5);
+                while self.builds.load(AtomicOrdering::SeqCst) < self.needed {
+                    if std::time::Instant::now() > deadline {
+                        self.gave_up.store(true, AtomicOrdering::SeqCst);
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            }
+            self.inner.insert_into(state, input, insert_op).await
+        }
+    }
+
+    /// The deferred build of envelopes that arrive while a write is in flight
+    /// happens during that write, not after it: the first write is held until
+    /// the next two envelopes are built, which the apply loop could only do once
+    /// the write it is stuck in had finished.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_reader_builds_arriving_envelopes_while_a_write_is_in_flight() {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let writes_started = Arc::new(AtomicUsize::new(0));
+        let gave_up = Arc::new(AtomicBool::new(false));
+        let provider = Arc::new(FirstWriteHeldForBuilds {
+            inner: make_mem_table() as Arc<dyn TableProvider>,
+            builds: Arc::clone(&builds),
+            needed: 3,
+            writes_started: Arc::clone(&writes_started),
+            gave_up: Arc::clone(&gave_up),
+        });
+        let task = make_refresh_task(provider as Arc<dyn TableProvider>);
+        let log = CommitLog::new();
+
+        let (source, stream) = futures::channel::mpsc::unbounded();
+        let stream: ChangesStream = stream.boxed();
+        source
+            .unbounded_send(Ok(make_deferred_tracked_envelope(
+                1,
+                &log,
+                &builds,
+                TestBuild::Succeeds,
+            )))
+            .expect("queue envelope 1");
+        let join = tokio::spawn(async move {
+            run_changes_stream_with_config(&task, test_cdc_config(0), stream).await
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while writes_started.load(AtomicOrdering::SeqCst) == 0 {
+            assert!(
+                std::time::Instant::now() <= deadline,
+                "the first write never started"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        for id in [2, 3] {
+            source
+                .unbounded_send(Ok(make_deferred_tracked_envelope(
+                    id,
+                    &log,
+                    &builds,
+                    TestBuild::Succeeds,
+                )))
+                .expect("queue envelope");
+        }
+        drop(source);
+
+        join.await
+            .expect("task join")
+            .expect("changes stream should succeed");
+        assert!(
+            !gave_up.load(AtomicOrdering::SeqCst),
+            "envelopes 2 and 3 were not built while the first write was in flight (builds: {})",
+            builds.load(AtomicOrdering::SeqCst)
+        );
+        assert_eq!(
+            builds.load(AtomicOrdering::SeqCst),
+            3,
+            "each envelope builds once"
+        );
+        assert_eq!(log.ids().await, vec![1, 2, 3]);
+    }
+
+    /// Run deferred envelopes with ids from 1 through the real reader and apply
+    /// loop: the first alone, then `later` while the first write is held, so the
+    /// reader builds them (the hold lasts until `later_builds` more builds have run,
+    /// and records whether it had to give up instead). Returns the committed ids,
+    /// the dataset status, and whether the hold gave up.
+    async fn run_with_later_envelopes_built_in_the_reader(
+        name: &str,
+        later: &[TestBuild],
+        later_builds: usize,
+    ) -> (Vec<i32>, Option<runtime_status::ComponentStatus>, bool) {
+        let builds = Arc::new(AtomicUsize::new(0));
+        let writes_started = Arc::new(AtomicUsize::new(0));
+        let gave_up = Arc::new(AtomicBool::new(false));
+        let provider = Arc::new(FirstWriteHeldForBuilds {
+            inner: make_mem_table() as Arc<dyn TableProvider>,
+            builds: Arc::clone(&builds),
+            needed: 1 + later_builds,
+            writes_started: Arc::clone(&writes_started),
+            gave_up: Arc::clone(&gave_up),
+        });
+        let task = Arc::new(make_refresh_task_named(
+            name,
+            provider as Arc<dyn TableProvider>,
+        ));
+        let log = CommitLog::new();
+
+        let (source, stream) = futures::channel::mpsc::unbounded();
+        let stream: ChangesStream = stream.boxed();
+        source
+            .unbounded_send(Ok(make_deferred_tracked_envelope(
+                1,
+                &log,
+                &builds,
+                TestBuild::Succeeds,
+            )))
+            .expect("queue envelope 1");
+        let run_task = Arc::clone(&task);
+        let join = tokio::spawn(async move {
+            run_changes_stream_with_config(&run_task, test_cdc_config(0), stream).await
+        });
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while writes_started.load(AtomicOrdering::SeqCst) == 0 {
+            assert!(
+                std::time::Instant::now() <= deadline,
+                "the first write never started"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        for (id, kind) in (2..).zip(later) {
+            source
+                .unbounded_send(Ok(make_deferred_tracked_envelope(id, &log, &builds, *kind)))
+                .expect("queue envelope");
+        }
+        drop(source);
+        let _ = join.await.expect("task join");
+
+        let status = task
+            .runtime_status
+            .get_dataset_status(&TableReference::bare(name.to_string()));
+        (
+            log.ids().await,
+            status,
+            gave_up.load(AtomicOrdering::SeqCst),
+        )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_failed_deferred_build_stops_the_dataset_with_nothing_committed_from_it_on() {
+        // Envelopes 2–4 are built in the reader (all three builds run, the failing
+        // one included) while envelope 1's write is held.
+        let (committed, status, gave_up) = run_with_later_envelopes_built_in_the_reader(
+            "prebuild_failed_build",
+            &[TestBuild::Succeeds, TestBuild::Fails, TestBuild::Succeeds],
+            3,
+        )
+        .await;
+        assert!(!gave_up, "envelopes 2-4 must be built in the reader");
+        assert!(
+            committed.iter().all(|id| *id < 3),
+            "nothing at or after the failed envelope may commit, got {committed:?}"
+        );
+        let message = status
+            .as_ref()
+            .and_then(runtime_status::ComponentStatus::error_message)
+            .unwrap_or_default();
+        assert!(
+            message.contains("test build failure"),
+            "the dataset must fail with the build's own error, got {status:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_lost_deferred_build_stops_the_dataset_with_nothing_committed_from_it_on() {
+        // Envelopes 2 and 3 reach the reader as one group while envelope 1's write
+        // is held; envelope 2's build panics, which loses the group's build task
+        // after that one build ran.
+        let (committed, status, gave_up) = run_with_later_envelopes_built_in_the_reader(
+            "prebuild_lost_build",
+            &[TestBuild::Panics, TestBuild::Succeeds],
+            1,
+        )
+        .await;
+        assert!(!gave_up, "envelope 2 must be built in the reader");
+        assert!(
+            committed.iter().all(|id| *id < 2),
+            "nothing at or after the lost build may commit, got {committed:?}"
+        );
+        let message = status
+            .as_ref()
+            .and_then(runtime_status::ComponentStatus::error_message)
+            .unwrap_or_default();
+        assert!(
+            message.contains("deferred CDC batch build task failed"),
+            "the dataset must fail with the lost build's reason, got {status:?}"
+        );
+    }
+
+    /// While the apply loop is idle the reader forwards deferred envelopes
+    /// unbuilt, and the apply loop builds them in its burst.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn an_idle_apply_loop_builds_its_burst_itself() {
+        let task = make_refresh_task_named(
+            "prebuild_idle_apply",
+            make_mem_table() as Arc<dyn TableProvider>,
+        );
+        let log = CommitLog::new();
+        let builds = Arc::new(AtomicUsize::new(0));
+        let items: Vec<Result<ChangeEnvelope, CdcStreamError>> = (1..=4)
+            .map(|id| {
+                Ok(make_deferred_tracked_envelope(
+                    id,
+                    &log,
+                    &builds,
+                    TestBuild::Succeeds,
+                ))
+            })
+            .collect();
+        run_changes_stream_with_config(&task, test_cdc_config(0), make_changes_stream(items))
+            .await
+            .expect("changes stream should succeed");
+        assert_eq!(
+            builds.load(AtomicOrdering::SeqCst),
+            4,
+            "each envelope builds once"
+        );
+        assert_eq!(log.ids().await, vec![1, 2, 3, 4]);
     }
 }

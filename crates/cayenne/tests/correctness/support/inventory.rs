@@ -28,6 +28,7 @@ use test_framework::queries::{
     get_tpch_test_queries,
 };
 
+use super::dialect::{Oracle, untranslatable};
 use super::micro_bench_queries;
 use super::sqllancer::sqllancer_queries;
 use super::ssb_data::ssb_queries;
@@ -50,6 +51,70 @@ pub struct InventoryEntry {
     /// tolerated at the gate: an unverified order that nobody has looked at is
     /// the outcome the sort check exists to surface, so it fails instead.
     pub order_unchecked_review: Option<&'static str>,
+    /// The fixtures on which this query's answer holds no value — no rows, or
+    /// only NULL — and why. Without a review naming the fixture a lane loaded,
+    /// an empty agreement fails as vacuous: two engines returning nothing
+    /// compared nothing.
+    pub empty_result_review: Option<EmptyResultReview>,
+}
+
+/// A reviewed empty answer: the fixtures a query was run on and found to
+/// select nothing from, and why.
+#[derive(Debug, Clone, Copy)]
+pub struct EmptyResultReview {
+    /// The fixtures, as [`fixture`] names them, on which the answer holds no
+    /// value. An empty answer on any other fixture fails.
+    pub fixtures: &'static [&'static str],
+    pub reason: &'static str,
+}
+
+impl EmptyResultReview {
+    /// Whether the review accepts an empty answer on `fixture`.
+    #[must_use]
+    pub fn covers(&self, fixture: &str) -> bool {
+        self.fixtures.contains(&fixture)
+    }
+}
+
+/// Names for the rows a lane loads, which decide what a query's answer holds.
+///
+/// Empty answers are reviewed per fixture. A query that selects nothing from
+/// one generator's rows, or at one scale, can answer on another, and a review
+/// that outlived its fixture would pass an empty answer where rows belong.
+pub mod fixture {
+    /// TPC-DS at SF1 as DuckDB's `dsdgen` writes it: the DuckDB lane's default.
+    pub const TPCDS_DSDGEN_SF1: &str = "TPC-DS dsdgen SF1";
+    /// TPC-DS at SF1 as `tpcdsgen` writes it: the chDB lane's default.
+    pub const TPCDS_TPCDSGEN_SF1: &str = "TPC-DS tpcdsgen SF1";
+    /// TPC-DS at SF 0.1 as `tpcdsgen` writes it: the SQLite lane's default.
+    pub const TPCDS_TPCDSGEN_SF0_1: &str = "TPC-DS tpcdsgen SF0.1";
+    /// The reduced ClickBench `hits` table the lanes build by default.
+    pub const REDUCED_HITS: &str = "reduced ClickBench hits";
+    /// The ClickBench `hits` dump `CLICKBENCH_HITS_PARQUET` names.
+    pub const HITS_DUMP: &str = "ClickBench hits dump";
+
+    /// TPC-DS as DuckDB's `dsdgen` writes it at `sf`.
+    #[must_use]
+    pub fn tpcds_dsdgen(sf: f64) -> String {
+        format!("TPC-DS dsdgen SF{sf}")
+    }
+
+    /// TPC-DS as `tpcdsgen` writes it at `sf`.
+    #[must_use]
+    pub fn tpcds_tpcdsgen(sf: f64) -> String {
+        format!("TPC-DS tpcdsgen SF{sf}")
+    }
+
+    /// The ClickBench `hits` rows a lane loads: the dump when
+    /// `CLICKBENCH_HITS_PARQUET` names one, the reduced table otherwise.
+    #[must_use]
+    pub fn clickbench_hits() -> &'static str {
+        if std::env::var_os("CLICKBENCH_HITS_PARQUET").is_some() {
+            HITS_DUMP
+        } else {
+            REDUCED_HITS
+        }
+    }
 }
 
 /// Why a query's `ORDER BY` cannot be verified against its own result columns.
@@ -76,6 +141,91 @@ fn order_unchecked_review(suite: &str, name: &str) -> Option<&'static str> {
     }
 }
 
+/// The fixtures on which a query's answer holds no value, and so compares
+/// nothing.
+///
+/// Each entry is a hole, not a pass: the census counts it, and naming it here is
+/// what lets a lane accept the empty agreement instead of failing on it.
+/// Emptiness is a property of the fixture's rows, so every fixture listed is one
+/// a lane loaded and saw the query select nothing from.
+fn empty_result_review(suite: &str, name: &str) -> Option<EmptyResultReview> {
+    use fixture::{REDUCED_HITS, TPCDS_DSDGEN_SF1, TPCDS_TPCDSGEN_SF0_1, TPCDS_TPCDSGEN_SF1};
+    const EVERY_TPCDS: &[&str] = &[TPCDS_DSDGEN_SF1, TPCDS_TPCDSGEN_SF1, TPCDS_TPCDSGEN_SF0_1];
+    let (fixtures, reason): (&'static [&'static str], &'static str) = match (suite, name) {
+        (
+            "tpcds",
+            "tpcds_q8" | "tpcds_q37" | "tpcds_q41" | "tpcds_q44" | "tpcds_q54" | "tpcds_q58",
+        ) => (
+            EVERY_TPCDS,
+            "no rows on either generator's data at either scale: the query's parameters \
+             select none",
+        ),
+        ("tpcds", "tpcds_q61" | "tpcds_q92") => (
+            EVERY_TPCDS,
+            "one all-NULL aggregate row on either generator's data at either scale: the \
+             query's filters select no rows",
+        ),
+        // SQLite has no standard deviation, so neither query runs at SF 0.1.
+        ("tpcds", "tpcds_q29") => (
+            &[TPCDS_DSDGEN_SF1, TPCDS_TPCDSGEN_SF1],
+            "no rows on either generator's SF1 data: the query's parameters select none",
+        ),
+        ("tpcds", "tpcds_q17") => (
+            &[TPCDS_TPCDSGEN_SF1],
+            "no rows on tpcdsgen's SF1 data; the dsdgen rows the DuckDB lane loads answer it",
+        ),
+        ("tpcds", "tpcds_q25" | "tpcds_q85") => (
+            &[TPCDS_TPCDSGEN_SF1, TPCDS_TPCDSGEN_SF0_1],
+            "no rows on tpcdsgen's data; the dsdgen rows the DuckDB lane loads answer it",
+        ),
+        (
+            "tpcds",
+            "tpcds_q31" | "tpcds_q64" | "tpcds_q65" | "tpcds_q73" | "tpcds_q82" | "tpcds_q83"
+            | "tpcds_q84",
+        ) => (
+            &[TPCDS_TPCDSGEN_SF0_1],
+            "no rows at SF 0.1, where the SQLite lane runs; both SF1 lanes answer it",
+        ),
+        ("tpcds", "tpcds_q13" | "tpcds_q32") => (
+            &[TPCDS_TPCDSGEN_SF0_1],
+            "one all-NULL aggregate row at SF 0.1, where the SQLite lane runs; both SF1 \
+             lanes answer it",
+        ),
+        ("clickbench", "clickbench_q20") => (
+            &[REDUCED_HITS],
+            "the reduced hits fixture has no row with UserID 435090932899640449; compared \
+             only with CLICKBENCH_HITS_PARQUET",
+        ),
+        ("clickbench", "clickbench_q22" | "clickbench_q23" | "clickbench_q24") => (
+            &[REDUCED_HITS],
+            "the reduced hits fixture has no URL containing 'google' or Title containing \
+             'Google'; compared only with CLICKBENCH_HITS_PARQUET",
+        ),
+        ("clickbench", "clickbench_q28" | "clickbench_q29") => (
+            &[REDUCED_HITS],
+            "HAVING COUNT(*) > 100000 selects nothing from the 50,000-row reduced hits \
+             fixture; compared only with CLICKBENCH_HITS_PARQUET",
+        ),
+        ("clickbench", "clickbench_q39" | "clickbench_q40" | "clickbench_q43") => (
+            &[REDUCED_HITS],
+            "OFFSET 1000 skips past every group CounterID 62 has in the reduced hits \
+             fixture; compared only with CLICKBENCH_HITS_PARQUET",
+        ),
+        ("clickbench", "clickbench_q41") => (
+            &[REDUCED_HITS],
+            "the reduced hits fixture has no row with RefererHash 3594120000172545465; \
+             compared only with CLICKBENCH_HITS_PARQUET",
+        ),
+        ("clickbench", "clickbench_q42") => (
+            &[REDUCED_HITS],
+            "the reduced hits fixture has no row with URLHash 2868770270353813622; compared \
+             only with CLICKBENCH_HITS_PARQUET",
+        ),
+        _ => return None,
+    };
+    Some(EmptyResultReview { fixtures, reason })
+}
+
 /// Build the full inventory from suite sources + micro + SQLLancer.
 #[must_use]
 pub fn build_inventory() -> Vec<InventoryEntry> {
@@ -87,15 +237,10 @@ pub fn build_inventory() -> Vec<InventoryEntry> {
             name: q.name.to_string(),
             sql: q.sql.to_string(),
             duckdb_exclusion: tpch_duckdb_exclusion(&q),
-            chdb_exclusion: Some(
-                "TPC-H multi-table SQL targets DataFusion/DuckDB dialect; \
-                 chDB runs SQLLancer + micro on all three engines",
-            ),
-            sqlite_exclusion: Some(
-                "TPC-H SQL uses DataFusion/DuckDB dialect (EXTRACT, INTERVAL, …); \
-                 SQLite lane covers SSB + SQLLancer + micro",
-            ),
+            chdb_exclusion: oracle_exclusion(&q, Oracle::ClickHouse),
+            sqlite_exclusion: oracle_exclusion(&q, Oracle::Sqlite),
             order_unchecked_review: order_unchecked_review("tpch", q.name.as_ref()),
+            empty_result_review: empty_result_review("tpch", q.name.as_ref()),
         });
     }
 
@@ -105,15 +250,10 @@ pub fn build_inventory() -> Vec<InventoryEntry> {
             name: q.name.to_string(),
             sql: q.sql.to_string(),
             duckdb_exclusion: tpcds_duckdb_exclusion(&q),
-            chdb_exclusion: Some(
-                "TPC-DS multi-table SQL targets DataFusion/DuckDB dialect; \
-                 chDB runs SQLLancer + micro on all three engines",
-            ),
-            sqlite_exclusion: Some(
-                "TPC-DS SQL targets DataFusion/DuckDB dialect; \
-                 SQLite lane covers SSB + SQLLancer + micro",
-            ),
+            chdb_exclusion: oracle_exclusion(&q, Oracle::ClickHouse),
+            sqlite_exclusion: oracle_exclusion(&q, Oracle::Sqlite),
             order_unchecked_review: order_unchecked_review("tpcds", q.name.as_ref()),
+            empty_result_review: empty_result_review("tpcds", q.name.as_ref()),
         });
     }
 
@@ -122,15 +262,11 @@ pub fn build_inventory() -> Vec<InventoryEntry> {
             suite: "clickbench",
             name: q.name.to_string(),
             sql: q.sql.to_string(),
-            duckdb_exclusion: None,
-            chdb_exclusion: Some(
-                "ClickBench full hits loaded in DuckDB lane; chDB runs SQLLancer + micro",
-            ),
-            sqlite_exclusion: Some(
-                "ClickBench hits schema/SQL surface is DataFusion-oriented; \
-                 SQLite lane covers SSB + SQLLancer + micro",
-            ),
+            duckdb_exclusion: unanswerable(&q),
+            chdb_exclusion: oracle_exclusion(&q, Oracle::ClickHouse),
+            sqlite_exclusion: oracle_exclusion(&q, Oracle::Sqlite),
             order_unchecked_review: order_unchecked_review("clickbench", q.name.as_ref()),
+            empty_result_review: empty_result_review("clickbench", q.name.as_ref()),
         });
     }
 
@@ -140,13 +276,10 @@ pub fn build_inventory() -> Vec<InventoryEntry> {
             name: q.name.to_string(),
             sql: q.sql.to_string(),
             duckdb_exclusion: None,
-            chdb_exclusion: Some(
-                "CH-benCHmark multi-table TPC-C/H hybrid SQL targets DataFusion/DuckDB dialect",
-            ),
-            sqlite_exclusion: Some(
-                "CH-benCHmark SQL uses mod()/dialect forms; SQLite lane covers SSB + SQLLancer + micro",
-            ),
+            chdb_exclusion: oracle_exclusion(&q, Oracle::ClickHouse),
+            sqlite_exclusion: oracle_exclusion(&q, Oracle::Sqlite),
             order_unchecked_review: order_unchecked_review("chbench", q.name.as_ref()),
+            empty_result_review: empty_result_review("chbench", q.name.as_ref()),
         });
     }
 
@@ -162,6 +295,7 @@ pub fn build_inventory() -> Vec<InventoryEntry> {
             ),
             sqlite_exclusion: None,
             order_unchecked_review: order_unchecked_review("ssb", q.name.as_ref()),
+            empty_result_review: empty_result_review("ssb", q.name.as_ref()),
         });
     }
 
@@ -170,18 +304,16 @@ pub fn build_inventory() -> Vec<InventoryEntry> {
         let name = q.name.replacen("tpch_", "spicebench_", 1);
         let sq = Query::new(name.clone().into(), Arc::clone(&q.sql), false);
         let review = order_unchecked_review("spicebench", &name);
+        let empty_review = empty_result_review("spicebench", &name);
         entries.push(InventoryEntry {
             suite: "spicebench",
             name,
             sql: q.sql.to_string(),
             duckdb_exclusion: tpch_duckdb_exclusion(&sq).or(tpch_duckdb_exclusion(&q)),
-            chdb_exclusion: Some(
-                "SpiceBench SF1 scenario is TPC-H; chDB dialect exclusion same as TPC-H suite",
-            ),
-            sqlite_exclusion: Some(
-                "SpiceBench SF1 is TPC-H dialect; SQLite lane covers SSB + SQLLancer + micro",
-            ),
+            chdb_exclusion: Some(SPICEBENCH_IS_TPCH),
+            sqlite_exclusion: Some(SPICEBENCH_IS_TPCH),
             order_unchecked_review: review,
+            empty_result_review: empty_review,
         });
     }
 
@@ -194,6 +326,7 @@ pub fn build_inventory() -> Vec<InventoryEntry> {
             chdb_exclusion: sqllancer_chdb_exclusion(&q),
             sqlite_exclusion: sqllancer_sqlite_exclusion(&q),
             order_unchecked_review: order_unchecked_review("sqllancer", q.name.as_ref()),
+            empty_result_review: empty_result_review("sqllancer", q.name.as_ref()),
         });
     }
 
@@ -206,10 +339,46 @@ pub fn build_inventory() -> Vec<InventoryEntry> {
             chdb_exclusion: None,
             sqlite_exclusion: None,
             order_unchecked_review: order_unchecked_review("micro", q.name.as_ref()),
+            empty_result_review: empty_result_review("micro", q.name.as_ref()),
         });
     }
 
     entries
+}
+
+/// SpiceBench's standalone-oracle cells would repeat TPC-H's exactly.
+const SPICEBENCH_IS_TPCH: &str = "SpiceBench's SF1 scenario is TPC-H: the same SQL over the same \
+     rows, compared against this engine in the TPC-H lane";
+
+/// Why a suite query is not compared against a standalone oracle — a property
+/// of the SQL, checkable by running it.
+///
+/// First the reasons that hold for every engine ([`unanswerable`]), then the
+/// constructs the oracle has no faithful spelling for, which the dialect
+/// translator names ([`untranslatable`]). Nothing here is a blanket per-suite
+/// reason: a query that translates is compared.
+fn oracle_exclusion(q: &Query, oracle: Oracle) -> Option<&'static str> {
+    unanswerable(q).or_else(|| untranslatable(&q.sql, oracle))
+}
+
+/// Queries with no single answer to compare, or that Cayenne cannot run at all.
+fn unanswerable(q: &Query) -> Option<&'static str> {
+    match q.name.as_ref() {
+        "tpch_simple_q3" => Some(
+            "ORDER BY l_linenumber DESC LIMIT 10 keeps 10 of the thousands of rows tied at the \
+             top line number, and the result does not return the sort key: any 10 of them are \
+             the answer",
+        ),
+        "tpch_simple_q6" | "tpch_simple_q7" | "clickbench_q18" => Some(
+            "LIMIT without ORDER BY: which rows come back is unspecified, so no two engines \
+             need agree",
+        ),
+        "clickbench_q30" => Some(
+            "Cayenne cannot plan it: DataFusion's simplify_expressions rewrites the 90 \
+             `SUM(\"ResolutionWidth\" + n)` columns into duplicate field names and fails",
+        ),
+        _ => None,
+    }
 }
 
 fn sqllancer_chdb_exclusion(q: &Query) -> Option<&'static str> {
@@ -258,22 +427,12 @@ fn tpcds_duckdb_exclusion(q: &Query) -> Option<&'static str> {
     }
 }
 
+/// A TPC-H (or SpiceBench) query's DuckDB exclusion: the ones no engine can be
+/// compared on. `simple_q4`'s `ORDER BY … LIMIT` ties are left in: the compare
+/// path checks only the sort keys of a tie group a `LIMIT` cuts.
 fn tpch_duckdb_exclusion(q: &Query) -> Option<&'static str> {
-    match q.name.as_ref() {
-        "tpch_simple_q3" | "tpch_simple_q4" | "spicebench_simple_q3" | "spicebench_simple_q4" => {
-            Some(
-                "ORDER BY non-unique key + LIMIT yields engine-dependent tied-row sets; \
-                 not a content correctness defect",
-            )
-        }
-        "tpch_simple_q6" | "tpch_simple_q7" | "spicebench_simple_q6" | "spicebench_simple_q7" => {
-            Some(
-                "LIMIT without ORDER BY is nondeterministic across engines and scale factors; \
-                 not a content correctness defect",
-            )
-        }
-        _ => None,
-    }
+    let tpch_name = q.name.replacen("spicebench_", "tpch_", 1);
+    unanswerable(&Query::new(tpch_name.into(), Arc::clone(&q.sql), false))
 }
 
 /// Assert inventory is complete relative to suite sources.

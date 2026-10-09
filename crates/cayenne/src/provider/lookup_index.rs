@@ -17,14 +17,24 @@ limitations under the License.
 //! Secondary index over a table's Vortex files, mapping an exact equality key
 //! to the physical `(file, file-local row position)` addresses that hold it.
 //!
-//! One immutable snapshot is indexed in memory; the index is bound to that
-//! snapshot's exact file set, and any deviation falls back to the ordinary scan.
-//! A full refresh builds the replacement during the write and publishes it in
-//! the flip that makes the snapshot visible, so there is no window in which
-//! lookups lose the index. Anything else that changes the files — an append, a
-//! compaction, a restart — leaves the index stale; it is dropped, and a later
-//! literal lookup or supported runtime join lookup rebuilds it in the background,
-//! paced so rebuilding takes a bounded share of a core. Nothing is persisted.
+//! Each key is a [`TieredIndex`] of immutable runs, and a run covers the files
+//! it was built from. Every write builds a run from exactly the rows it writes,
+//! as the Vortex sink reports them, and publishes it when the write returns,
+//! just before the write becomes visible. That holds for every write: a CDC
+//! append, a full-refresh overwrite, a compaction's rewrite, a memory-tier
+//! checkpoint. So a file is indexed from the moment a scan can read it, and
+//! nothing an append, a compaction or a refresh does leaves the index stale.
+//! The one exception is an append of more than 2^20 rows,
+//! which finishes its run in the background: its files are read in full until
+//! the run publishes.
+//! A file no run covers — written before a restart, or by a write whose run
+//! could not be built — is read in full, and a lookup that meets one asks for
+//! a background build that reads back only the files not yet covered, paced
+//! so it takes a bounded share of a core. With the hidden
+//! `SPICE_CAYENNE_INDEX_PERSISTENCE=enabled` switch (for testing), each run also
+//! persists as a file under the table's `_lookup_index` directory, registered
+//! in the metastore, so a reopened table loads its runs instead of reading its
+//! files back; otherwise nothing is persisted.
 //!
 //! Declared with the acceleration's `indexes`, one key per entry:
 //!
@@ -36,25 +46,24 @@ limitations under the License.
 //!     '(tenant_id, service_id)': enabled
 //! ```
 //!
-//! With no entry the whole module is inert. Every build reserves its working
-//! memory, and every published index its resident bytes, against the query
-//! memory pool; when the pool cannot fit them the index is not built and the
-//! table keeps scanning. This index is always safe to go without, which is what
+//! With no entry the whole module is inert. The runs' resident bytes, and every
+//! run's working memory while it is built, are reserved against the query
+//! memory pool; when the pool cannot fit them the run is dropped and its files
+//! are read in full. This index is always safe to go without, which is what
 //! lets it degrade rather than fail.
-//!
-//! Each key is held as sorted, compressed Vortex arrays: one per key column in
-//! its stored type and one packed `(file, position)` column, ordered by key and
-//! then by address. Resident size is therefore close to the compressed size of the key
-//! columns. A lookup finds the block of [`BLOCK_ROWS`] entries its key can fall in
-//! from the row-encoded key retained for the start of every block, decodes only
-//! that block, and compares row-encoded keys inside it.
 //!
 //! Footguns this code depends on:
 //!
-//! * Row positions are file-local physical positions in unfiltered scan order.
-//!   They are only valid for the exact file they were captured from, which is
-//!   why [`LookupSelection::validate`] compares path, size and modification time
-//!   before a selection is attached.
+//! * A run is keyed by file NAME, not path: a write's files move between its
+//!   staging directory and the snapshot directories, which changes their path
+//!   but not their name or any row position. Cayenne names every data file
+//!   after the write that produced it (a UUID v7) plus a partition and a
+//!   sequence, so no two files a table writes share a name, and a name the
+//!   index covers always refers to the rows it was built from.
+//! * Coverage is judged per file, against the view a scan pinned in the same
+//!   fenced instant as its file list. A covered file is read only at its
+//!   candidate positions; an uncovered one is read in full. An incomplete
+//!   index therefore narrows less but never answers with a false empty.
 //! * The index answers `key -> candidate positions` only. Every original
 //!   predicate still runs, so a candidate that fails `Active = 1` is discarded
 //!   by the scan's own filter rather than by the index.
@@ -64,24 +73,26 @@ limitations under the License.
 //! * A runtime key set is usable only after its dynamic filter is complete and
 //!   only through conjunctions. A list nested under `OR` or `CASE` is not a
 //!   complete necessary condition and must not become a row selection.
-//! * The build sorts with Arrow's lexicographic sort and a lookup compares
-//!   `RowConverter` bytes. Those orders agree for every type the converter
-//!   supports, and the build re-checks them while it records block heads: a block
-//!   searched in the wrong order would answer with a false empty.
+//! * A write's run is only as good as the positions the sink reports: batches
+//!   land in a file in the order the sink reports them. A read-back build takes
+//!   every position from Vortex's own `row_idx()` instead, and
+//!   [`verify_against_read_back`] diffs the two.
 //! * A selection of N row positions is not a promise of N decoded rows. Vortex
 //!   reads whole encoded segments and dictionaries that cover those positions.
 
+use tracing::Instrument;
+use tracing::instrument::WithSubscriber;
+
 use std::collections::{HashMap, HashSet};
-use std::ops::Range;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 
 use super::memory_account::{CayenneMemoryAccount, LookupIndexReservation};
-use crate::row_converter::{RowConverter, SortField};
-use arc_swap::ArcSwapOption;
-use arrow::array::{Array, ArrayRef, AsArray, UInt32Array, UInt64Array};
-use arrow::compute::SortColumn;
+use crate::catalog::MetadataCatalog;
+use crate::metadata::IndexRunRecord;
+use arc_swap::ArcSwap;
+use arrow::array::{Array, ArrayRef, AsArray};
 use arrow::datatypes::UInt64Type;
 use arrow::record_batch::RecordBatch;
 use arrow_schema::{DataType, Field, FieldRef};
@@ -95,83 +106,95 @@ use datafusion_physical_expr::expressions::{
 use datafusion_physical_expr::utils::split_conjunction;
 use datafusion_physical_expr::{PhysicalExpr, ScalarFunctionExpr};
 use futures::StreamExt;
-use object_store::{ObjectMeta, ObjectStore};
+use key_index::tiered::{Candidate, IndexRun, IndexView, RunBuilder, TieredIndex};
+use key_index::{KeyEncoder, KeyField};
+use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt};
 use parking_lot::Mutex;
 use vortex::VortexSessionDefault;
-use vortex::array::arrays::ChunkedArray;
-use vortex::array::{ExecutionCtx, IntoArray, VortexSessionExecute};
+use vortex::array::VortexSessionExecute;
 use vortex::arrow::ArrowSessionExt;
 use vortex::buffer::Buffer;
-use vortex::compressor::{BtrBlocksCompressor, BtrBlocksCompressorBuilder};
 use vortex::dtype::Nullability;
 use vortex::file::OpenOptionsSessionExt;
 use vortex::layout::layouts::row_idx::row_idx;
 use vortex_datafusion::{
-    VortexAccessPlan, VortexAccessPlanProvider, VortexRuntimeAccessPlanProvider,
+    VortexAccessPlan, VortexAccessPlanProvider, VortexRuntimeAccessPlanProvider, include_by_index,
 };
-use vortex_scan::selection::Selection;
 use vortex_session::VortexSession;
 
-/// Bits reserved for the file-local row position inside a packed posting.
-const POSITION_BITS: u32 = 40;
-const POSITION_MASK: u64 = (1u64 << POSITION_BITS) - 1;
-/// File ids above this would not survive the shift into a packed posting.
-const MAX_FILE_ID: u32 = (1u32 << (u64::BITS - POSITION_BITS)) - 1;
-
-/// Runtime index scans accept only small exact build-side key sets.
-const RUNTIME_INDEX_MAX_KEYS: usize = 2_048;
+/// Runtime index scans accept only small exact build-side key sets, and a
+/// literal lookup at most this many key tuples.
+pub(crate) const RUNTIME_INDEX_MAX_KEYS: usize = 2_048;
 /// Candidate rows may scale with the table, but stay within a fixed memory bound.
 const RUNTIME_INDEX_MIN_ROWS: usize = 2_048;
 const RUNTIME_INDEX_MAX_ROWS: usize = 1_000_000;
 
-/// Sorted entries per block. A lookup decodes the block(s) its key can fall in,
-/// and one row-encoded key is retained per block to find them, so this trades
-/// resident head bytes against the work of every lookup.
-const BLOCK_ROWS: usize = 256;
-
-/// Sorted entries compressed together. A multiple of [`BLOCK_ROWS`], so blocks
-/// never straddle chunks, and small enough that a build holds one sorted chunk of
-/// the key columns at a time rather than a second sorted copy of all of them.
-const COMPRESS_CHUNK_ROWS: usize = BLOCK_ROWS * 256;
+/// Runs a key holds before a background merge folds a size tier together: a
+/// lookup probes every run, so their number bounds its cost.
+const MERGE_ABOVE_RUNS: usize = 8;
 
 /// Name of the file-local row position column the read-back build projects.
 const READ_BACK_POSITION_COLUMN: &str = "__cayenne_lookup_row_idx";
 
-/// How a probe ended. [`Self::as_str`] is the `outcome` dimension on
-/// `cayenne_lookup_index_probe_total`.
+/// How much of what a lookup reads its index covers. `EXPLAIN` shows it as
+/// counts (`uncovered_files` of `candidate_files`, or the batch counterparts
+/// in memory mode); the table's counters keep it per lookup.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(crate) enum ProbeOutcome {
-    /// A row selection was attached to the scan.
-    Selected,
-    /// The key has no posting, so the scan reads no file.
-    Empty,
-    /// No index covers the rows the lookup reads, so it read them in full.
-    Unbuilt,
-    /// The scan's files are not the ones the index was built from.
-    SnapshotMismatch,
+pub(crate) enum Coverage {
+    /// No file (in memory mode, no batch) the lookup reads is indexed yet, so
+    /// every one is read in full.
+    Unindexed,
+    /// Some are narrowed to their candidate rows by the index, and the rest
+    /// are read in full.
+    Partial,
+    /// Every one the lookup reads is indexed.
+    Full,
 }
 
-/// The lookup-index decision shown on `CayenneAccelerationExec` in `EXPLAIN`.
-///
-/// This is deliberately separate from [`ProbeOutcome`]: `NotApplicable` is a
-/// planning decision, not a probe, so it must not inflate the probe counters.
+impl Coverage {
+    /// The coverage of a read that included indexed parts (`indexed`) and
+    /// unindexed ones (`unindexed`). A read of nothing is fully covered.
+    pub(crate) const fn of(indexed: bool, unindexed: bool) -> Self {
+        match (indexed, unindexed) {
+            (false, true) => Self::Unindexed,
+            (true, true) => Self::Partial,
+            _ => Self::Full,
+        }
+    }
+}
+
+/// Whether an index served a lookup, and how much of what it read the index
+/// covered. `EXPLAIN` names the index only when it served the lookup
+/// ([`LookupIndexExplain::served_by`]). `NotApplicable` is a planning
+/// decision, not a probe, so it is never counted as one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LookupIndexExplainOutcome {
     NotApplicable,
-    Selected,
-    Empty,
-    Unbuilt,
-    SnapshotMismatch,
+    Probed(Coverage),
 }
 
-impl LookupIndexExplainOutcome {
+/// Why a lookup on an indexed table scanned instead of using its index,
+/// reported in `EXPLAIN` beside `lookup_index=none`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum LookupIndexScanReason {
+    /// The filters give no indexed key a value for every one of its columns:
+    /// an equality, an `IN` list, or an `OR` of equalities on each.
+    NoKeyPinned,
+    /// The columns' values combine into more key tuples than a lookup probes.
+    TooManyKeys,
+    /// The key tuples match more candidate rows than a lookup reads.
+    TooManyCandidates,
+    /// A value cannot be cast to its key column's type.
+    ValueNotIndexable,
+}
+
+impl LookupIndexScanReason {
     pub(crate) const fn as_str(self) -> &'static str {
         match self {
-            Self::NotApplicable => "not_applicable",
-            Self::Selected => "selected",
-            Self::Empty => "empty",
-            Self::Unbuilt => "unbuilt",
-            Self::SnapshotMismatch => "snapshot_mismatch",
+            Self::NoKeyPinned => "no_key_pinned",
+            Self::TooManyKeys => "too_many_keys",
+            Self::TooManyCandidates => "too_many_candidates",
+            Self::ValueNotIndexable => "value_not_indexable",
         }
     }
 }
@@ -182,25 +205,94 @@ pub(crate) struct LookupIndexExplain {
     pub(crate) shape: Option<String>,
     pub(crate) outcome: LookupIndexExplainOutcome,
     pub(crate) candidate_files: Option<usize>,
+    /// Files the scan reads in full because no run covers them yet, which are
+    /// part of `candidate_files`: all of them when the index covers none of
+    /// what the lookup reads, `0` when it covers all of it.
+    pub(crate) uncovered_files: Option<usize>,
+    /// Files the index answered for (file mode): read at their candidate
+    /// rows, or skipped because none holds the key. Not shown in `EXPLAIN`;
+    /// with `uncovered_files` it decides the coverage of a merged decision.
+    pub(crate) indexed_files: Option<usize>,
+    /// Memory mode's counterparts of `candidate_files` and `uncovered_files`,
+    /// over the in-memory batches a lookup reads.
+    pub(crate) candidate_batches: Option<usize>,
+    pub(crate) uncovered_batches: Option<usize>,
     pub(crate) candidate_rows: Option<u64>,
+    /// Why the lookup scanned, when an indexed table's lookup did.
+    pub(crate) reason: Option<LookupIndexScanReason>,
 }
 
 impl LookupIndexExplain {
+    /// One decision for a scan that read several snapshots, over all of their
+    /// files: `none` when no file read was indexed, `full` when every one
+    /// was, else `partial`, with their file counts summed. A snapshot that
+    /// read no file, or that the index did not apply to, leaves the others'
+    /// decision as it is.
+    #[must_use]
+    pub(crate) fn merge(self, other: Self) -> Self {
+        use LookupIndexExplainOutcome::{NotApplicable, Probed};
+        let sum = |a: Option<usize>, b: Option<usize>| match (a, b) {
+            (None, None) => None,
+            (a, b) => Some(a.unwrap_or(0) + b.unwrap_or(0)),
+        };
+        let sum_files = sum(self.candidate_files, other.candidate_files);
+        let sum_uncovered = sum(self.uncovered_files, other.uncovered_files);
+        let sum_indexed = sum(self.indexed_files, other.indexed_files);
+        let (outcome, reason) = match (self.outcome, other.outcome) {
+            (Probed(_), Probed(_)) => (
+                Probed(Coverage::of(
+                    sum_indexed.unwrap_or(0) > 0,
+                    sum_uncovered.unwrap_or(0) > 0,
+                )),
+                None,
+            ),
+            (Probed(_), NotApplicable) => (self.outcome, None),
+            (NotApplicable, Probed(_)) => (other.outcome, None),
+            (NotApplicable, NotApplicable) => (NotApplicable, self.reason.or(other.reason)),
+        };
+        // Every snapshot reports the selection's candidate rows, not its own.
+        let sum_rows = self.candidate_rows.max(other.candidate_rows);
+        Self {
+            shape: self.shape.or(other.shape),
+            outcome,
+            candidate_files: sum_files,
+            uncovered_files: sum_uncovered,
+            indexed_files: sum_indexed,
+            candidate_batches: sum(self.candidate_batches, other.candidate_batches),
+            uncovered_batches: sum(self.uncovered_batches, other.uncovered_batches),
+            candidate_rows: sum_rows,
+            reason,
+        }
+    }
+
+    /// The key whose index served the lookup, or `None` when no index did:
+    /// none matched, or the one that matched declined (see `reason`).
+    pub(crate) fn served_by(&self) -> Option<&str> {
+        match self.outcome {
+            LookupIndexExplainOutcome::Probed(_) => self.shape.as_deref(),
+            LookupIndexExplainOutcome::NotApplicable => None,
+        }
+    }
+
     pub(crate) fn not_applicable(shape: Option<String>) -> Self {
         Self {
             shape,
             outcome: LookupIndexExplainOutcome::NotApplicable,
             candidate_files: None,
+            uncovered_files: None,
+            indexed_files: None,
+            candidate_batches: None,
+            uncovered_batches: None,
             candidate_rows: None,
+            reason: None,
         }
     }
 
-    pub(crate) fn fallback(shape: String, outcome: LookupIndexExplainOutcome) -> Self {
+    /// An indexed table's lookup that scanned, and why.
+    pub(crate) fn scanned(shape: Option<String>, reason: LookupIndexScanReason) -> Self {
         Self {
-            shape: Some(shape),
-            outcome,
-            candidate_files: None,
-            candidate_rows: None,
+            reason: Some(reason),
+            ..Self::not_applicable(shape)
         }
     }
 
@@ -214,18 +306,12 @@ impl LookupIndexExplain {
             shape: Some(shape),
             outcome,
             candidate_files,
+            uncovered_files: None,
+            indexed_files: None,
+            candidate_batches: None,
+            uncovered_batches: None,
             candidate_rows: Some(candidate_rows),
-        }
-    }
-}
-
-impl ProbeOutcome {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::Selected => "selected",
-            Self::Empty => "empty",
-            Self::Unbuilt => "unbuilt",
-            Self::SnapshotMismatch => "snapshot_mismatch",
+            reason: None,
         }
     }
 }
@@ -268,26 +354,36 @@ impl KeySpec {
         &self.columns
     }
 
+    /// This key over `columns`, the table's spelling of its columns, keeping
+    /// the label `indexes` gave it.
+    pub(crate) fn with_columns(self, columns: Vec<String>) -> Self {
+        Self {
+            columns,
+            label: self.label,
+        }
+    }
+
     pub(crate) fn label(&self) -> &str {
         &self.label
     }
 }
 
 /// Which file set of a snapshot a listing saw: the table's directory generation
-/// and listing-cache epoch, sampled before listing. One of them moves whenever
-/// files are added to, or rewritten under, the same snapshot.
+/// and listing-cache epoch, sampled before listing, and a digest of the
+/// protected snapshots whose files are part of the set. One of them moves
+/// whenever that set of files changes.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct FileSetVersion {
     pub(crate) dir_generation: u64,
     pub(crate) listing_epoch: u64,
+    /// A digest of the protected snapshots whose files are part of the set.
+    pub(crate) protected: u64,
 }
 
 /// A data file of the indexed snapshot, recorded exactly as the scan lists it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct IndexedFile {
     pub(crate) path: String,
-    pub(crate) size: u64,
-    pub(crate) last_modified_ms: i64,
 }
 
 /// One key column, resolved against the table schema.
@@ -325,26 +421,11 @@ impl KeyColumn {
             }
             field.as_ref()
         };
-        if matches!(
-            field.data_type(),
-            DataType::Float16 | DataType::Float32 | DataType::Float64
-        ) {
-            return Err(format!(
-                "lookup index column '{}' has unsupported floating-point type {}; use an integer, decimal, string, or other exact-equality type",
-                field.name(),
-                field.data_type()
-            ));
-        }
         Ok(Self {
             name: field.name().clone(),
             data_type: field.data_type().clone(),
             nullable: field.is_nullable(),
         })
-    }
-
-    /// The field of this column inside the index, where nulls never appear.
-    fn indexed_field(&self) -> Field {
-        Field::new(&self.name, self.data_type.clone(), false)
     }
 
     /// The field of this column as a scan of the table's files returns it.
@@ -357,24 +438,6 @@ impl KeyColumn {
     }
 }
 
-fn postings_field() -> Field {
-    Field::new("postings", DataType::UInt64, false)
-}
-
-/// The byte-comparable encoding of one key's columns.
-pub(crate) fn key_converter(columns: &[KeyColumn]) -> Result<RowConverter, String> {
-    RowConverter::new(
-        columns
-            .iter()
-            .map(|column| SortField::new(column.data_type.clone()))
-            .collect(),
-    )
-    .map_err(|e| {
-        let types: Vec<String> = columns.iter().map(|c| c.data_type.to_string()).collect();
-        format!("key ({}) cannot be row-encoded: {e}", types.join(", "))
-    })
-}
-
 /// Casts `array` to `data_type`, or returns it unchanged when it already matches.
 pub(crate) fn cast_to(array: &ArrayRef, data_type: &DataType) -> Result<ArrayRef, String> {
     if array.data_type() == data_type {
@@ -384,386 +447,282 @@ pub(crate) fn cast_to(array: &ArrayRef, data_type: &DataType) -> Result<ArrayRef
         .map_err(|e| format!("cast {} -> {data_type}: {e}", array.data_type()))
 }
 
-/// The first index in `0..len` for which `pred` is false, for a `pred` that is
-/// true on a prefix of the range.
-fn partition_point(len: usize, pred: impl Fn(usize) -> bool) -> usize {
-    let (mut lo, mut hi) = (0usize, len);
-    while lo < hi {
-        let mid = lo + (hi - lo) / 2;
-        if pred(mid) {
-            lo = mid + 1;
-        } else {
-            hi = mid;
-        }
-    }
-    lo
+/// A data file's name: its identity across the moves and hardlinks between a
+/// write's staging directory and the snapshot directories, which change its
+/// path but not its name or any row position. See the module's note on file
+/// names.
+pub(crate) fn file_name(path: &str) -> &str {
+    path.rsplit('/').next().unwrap_or(path)
 }
 
-fn usize_of(bytes: u64) -> usize {
-    usize::try_from(bytes).unwrap_or(usize::MAX)
+/// The type a key column is encoded in: its stored type, or a dictionary's
+/// value type (see [`key_index::key_type`]).
+fn encoded_type(data_type: &DataType) -> DataType {
+    key_index::key_type(data_type).clone()
 }
 
-/// Splits a packed posting into its file id and file-local row position.
-fn unpack(packed: u64) -> (usize, u64) {
-    (usize_of(packed >> POSITION_BITS), packed & POSITION_MASK)
+/// Whether a column of `data_type` can be indexed. The index encodes a key
+/// by its stored value, so every type it accepts must have a total,
+/// value-preserving byte order; nested types do not.
+pub(crate) fn supported_key_type(data_type: &DataType) -> Result<(), String> {
+    KeyEncoder::new(vec![KeyField::new(encoded_type(data_type), true)])
+        .map(|_| ())
+        .map_err(|e| e.to_string())
 }
 
-/// Decodes `range` of an index array into Arrow as `field`'s type.
-fn decode(
-    session: &VortexSession,
-    array: &vortex::array::ArrayRef,
-    range: Range<usize>,
-    field: &Field,
-    ctx: &mut ExecutionCtx,
-) -> Result<ArrayRef, String> {
-    let slice = array
-        .slice(range)
-        .map_err(|e| format!("slice {}: {e}", field.name()))?;
-    session
-        .arrow()
-        .execute_arrow(slice, Some(field), ctx)
-        .map_err(|e| format!("decode {}: {e}", field.name()))
-}
+/// Every key's shape, in spec order.
+type Shapes = Arc<Vec<Arc<Shape>>>;
 
-/// Measured cost of one index build, reported separately from query execution.
-#[derive(Clone, Debug)]
-pub(crate) struct BuildStats {
-    pub(crate) duration: Duration,
-    pub(crate) files: usize,
-    pub(crate) rows: u64,
-    pub(crate) distinct_keys: usize,
-    pub(crate) rss_before: Option<u64>,
-    pub(crate) rss_after: Option<u64>,
-    pub(crate) per_key_entries: Vec<(String, usize, usize)>,
-}
+/// Every key's shape under a table schema, from
+/// [`LookupIndexState::shapes_for`].
+pub(crate) struct KeyShapes(Vec<Shape>);
 
-/// What one key shape answers for a pinned key.
-enum ShapeProbe {
-    /// Every packed posting of the key, sorted; empty when no row holds it.
-    Postings(Vec<u64>),
-    /// The key could not be resolved against this index, or its postings
-    /// exceed the caller's candidate-row budget, so it proves nothing.
-    Unanswerable,
-}
-
-/// One indexed key over the snapshot, as sorted compressed arrays.
-struct ShapeIndex {
+/// One indexed key: its resolved columns and its tiered index, whose runs
+/// cover the files the table's writes and read-back builds indexed.
+struct Shape {
     label: String,
     columns: Vec<KeyColumn>,
-    converter: RowConverter,
-    /// One array per key column, in `columns` order, sorted by key and then by
-    /// posting.
-    keys: Vec<vortex::array::ArrayRef>,
-    /// The packed postings, in the same order as `keys`.
-    postings: vortex::array::ArrayRef,
-    len: usize,
-    /// The row-encoded key of the first entry of every block, concatenated.
-    heads: Vec<u8>,
-    /// Block `i`'s head is `heads[head_offsets[i]..head_offsets[i + 1]]`.
-    head_offsets: Vec<usize>,
-    distinct_keys: usize,
+    /// Per column, the type the key is encoded in.
+    encoded_types: Vec<DataType>,
+    encoder: KeyEncoder,
+    /// Shared with the shape that replaces this one when a schema change
+    /// leaves the key's encoding as it was (see
+    /// [`LookupIndexState::adopt_shapes`]).
+    index: Arc<TieredIndex>,
 }
 
-impl ShapeIndex {
-    fn blocks(&self) -> usize {
-        self.head_offsets.len().saturating_sub(1)
-    }
-
-    fn head(&self, block: usize) -> &[u8] {
-        &self.heads[self.head_offsets[block]..self.head_offsets[block + 1]]
-    }
-
-    /// Resident bytes: the compressed arrays' buffers plus the retained heads.
-    fn resident_bytes(&self) -> usize {
-        self.keys
+impl Shape {
+    fn new(
+        spec: &KeySpec,
+        schema: &arrow_schema::Schema,
+        word_bits: Option<u32>,
+    ) -> Result<Self, String> {
+        let columns = spec
+            .columns()
             .iter()
-            .map(|keys| usize_of(keys.nbytes()))
-            .fold(usize_of(self.postings.nbytes()), usize::saturating_add)
-            .saturating_add(self.heads.capacity())
-            .saturating_add(self.head_offsets.capacity() * std::mem::size_of::<usize>())
-    }
-
-    /// The entries of every block that can hold `key`.
-    ///
-    /// A block whose head is below `key` may hold it; so may a block whose head
-    /// equals it, and the block before the first such block may end with it.
-    fn candidate_range(&self, key: &[u8]) -> Range<usize> {
-        let blocks = self.blocks();
-        let below = partition_point(blocks, |block| self.head(block) < key);
-        let through = partition_point(blocks, |block| self.head(block) <= key);
-        if through == 0 {
-            return 0..0;
-        }
-        let start = below.saturating_sub(1) * BLOCK_ROWS;
-        let end = (through * BLOCK_ROWS).min(self.len);
-        start..end
-    }
-
-    /// The packed postings of the key whose column values are `values`, in
-    /// `columns` order, refusing to decode more than `max_rows` when given.
-    fn probe(
-        &self,
-        session: &VortexSession,
-        values: &[ScalarValue],
-        max_rows: Option<usize>,
-    ) -> ShapeProbe {
-        if values.len() != self.columns.len() {
-            return ShapeProbe::Unanswerable;
-        }
-        let mut literals = Vec::with_capacity(values.len());
-        for (value, column) in values.iter().zip(&self.columns) {
-            let Some(literal) = value
-                .cast_to(&column.data_type)
-                .ok()
-                .and_then(|v| v.to_array_of_size(1).ok())
-            else {
-                return ShapeProbe::Unanswerable;
-            };
-            // A NULL literal never satisfies an equality predicate.
-            if literal.is_null(0) {
-                return ShapeProbe::Postings(Vec::new());
-            }
-            literals.push(literal);
-        }
-        let Ok(rows) = self.converter.convert_columns(&literals) else {
-            return ShapeProbe::Unanswerable;
+            .map(|name| KeyColumn::resolve(schema, name))
+            .collect::<Result<Vec<_>, _>>()?;
+        let encoded_types: Vec<DataType> = columns
+            .iter()
+            .map(|column| encoded_type(&column.data_type))
+            .collect();
+        let encoder = KeyEncoder::new(
+            columns
+                .iter()
+                .zip(&encoded_types)
+                .map(|(column, data_type)| KeyField::new(data_type.clone(), column.nullable))
+                .collect(),
+        )
+        .map_err(|e| format!("key {} cannot be indexed: {e}", spec.label()))?;
+        let encoder = match word_bits {
+            Some(bits) => encoder.with_word_bits(bits),
+            None => encoder,
         };
-        let key = rows.row(0);
-        let range = self.candidate_range(key.as_ref());
-        if range.is_empty() {
-            return ShapeProbe::Postings(Vec::new());
-        }
-        match self.postings_in(session, range, key.as_ref(), max_rows) {
-            Ok(Some(postings)) => ShapeProbe::Postings(postings),
-            Ok(None) => ShapeProbe::Unanswerable,
-            Err(error) => {
-                tracing::debug!(shape = %self.label, %error, "Point-lookup index block could not be read; scanning instead");
-                ShapeProbe::Unanswerable
-            }
-        }
+        Ok(Self {
+            label: spec.label().to_string(),
+            columns,
+            encoded_types,
+            index: Arc::new(TieredIndex::new(encoder.clone())),
+            encoder,
+        })
     }
 
-    /// Decodes every key column of the entries `range`.
-    fn decode_keys(
-        &self,
-        session: &VortexSession,
-        range: Range<usize>,
-        ctx: &mut ExecutionCtx,
-    ) -> Result<Vec<ArrayRef>, String> {
-        self.keys
+    /// Identifies this key's persisted runs: its resolved columns, the words its encoder
+    /// gives keys (its encoded types, their nullability and how keys become
+    /// words) and the persisted format. A reopened table therefore reads back
+    /// only runs written by the same key, encoding and format, and deletes the
+    /// rest: a key column relaxed to nullable in place changes every key's word.
+    /// The hash is the identity, so it is 128 bits (see
+    /// [`hash_index::hash_key_128`]).
+    fn persisted_key(&self) -> u128 {
+        let mut descriptor = Vec::new();
+        descriptor.extend_from_slice(&key_index::persist::VERSION.to_le_bytes());
+        descriptor.extend_from_slice(&self.encoder.word_identity().to_le_bytes());
+        descriptor.extend_from_slice(&(self.columns.len() as u64).to_le_bytes());
+        for column in &self.columns {
+            descriptor.extend_from_slice(&(column.name.len() as u64).to_le_bytes());
+            descriptor.extend_from_slice(column.name.as_bytes());
+        }
+        hash_index::hash_key_128(&descriptor)
+    }
+
+    /// The directory this key's persisted runs live in.
+    fn persisted_dir(&self) -> String {
+        format!("{:032x}", self.persisted_key())
+    }
+
+    /// A builder for one run of this key.
+    fn run_builder(&self) -> RunBuilder {
+        RunBuilder::new(self.encoder.clone())
+    }
+
+    /// The key columns of a written or read-back batch, in the encoded types.
+    fn key_columns(&self, batch: &RecordBatch) -> Result<Vec<ArrayRef>, String> {
+        self.cast_key_columns(&self.raw_key_columns(batch)?)
+    }
+
+    /// The key columns of a batch as written, before any cast: a reference
+    /// to each column, not a copy.
+    fn raw_key_columns(&self, batch: &RecordBatch) -> Result<Vec<ArrayRef>, String> {
+        self.columns
             .iter()
-            .zip(&self.columns)
-            .map(|(keys, column)| {
-                decode(session, keys, range.clone(), &column.indexed_field(), ctx)
+            .map(|column| {
+                batch
+                    .column_by_name(&column.name)
+                    .map(Arc::clone)
+                    .ok_or_else(|| format!("key column '{}' is not in the batch", column.name))
             })
             .collect()
     }
 
-    /// Decodes the packed postings of the entries `range`.
-    fn decode_postings(
-        &self,
-        session: &VortexSession,
-        range: Range<usize>,
-        ctx: &mut ExecutionCtx,
-    ) -> Result<UInt64Array, String> {
-        decode(session, &self.postings, range, &postings_field(), ctx)?
-            .as_primitive_opt::<UInt64Type>()
-            .cloned()
-            .ok_or_else(|| "postings did not decode as UInt64".to_string())
+    /// [`Self::raw_key_columns`] cast to the encoded types.
+    fn cast_key_columns(&self, raw: &[ArrayRef]) -> Result<Vec<ArrayRef>, String> {
+        raw.iter()
+            .zip(&self.encoded_types)
+            .map(|(array, data_type)| cast_to(array, data_type))
+            .collect()
     }
 
-    /// The postings of `key` within the entries `range`.
-    fn postings_in(
-        &self,
-        session: &VortexSession,
-        range: Range<usize>,
-        key: &[u8],
-        max_rows: Option<usize>,
-    ) -> Result<Option<Vec<u64>>, String> {
-        let mut ctx = session.create_execution_ctx();
-        let rows = self
-            .converter
-            .convert_columns(&self.decode_keys(session, range.clone(), &mut ctx)?)
-            .map_err(|e| format!("encode block: {e}"))?;
-        let lo = partition_point(rows.num_rows(), |row| rows.row(row).as_ref() < key);
-        let hi = partition_point(rows.num_rows(), |row| rows.row(row).as_ref() <= key);
-        if lo == hi {
-            return Ok(Some(Vec::new()));
-        }
-        if max_rows.is_some_and(|limit| hi - lo > limit) {
-            return Ok(None);
-        }
-        let postings =
-            self.decode_postings(session, range.start + lo..range.start + hi, &mut ctx)?;
-        Ok(Some(postings.values().to_vec()))
-    }
-
-    /// Every entry as `(row-encoded key, file path, position)`, sorted.
-    fn resolved_entries(
-        &self,
-        index: &SnapshotLookupIndex,
-    ) -> Result<Vec<(Vec<u8>, String, u64)>, String> {
-        if self.len == 0 {
-            return Ok(Vec::new());
-        }
-        let session = &index.session;
-        let mut ctx = session.create_execution_ctx();
-        let keys = self.decode_keys(session, 0..self.len, &mut ctx)?;
-        let postings = self.decode_postings(session, 0..self.len, &mut ctx)?;
-        let rows = self
-            .converter
-            .convert_columns(&keys)
-            .map_err(|e| format!("encode entries: {e}"))?;
-        let mut entries = Vec::with_capacity(self.len);
-        for (row, &packed) in postings.values().iter().enumerate() {
-            let (file_id, position) = unpack(packed);
-            let path = index
-                .files
-                .get(file_id)
-                .map_or_else(|| format!("<unknown file {file_id}>"), |f| f.path.clone());
-            entries.push((rows.row(row).as_ref().to_vec(), path, position));
-        }
-        entries.sort();
-        Ok(entries)
-    }
-}
-
-/// An index over exactly one immutable snapshot file set.
-pub(crate) struct SnapshotLookupIndex {
-    snapshot_id: String,
-    files: Vec<IndexedFile>,
-    file_ids: HashMap<String, u32>,
-    shapes: Vec<ShapeIndex>,
-    session: VortexSession,
-    stats: BuildStats,
-    /// The file set this index covers. A scan that finds a file the index lacks
-    /// while the table's file set has moved on proves the index stale.
-    file_set: FileSetVersion,
-    /// The index's resident bytes in the table's memory account, released when
-    /// the index is dropped.
-    reservation: LookupIndexReservation,
-}
-
-impl SnapshotLookupIndex {
-    pub(crate) fn snapshot_id(&self) -> &str {
-        &self.snapshot_id
-    }
-
-    /// Resolves `filters` against one indexed key, returning the candidate row
-    /// addresses grouped by file path. `None` means no indexed key is fully
-    /// pinned to literals by these filters, or none of the pinned ones could be
-    /// answered, so the ordinary scan must run.
-    fn probe(&self, scalar_for: &dyn Fn(&str) -> Option<ScalarValue>) -> Option<ProbeHit> {
-        for shape in &self.shapes {
-            let Some(values) = shape
-                .columns
-                .iter()
-                .map(|column| scalar_for(&column.name))
-                .collect::<Option<Vec<_>>>()
-            else {
-                continue;
-            };
-            let postings = match shape.probe(&self.session, &values, None) {
-                ShapeProbe::Postings(postings) => postings,
-                ShapeProbe::Unanswerable => continue,
-            };
-            let (per_file, rows) = self.group_by_file(&postings)?;
-            return Some(ProbeHit {
-                shape: shape.label.clone(),
-                per_file,
-                rows,
-            });
-        }
-        None
-    }
-
-    /// Resolves a batch of correlated keys and groups all of the resulting
-    /// postings by file. Returning `None` declines the index entirely; callers
-    /// must never use a partial batch.
-    fn probe_keys(
-        &self,
-        columns: &[String],
-        keys: &[Vec<ScalarValue>],
-        max_rows: usize,
-    ) -> Option<ProbeHit> {
-        let shape = self.shapes.iter().find(|shape| {
-            shape.columns.len() == columns.len()
-                && shape
-                    .columns
-                    .iter()
-                    .zip(columns)
-                    .all(|(indexed, requested)| indexed.name == *requested)
-        })?;
-        let mut postings = Vec::new();
+    /// The encoded keys of scalar tuples, one per tuple in `columns` order:
+    /// `None` for a tuple with a NULL value, which no equality predicate
+    /// matches. `Err` when a value does not cast exactly to its column's
+    /// stored type, so the index cannot answer and the scan must run.
+    fn encode_keys(&self, keys: &[Vec<ScalarValue>]) -> Result<Vec<Option<Vec<u8>>>, String> {
+        let mut columns: Vec<Vec<ScalarValue>> = (0..self.columns.len())
+            .map(|_| Vec::with_capacity(keys.len()))
+            .collect();
         for key in keys {
-            let remaining = max_rows.saturating_sub(postings.len());
-            match shape.probe(&self.session, key, Some(remaining)) {
-                ShapeProbe::Postings(key_postings) => postings.extend(key_postings),
-                ShapeProbe::Unanswerable => return None,
+            if key.len() != self.columns.len() {
+                return Err(format!(
+                    "a key of {} values for {} key columns",
+                    key.len(),
+                    self.columns.len()
+                ));
+            }
+            for (at, (value, column)) in key.iter().zip(&self.columns).enumerate() {
+                // As a write does: to the stored type, strictly.
+                let value = value
+                    .cast_to(&column.data_type)
+                    .map_err(|e| format!("cast {value} to {}: {e}", column.data_type))?;
+                columns[at].push(value);
             }
         }
-        let (per_file, rows) = self.group_by_file(&postings)?;
-        Some(ProbeHit {
-            shape: shape.label.clone(),
-            per_file,
+        if keys.is_empty() {
+            return Ok(Vec::new());
+        }
+        let arrays = columns
+            .into_iter()
+            .zip(&self.encoded_types)
+            .map(|(values, data_type)| {
+                let array = ScalarValue::iter_to_array(values).map_err(|e| e.to_string())?;
+                cast_to(&array, data_type)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let bound = self.encoder.bind(&arrays).map_err(|e| e.to_string())?;
+        Ok((0..keys.len())
+            .map(|row| {
+                (!bound.has_null(row)).then(|| {
+                    let mut key = Vec::new();
+                    bound.encode_row(row, &mut key);
+                    key
+                })
+            })
+            .collect())
+    }
+}
+
+/// What a scan pins: every key's view, taken together at one instant.
+///
+/// A view answers only for the files it covers; a file it does not cover
+/// must be read in full. That per-file rule is what keeps the index usable
+/// while files come and go.
+pub(crate) struct LookupIndexView {
+    /// The keys the views were taken of. A probe encodes its keys with these,
+    /// never with the table's current shapes, so a key's encoding and the
+    /// runs it is looked up in always agree.
+    shapes: Shapes,
+    views: Vec<IndexView>,
+    /// Rows the runs hold, for the runtime probe's row bound.
+    rows: usize,
+}
+
+impl LookupIndexView {
+    /// Every key's current view of `shapes`, taken together.
+    fn of(shapes: Shapes) -> Self {
+        let views: Vec<IndexView> = shapes.iter().map(|shape| shape.index.view()).collect();
+        let rows = views
+            .first()
+            .map_or(0, |view| view.run_list().iter().map(|run| run.len()).sum());
+        Self {
+            shapes,
+            views,
             rows,
-        })
+        }
     }
 
-    /// Groups packed postings by file path, each file's positions sorted and
-    /// distinct, with the total row count. `None` when a posting names a file
-    /// the index does not have: the index is not internally consistent, so the
-    /// probe is refused rather than answered with a partial selection.
-    fn group_by_file(&self, postings: &[u64]) -> Option<(HashMap<String, Vec<u64>>, usize)> {
-        // Grouped under the index's own path strings, so each candidate file's
-        // path is copied once rather than once per posting.
-        let mut by_file: HashMap<&str, Vec<u64>> = HashMap::new();
-        for &packed in postings {
-            let (file_id, position) = unpack(packed);
-            let file = self.files.get(file_id)?;
-            by_file
-                .entry(file.path.as_str())
-                .or_default()
-                .push(position);
+    /// Whether every key's view covers the file `path` names.
+    pub(crate) fn covers(&self, path: &str) -> bool {
+        let name = file_name(path);
+        self.views.iter().all(|view| view.covers(name))
+    }
+
+    /// Candidates of `keys` (encoded; `None` matches nothing) under key
+    /// `shape`, grouped by file name, each file's positions sorted and
+    /// distinct; only those in the files `only` names, when it is given.
+    /// `None` when more than `max_rows` would be selected: callers never use
+    /// a partial answer.
+    fn probe_keys(
+        &self,
+        shape: usize,
+        keys: &[Option<Vec<u8>>],
+        max_rows: Option<usize>,
+        only: Option<&HashSet<&str>>,
+    ) -> Option<ProbeHit> {
+        let present: Vec<&[u8]> = keys.iter().flatten().map(Vec::as_slice).collect();
+        let mut by_file: HashMap<String, Vec<u64>> = HashMap::new();
+        let mut selected = 0_usize;
+        let mut over = false;
+        self.views[shape].candidates_batch(&present, |_, Candidate { file, position }| {
+            if only.is_some_and(|only| !only.contains(file)) {
+                return;
+            }
+            selected += 1;
+            over |= max_rows.is_some_and(|limit| selected > limit);
+            if !over {
+                by_file.entry(file.to_string()).or_default().push(position);
+            }
+        });
+        if over {
+            return None;
         }
         let mut rows = 0;
-        let per_file = by_file
-            .into_iter()
-            .map(|(path, mut positions)| {
-                positions.sort_unstable();
-                positions.dedup();
-                rows += positions.len();
-                (path.to_string(), positions)
-            })
-            .collect();
-        Some((per_file, rows))
-    }
-
-    /// Whether `file` is, byte for byte, one of the files this index was built
-    /// from.
-    fn indexes_file(&self, file: &ObjectMeta) -> bool {
-        let path: &str = file.location.as_ref();
-        self.file_ids
-            .get(path)
-            .and_then(|&id| self.files.get(id as usize))
-            .is_some_and(|indexed| {
-                indexed.size == file.size
-                    && indexed.last_modified_ms == file.last_modified.timestamp_millis()
-            })
+        for positions in by_file.values_mut() {
+            positions.sort_unstable();
+            positions.dedup();
+            rows += positions.len();
+        }
+        Some(ProbeHit {
+            shape: self.shapes[shape].label.clone(),
+            per_file: by_file,
+            rows,
+        })
     }
 }
 
 struct ProbeHit {
     shape: String,
+    /// Candidate positions by file name.
     per_file: HashMap<String, Vec<u64>>,
     rows: usize,
 }
 
-/// A resolved row selection awaiting validation against the scan's own file
-/// list. Nothing is applied until [`Self::restrict`] accepts that file list.
+/// A resolved row selection awaiting the scan's own file list. Nothing is
+/// applied until [`Self::restrict`] sees that list. Cloned for each snapshot
+/// a scan reads: it names files, so each clone narrows only its own.
+#[derive(Clone)]
 pub(crate) struct LookupSelection {
     state: Arc<LookupIndexState>,
-    index: Arc<SnapshotLookupIndex>,
+    index: Arc<LookupIndexView>,
     shape: String,
     per_file: HashMap<String, Vec<u64>>,
     rows: usize,
@@ -776,49 +735,34 @@ pub(crate) enum LookupProbe {
 }
 
 impl LookupSelection {
-    /// Narrows a scan's file groups to the files that hold a candidate row, and
-    /// returns the access-plan provider that carries their positions into the
-    /// Vortex scan. Either way the probe's outcome is recorded, so a run that
-    /// silently fell back is visible in the metrics.
+    /// The label of the key it probed.
+    pub(crate) fn shape(&self) -> &str {
+        &self.shape
+    }
+
+    /// Narrows a scan's file groups and returns the access-plan provider that
+    /// carries the candidate positions into the Vortex scan, and the decision
+    /// for `EXPLAIN`, which the caller merges over every snapshot the scan
+    /// reads and records once (see [`LookupIndexState::record_lookup`]).
     ///
-    /// The selection is honored ONLY for the exact snapshot and files it was
-    /// captured from: for any other file set the groups come back untouched and
-    /// no provider is returned, so a stale or incomplete index can never turn
-    /// into a false empty result. `table_plans` is the provider the scan would
-    /// otherwise attach, which carries the table's position-delete vectors.
-    ///
-    /// `current` is the table's file-set version now. A file the index lacks,
-    /// under the index's own snapshot, while the file set has moved on since the
-    /// index was listed, means files were added or rewritten under that snapshot
-    /// — an append, say — so the index is dropped and a lookup can schedule its
-    /// rebuild. When the file set has not moved, the scan's list is simply older
-    /// than the index, and nothing is dropped.
+    /// Each file is judged on its own. A file the pinned view covers is kept
+    /// only when it holds a candidate, and then read at those positions. A
+    /// file it does not cover is kept and read in full. `table_plans` is the
+    /// provider the scan would otherwise attach, which carries the table's
+    /// position-delete vectors. Also returns whether any scan file was not
+    /// covered, so the caller can have it indexed.
     pub(crate) fn restrict(
         self,
-        snapshot_id: &str,
         file_groups: Vec<FileGroup>,
         table_plans: Arc<dyn VortexAccessPlanProvider>,
-        current: FileSetVersion,
     ) -> (
         Vec<FileGroup>,
         Option<Arc<dyn VortexAccessPlanProvider>>,
         LookupIndexExplain,
+        bool,
     ) {
-        if !self.validate(snapshot_id, file_groups.iter().flat_map(FileGroup::iter)) {
-            self.state
-                .record_probe(&self.shape, ProbeOutcome::SnapshotMismatch);
-            if self.index.snapshot_id == snapshot_id && self.index.file_set != current {
-                self.state.discard_stale(&self.index);
-            }
-            return (
-                file_groups,
-                None,
-                LookupIndexExplain::fallback(
-                    self.shape,
-                    LookupIndexExplainOutcome::SnapshotMismatch,
-                ),
-            );
-        }
+        let mut uncovered = 0_usize;
+        let mut covered = 0_usize;
         let file_groups: Vec<FileGroup> = file_groups
             .into_iter()
             .filter_map(|group| {
@@ -827,106 +771,108 @@ impl LookupSelection {
                     .into_iter()
                     .filter(|file| {
                         let path: &str = file.object_meta.location.as_ref();
-                        self.per_file.contains_key(path)
+                        if self.index.covers(path) {
+                            covered += 1;
+                            self.per_file.contains_key(file_name(path))
+                        } else {
+                            uncovered += 1;
+                            true
+                        }
                     })
                     .collect();
                 (!files.is_empty()).then(|| FileGroup::new(files))
             })
             .collect();
+        let coverage = Coverage::of(covered > 0, uncovered > 0);
         let candidate_files: usize = file_groups.iter().map(FileGroup::len).sum();
-        if candidate_files == 0 {
-            self.state.record_probe(&self.shape, ProbeOutcome::Empty);
-            return (
-                file_groups,
-                None,
-                LookupIndexExplain::selection(
-                    self.shape,
-                    LookupIndexExplainOutcome::Empty,
-                    Some(0),
-                    0,
-                ),
-            );
+        let candidate_rows = match coverage {
+            Coverage::Unindexed => None,
+            // Every file is indexed and none holds the key: nothing is read.
+            _ if candidate_files == 0 => Some(0),
+            _ => Some(u64::try_from(self.rows).unwrap_or(u64::MAX)),
+        };
+        let explain = LookupIndexExplain {
+            shape: Some(self.shape),
+            outcome: LookupIndexExplainOutcome::Probed(coverage),
+            candidate_files: Some(candidate_files),
+            uncovered_files: Some(uncovered),
+            indexed_files: Some(covered),
+            candidate_batches: None,
+            uncovered_batches: None,
+            candidate_rows,
+            reason: None,
+        };
+        // Nothing to narrow when no file read is indexed, or none is left.
+        if covered == 0 || candidate_files == 0 {
+            return (file_groups, None, explain, uncovered > 0);
         }
-        self.state
-            .record_selection(&self.shape, candidate_files as u64, self.rows as u64);
         let provider = LookupAccessPlanProvider {
             state: self.state,
+            index: self.index,
             selections: self.per_file,
             table: table_plans,
         };
         (
             file_groups,
             Some(Arc::new(provider)),
-            LookupIndexExplain::selection(
-                self.shape,
-                LookupIndexExplainOutcome::Selected,
-                Some(candidate_files),
-                u64::try_from(self.rows).unwrap_or(u64::MAX),
-            ),
+            explain,
+            uncovered > 0,
         )
-    }
-
-    /// Accepts this selection only for the exact snapshot and files it was built
-    /// from. `files` is the scan's own (already pruned) list: a file pruned away
-    /// by statistics provably holds no matching row, so its absence is fine,
-    /// while a file the index has never seen means the snapshot moved under us.
-    fn validate<'a>(
-        &self,
-        snapshot_id: &str,
-        mut files: impl Iterator<Item = &'a PartitionedFile>,
-    ) -> bool {
-        self.index.snapshot_id == snapshot_id
-            && files.all(|file| self.index.indexes_file(&file.object_meta))
     }
 }
 
-/// Per-file row selections handed to the Vortex scan, composed with the table's
-/// own per-file access plans.
+/// Per-file row selections handed to the Vortex scan, composed with the
+/// table's own per-file access plans.
 ///
 /// A file carries exactly one access plan, and position-delete vectors travel
-/// in it. So the lookup's candidate positions are intersected with whatever the
-/// table's provider would have attached — a deleted candidate is never selected
-/// — instead of replacing it.
+/// in it. So the lookup's candidate positions are intersected with whatever
+/// the table's provider would have attached — a deleted candidate is never
+/// selected — instead of replacing it.
 struct LookupAccessPlanProvider {
     state: Arc<LookupIndexState>,
+    index: Arc<LookupIndexView>,
+    /// Candidate positions by file name.
     selections: HashMap<String, Vec<u64>>,
     table: Arc<dyn VortexAccessPlanProvider>,
 }
 
-/// Runtime row selection derived from a completed hash-join dynamic filter,
-/// already validated against every file of the scan.
-struct RuntimeLookupSelection {
-    index: Arc<SnapshotLookupIndex>,
-    /// The ready-made plan for each file holding a candidate row, so a file open
-    /// shares it instead of copying the positions.
+/// Runtime row selection derived from a completed hash-join dynamic filter.
+pub(crate) struct RuntimeLookupSelection {
+    index: Arc<LookupIndexView>,
+    /// The ready-made plan for each covered file holding a candidate row, by
+    /// file name, so a file open shares it instead of copying the positions.
     plans: HashMap<String, Arc<VortexAccessPlan>>,
-    /// The plan for an indexed file that holds no candidate row.
+    /// The plan for a covered file that holds no candidate row.
     empty: Arc<VortexAccessPlan>,
 }
 
 impl RuntimeLookupSelection {
-    fn new(index: Arc<SnapshotLookupIndex>, per_file: HashMap<String, Vec<u64>>) -> Self {
+    /// Whether the file `path` names may hold a row of the selection: a file
+    /// the index does not cover is read as planned, and a covered one only
+    /// when it holds a candidate.
+    pub(crate) fn may_hold(&self, path: &str) -> bool {
+        !self.index.covers(path) || self.plans.contains_key(file_name(path))
+    }
+
+    fn new(index: Arc<LookupIndexView>, per_file: HashMap<String, Vec<u64>>) -> Self {
         let plans = per_file
             .into_iter()
-            .map(|(path, positions)| {
+            .map(|(name, positions)| {
                 let plan = VortexAccessPlan::default()
-                    .with_selection(Selection::IncludeByIndex(Buffer::from(positions)));
-                (path, Arc::new(plan))
+                    .with_selection(include_by_index(&Buffer::from(positions)));
+                (name, Arc::new(plan))
             })
             .collect();
         Self {
             index,
             plans,
             empty: Arc::new(
-                VortexAccessPlan::default()
-                    .with_selection(Selection::IncludeByIndex(Buffer::empty())),
+                VortexAccessPlan::default().with_selection(include_by_index(&Buffer::empty())),
             ),
         }
     }
 }
 
-/// Which dynamic-filter state a cached runtime selection answers: the filter
-/// expression, its generation, and the index entry it matched.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct RuntimeLookupFilterIdentity {
     expression_id: u64,
@@ -936,10 +882,16 @@ struct RuntimeLookupFilterIdentity {
 
 /// What a runtime probe decided.
 enum RuntimeProbe {
-    Selection(RuntimeLookupSelection),
-    /// The index is current but cannot answer these keys within its bounds.
+    /// A selection for the covered files. `uncovered` when some scan file is
+    /// not covered, which is read as planned and should be indexed.
+    Selection {
+        selection: RuntimeLookupSelection,
+        uncovered: bool,
+    },
+    /// The index cannot answer these keys within its bounds.
     Declined,
-    /// No index covers the scan's files; a rebuild may make the next one usable.
+    /// No run covers any of the scan's files; a build may make the next
+    /// lookup usable.
     IndexUnusable,
 }
 
@@ -955,19 +907,16 @@ type RuntimeLookupCell = Arc<tokio::sync::OnceCell<Option<Arc<RuntimeLookupSelec
 /// list. The expression generation prevents an early, unresolved filter from
 /// becoming a permanent decision for later file openers.
 ///
-/// The index is the one the scan's view pinned, captured in the same fenced
-/// instant as its snapshot and files. A join can run long after it was planned,
-/// and a refresh may publish a newer index meanwhile; the scan still probes the
-/// index that matches what it reads, and never judges the newer one.
+/// The index is the view the scan pinned, captured in the same fenced instant
+/// as its files. A join can run long after it was planned, and later writes may
+/// publish newer runs meanwhile; the scan still probes the view that matches
+/// what it reads.
 pub(crate) struct DynamicLookupAccessPlanProvider {
     state: Arc<LookupIndexState>,
-    /// The index published when the scan's view was captured, if any.
-    index: Option<Arc<SnapshotLookupIndex>>,
-    /// The snapshot and file set the scan's view captured.
-    visible_snapshot: String,
-    visible_file_set: FileSetVersion,
-    /// Every file the scan reads. A selection is used only when the index covers
-    /// all of them, so the probe's outcome is decided once, before any file opens.
+    /// The view the scan pinned.
+    index: Arc<LookupIndexView>,
+    /// Every file the scan reads, so the probe's outcome is decided once,
+    /// before any file opens.
     scan_files: Arc<[ObjectMeta]>,
     request_build: Option<Arc<dyn Fn() + Send + Sync>>,
     selection: Mutex<Option<(RuntimeLookupFilterIdentity, RuntimeLookupCell)>>,
@@ -976,21 +925,26 @@ pub(crate) struct DynamicLookupAccessPlanProvider {
 impl DynamicLookupAccessPlanProvider {
     pub(crate) fn new(
         state: Arc<LookupIndexState>,
-        index: Option<Arc<SnapshotLookupIndex>>,
-        visible_snapshot: String,
-        visible_file_set: FileSetVersion,
+        index: Arc<LookupIndexView>,
         scan_files: Arc<[ObjectMeta]>,
         request_build: Option<Arc<dyn Fn() + Send + Sync>>,
     ) -> Self {
         Self {
             state,
             index,
-            visible_snapshot,
-            visible_file_set,
             scan_files,
             request_build,
             selection: Mutex::default(),
         }
+    }
+
+    /// The selection a completed dynamic filter in `predicate` resolves to,
+    /// or `None` when no index can answer it.
+    pub(crate) async fn selection(
+        &self,
+        predicate: Option<&Arc<dyn PhysicalExpr>>,
+    ) -> Option<Arc<RuntimeLookupSelection>> {
+        self.resolve(predicate).await
     }
 
     /// The selection for the scan's completed dynamic filter, probed at most
@@ -1046,9 +1000,7 @@ impl DynamicLookupAccessPlanProvider {
             return None;
         }
         let state = Arc::clone(&self.state);
-        let index = self.index.clone();
-        let visible_snapshot = self.visible_snapshot.clone();
-        let visible_file_set = self.visible_file_set;
+        let index = Arc::clone(&self.index);
         let scan_files = Arc::clone(&self.scan_files);
         let probed = tokio::task::spawn_blocking(move || {
             let spec = &state.specs[identity.spec];
@@ -1058,23 +1010,22 @@ impl DynamicLookupAccessPlanProvider {
                 state.record_runtime_fallback();
                 return RuntimeProbe::Declined;
             };
-            state.probe_runtime_filter(
-                spec,
-                index.as_ref(),
-                &visible_snapshot,
-                visible_file_set,
-                &scan_files,
-                &keys,
-            )
+            state.probe_runtime_filter(identity.spec, &index, &scan_files, &keys)
         })
         .await;
         match probed {
-            Ok(RuntimeProbe::Selection(selection)) => Some(Arc::new(selection)),
+            Ok(RuntimeProbe::Selection {
+                selection,
+                uncovered,
+            }) => {
+                if uncovered {
+                    self.request_build();
+                }
+                Some(Arc::new(selection))
+            }
             Ok(RuntimeProbe::Declined) => None,
             Ok(RuntimeProbe::IndexUnusable) => {
-                if let Some(request_build) = &self.request_build {
-                    request_build();
-                }
+                self.request_build();
                 None
             }
             Err(error) => {
@@ -1083,12 +1034,17 @@ impl DynamicLookupAccessPlanProvider {
             }
         }
     }
+
+    fn request_build(&self) {
+        if let Some(request_build) = &self.request_build {
+            request_build();
+        }
+    }
 }
 
 impl std::fmt::Debug for DynamicLookupAccessPlanProvider {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("DynamicLookupAccessPlanProvider")
-            .field("visible_snapshot", &self.visible_snapshot)
             .field("files", &self.scan_files.len())
             .field("resolved", &self.selection.lock().is_some())
             .finish_non_exhaustive()
@@ -1208,14 +1164,18 @@ impl VortexAccessPlanProvider for LookupAccessPlanProvider {
     fn access_plan_for_file(&self, file: &PartitionedFile) -> Option<Arc<VortexAccessPlan>> {
         let path: &str = file.object_meta.location.as_ref();
         let table_plan = self.table.access_plan_for_file(file);
-        let Some(candidates) = self.selections.get(path) else {
-            // Not a file this lookup selected from: leave it exactly as the table
+        if !self.index.covers(path) {
+            // A file the index does not cover is read exactly as the table
             // would read it.
             return table_plan;
-        };
-        let selected = VortexAccessPlan::default().with_selection(Selection::IncludeByIndex(
-            Buffer::copy_from(candidates.as_slice()),
-        ));
+        }
+        // `restrict` kept a covered file only when it holds a candidate.
+        let candidates = self
+            .selections
+            .get(file_name(path))
+            .map_or(&[][..], Vec::as_slice);
+        let selected = VortexAccessPlan::default()
+            .with_selection(include_by_index(&Buffer::copy_from(candidates)));
         self.state
             .counters
             .access_plans_attached
@@ -1241,18 +1201,20 @@ impl VortexRuntimeAccessPlanProvider for DynamicLookupAccessPlanProvider {
         predicate: Option<&Arc<dyn PhysicalExpr>>,
     ) -> Option<Arc<VortexAccessPlan>> {
         let selection = self.resolve(predicate).await?;
-        // `resolve` validated every scan file; a file outside that list is read
-        // as planned.
-        if !selection.index.indexes_file(&file.object_meta) {
+        let path: &str = file.object_meta.location.as_ref();
+        // A file the pinned view does not cover is read as planned.
+        if !selection.index.covers(path) {
             return None;
         }
         self.state
             .counters
             .access_plans_attached
             .fetch_add(1, Ordering::Relaxed);
-        let path: &str = file.object_meta.location.as_ref();
         Some(Arc::clone(
-            selection.plans.get(path).unwrap_or(&selection.empty),
+            selection
+                .plans
+                .get(file_name(path))
+                .unwrap_or(&selection.empty),
         ))
     }
 }
@@ -1263,19 +1225,20 @@ impl VortexRuntimeAccessPlanProvider for DynamicLookupAccessPlanProvider {
 /// scanning.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LookupIndexCounters {
-    /// Probes that attached a row selection to the scan.
-    pub selected: u64,
-    /// Probes whose key has no posting at all, so the file branch reads nothing.
-    pub empty: u64,
-    /// Probes on an indexed key shape before any index was published.
-    pub unbuilt: u64,
-    /// Probes refused because the scan's files are not the indexed ones.
-    pub snapshot_mismatch: u64,
+    /// Probes where none of the files the scan reads is indexed yet (coverage
+    /// `none`).
+    pub none: u64,
+    /// Probes where some files the scan reads are indexed and the rest are
+    /// read in full (coverage `partial`).
+    pub partial: u64,
+    /// Probes where every file the scan reads is indexed (coverage `full`),
+    /// including those whose key no file holds, which read nothing.
+    pub full: u64,
     /// Runtime key sets declined because their shape or cost cannot be bounded.
     pub runtime_fallback: u64,
-    /// Candidate files summed over selected probes.
+    /// Candidate files summed over probes that narrowed a scan.
     pub candidate_files: u64,
-    /// Candidate row positions summed over selected probes.
+    /// Candidate row positions summed over probes that narrowed a scan.
     pub candidate_rows: u64,
     /// Files that were actually handed a Vortex row selection.
     pub access_plans_attached: u64,
@@ -1291,12 +1254,40 @@ pub struct LookupIndexCounters {
     pub builds_unpublished: u64,
 }
 
+/// A problem that keeps recurring is logged at `warn` the first time, then
+/// at `debug` until [`Self::reset`], so a table that keeps hitting it does not
+/// flood the log.
+#[derive(Debug, Default)]
+pub(crate) struct WarnOnce(AtomicBool);
+
+impl WarnOnce {
+    /// Logs `message` for `table`, at `warn` unless it already has since the
+    /// last reset.
+    pub(crate) fn report(&self, table: &str, message: &str) {
+        if self.0.swap(true, Ordering::Relaxed) {
+            tracing::debug!(table = %table, "{message}");
+        } else {
+            tracing::warn!(table = %table, "{message}");
+        }
+    }
+
+    /// Whether it has warned since the last reset.
+    #[cfg(test)]
+    pub(crate) fn warned(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+
+    /// The next report warns again.
+    pub(crate) fn reset(&self) {
+        self.0.store(false, Ordering::Relaxed);
+    }
+}
+
 #[derive(Default)]
 pub(crate) struct Counters {
-    selected: AtomicU64,
-    empty: AtomicU64,
-    unbuilt: AtomicU64,
-    snapshot_mismatch: AtomicU64,
+    none: AtomicU64,
+    partial: AtomicU64,
+    full: AtomicU64,
     runtime_fallback: AtomicU64,
     candidate_files: AtomicU64,
     pub(crate) candidate_rows: AtomicU64,
@@ -1309,10 +1300,9 @@ pub(crate) struct Counters {
 impl Counters {
     pub(crate) fn snapshot(&self, index_bytes: u64) -> LookupIndexCounters {
         LookupIndexCounters {
-            selected: self.selected.load(Ordering::Relaxed),
-            empty: self.empty.load(Ordering::Relaxed),
-            unbuilt: self.unbuilt.load(Ordering::Relaxed),
-            snapshot_mismatch: self.snapshot_mismatch.load(Ordering::Relaxed),
+            none: self.none.load(Ordering::Relaxed),
+            partial: self.partial.load(Ordering::Relaxed),
+            full: self.full.load(Ordering::Relaxed),
             runtime_fallback: self.runtime_fallback.load(Ordering::Relaxed),
             candidate_files: self.candidate_files.load(Ordering::Relaxed),
             candidate_rows: self.candidate_rows.load(Ordering::Relaxed),
@@ -1324,12 +1314,11 @@ impl Counters {
         }
     }
 
-    fn record(&self, outcome: ProbeOutcome) {
-        let counter = match outcome {
-            ProbeOutcome::Selected => &self.selected,
-            ProbeOutcome::Empty => &self.empty,
-            ProbeOutcome::Unbuilt => &self.unbuilt,
-            ProbeOutcome::SnapshotMismatch => &self.snapshot_mismatch,
+    fn record(&self, coverage: Coverage) {
+        let counter = match coverage {
+            Coverage::Unindexed => &self.none,
+            Coverage::Partial => &self.partial,
+            Coverage::Full => &self.full,
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }
@@ -1382,104 +1371,738 @@ impl BuildSchedule {
     }
 }
 
-/// A table's secondary indexes over its Vortex files: the published index, a
-/// write-time index waiting for its snapshot, and the schedule of the one
-/// background build that replaces a missing or stale index.
-///
-/// The published index is never for a snapshot newer than the table's visible
-/// one — a write-time index is promoted inside the visibility flip — so an index
-/// whose snapshot is not the visible one is always stale.
+/// A table's secondary indexes over its Vortex files: one tiered index per
+/// key, the view scans pin, the reservation that holds the runs' bytes, and
+/// the schedule of the one background build that indexes uncovered files.
 pub(crate) struct LookupIndexState {
     table_name: String,
     specs: Vec<KeySpec>,
+    /// One per spec, replaced together when a schema change alters a key's
+    /// encoding ([`Self::adopt_shapes`]).
+    shapes: ArcSwap<Vec<Arc<Shape>>>,
+    word_bits: Option<u32>,
     /// The pool a build's working memory is reserved against.
     pool: Arc<dyn MemoryPool>,
-    /// The table's account, which holds each live index's resident bytes.
+    /// The table's account, which holds the runs' resident bytes.
     account: Arc<CayenneMemoryAccount>,
-    index: ArcSwapOption<SnapshotLookupIndex>,
-    /// Bumped every time `index` changes, so a build can tell whether anything
-    /// was published or dropped while it ran without holding the index itself.
-    generation: AtomicU64,
-    /// Serializes changing `index` and `generation`, so an older build never
-    /// overwrites a newer index. Probes never take it.
+    /// Every key's current view, pinned together. Always set: an empty view
+    /// covers no file, so a lookup reads everything and asks for a build.
+    index: ArcSwap<LookupIndexView>,
+    /// Serializes changing the runs, `index` and `reservation`, so the
+    /// published view always matches the runs and their bytes are always
+    /// charged. Probes never take it.
     publish_lock: Mutex<()>,
-    /// A finished write-time index whose snapshot is not visible yet.
-    staged: Mutex<Option<Arc<SnapshotLookupIndex>>>,
-    /// A write-time build in progress for a snapshot that is not visible yet.
-    pending: Mutex<Option<Arc<IncrementalIndexBuilder>>>,
+    /// The live runs' resident bytes, charged to the account.
+    reservation: Mutex<Option<LookupIndexReservation>>,
+    /// The snapshot and file set last reconciled against, so an unchanged one
+    /// does no work and every reconcile sees a distinct file set.
+    reconciled: Mutex<Option<(String, FileSetVersion)>>,
+    /// The table's current data files as last reconciled, which coverage is
+    /// reported against.
+    live_files: Mutex<Option<Arc<HashSet<String>>>>,
+    /// Whether a background merge is running.
+    merging: AtomicBool,
     schedule: Mutex<BuildSchedule>,
-    /// Whether an index has been published yet, so only the first is logged at
+    /// Whether runs have been published yet, so only the first is logged at
     /// `info`.
     published_once: AtomicBool,
+    /// The pool's refusal of runs, reported once until runs fit again.
+    refusal: WarnOnce,
+    /// Where the runs persist, when they do.
+    persisted_runs: std::sync::OnceLock<Arc<PersistedRuns>>,
+    /// A write that could not be indexed, reported once until runs publish
+    /// again.
+    write_failure: WarnOnce,
     counters: Counters,
-    /// The table's scan-input version. Scan views pin the published index, so
+    /// The table's scan-input version. Scan views pin the published view, so
     /// every change to it must invalidate the cached views, or scans keep
-    /// serving a view that pinned the previous index (or none).
+    /// serving a view that pinned older runs.
     scan_input_version: Arc<AtomicU64>,
 }
 
 impl LookupIndexState {
     /// The index state for `specs`, or `None` when the table declares no index.
+    ///
+    /// # Errors
+    ///
+    /// When a key column cannot be indexed. Configuration validation reports
+    /// that before a table is created or opened.
     pub(crate) fn new(
         table_name: &str,
         specs: Vec<KeySpec>,
+        schema: &arrow_schema::Schema,
         pool: Arc<dyn MemoryPool>,
         account: Arc<CayenneMemoryAccount>,
         scan_input_version: Arc<AtomicU64>,
-    ) -> Option<Arc<Self>> {
+        word_bits: Option<u32>,
+    ) -> Result<Option<Arc<Self>>, String> {
         if specs.is_empty() {
-            return None;
+            return Ok(None);
         }
+        let shapes = specs
+            .iter()
+            .map(|spec| Shape::new(spec, schema, word_bits).map(Arc::new))
+            .collect::<Result<Vec<_>, _>>()?;
         let labels: Vec<&str> = specs.iter().map(KeySpec::label).collect();
         tracing::info!(
             table = %table_name,
             "Dataset '{table_name}' (cayenne): maintaining secondary indexes on {}",
             labels.join(", ")
         );
-        Some(Arc::new(Self {
+        let shapes = Arc::new(shapes);
+        let state = Arc::new(Self {
+            index: ArcSwap::from_pointee(LookupIndexView::of(Arc::clone(&shapes))),
             table_name: table_name.to_string(),
             specs,
+            shapes: ArcSwap::new(shapes),
+            word_bits,
             pool,
             account,
-            index: ArcSwapOption::empty(),
-            generation: AtomicU64::new(0),
             publish_lock: Mutex::new(()),
-            staged: Mutex::new(None),
-            pending: Mutex::new(None),
+            reservation: Mutex::new(None),
+            reconciled: Mutex::new(None),
+            live_files: Mutex::new(None),
+            merging: AtomicBool::new(false),
             schedule: Mutex::new(BuildSchedule::default()),
             published_once: AtomicBool::new(false),
+            refusal: WarnOnce::default(),
+            persisted_runs: std::sync::OnceLock::new(),
+            write_failure: WarnOnce::default(),
             counters: Counters::default(),
             scan_input_version,
-        }))
+        });
+        Ok(Some(state))
     }
 
-    pub(crate) fn published(&self) -> Option<Arc<SnapshotLookupIndex>> {
+    pub(crate) fn published(&self) -> Arc<LookupIndexView> {
         self.index.load_full()
+    }
+
+    /// Every key's shape under `schema`, the table's schema after a change,
+    /// for [`Self::adopt_shapes`] to swap in once the change is committed.
+    ///
+    /// # Errors
+    ///
+    /// When a key column can no longer be indexed under `schema`, as opening
+    /// the table with it would report.
+    pub(crate) fn shapes_for(&self, schema: &arrow_schema::Schema) -> Result<KeyShapes, String> {
+        self.specs
+            .iter()
+            .map(|spec| Shape::new(spec, schema, self.word_bits))
+            .collect::<Result<Vec<_>, _>>()
+            .map(KeyShapes)
+    }
+
+    /// Swaps in `shapes`, from [`Self::shapes_for`] under the table's new
+    /// schema. A key whose encoding is unchanged keeps its index. A key whose
+    /// encoding changed (a key column relaxed to nullable, or widened to
+    /// another type) gets an empty index, as if none of the table's files had
+    /// been indexed: its runs no longer match its keys, so they are dropped,
+    /// every file reads as uncovered, and the next lookup
+    /// rebuilds the index from the files. A run still being built under the old
+    /// encoding is refused when it is published.
+    pub(crate) fn adopt_shapes(self: &Arc<Self>, shapes: KeyShapes) {
+        let mut rebuilt: Vec<String> = Vec::new();
+        {
+            let _publishing = self.publish_lock.lock();
+            let current = self.shapes.load_full();
+            let shapes: Vec<Arc<Shape>> = shapes
+                .0
+                .into_iter()
+                .zip(current.iter())
+                .map(|(mut shape, old)| {
+                    if shape.encoder.word_identity() == old.encoder.word_identity() {
+                        shape.index = Arc::clone(&old.index);
+                    } else {
+                        rebuilt.push(shape.label.clone());
+                    }
+                    Arc::new(shape)
+                })
+                .collect();
+            self.shapes.store(Arc::new(shapes));
+            self.charge(self.run_bytes());
+            self.repin();
+        }
+        if rebuilt.is_empty() {
+            return;
+        }
+        self.report_coverage();
+        tracing::info!(
+            table = %self.table_name,
+            "{}",
+            rebuilt_index_message(&self.table_name, &rebuilt)
+        );
     }
 
     pub(crate) fn counters(&self) -> LookupIndexCounters {
         let index_bytes = self
-            .index
-            .load()
+            .reservation
+            .lock()
             .as_ref()
-            .map_or(0, |index| index.reservation.bytes());
+            .map_or(0, LookupIndexReservation::bytes);
         self.counters
             .snapshot(u64::try_from(index_bytes).unwrap_or(u64::MAX))
     }
 
-    /// The right to build an index for the visible snapshot `snapshot_id` in the
-    /// background, or `None` when one is published for it, a build is running,
-    /// or the schedule says not yet.
-    pub(crate) fn claim_build(self: &Arc<Self>, snapshot_id: &str) -> Option<BuildClaim> {
-        let generation = self.generation.load(Ordering::Acquire);
-        if self
-            .index
-            .load()
-            .as_ref()
-            .is_some_and(|index| index.snapshot_id == snapshot_id)
-        {
-            return None;
+    /// Pins every key's current view as the published one. The caller holds
+    /// `publish_lock`.
+    fn repin(&self) {
+        let view = LookupIndexView::of(self.shapes.load_full());
+        if let Some(persisted_runs) = self.persisted_runs.get() {
+            persisted_runs.schedule(
+                view.shapes
+                    .iter()
+                    .map(|shape| shape.persisted_dir())
+                    .zip(view.views.iter().cloned())
+                    .collect(),
+            );
         }
+        self.index.store(Arc::new(view));
+        self.scan_input_version.fetch_add(1, Ordering::Release);
+    }
+
+    /// Persists every key's runs as run files under `root`, registered in
+    /// the table's metastore, and loads the registered ones, so a reopened
+    /// table reads back only the files no persisted run covers. `live` lists the
+    /// files a reader can see now. A persisted run that cannot be read is deleted
+    /// and its files are indexed again.
+    pub(crate) async fn open_persisted_runs(
+        self: &Arc<Self>,
+        store: Arc<dyn ObjectStore>,
+        catalog: Arc<dyn MetadataCatalog>,
+        table_id: String,
+        location: &datafusion::datasource::listing::ListingTableUrl,
+        live: Vec<String>,
+    ) {
+        let coordinator = PersistenceCoordinator::for_location(location.to_string());
+        let mut generation = Arc::clone(&coordinator.owner).lock_owned().await;
+        let owner = Arc::new(());
+        *generation = Arc::downgrade(&owner);
+        let root = location.prefix().clone();
+        let keys: Vec<String> = self
+            .shapes
+            .load()
+            .iter()
+            .map(|shape| shape.persisted_dir())
+            .collect();
+        if !distinct_dirs(keys.iter().map(String::as_str)) {
+            tracing::debug!(table = %self.table_name, "Secondary index runs are not persisted: two keys share a run directory");
+            return;
+        }
+        let persisted_runs = Arc::new(PersistedRuns::new(
+            self.table_name.clone(),
+            store,
+            catalog,
+            table_id,
+            root,
+            keys,
+            (coordinator, owner),
+        ));
+        let state = Arc::clone(self);
+        // Cancellation while waiting does no work; after acquisition the worker
+        // retains the operation lock until every mutation has completed.
+        let result = tokio::spawn(
+            async move {
+                let _generation = generation;
+                state.open_persisted_runs_owned(persisted_runs, live).await;
+            }
+            .instrument(tracing::Span::current())
+            .with_current_subscriber(),
+        )
+        .await;
+        if let Err(error) = result {
+            tracing::debug!(table = %self.table_name, %error, "Persisted secondary index initialization did not complete");
+        }
+    }
+
+    async fn open_persisted_runs_owned(
+        self: &Arc<Self>,
+        persisted_runs: Arc<PersistedRuns>,
+        live: Vec<String>,
+    ) {
+        if self
+            .persisted_runs
+            .set(Arc::clone(&persisted_runs))
+            .is_err()
+        {
+            return;
+        }
+        // A failed load leaves syncing off for this open, as if the table did
+        // not persist: its files are indexed in the background, and the runs
+        // stay where they are for the next open.
+        let live: HashSet<&str> = live.iter().map(|path| file_name(path)).collect();
+        *self.live_files.lock() = Some(Arc::new(
+            live.iter().map(|&name| name.to_string()).collect(),
+        ));
+        let mut loaded = match persisted_runs.load(Some(&self.account)).await {
+            Ok(loaded) => loaded,
+            Err(error) => {
+                if matches!(error, PersistedReadError::BudgetRefused) {
+                    self.report_refusal();
+                }
+                self.report_coverage();
+                tracing::debug!(table = %self.table_name, %error, "Secondary index runs were not loaded, and are not persisted until the table reopens");
+                return;
+            }
+        };
+        let loaded_count: usize = loaded.runs.iter().map(Vec::len).sum();
+        {
+            let publishing = self.publish_lock.lock();
+            // Publishing can temporarily duplicate the existing run metadata.
+            // Reserve that scratch before changing any visible view.
+            let Some(scratch) = self.run_bytes().checked_mul(8) else {
+                self.report_refusal();
+                return;
+            };
+            let Some(reservation) = loaded.reservation.as_mut() else {
+                self.report_refusal();
+                return;
+            };
+            let Some(peak) = reservation.bytes().checked_add(scratch) else {
+                self.report_refusal();
+                return;
+            };
+            if !reservation.try_resize(peak) {
+                self.report_refusal();
+                return;
+            }
+            let Some(reservation) = loaded.reservation.take() else {
+                self.report_refusal();
+                return;
+            };
+            let transferred = {
+                let mut held = self.reservation.lock();
+                if let Some(held) = held.as_mut() {
+                    held.absorb(reservation)
+                } else {
+                    *held = Some(reservation);
+                    Ok(())
+                }
+            };
+            if let Err(reservation) = transferred {
+                loaded.reservation = Some(reservation);
+                self.report_refusal();
+                return;
+            }
+            for (shape, runs) in self.shapes.load().iter().zip(loaded.runs) {
+                shape.index.publish_visible(runs, &live);
+            }
+            // From here every change to the runs is persisted, and the first
+            // sync removes the persisted runs of files that are gone.
+            persisted_runs.loaded.store(true, Ordering::Release);
+            self.repin();
+            // Encoded buffers, decode scratch and replaced local views are
+            // gone. Each decode bound includes its run and table-filter share,
+            // and existing resident bytes retain extra publication headroom,
+            // so settling to the published bytes only shrinks the charge.
+            let settled = self.charge(self.run_bytes());
+            debug_assert!(settled, "published runs fit their admitted decode bounds");
+            drop(publishing);
+            self.report_coverage();
+        }
+        if loaded_count > 0 {
+            // A file counts as covered once every key's runs hold it.
+            let view = self.published();
+            let covered = live.iter().filter(|file| view.covers(file)).count();
+            tracing::info!(
+                table = %self.table_name,
+                "{}",
+                persisted_runs_loaded_message(&self.table_name, loaded.bytes, covered, live.len())
+            );
+        }
+    }
+
+    /// Reports, per key, how many of the table's current data files its runs
+    /// cover and how many they do not yet, on `cayenne_lookup_index_files`.
+    /// Nothing is reported until the table's files are known: at open, when
+    /// it loads persisted runs, or else at the first scan.
+    fn report_coverage(&self) {
+        for (label, covered, uncovered) in self.coverage().unwrap_or_default() {
+            for (coverage, files) in [("covered", covered), ("uncovered", uncovered)] {
+                telemetry::cayenne::track_lookup_index_files(
+                    u64::try_from(files).unwrap_or(u64::MAX),
+                    &[
+                        telemetry::KeyValue::new("table", self.table_name.clone()),
+                        telemetry::KeyValue::new("shape", label.clone()),
+                        telemetry::KeyValue::new("coverage", coverage),
+                    ],
+                );
+            }
+        }
+    }
+
+    /// Per key, its label and how many of the table's current data files its
+    /// runs cover and do not cover; `None` before a scan has listed them.
+    fn coverage(&self) -> Option<Vec<(String, usize, usize)>> {
+        let live = self.live_files.lock().clone()?;
+        Some(
+            self.shapes
+                .load()
+                .iter()
+                .map(|shape| {
+                    let view = shape.index.view();
+                    let covered = live.iter().filter(|file| view.covers(file)).count();
+                    (shape.label.clone(), covered, live.len() - covered)
+                })
+                .collect(),
+        )
+    }
+
+    /// Resident bytes of every key's runs.
+    fn run_bytes(&self) -> usize {
+        self.shapes
+            .load()
+            .iter()
+            .map(|shape| shape.index.view().run_heap_bytes())
+            .sum()
+    }
+
+    /// Charges `bytes` for the runs, replacing the previous charge. `false`,
+    /// keeping the previous charge, when the pool cannot fit the growth. The
+    /// caller holds `publish_lock`.
+    fn charge(&self, bytes: usize) -> bool {
+        let mut reservation = self.reservation.lock();
+        if let Some(reservation) = reservation.as_mut() {
+            return reservation.try_resize(bytes);
+        }
+        match self.account.try_reserve_lookup_index(bytes) {
+            Some(charged) => {
+                *reservation = Some(charged);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Reports that the pool refused a run, once until runs fit again.
+    fn report_refusal(&self) {
+        self.counters
+            .builds_unpublished
+            .fetch_add(1, Ordering::Relaxed);
+        self.refusal
+            .report(&self.table_name, &refused_build_message(&self.table_name));
+    }
+
+    /// Publishes one run per key over the same files, and pins the new view.
+    /// `live`, when given, is the complete file set a reader can see now: the
+    /// runs' files are then marked seen (a read-back of visible files).
+    /// Without it the runs are for a write that is about to become visible.
+    /// The runs are dropped, leaving their files uncovered, when the pool
+    /// cannot fit them. Returns whether they were published.
+    fn publish_runs(self: &Arc<Self>, runs: Vec<IndexRun>, live: Option<&HashSet<&str>>) -> bool {
+        let rows = runs.first().map_or(0, IndexRun::len);
+        let files = runs.first().map_or(0, |run| run.files().len());
+        let added: usize = runs.iter().map(IndexRun::heap_bytes).sum();
+        {
+            let publishing = self.publish_lock.lock();
+            if !self.charge(self.run_bytes().saturating_add(added)) {
+                drop(publishing);
+                self.report_refusal();
+                return false;
+            }
+            for (shape, run) in self.shapes.load().iter().zip(runs) {
+                match live {
+                    Some(live) => shape.index.publish_visible(vec![run], live),
+                    None => shape.index.publish(vec![run], &[]),
+                }
+            }
+            // A run over files that already left the set was dropped, as is a
+            // run built under a key's previous encoding, so charge what is
+            // actually held.
+            self.charge(self.run_bytes());
+            self.repin();
+        }
+        self.refusal.reset();
+        self.write_failure.reset();
+        self.report_coverage();
+        self.counters
+            .builds_published
+            .fetch_add(1, Ordering::Relaxed);
+        let message = format!(
+            "Dataset '{}' (cayenne): indexed {rows} rows in {files} files for its secondary index",
+            self.table_name
+        );
+        if self.published_once.swap(true, Ordering::Relaxed) {
+            tracing::trace!(table = %self.table_name, "{message}");
+        } else {
+            tracing::info!(table = %self.table_name, "{message}");
+        }
+        self.maybe_merge();
+        true
+    }
+
+    /// Folds runs together in the background once a key holds more than
+    /// [`MERGE_ABOVE_RUNS`], so a lookup's cost stays bounded as writes add
+    /// runs and the rows of retired files are dropped, and rebuilds a key's
+    /// filter once it is overfull (a publish never rebuilds it, so no write
+    /// waits for that). One at a time.
+    fn maybe_merge(self: &Arc<Self>) {
+        let busy = self.shapes.load().iter().any(|shape| {
+            shape.index.view().runs() > MERGE_ABOVE_RUNS || shape.index.filter_overfull()
+        });
+        if !busy || self.merging.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            self.merging.store(false, Ordering::Release);
+            return;
+        };
+        let state = Arc::clone(self);
+        // Merging decodes and re-encodes runs: CPU work for the blocking pool.
+        runtime.spawn_blocking(move || {
+            for shape in state.shapes.load_full().iter() {
+                shape.index.rebuild_overfull_filter();
+                while shape.index.view().runs() > MERGE_ABOVE_RUNS {
+                    match shape.index.merge_step() {
+                        Ok(true) => {}
+                        Ok(false) => break,
+                        Err(error) => {
+                            tracing::debug!(table = %state.table_name, %error, "Secondary index runs could not be merged; lookups probe more runs until a later merge");
+                            break;
+                        }
+                    }
+                }
+            }
+            {
+                let _publishing = state.publish_lock.lock();
+                // A merge only drops rows, so the charge shrinks or stays.
+                state.charge(state.run_bytes());
+                state.repin();
+            }
+            state.merging.store(false, Ordering::Release);
+        });
+    }
+
+    /// Retires the files that have left the table's current file set
+    /// (compacted away, replaced by a refresh, moved to the cold tier), once
+    /// per distinct snapshot and file set. `live` is every warm file of
+    /// `snapshot_id` at `file_set`.
+    pub(crate) fn reconcile<'a>(
+        self: &Arc<Self>,
+        snapshot_id: &str,
+        file_set: FileSetVersion,
+        live: impl Iterator<Item = &'a str>,
+    ) {
+        {
+            let mut reconciled = self.reconciled.lock();
+            if reconciled
+                .as_ref()
+                .is_some_and(|(snapshot, set)| snapshot == snapshot_id && *set == file_set)
+            {
+                return;
+            }
+            *reconciled = Some((snapshot_id.to_string(), file_set));
+        }
+        let live: HashSet<&str> = live.map(file_name).collect();
+        *self.live_files.lock() = Some(Arc::new(
+            live.iter().map(|&name| name.to_string()).collect(),
+        ));
+        let publishing = self.publish_lock.lock();
+        let retired: usize = self
+            .shapes
+            .load()
+            .iter()
+            .map(|shape| shape.index.reconcile(&live))
+            .sum();
+        if retired > 0 {
+            self.charge(self.run_bytes());
+            self.repin();
+        }
+        drop(publishing);
+        self.report_coverage();
+        // The runs a rewrite replaced have retired: now an overfull filter
+        // is rebuilt over only the keys still live.
+        self.maybe_merge();
+    }
+
+    /// An observer for one write: it builds a run per key from exactly the
+    /// rows written, and [`Self::finish_write`] publishes them when the write
+    /// returns. Whether the write `replaces` files decides what happens when
+    /// indexing falls behind the write; see [`RunObserver`].
+    pub(crate) fn write_observer(self: &Arc<Self>, replaces: bool) -> Arc<RunObserver> {
+        self.write_observer_with(replaces, QUEUED_BYTES, None)
+    }
+
+    /// [`Self::write_observer`] with a queue of up to `capacity` bytes, whose
+    /// thread starts indexing only once `gate` (when given) receives, so a
+    /// test can fill the queue.
+    fn write_observer_with(
+        self: &Arc<Self>,
+        replaces: bool,
+        capacity: usize,
+        gate: Option<std::sync::mpsc::Receiver<()>>,
+    ) -> Arc<RunObserver> {
+        let shapes = self.shapes.load_full();
+        let shared = Arc::new(ObserverShared {
+            state: Arc::clone(self),
+            builders: Mutex::new(Some(
+                shapes.iter().map(|shape| shape.run_builder()).collect(),
+            )),
+            shapes,
+            reservation: Mutex::new(self.build_reservation()),
+            failure: Mutex::new(None),
+            lock_wait_ns: AtomicU64::new(0),
+            encode_ns: AtomicU64::new(0),
+            inline_batches: AtomicU64::new(0),
+            queued_bytes: AtomicUsize::new(0),
+            queue_limit: capacity,
+        });
+        let (sender, receiver) = std::sync::mpsc::channel::<IndexJob>();
+        let (drained_tx, drained_rx) = tokio::sync::oneshot::channel();
+        let indexer = Arc::clone(&shared);
+        let spawned = std::thread::Builder::new()
+            .name("cayenne-index-write".to_string())
+            .spawn(move || {
+                if let Some(gate) = gate {
+                    let _ = gate.recv();
+                }
+                for job in receiver {
+                    indexer.index(&job);
+                    indexer.queued_bytes.fetch_sub(job.bytes, Ordering::AcqRel);
+                }
+                // The observer may be gone already (its write failed).
+                let _ = drained_tx.send(());
+            });
+        let queue = match spawned {
+            Ok(_) => Queue::Open(sender),
+            // No thread: the writer indexes every batch itself.
+            Err(_) => Queue::Inline,
+        };
+        Arc::new(RunObserver {
+            shared,
+            replaces,
+            queue: Mutex::new(queue),
+            drained: Mutex::new(Some(drained_rx)),
+        })
+    }
+
+    /// Publishes the runs `observer` built during its write, which has
+    /// returned and is about to become visible. A run missing rows is never
+    /// published: on any failure the write's files stay uncovered and are
+    /// read in full until a background build indexes them.
+    ///
+    /// A write that `replaces` files — a compaction's rewrite, a full refresh
+    /// — always finishes its run here, before its caller makes it visible, so
+    /// the files it swaps in are covered from the moment they are visible and
+    /// no reader falls back to scanning them. An additive write (an append) of
+    /// more than [`DEFER_FINISH_ROWS`] rows is finished in the background
+    /// instead, so the append does not wait while its keys are sorted: its
+    /// files are uncovered, and read in full, until the run is published —
+    /// as a write's run always is, whether or not the write is visible by
+    /// then; reconcile retires the files of a write that never becomes
+    /// visible.
+    pub(crate) async fn finish_write(self: &Arc<Self>, observer: &RunObserver) {
+        observer.drain().await;
+        let replaces = observer.replaces;
+        let observer = &*observer.shared;
+        let builders = observer.builders.lock().take();
+        let failure = observer.failure.lock().take();
+        let published = match (failure, builders) {
+            (Some(ObserverFailure::Refused), _) => {
+                self.report_refusal();
+                false
+            }
+            (Some(ObserverFailure::Failed(cause)), _) => {
+                self.write_unindexed(&cause);
+                false
+            }
+            (Some(ObserverFailure::Behind), _) => {
+                self.counters
+                    .builds_unpublished
+                    .fetch_add(1, Ordering::Relaxed);
+                tracing::debug!(table = %self.table_name, "An append outpaced its secondary index, so its files are read in full until they are indexed in the background");
+                false
+            }
+            (None, Some(builders))
+                if builders
+                    .first()
+                    .is_some_and(|builder| !builder.files().is_empty()) =>
+            {
+                let rows = builders.first().map_or(0, RunBuilder::rows);
+                if !replaces && rows > DEFER_FINISH_ROWS {
+                    self.finish_in_background(builders, observer.reservation.lock().take());
+                    return;
+                }
+                let finishing = Instant::now();
+                let finished = finish_runs(builders).await;
+                super::table::record_cayenne_write_phase(
+                    &self.table_name,
+                    "lookup_index",
+                    finishing,
+                );
+                tracing::debug!(
+                    table = %self.table_name,
+                    rows,
+                    encode_ms = observer.encode_ns.load(Ordering::Relaxed) / 1_000_000,
+                    lock_wait_ms = observer.lock_wait_ns.load(Ordering::Relaxed) / 1_000_000,
+                    inline_batches = observer.inline_batches.load(Ordering::Relaxed),
+                    finish_ms = finishing.elapsed().as_millis(),
+                    "Built a write's secondary index runs"
+                );
+                match finished {
+                    Ok(runs) => self.publish_runs(runs, None),
+                    Err(cause) => {
+                        self.write_unindexed(&cause);
+                        false
+                    }
+                }
+            }
+            (None, _) => false,
+        };
+        if !published {
+            tracing::trace!(table = %self.table_name, "A write's secondary index runs were not published");
+        }
+        // Whatever happened, the builders' working memory goes with them.
+        observer.reservation.lock().free();
+    }
+
+    /// [`Self::finish_write`] for a large write, off the write path. The
+    /// write's working memory stays reserved until its run is published or
+    /// dropped.
+    fn finish_in_background(
+        self: &Arc<Self>,
+        builders: Vec<RunBuilder>,
+        reservation: MemoryReservation,
+    ) {
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            return;
+        };
+        let state = Arc::clone(self);
+        runtime.spawn(async move {
+            let rows = builders.first().map_or(0, RunBuilder::rows);
+            let finishing = Instant::now();
+            match finish_runs(builders).await {
+                Ok(runs) => {
+                    state.publish_runs(runs, None);
+                }
+                Err(cause) => state.write_unindexed(&cause),
+            }
+            tracing::debug!(
+                table = %state.table_name,
+                rows,
+                finish_ms = finishing.elapsed().as_millis(),
+                "Built a large write's secondary index runs in the background"
+            );
+            drop(reservation);
+        });
+    }
+
+    /// Reports a write whose rows could not be indexed: at `warn` once until
+    /// runs publish again, then at `debug`.
+    fn write_unindexed(&self, cause: &str) {
+        self.counters
+            .builds_unpublished
+            .fetch_add(1, Ordering::Relaxed);
+        let message = format!(
+            "Dataset '{}' (cayenne): failed to index a write's rows for its secondary index, so lookups read that write's files in full until they are indexed in the background. Cause: {cause}",
+            self.table_name
+        );
+        self.write_failure.report(&self.table_name, &message);
+    }
+
+    /// The right to index the table's uncovered files in the background, or
+    /// `None` when a build is running or the schedule says not yet.
+    pub(crate) fn claim_build(self: &Arc<Self>) -> Option<BuildClaim> {
         let now = Instant::now();
         {
             let mut schedule = self.schedule.lock();
@@ -1491,93 +2114,9 @@ impl LookupIndexState {
         self.counters.builds_started.fetch_add(1, Ordering::Relaxed);
         Some(BuildClaim {
             state: Arc::clone(self),
-            generation,
             started: now,
             settled: false,
         })
-    }
-
-    /// Changes the published index. The caller holds `publish_lock`.
-    fn store_index(&self, index: Option<Arc<SnapshotLookupIndex>>) {
-        self.index.store(index);
-        self.generation.fetch_add(1, Ordering::Release);
-        self.scan_input_version.fetch_add(1, Ordering::Release);
-    }
-
-    /// Makes `index` the published index if `expected` still is. Returns whether
-    /// it did.
-    fn replace_if_current(
-        &self,
-        expected: Option<&Arc<SnapshotLookupIndex>>,
-        index: Option<Arc<SnapshotLookupIndex>>,
-    ) -> bool {
-        let _publishing = self.publish_lock.lock();
-        let current = self.index.load();
-        let unchanged = match (current.as_ref(), expected) {
-            (None, None) => true,
-            (Some(current), Some(expected)) => Arc::ptr_eq(current, expected),
-            _ => false,
-        };
-        if unchanged {
-            self.store_index(index);
-        }
-        unchanged
-    }
-
-    /// Publishes a finished background build claimed at `generation`, unless a
-    /// different index was published while it ran: that one came from a later
-    /// refresh or build. An empty slot is always filled — whatever the build
-    /// meant to replace was dropped as stale in the meantime.
-    fn publish_unless_overtaken(&self, generation: u64, index: Arc<SnapshotLookupIndex>) -> bool {
-        let _publishing = self.publish_lock.lock();
-        let publish =
-            self.index.load().is_none() || self.generation.load(Ordering::Acquire) == generation;
-        if publish {
-            self.store_index(Some(index));
-        }
-        publish
-    }
-
-    /// Drops `stale` if it is still the published index, returning its memory
-    /// and letting a lookup schedule the rebuild.
-    fn discard_stale(&self, stale: &Arc<SnapshotLookupIndex>) {
-        if self.replace_if_current(Some(stale), None) {
-            tracing::debug!(
-                table = %self.table_name,
-                snapshot_id = %stale.snapshot_id,
-                "Dropped a stale secondary index"
-            );
-        }
-    }
-
-    /// Starts a write-time build for a snapshot that is not visible yet. The
-    /// returned observer is handed to the write; [`Self::stage_pending`] finishes
-    /// it once the snapshot's files are final.
-    pub(crate) fn begin_incremental_build(
-        self: &Arc<Self>,
-        snapshot_id: &str,
-        schema: &arrow_schema::Schema,
-    ) -> Option<Arc<IncrementalIndexBuilder>> {
-        let reservation = self.build_reservation();
-        let builder = match IncrementalIndexBuilder::new(
-            self.table_name.clone(),
-            snapshot_id.to_string(),
-            &self.specs,
-            reservation,
-            schema,
-        ) {
-            Ok(builder) => Arc::new(builder),
-            Err(error) => {
-                tracing::warn!(
-                    table = %self.table_name,
-                    "Dataset '{}' (cayenne): failed to start building its secondary index during the refresh, so lookups on it scan until an index is built from the refreshed files. Cause: {error}",
-                    self.table_name
-                );
-                return None;
-            }
-        };
-        *self.pending.lock() = Some(Arc::clone(&builder));
-        Some(builder)
     }
 
     /// Working memory for one build, reserved against the query pool.
@@ -1585,271 +2124,168 @@ impl LookupIndexState {
         MemoryConsumer::new(format!("cayenne_index_build:{}", self.table_name)).register(&self.pool)
     }
 
-    /// Finishes a write-time build and holds the index until its snapshot becomes
-    /// visible, when [`Self::promote_staged`] publishes it inside the same flip.
-    ///
-    /// Nothing is staged for a refused or failed build, or for a file set that
-    /// does not match the listing. The snapshot must still publish in that case:
-    /// data availability never depends on this index.
-    pub(crate) async fn stage_pending(
+    /// The index of the key these filters fully pin, if any. `values_for`
+    /// gives a column's equality values: one for `=`, several for `IN`.
+    fn matched_shape(
         &self,
-        snapshot_id: &str,
-        files: Vec<IndexedFile>,
-        file_set: FileSetVersion,
-    ) {
-        let Some(builder) = self.pending.lock().take() else {
-            return;
-        };
-        if builder.snapshot_id() != snapshot_id {
-            return;
-        }
-        let account = Arc::clone(&self.account);
-        let started = Instant::now();
-        // Sorting and compressing the index is CPU work that runs for seconds on a
-        // large table, so it goes to the blocking pool rather than the runtime.
-        let finished =
-            match tokio::task::spawn_blocking(move || builder.finish(&files, &account, file_set))
-                .await
-            {
-                Ok(finished) => finished,
-                Err(error) => Err(format!("index build task failed: {error}")),
-            };
-        super::table::record_cayenne_write_phase(&self.table_name, "lookup_index", started);
-        match finished {
-            Ok(Some(index)) => {
-                *self.staged.lock() = Some(Arc::new(index));
-            }
-            Ok(None) => {
-                self.counters
-                    .builds_unpublished
-                    .fetch_add(1, Ordering::Relaxed);
-                self.schedule_after_unpublished(started.elapsed());
-                tracing::warn!(
-                    table = %self.table_name,
-                    snapshot_id = %snapshot_id,
-                    "{}",
-                    refused_build_message(&self.table_name)
-                );
-            }
-            Err(error) => {
-                self.counters
-                    .builds_unpublished
-                    .fetch_add(1, Ordering::Relaxed);
-                self.schedule_after_unpublished(started.elapsed());
-                tracing::warn!(
-                    table = %self.table_name,
-                    snapshot_id = %snapshot_id,
-                    "Dataset '{}' (cayenne): failed to build its secondary index during the refresh, so lookups on it scan until an index is built from the refreshed files. Cause: {error}",
-                    self.table_name
-                );
-            }
-        }
+        values_for: &dyn Fn(&str) -> Option<Vec<ScalarValue>>,
+    ) -> Option<usize> {
+        self.specs.iter().position(|spec| {
+            spec.columns
+                .iter()
+                .all(|column| values_for(column).is_some())
+        })
     }
 
-    /// A refresh whose write-time index was not published leaves the refreshed
-    /// files to a background build; this makes that build wait as if it had
-    /// followed a failed one, rather than start on the next lookup and very
-    /// likely fail the same way.
-    fn schedule_after_unpublished(&self, took: Duration) {
-        let mut schedule = self.schedule.lock();
-        let in_flight = schedule.in_flight;
-        schedule.finished(Instant::now(), took, false);
-        schedule.in_flight = in_flight;
+    /// The label of key `shape`.
+    fn shape_label(&self, shape: usize) -> &str {
+        self.specs[shape].label()
     }
 
-    /// Publishes the staged write-time index for `snapshot_id`. Called inside the
-    /// flip that makes `snapshot_id` visible, so probes never see an index for a
-    /// snapshot newer than the one they can read. Synchronous and lock-light.
-    pub(crate) fn promote_staged(&self, snapshot_id: &str) {
-        let Some(index) = self.staged.lock().take() else {
-            return;
-        };
-        if index.snapshot_id != snapshot_id {
-            return;
-        }
-        {
-            let _publishing = self.publish_lock.lock();
-            self.store_index(Some(Arc::clone(&index)));
-        }
-        self.record_published(&index);
-    }
-
-    /// Drops a write-time build and any staged index whose write did not commit.
-    pub(crate) fn discard_pending(&self) {
-        *self.pending.lock() = None;
-        *self.staged.lock() = None;
-    }
-
-    fn record_published(&self, index: &SnapshotLookupIndex) {
-        self.counters
-            .builds_published
-            .fetch_add(1, Ordering::Relaxed);
-        let stats = &index.stats;
-        let first = !self.published_once.swap(true, Ordering::Relaxed);
-        let message = format!(
-            "Dataset '{}' (cayenne): built its secondary index over {} rows in {} files, holding {} bytes",
-            self.table_name,
-            stats.rows,
-            stats.files,
-            index.reservation.bytes()
-        );
-        if first {
-            tracing::info!(
-                table = %self.table_name,
-                snapshot_id = %index.snapshot_id,
-                build_ms = stats.duration.as_millis(),
-                distinct_keys = stats.distinct_keys,
-                "{message}"
-            );
-        } else {
-            tracing::debug!(
-                table = %self.table_name,
-                snapshot_id = %index.snapshot_id,
-                build_ms = stats.duration.as_millis(),
-                distinct_keys = stats.distinct_keys,
-                rss_before = ?stats.rss_before,
-                rss_after = ?stats.rss_after,
-                per_key = ?stats.per_key_entries,
-                "{message}"
-            );
-        }
-    }
-
-    /// The indexed key these filters fully pin to literals, if any.
-    pub(crate) fn matched_shape(
-        &self,
-        scalar_for: &dyn Fn(&str) -> Option<ScalarValue>,
-    ) -> Option<&str> {
-        self.specs
-            .iter()
-            .find(|spec| {
-                spec.columns
-                    .iter()
-                    .all(|column| scalar_for(column).is_some())
-            })
-            .map(KeySpec::label)
-    }
-
-    /// Resolves a candidate row selection for `scalar_for` on a table whose
-    /// visible snapshot is `visible_snapshot`. A fallback carries the reason for
-    /// `EXPLAIN`; the caller records the final outcome once it has validated a
-    /// selection against its own file list.
+    /// Resolves a candidate row selection for `values_for` (see
+    /// [`Self::matched_shape`]) against the view the scan pinned. A fallback
+    /// carries the reason for `EXPLAIN`; the caller records the final outcome
+    /// once [`LookupSelection::restrict`] has seen its files.
     ///
-    /// `scalar_for` must only answer for predicates that compare the bare column
-    /// with a value: see the module's note on column-side casts.
+    /// `values_for` must only answer for predicates that compare the bare
+    /// column with values: see the module's note on column-side casts. The
+    /// keys are every combination of the columns' values, all probed in one
+    /// batch; more than [`RUNTIME_INDEX_MAX_KEYS`] combinations, or more than
+    /// [`RUNTIME_INDEX_MAX_ROWS`] candidates for several keys, decline.
     pub(crate) fn probe(
         self: &Arc<Self>,
-        index: Option<&Arc<SnapshotLookupIndex>>,
-        visible_snapshot: &str,
-        scalar_for: &dyn Fn(&str) -> Option<ScalarValue>,
+        index: &Arc<LookupIndexView>,
+        values_for: &dyn Fn(&str) -> Option<Vec<ScalarValue>>,
     ) -> LookupProbe {
-        let Some(shape) = self.matched_shape(scalar_for) else {
-            return LookupProbe::Fallback(LookupIndexExplain::not_applicable(None));
+        let Some(shape) = self.matched_shape(values_for) else {
+            return LookupProbe::Fallback(LookupIndexExplain::scanned(
+                None,
+                LookupIndexScanReason::NoKeyPinned,
+            ));
         };
-        let index = match self.index_for_scan(shape, index, visible_snapshot) {
-            Ok(index) => index,
-            Err(outcome) => {
-                return LookupProbe::Fallback(LookupIndexExplain::fallback(
-                    shape.to_string(),
-                    outcome,
-                ));
-            }
+        let label = self.shape_label(shape).to_string();
+        // `matched_shape` found every column pinned, so a missing product is
+        // one past the bound.
+        let Some(keys) = key_tuples(&self.specs[shape].columns, values_for) else {
+            return LookupProbe::Fallback(LookupIndexExplain::scanned(
+                Some(label),
+                LookupIndexScanReason::TooManyKeys,
+            ));
         };
-        let Some(hit) = index.probe(scalar_for) else {
-            return LookupProbe::Fallback(LookupIndexExplain::not_applicable(Some(
-                shape.to_string(),
-            )));
+        // One key keeps every candidate, as an equality lookup always has;
+        // several are bounded like a runtime key set.
+        let max_rows = (keys.len() > 1).then_some(RUNTIME_INDEX_MAX_ROWS);
+        let Ok(encoded) = index.shapes[shape].encode_keys(&keys) else {
+            return LookupProbe::Fallback(LookupIndexExplain::scanned(
+                Some(label),
+                LookupIndexScanReason::ValueNotIndexable,
+            ));
+        };
+        let Some(hit) = index.probe_keys(shape, &encoded, max_rows, None) else {
+            return LookupProbe::Fallback(LookupIndexExplain::scanned(
+                Some(label),
+                LookupIndexScanReason::TooManyCandidates,
+            ));
         };
         LookupProbe::Selection(LookupSelection {
             state: Arc::clone(self),
-            index,
+            index: Arc::clone(index),
             shape: hit.shape,
             per_file: hit.per_file,
             rows: hit.rows,
         })
     }
 
-    /// `index`, the index the scan's view pinned, when it was built for the
-    /// scan's `visible_snapshot`. Otherwise records why there is none as
-    /// `shape`'s probe outcome. A pinned index for another snapshot is older than
-    /// the view that captured it, so it is dropped, unless something newer
-    /// already replaced it, so a rebuild can take its place.
-    fn index_for_scan(
-        &self,
-        shape: &str,
-        index: Option<&Arc<SnapshotLookupIndex>>,
-        visible_snapshot: &str,
-    ) -> Result<Arc<SnapshotLookupIndex>, LookupIndexExplainOutcome> {
-        let Some(index) = index else {
-            self.record_probe(shape, ProbeOutcome::Unbuilt);
-            return Err(LookupIndexExplainOutcome::Unbuilt);
-        };
-        if index.snapshot_id != visible_snapshot {
-            self.record_probe(shape, ProbeOutcome::SnapshotMismatch);
-            self.discard_stale(index);
-            return Err(LookupIndexExplainOutcome::SnapshotMismatch);
-        }
-        Ok(Arc::clone(index))
-    }
-
-    /// Probes a completed hash-join dynamic filter's `keys` for `spec` as one
-    /// batched lookup, recording exactly one outcome.
+    /// Probes a completed hash-join dynamic filter's `keys` for key `spec` as
+    /// one batched lookup, recording exactly one outcome.
     ///
     /// Single-column membership arrives as `column IN (...)`; composite
     /// membership arrives as `struct(columns...) IN (struct literals...)`, so
     /// tuple correlation is preserved without a Cartesian product. `index` is
-    /// the one the scan's view pinned; it answers only when it covers every one
-    /// of `scan_files`, checked before any key is probed. As in
-    /// [`LookupSelection::restrict`], a file it lacks while the view's file set
-    /// has moved on since the index was listed proves the index stale.
+    /// the view the scan pinned. It answers for the files it covers; files it
+    /// does not cover are read as planned, and a build is requested for them.
     fn probe_runtime_filter(
         &self,
-        spec: &KeySpec,
-        index: Option<&Arc<SnapshotLookupIndex>>,
-        visible_snapshot: &str,
-        visible_file_set: FileSetVersion,
+        spec: usize,
+        index: &Arc<LookupIndexView>,
         scan_files: &[ObjectMeta],
         keys: &[Vec<ScalarValue>],
     ) -> RuntimeProbe {
-        let Ok(index) = self.index_for_scan(&spec.label, index, visible_snapshot) else {
-            return RuntimeProbe::IndexUnusable;
-        };
-        if !scan_files.iter().all(|file| index.indexes_file(file)) {
-            self.record_probe(&spec.label, ProbeOutcome::SnapshotMismatch);
-            if index.file_set != visible_file_set {
-                self.discard_stale(&index);
-            }
+        let label = self.shape_label(spec);
+        // The view spans every file of the table; this scan answers only for
+        // its own, so only their candidates count, against the row bound too.
+        let read: HashSet<&str> = scan_files
+            .iter()
+            .map(|file| file_name(file.location.as_ref()))
+            .collect();
+        let covered = read.iter().filter(|name| index.covers(name)).count();
+        if covered == 0 {
+            self.record_probe(label, Coverage::Unindexed);
             return RuntimeProbe::IndexUnusable;
         }
-
         let max_rows = RUNTIME_INDEX_MIN_ROWS
-            .max(usize_of(index.stats.rows) / 1_000)
+            .max(index.rows / 1_000)
             .min(RUNTIME_INDEX_MAX_ROWS);
-        let Some(hit) = index.probe_keys(&spec.columns, keys, max_rows) else {
+        let hit = index.shapes[spec]
+            .encode_keys(keys)
+            .ok()
+            .and_then(|encoded| index.probe_keys(spec, &encoded, Some(max_rows), Some(&read)));
+        let Some(hit) = hit else {
             self.record_runtime_fallback();
             return RuntimeProbe::Declined;
         };
-
-        if hit.rows == 0 {
-            self.record_probe(&hit.shape, ProbeOutcome::Empty);
+        // An uncovered file is read in full whatever the covered ones hold, so
+        // a probe reads nothing only when every file the scan reads is covered.
+        let uncovered = read.len() - covered;
+        if hit.rows == 0 && uncovered == 0 {
+            // Every file is indexed and none holds a key: nothing is read.
+            self.record_probe(&hit.shape, Coverage::Full);
         } else {
-            self.record_selection(&hit.shape, hit.per_file.len() as u64, hit.rows as u64);
+            self.record_selection(
+                &hit.shape,
+                Coverage::of(true, uncovered > 0),
+                (hit.per_file.len() + uncovered) as u64,
+                hit.rows as u64,
+            );
         }
-        RuntimeProbe::Selection(RuntimeLookupSelection::new(index, hit.per_file))
+        RuntimeProbe::Selection {
+            selection: RuntimeLookupSelection::new(Arc::clone(index), hit.per_file),
+            uncovered: uncovered > 0,
+        }
     }
 
-    fn record_probe(&self, shape: &str, outcome: ProbeOutcome) {
-        record_probe_outcome(&self.table_name, &self.counters, shape, outcome);
+    fn record_probe(&self, shape: &str, coverage: Coverage) {
+        record_probe_outcome(&self.table_name, &self.counters, shape, coverage);
     }
 
-    fn record_selection(&self, shape: &str, files: u64, rows: u64) {
+    /// Records a file-mode lookup once, from the decision its scan reached
+    /// over every snapshot it read.
+    pub(crate) fn record_lookup(&self, explain: &LookupIndexExplain) {
+        let (Some(shape), LookupIndexExplainOutcome::Probed(coverage)) =
+            (&explain.shape, explain.outcome)
+        else {
+            return;
+        };
+        if coverage == Coverage::Unindexed {
+            self.record_probe(shape, coverage);
+        } else {
+            self.record_selection(
+                shape,
+                coverage,
+                explain.candidate_files.unwrap_or(0) as u64,
+                explain.candidate_rows.unwrap_or(0),
+            );
+        }
+    }
+
+    fn record_selection(&self, shape: &str, coverage: Coverage, files: u64, rows: u64) {
         self.counters
             .candidate_files
             .fetch_add(files, Ordering::Relaxed);
         self.counters
             .candidate_rows
             .fetch_add(rows, Ordering::Relaxed);
-        self.record_probe(shape, ProbeOutcome::Selected);
+        self.record_probe(shape, coverage);
     }
 
     fn record_runtime_fallback(&self) {
@@ -1859,20 +2295,820 @@ impl LookupIndexState {
     }
 }
 
-/// Counts one probe's outcome and reports it on
+/// Every key tuple the columns' equality values pin: their cartesian
+/// product, `None` past [`RUNTIME_INDEX_MAX_KEYS`] tuples.
+pub(crate) fn key_tuples(
+    columns: &[String],
+    values_for: &dyn Fn(&str) -> Option<Vec<ScalarValue>>,
+) -> Option<Vec<Vec<ScalarValue>>> {
+    let mut tuples: Vec<Vec<ScalarValue>> = vec![Vec::with_capacity(columns.len())];
+    for column in columns {
+        let values = values_for(column)?;
+        if tuples.len().saturating_mul(values.len()) > RUNTIME_INDEX_MAX_KEYS {
+            return None;
+        }
+        tuples = tuples
+            .into_iter()
+            .flat_map(|tuple| {
+                values.iter().map(move |value| {
+                    let mut tuple = tuple.clone();
+                    tuple.push(value.clone());
+                    tuple
+                })
+            })
+            .collect();
+    }
+    Some(tuples)
+}
+
+/// Finishes one run per key. Sorting a large write's keys is CPU work, so it
+/// runs on the blocking pool.
+async fn finish_runs(builders: Vec<RunBuilder>) -> Result<Vec<IndexRun>, String> {
+    tokio::task::spawn_blocking(move || {
+        builders
+            .into_iter()
+            .map(RunBuilder::finish)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|e| e.to_string())
+    })
+    .await
+    .map_err(|e| format!("index build task failed: {e}"))?
+}
+
+/// Why a write's runs will not be published.
+#[derive(Clone, Debug)]
+enum ObserverFailure {
+    /// The pool could not fit the runs' working memory.
+    Refused,
+    /// The rows could not be indexed.
+    Failed(String),
+    /// An append outpaced its indexing, which dropped the run rather than
+    /// hold the write back.
+    Behind,
+}
+
+/// Bytes of key columns a write may have queued for its indexing thread
+/// before it is behind. A write arrives in bursts much faster than its keys
+/// encode, so the bound is on memory, not batches: a 1.2M-row append queues
+/// about 50 MB.
+const QUEUED_BYTES: usize = 256 << 20;
+
+/// One written batch's key columns, as written, for the indexing thread.
+struct IndexJob {
+    file: String,
+    first_row_position: u64,
+    /// Per key, its columns before any cast.
+    columns: Vec<Vec<ArrayRef>>,
+    /// The columns' memory, counted in [`ObserverShared::queued_bytes`].
+    bytes: usize,
+}
+
+/// Where a write's batches go.
+enum Queue {
+    /// To the write's indexing thread.
+    Open(std::sync::mpsc::Sender<IndexJob>),
+    /// Nowhere else: the writer indexes each batch itself.
+    Inline,
+    /// Nowhere: the write's index is finished.
+    Closed,
+}
+
+/// Builds one write's runs from the rows as they are written, from the file
+/// and file-local position the Vortex sink reports for each batch.
+///
+/// The writer only queues each batch's key columns (references, not copies)
+/// for a thread of the write's own that encodes them, so the write does not
+/// wait while its keys are encoded and sorted. When the thread falls so far
+/// behind that the queue holds [`QUEUED_BYTES`], the write never waits either:
+/// - an additive write (an append) drops its run, and its files are indexed
+///   in the background like any uncovered file;
+/// - a replacing write (a compaction, an overwrite) indexes that batch
+///   itself, so its files are still covered when it becomes visible.
+pub(crate) struct RunObserver {
+    shared: Arc<ObserverShared>,
+    replaces: bool,
+    queue: Mutex<Queue>,
+    /// Fires once the indexing thread has indexed every queued batch.
+    drained: Mutex<Option<tokio::sync::oneshot::Receiver<()>>>,
+}
+
+/// What a write's writer and its indexing thread share.
+struct ObserverShared {
+    state: Arc<LookupIndexState>,
+    /// The keys the builders were made for.
+    shapes: Shapes,
+    /// One builder per key; `None` once taken, or dropped on a failure.
+    builders: Mutex<Option<Vec<RunBuilder>>>,
+    /// The builders' working memory.
+    reservation: Mutex<MemoryReservation>,
+    /// The first failure. The observer cannot return an error, and a run
+    /// missing rows must never be published, so it is recorded and checked
+    /// before publication.
+    failure: Mutex<Option<ObserverFailure>>,
+    /// Nanoseconds spent waiting for `builders`, and encoding keys into them,
+    /// summed over every batch: how much the index cost, and how much of that
+    /// is contention.
+    lock_wait_ns: AtomicU64,
+    encode_ns: AtomicU64,
+    /// Batches a replacing write indexed itself because the queue was full.
+    inline_batches: AtomicU64,
+    /// Bytes of key columns queued and not yet indexed, and the most allowed.
+    queued_bytes: AtomicUsize,
+    queue_limit: usize,
+}
+
+impl std::fmt::Debug for RunObserver {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RunObserver")
+            .field("table", &self.shared.state.table_name)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RunObserver {
+    /// Closes the queue and waits until every queued batch is indexed.
+    async fn drain(&self) {
+        *self.queue.lock() = Queue::Closed;
+        let drained = self.drained.lock().take();
+        if let Some(drained) = drained {
+            // An error means the thread is gone, having indexed what it had.
+            let _ = drained.await;
+        }
+    }
+}
+
+impl ObserverShared {
+    fn fail(&self, failure: ObserverFailure) {
+        // Free the builders' memory now: nothing will be published.
+        *self.builders.lock() = None;
+        self.reservation.lock().free();
+        let mut slot = self.failure.lock();
+        if slot.is_none() {
+            *slot = Some(failure);
+        }
+    }
+
+    /// Adds one batch's keys to the builders.
+    fn index(&self, job: &IndexJob) {
+        let waiting = Instant::now();
+        let mut slot = self.builders.lock();
+        let encoding = Instant::now();
+        self.lock_wait_ns.fetch_add(
+            u64::try_from((encoding - waiting).as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        // Failed already: the rest of the write goes unindexed.
+        let Some(builders) = slot.as_mut() else {
+            return;
+        };
+        let indexed = builders
+            .iter_mut()
+            .zip(self.shapes.iter())
+            .zip(&job.columns)
+            .try_for_each(|((builder, shape), raw)| {
+                let columns = shape.cast_key_columns(raw)?;
+                builder
+                    .add_batch(&job.file, job.first_row_position, &columns)
+                    .map_err(|e| e.to_string())
+            });
+        // Finishing a run needs about as much again while it sorts.
+        let bytes = builders
+            .iter()
+            .map(RunBuilder::heap_bytes)
+            .sum::<usize>()
+            .saturating_mul(2);
+        drop(slot);
+        self.encode_ns.fetch_add(
+            u64::try_from(encoding.elapsed().as_nanos()).unwrap_or(u64::MAX),
+            Ordering::Relaxed,
+        );
+        if let Err(cause) = indexed {
+            self.fail(ObserverFailure::Failed(cause));
+        } else if self.reservation.lock().try_resize(bytes).is_err() {
+            self.fail(ObserverFailure::Refused);
+        }
+    }
+}
+
+impl vortex_datafusion::VortexWriteObserver for RunObserver {
+    fn batch_written(
+        &self,
+        file_path: &object_store::path::Path,
+        first_row_position: u64,
+        batch: &RecordBatch,
+    ) {
+        let shared = &self.shared;
+        let columns: Result<Vec<Vec<ArrayRef>>, String> = shared
+            .shapes
+            .iter()
+            .map(|shape| shape.raw_key_columns(batch))
+            .collect();
+        let columns = match columns {
+            Ok(columns) => columns,
+            Err(cause) => {
+                shared.fail(ObserverFailure::Failed(cause));
+                return;
+            }
+        };
+        let bytes = columns
+            .iter()
+            .flatten()
+            .map(|array: &ArrayRef| array.get_array_memory_size())
+            .sum();
+        let job = IndexJob {
+            file: file_name(file_path.as_ref()).to_string(),
+            first_row_position,
+            columns,
+            bytes,
+        };
+        let queue = self.queue.lock();
+        let job = match &*queue {
+            Queue::Open(sender) => {
+                let queued = shared.queued_bytes.fetch_add(bytes, Ordering::AcqRel);
+                if queued.saturating_add(bytes) <= shared.queue_limit {
+                    match sender.send(job) {
+                        Ok(()) => return,
+                        // The thread is gone: index here.
+                        Err(std::sync::mpsc::SendError(job)) => {
+                            shared.queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
+                            job
+                        }
+                    }
+                } else {
+                    shared.queued_bytes.fetch_sub(bytes, Ordering::AcqRel);
+                    if !self.replaces {
+                        drop(queue);
+                        shared.fail(ObserverFailure::Behind);
+                        return;
+                    }
+                    shared.inline_batches.fetch_add(1, Ordering::Relaxed);
+                    job
+                }
+            }
+            Queue::Inline => job,
+            Queue::Closed => {
+                drop(queue);
+                // A late batch has nowhere to go, and a run missing it must
+                // not be published.
+                shared.fail(ObserverFailure::Failed(
+                    "a batch was written after the write's index was finished".to_string(),
+                ));
+                return;
+            }
+        };
+        drop(queue);
+        shared.index(&job);
+    }
+}
+
+/// Rows above which an append's run is finished off the write path. Finishing
+/// sorts the write's keys: about 140 ms for 1.2M rows and 3.5 s for 20M,
+/// measured in `spiced`.
+const DEFER_FINISH_ROWS: usize = 1 << 20;
+
+/// Whether a table's secondary index runs persist as run files. Hidden,
+/// for testing: `SPICE_CAYENNE_INDEX_PERSISTENCE=enabled`.
+pub(crate) const PERSISTENCE_ENV: &str = "SPICE_CAYENNE_INDEX_PERSISTENCE";
+
+/// Serializes persistence for one durable table location across provider opens.
+/// The weak owner fences work queued by providers that have been replaced.
+struct PersistenceCoordinator {
+    owner: Arc<tokio::sync::Mutex<std::sync::Weak<()>>>,
+}
+
+impl PersistenceCoordinator {
+    fn for_location(location: String) -> Arc<Self> {
+        type Registry = HashMap<String, std::sync::Weak<PersistenceCoordinator>>;
+        static REGISTRY: std::sync::OnceLock<Mutex<Registry>> = std::sync::OnceLock::new();
+        let mut registry = REGISTRY.get_or_init(Mutex::default).lock();
+        registry.retain(|_, coordinator| coordinator.strong_count() > 0);
+        if let Some(coordinator) = registry.get(&location).and_then(std::sync::Weak::upgrade) {
+            return coordinator;
+        }
+        let coordinator = Arc::new(Self {
+            owner: Arc::new(tokio::sync::Mutex::new(std::sync::Weak::new())),
+        });
+        registry.insert(location, Arc::downgrade(&coordinator));
+        coordinator
+    }
+}
+
+/// Every key's runs, persisted one file per run under the table's
+/// `_lookup_index` directory, which snapshot cleanup never sweeps.
+///
+/// A persisted run is named after the run's content, so persisting is a stateless
+/// sync of the directory against the live runs: write the missing, delete the
+/// rest. It holds file names only, which the module's note on file names makes
+/// safe to trust: at load a run covers only the files still live.
+pub(crate) struct PersistedRuns {
+    table_name: String,
+    store: Arc<dyn ObjectStore>,
+    /// Records which runs are persisted. A run is registered only once its
+    /// file is written, and unregistered before its file is deleted, so every
+    /// registered run has a complete file.
+    catalog: Arc<dyn MetadataCatalog>,
+    table_id: String,
+    /// The directory every key's run directory sits in.
+    root: object_store::path::Path,
+    /// Per key, the name of the directory its runs persist in.
+    keys: Vec<String>,
+    /// Whether the persisted runs have been loaded. Until then a sync would
+    /// delete them.
+    loaded: AtomicBool,
+    /// The latest views to sync, each with its key's directory, taken by the
+    /// running sync.
+    pending: Mutex<Option<Vec<(String, IndexView)>>>,
+    /// Whether a sync is running.
+    syncing: AtomicBool,
+    coordinator: Arc<PersistenceCoordinator>,
+    owner: Arc<()>,
+}
+
+/// Field order keeps decoded runs charged until their allocations are freed.
+struct LoadedRuns {
+    runs: Vec<Vec<IndexRun>>,
+    bytes: u64,
+    reservation: Option<LookupIndexReservation>,
+}
+
+#[derive(Debug, snafu::Snafu)]
+enum PersistedReadError {
+    #[snafu(display("The query memory pool refused persisted secondary index runs"))]
+    BudgetRefused,
+    #[snafu(display("Persisted index loading stopped: {message}"))]
+    Interrupted { message: String },
+    #[snafu(display("{message}"))]
+    Unreadable { message: String },
+}
+
+impl PersistedReadError {
+    fn unreadable(message: impl Into<String>) -> Self {
+        Self::Unreadable {
+            message: message.into(),
+        }
+    }
+}
+
+impl PersistedRuns {
+    fn new(
+        table_name: String,
+        store: Arc<dyn ObjectStore>,
+        catalog: Arc<dyn MetadataCatalog>,
+        table_id: String,
+        root: object_store::path::Path,
+        keys: Vec<String>,
+        ownership: (Arc<PersistenceCoordinator>, Arc<()>),
+    ) -> Self {
+        Self {
+            coordinator: ownership.0,
+            owner: ownership.1,
+            table_name,
+            store,
+            catalog,
+            table_id,
+            root,
+            keys,
+            loaded: AtomicBool::new(false),
+            pending: Mutex::new(None),
+            syncing: AtomicBool::new(false),
+        }
+    }
+
+    /// Removes every registered and orphan run when the table has no file-backed indexes.
+    /// Loading with no configured keys applies the same cleanup as removing
+    /// individual keys, without reading any run into memory.
+    pub(crate) async fn remove_all(
+        table_name: String,
+        store: Arc<dyn ObjectStore>,
+        catalog: Arc<dyn MetadataCatalog>,
+        table_id: String,
+        root: object_store::path::Path,
+        location: String,
+    ) {
+        let coordinator = PersistenceCoordinator::for_location(location);
+        let mut generation = Arc::clone(&coordinator.owner).lock_owned().await;
+        let owner = Arc::new(());
+        *generation = Arc::downgrade(&owner);
+        let runs = Self::new(
+            table_name.clone(),
+            store,
+            catalog,
+            table_id,
+            root,
+            Vec::new(),
+            (coordinator, owner),
+        );
+        let result = tokio::spawn(async move {
+            let _generation = generation;
+            if let Err(error) = runs.load(None).await {
+                tracing::debug!(table = %runs.table_name, %error, "Persisted secondary index runs of removed indexes were not deleted; the next open retries");
+            }
+        }.instrument(tracing::Span::current()).with_current_subscriber()).await;
+        if let Err(error) = result {
+            tracing::debug!(table = %table_name, %error, "Persisted secondary index removal did not complete");
+        }
+    }
+
+    /// Stops replaced providers from persisting when persistence is disabled.
+    pub(crate) async fn fence(location: String) {
+        let coordinator = PersistenceCoordinator::for_location(location);
+        *coordinator.owner.lock().await = std::sync::Weak::new();
+    }
+
+    /// Persists `views`' runs in the background, coalescing with any sync
+    /// already running.
+    fn schedule(self: &Arc<Self>, views: Vec<(String, IndexView)>) {
+        if !self.loaded.load(Ordering::Acquire)
+            || !distinct_dirs(views.iter().map(|(dir, _)| dir.as_str()))
+        {
+            return;
+        }
+        *self.pending.lock() = Some(views);
+        if self.syncing.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+            self.syncing.store(false, Ordering::Release);
+            return;
+        };
+        let persisted_runs = Arc::clone(self);
+        runtime.spawn(async move { persisted_runs.sync().await });
+    }
+
+    async fn sync(&self) {
+        loop {
+            let views = self.pending.lock().take();
+            let Some(views) = views else {
+                self.syncing.store(false, Ordering::Release);
+                // Views scheduled after the take above found a sync running.
+                if self.pending.lock().is_some() && !self.syncing.swap(true, Ordering::AcqRel) {
+                    continue;
+                }
+                return;
+            };
+            let generation = self.coordinator.owner.lock().await;
+            if !std::sync::Weak::ptr_eq(&generation, &Arc::downgrade(&self.owner)) {
+                self.pending.lock().take();
+                self.syncing.store(false, Ordering::Release);
+                return;
+            }
+            if let Err(error) = self.sync_views(&views).await {
+                tracing::debug!(table = %self.table_name, %error, "Persisted secondary index runs were not synced; the next change retries");
+            }
+        }
+    }
+
+    fn path(&self, key: &str, run_name: &str) -> object_store::path::Path {
+        self.root.clone().join(key).join(run_name)
+    }
+
+    async fn sync_views(&self, views: &[(String, IndexView)]) -> Result<(), String> {
+        let registered = self
+            .catalog
+            .list_index_runs(&self.table_id)
+            .await
+            .map_err(|e| format!("list persisted runs: {e}"))?;
+        let mut existing: HashSet<(String, String)> = registered
+            .into_iter()
+            .map(|record| (record.index_key, record.run_name))
+            .collect();
+        for (key, view) in views {
+            for run in view.run_list() {
+                let name = run_file_name(&run);
+                if existing.remove(&(key.clone(), name.clone())) {
+                    continue;
+                }
+                let row_count = run.len() as u64;
+                let bytes = tokio::task::spawn_blocking(move || run.to_bytes())
+                    .await
+                    .map_err(|e| format!("encode persisted run: {e}"))?;
+                let record = IndexRunRecord {
+                    table_id: self.table_id.clone(),
+                    index_key: key.clone(),
+                    run_name: name.clone(),
+                    row_count,
+                    size_bytes: bytes.len() as u64,
+                };
+                let path = self.path(key, &name);
+                self.store
+                    .put(&path, bytes.into())
+                    .await
+                    .map_err(|e| format!("write {path}: {e}"))?;
+                self.catalog
+                    .register_index_run(&record)
+                    .await
+                    .map_err(|e| format!("register {path}: {e}"))?;
+            }
+        }
+        // What is left is registered but no longer wanted: runs merged or
+        // retired since, and runs of a key the table no longer has.
+        for (key, name) in existing {
+            self.remove(&key, &name).await?;
+        }
+        Ok(())
+    }
+
+    /// Unregisters a run, then attempts to delete its file. An orphan left by
+    /// a failed deletion is eligible for cleanup during a successful open.
+    async fn remove(&self, key: &str, name: &str) -> Result<(), String> {
+        let path = self.path(key, name);
+        self.catalog
+            .remove_index_run(&self.table_id, key, name)
+            .await
+            .map_err(|e| format!("unregister {path}: {e}"))?;
+        match self.store.delete(&path).await {
+            Ok(()) | Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(error) => {
+                tracing::debug!(table = %self.table_name, run_file = %path, %error, "An unregistered persisted secondary index run was not deleted; a successful open can retry cleanup");
+                Ok(())
+            }
+        }
+    }
+
+    /// Every key's persisted runs. A registered run whose file cannot be read
+    /// is unregistered and deleted, and a file no run is registered for, left
+    /// by a write that stopped before registering it, is deleted. An error
+    /// when the registered runs cannot be listed: nothing is loaded, and
+    /// nothing may be synced, since every run would then look unwanted.
+    async fn load(
+        &self,
+        account: Option<&Arc<CayenneMemoryAccount>>,
+    ) -> Result<LoadedRuns, PersistedReadError> {
+        let reservation = match account {
+            Some(account) => Some(
+                account
+                    .try_reserve_lookup_index(0)
+                    .ok_or(PersistedReadError::BudgetRefused)?,
+            ),
+            None => None,
+        };
+        let mut loaded = LoadedRuns {
+            runs: self.keys.iter().map(|_| Vec::new()).collect(),
+            bytes: 0,
+            reservation,
+        };
+        let registered = self
+            .catalog
+            .list_index_runs(&self.table_id)
+            .await
+            .map_err(|e| PersistedReadError::unreadable(format!("list persisted runs: {e}")))?;
+        // A run whose removal failed may still be registered, so the orphan
+        // sweep must retain its file even when the run is not loaded.
+        let mut kept: HashSet<object_store::path::Path> = HashSet::new();
+        for record in registered {
+            let path = self.path(&record.index_key, &record.run_name);
+            let Some(slot) = self.keys.iter().position(|key| *key == record.index_key) else {
+                // Persisted for a key the table no longer has.
+                if let Err(error) = self.remove(&record.index_key, &record.run_name).await {
+                    tracing::debug!(table = %self.table_name, run_file = %path, %error, "A persisted secondary index run of a removed index was not deleted; the next sync retries");
+                    kept.insert(path);
+                }
+                continue;
+            };
+            let account = account.ok_or_else(|| {
+                PersistedReadError::unreadable("No memory account for persisted index loading")
+            })?;
+            match self.read(&path, account).await {
+                Ok((run, size_bytes, reservation)) => {
+                    let Some(held) = loaded.reservation.as_mut() else {
+                        drop(run);
+                        drop(reservation);
+                        return Err(PersistedReadError::BudgetRefused);
+                    };
+                    if let Err(reservation) = held.absorb(reservation) {
+                        drop(run);
+                        drop(reservation);
+                        return Err(PersistedReadError::BudgetRefused);
+                    }
+                    kept.insert(path);
+                    loaded.bytes = loaded.bytes.saturating_add(size_bytes);
+                    loaded.runs[slot].push(run);
+                }
+                Err(
+                    error @ (PersistedReadError::BudgetRefused
+                    | PersistedReadError::Interrupted { .. }),
+                ) => {
+                    // Valid runs remain registered and syncing stays disabled.
+                    // Drop all newly decoded runs without sweeping their files.
+                    return Err(error);
+                }
+                Err(error) => {
+                    tracing::debug!(table = %self.table_name, run_file = %path, %error, "Deleting a persisted secondary index run that cannot be read; its files are indexed again");
+                    if let Err(error) = self.remove(&record.index_key, &record.run_name).await {
+                        tracing::debug!(table = %self.table_name, run_file = %path, %error, "An unreadable persisted secondary index run was not deleted; the next sync retries");
+                        kept.insert(path);
+                    }
+                }
+            }
+        }
+        self.delete_unregistered(&kept).await;
+        Ok(loaded)
+    }
+
+    async fn read(
+        &self,
+        path: &object_store::path::Path,
+        account: &Arc<CayenneMemoryAccount>,
+    ) -> Result<(IndexRun, u64, LookupIndexReservation), PersistedReadError> {
+        let store = Arc::clone(&self.store);
+        let path = path.clone();
+        let account = Arc::clone(account);
+        // Dropping the caller's future leaves this task running. Its buffers
+        // retain their reservations until the read and decode actually finish.
+        tokio::spawn(async move {
+            use futures::TryStreamExt;
+            let result = store
+                .get(&path)
+                .await
+                .map_err(|error| PersistedReadError::unreadable(error.to_string()))?;
+            if result.range.start != 0 || result.range.end != result.meta.size {
+                return Err(PersistedReadError::unreadable("incomplete object range"));
+            }
+            let size_bytes = result.meta.size;
+            let size =
+                usize::try_from(size_bytes).map_err(|_| PersistedReadError::BudgetRefused)?;
+            // A collected buffer can coexist with the stream's current chunk.
+            let read_bytes = size
+                .checked_mul(2)
+                .and_then(|size| size.checked_add(8192))
+                .ok_or(PersistedReadError::BudgetRefused)?;
+            let reservation = account
+                .try_reserve_lookup_index(read_bytes)
+                .ok_or(PersistedReadError::BudgetRefused)?;
+            let admitted = match result.payload {
+                object_store::GetResultPayload::File(mut file, _) => {
+                    // The blocking read owns the guard too: runtime shutdown
+                    // can cancel its waiter without stopping this closure.
+                    tokio::task::spawn_blocking(move || {
+                        use std::io::{Read, Seek, SeekFrom};
+                        file.seek(SeekFrom::Start(0))
+                            .map_err(|error| PersistedReadError::unreadable(error.to_string()))?;
+                        let mut bytes = vec![0; size];
+                        file.read_exact(&mut bytes)
+                            .map_err(|error| PersistedReadError::unreadable(error.to_string()))?;
+                        let mut extra = [0_u8];
+                        if file
+                            .read(&mut extra)
+                            .map_err(|error| PersistedReadError::unreadable(error.to_string()))?
+                            != 0
+                        {
+                            return Err(PersistedReadError::unreadable(
+                                "object grew while reading",
+                            ));
+                        }
+                        Ok((bytes, reservation))
+                    })
+                    .await
+                    .map_err(|error| PersistedReadError::Interrupted {
+                        message: error.to_string(),
+                    })??
+                }
+                object_store::GetResultPayload::Stream(mut stream) => {
+                    let mut bytes = Vec::with_capacity(size);
+                    while let Some(chunk) = stream
+                        .try_next()
+                        .await
+                        .map_err(|error| PersistedReadError::unreadable(error.to_string()))?
+                    {
+                        if chunk.len() > size.saturating_sub(bytes.len()) {
+                            return Err(PersistedReadError::unreadable(
+                                "object grew while reading",
+                            ));
+                        }
+                        bytes.extend_from_slice(&chunk);
+                    }
+                    if bytes.len() != size {
+                        return Err(PersistedReadError::unreadable("incomplete object body"));
+                    }
+                    (bytes, reservation)
+                }
+            };
+            tokio::task::spawn_blocking(move || {
+                // Capture the tuple whole, including when a queued closure is
+                // dropped before it runs: bytes must drop before their guard.
+                let mut admitted = admitted;
+                let decoded = IndexRun::decode_memory_bound(&admitted.0)
+                    .map_err(|error| PersistedReadError::unreadable(error.to_string()))?;
+                let peak = admitted
+                    .0
+                    .capacity()
+                    .checked_add(decoded)
+                    .ok_or(PersistedReadError::BudgetRefused)?;
+                if !admitted.1.try_resize(peak) {
+                    return Err(PersistedReadError::BudgetRefused);
+                }
+                let run = IndexRun::from_bytes(&admitted.0)
+                    .map_err(|error| PersistedReadError::unreadable(error.to_string()))?;
+                drop(admitted.0);
+                // Decoder scratch is gone. Keep only resident bytes and the
+                // run's share of publication headroom while later runs load.
+                let publish = run
+                    .publication_memory_bound()
+                    .map_err(|error| PersistedReadError::unreadable(error.to_string()))?;
+                debug_assert!(publish <= decoded, "publication fits decode headroom");
+                admitted.1.try_resize(publish);
+                Ok((run, size_bytes, admitted.1))
+            })
+            .await
+            .map_err(|error| PersistedReadError::Interrupted {
+                message: error.to_string(),
+            })?
+        })
+        .await
+        .map_err(|error| PersistedReadError::Interrupted {
+            message: error.to_string(),
+        })?
+    }
+
+    /// Deletes every file under the root that `kept` does not list. Runs only
+    /// before the first sync, so no write is in flight.
+    async fn delete_unregistered(&self, kept: &HashSet<object_store::path::Path>) {
+        use futures::TryStreamExt;
+        let listed: Vec<ObjectMeta> = match self.store.list(Some(&self.root)).try_collect().await {
+            Ok(listed) => listed,
+            Err(error) => {
+                tracing::debug!(table = %self.table_name, %error, "Unregistered persisted secondary index runs were not listed; the next open retries");
+                return;
+            }
+        };
+        for meta in listed {
+            if kept.contains(&meta.location) {
+                continue;
+            }
+            if let Err(error) = self.store.delete(&meta.location).await {
+                tracing::debug!(table = %self.table_name, run_file = %meta.location, %error, "An unregistered persisted secondary index run was not deleted; the next open retries");
+            }
+        }
+    }
+}
+
+/// The line a reopened table logs once it has loaded its persisted index.
+fn persisted_runs_loaded_message(
+    table_name: &str,
+    bytes: u64,
+    covered: usize,
+    files: usize,
+) -> String {
+    #[expect(
+        clippy::cast_precision_loss,
+        reason = "a size shown to one decimal place of a MiB"
+    )]
+    let mib = bytes as f64 / f64::from(1_u32 << 20);
+    let coverage = if covered >= files {
+        format!("covering all {files} of its files")
+    } else {
+        format!(
+            "covering {covered} of its {files} files; the other {} are indexed in the background",
+            files - covered
+        )
+    };
+    format!(
+        "Dataset '{table_name}' (cayenne): loaded its secondary index from disk ({mib:.1} MiB), {coverage}"
+    )
+}
+
+/// Whether every key has a run directory of its own. Keys sharing one would
+/// load each other's runs, and a lookup on one could then miss rows the
+/// other's runs hold, so a table whose keys collide persists nothing.
+fn distinct_dirs<'a>(mut dirs: impl Iterator<Item = &'a str>) -> bool {
+    let mut unique = HashSet::new();
+    dirs.all(|dir| unique.insert(dir))
+}
+
+/// A persisted run's name: a digest of the run's files and size, so the same run
+/// always has the same name.
+fn run_file_name(run: &IndexRun) -> String {
+    let mut descriptor = Vec::new();
+    for file in run.files() {
+        descriptor.extend_from_slice(&(file.len() as u64).to_le_bytes());
+        descriptor.extend_from_slice(file.as_bytes());
+    }
+    descriptor.extend_from_slice(&(run.len() as u64).to_le_bytes());
+    format!("{:016x}.run", hash_index::hash_key_bytes(&[&descriptor]))
+}
+
+/// Counts one probe's coverage, and reports the probe on
 /// `cayenne_lookup_index_probe_total`.
 pub(crate) fn record_probe_outcome(
     table_name: &str,
     counters: &Counters,
     shape: &str,
-    outcome: ProbeOutcome,
+    coverage: Coverage,
 ) {
-    counters.record(outcome);
+    counters.record(coverage);
     telemetry::cayenne::track_lookup_index_probe(&[
         telemetry::KeyValue::new("table", table_name.to_string()),
         telemetry::KeyValue::new("shape", shape.to_string()),
-        telemetry::KeyValue::new("outcome", outcome.as_str()),
     ]);
+}
+
+/// The line a table logs when a schema change alters the encoding of the keys
+/// `labels` name, so their indexes are rebuilt.
+fn rebuilt_index_message(table_name: &str, labels: &[String]) -> String {
+    format!(
+        "Dataset '{table_name}' (cayenne): the schema change altered the key columns of its secondary index on {}, so the index is rebuilt from the table's files as lookups need it; until then those lookups read every file",
+        labels.join(", ")
+    )
 }
 
 /// What the warning says when the memory pool refuses to fit an index.
@@ -1889,15 +3125,12 @@ fn refused_build_message(table_name: &str) -> String {
 /// can never leave the table unindexed.
 pub(crate) struct BuildClaim {
     state: Arc<LookupIndexState>,
-    /// The table's index generation when the build was claimed. The build's
-    /// result is published only if nothing newer has been published since.
-    generation: u64,
     started: Instant,
     settled: bool,
 }
 
 impl BuildClaim {
-    /// Ends a build that published its index.
+    /// Ends a build that published its runs, or found nothing to index.
     fn published(mut self) {
         self.finish(true);
     }
@@ -1912,14 +3145,10 @@ impl BuildClaim {
         self.finish(false);
     }
 
-    /// Ends a build whose index a newer one replaced while it ran. The table has
-    /// an index, so the next build is paced but not backed off.
-    fn overtaken(mut self) {
-        self.state
-            .counters
-            .builds_unpublished
-            .fetch_add(1, Ordering::Relaxed);
-        self.finish(true);
+    /// Settles a build the pool refused, which [`LookupIndexState::report_refusal`]
+    /// has already counted as unpublished.
+    fn refused(mut self) {
+        self.finish(false);
     }
 
     fn finish(&mut self, published: bool) {
@@ -1939,63 +3168,62 @@ impl Drop for BuildClaim {
     }
 }
 
-/// Builds the index for `snapshot_id` in the background and publishes it only
-/// once complete, unless a newer index was published meanwhile. Failures leave
-/// the table on the ordinary scan until the schedule allows another attempt.
+/// Lists the files a reader can see now, for a build to publish against.
+/// `None` when they cannot be listed.
+pub(crate) type ListLive =
+    Box<dyn FnOnce() -> futures::future::BoxFuture<'static, Option<Vec<String>>> + Send>;
+
+/// Indexes `files` — the current snapshot's files no run covers — in the
+/// background by reading them back, and publishes the runs against the file
+/// set `list_live` reports once they are built, so a file that left the set
+/// meanwhile is never covered. Failures leave those files read in full
+/// until the schedule allows another attempt.
 pub(crate) fn spawn_build(
     claim: BuildClaim,
-    snapshot_id: String,
     store: Arc<dyn ObjectStore>,
     files: Vec<IndexedFile>,
-    schema: Arc<arrow_schema::Schema>,
-    file_set: FileSetVersion,
+    list_live: ListLive,
 ) {
     tokio::spawn(async move {
         let state = Arc::clone(&claim.state);
         let table = state.table_name.clone();
-        tracing::debug!(
-            table = %table,
-            snapshot_id = %snapshot_id,
-            files = files.len(),
-            "Building secondary index"
-        );
+        if files.is_empty() {
+            claim.published();
+            return;
+        }
+        tracing::debug!(table = %table, files = files.len(), "Indexing files no secondary index run covers");
         let first_failure = state.schedule.lock().unpublished == 0;
-        match build(
-            &state,
-            snapshot_id.clone(),
-            &store,
-            files,
-            &schema,
-            file_set,
-        )
-        .await
-        {
-            Ok(Some(index)) => {
-                let index = Arc::new(index);
-                if state.publish_unless_overtaken(claim.generation, Arc::clone(&index)) {
-                    state.record_published(&index);
+        let built = match read_back(&state, &store, &files).await {
+            Ok(Some(builders)) => finish_runs(builders).await.map(Some),
+            Ok(None) => Ok(None),
+            Err(error) => Err(error),
+        };
+        match built {
+            Ok(Some(runs)) => {
+                let Some(live) = list_live().await else {
+                    claim.unpublished();
+                    return;
+                };
+                let live: HashSet<&str> = live.iter().map(|path| file_name(path)).collect();
+                if state.publish_runs(runs, Some(&live)) {
                     claim.published();
                 } else {
-                    claim.overtaken();
+                    // `publish_runs` reported the pool's refusal, which counts it.
+                    claim.refused();
                 }
             }
             Ok(None) => {
-                if first_failure {
-                    tracing::warn!(table = %table, snapshot_id = %snapshot_id, "{}", refused_build_message(&table));
-                } else {
-                    tracing::debug!(table = %table, snapshot_id = %snapshot_id, "{}", refused_build_message(&table));
-                }
-                claim.unpublished();
+                state.report_refusal();
+                claim.refused();
             }
             Err(error) => {
                 if first_failure {
                     tracing::warn!(
                         table = %table,
-                        snapshot_id = %snapshot_id,
-                        "Dataset '{table}' (cayenne): failed to build its secondary index, so lookups on it scan until a later attempt succeeds. Cause: {error}"
+                        "Dataset '{table}' (cayenne): failed to build its secondary index, so lookups read its unindexed files in full until a later attempt succeeds. Cause: {error}"
                     );
                 } else {
-                    tracing::debug!(table = %table, snapshot_id = %snapshot_id, %error, "Secondary index build failed again");
+                    tracing::debug!(table = %table, %error, "Secondary index build failed again");
                 }
                 claim.unpublished();
             }
@@ -2003,872 +3231,47 @@ pub(crate) fn spawn_build(
     });
 }
 
-/// Where a batch's rows sit in their file.
-#[derive(Clone, Copy)]
-enum RowPositions<'a> {
-    /// Rows occupy consecutive positions from this one — what a writer reports.
-    Contiguous(u64),
-    /// One position per row — what a read-back scan's `row_idx()` reports.
-    Explicit(&'a UInt64Array),
-}
-
-impl RowPositions<'_> {
-    fn position(self, row: u32) -> u64 {
-        match self {
-            Self::Contiguous(start) => start + u64::from(row),
-            Self::Explicit(positions) => positions.value(row as usize),
-        }
-    }
-}
-
-/// Entries for one key shape, accumulated until the snapshot is complete.
-struct ShapeBuild {
-    label: String,
-    columns: Vec<KeyColumn>,
-    /// Per key column, the compacted, null-free chunks in arrival order.
-    keys: Vec<Vec<ArrayRef>>,
-    /// The packed posting of every retained row, in arrival order.
-    postings: Vec<u64>,
-    /// Bytes held by `keys` and `postings`.
-    retained: usize,
-}
-
-impl ShapeBuild {
-    fn new(label: String, columns: Vec<KeyColumn>) -> Self {
-        let keys = columns.iter().map(|_| Vec::new()).collect();
-        Self {
-            label,
-            columns,
-            keys,
-            postings: Vec::new(),
-            retained: 0,
-        }
-    }
-
-    /// Drops every accumulated entry.
-    fn release(&mut self) {
-        for chunks in &mut self.keys {
-            *chunks = Vec::new();
-        }
-        self.postings = Vec::new();
-        self.retained = 0;
-    }
-
-    /// What [`Self::finish`] holds beyond the accumulated entries while it
-    /// sorts: one concatenated copy of the key columns and the sort order.
-    fn sort_working_bytes(&self) -> usize {
-        let keys = self
-            .retained
-            .saturating_sub(self.postings.len() * std::mem::size_of::<u64>());
-        keys.saturating_add(self.postings.len() * std::mem::size_of::<u32>())
-    }
-
-    /// Appends the rows of `batch` whose key columns are all non-null.
-    ///
-    /// Returns the bytes this retained. The key columns are copied, so a batch
-    /// that is a slice of a larger buffer does not keep that buffer alive.
-    fn ingest(
-        &mut self,
-        file_id: u32,
-        positions: RowPositions<'_>,
-        batch: &RecordBatch,
-        file_path: &str,
-    ) -> Result<usize, String> {
-        let columns = self
-            .columns
-            .iter()
-            .map(|key| {
-                let array = batch.column_by_name(&key.name).ok_or_else(|| {
-                    format!("{file_path}: column '{}' not in the batch", key.name)
-                })?;
-                cast_to(array, &key.data_type)
-                    .map_err(|e| format!("{file_path}: {}: {e}", key.name))
-            })
-            .collect::<Result<Vec<ArrayRef>, String>>()?;
-        let num_rows = u32::try_from(batch.num_rows())
-            .map_err(|_| format!("{file_path}: batch has more than u32::MAX rows"))?;
-
-        // A NULL can never satisfy an equality predicate, so an incomplete key
-        // is simply not indexed.
-        let mut keep: Option<arrow::array::BooleanArray> = None;
-        for column in columns.iter().filter(|column| column.null_count() > 0) {
-            let valid = arrow::compute::is_not_null(column.as_ref()).map_err(|e| e.to_string())?;
-            keep = Some(match keep {
-                None => valid,
-                Some(keep) => arrow::compute::and(&keep, &valid).map_err(|e| e.to_string())?,
-            });
-        }
-        let indices = match keep {
-            None => UInt32Array::from_iter_values(0..num_rows),
-            Some(keep) => UInt32Array::from_iter_values(
-                keep.values()
-                    .set_indices()
-                    .filter_map(|row| u32::try_from(row).ok()),
-            ),
-        };
-
-        self.postings.reserve(indices.len());
-        for &row in indices.values() {
-            let position = positions.position(row);
-            if position > POSITION_MASK {
-                return Err(format!(
-                    "{file_path}: row position {position} does not fit the index's address"
-                ));
-            }
-            self.postings
-                .push((u64::from(file_id) << POSITION_BITS) | position);
-        }
-        let mut retained = indices.len() * std::mem::size_of::<u64>();
-        for (column, chunks) in columns.iter().zip(&mut self.keys) {
-            let kept = arrow::compute::take(column.as_ref(), &indices, None)
-                .map_err(|e| format!("{file_path}: {e}"))?;
-            retained += kept.get_array_memory_size();
-            chunks.push(kept);
-        }
-        self.retained = self.retained.saturating_add(retained);
-        Ok(retained)
-    }
-
-    /// Sorts the entries and compresses them into a [`ShapeIndex`], one chunk of
-    /// `chunk_rows` sorted entries at a time.
-    fn finish(
-        self,
-        session: &VortexSession,
-        compressor: &BtrBlocksCompressor,
-        chunk_rows: usize,
-    ) -> Result<ShapeIndex, String> {
-        let Self {
-            label,
-            columns,
-            keys,
-            postings,
-            ..
-        } = self;
-        let converter = key_converter(&columns)?;
-        let keys = keys
-            .into_iter()
-            .zip(&columns)
-            .map(|(chunks, column)| {
-                if chunks.is_empty() {
-                    return Ok(arrow::array::new_empty_array(&column.data_type));
-                }
-                let parts: Vec<&dyn Array> = chunks.iter().map(AsRef::as_ref).collect();
-                arrow::compute::concat(&parts).map_err(|e| format!("{}: {e}", column.name))
-            })
-            .collect::<Result<Vec<ArrayRef>, String>>()?;
-        let postings: ArrayRef = Arc::new(UInt64Array::from(postings));
-
-        let sort_columns: Vec<SortColumn> = keys
-            .iter()
-            .chain(std::iter::once(&postings))
-            .map(|values| SortColumn {
-                values: Arc::clone(values),
-                options: None,
-            })
-            .collect();
-        let order = arrow::compute::lexsort_to_indices(&sort_columns, None)
-            .map_err(|e| format!("sort {label}: {e}"))?;
-        drop(sort_columns);
-
-        let mut fields: Vec<Field> = columns.iter().map(KeyColumn::indexed_field).collect();
-        fields.push(postings_field());
-        let mut ctx = session.create_execution_ctx();
-        let mut heads = BlockHeads::new();
-        let mut compressed: Vec<Vec<vortex::array::ArrayRef>> =
-            fields.iter().map(|_| Vec::new()).collect();
-        let len = postings.len();
-        let mut start = 0usize;
-        while start < len {
-            let rows = chunk_rows.min(len - start);
-            let indices = order.slice(start, rows);
-            let chunk = keys
-                .iter()
-                .chain(std::iter::once(&postings))
-                .map(|array| {
-                    arrow::compute::take(array.as_ref(), &indices, None)
-                        .map_err(|e| format!("sort {label}: {e}"))
-                })
-                .collect::<Result<Vec<ArrayRef>, String>>()?;
-            heads
-                .extend(&converter, &chunk[..columns.len()])
-                .map_err(|e| format!("{label}: {e}"))?;
-            for ((array, field), out) in chunk.into_iter().zip(&fields).zip(&mut compressed) {
-                let imported = session
-                    .arrow()
-                    .from_arrow_array(array, field)
-                    .map_err(|e| format!("import {}: {e}", field.name()))?;
-                out.push(
-                    compressor
-                        .compress(&imported, &mut ctx)
-                        .map_err(|e| format!("compress {}: {e}", field.name()))?,
-                );
-            }
-            start += rows;
-        }
-        drop((order, keys, postings));
-
-        let assemble = |chunks: Vec<vortex::array::ArrayRef>, field: &Field| {
-            if chunks.len() == 1 {
-                return chunks
-                    .into_iter()
-                    .next()
-                    .ok_or_else(|| format!("{}: no chunk", field.name()));
-            }
-            let Some(dtype) = chunks.first().map(|chunk| chunk.dtype().clone()) else {
-                return session
-                    .arrow()
-                    .from_arrow_array(arrow::array::new_empty_array(field.data_type()), field)
-                    .map_err(|e| format!("import {}: {e}", field.name()));
-            };
-            ChunkedArray::try_new(chunks, dtype)
-                .map(IntoArray::into_array)
-                .map_err(|e| format!("chunk {}: {e}", field.name()))
-        };
-        let mut arrays = compressed
-            .into_iter()
-            .zip(&fields)
-            .map(|(chunks, field)| assemble(chunks, field))
-            .collect::<Result<Vec<_>, String>>()?;
-        let postings = arrays
-            .pop()
-            .ok_or_else(|| format!("{label}: no postings array"))?;
-        let (heads, head_offsets, distinct_keys) = heads.finish();
-        Ok(ShapeIndex {
-            label,
-            converter,
-            keys: arrays,
-            postings,
-            columns,
-            len,
-            heads,
-            head_offsets,
-            distinct_keys,
-        })
-    }
-}
-
-/// The row-encoded key at the start of every block of sorted entries, and the
-/// number of distinct keys, fed one sorted chunk at a time.
-///
-/// Encodes one block at a time, so the whole index is never row-encoded at
-/// once. Fails if any entry encodes below its predecessor: the sort and the
-/// encoding disagree for this key's types, and a lookup would miss rows.
-struct BlockHeads {
-    heads: Vec<u8>,
-    /// Block `i`'s head is `heads[offsets[i]..offsets[i + 1]]`.
-    offsets: Vec<usize>,
-    distinct_keys: usize,
-    /// The last key seen, which continues the order check and the distinct count
-    /// from one chunk into the next.
-    previous: Option<Vec<u8>>,
-}
-
-impl BlockHeads {
-    fn new() -> Self {
-        Self {
-            heads: Vec::new(),
-            offsets: vec![0],
-            distinct_keys: 0,
-            previous: None,
-        }
-    }
-
-    /// Records the next sorted entries, given as one array per key column, which
-    /// start on a block boundary.
-    fn extend(&mut self, converter: &RowConverter, keys: &[ArrayRef]) -> Result<(), String> {
-        let len = keys.first().map_or(0, Array::len);
-        let mut start = 0usize;
-        while start < len {
-            let block = BLOCK_ROWS.min(len - start);
-            let slices: Vec<ArrayRef> = keys
-                .iter()
-                .map(|column| column.slice(start, block))
-                .collect();
-            let rows = converter
-                .convert_columns(&slices)
-                .map_err(|e| format!("encode block: {e}"))?;
-            self.heads.extend_from_slice(rows.row(0).as_ref());
-            self.offsets.push(self.heads.len());
-            for row in 0..rows.num_rows() {
-                let current = rows.row(row);
-                let prior_row = row.checked_sub(1).map(|prior| rows.row(prior));
-                let prior = match &prior_row {
-                    Some(prior_row) => Some(prior_row.as_ref()),
-                    None => self.previous.as_deref(),
-                };
-                match prior.map(|prior| prior.cmp(current.as_ref())) {
-                    None | Some(std::cmp::Ordering::Less) => self.distinct_keys += 1,
-                    Some(std::cmp::Ordering::Equal) => {}
-                    Some(std::cmp::Ordering::Greater) => {
-                        return Err(
-                            "sorted keys are out of order in their row encoding".to_string()
-                        );
-                    }
-                }
-            }
-            self.previous = Some(rows.row(rows.num_rows() - 1).as_ref().to_vec());
-            start += block;
-        }
-        Ok(())
-    }
-
-    fn finish(mut self) -> (Vec<u8>, Vec<usize>, usize) {
-        self.heads.shrink_to_fit();
-        (self.heads, self.offsets, self.distinct_keys)
-    }
-}
-
-/// Accumulates postings for one snapshot.
-///
-/// Shared by both builders — the read-back build that scans finished files and
-/// the write-time build fed by the Vortex sink — so the two cannot drift apart
-/// in how they select, pack or sort entries.
-struct BuildState {
-    shapes: Vec<ShapeBuild>,
-    file_ids: HashMap<String, u32>,
-    /// `file_id -> path`, in assignment order.
-    file_order: Vec<String>,
-    rows: u64,
-    /// The accumulated entries' bytes, reserved against the query memory pool
-    /// while the build holds them.
-    reservation: MemoryReservation,
-    /// Set once the pool refuses to fit the accumulated entries. They are dropped
-    /// at once, and the index is abandoned rather than published with postings
-    /// missing.
-    refused: bool,
-    /// Sorted entries compressed together; [`COMPRESS_CHUNK_ROWS`] outside tests.
-    chunk_rows: usize,
-}
-
-impl BuildState {
-    fn new(
-        specs: &[KeySpec],
-        reservation: MemoryReservation,
-        schema: &arrow_schema::Schema,
-    ) -> Result<Self, String> {
-        let shapes = specs
-            .iter()
-            .map(|spec| {
-                let columns = spec
-                    .columns
-                    .iter()
-                    .map(|column| KeyColumn::resolve(schema, column))
-                    .collect::<Result<Vec<_>, String>>()?;
-                Ok(ShapeBuild::new(spec.label.clone(), columns))
-            })
-            .collect::<Result<Vec<_>, String>>()?;
-        Ok(Self {
-            shapes,
-            file_ids: HashMap::new(),
-            file_order: Vec::new(),
-            rows: 0,
-            reservation,
-            refused: false,
-            chunk_rows: COMPRESS_CHUNK_ROWS,
-        })
-    }
-
-    /// Compresses `rows` sorted entries at a time, so a test can cross chunks
-    /// without millions of rows.
-    #[cfg(test)]
-    fn with_chunk_rows(mut self, rows: usize) -> Self {
-        self.chunk_rows = rows;
-        self
-    }
-
-    /// Ids are assigned on first sight, so the write-time builder does not need
-    /// to know the file set in advance.
-    fn file_id(&mut self, path: &str) -> Result<u32, String> {
-        if let Some(id) = self.file_ids.get(path) {
-            return Ok(*id);
-        }
-        let id = u32::try_from(self.file_order.len())
-            .ok()
-            .filter(|&id| id <= MAX_FILE_ID)
-            .ok_or_else(|| "too many files for the index's address".to_string())?;
-        self.file_ids.insert(path.to_string(), id);
-        self.file_order.push(path.to_string());
-        Ok(id)
-    }
-
-    /// The key columns the read-back build projects, once each.
-    fn key_columns(&self) -> Vec<KeyColumn> {
-        let mut columns: Vec<KeyColumn> = Vec::new();
-        for shape in &self.shapes {
-            for column in &shape.columns {
-                if !columns.iter().any(|c| c.name == column.name) {
-                    columns.push(column.clone());
-                }
-            }
-        }
-        columns
-    }
-
-    fn ingest(
-        &mut self,
-        file_id: u32,
-        positions: RowPositions<'_>,
-        batch: &RecordBatch,
-        file_path: &str,
-    ) -> Result<(), String> {
-        if self.refused {
-            return Ok(());
-        }
-        if let RowPositions::Explicit(explicit) = positions
-            && explicit.len() != batch.num_rows()
-        {
-            return Err(format!(
-                "{file_path}: {} row positions for {} rows",
-                explicit.len(),
-                batch.num_rows()
-            ));
-        }
-        for shape in &mut self.shapes {
-            let retained = shape.ingest(file_id, positions, batch, file_path)?;
-            if self.reservation.try_grow(retained).is_err() {
-                self.refuse();
-                return Ok(());
-            }
-        }
-        self.rows += batch.num_rows() as u64;
-        Ok(())
-    }
-
-    /// Abandons the build because the pool cannot fit it, returning what it
-    /// accumulated right away rather than when the build ends.
-    fn refuse(&mut self) {
-        self.refused = true;
-        for shape in &mut self.shapes {
-            shape.release();
-        }
-        self.reservation.free();
-    }
-
-    /// `Ok(None)` means the memory pool refused the build or the finished index.
-    ///
-    /// `files` is the snapshot's file set as the SCAN lists it, at `file_set`.
-    /// Requiring it to match the set the build actually saw is what makes a
-    /// write-time index safe to publish: a file the build never observed would
-    /// otherwise be served with no postings at all, which is a false empty rather
-    /// than a fallback.
-    #[expect(
-        clippy::too_many_arguments,
-        reason = "each argument is a distinct part of the published index"
-    )]
-    fn into_index(
-        self,
-        snapshot_id: String,
-        files: &[IndexedFile],
-        started: Instant,
-        rss_before: Option<u64>,
-        session: VortexSession,
-        account: &Arc<CayenneMemoryAccount>,
-        file_set: FileSetVersion,
-    ) -> Result<Option<SnapshotLookupIndex>, String> {
-        let Self {
-            shapes,
-            file_ids,
-            file_order,
-            rows,
-            reservation,
-            refused,
-            chunk_rows,
-        } = self;
-        if refused {
-            return Ok(None);
-        }
-        let listed: HashSet<&str> = files.iter().map(|f| f.path.as_str()).collect();
-        let observed: HashSet<&str> = file_order.iter().map(String::as_str).collect();
-        if listed != observed {
-            return Err(format!(
-                "indexed file set does not match the snapshot listing ({} observed, {} listed)",
-                observed.len(),
-                listed.len()
-            ));
-        }
-        // Re-key the postings' file ids onto the listing's order so `files[id]`
-        // resolves, whatever order the build happened to see the files in.
-        let mut files_by_id: Vec<IndexedFile> = Vec::with_capacity(file_order.len());
-        for path in &file_order {
-            let file = files
-                .iter()
-                .find(|f| &f.path == path)
-                .ok_or_else(|| format!("listing lost {path}"))?;
-            files_by_id.push(file.clone());
-        }
-
-        let compressor = BtrBlocksCompressorBuilder::default().build();
-        let mut built = Vec::with_capacity(shapes.len());
-        let mut resident = 0usize;
-        for shape in shapes {
-            // Sorting holds a concatenated copy of the key columns and the sort
-            // order next to the accumulated chunks, so that is reserved first.
-            let accumulated = shape.retained;
-            let working = shape.sort_working_bytes();
-            if reservation.try_grow(working).is_err() {
-                return Ok(None);
-            }
-            let shape = shape.finish(&session, &compressor, chunk_rows)?;
-            reservation.shrink(accumulated.saturating_add(working).min(reservation.size()));
-            resident = resident.saturating_add(shape.resident_bytes());
-            built.push(shape);
-        }
-        let Some(resident_reservation) = account.try_reserve_lookup_index(resident) else {
-            return Ok(None);
-        };
-        drop(reservation);
-
-        let per_key_entries = built
-            .iter()
-            .map(|shape| (shape.label.clone(), shape.distinct_keys, shape.len))
-            .collect();
-        let file_count = files_by_id.len();
-        Ok(Some(SnapshotLookupIndex {
-            snapshot_id,
-            files: files_by_id,
-            file_ids,
-            stats: BuildStats {
-                duration: started.elapsed(),
-                files: file_count,
-                rows,
-                distinct_keys: built.iter().map(|shape| shape.distinct_keys).sum(),
-                rss_before,
-                rss_after: super::tuning::proc_self_rss_bytes(),
-                per_key_entries,
-            },
-            shapes: built,
-            session,
-            file_set,
-            reservation: resident_reservation,
-        }))
-    }
-}
-
-/// Result of diffing a write-time index against a read-back build of the same
-/// snapshot.
-///
-/// The write-time index trusts that the writer appends batches in arrival order,
-/// so its positions are only as good as that invariant. The read-back build takes
-/// every position from Vortex's own `row_idx()`, so diffing the two turns that
-/// invariant from an assumption into a check.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct LookupIndexVerification {
-    /// The snapshot both indexes describe.
-    pub snapshot_id: String,
-    /// Files the snapshot spans. More than one means the writer's file-roll
-    /// path — where positions restart — was actually exercised.
-    pub files: usize,
-    /// Distinct keys per lookup shape, as `(shape, write-time, read-back)`.
-    pub keys_per_shape: Vec<(String, usize, usize)>,
-    /// Postings per lookup shape, as `(shape, write-time, read-back)`.
-    pub postings_per_shape: Vec<(String, usize, usize)>,
-    /// Distinct keys whose postings were compared value-for-value.
-    pub keys_compared: usize,
-    /// Every disagreement found, described in full.
-    pub mismatches: Vec<String>,
-}
-
-impl LookupIndexVerification {
-    /// `true` when the two builds agree on every key and every row address.
-    #[must_use]
-    pub fn agrees(&self) -> bool {
-        self.mismatches.is_empty()
-    }
-}
-
-/// How many entry disagreements a verification spells out before summarizing.
-const MAX_REPORTED_MISMATCHES: usize = 20;
-
-/// Compares two indexes over the same snapshot, entry for entry. File ids are
-/// build-order dependent, so the comparison goes through resolved file paths.
-fn diff_indexes(
-    write_time: &SnapshotLookupIndex,
-    read_back: &SnapshotLookupIndex,
-) -> LookupIndexVerification {
-    let mut report = LookupIndexVerification {
-        snapshot_id: write_time.snapshot_id.clone(),
-        files: write_time.files.len(),
-        ..LookupIndexVerification::default()
-    };
-    if write_time.snapshot_id != read_back.snapshot_id {
-        report.mismatches.push(format!(
-            "snapshot ids differ: {} vs {}",
-            write_time.snapshot_id, read_back.snapshot_id
-        ));
-        return report;
-    }
-    if write_time.shapes.len() != read_back.shapes.len() {
-        report
-            .mismatches
-            .push("different key-shape counts".to_string());
-        return report;
-    }
-
-    for (write_shape, read_shape) in write_time.shapes.iter().zip(&read_back.shapes) {
-        let label = &write_shape.label;
-        report.keys_per_shape.push((
-            label.clone(),
-            write_shape.distinct_keys,
-            read_shape.distinct_keys,
-        ));
-        report
-            .postings_per_shape
-            .push((label.clone(), write_shape.len, read_shape.len));
-        if write_shape.distinct_keys != read_shape.distinct_keys {
-            report.mismatches.push(format!(
-                "{label}: {} keys write-time vs {} read-back",
-                write_shape.distinct_keys, read_shape.distinct_keys
-            ));
-        }
-
-        let entries = write_shape
-            .resolved_entries(write_time)
-            .and_then(|w| read_shape.resolved_entries(read_back).map(|r| (w, r)));
-        let (written, read) = match entries {
-            Ok(entries) => entries,
-            Err(error) => {
-                report
-                    .mismatches
-                    .push(format!("{label}: could not read entries: {error}"));
-                continue;
-            }
-        };
-        report.keys_compared += read_shape.distinct_keys;
-        if written.len() != read.len() {
-            report.mismatches.push(format!(
-                "{label}: {} postings write-time vs {} read-back",
-                written.len(),
-                read.len()
-            ));
-        }
-        let mut disagreements = 0usize;
-        for (index, (w, r)) in written.iter().zip(&read).enumerate() {
-            if w == r {
-                continue;
-            }
-            disagreements += 1;
-            if disagreements <= MAX_REPORTED_MISMATCHES {
-                report.mismatches.push(format!(
-                    "{label} entry {index}: write-time ({:?}, {}) vs read-back ({:?}, {})",
-                    w.1, w.2, r.1, r.2
-                ));
-            }
-        }
-        if disagreements > MAX_REPORTED_MISMATCHES {
-            report.mismatches.push(format!(
-                "{label}: {} further entries disagree",
-                disagreements - MAX_REPORTED_MISMATCHES
-            ));
-        }
-    }
-    report
-}
-
-/// Diffs `published` against a fresh read-back build of the same snapshot's
-/// `files`.
-pub(crate) async fn verify_against_read_back(
-    state: &Arc<LookupIndexState>,
-    published: Arc<SnapshotLookupIndex>,
-    store: &Arc<dyn ObjectStore>,
-    files: Vec<IndexedFile>,
-    schema: &Arc<arrow_schema::Schema>,
-) -> Result<LookupIndexVerification, String> {
-    let snapshot_id = published.snapshot_id.clone();
-    let read_back = build(state, snapshot_id, store, files, schema, published.file_set)
-        .await?
-        .ok_or_else(|| "the memory pool refused the read-back build".to_string())?;
-    // Decoding every entry of both indexes is CPU work, like building them.
-    tokio::task::spawn_blocking(move || diff_indexes(&published, &read_back))
-        .await
-        .map_err(|e| format!("index verification task failed: {e}"))
-}
-
-/// Builds the index from the rows as they are WRITTEN, instead of reading the
-/// finished files back afterwards.
-///
-/// The Vortex sink already knows which file each batch lands in and how many
-/// rows precede it there; this turns that into postings directly, so a refresh
-/// publishes its snapshot and its index together and no query is ever served by
-/// a full scan while an index is rebuilt.
-///
-/// Every shard writer calls in concurrently, so the accumulator is behind one
-/// mutex. Key extraction is small next to Vortex encode, but this is the obvious
-/// place to shard if it ever shows up in a profile.
-pub(crate) struct IncrementalIndexBuilder {
-    table_name: String,
-    snapshot_id: String,
-    /// `None` once the accumulator has been taken by `finish`.
-    state: Mutex<Option<BuildState>>,
-    /// First failure seen inside the observer. The trait cannot return an error,
-    /// and a partially-built index must never be published, so the failure is
-    /// recorded and checked before publication.
-    failure: Mutex<Option<String>>,
-    started: Instant,
-    rss_before: Option<u64>,
-}
-
-impl std::fmt::Debug for IncrementalIndexBuilder {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("IncrementalIndexBuilder")
-            .field("table", &self.table_name)
-            .field("snapshot_id", &self.snapshot_id)
-            .finish_non_exhaustive()
-    }
-}
-
-impl IncrementalIndexBuilder {
-    fn new(
-        table_name: String,
-        snapshot_id: String,
-        specs: &[KeySpec],
-        reservation: MemoryReservation,
-        schema: &arrow_schema::Schema,
-    ) -> Result<Self, String> {
-        Ok(Self {
-            table_name,
-            snapshot_id,
-            state: Mutex::new(Some(BuildState::new(specs, reservation, schema)?)),
-            failure: Mutex::new(None),
-            started: Instant::now(),
-            rss_before: super::tuning::proc_self_rss_bytes(),
-        })
-    }
-
-    pub(crate) fn snapshot_id(&self) -> &str {
-        &self.snapshot_id
-    }
-
-    fn record_failure(&self, message: String) {
-        let mut failure = self.failure.lock();
-        if failure.is_none() {
-            tracing::warn!(
-                table = %self.table_name,
-                snapshot_id = %self.snapshot_id,
-                error = %message,
-                "Write-time point-lookup index build failed; the snapshot will publish unindexed"
-            );
-            *failure = Some(message);
-        }
-    }
-
-    /// Consumes the accumulated postings. `files` is the snapshot's file set as
-    /// the scan lists it, at `file_set`, which also supplies the sizes
-    /// and modification times the scan-time snapshot check compares.
-    fn finish(
-        &self,
-        files: &[IndexedFile],
-        account: &Arc<CayenneMemoryAccount>,
-        file_set: FileSetVersion,
-    ) -> Result<Option<SnapshotLookupIndex>, String> {
-        if let Some(failure) = self.failure.lock().clone() {
-            return Err(failure);
-        }
-        let state = self
-            .state
-            .lock()
-            .take()
-            .ok_or_else(|| "index accumulator already consumed".to_string())?;
-        state.into_index(
-            self.snapshot_id.clone(),
-            files,
-            self.started,
-            self.rss_before,
-            VortexSession::default(),
-            account,
-            file_set,
-        )
-    }
-}
-
-impl vortex_datafusion::VortexWriteObserver for IncrementalIndexBuilder {
-    fn batch_written(
-        &self,
-        file_path: &object_store::path::Path,
-        first_row_position: u64,
-        batch: &RecordBatch,
-    ) {
-        let path: &str = file_path.as_ref();
-        let mut slot = self.state.lock();
-        // `None` once the build has been consumed; a late batch then has nowhere
-        // to go, and publishing a partial index is never acceptable.
-        let Some(state) = slot.as_mut() else {
-            drop(slot);
-            self.record_failure("batch written after the index build was consumed".to_string());
-            return;
-        };
-        if state.refused {
-            return;
-        }
-        let file_id = match state.file_id(path) {
-            Ok(id) => id,
-            Err(e) => {
-                drop(slot);
-                self.record_failure(e);
-                return;
-            }
-        };
-        if let Err(e) = state.ingest(
-            file_id,
-            RowPositions::Contiguous(first_row_position),
-            batch,
-            path,
-        ) {
-            drop(slot);
-            self.record_failure(e);
-        }
-    }
-}
-
-/// Builds the index by reading the snapshot's finished files.
+/// One run builder per key over `files`, read back from the finished files.
+/// `None` when the pool refuses the builders' working memory.
 ///
 /// Every position comes from Vortex's `row_idx()` rather than from counting the
 /// rows a scan returns, so this build shares no assumption about row order with
-/// the write-time one it verifies.
-///
-/// Decoding and ingesting is CPU work for the whole table, so the build runs on
-/// the blocking pool and drives its file reads from there rather than occupying
-/// a runtime worker between reads.
-async fn build(
+/// the write-time runs it verifies. Decoding and encoding is CPU work, so the
+/// read runs on the blocking pool and drives its file reads from there.
+async fn read_back(
     state: &Arc<LookupIndexState>,
-    snapshot_id: String,
     store: &Arc<dyn ObjectStore>,
-    files: Vec<IndexedFile>,
-    schema: &Arc<arrow_schema::Schema>,
-    file_set: FileSetVersion,
-) -> Result<Option<SnapshotLookupIndex>, String> {
-    let (state, store, schema) = (Arc::clone(state), Arc::clone(store), Arc::clone(schema));
+    files: &[IndexedFile],
+) -> Result<Option<Vec<RunBuilder>>, String> {
+    let (state, store, files) = (Arc::clone(state), Arc::clone(store), files.to_vec());
     let runtime = tokio::runtime::Handle::current();
-    tokio::task::spawn_blocking(move || {
-        runtime.block_on(read_back(
-            &state,
-            snapshot_id,
-            &store,
-            files,
-            &schema,
-            file_set,
-        ))
-    })
-    .await
-    .map_err(|e| format!("index build task failed: {e}"))?
+    tokio::task::spawn_blocking(move || runtime.block_on(read_back_files(&state, &store, &files)))
+        .await
+        .map_err(|e| format!("index build task failed: {e}"))?
 }
 
-async fn read_back(
+async fn read_back_files(
     state: &LookupIndexState,
-    snapshot_id: String,
     store: &Arc<dyn ObjectStore>,
-    files: Vec<IndexedFile>,
-    schema: &arrow_schema::Schema,
-    file_set: FileSetVersion,
-) -> Result<Option<SnapshotLookupIndex>, String> {
+    files: &[IndexedFile],
+) -> Result<Option<Vec<RunBuilder>>, String> {
     use vortex::expr::{get_item, pack, root};
 
-    let started = Instant::now();
-    let rss_before = super::tuning::proc_self_rss_bytes();
-    let mut build = BuildState::new(&state.specs, state.build_reservation(), schema)?;
-    let columns = build.key_columns();
+    let shapes = state.shapes.load_full();
+    let mut builders: Vec<RunBuilder> = shapes.iter().map(|shape| shape.run_builder()).collect();
+    let reservation = state.build_reservation();
+    // Every key column of every key, read once per file.
+    let mut columns: Vec<&KeyColumn> = Vec::new();
+    for shape in shapes.iter() {
+        for column in &shape.columns {
+            if !columns.iter().any(|seen| seen.name == column.name) {
+                columns.push(column);
+            }
+        }
+    }
     let session = VortexSession::default();
-
-    let mut target_fields: Vec<FieldRef> = columns.iter().map(KeyColumn::stored_field).collect();
+    let mut target_fields: Vec<FieldRef> =
+        columns.iter().map(|column| column.stored_field()).collect();
     target_fields.push(Arc::new(Field::new(
         READ_BACK_POSITION_COLUMN,
         DataType::UInt64,
@@ -2886,22 +3289,26 @@ async fn read_back(
         Nullability::NonNullable,
     );
 
-    for file in &files {
-        let file_id = build.file_id(&file.path)?;
-
+    for file in files {
+        let name = file_name(&file.path);
+        // Covered even when it holds no row, or only NULL keys.
+        for builder in &mut builders {
+            builder.add_file(name).map_err(|e| e.to_string())?;
+        }
         let vxf = session
             .open_options()
-            .open_object_store(store, &file.path)
+            .open_object_store(store, object_store::path::Path::from(file.path.as_str()))
             .await
             .map_err(|e| format!("open {}: {e}", file.path))?;
-
+        let file_projection = projection
+            .bind(vxf.dtype())
+            .map_err(|e| format!("bind projection {}: {e}", file.path))?;
         let mut stream = vxf
             .scan()
             .map_err(|e| format!("scan {}: {e}", file.path))?
-            .with_projection(projection.clone())
+            .with_projection(file_projection)
             .into_stream()
             .map_err(|e| format!("stream {}: {e}", file.path))?;
-
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| format!("read {}: {e}", file.path))?;
             if chunk.is_empty() {
@@ -2920,29 +3327,163 @@ async fn read_back(
             let positions = batch
                 .column_by_name(READ_BACK_POSITION_COLUMN)
                 .and_then(|column| column.as_primitive_opt::<UInt64Type>())
-                .ok_or_else(|| format!("{}: row positions are not UInt64", file.path))?
-                .clone();
-            build.ingest(
-                file_id,
-                RowPositions::Explicit(&positions),
-                &batch,
-                &file.path,
-            )?;
-            if build.refused {
+                .ok_or_else(|| format!("{}: row positions are not UInt64", file.path))?;
+            for (builder, shape) in builders.iter_mut().zip(shapes.iter()) {
+                let key_columns = shape.key_columns(&batch)?;
+                builder
+                    .add_batch_at(name, positions.values(), &key_columns)
+                    .map_err(|e| e.to_string())?;
+            }
+            let bytes = builders
+                .iter()
+                .map(RunBuilder::heap_bytes)
+                .sum::<usize>()
+                .saturating_mul(2);
+            if reservation.try_resize(bytes).is_err() {
                 return Ok(None);
             }
         }
     }
+    Ok(Some(builders))
+}
 
-    build.into_index(
-        snapshot_id,
-        &files,
-        started,
-        rss_before,
-        session,
-        &state.account,
-        file_set,
-    )
+/// A diff of the published runs against a read-back of the files they cover.
+///
+/// A write's runs trust that the sink reports each batch's position in its
+/// file, so they are only as good as that invariant. A read-back takes every
+/// position from Vortex's own `row_idx()`, so diffing the two turns that
+/// invariant from an assumption into a check.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct LookupIndexVerification {
+    /// The snapshot whose files were compared.
+    pub snapshot_id: String,
+    /// Files of the snapshot the published runs cover, all of them compared.
+    /// More than one means the writer's file-roll path — where positions
+    /// restart — was exercised.
+    pub files: usize,
+    /// Files of the snapshot no run covers, which lookups read in full.
+    pub uncovered_files: usize,
+    /// Distinct keys per lookup shape, as `(shape, published, read-back)`.
+    pub keys_per_shape: Vec<(String, usize, usize)>,
+    /// Row addresses per lookup shape, as `(shape, published, read-back)`.
+    pub postings_per_shape: Vec<(String, usize, usize)>,
+    /// Distinct keys whose row addresses were compared.
+    pub keys_compared: usize,
+    /// Every disagreement found, described in full.
+    pub mismatches: Vec<String>,
+}
+
+impl LookupIndexVerification {
+    /// `true` when the two agree on every key and every row address.
+    #[must_use]
+    pub fn agrees(&self) -> bool {
+        self.mismatches.is_empty()
+    }
+}
+
+/// How many entry disagreements a verification spells out before summarizing.
+const MAX_REPORTED_MISMATCHES: usize = 20;
+
+/// `(key word, file name, position)` entries of one key's runs, restricted
+/// to `files`.
+type Entries = std::collections::BTreeSet<(u64, String, u64)>;
+
+fn entries_of(runs: &[Arc<IndexRun>], files: &HashSet<&str>) -> Entries {
+    let mut entries = Entries::new();
+    for run in runs {
+        run.for_each_row(|word, file, position| {
+            if files.contains(file) {
+                entries.insert((word, file.to_string(), position));
+            }
+        });
+    }
+    entries
+}
+
+fn distinct_keys(entries: &Entries) -> usize {
+    let mut keys = 0;
+    let mut last: Option<u64> = None;
+    for &(word, _, _) in entries {
+        if last != Some(word) {
+            keys += 1;
+            last = Some(word);
+        }
+    }
+    keys
+}
+
+/// Compares two indexes' entries for one key, appending every disagreement.
+fn diff_entries(
+    label: &str,
+    published: &Entries,
+    read: &Entries,
+    report: &mut LookupIndexVerification,
+) {
+    let (published_keys, read_keys) = (distinct_keys(published), distinct_keys(read));
+    report
+        .keys_per_shape
+        .push((label.to_string(), published_keys, read_keys));
+    report
+        .postings_per_shape
+        .push((label.to_string(), published.len(), read.len()));
+    report.keys_compared += read_keys;
+    let mut disagreements = 0usize;
+    for entry in published.symmetric_difference(read) {
+        disagreements += 1;
+        if disagreements <= MAX_REPORTED_MISMATCHES {
+            let side = if read.contains(entry) {
+                "read-back"
+            } else {
+                "published"
+            };
+            report.mismatches.push(format!(
+                "{label}: only the {side} index has key {:?} at {} row {}",
+                entry.0, entry.1, entry.2
+            ));
+        }
+    }
+    if disagreements > MAX_REPORTED_MISMATCHES {
+        report.mismatches.push(format!(
+            "{label}: {} further entries disagree",
+            disagreements - MAX_REPORTED_MISMATCHES
+        ));
+    }
+}
+
+/// Diffs `view`'s runs against a read-back of the `files` it covers: every
+/// file a lookup on current snapshot `snapshot_id` reads, its own and the
+/// protected snapshots'.
+pub(crate) async fn verify_against_read_back(
+    state: &Arc<LookupIndexState>,
+    view: Arc<LookupIndexView>,
+    snapshot_id: String,
+    store: &Arc<dyn ObjectStore>,
+    files: Vec<IndexedFile>,
+) -> Result<LookupIndexVerification, String> {
+    let (covered, uncovered): (Vec<IndexedFile>, Vec<IndexedFile>) =
+        files.into_iter().partition(|file| view.covers(&file.path));
+    let builders = read_back(state, store, &covered)
+        .await?
+        .ok_or_else(|| "the memory pool refused the read-back build".to_string())?;
+    let read = finish_runs(builders).await?;
+    // Decoding every entry of both is CPU work, like building them.
+    tokio::task::spawn_blocking(move || {
+        let names: HashSet<&str> = covered.iter().map(|file| file_name(&file.path)).collect();
+        let mut report = LookupIndexVerification {
+            snapshot_id,
+            files: covered.len(),
+            uncovered_files: uncovered.len(),
+            ..LookupIndexVerification::default()
+        };
+        for ((shape, read), key) in view.views.iter().zip(read).zip(view.shapes.iter()) {
+            let published = entries_of(&shape.run_list(), &names);
+            let read = entries_of(&[Arc::new(read)], &names);
+            diff_entries(&key.label, &published, &read, &mut report);
+        }
+        report
+    })
+    .await
+    .map_err(|e| format!("index verification task failed: {e}"))
 }
 
 #[cfg(test)]
@@ -2957,10 +3498,6 @@ mod tests {
 
     fn account(pool: &Arc<dyn MemoryPool>) -> Arc<CayenneMemoryAccount> {
         Arc::new(CayenneMemoryAccount::new("lookup_index_test", pool))
-    }
-
-    fn build_reservation(pool: &Arc<dyn MemoryPool>) -> MemoryReservation {
-        MemoryConsumer::new("lookup_index_test_build").register(pool)
     }
 
     fn spec(columns: &[&str]) -> KeySpec {
@@ -3046,20 +3583,22 @@ mod tests {
     #[tokio::test]
     async fn runtime_filter_cache_tracks_expression_generation() {
         let pool = unbounded_pool();
+        let schema = arrow_schema::Schema::new(vec![Field::new("tenant", DataType::Int64, true)]);
         let state = LookupIndexState::new(
             "dynamic_generation",
             vec![spec(&["tenant"])],
+            &schema,
             Arc::clone(&pool),
             account(&pool),
             Arc::default(),
+            None,
         )
+        .expect("indexable")
         .expect("state");
         let builds = BuildRequests::default();
         let provider = DynamicLookupAccessPlanProvider::new(
             Arc::clone(&state),
             state.published(),
-            "snapshot".to_string(),
-            FileSetVersion::default(),
             Arc::new([]),
             Some(builds.callback()),
         );
@@ -3072,7 +3611,7 @@ mod tests {
 
         assert!(provider.resolve(Some(&predicate)).await.is_none());
         assert_eq!(
-            state.counters().unbuilt,
+            state.counters().none,
             0,
             "an unresolved filter is not probed"
         );
@@ -3083,11 +3622,11 @@ mod tests {
             .expect("first update");
         dynamic.mark_complete();
         assert!(provider.resolve(Some(&predicate)).await.is_none());
-        assert_eq!(state.counters().unbuilt, 1);
+        assert_eq!(state.counters().none, 1);
         assert_eq!(builds.count(), 1);
         assert!(provider.resolve(Some(&predicate)).await.is_none());
         assert_eq!(
-            state.counters().unbuilt,
+            state.counters().none,
             1,
             "one generation is probed only once"
         );
@@ -3098,7 +3637,7 @@ mod tests {
             .expect("second update");
         assert!(provider.resolve(Some(&predicate)).await.is_none());
         assert_eq!(
-            state.counters().unbuilt,
+            state.counters().none,
             2,
             "a later generation is resolved independently"
         );
@@ -3244,86 +3783,6 @@ mod tests {
     }
 
     #[test]
-    fn runtime_probe_keeps_case_distinct_index_shapes_separate() {
-        let pool = unbounded_pool();
-        let table = account(&pool);
-        let schema = arrow_schema::Schema::new(vec![
-            Field::new("Foo", DataType::Int64, false),
-            Field::new("foo", DataType::Int64, false),
-        ]);
-        let files = vec![IndexedFile {
-            path: "snapshot/file.vortex".to_string(),
-            size: 1,
-            last_modified_ms: 0,
-        }];
-        let mut build = BuildState::new(
-            &[spec(&["Foo"]), spec(&["foo"])],
-            build_reservation(&pool),
-            &schema,
-        )
-        .expect("build state");
-        let file_id = build.file_id(&files[0].path).expect("file id");
-        let batch = RecordBatch::try_new(
-            Arc::new(schema),
-            vec![
-                Arc::new(Int64Array::from(vec![1])),
-                Arc::new(Int64Array::from(vec![2])),
-            ],
-        )
-        .expect("case-distinct batch");
-        build
-            .ingest(file_id, RowPositions::Contiguous(0), &batch, &files[0].path)
-            .expect("ingest");
-        let index = build
-            .into_index(
-                "snapshot".to_string(),
-                &files,
-                Instant::now(),
-                None,
-                VortexSession::default(),
-                &table,
-                FileSetVersion::default(),
-            )
-            .expect("finish")
-            .expect("fits");
-
-        for (column, value) in [("Foo", 1), ("foo", 2)] {
-            let hit = index
-                .probe_keys(
-                    &[column.to_string()],
-                    &[vec![ScalarValue::Int64(Some(value))]],
-                    1,
-                )
-                .expect("matching case-distinct shape");
-            assert_eq!(hit.shape, column);
-            assert_eq!(hit.rows, 1);
-        }
-    }
-
-    #[test]
-    fn packed_postings_round_trip_file_and_position() {
-        let packed = (u64::from(MAX_FILE_ID) << POSITION_BITS) | POSITION_MASK;
-        assert_eq!(packed >> POSITION_BITS, u64::from(MAX_FILE_ID));
-        assert_eq!(packed & POSITION_MASK, POSITION_MASK);
-    }
-
-    #[test]
-    fn a_table_selection_removes_deleted_candidates() {
-        let deleted: roaring::RoaringTreemap = [3u64, 9].into_iter().collect();
-        let table_plan =
-            VortexAccessPlan::default().with_selection(Selection::ExcludeRoaring(deleted));
-        let candidates = VortexAccessPlan::default().with_selection(Selection::IncludeByIndex(
-            Buffer::from_iter([1u64, 3, 5, 9]),
-        ));
-        let Some(Selection::IncludeByIndex(kept)) =
-            candidates.intersect(&table_plan).selection().cloned()
-        else {
-            panic!("candidates stay an include list");
-        };
-        assert_eq!(kept.as_slice(), &[1, 5]);
-    }
-
-    #[test]
     fn a_column_matching_by_case_only_twice_is_refused() {
         let schema = arrow_schema::Schema::new(vec![
             Field::new("TenantId", DataType::Utf8, false),
@@ -3340,525 +3799,16 @@ mod tests {
         assert!(service.nullable);
     }
 
+    /// Floating-point columns can be indexed: the key encoding gives every
+    /// pair of floats SQL can hold equal one encoding.
     #[test]
-    fn floating_point_key_columns_are_refused() {
+    fn floating_point_key_columns_can_be_indexed() {
         for data_type in [DataType::Float16, DataType::Float32, DataType::Float64] {
             let schema =
                 arrow_schema::Schema::new(vec![Field::new("score", data_type.clone(), false)]);
-            let error = KeyColumn::resolve(&schema, "score").expect_err("float index rejected");
-            assert!(
-                error.contains("unsupported floating-point type")
-                    && error.contains(&data_type.to_string()),
-                "unexpected error for {data_type}: {error}"
-            );
+            KeyColumn::resolve(&schema, "score").expect("a float column resolves");
+            supported_key_type(&data_type).expect("a float key is supported");
         }
-    }
-
-    fn keyed_schema() -> Arc<arrow_schema::Schema> {
-        Arc::new(arrow_schema::Schema::new(vec![
-            Field::new("tenant", DataType::Int64, true),
-            Field::new("service", DataType::Utf8, true),
-            Field::new("region", DataType::Utf8, true),
-        ]))
-    }
-
-    fn keyed_batch(
-        tenants: Vec<Option<i64>>,
-        services: Vec<Option<String>>,
-        regions: Vec<Option<String>>,
-    ) -> RecordBatch {
-        RecordBatch::try_new(
-            keyed_schema(),
-            vec![
-                Arc::new(Int64Array::from(tenants)),
-                Arc::new(StringArray::from(services)),
-                Arc::new(StringArray::from(regions)),
-            ],
-        )
-        .expect("batch")
-    }
-
-    fn scalar(column: &str, value: &str) -> Option<ScalarValue> {
-        match column {
-            "tenant" => Some(ScalarValue::Int64(value.parse().ok())),
-            "service" | "region" => Some(ScalarValue::Utf8(
-                (value != "NULL").then(|| value.to_string()),
-            )),
-            _ => None,
-        }
-    }
-
-    /// Every key of every width, including keys that straddle and coincide with
-    /// block heads, resolves to exactly the addresses a brute-force map holds,
-    /// and absent or NULL keys resolve to nothing.
-    #[test]
-    fn probes_match_a_brute_force_map_for_every_key_width() {
-        let columns = ["tenant", "service", "region"];
-        for width in 1..=columns.len() {
-            let key_columns = &columns[..width];
-            let pool = unbounded_pool();
-            let mut build = BuildState::new(
-                &[spec(key_columns)],
-                build_reservation(&pool),
-                &keyed_schema(),
-            )
-            .expect("build state")
-            .with_chunk_rows(BLOCK_ROWS * 2);
-
-            let mut expected: HashMap<Vec<String>, Vec<(String, u64)>> = HashMap::new();
-            let mut files = Vec::new();
-            let mut state = 0x9E37_79B9_7F4A_7C15u64;
-            for file in 0..3u64 {
-                let path = format!("snapshot/file-{file}.vortex");
-                files.push(IndexedFile {
-                    path: path.clone(),
-                    size: 1,
-                    last_modified_ms: 0,
-                });
-                let file_id = build.file_id(&path).expect("file id");
-                let mut position = 0u64;
-                for _batch in 0..4 {
-                    let (mut tenants, mut services, mut regions) =
-                        (Vec::new(), Vec::new(), Vec::new());
-                    for _ in 0..(BLOCK_ROWS * 3 / 2) {
-                        state = state
-                            .wrapping_mul(6_364_136_223_846_793_005)
-                            .wrapping_add(1_442_695_040_888_963_407);
-                        // Few distinct values, so most keys repeat across blocks
-                        // and files.
-                        let tenant = i64::try_from((state >> 33) % 7).expect("small");
-                        let service = format!("s{}", (state >> 13) % 40);
-                        let region = format!("r{}", (state >> 23) % 3);
-                        let null = (state >> 7).is_multiple_of(23);
-                        let values = [tenant.to_string(), service.clone(), region.clone()];
-                        // The nullable column is the first key column at every
-                        // width, so a NULL always leaves the row unindexed.
-                        if !null {
-                            expected
-                                .entry(values[..width].to_vec())
-                                .or_default()
-                                .push((path.clone(), position));
-                        }
-                        tenants.push(if null { None } else { Some(tenant) });
-                        services.push(Some(service));
-                        regions.push(Some(region));
-                        position += 1;
-                    }
-                    let start = position - tenants.len() as u64;
-                    build
-                        .ingest(
-                            file_id,
-                            RowPositions::Contiguous(start),
-                            &keyed_batch(tenants, services, regions),
-                            &path,
-                        )
-                        .expect("ingest");
-                }
-            }
-
-            let index = build
-                .into_index(
-                    "snapshot".to_string(),
-                    &files,
-                    Instant::now(),
-                    None,
-                    VortexSession::default(),
-                    &account(&pool),
-                    FileSetVersion::default(),
-                )
-                .expect("finish")
-                .expect("the unbounded pool fits it");
-            assert!(
-                index.shapes[0].blocks() > 4,
-                "fixture must span many blocks"
-            );
-            assert_eq!(
-                index.shapes[0].distinct_keys,
-                expected.len(),
-                "width {width}"
-            );
-
-            for (values, addresses) in &expected {
-                let hit = index
-                    .probe(&|column| {
-                        let at = key_columns.iter().position(|c| *c == column)?;
-                        scalar(column, &values[at])
-                    })
-                    .expect("pinned key");
-                let mut found: Vec<(String, u64)> = hit
-                    .per_file
-                    .iter()
-                    .flat_map(|(path, positions)| positions.iter().map(|p| (path.clone(), *p)))
-                    .collect();
-                found.sort();
-                let mut wanted = addresses.clone();
-                wanted.sort();
-                assert_eq!(found, wanted, "width {width}, key {values:?}");
-            }
-
-            // Tenants run 0..7, so 99 is absent at every width.
-            let absent = ["99", "absent", "nowhere"];
-            let miss = index
-                .probe(&|column| {
-                    let at = key_columns.iter().position(|c| *c == column)?;
-                    scalar(column, absent[at])
-                })
-                .expect("pinned key");
-            assert!(miss.per_file.is_empty(), "width {width}");
-            let null = index
-                .probe(&|column| {
-                    let at = key_columns.iter().position(|c| *c == column)?;
-                    scalar(column, if at == 0 { "NULL" } else { "s1" })
-                })
-                .expect("pinned key");
-            assert!(null.per_file.is_empty(), "width {width}");
-            assert!(
-                index
-                    .probe(&|column| (column == "service").then(|| ScalarValue::from("s1")))
-                    .is_none()
-                    || width == 1,
-                "a key with an unpinned column must not be answered"
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn runtime_probe_declines_inputs_over_its_bounds_and_rebuilds_stale_indexes() {
-        let rows = 4_096usize;
-        let pool = unbounded_pool();
-        let table = account(&pool);
-        let files = vec![IndexedFile {
-            path: "snapshot/file.vortex".to_string(),
-            size: 1,
-            last_modified_ms: 0,
-        }];
-        let mut build = BuildState::new(
-            &[spec(&["tenant"])],
-            build_reservation(&pool),
-            &keyed_schema(),
-        )
-        .expect("build state");
-        let file_id = build.file_id(&files[0].path).expect("file id");
-        build
-            .ingest(
-                file_id,
-                RowPositions::Contiguous(0),
-                &keyed_batch(
-                    vec![Some(7); rows],
-                    vec![Some("service".to_string()); rows],
-                    vec![None; rows],
-                ),
-                &files[0].path,
-            )
-            .expect("ingest");
-        let index = Arc::new(
-            build
-                .into_index(
-                    "snapshot".to_string(),
-                    &files,
-                    Instant::now(),
-                    None,
-                    VortexSession::default(),
-                    &table,
-                    FileSetVersion::default(),
-                )
-                .expect("finish")
-                .expect("fits"),
-        );
-        let columns = vec!["tenant".to_string()];
-        let keys = vec![vec![ScalarValue::Int64(Some(7))]];
-
-        assert!(
-            index.probe_keys(&columns, &keys, 100).is_none(),
-            "the probe must fall back before materializing an oversized posting list"
-        );
-        assert_eq!(
-            index
-                .probe_keys(&columns, &keys, rows)
-                .expect("bounded hit")
-                .rows,
-            rows
-        );
-
-        let state = LookupIndexState::new(
-            "bounded_runtime_probe",
-            vec![spec(&["tenant"])],
-            Arc::clone(&pool),
-            Arc::clone(&table),
-            Arc::default(),
-        )
-        .expect("state");
-        state.store_index(Some(index));
-        let indexed = scan_file(&files[0].path);
-        assert!(matches!(
-            state.probe_runtime_filter(
-                &spec(&["tenant"]),
-                state.published().as_ref(),
-                "snapshot",
-                FileSetVersion::default(),
-                std::slice::from_ref(&indexed),
-                &keys,
-            ),
-            RuntimeProbe::Declined
-        ));
-        assert_eq!(state.counters().runtime_fallback, 1);
-
-        let column = Arc::new(Column::new("tenant", 0)) as Arc<dyn PhysicalExpr>;
-        let builds = BuildRequests::default();
-        let provider = |scan_files: Vec<ObjectMeta>, visible_file_set| {
-            Arc::new(DynamicLookupAccessPlanProvider::new(
-                Arc::clone(&state),
-                state.published(),
-                "snapshot".to_string(),
-                visible_file_set,
-                scan_files.into(),
-                Some(builds.callback()),
-            ))
-        };
-
-        // An oversized key set is declined once per filter, not once per file
-        // open, and no index build could help it.
-        let too_many_keys: Vec<i64> = (0..=RUNTIME_INDEX_MAX_KEYS)
-            .map(|value| i64::try_from(value).expect("small"))
-            .collect();
-        let oversized = completed_dynamic_filter(&column, &too_many_keys);
-        let scan = provider(vec![indexed.clone()], FileSetVersion::default());
-        for _ in 0..3 {
-            assert!(scan.resolve(Some(&oversized)).await.is_none());
-        }
-        assert_eq!(state.counters().runtime_fallback, 2);
-        assert_eq!(builds.count(), 0);
-
-        // A scan file the index lacks, while the file set has not moved, means
-        // the scan predates the index: every concurrent opener sees one
-        // `snapshot_mismatch` outcome, and nothing is discarded.
-        let appended = scan_file("snapshot/appended.vortex");
-        let predicate = completed_dynamic_filter(&column, &[8]);
-        let scan = provider(
-            vec![indexed.clone(), appended.clone()],
-            FileSetVersion::default(),
-        );
-        let resolved =
-            futures::future::join_all((0..8).map(|_| scan.resolve(Some(&predicate)))).await;
-        assert!(resolved.iter().all(Option::is_none));
-        let counters = state.counters();
-        assert_eq!(counters.snapshot_mismatch, 1);
-        assert_eq!(
-            counters.empty + counters.selected,
-            0,
-            "a probe the file set refuses must not also count as answered"
-        );
-        assert!(state.published().is_some());
-
-        // The same missing file in a view whose file set moved on since the index
-        // was listed proves the index stale: it is discarded and one replacement
-        // build is requested.
-        let scan = provider(
-            vec![indexed, appended],
-            FileSetVersion {
-                dir_generation: 1,
-                listing_epoch: 0,
-            },
-        );
-        assert!(scan.resolve(Some(&predicate)).await.is_none());
-        assert_eq!(state.counters().snapshot_mismatch, 2);
-        assert!(state.published().is_none(), "the stale index is discarded");
-        assert_eq!(
-            builds.count(),
-            2,
-            "each refused scan requests a build; the schedule decides whether one runs"
-        );
-    }
-
-    /// A full refresh can publish the next snapshot's index while a join that
-    /// was planned against the previous snapshot is still building its hash
-    /// table. The join probes the index its view pinned, which matches what it
-    /// reads, and leaves the newer index alone.
-    #[tokio::test]
-    async fn a_runtime_probe_planned_before_a_refresh_keeps_the_newer_index() {
-        let pool = unbounded_pool();
-        let table = account(&pool);
-        let state = LookupIndexState::new(
-            "refreshed_during_join",
-            vec![spec(&["tenant"])],
-            Arc::clone(&pool),
-            Arc::clone(&table),
-            Arc::default(),
-        )
-        .expect("state");
-        let scan = |pinned: &Arc<SnapshotLookupIndex>, snapshot: &str| {
-            DynamicLookupAccessPlanProvider::new(
-                Arc::clone(&state),
-                Some(Arc::clone(pinned)),
-                snapshot.to_string(),
-                FileSetVersion::default(),
-                vec![scan_file(&format!("{snapshot}/file.vortex"))].into(),
-                None,
-            )
-        };
-        let column = Arc::new(Column::new("tenant", 0)) as Arc<dyn PhysicalExpr>;
-        let predicate = completed_dynamic_filter(&column, &[1]);
-
-        let planned = tiny_index(&pool, &table, "s1");
-        state.store_index(Some(Arc::clone(&planned)));
-        let join = scan(&planned, "s1");
-        let refreshed = tiny_index(&pool, &table, "s2");
-        state.store_index(Some(Arc::clone(&refreshed)));
-
-        assert!(
-            join.resolve(Some(&predicate)).await.is_some(),
-            "the join still answers from the index its view pinned"
-        );
-        assert_eq!(state.counters().snapshot_mismatch, 0);
-        assert!(
-            state
-                .published()
-                .is_some_and(|index| Arc::ptr_eq(&index, &refreshed)),
-            "the refreshed snapshot's index stays published"
-        );
-
-        // A view that pinned an index older than its own snapshot refuses it,
-        // and discards it only while it is still the published one.
-        assert!(
-            scan(&planned, "s2")
-                .resolve(Some(&predicate))
-                .await
-                .is_none()
-        );
-        assert!(
-            state
-                .published()
-                .is_some_and(|index| Arc::ptr_eq(&index, &refreshed)),
-            "a newer index is never discarded in place of a stale one"
-        );
-        state.store_index(Some(Arc::clone(&planned)));
-        assert!(
-            scan(&planned, "s2")
-                .resolve(Some(&predicate))
-                .await
-                .is_none()
-        );
-        assert!(state.published().is_none(), "the stale index is discarded");
-        assert_eq!(state.counters().snapshot_mismatch, 2);
-    }
-
-    /// A single shifted address is reported, so the read-back verification can
-    /// actually fail.
-    #[test]
-    fn verification_reports_a_shifted_address() {
-        let files = vec![IndexedFile {
-            path: "snapshot/file.vortex".to_string(),
-            size: 1,
-            last_modified_ms: 0,
-        }];
-        let pool = unbounded_pool();
-        let index_with = |shift: u64| {
-            let mut build = BuildState::new(
-                &[spec(&["tenant", "service"])],
-                build_reservation(&pool),
-                &keyed_schema(),
-            )
-            .expect("build state");
-            let file_id = build.file_id(&files[0].path).expect("file id");
-            build
-                .ingest(
-                    file_id,
-                    RowPositions::Contiguous(shift),
-                    &keyed_batch(
-                        vec![Some(1), Some(2)],
-                        vec![Some("a".to_string()), Some("b".to_string())],
-                        vec![None, None],
-                    ),
-                    &files[0].path,
-                )
-                .expect("ingest");
-            build
-                .into_index(
-                    "snapshot".to_string(),
-                    &files,
-                    Instant::now(),
-                    None,
-                    VortexSession::default(),
-                    &account(&pool),
-                    FileSetVersion::default(),
-                )
-                .expect("finish")
-                .expect("the unbounded pool fits it")
-        };
-        assert!(diff_indexes(&index_with(0), &index_with(0)).agrees());
-        let report = diff_indexes(&index_with(1), &index_with(0));
-        assert!(!report.agrees());
-        assert_eq!(
-            report.keys_per_shape,
-            vec![("(tenant, service)".to_string(), 2, 2)]
-        );
-    }
-
-    /// A build the pool cannot fit gives back what it accumulated at once, and
-    /// a published index holds its bytes in the account only while it lives.
-    #[test]
-    fn index_memory_is_admitted_by_the_pool_and_released_with_the_index() {
-        let rows = 4_096usize;
-        let batch = keyed_batch(
-            (0..rows).map(|i| i64::try_from(i).ok()).collect(),
-            (0..rows).map(|i| Some(format!("service-{i:08}"))).collect(),
-            vec![None; rows],
-        );
-        let files = vec![IndexedFile {
-            path: "snapshot/file.vortex".to_string(),
-            size: 1,
-            last_modified_ms: 0,
-        }];
-
-        let small: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(16 * 1024));
-        let mut refused = BuildState::new(
-            &[spec(&["tenant", "service"])],
-            build_reservation(&small),
-            &keyed_schema(),
-        )
-        .expect("build state");
-        refused
-            .ingest(0, RowPositions::Contiguous(0), &batch, &files[0].path)
-            .expect("ingest");
-        assert!(refused.refused, "a 16 KiB pool cannot fit 4,096 keys");
-        assert_eq!(small.reserved(), 0, "a refused build holds nothing");
-        assert!(refused.shapes[0].postings.is_empty());
-
-        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64 * 1024 * 1024));
-        let table = account(&pool);
-        let mut fits = BuildState::new(
-            &[spec(&["tenant", "service"])],
-            build_reservation(&pool),
-            &keyed_schema(),
-        )
-        .expect("build state");
-        let file_id = fits.file_id(&files[0].path).expect("file id");
-        fits.ingest(file_id, RowPositions::Contiguous(0), &batch, &files[0].path)
-            .expect("ingest");
-        assert!(pool.reserved() > 0, "accumulated entries are reserved");
-        let index = fits
-            .into_index(
-                "snapshot".to_string(),
-                &files,
-                Instant::now(),
-                None,
-                VortexSession::default(),
-                &table,
-                FileSetVersion::default(),
-            )
-            .expect("finish")
-            .expect("fits");
-        let resident = index.reservation.bytes();
-        assert!(resident > 0);
-        assert_eq!(
-            pool.reserved(),
-            resident,
-            "only the resident index stays reserved"
-        );
-        assert_eq!(table.snapshot().lookup_index, resident);
-        drop(index);
-        assert_eq!(pool.reserved(), 0, "dropping the index releases its bytes");
-        assert_eq!(table.snapshot().lookup_index, 0);
     }
 
     #[test]
@@ -3908,121 +3858,997 @@ mod tests {
         );
     }
 
-    fn tiny_index(
-        pool: &Arc<dyn MemoryPool>,
-        table: &Arc<CayenneMemoryAccount>,
-        snapshot: &str,
-    ) -> Arc<SnapshotLookupIndex> {
-        let files = vec![IndexedFile {
-            path: format!("{snapshot}/file.vortex"),
-            size: 1,
-            last_modified_ms: 0,
-        }];
-        let mut build = BuildState::new(
-            &[spec(&["tenant"])],
-            build_reservation(pool),
-            &keyed_schema(),
-        )
-        .expect("build state");
-        let file_id = build.file_id(&files[0].path).expect("file id");
-        build
-            .ingest(
-                file_id,
-                RowPositions::Contiguous(0),
-                &keyed_batch(vec![Some(1)], vec![Some("a".to_string())], vec![None]),
-                &files[0].path,
-            )
-            .expect("ingest");
-        Arc::new(
-            build
-                .into_index(
-                    snapshot.to_string(),
-                    &files,
-                    Instant::now(),
-                    None,
-                    VortexSession::default(),
-                    table,
-                    FileSetVersion::default(),
-                )
-                .expect("finish")
-                .expect("fits"),
-        )
+    fn keyed_schema() -> Arc<arrow_schema::Schema> {
+        Arc::new(arrow_schema::Schema::new(vec![
+            Field::new("tenant", DataType::Int64, true),
+            Field::new("service", DataType::Utf8, true),
+            Field::new("value", DataType::Int64, false),
+        ]))
     }
 
-    /// A background build publishes into a slot emptied while it ran — the index
-    /// it meant to replace went stale — but never over an index published by
-    /// someone else in the meantime.
-    #[tokio::test]
-    async fn a_build_fills_an_emptied_slot_but_never_overwrites_a_newer_index() {
-        let pool = unbounded_pool();
-        let table = account(&pool);
-        let state = LookupIndexState::new(
-            "overtaken",
-            vec![spec(&["tenant"])],
-            Arc::clone(&pool),
-            Arc::clone(&table),
-            Arc::default(),
+    fn keyed_batch(tenants: &[Option<i64>], services: &[Option<&str>]) -> RecordBatch {
+        let values: Vec<i64> = (0..tenants.len())
+            .map(|row| i64::try_from(row).expect("small"))
+            .collect();
+        RecordBatch::try_new(
+            keyed_schema(),
+            vec![
+                Arc::new(Int64Array::from(tenants.to_vec())),
+                Arc::new(StringArray::from(services.to_vec())),
+                Arc::new(Int64Array::from(values)),
+            ],
         )
-        .expect("state");
-        let old = tiny_index(&pool, &table, "s1");
-        state.store_index(Some(Arc::clone(&old)));
+        .expect("batch")
+    }
 
-        // A build claimed while `old` was published; `old` then goes stale.
-        let claimed = state.generation.load(Ordering::Acquire);
-        state.discard_stale(&old);
-        drop(old);
-        assert!(state.published().is_none());
+    fn keyed_state(pool: &Arc<dyn MemoryPool>) -> Arc<LookupIndexState> {
+        LookupIndexState::new(
+            "keyed",
+            vec![spec(&["tenant"]), spec(&["tenant", "service"])],
+            &keyed_schema(),
+            Arc::clone(pool),
+            account(pool),
+            Arc::default(),
+            None,
+        )
+        .expect("indexable")
+        .expect("state")
+    }
+
+    /// A table whose writes keep failing to index warns once, not on every
+    /// write, until runs publish again.
+    #[tokio::test]
+    async fn a_failing_write_warns_once_until_runs_publish() {
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64 << 20));
+        let state = keyed_state(&pool);
+        state.write_unindexed("first");
+        assert!(state.write_failure.warned(), "the first failure warns");
+        state.write_unindexed("second");
+        write(
+            &state,
+            &[("a.vortex", 0, keyed_batch(&[Some(1)], &[Some("x")]))],
+        )
+        .await;
+        assert!(
+            !state.write_failure.warned(),
+            "a failure after runs published warns again"
+        );
+        state.write_unindexed("after a publish");
+        assert_eq!(state.counters().builds_unpublished, 3);
+    }
+
+    /// A join's runtime probe answers for the files its scan reads, and no
+    /// other: a key held only by a file outside the scan selects nothing there,
+    /// so the probe is fully covered and reads nothing, not a selection of a
+    /// file the scan never opens.
+    #[tokio::test]
+    async fn a_runtime_probe_counts_only_the_files_its_scan_reads() {
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64 << 20));
+        let state = keyed_state(&pool);
+        write(
+            &state,
+            &[("a.vortex", 0, keyed_batch(&[Some(1)], &[Some("x")]))],
+        )
+        .await;
+        write(
+            &state,
+            &[("b.vortex", 0, keyed_batch(&[Some(2)], &[Some("y")]))],
+        )
+        .await;
+        let view = state.published();
+        let scan = [scan_file("table/snapshot/a.vortex")];
+        let before = state.counters();
+        let probed =
+            state.probe_runtime_filter(0, &view, &scan, &[vec![ScalarValue::Int64(Some(2))]]);
+        let after = state.counters();
+        assert!(
+            matches!(
+                probed,
+                RuntimeProbe::Selection {
+                    uncovered: false,
+                    ..
+                }
+            ),
+            "the scan's one file is covered"
+        );
         assert_eq!(
-            table.snapshot().lookup_index,
-            0,
-            "a dropped stale index holds nothing"
+            (
+                after.full - before.full,
+                after.partial - before.partial,
+                after.candidate_files - before.candidate_files
+            ),
+            (1, 0, 0),
+            "a key only in a file the scan does not read is a fully covered probe that reads nothing: {before:?} -> {after:?}"
         );
-        let rebuilt = tiny_index(&pool, &table, "s2");
-        assert!(state.publish_unless_overtaken(claimed, Arc::clone(&rebuilt)));
-        assert!(
+    }
+
+    /// A schema change resets the index of exactly the keys whose encoding it
+    /// changes: `service` becoming `LargeUtf8` changes `(tenant, service)`,
+    /// whose index then covers nothing until it is rebuilt, and leaves
+    /// `tenant`'s index as it was. A key column of a type the index cannot hold
+    /// is refused before anything is swapped.
+    #[tokio::test]
+    async fn a_schema_change_resets_only_the_keys_whose_encoding_it_changes() {
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64 << 20));
+        let state = keyed_state(&pool);
+        write(
+            &state,
+            &[(
+                "a.vortex",
+                0,
+                keyed_batch(&[Some(1), Some(2)], &[Some("x"), Some("y")]),
+            )],
+        )
+        .await;
+        let covers = |state: &LookupIndexState| -> Vec<bool> {
             state
-                .published()
-                .is_some_and(|index| Arc::ptr_eq(&index, &rebuilt))
+                .shapes
+                .load()
+                .iter()
+                .map(|shape| shape.index.view().covers("a.vortex"))
+                .collect()
+        };
+        assert_eq!(covers(&state), vec![true, true]);
+
+        let nested = arrow_schema::Schema::new(vec![
+            Field::new(
+                "tenant",
+                DataType::List(Arc::new(Field::new("item", DataType::Int64, true))),
+                true,
+            ),
+            Field::new("service", DataType::Utf8, true),
+            Field::new("value", DataType::Int64, false),
+        ]);
+        let refused = state
+            .shapes_for(&nested)
+            .err()
+            .expect("a nested key is refused");
+        assert!(refused.contains("tenant"), "{refused}");
+        assert_eq!(
+            covers(&state),
+            vec![true, true],
+            "a refused change swaps nothing"
         );
 
-        // A build claimed before a newer index is published never replaces it.
-        let claimed = state.generation.load(Ordering::Acquire);
-        let newer = tiny_index(&pool, &table, "s3");
-        state.store_index(Some(Arc::clone(&newer)));
-        assert!(!state.publish_unless_overtaken(claimed, tiny_index(&pool, &table, "s2")));
+        let large = arrow_schema::Schema::new(vec![
+            Field::new("tenant", DataType::Int64, true),
+            Field::new("service", DataType::LargeUtf8, true),
+            Field::new("value", DataType::Int64, false),
+        ]);
+        state.adopt_shapes(state.shapes_for(&large).expect("indexable"));
+        assert_eq!(
+            covers(&state),
+            vec![true, false],
+            "only the key whose encoding changed is reset"
+        );
+        let view = state.published();
         assert!(
-            state
-                .published()
-                .is_some_and(|index| Arc::ptr_eq(&index, &newer))
+            !view.covers("table/snapshot/a.vortex"),
+            "the published view must not cover a file the reset key does not"
+        );
+    }
+
+    fn path(name: &str) -> object_store::path::Path {
+        object_store::path::Path::from(format!("table/snapshot/{name}"))
+    }
+
+    /// Writes `batches` through a write observer, each as `(file, first
+    /// position, batch)`, and publishes the write's runs.
+    async fn write(state: &Arc<LookupIndexState>, batches: &[(&str, u64, RecordBatch)]) {
+        use vortex_datafusion::VortexWriteObserver;
+        let observer = state.write_observer(false);
+        for (file, first, batch) in batches {
+            observer.batch_written(&path(file), *first, batch);
+        }
+        state.finish_write(&observer).await;
+    }
+
+    /// With its indexing thread behind and its queue full, an append drops
+    /// its run (its files are read in full until a background build indexes
+    /// them) rather than wait, while a rewrite indexes the overflow itself, so
+    /// every file it swaps in is covered.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_full_queue_drops_an_append_but_not_a_rewrite() {
+        use vortex_datafusion::VortexWriteObserver;
+        for replaces in [false, true] {
+            let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+            let state = keyed_state(&pool);
+            let (go, gate) = std::sync::mpsc::channel();
+            // A one-byte queue: every batch finds it full.
+            let observer = state.write_observer_with(replaces, 1, Some(gate));
+            let files: Vec<String> = (0..6).map(|i| format!("f{i}.vortex")).collect();
+            for (i, file) in files.iter().enumerate() {
+                let tenant = i64::try_from(i).expect("small");
+                let services: Vec<String> = (0..10).map(|row| format!("s{i}-{row}")).collect();
+                let services: Vec<Option<&str>> =
+                    services.iter().map(|s| Some(s.as_str())).collect();
+                observer.batch_written(
+                    &path(file),
+                    0,
+                    &keyed_batch(&[Some(tenant); 10], &services),
+                );
+            }
+            go.send(()).expect("release the indexing thread");
+            let unpublished = state.counters.builds_unpublished.load(Ordering::Relaxed);
+            state.finish_write(&observer).await;
+            let covered: Vec<bool> = files
+                .iter()
+                .map(|file| state.published().covers(&format!("table/snapshot/{file}")))
+                .collect();
+            let unpublished =
+                state.counters.builds_unpublished.load(Ordering::Relaxed) - unpublished;
+            if replaces {
+                assert_eq!(
+                    (
+                        covered,
+                        observer.shared.inline_batches.load(Ordering::Relaxed),
+                        unpublished
+                    ),
+                    (vec![true; 6], 6, 0),
+                    "a rewrite must cover every file it writes"
+                );
+            } else {
+                assert_eq!(
+                    (covered, unpublished),
+                    (vec![false; 6], 1),
+                    "an append that outpaced its index must drop its run"
+                );
+            }
+        }
+    }
+
+    /// A write whose rows cannot all be indexed publishes no run, so none of
+    /// its files is covered and a lookup reads them in full. The case that
+    /// matters is a file whose first batch indexed and whose second did not:
+    /// publishing that run would claim the file while missing the second
+    /// batch's rows, and a lookup for them would skip the file.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_write_that_fails_to_index_covers_none_of_its_files() {
+        use vortex_datafusion::VortexWriteObserver;
+        // A batch without the `service` key column.
+        let unkeyed = RecordBatch::try_new(
+            Arc::new(arrow_schema::Schema::new(vec![Field::new(
+                "tenant",
+                DataType::Int64,
+                true,
+            )])),
+            vec![Arc::new(Int64Array::from(vec![Some(7_i64); 3]))],
+        )
+        .expect("batch");
+        for replaces in [false, true] {
+            let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+            let state = keyed_state(&pool);
+            let observer = state.write_observer(replaces);
+            observer.batch_written(
+                &path("good.vortex"),
+                0,
+                &keyed_batch(&[Some(1); 3], &[Some("a"), Some("b"), Some("c")]),
+            );
+            observer.batch_written(
+                &path("split.vortex"),
+                0,
+                &keyed_batch(&[Some(7); 3], &[Some("x"), Some("y"), Some("z")]),
+            );
+            observer.batch_written(&path("split.vortex"), 3, &unkeyed);
+            let unpublished = state.counters.builds_unpublished.load(Ordering::Relaxed);
+            state.finish_write(&observer).await;
+            let covered: Vec<bool> = ["good.vortex", "split.vortex"]
+                .iter()
+                .map(|file| state.published().covers(&format!("table/snapshot/{file}")))
+                .collect();
+            assert_eq!(
+                (
+                    covered,
+                    state.counters.builds_unpublished.load(Ordering::Relaxed) - unpublished
+                ),
+                (vec![false, false], 1),
+                "a write with an unindexed batch (replaces: {replaces}) must cover none of its files"
+            );
+            assert_eq!(
+                state.counters().index_bytes,
+                0,
+                "an unpublished run holds nothing"
+            );
+        }
+    }
+
+    /// Coverage counts the table's current files per key: none before a scan
+    /// has listed them, then the files a published run holds against the
+    /// rest, following publishes and retirements.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn coverage_counts_each_keys_covered_and_uncovered_files() {
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let state = keyed_state(&pool);
+        assert_eq!(state.coverage(), None, "no file set listed yet");
+        let files = ["a.vortex", "b.vortex", "c.vortex"];
+        state.reconcile(
+            "s1",
+            FileSetVersion::default(),
+            files
+                .iter()
+                .map(|file| format!("table/snapshot/{file}"))
+                .collect::<Vec<_>>()
+                .iter()
+                .map(String::as_str),
+        );
+        assert_eq!(
+            state.coverage(),
+            Some(vec![
+                ("tenant".to_string(), 0, 3),
+                ("(tenant, service)".to_string(), 0, 3)
+            ])
+        );
+        write(
+            &state,
+            &[(
+                "a.vortex",
+                0,
+                keyed_batch(&[Some(1); 2], &[Some("x"), Some("y")]),
+            )],
+        )
+        .await;
+        assert_eq!(
+            state.coverage(),
+            Some(vec![
+                ("tenant".to_string(), 1, 2),
+                ("(tenant, service)".to_string(), 1, 2)
+            ])
+        );
+    }
+
+    #[test]
+    fn the_loaded_runs_message_names_the_table_its_size_and_its_coverage() {
+        assert_eq!(
+            persisted_runs_loaded_message("orders", 5 << 20, 20, 20),
+            "Dataset 'orders' (cayenne): loaded its secondary index from disk (5.0 MiB), covering all 20 of its files"
+        );
+        assert_eq!(
+            persisted_runs_loaded_message("orders", 3 << 19, 18, 20),
+            "Dataset 'orders' (cayenne): loaded its secondary index from disk (1.5 MiB), covering 18 of its 20 files; the other 2 are indexed in the background"
+        );
+        assert_eq!(
+            persisted_runs_loaded_message("orders", 5 << 20, 4, 4),
+            "Dataset 'orders' (cayenne): loaded its secondary index from disk (5.0 MiB), covering all 4 of its files"
+        );
+    }
+
+    /// A batch that arrives after its write's index was finished has no run
+    /// to join: its file stays uncovered while the finished run still covers
+    /// the files it holds in full.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_batch_after_the_write_finished_leaves_its_file_uncovered() {
+        use vortex_datafusion::VortexWriteObserver;
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let state = keyed_state(&pool);
+        let observer = state.write_observer(false);
+        observer.batch_written(
+            &path("first.vortex"),
+            0,
+            &keyed_batch(&[Some(1); 2], &[Some("a"), Some("b")]),
+        );
+        state.finish_write(&observer).await;
+        observer.batch_written(
+            &path("late.vortex"),
+            0,
+            &keyed_batch(&[Some(2); 2], &[Some("c"), Some("d")]),
+        );
+        let view = state.published();
+        assert!(view.covers("table/snapshot/first.vortex"));
+        assert!(
+            !view.covers("table/snapshot/late.vortex"),
+            "a late batch's file must be read in full"
+        );
+    }
+
+    /// An append arrives in a burst far faster than its keys encode, and the
+    /// queue absorbs it: an ordinary append of many batches is covered, not
+    /// dropped as behind.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_burst_of_batches_is_queued_not_dropped() {
+        use vortex_datafusion::VortexWriteObserver;
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let state = keyed_state(&pool);
+        let observer = state.write_observer(false);
+        let names: Vec<String> = (0..1_000).map(|row| format!("s{row}")).collect();
+        let services: Vec<Option<&str>> = names.iter().map(|name| Some(name.as_str())).collect();
+        for batch in 0..200_u64 {
+            let tenant = i64::try_from(batch).expect("small");
+            observer.batch_written(
+                &path("burst.vortex"),
+                batch * 1_000,
+                &keyed_batch(&[Some(tenant); 1_000], &services),
+            );
+        }
+        let unpublished = state.counters.builds_unpublished.load(Ordering::Relaxed);
+        state.finish_write(&observer).await;
+        assert_eq!(
+            (
+                state.published().covers("table/snapshot/burst.vortex"),
+                state.counters.builds_unpublished.load(Ordering::Relaxed) - unpublished,
+            ),
+            (true, 0),
+            "an ordinary append must be indexed, not dropped as behind"
+        );
+    }
+
+    /// A write too large to finish on the write path has its run published
+    /// from the background even when its files are not yet visible — a
+    /// compaction can still be committing when its run is ready — so its
+    /// files end up covered rather than dropped as already gone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_large_write_is_covered_even_before_it_is_visible() {
+        use vortex_datafusion::VortexWriteObserver;
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let state = keyed_state(&pool);
+        let rows = DEFER_FINISH_ROWS + 1;
+        let tenants: Vec<Option<i64>> = (0..rows)
+            .map(|row| Some(i64::try_from(row % 1_000).expect("small")))
+            .collect();
+        let names: Vec<String> = (0..rows).map(|row| format!("s{row}")).collect();
+        let services: Vec<Option<&str>> = names.iter().map(|name| Some(name.as_str())).collect();
+        let observer = state.write_observer(false);
+        observer.batch_written(&path("large.vortex"), 0, &keyed_batch(&tenants, &services));
+        // No reconcile ever reports the file visible.
+        state.finish_write(&observer).await;
+        let deadline = Instant::now() + Duration::from_mins(1);
+        while !state.published().covers("table/snapshot/large.vortex") {
+            assert!(
+                Instant::now() < deadline,
+                "a large write's run was never published"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let view = state.published();
+        assert_eq!(view.rows, rows, "the run holds every row of the write");
+    }
+
+    fn tenant_values(values: &[i64]) -> impl Fn(&str) -> Option<Vec<ScalarValue>> + '_ {
+        move |column: &str| {
+            (column == "tenant").then(|| {
+                values
+                    .iter()
+                    .map(|v| ScalarValue::Int64(Some(*v)))
+                    .collect()
+            })
+        }
+    }
+
+    fn selection(probe: LookupProbe) -> LookupSelection {
+        match probe {
+            LookupProbe::Selection(selection) => selection,
+            LookupProbe::Fallback(explain) => panic!("expected a selection, got {explain:?}"),
+        }
+    }
+
+    fn group(names: &[&str]) -> Vec<FileGroup> {
+        vec![FileGroup::new(
+            names
+                .iter()
+                .map(|name| PartitionedFile::new(path(name).to_string(), 1))
+                .collect(),
+        )]
+    }
+
+    fn no_table_plans() -> Arc<dyn VortexAccessPlanProvider> {
+        Arc::new(NoPlans)
+    }
+
+    #[derive(Debug)]
+    struct NoPlans;
+
+    impl VortexAccessPlanProvider for NoPlans {
+        fn access_plan_for_file(&self, _: &PartitionedFile) -> Option<Arc<VortexAccessPlan>> {
+            None
+        }
+
+        fn adjust_statistics(&self, _: &ObjectMeta, statistics: Statistics) -> Statistics {
+            statistics
+        }
+    }
+
+    /// `(file, position)` rows of one key.
+    type FileRows = Vec<(String, u64)>;
+
+    /// Every write, file roll and batch boundary lands where a brute-force
+    /// map of the written rows says, for single and composite keys, single
+    /// values and `IN` lists, and NULL keys never match.
+    #[tokio::test]
+    async fn written_rows_probe_like_a_brute_force_map() {
+        let pool = unbounded_pool();
+        let state = keyed_state(&pool);
+        let mut truth: std::collections::BTreeMap<(i64, Option<String>), FileRows> =
+            std::collections::BTreeMap::new();
+        for write_no in 0..3_i64 {
+            let mut batches = Vec::new();
+            for file_no in 0..2 {
+                let file = format!("w{write_no}_p00{file_no}_00000.vortex");
+                let mut first = 0_u64;
+                for batch_no in 0..3_i64 {
+                    let rows = 50;
+                    let tenants: Vec<Option<i64>> = (0..rows)
+                        .map(|row| (row % 11 != 0).then_some((row * 7 + batch_no + write_no) % 13))
+                        .collect();
+                    let services: Vec<Option<String>> = (0..rows)
+                        .map(|row| (row % 5 != 0).then(|| format!("s{}", row % 3)))
+                        .collect();
+                    let service_refs: Vec<Option<&str>> =
+                        services.iter().map(Option::as_deref).collect();
+                    for (row, tenant) in tenants.iter().enumerate() {
+                        if let Some(tenant) = tenant {
+                            truth
+                                .entry((*tenant, services[row].clone()))
+                                .or_default()
+                                .push((file.clone(), first + row as u64));
+                        }
+                    }
+                    batches.push((file.clone(), first, keyed_batch(&tenants, &service_refs)));
+                    first += rows.cast_unsigned();
+                }
+            }
+            let batches: Vec<(&str, u64, RecordBatch)> = batches
+                .iter()
+                .map(|(file, first, batch)| (file.as_str(), *first, batch.clone()))
+                .collect();
+            write(&state, &batches).await;
+        }
+        let view = state.published();
+        let flatten = |per_file: &HashMap<String, Vec<u64>>| {
+            let mut rows: Vec<(String, u64)> = per_file
+                .iter()
+                .flat_map(|(file, positions)| positions.iter().map(|p| (file.clone(), *p)))
+                .collect();
+            rows.sort();
+            rows
+        };
+        // Single tenants, and IN lists of them.
+        for tenants in [
+            vec![0],
+            vec![5],
+            vec![12],
+            vec![99],
+            vec![1, 4, 9],
+            vec![3, 3, 99],
+        ] {
+            let hit = selection(state.probe(&view, &tenant_values(&tenants)));
+            let mut expected: Vec<(String, u64)> = truth
+                .iter()
+                .filter(|((tenant, _), _)| tenants.contains(tenant))
+                .flat_map(|(_, rows)| rows.clone())
+                .collect();
+            expected.sort();
+            expected.dedup();
+            assert_eq!(flatten(&hit.per_file), expected, "tenants {tenants:?}");
+        }
+        // Composite keys: every (tenant, service) combination, and a NULL.
+        let composite = |tenant: i64, services: &[Option<&str>]| {
+            let services: Vec<ScalarValue> = services
+                .iter()
+                .map(|service| ScalarValue::Utf8(service.map(str::to_string)))
+                .collect();
+            move |column: &str| match column {
+                "tenant" => Some(vec![ScalarValue::Int64(Some(tenant))]),
+                "service" => Some(services.clone()),
+                _ => None,
+            }
+        };
+        for tenant in 0..13 {
+            let values = composite(tenant, &[Some("s0"), Some("s2"), None]);
+            // The single-column key is declared first, so pin it out.
+            let shape = state.matched_shape(&values).expect("a key");
+            assert_eq!(state.shape_label(shape), "tenant");
+            let keys = key_tuples(&["tenant".to_string(), "service".to_string()], &values)
+                .expect("bounded");
+            let encoded = state.shapes.load()[1].encode_keys(&keys).expect("encodes");
+            assert_eq!(encoded.iter().filter(|key| key.is_none()).count(), 1);
+            let hit = view.probe_keys(1, &encoded, None, None).expect("unbounded");
+            let mut expected: Vec<(String, u64)> = ["s0", "s2"]
+                .iter()
+                .filter_map(|service| truth.get(&(tenant, Some((*service).to_string()))))
+                .flatten()
+                .cloned()
+                .collect();
+            expected.sort();
+            assert_eq!(flatten(&hit.per_file), expected, "tenant {tenant}");
+        }
+        // A NULL literal matches nothing.
+        let null = |column: &str| (column == "tenant").then(|| vec![ScalarValue::Int64(None)]);
+        assert!(selection(state.probe(&view, &null)).per_file.is_empty());
+    }
+
+    /// Every key persists its runs in a directory of its own, named by a
+    /// 128-bit digest; keys that shared one would load each other's runs, so
+    /// a set of directories with a repeat is refused.
+    #[test]
+    fn every_key_persists_in_a_directory_of_its_own() {
+        let pool = unbounded_pool();
+        let state = keyed_state(&pool);
+        let dirs: Vec<String> = state
+            .shapes
+            .load()
+            .iter()
+            .map(|shape| shape.persisted_dir())
+            .collect();
+        assert_eq!(dirs.len(), 2);
+        assert!(
+            dirs.iter()
+                .all(|dir| dir.len() == 32 && dir.chars().all(|c| c.is_ascii_hexdigit())),
+            "{dirs:?}"
+        );
+        assert!(distinct_dirs(dirs.iter().map(String::as_str)), "{dirs:?}");
+        assert!(!distinct_dirs(
+            [dirs[0].as_str(), dirs[1].as_str(), dirs[0].as_str()].into_iter()
+        ));
+    }
+
+    #[tokio::test]
+    async fn a_scan_reads_uncovered_files_in_full_and_narrows_covered_ones() {
+        let pool = unbounded_pool();
+        let state = keyed_state(&pool);
+        write(
+            &state,
+            &[(
+                "a.vortex",
+                0,
+                keyed_batch(&[Some(1), Some(2), Some(1)], &[None, None, None]),
+            )],
+        )
+        .await;
+        let view = state.published();
+        assert!(view.covers(path("a.vortex").as_ref()));
+        assert!(
+            view.covers("another/dir/a.vortex"),
+            "coverage follows the file name, not the directory it moved to"
+        );
+        assert!(!view.covers(path("b.vortex").as_ref()));
+
+        // Key 1 is at rows 0 and 2 of `a`; `b` is unindexed, so read whole.
+        let (groups, provider, explain, uncovered) =
+            selection(state.probe(&view, &tenant_values(&[1])))
+                .restrict(group(&["a.vortex", "b.vortex"]), no_table_plans());
+        assert!(uncovered);
+        assert_eq!(
+            explain.outcome,
+            LookupIndexExplainOutcome::Probed(Coverage::Partial)
+        );
+        assert_eq!(
+            (explain.candidate_files, explain.uncovered_files),
+            (Some(2), Some(1)),
+            "the uncovered file is a candidate, and reported as read in full"
+        );
+        let files: Vec<&PartitionedFile> = groups.iter().flat_map(FileGroup::iter).collect();
+        assert_eq!(files.len(), 2);
+        let provider = provider.expect("a selection");
+        let plan_a = provider.access_plan_for_file(files[0]).expect("covered");
+        assert_eq!(
+            format!("{:?}", plan_a.selection()),
+            format!(
+                "{:?}",
+                Some(&include_by_index(&Buffer::from(vec![0_u64, 2])))
+            ),
+        );
+        assert!(
+            provider.access_plan_for_file(files[1]).is_none(),
+            "an uncovered file is read as the table reads it"
+        );
+
+        // A key in no covered file drops `a` but still reads `b`: the coverage
+        // is partial.
+        let (groups, _, explain, uncovered) = selection(state.probe(&view, &tenant_values(&[7])))
+            .restrict(group(&["a.vortex", "b.vortex"]), no_table_plans());
+        assert!(uncovered);
+        assert_eq!(
+            explain.outcome,
+            LookupIndexExplainOutcome::Probed(Coverage::Partial)
+        );
+        assert_eq!(
+            (explain.candidate_files, explain.uncovered_files),
+            (Some(1), Some(1))
+        );
+        let names: Vec<String> = groups
+            .iter()
+            .flat_map(FileGroup::iter)
+            .map(|file| file.object_meta.location.to_string())
+            .collect();
+        assert_eq!(names, vec![path("b.vortex").to_string()]);
+
+        // Only covered files: full coverage, and an answer of no rows reads
+        // nothing.
+        let (groups, provider, explain, uncovered) =
+            selection(state.probe(&view, &tenant_values(&[7])))
+                .restrict(group(&["a.vortex"]), no_table_plans());
+        assert!(!uncovered && groups.is_empty() && provider.is_none());
+        assert_eq!(
+            explain.outcome,
+            LookupIndexExplainOutcome::Probed(Coverage::Full)
+        );
+
+        // Only uncovered files: nothing to narrow.
+        let (_, provider, explain, uncovered) = selection(state.probe(&view, &tenant_values(&[1])))
+            .restrict(group(&["b.vortex"]), no_table_plans());
+        assert!(uncovered && provider.is_none());
+        assert_eq!(
+            explain.outcome,
+            LookupIndexExplainOutcome::Probed(Coverage::Unindexed)
+        );
+        assert_eq!(
+            (explain.candidate_files, explain.uncovered_files),
+            (Some(1), Some(1))
+        );
+    }
+
+    /// A lookup over several snapshots is counted once, with the coverage
+    /// `EXPLAIN` reports for the whole scan: a current snapshot the index
+    /// covers and a protected one it does not make a partly covered lookup,
+    /// and a current snapshot with no files leaves the protected one's `none`.
+    #[tokio::test]
+    async fn a_lookup_over_several_snapshots_is_counted_with_its_merged_coverage() {
+        let pool = unbounded_pool();
+        let state = keyed_state(&pool);
+        write(&state, &[("a.vortex", 0, keyed_batch(&[Some(1)], &[None]))]).await;
+        let view = state.published();
+        let counts = |state: &LookupIndexState| {
+            let counters = state.counters.snapshot(0);
+            (counters.none, counters.partial, counters.full)
+        };
+        for (current, protected, expected) in [
+            (&["a.vortex"][..], &["b.vortex"][..], Coverage::Partial),
+            (&[][..], &["b.vortex"][..], Coverage::Unindexed),
+        ] {
+            let before = counts(&state);
+            let selection = selection(state.probe(&view, &tenant_values(&[1])));
+            let (_, _, protected_explain, _) = selection
+                .clone()
+                .restrict(group(protected), no_table_plans());
+            let (_, _, current_explain, _) = selection.restrict(group(current), no_table_plans());
+            let explain = current_explain.merge(protected_explain);
+            state.record_lookup(&explain);
+            let after = counts(&state);
+            let recorded = (after.0 - before.0, after.1 - before.1, after.2 - before.2);
+            let reported = match explain.outcome {
+                LookupIndexExplainOutcome::Probed(Coverage::Unindexed) => (1, 0, 0),
+                LookupIndexExplainOutcome::Probed(Coverage::Partial) => (0, 1, 0),
+                LookupIndexExplainOutcome::Probed(Coverage::Full) => (0, 0, 1),
+                LookupIndexExplainOutcome::NotApplicable => (0, 0, 0),
+            };
+            assert_eq!(
+                explain.outcome,
+                LookupIndexExplainOutcome::Probed(expected),
+                "{current:?} + {protected:?}"
+            );
+            assert_eq!(
+                recorded, reported,
+                "{current:?} + {protected:?}: the metric matches EXPLAIN"
+            );
+        }
+    }
+
+    /// A scan over several snapshots, one of them read in full, is one
+    /// decision: partly covered, with the snapshot read in full counted among
+    /// its candidate and uncovered files. Two fully covered snapshots stay
+    /// full, and two unindexed ones stay none.
+    #[test]
+    fn a_selection_merged_with_an_unindexed_snapshot_counts_its_files() {
+        let full = |files: usize| LookupIndexExplain {
+            uncovered_files: Some(0),
+            indexed_files: Some(files),
+            ..LookupIndexExplain::selection(
+                "TenantId".to_string(),
+                LookupIndexExplainOutcome::Probed(Coverage::Full),
+                Some(files),
+                4,
+            )
+        };
+        let unindexed = LookupIndexExplain {
+            candidate_files: Some(3),
+            uncovered_files: Some(3),
+            indexed_files: Some(0),
+            candidate_rows: None,
+            ..LookupIndexExplain::selection(
+                "TenantId".to_string(),
+                LookupIndexExplainOutcome::Probed(Coverage::Unindexed),
+                None,
+                0,
+            )
+        };
+        assert_eq!(
+            full(2).merge(full(1)).outcome,
+            LookupIndexExplainOutcome::Probed(Coverage::Full)
+        );
+        assert_eq!(
+            unindexed.clone().merge(unindexed.clone()).outcome,
+            LookupIndexExplainOutcome::Probed(Coverage::Unindexed)
+        );
+        for merged in [full(2).merge(unindexed.clone()), unindexed.merge(full(2))] {
+            assert_eq!(
+                merged.outcome,
+                LookupIndexExplainOutcome::Probed(Coverage::Partial)
+            );
+            assert_eq!(
+                (
+                    merged.candidate_files,
+                    merged.uncovered_files,
+                    merged.candidate_rows
+                ),
+                (Some(5), Some(3), Some(4)),
+                "{merged:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn retired_files_release_their_memory() {
+        let pool = unbounded_pool();
+        let state = keyed_state(&pool);
+        write(
+            &state,
+            &[("a.vortex", 0, keyed_batch(&[Some(1)], &[Some("x")]))],
+        )
+        .await;
+        write(
+            &state,
+            &[("b.vortex", 0, keyed_batch(&[Some(2)], &[Some("y")]))],
+        )
+        .await;
+        let charged = state.counters().index_bytes;
+        assert!(charged > 0, "published runs are charged");
+        assert_eq!(pool.reserved() as u64, charged);
+        let reconcile = |generation: u64, live: &[&str]| {
+            let live: Vec<String> = live.iter().map(|name| path(name).to_string()).collect();
+            state.reconcile(
+                "snapshot",
+                FileSetVersion {
+                    dir_generation: generation,
+                    listing_epoch: 0,
+                    protected: 0,
+                },
+                live.iter().map(String::as_str),
+            );
+        };
+        reconcile(1, &["a.vortex", "b.vortex"]);
+        // `a` was compacted away.
+        reconcile(2, &["b.vortex"]);
+        let view = state.published();
+        assert!(!view.covers("a.vortex") && view.covers("b.vortex"));
+        let after = state.counters().index_bytes;
+        assert!(
+            after < charged,
+            "{after} bytes still charged after retiring a run of {charged}"
+        );
+        assert_eq!(pool.reserved() as u64, after);
+        reconcile(3, &[]);
+        assert_eq!(state.counters().index_bytes, 0);
+        assert_eq!(pool.reserved(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_write_the_pool_cannot_fit_stays_uncovered() {
+        let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(64));
+        let state = keyed_state(&pool);
+        let tenants: Vec<Option<i64>> = (0..1_000).map(Some).collect();
+        let services: Vec<Option<&str>> = vec![Some("s"); 1_000];
+        write(&state, &[("a.vortex", 0, keyed_batch(&tenants, &services))]).await;
+        assert!(!state.published().covers("a.vortex"));
+        let counters = state.counters();
+        assert_eq!(
+            (counters.builds_published, counters.builds_unpublished),
+            (0, 1)
+        );
+        assert_eq!(pool.reserved(), 0, "the refused write released its memory");
+    }
+
+    #[tokio::test]
+    async fn a_failed_write_publishes_nothing() {
+        use vortex_datafusion::VortexWriteObserver;
+        let pool = unbounded_pool();
+        let state = keyed_state(&pool);
+        let observer = state.write_observer(false);
+        observer.batch_written(&path("a.vortex"), 0, &keyed_batch(&[Some(1)], &[None]));
+        // A batch without the key columns cannot be indexed.
+        let other = RecordBatch::try_new(
+            Arc::new(arrow_schema::Schema::new(vec![Field::new(
+                "value",
+                DataType::Int64,
+                false,
+            )])),
+            vec![Arc::new(Int64Array::from(vec![1]))],
+        )
+        .expect("batch");
+        observer.batch_written(&path("a.vortex"), 1, &other);
+        state.finish_write(&observer).await;
+        assert!(
+            !state.published().covers("a.vortex"),
+            "a run missing rows is never published"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_runtime_probe_selects_in_covered_files_and_requests_the_rest() {
+        let pool = unbounded_pool();
+        let state = keyed_state(&pool);
+        write(
+            &state,
+            &[(
+                "a.vortex",
+                0,
+                keyed_batch(&[Some(1), Some(2), Some(1)], &[None, None, None]),
+            )],
+        )
+        .await;
+        let builds = BuildRequests::default();
+        let scan_files: Arc<[ObjectMeta]> = Arc::new([
+            scan_file(path("a.vortex").as_ref()),
+            scan_file(path("b.vortex").as_ref()),
+        ]);
+        let provider = DynamicLookupAccessPlanProvider::new(
+            Arc::clone(&state),
+            state.published(),
+            scan_files,
+            Some(builds.callback()),
+        );
+        let column = Arc::new(Column::new("tenant", 0)) as Arc<dyn PhysicalExpr>;
+        let predicate = completed_dynamic_filter(&column, &[1]);
+        let file = |name: &str| PartitionedFile::new(path(name).to_string(), 1);
+        let covered = provider
+            .runtime_access_plan_for_file(&file("a.vortex"), Some(&predicate))
+            .await
+            .expect("a covered file is selected");
+        assert_eq!(
+            format!("{:?}", covered.selection()),
+            format!(
+                "{:?}",
+                Some(&include_by_index(&Buffer::from(vec![0_u64, 2])))
+            ),
+        );
+        assert!(
+            provider
+                .runtime_access_plan_for_file(&file("b.vortex"), Some(&predicate))
+                .await
+                .is_none(),
+            "an uncovered file is read as planned"
+        );
+        assert_eq!(
+            builds.count(),
+            1,
+            "the uncovered file is sent to be indexed"
+        );
+        assert_eq!(
+            state.counters().partial,
+            1,
+            "one probe per filter generation"
         );
     }
 
     #[tokio::test]
     async fn a_claim_dropped_before_its_build_runs_frees_the_slot() {
         let pool = unbounded_pool();
-        let state = LookupIndexState::new(
-            "claims",
-            vec![spec(&["tenant"])],
-            Arc::clone(&pool),
-            account(&pool),
-            Arc::default(),
-        )
-        .expect("state");
-        let claim = state.claim_build("snapshot").expect("first claim");
-        assert!(
-            state.claim_build("snapshot").is_none(),
-            "one build at a time"
-        );
+        let state = keyed_state(&pool);
+        let claim = state.claim_build().expect("first claim");
+        assert!(state.claim_build().is_none(), "one build at a time");
         drop(claim);
         let claim = state
-            .claim_build("snapshot")
+            .claim_build()
             .expect("a dropped claim frees the slot without delaying the next");
         claim.unpublished();
         assert!(
-            state.claim_build("snapshot").is_none(),
+            state.claim_build().is_none(),
             "a build that published nothing delays the next"
         );
         assert_eq!(state.counters().builds_started, 2);
         assert_eq!(state.counters().builds_unpublished, 1);
+    }
+
+    #[test]
+    fn nested_key_columns_are_refused() {
+        let nested = DataType::List(Arc::new(Field::new("item", DataType::Int64, true)));
+        assert!(supported_key_type(&nested).is_err());
+        for supported in [
+            DataType::Int64,
+            DataType::Utf8,
+            DataType::Utf8View,
+            DataType::Decimal128(20, 2),
+            DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+        ] {
+            supported_key_type(&supported).expect("indexable");
+        }
     }
 }

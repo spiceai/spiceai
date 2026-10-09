@@ -1580,8 +1580,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn metrics_stop_reporting_once_the_cache_is_dropped() {
+    #[tokio::test]
+    async fn metrics_stop_reporting_once_the_cache_is_dropped() {
         let harness = MetricsHarness::new();
         let (shared, _metrics) = harness.cache("retired", 1_024);
         let weak = Arc::downgrade(&shared);
@@ -1596,10 +1596,13 @@ mod tests {
 
         drop(cache);
         drop(shared);
-        assert!(
-            weak.upgrade().is_none(),
-            "observable callbacks must not keep the cache alive"
-        );
+        // Every harness's callbacks walk the process-wide `REGISTERED_CACHES`, so
+        // a sibling test collecting right now briefly holds this cache too; only a
+        // reference that outlives the bound is a leak.
+        wait_for("the metric callbacks to release the dropped cache", || {
+            weak.strong_count() == 0
+        })
+        .await;
 
         // Every series stops, counters included. The process cache lives in a
         // `OnceLock` for the process lifetime, so this only happens to a private
@@ -1613,6 +1616,7 @@ mod tests {
     async fn a_delta_reader_sees_the_live_cache_and_nothing_after_it_drops() {
         let harness = DeltaMetricsHarness::new();
         let (shared, _metrics) = harness.cache("delta", 1_024);
+        let weak = Arc::downgrade(&shared);
         let cache = shared.for_path(test_store(), Path::from("delta.vortex"));
         let id = SegmentId::from(1);
 
@@ -1631,6 +1635,11 @@ mod tests {
 
         drop(cache);
         drop(shared);
+        // Until it is freed, this harness's own next collection still reports it.
+        wait_for("the metric callbacks to release the dropped cache", || {
+            weak.strong_count() == 0
+        })
+        .await;
         // A callback run for one reader writes observations to every SDK
         // pipeline, so the other reader may still hold one buffered sample; its
         // first collection drains it.
@@ -2201,7 +2210,7 @@ mod tests {
     /// single poll deterministically at the first await after registration.
     #[tokio::test]
     async fn a_retirement_dropped_mid_flight_releases_its_registrations() {
-        let shared = SharedSegmentCache::new(1 << 20, true, "retirement");
+        let shared = SharedSegmentCache::new(1 << 20, true, "retirement-dropped");
         let keeper = Path::from("snapshot-a/keeper.vortex");
         let never_opened = Path::from("snapshot-a/never-opened.vortex");
         let states = shared

@@ -32,8 +32,8 @@ use data_connector_api::{
     DataConnectorResult, NewDataConnectorResult, parameters::ConnectorContext,
     write_back::WriteBackDeliverer,
 };
+use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
-use datafusion::sql::TableReference;
 use datafusion::sql::unparser::dialect::PostgreSqlDialect;
 use datafusion_table_providers::postgres::{DynPostgresConnectionPool, PostgresTableFactory};
 use datafusion_table_providers::sql::db_connection_pool::dbconnection;

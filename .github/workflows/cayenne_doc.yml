@@ -15,7 +15,8 @@ name: Build Cayenne doc PDF
 #
 # That determinism is also what lets this run on pull requests: it renders the
 # PDF to prove the document still builds (every mermaid block parses, WeasyPrint
-# succeeds) and uploads the result so a reviewer can read the rendered change.
+# succeeds). Pull request checks keep no artifacts, so to read the rendered
+# change, dispatch this workflow on the pull request's branch.
 
 on:
   pull_request:
@@ -144,10 +145,10 @@ jobs:
         working-directory: docs/cayenne
         run: python3 build_pdf.py
 
-      # Uploaded for every trigger: off trunk or a release branch it is that
-      # branch's linkable build, and on a pull request it is the rendered
-      # document under review.
+      # The linkable build of trunk, a release branch, or the dispatched branch.
+      # Not on a pull request: pull request checks keep no artifacts.
       - name: Upload Cayenne PDF artifact
+        if: github.event_name != 'pull_request'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: Cayenne.pdf

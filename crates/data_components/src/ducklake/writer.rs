@@ -35,6 +35,7 @@ use arrow::datatypes::SchemaRef;
 use arrow::ffi_stream::FFI_ArrowArrayStream;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
+use datafusion::common::TableReference;
 use datafusion::common::{Constraints, DataFusionError, SchemaExt};
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::sink::{DataSink, DataSinkExec};
@@ -44,7 +45,6 @@ use datafusion::logical_expr::{Expr, LogicalPlan, TableType};
 use datafusion::physical_plan::{
     DisplayAs, DisplayFormatType, ExecutionPlan, SendableRecordBatchStream,
 };
-use datafusion::sql::TableReference;
 use datafusion_federation::FederatedTableProviderAdaptor;
 use datafusion_table_providers::duckdb::DuckDB;
 use datafusion_table_providers::sql::db_connection_pool::duckdbpool::DuckDbConnectionPool;
@@ -210,6 +210,19 @@ impl TableProvider for DuckDbFederatedTableWriter {
 
     async fn truncate(&self, state: &dyn Session) -> DFResult<Arc<dyn ExecutionPlan>> {
         self.read_provider.truncate(state).await
+    }
+
+    async fn merge_into(
+        &self,
+        state: &dyn Session,
+        source: Arc<dyn ExecutionPlan>,
+        merge_schema: datafusion::common::DFSchemaRef,
+        on: datafusion::prelude::Expr,
+        clauses: Vec<datafusion::logical_expr::dml::MergeIntoClause>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        self.read_provider
+            .merge_into(state, source, merge_schema, on, clauses)
+            .await
     }
 }
 

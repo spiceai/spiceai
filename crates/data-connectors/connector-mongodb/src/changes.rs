@@ -351,7 +351,7 @@ async fn clear_persisted_token(
 
 fn serialize_current_schema(
     schema: &SchemaRef,
-    dataset_name: &datafusion::sql::TableReference,
+    dataset_name: &datafusion::common::TableReference,
 ) -> Option<String> {
     match arrow_tools::schema::schema_to_json(schema) {
         Ok(json) => Some(json),
@@ -390,7 +390,7 @@ fn build_batch_committer(
     tail_token: Option<ResumeToken>,
     tail_cluster_time: Option<i64>,
     schema_json: Option<&str>,
-    dataset_name: &datafusion::sql::TableReference,
+    dataset_name: &datafusion::common::TableReference,
 ) -> Box<dyn CommitChange + Send + Sync> {
     let Some(sys) = mongo_sys else {
         return Box::new(NoOpCommitter);
@@ -509,7 +509,7 @@ async fn try_open_change_stream(
 async fn open_change_stream(
     collection: &Collection<Document>,
     config: &ChangeStreamConfig,
-    dataset_name: &datafusion::sql::TableReference,
+    dataset_name: &datafusion::common::TableReference,
     collection_name: &str,
     resume_token: Option<ResumeToken>,
 ) -> Result<ChangeStream<ChangeStreamEvent<Document>>, StreamError> {
@@ -560,7 +560,7 @@ fn collect_change_events(
 }
 
 fn resolve_primary_keys(
-    dataset_name: &datafusion::sql::TableReference,
+    dataset_name: &datafusion::common::TableReference,
     acceleration: Option<&Acceleration>,
     schema: &SchemaRef,
 ) -> Result<Vec<String>, data_components::cdc::StreamError> {
@@ -593,10 +593,14 @@ fn resolve_primary_keys(
         )));
     }
 
-    if !matches!(
-        acceleration.on_conflict.get(primary_key),
-        Some(OnConflictBehavior::Upsert(_))
-    ) {
+    // Cayenne keeps one row per primary key on its own; the other upsert
+    // engines replace a row only through an `on_conflict` upsert keyed on it.
+    if !matches!(engine, Engine::Cayenne)
+        && !matches!(
+            acceleration.on_conflict.get(primary_key),
+            Some(OnConflictBehavior::Upsert(_))
+        )
+    {
         return Err(data_components::cdc::StreamError::External(format!(
             "mongodb change streams for dataset `{dataset_name}` require `acceleration.on_conflict` keyed on `primary_key` with `upsert` behavior so UPDATE events replace existing rows. Add: `on_conflict: {{ _id: upsert }}`."
         )));
@@ -809,7 +813,7 @@ mod tests {
             ..Default::default()
         };
 
-        let dataset_name = datafusion::sql::TableReference::bare("users");
+        let dataset_name = datafusion::common::TableReference::bare("users");
         let keys = resolve_primary_keys(&dataset_name, Some(&acceleration), &schema())
             .expect("valid CDC config");
         assert_eq!(keys, vec!["_id".to_string()]);
@@ -817,7 +821,7 @@ mod tests {
 
     #[test]
     fn rejects_missing_acceleration() {
-        let dataset_name = datafusion::sql::TableReference::bare("users");
+        let dataset_name = datafusion::common::TableReference::bare("users");
         let error = resolve_primary_keys(&dataset_name, None, &schema())
             .expect_err("missing acceleration should fail");
 
@@ -841,7 +845,7 @@ mod tests {
             ..Default::default()
         };
 
-        let dataset_name = datafusion::sql::TableReference::bare("users");
+        let dataset_name = datafusion::common::TableReference::bare("users");
         let error = resolve_primary_keys(&dataset_name, Some(&acceleration), &schema())
             .expect_err("arrow acceleration should fail");
 
@@ -857,7 +861,7 @@ mod tests {
             ..Default::default()
         };
 
-        let dataset_name = datafusion::sql::TableReference::bare("users");
+        let dataset_name = datafusion::common::TableReference::bare("users");
         let error = resolve_primary_keys(&dataset_name, Some(&acceleration), &schema())
             .expect_err("missing primary key should fail");
 
@@ -874,10 +878,26 @@ mod tests {
             ..Default::default()
         };
 
-        let dataset_name = datafusion::sql::TableReference::bare("users");
+        let dataset_name = datafusion::common::TableReference::bare("users");
         let error = resolve_primary_keys(&dataset_name, Some(&acceleration), &schema())
             .expect_err("missing upsert should fail");
         assert!(error.to_string().contains("on_conflict"));
+    }
+
+    #[test]
+    fn accepts_cayenne_primary_key_without_upsert() {
+        let acceleration = Acceleration {
+            enabled: true,
+            engine: Engine::Cayenne,
+            refresh_mode: Some(RefreshMode::Changes),
+            primary_key: Some(ColumnReference::new(vec!["_id".to_string()])),
+            ..Default::default()
+        };
+
+        let dataset_name = datafusion::common::TableReference::bare("users");
+        let keys = resolve_primary_keys(&dataset_name, Some(&acceleration), &schema())
+            .expect("Cayenne keeps one row per primary key without on_conflict");
+        assert_eq!(keys, vec!["_id".to_string()]);
     }
 
     #[test]
@@ -897,7 +917,7 @@ mod tests {
             ..Default::default()
         };
 
-        let dataset_name = datafusion::sql::TableReference::bare("users");
+        let dataset_name = datafusion::common::TableReference::bare("users");
         let error = resolve_primary_keys(&dataset_name, Some(&acceleration), &schema())
             .expect_err("non-_id primary key should fail");
         assert!(error.to_string().contains("primary_key: _id"));
@@ -916,7 +936,7 @@ mod tests {
             ..Default::default()
         };
 
-        let dataset_name = datafusion::sql::TableReference::bare("users");
+        let dataset_name = datafusion::common::TableReference::bare("users");
         let error = resolve_primary_keys(&dataset_name, Some(&acceleration), &schema())
             .expect_err("composite primary key should fail before on_conflict hint");
 
@@ -940,7 +960,7 @@ mod tests {
             ..Default::default()
         };
 
-        let dataset_name = datafusion::sql::TableReference::bare("users");
+        let dataset_name = datafusion::common::TableReference::bare("users");
         let error = resolve_primary_keys(&dataset_name, Some(&acceleration), &schema_without_id())
             .expect_err("missing _id column should fail");
 

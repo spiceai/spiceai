@@ -31,6 +31,7 @@ All criteria must be met for the connector to be considered Alpha. As Alpha sign
 | Glue                             | ✅             | @kczimm         |
 | GraphQL                          | ✅             | @peasee         |
 | HTTP/HTTPS                       | ✅             | @lukekim        |
+| Hugging Face                     | ➖             |                 |
 | Iceberg                          | ✅             | @phillipleblanc |
 | IMAP                             | ✅             | @peasee         |
 | Kafka                            | ✅             | @sgrebnov       |

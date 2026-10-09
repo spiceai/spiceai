@@ -937,7 +937,7 @@ impl GithubRestClient {
 
         if let Some(response_json) = response_json.as_ref() {
             error_checker(&response_headers, response_json).map_err(|e| {
-                if let graphql::Error::RateLimited { message } = e {
+                if let graphql::Error::RateLimited { message, .. } = e {
                     Error::RateLimited { message }
                 } else {
                     Error::GithubApiError { source: e.into() }
@@ -1001,7 +1001,7 @@ impl GithubRestClient {
 
         if let Some(response_json) = response_json.as_ref() {
             error_checker(&response_headers, response_json).map_err(|e| {
-                if let graphql::Error::RateLimited { message } = e {
+                if let graphql::Error::RateLimited { message, .. } = e {
                     Error::RateLimited { message }
                 } else {
                     Error::GithubApiError { source: e.into() }
@@ -1136,7 +1136,7 @@ impl GithubRestClient {
 
         if let Some(response_json) = response_json.as_ref() {
             error_checker(&response_headers, response_json).map_err(|e| {
-                if let graphql::Error::RateLimited { message } = e {
+                if let graphql::Error::RateLimited { message, .. } = e {
                     Error::RateLimited { message }
                 } else {
                     Error::GithubApiError { source: e.into() }
@@ -1208,7 +1208,7 @@ impl GithubRestClient {
 
                 if let Some(response_json) = response_json.as_ref() {
                     error_checker(&response_headers, response_json).map_err(|e| {
-                        if let graphql::Error::RateLimited { message } = e {
+                        if let graphql::Error::RateLimited { message, .. } = e {
                             Error::RateLimited { message }
                         } else {
                             Error::GithubApiError { source: e.into() }
@@ -1303,7 +1303,7 @@ impl GithubRestClient {
 
             if let Some(response_json) = response_json.as_ref() {
                 error_checker(&response_headers, response_json).map_err(|e| {
-                    if let graphql::Error::RateLimited { message } = e {
+                    if let graphql::Error::RateLimited { message, .. } = e {
                         Error::RateLimited { message }
                     } else {
                         Error::GithubApiError { source: e.into() }
@@ -1463,7 +1463,7 @@ impl GithubRestClient {
 
                 if let Some(response_json) = response_json.as_ref() {
                     error_checker(&response_headers, response_json).map_err(|e| {
-                        if let graphql::Error::RateLimited { message } = e {
+                        if let graphql::Error::RateLimited { message, .. } = e {
                             Error::RateLimited { message }
                         } else {
                             Error::GithubApiError { source: e.into() }
@@ -1836,7 +1836,7 @@ impl GithubRestClient {
 
                 if let Some(response_json) = response_json.as_ref() {
                     error_checker(&response_headers, response_json).map_err(|e| {
-                        if let graphql::Error::RateLimited { message } = e {
+                        if let graphql::Error::RateLimited { message, .. } = e {
                             Error::RateLimited { message }
                         } else {
                             Error::GithubApiError { source: e.into() }
@@ -2101,6 +2101,7 @@ pub fn error_checker(
         // A secondary rate limit was exceeded
         return Err(graphql::Error::RateLimited {
             message: "GitHub API rate limit exceeded. Consider reducing dataset 'max_concurrent_requests' or runtime.source_rate_control.github_concurrent_connections_limit in your spicepod to avoid rate limits. See: https://spiceai.org/docs/components/data-connectors/github".to_string(),
+            retry_after: graphql::response::retry_after_from_headers(headers),
         });
     }
 
@@ -2114,6 +2115,7 @@ pub fn error_checker(
         if ratelimit_remaining == 0 {
             return Err(graphql::Error::RateLimited {
                 message: "GitHub API rate limit exceeded. Consider reducing dataset 'max_concurrent_requests' or runtime.source_rate_control.github_concurrent_connections_limit in your spicepod to avoid rate limits. See: https://spiceai.org/docs/components/data-connectors/github".to_string(),
+                retry_after: graphql::response::retry_after_from_headers(headers),
             });
         }
     }
@@ -2200,20 +2202,42 @@ mod tests {
         );
     }
 
+    /// The refusal for any `ref` predicate a single-ref listing cannot answer
+    /// exactly; serving one ref's files for it would return wrong rows.
+    const UNSUPPORTED_REF_FILTER_MESSAGE: &str = "GitHub files only support a single non-empty ref = '<value>' predicate. Queries using ref with OR, IN, inequality, or multiple values are not supported because they can return incorrect results.";
+
+    fn assert_unsupported_ref_filter(filters: &[datafusion::logical_expr::Expr]) {
+        let err = requested_ref_from_filters(filters)
+            .expect_err("an unsupported ref predicate must be rejected");
+        assert!(
+            matches!(
+                &err,
+                datafusion::error::DataFusionError::Execution(message)
+                    if message == UNSUPPORTED_REF_FILTER_MESSAGE
+            ),
+            "expected the unsupported ref filter error for {filters:?}, got: {err:?}"
+        );
+    }
+
     #[test]
     fn test_requested_ref_from_filters_rejects_multiple_ref_values() {
-        let filters = vec![col("ref").eq(lit("trunk")), col("ref").eq(lit("main"))];
-
-        let _ = requested_ref_from_filters(&filters)
-            .expect_err("multiple ref values should be rejected");
+        assert_unsupported_ref_filter(&[col("ref").eq(lit("trunk")), col("ref").eq(lit("main"))]);
+        // The same pair inside one conjunction is rejected the same way.
+        assert_unsupported_ref_filter(&[col("ref")
+            .eq(lit("trunk"))
+            .and(col("ref").eq(lit("main")))]);
     }
 
     #[test]
     fn test_requested_ref_from_filters_rejects_unsupported_ref_or_predicate() {
-        let filters = vec![col("ref").eq(lit("trunk")).or(col("ref").eq(lit("main")))];
-
-        let _ = requested_ref_from_filters(&filters)
-            .expect_err("unsupported ref OR predicates should be rejected");
+        assert_unsupported_ref_filter(&[col("ref")
+            .eq(lit("trunk"))
+            .or(col("ref").eq(lit("main")))]);
+        // An OR that mixes ref with another column cannot be answered from one
+        // ref's listing either.
+        assert_unsupported_ref_filter(&[col("ref")
+            .eq(lit("trunk"))
+            .or(col("path").eq(lit("README.md")))]);
     }
 
     #[test]

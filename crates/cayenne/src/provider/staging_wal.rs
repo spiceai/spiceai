@@ -1316,7 +1316,24 @@ impl CayenneTableProvider {
         setup_cleanup.snapshots.push(staging_snapshot_id.clone());
         self.clear_staging_snapshot_dir(&staging_snapshot_id)
             .await?;
-        let prepared_insert = match self.prepare_stream_for_insert(data).await {
+        // A partition's append is one statement over its whole input: the keys
+        // it repeats are resolved after it is staged. Its staged files move into
+        // the target snapshot when it publishes, so the copies the policy does
+        // not keep are folded out of them rather than hidden by position deletes
+        // on paths that will change.
+        let (resolution, data) = match self.key_resolver()? {
+            None => (None, data),
+            Some(resolver) => {
+                let (resolution, data) =
+                    super::append_stage::ResolveAfterWrite::start(self, data, resolver)?;
+                (Some(resolution), data)
+            }
+        };
+        let prepared_insert = match if resolution.is_some() {
+            self.prepare_stream_for_insert_resolving_repeats(data).await
+        } else {
+            self.prepare_stream_for_insert(data).await
+        } {
             Ok(prepared) => prepared,
             Err(error) => {
                 self.clear_snapshot_dir(&target_snapshot_id).await?;
@@ -1325,14 +1342,26 @@ impl CayenneTableProvider {
         };
         let may_have_on_conflict_deletions = prepared_insert.may_have_on_conflict_deletions();
         let post_validation = prepared_insert.post_validation();
-        let row_count = match self
-            .write_stream_to_staging_snapshot(
-                prepared_insert.stream,
-                &staging_snapshot_id,
-                target_partitions,
-            )
-            .await
-        {
+        let staged = match &resolution {
+            None => {
+                self.write_stream_to_staging_snapshot(
+                    prepared_insert.stream,
+                    &staging_snapshot_id,
+                    target_partitions,
+                )
+                .await
+            }
+            Some(resolution) => {
+                self.stage_resolving_repeats(
+                    prepared_insert.stream,
+                    resolution,
+                    &staging_snapshot_id,
+                    target_partitions,
+                )
+                .await
+            }
+        };
+        let row_count = match staged {
             Ok(row_count) => row_count,
             Err(error) => {
                 self.clear_staging_snapshot_dir(&staging_snapshot_id)
@@ -1341,6 +1370,7 @@ impl CayenneTableProvider {
                 return Err(error);
             }
         };
+        drop(resolution);
         let PostValidationState {
             on_conflict_deletions,
             validated_keys,
@@ -1743,6 +1773,7 @@ impl CayenneTableProvider {
     /// missing from both staging and the target snapshot, or the WAL removal
     /// after a successful move fails.
     pub(crate) async fn ensure_no_incomplete_write(&self) -> Result<()> {
+        self.ensure_publication_outcome_known()?;
         if !self.staging_wal_present().load(Ordering::Acquire)
             && !self.staging_may_have_files().load(Ordering::Acquire)
         {

@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use spicepod::vector::VectorStore;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 

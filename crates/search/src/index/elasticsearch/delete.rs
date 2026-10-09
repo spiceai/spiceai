@@ -1698,28 +1698,62 @@ mod tests {
         .await
         .expect("the prune should succeed");
 
+        // Each `_id` is a JSON object serialized by the write path; its key order follows
+        // `serde_json`'s `preserve_order` feature, which cargo unifies per build. Compare the
+        // ids as parsed JSON so the assertion pins their exact content in every build.
+        let queries = client.queries();
+        assert_eq!(queries.len(), 1, "{queries:?}");
+        let mut query = queries[0].clone();
+        let mut clause_ids = Vec::new();
+        for clause in query["bool"]["should"]
+            .as_array_mut()
+            .expect("the prune is a `should` of group clauses")
+        {
+            let values = clause["bool"]["must_not"][0]["ids"]["values"]
+                .as_array_mut()
+                .expect("each group clause protects its members by `_id`");
+            clause_ids.push(
+                values
+                    .iter()
+                    .map(|id| {
+                        serde_json::from_str::<serde_json::Value>(
+                            id.as_str().expect("each `_id` is a string"),
+                        )
+                        .expect("each `_id` is serialized JSON")
+                    })
+                    .collect::<Vec<_>>(),
+            );
+            values.clear();
+        }
         assert_eq!(
-            client.queries(),
-            vec![json!({
+            clause_ids,
+            vec![
+                vec![json!({"id": "a", "_spice.chunk_id": 0})],
+                vec![
+                    json!({"id": "b", "_spice.chunk_id": 0}),
+                    json!({"id": "b", "_spice.chunk_id": 1}),
+                ],
+            ],
+            "each group protects exactly its own members"
+        );
+        assert_eq!(
+            query,
+            json!({
                 "bool": {
                     "should": [
                         {"bool": {
                             "filter": [{"term": {"id": "a"}}],
-                            "must_not": [{"ids": {"values": [
-                                "{\"_spice.chunk_id\":0,\"id\":\"a\"}"
-                            ]}}]
+                            "must_not": [{"ids": {"values": []}}]
                         }},
                         {"bool": {
                             "filter": [{"term": {"id": "b"}}],
-                            "must_not": [{"ids": {"values": [
-                                "{\"_spice.chunk_id\":0,\"id\":\"b\"}",
-                                "{\"_spice.chunk_id\":1,\"id\":\"b\"}"
-                            ]}}]
+                            "must_not": [{"ids": {"values": []}}]
                         }}
                     ],
                     "minimum_should_match": 1
                 }
-            })],
+            }),
+            "the rest of the prune query is exact"
         );
     }
 
@@ -1841,9 +1875,18 @@ mod tests {
         .await
         .expect("the prune should succeed");
 
+        // Parsed, so the assertion holds whichever key order `serde_json` serializes with.
+        let protected: Vec<Vec<serde_json::Value>> = protected_ids(&client.queries()[0])
+            .into_iter()
+            .map(|ids| {
+                ids.iter()
+                    .map(|id| serde_json::from_str(id).expect("each `_id` is serialized JSON"))
+                    .collect()
+            })
+            .collect();
         assert_eq!(
-            protected_ids(&client.queries()[0]),
-            vec![vec!["{\"_spice.chunk_id\":0,\"id\":\"b\"}".to_string()]],
+            protected,
+            vec![vec![json!({"id": "b", "_spice.chunk_id": 0})]],
             "only the group whose every member could be named is pruned"
         );
     }
@@ -2080,19 +2123,44 @@ mod tests {
             DataType::UInt32,
             DataType::UInt64,
         ];
-        for field_type in TERM_EXACT_FIELD_TYPES {
-            let mapping = field_mapping(field_type);
-            let refused_for_some = renderable
-                .iter()
-                .any(|t| term_over_matches(&mapping, t).is_some());
-            if refused_for_some {
-                assert!(
-                    term_over_matches(&mapping, &ASSUMED_KEY_TYPE).is_some(),
-                    "`{field_type}` is refused for some source type, so it must be refused for \
-                     the assumed one — otherwise an absent key column resolves to a mapping a \
-                     present one would have been refused for"
-                );
-            }
+        let refused_for_some: Vec<&str> = TERM_EXACT_FIELD_TYPES
+            .iter()
+            .copied()
+            .filter(|field_type| {
+                let mapping = field_mapping(field_type);
+                renderable
+                    .iter()
+                    .any(|t| term_over_matches(&mapping, t).is_some())
+            })
+            .collect();
+        // Not a vacuous sweep: every exact type except the three a string reaches as itself is
+        // refused for some renderable column type.
+        assert_eq!(
+            refused_for_some,
+            [
+                "boolean",
+                "byte",
+                "constant_keyword",
+                "date",
+                "date_nanos",
+                "double",
+                "float",
+                "half_float",
+                "integer",
+                "ip",
+                "long",
+                "scaled_float",
+                "short",
+                "unsigned_long",
+            ]
+        );
+        for field_type in refused_for_some {
+            assert!(
+                term_over_matches(&field_mapping(field_type), &ASSUMED_KEY_TYPE).is_some(),
+                "`{field_type}` is refused for some source type, so it must be refused for \
+                 the assumed one — otherwise an absent key column resolves to a mapping a \
+                 present one would have been refused for"
+            );
         }
     }
 

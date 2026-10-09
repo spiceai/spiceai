@@ -17,14 +17,13 @@ limitations under the License.
 use arrow::{
     array::{Array, RecordBatch},
     datatypes::{Field, Schema, SchemaRef},
-    ipc::reader::StreamReader,
 };
-use arrow_tools::map_entries::MapEntriesNormalizer;
+use arrow_tools::map_entries;
 use async_trait::async_trait;
 use datafusion::{
-    datasource::TableProvider, error::DataFusionError, execution::SendableRecordBatchStream,
-    physical_plan::EmptyRecordBatchStream, physical_plan::stream::RecordBatchStreamAdapter,
-    sql::TableReference,
+    common::TableReference, datasource::TableProvider, error::DataFusionError,
+    execution::SendableRecordBatchStream, physical_plan::EmptyRecordBatchStream,
+    physical_plan::stream::RecordBatchStreamAdapter,
 };
 use datafusion_table_providers::sql::{
     db_connection_pool::{
@@ -43,7 +42,6 @@ use std::{
     collections::{HashMap, hash_map::Entry},
     error::Error as StdError,
     fmt::{Display, Formatter},
-    io::Cursor,
     pin::Pin,
     str::FromStr,
     sync::{
@@ -1176,7 +1174,7 @@ impl SqlWarehouseApi {
                     Err(e) => return Some((Err(e), None)),
                 };
 
-                let batches = match Self::read_arrow_batches(bytes) {
+                let batches = match Self::read_arrow_batches(&bytes) {
                     Ok(batches) => batches,
                     Err(e) => return Some((Err(e), None)),
                 };
@@ -1318,27 +1316,24 @@ impl SqlWarehouseApi {
         result
     }
 
-    fn read_arrow_batches(
-        bytes: bytes::Bytes,
-    ) -> Result<Vec<arrow::record_batch::RecordBatch>, Error> {
-        let cursor = Cursor::new(bytes);
-        let reader = StreamReader::try_new(cursor, None).context(ArrowStreamReadFailedSnafu)?;
-
+    fn read_arrow_batches(bytes: &[u8]) -> Result<Vec<arrow::record_batch::RecordBatch>, Error> {
         // The warehouse declares a MAP's `entries` field nullable, which the Arrow map layout
-        // forbids. Such a batch decodes here and then fails in whichever kernel first rebuilds
-        // the column, so it is brought into line at the boundary rather than carried into the
-        // plan. One stream carries one schema, so what its batches need is resolved once and
-        // every batch comes out sharing the same `SchemaRef`.
-        let normalizer = MapEntriesNormalizer::for_schema(&reader.schema());
+        // forbids — and which `ArrayData` validation refuses inside the decode, over the one part
+        // of the column that holds no data, naming neither the column nor which of the two map
+        // rules was broken. Reading through `arrow_tools` decodes those buffers as the list they
+        // are laid out as and brings the column into line where it can still be named, so the
+        // chunk is readable and the batches carry the type the scan publishes.
+        let batches = map_entries::read_ipc_stream(bytes).map_err(|error| match error {
+            map_entries::Error::UndecodableStream { source } => {
+                Error::ArrowStreamReadFailed { source }
+            }
+            named => Error::MapEntriesNotNormalizable { source: named },
+        })?;
 
-        reader
-            .filter(|batch| !matches!(batch, Ok(batch) if batch.num_rows() == 0))
-            .map(|batch| {
-                normalizer
-                    .normalize(batch.context(ArrowStreamReadFailedSnafu)?)
-                    .context(MapEntriesNotNormalizableSnafu)
-            })
-            .collect()
+        Ok(batches
+            .into_iter()
+            .filter(|batch| batch.num_rows() != 0)
+            .collect())
     }
 
     fn extract_response_status(response: &Value) -> Result<ResponseStatus, Error> {
@@ -2170,12 +2165,15 @@ mod tests {
             )),
             false,
         );
-        let data = arrow::array::ArrayData::builder(map_type.clone())
+        let builder = arrow::array::ArrayData::builder(map_type.clone())
             .len(1)
             .add_buffer(arrow::buffer::Buffer::from_slice_ref([0i32, 1]))
-            .add_child_data(entries.to_data())
-            .build()
-            .expect("map array data");
+            .add_child_data(entries.to_data());
+        // SAFETY: the offsets, buffers and child data are well formed. Only the
+        // `entries` nullability declaration is what `ArrayData::validate` rejects,
+        // and reproducing it is the point of the fixture — the IPC reader builds
+        // such a map without either entries check.
+        let data = unsafe { builder.build_unchecked() };
 
         RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("col_map", map_type, true)])),
@@ -2192,7 +2190,7 @@ mod tests {
     fn a_map_column_is_published_with_a_non_nullable_entries_field() {
         let wire = wire_map_column_batch(None);
 
-        let batches = SqlWarehouseApi::read_arrow_batches(arrow_stream_bytes(&wire))
+        let batches = SqlWarehouseApi::read_arrow_batches(&arrow_stream_bytes(&wire))
             .expect("the chunk is readable");
         let published = batches
             .first()
@@ -2223,7 +2221,7 @@ mod tests {
     fn entry_level_nulls_fail_the_read_with_an_actionable_message() {
         let wire = wire_map_column_batch(Some(arrow::buffer::NullBuffer::from(vec![false])));
 
-        let err = SqlWarehouseApi::read_arrow_batches(arrow_stream_bytes(&wire))
+        let err = SqlWarehouseApi::read_arrow_batches(&arrow_stream_bytes(&wire))
             .expect_err("entry nulls must fail the read");
 
         let message = err.to_string();

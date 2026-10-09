@@ -18,7 +18,10 @@
 //! not the Spice SQLite accelerator) return **equivalent query results** for the
 //! same SQL on identical data. Always available — no feature gate.
 //!
-//! Suites: SSB (star-schema), SQLLancer corpus, micro SQL shapes.
+//! Suites: TPC-H and TPC-DS at SF 0.1, ClickBench on the reduced `hits` table,
+//! CH-benCHmark after a full load, SSB (star-schema), SQLLancer corpus, micro SQL
+//! shapes. The four benchmark suites go through `support::oracle_lane`, which
+//! rewrites each query for SQLite with `support::dialect`.
 //! Spice SQLite **accelerator** vs standalone is in
 //! `runtime`’s `result_correctness` test. See `tests/correctness/README.md`.
 
@@ -38,7 +41,7 @@ mod support;
 use std::path::PathBuf;
 
 use rusqlite::Connection;
-use support::inventory::build_inventory;
+use support::inventory::{build_inventory, fixture};
 use support::report::{RunResult, summary_line};
 use support::sqlite_engine::{
     load_sqlite_from_batches, load_sqlite_from_parquet, sqlite_query_batches,
@@ -276,4 +279,151 @@ async fn sqllancer_corpus_parity_vs_sqlite() {
     eprintln!("{}", summary_line(&results));
 
     assert_all_pass_or_excluded(&labeled, "SQLLancer vs SQLite");
+}
+
+/// TPC-H against SQLite.
+///
+/// SQLite has no `DECIMAL`, so the loader stores money columns as `REAL` and its
+/// sums land within the float tolerance of Cayenne's exact decimals rather than
+/// on them. Every whole-number cell — each `count(*)`, key and `sum` over
+/// integers — still compares exactly.
+///
+/// SF 0.1 by default, where every query still returns rows: a debug-built SQLite
+/// takes minutes a query on SF1's correlated subqueries (Q20, Q21), which the
+/// DuckDB and chDB lanes compare at SF1.
+#[tokio::test(flavor = "multi_thread")]
+async fn tpch_full_result_parity_vs_sqlite() {
+    use support::oracle_lane::run_fixture_suite;
+    use support::sqlite_engine::SqliteOracle;
+    use support::{LoadMode, TPCH_TABLES};
+    use test_framework::queries::get_tpch_test_queries;
+
+    let sf = support::env_f64("CAYENNE_PARITY_SQLITE_TPCH_SF", 0.1);
+    let parquet_dir = support::scratch_dir().join(format!("tpch_sf{sf}"));
+    support::tpch_data::ensure_tpch_fixture(&parquet_dir, sf);
+
+    let sqlite = SqliteOracle::from_parquet(&parquet_dir, TPCH_TABLES).await;
+    let results = run_fixture_suite(
+        &sqlite,
+        &parquet_dir,
+        TPCH_TABLES,
+        "tpch",
+        &get_tpch_test_queries(None),
+        &[LoadMode::Full],
+        Clone::clone,
+    )
+    .await;
+    support::report::finish_lane(
+        &results,
+        &[],
+        "cayenne_sqlite_tpch_parity.log",
+        &format!("TPC-H SF={sf} Cayenne vs SQLite"),
+    );
+}
+
+/// ClickBench against SQLite, on the same reduced `hits` fixture the DuckDB lane
+/// builds (or `CLICKBENCH_HITS_PARQUET`).
+#[tokio::test(flavor = "multi_thread")]
+async fn clickbench_full_result_parity_vs_sqlite() {
+    use support::LoadMode;
+    use support::oracle_lane::run_fixture_suite;
+    use support::sqlite_engine::SqliteOracle;
+    use test_framework::queries::get_clickbench_test_queries;
+
+    let hits_dir = support::clickbench_data::hits_fixture_dir();
+    let sqlite = SqliteOracle::from_parquet(hits_dir.path(), &["hits"]).await;
+    let results = run_fixture_suite(
+        &sqlite,
+        hits_dir.path(),
+        &["hits"],
+        "clickbench",
+        &get_clickbench_test_queries(None),
+        &[LoadMode::Full],
+        Clone::clone,
+    )
+    .await;
+    support::report::finish_lane(
+        &results,
+        &[("clickbench", fixture::clickbench_hits())],
+        "cayenne_sqlite_clickbench_parity.log",
+        "ClickBench Cayenne vs SQLite",
+    );
+}
+
+/// TPC-DS against SQLite, on a `tpcdsgen` fixture.
+///
+/// SF 0.1 by default, which keeps the test inside the gate's per-test ceiling.
+/// There 62 of the 81 queries SQLite can express return a value; the inventory
+/// reviews the other 19 as empty on this fixture, and the chDB lane compares
+/// SF1, where nine of those 19 answer.
+#[tokio::test(flavor = "multi_thread")]
+async fn tpcds_full_result_parity_vs_sqlite() {
+    use support::oracle_lane::run_fixture_suite;
+    use support::sqlite_engine::SqliteOracle;
+    use support::tpcds_data::{TPCDS_TABLES, ensure_tpcds_fixture};
+    use test_framework::queries::get_tpcds_test_queries;
+
+    let sf = support::env_f64("CAYENNE_PARITY_SQLITE_TPCDS_SF", 0.1);
+    let dir = support::scratch_dir().join(format!("tpcds_tpcdsgen_sf{sf}"));
+    ensure_tpcds_fixture(&dir, sf);
+    let sqlite = SqliteOracle::from_parquet(&dir, TPCDS_TABLES).await;
+    let results = run_fixture_suite(
+        &sqlite,
+        &dir,
+        TPCDS_TABLES,
+        "tpcds",
+        &get_tpcds_test_queries(None, Some(1.0)),
+        &[support::LoadMode::Full],
+        Clone::clone,
+    )
+    .await;
+    support::report::finish_lane(
+        &results,
+        &[("tpcds", &fixture::tpcds_tpcdsgen(sf))],
+        "cayenne_sqlite_tpcds_parity.log",
+        &format!("TPC-DS SF={sf} Cayenne vs SQLite"),
+    );
+}
+
+/// CH-benCHmark against SQLite, after a full load.
+///
+/// The DuckDB and chDB lanes compare the append and CDC loads as well. Repeating
+/// them here repeats Cayenne's side, not SQLite's — Q21 alone takes Cayenne
+/// about a minute per load in a debug build — and takes this test past the
+/// gate's per-test ceiling.
+#[tokio::test(flavor = "multi_thread")]
+async fn chbench_full_result_parity_vs_sqlite() {
+    use support::chbench_data::{
+        CHBENCH_TABLES, chbench_sql_for_datafusion, ensure_chbench_fixture,
+    };
+    use support::oracle_lane::run_fixture_suite;
+    use support::sqlite_engine::SqliteOracle;
+    use test_framework::queries::get_chbench_test_queries;
+
+    let warehouses = support::env_f64("CAYENNE_PARITY_CHBENCH_SF", 1.0) as i64;
+    let dir = support::scratch_dir().join(format!("chbench_sf{warehouses}"));
+    ensure_chbench_fixture(&dir, warehouses);
+    let sqlite = SqliteOracle::from_parquet(&dir, CHBENCH_TABLES).await;
+    let results = run_fixture_suite(
+        &sqlite,
+        &dir,
+        CHBENCH_TABLES,
+        "chbench",
+        &get_chbench_test_queries(None),
+        &[support::LoadMode::Full],
+        |q| {
+            Query::new(
+                std::sync::Arc::clone(&q.name),
+                chbench_sql_for_datafusion(&q.sql).into(),
+                false,
+            )
+        },
+    )
+    .await;
+    support::report::finish_lane(
+        &results,
+        &[],
+        "cayenne_sqlite_chbench_parity.log",
+        &format!("CH-benCHmark SF={warehouses} Cayenne vs SQLite"),
+    );
 }

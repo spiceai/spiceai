@@ -2435,8 +2435,10 @@ async fn test_caching_mode_query_param_order() -> Result<(), anyhow::Error> {
         .await
 }
 
-/// 4xx responses (like 404 "Not Found") represent valid business responses (e.g., "user not found",
-/// "resource doesn't exist") and should be returned to user and cached.
+/// 4xx responses (like 404 "Not Found") can be valid business responses (e.g., "user not found",
+/// "resource doesn't exist") and are then returned to the user and cached.
+///
+/// That is an opt-in — `on_error_response` defaults to `error` (#13515).
 ///
 /// This test:
 /// 1. Queries an invalid path that returns 404
@@ -2460,6 +2462,8 @@ async fn test_caching_mode_http_404_responses_cached() -> Result<(), anyhow::Err
                         "/search/invalid_404_test".to_string(), // Invalid path that returns 404
                     ),
                     ("request_query_filters".to_string(), "enabled".to_string()),
+                    // This dataset means its 404s; without it the fetch fails by default.
+                    ("on_error_response".to_string(), "store".to_string()),
                 ]
                 .into_iter()
                 .collect(),

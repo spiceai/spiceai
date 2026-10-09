@@ -41,16 +41,12 @@ impl ScheduledTask for ViewRefreshTask {
 
             match runtime.datafusion().refresh_table(&view.name, None).await {
                 Ok(completion) => {
-                    if let Some(completion) = completion
-                        && completion.wait().await.is_abandoned()
-                    {
-                        // The view was removed while its scheduled refresh was
-                        // in flight. As for datasets, the task acts on nothing
-                        // after the wait, so this is recorded rather than
-                        // raised.
-                        let view_name = &view.name;
-                        tracing::debug!(
-                            "{view_name} was removed before its scheduled refresh completed."
+                    // Abandoned (removal/shutdown) stays Ok. A terminal
+                    // one-shot failure must fail the scheduled task.
+                    if let Some(completion) = completion {
+                        return super::scheduled_refresh_wait_result(
+                            completion.wait().await,
+                            &view.name,
                         );
                     }
                     Ok(())

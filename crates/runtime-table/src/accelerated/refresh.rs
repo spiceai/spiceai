@@ -54,28 +54,35 @@ use tokio::sync::Mutex;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::{RwLock, Semaphore};
 use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
 
 // The refresh-SQL types travel with their parser in `runtime-datafusion`: the
 // parser produces them, and it sits below `runtime` so connectors can call it.
 pub use runtime_datafusion::refresh_sql::{RefreshSQL, RefreshSQLColumns};
 
+const TIME_FORMAT_DOCS: &str = "https://spiceai.org/docs/reference/spicepod/datasets#time_format";
+
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display(
-        "time_column '{time_column}' in dataset {table_name} has data type '{actual_time_format}', but time_format is configured as '{expected_time_format}'"
-    ))]
-    TimeFormatMismatch {
-        table_name: String,
-        time_column: String,
-        expected_time_format: String,
-        actual_time_format: String,
-    },
+    #[snafu(display("{message}"))]
+    TimeFormatMismatch { message: String },
 
     #[snafu(display("time_column '{time_column}' was not found in dataset {table_name}"))]
     NoTimeColumnFound {
         table_name: String,
         time_column: String,
     },
+}
+
+/// How a refresh that keeps each key's newest version by `time_column` resolves it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VersionsByTime {
+    /// The accelerator resolves a full refresh's repeated keys as it writes them, by
+    /// the row versions the refresh supplies (unpartitioned Cayenne).
+    pub versions_resolved_after_write: bool,
+    /// It also resolves them for an append into an empty table (unpartitioned
+    /// file-mode Cayenne; a table with `retention_sql` refuses such a load).
+    pub appends_resolved_after_write: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -93,6 +100,10 @@ pub struct Refresh {
     pub(crate) mode: RefreshMode,
     pub(crate) period: Option<Duration>,
     pub(crate) append_overlap: Option<Duration>,
+    /// Keep each key's newest version by `time_column`: only rows newer than the
+    /// version of their key already kept (see `refresh_task::latest_by_time`), resolved as the
+    /// accelerator needs.
+    pub(crate) versions_by_time: Option<VersionsByTime>,
     pub(crate) retry_enabled: bool,
     pub(crate) retry_max_attempts: Option<usize>,
     /// TTL for cache entries. Data older than this is considered stale.
@@ -214,6 +225,12 @@ impl Refresh {
     }
 
     #[must_use]
+    pub fn versions_by_time(mut self, versions_by_time: Option<VersionsByTime>) -> Self {
+        self.versions_by_time = versions_by_time;
+        self
+    }
+
+    #[must_use]
     pub fn caching_ttl(mut self, caching_ttl: Duration) -> Self {
         self.caching_ttl = Some(caching_ttl);
         self
@@ -249,50 +266,72 @@ impl Refresh {
     /// Checks that the dataset's `time_column` exists in `schema` and that its
     /// Arrow type is compatible with the configured `time_format`.
     ///
+    /// A string `time_format` such as `iso8601` on a column that is already a
+    /// native timestamp or date is accepted: the format is ignored and a single
+    /// warning is logged. Genuinely incompatible pairs remain errors.
+    ///
     /// # Errors
     ///
     /// Returns an error if the time column is absent from the schema, or if its
     /// type cannot represent the declared `time_format`.
     pub fn validate_time_format(
         &self,
-        dataset_name: String,
+        dataset_name: &str,
         schema: &Arc<Schema>,
     ) -> Result<(), Error> {
-        let Some(time_column) = self.time_column.clone() else {
+        self.validate_time_format_inner(dataset_name, schema, true)
+    }
+
+    /// Same checks as [`Self::validate_time_format`], without logging when a
+    /// string `time_format` is ignored on a native temporal column.
+    ///
+    /// Append refresh re-validates on every pass; the ignored-format warning
+    /// belongs at dataset setup so it is emitted once.
+    pub(crate) fn validate_time_format_inner(
+        &self,
+        dataset_name: &str,
+        schema: &Arc<Schema>,
+        log_ignored: bool,
+    ) -> Result<(), Error> {
+        let Some(time_column) = self.time_column.as_deref() else {
             return Ok(());
         };
 
-        let Some((_, field)) = schema.column_with_name(&time_column) else {
+        let Some((_, field)) = schema.column_with_name(time_column) else {
             return Err(Error::NoTimeColumnFound {
-                table_name: dataset_name,
-                time_column,
+                table_name: dataset_name.to_string(),
+                time_column: time_column.to_string(),
             });
         };
 
-        let time_format = self.time_format.unwrap_or(TimeFormat::Timestamp);
-        let data_type = field.data_type().clone();
+        validate_time_format_for_column(
+            field.data_type(),
+            dataset_name,
+            time_column,
+            self.time_format,
+            TIME_COLUMN_FORMAT_KEYS,
+            log_ignored,
+        )?;
 
-        validate_time_partition_format(&data_type, &dataset_name, &time_column, time_format)?;
+        let Some(time_partition_column) = self.time_partition_column.as_deref() else {
+            return Ok(());
+        };
 
-        if let Some(time_partition_column) = self.time_partition_column.clone() {
-            let Some((_, field)) = schema.column_with_name(&time_partition_column) else {
-                return Err(Error::NoTimeColumnFound {
-                    table_name: dataset_name,
-                    time_column: time_partition_column,
-                });
-            };
+        let Some((_, field)) = schema.column_with_name(time_partition_column) else {
+            return Err(Error::NoTimeColumnFound {
+                table_name: dataset_name.to_string(),
+                time_column: time_partition_column.to_string(),
+            });
+        };
 
-            let time_partition_format = self.time_partition_format.unwrap_or(TimeFormat::Timestamp);
-            let partition_data_type = field.data_type().clone();
-            validate_time_partition_format(
-                &partition_data_type,
-                &dataset_name,
-                &time_partition_column,
-                time_partition_format,
-            )?;
-        }
-
-        Ok(())
+        validate_time_format_for_column(
+            field.data_type(),
+            dataset_name,
+            time_partition_column,
+            self.time_partition_format,
+            TIME_PARTITION_FORMAT_KEYS,
+            log_ignored,
+        )
     }
 
     /// Determine the next refresh when Spice starts based on the refresh mode and the last checkpoint.
@@ -411,20 +450,101 @@ impl Refresh {
     }
 }
 
-fn validate_time_partition_format(
+/// Spicepod keys for the column and format being validated.
+#[derive(Clone, Copy)]
+struct TimeFormatConfigKeys {
+    column: &'static str,
+    format: &'static str,
+}
+
+const TIME_COLUMN_FORMAT_KEYS: TimeFormatConfigKeys = TimeFormatConfigKeys {
+    column: "time_column",
+    format: "time_format",
+};
+
+const TIME_PARTITION_FORMAT_KEYS: TimeFormatConfigKeys = TimeFormatConfigKeys {
+    column: "time_partition_column",
+    format: "time_partition_format",
+};
+
+const fn time_format_spicepod_name(time_format: TimeFormat) -> &'static str {
+    match time_format {
+        TimeFormat::Timestamp => "timestamp",
+        TimeFormat::Timestamptz => "timestamptz",
+        TimeFormat::UnixSeconds => "unix_seconds",
+        TimeFormat::UnixMillis => "unix_millis",
+        TimeFormat::UnixNanos => "unix_nanos",
+        TimeFormat::ISO8601 => "iso8601",
+        TimeFormat::Date => "date",
+    }
+}
+
+const fn is_string_time_format(time_format: TimeFormat) -> bool {
+    matches!(time_format, TimeFormat::ISO8601)
+}
+
+fn is_native_temporal_type(data_type: &arrow::datatypes::DataType) -> bool {
+    matches!(
+        data_type,
+        arrow::datatypes::DataType::Timestamp(_, _)
+            | arrow::datatypes::DataType::Date32
+            | arrow::datatypes::DataType::Date64
+    )
+}
+
+fn native_temporal_kind(data_type: &arrow::datatypes::DataType) -> Option<&'static str> {
+    match data_type {
+        arrow::datatypes::DataType::Timestamp(_, _) => Some("timestamp"),
+        arrow::datatypes::DataType::Date32 | arrow::datatypes::DataType::Date64 => Some("date"),
+        _ => None,
+    }
+}
+
+/// Advice after ignoring a string format on a native temporal column.
+///
+/// A timezone-naive timestamp matches the default `timestamp` format, so the
+/// setting can be removed. Date and timezone-aware timestamps do not: the
+/// default would reject them, so recommend `date` or `timestamptz`.
+fn ignored_string_time_format_advice(
     data_type: &arrow::datatypes::DataType,
+    format_key: &str,
+) -> String {
+    match data_type {
+        arrow::datatypes::DataType::Timestamp(_, Some(_)) => {
+            format!("Set `{format_key}` to `timestamptz`.")
+        }
+        arrow::datatypes::DataType::Date32 | arrow::datatypes::DataType::Date64 => {
+            format!("Set `{format_key}` to `date`.")
+        }
+        _ => format!("Remove `{format_key}` from the dataset configuration."),
+    }
+}
+
+fn ignored_string_time_format_warning(
     dataset_name: &str,
-    time_column: &str,
+    column_name: &str,
     time_format: TimeFormat,
-) -> Result<(), Error> {
-    let mut invalid = false;
+    data_type: &arrow::datatypes::DataType,
+    keys: TimeFormatConfigKeys,
+) -> String {
+    let kind = native_temporal_kind(data_type).unwrap_or("timestamp");
+    format!(
+        "Dataset '{dataset_name}' ignores `{format_key}: {format}` on `{column_key}` '{column_name}' because the column is already a {kind} ({data_type}). {advice} See: {TIME_FORMAT_DOCS}",
+        format_key = keys.format,
+        format = time_format_spicepod_name(time_format),
+        column_key = keys.column,
+        advice = ignored_string_time_format_advice(data_type, keys.format),
+    )
+}
+
+fn time_format_mismatch_fix(data_type: &arrow::datatypes::DataType, format_key: &str) -> String {
     match data_type {
         arrow::datatypes::DataType::Utf8
         | arrow::datatypes::DataType::LargeUtf8
         | arrow::datatypes::DataType::Utf8View => {
-            if time_format != TimeFormat::ISO8601 {
-                invalid = true;
-            }
+            format!(
+                "Set `{format_key}` to `iso8601` to parse string timestamps, or change the column to an integer or timestamp type that matches a different `{format_key}`."
+            )
         }
         arrow::datatypes::DataType::Int8
         | arrow::datatypes::DataType::Int16
@@ -437,67 +557,116 @@ fn validate_time_partition_format(
         | arrow::datatypes::DataType::Float16
         | arrow::datatypes::DataType::Float32
         | arrow::datatypes::DataType::Float64 => {
-            if time_format != TimeFormat::UnixSeconds
-                && time_format != TimeFormat::UnixMillis
-                && time_format != TimeFormat::UnixNanos
-            {
-                invalid = true;
-            }
+            format!(
+                "Set `{format_key}` to `unix_seconds`, `unix_millis`, or `unix_nanos` to match the integer epoch column."
+            )
         }
         arrow::datatypes::DataType::Timestamp(_, None) => {
-            if time_format != TimeFormat::Timestamp {
-                invalid = true;
-            }
+            format!(
+                "Set `{format_key}` to `timestamp`, or remove `{format_key}` if the column is already a timestamp."
+            )
         }
         arrow::datatypes::DataType::Timestamp(_, Some(_)) => {
-            if time_format != TimeFormat::Timestamptz {
-                invalid = true;
-            }
+            format!("Set `{format_key}` to `timestamptz`.")
         }
-        arrow::datatypes::DataType::Date32 => {
-            if time_format != TimeFormat::Date {
-                invalid = true;
-            }
+        arrow::datatypes::DataType::Date32 | arrow::datatypes::DataType::Date64 => {
+            format!("Set `{format_key}` to `date`.")
         }
-        arrow::datatypes::DataType::Null
-        | arrow::datatypes::DataType::Boolean
-        | arrow::datatypes::DataType::Date64
-        | arrow::datatypes::DataType::Time32(_)
-        | arrow::datatypes::DataType::Time64(_)
-        | arrow::datatypes::DataType::Duration(_)
-        | arrow::datatypes::DataType::Interval(_)
-        | arrow::datatypes::DataType::Binary
-        | arrow::datatypes::DataType::FixedSizeBinary(_)
-        | arrow::datatypes::DataType::LargeBinary
-        | arrow::datatypes::DataType::BinaryView
-        | arrow::datatypes::DataType::List(_)
-        | arrow::datatypes::DataType::ListView(_)
-        | arrow::datatypes::DataType::FixedSizeList(_, _)
-        | arrow::datatypes::DataType::LargeList(_)
-        | arrow::datatypes::DataType::LargeListView(_)
-        | arrow::datatypes::DataType::Struct(_)
-        | arrow::datatypes::DataType::Union(_, _)
-        | arrow::datatypes::DataType::Dictionary(_, _)
-        | arrow::datatypes::DataType::Decimal32(_, _)
-        | arrow::datatypes::DataType::Decimal64(_, _)
-        | arrow::datatypes::DataType::Decimal128(_, _)
-        | arrow::datatypes::DataType::Decimal256(_, _)
-        | arrow::datatypes::DataType::Map(_, _)
-        | arrow::datatypes::DataType::RunEndEncoded(_, _) => {
-            invalid = true;
+        _ => {
+            "Use `iso8601` for string columns, `unix_seconds`/`unix_millis`/`unix_nanos` for integer columns, `timestamp`/`timestamptz` for timestamp columns, or `date` for date columns."
+                .to_string()
         }
     }
+}
 
-    if invalid {
-        return Err(Error::TimeFormatMismatch {
-            table_name: dataset_name.to_string(),
-            time_column: time_column.to_string(),
-            expected_time_format: time_format.to_string(),
-            actual_time_format: data_type.to_string(),
-        });
+fn time_format_mismatch_message(
+    table_name: &str,
+    column_name: &str,
+    time_format: TimeFormat,
+    data_type: &arrow::datatypes::DataType,
+    keys: TimeFormatConfigKeys,
+) -> String {
+    format!(
+        "`{column_key}` '{column_name}' in dataset '{table_name}' has data type '{data_type}', but `{format_key}` is configured as '{format}'. {fix} See: {TIME_FORMAT_DOCS}",
+        column_key = keys.column,
+        format_key = keys.format,
+        format = time_format_spicepod_name(time_format),
+        fix = time_format_mismatch_fix(data_type, keys.format),
+    )
+}
+
+fn time_format_matches_data_type(
+    data_type: &arrow::datatypes::DataType,
+    time_format: TimeFormat,
+) -> bool {
+    match data_type {
+        arrow::datatypes::DataType::Utf8
+        | arrow::datatypes::DataType::LargeUtf8
+        | arrow::datatypes::DataType::Utf8View => time_format == TimeFormat::ISO8601,
+        arrow::datatypes::DataType::Int8
+        | arrow::datatypes::DataType::Int16
+        | arrow::datatypes::DataType::Int32
+        | arrow::datatypes::DataType::Int64
+        | arrow::datatypes::DataType::UInt8
+        | arrow::datatypes::DataType::UInt16
+        | arrow::datatypes::DataType::UInt32
+        | arrow::datatypes::DataType::UInt64
+        | arrow::datatypes::DataType::Float16
+        | arrow::datatypes::DataType::Float32
+        | arrow::datatypes::DataType::Float64 => matches!(
+            time_format,
+            TimeFormat::UnixSeconds | TimeFormat::UnixMillis | TimeFormat::UnixNanos
+        ),
+        arrow::datatypes::DataType::Timestamp(_, None) => time_format == TimeFormat::Timestamp,
+        arrow::datatypes::DataType::Timestamp(_, Some(_)) => time_format == TimeFormat::Timestamptz,
+        arrow::datatypes::DataType::Date32 | arrow::datatypes::DataType::Date64 => {
+            time_format == TimeFormat::Date
+        }
+        _ => false,
+    }
+}
+
+fn validate_time_format_for_column(
+    data_type: &arrow::datatypes::DataType,
+    dataset_name: &str,
+    column_name: &str,
+    time_format: Option<TimeFormat>,
+    keys: TimeFormatConfigKeys,
+    log_ignored: bool,
+) -> Result<(), Error> {
+    if let Some(time_format) = time_format
+        && is_native_temporal_type(data_type)
+        && is_string_time_format(time_format)
+    {
+        if log_ignored {
+            tracing::warn!(
+                "{}",
+                ignored_string_time_format_warning(
+                    dataset_name,
+                    column_name,
+                    time_format,
+                    data_type,
+                    keys
+                )
+            );
+        }
+        return Ok(());
     }
 
-    Ok(())
+    let time_format = time_format.unwrap_or(TimeFormat::Timestamp);
+    if time_format_matches_data_type(data_type, time_format) {
+        return Ok(());
+    }
+
+    Err(Error::TimeFormatMismatch {
+        message: time_format_mismatch_message(
+            dataset_name,
+            column_name,
+            time_format,
+            data_type,
+            keys,
+        ),
+    })
 }
 
 impl Default for Refresh {
@@ -514,6 +683,7 @@ impl Default for Refresh {
             mode: RefreshMode::Full,
             period: None,
             append_overlap: None,
+            versions_by_time: None,
             retry_enabled: false,
             retry_max_attempts: None,
             caching_ttl: None,
@@ -541,6 +711,8 @@ pub struct Refresher {
     federated_source: Option<String>,
     refresh: Arc<RwLock<Refresh>>,
     accelerator: Arc<dyn TableProvider>,
+    change_sink: Option<runtime_acceleration::change_sink::ChangeSink>,
+    cache_write_sender: Option<super::caching::CacheWriteSender>,
     // `Weak` reference to `Caching` is used to prevent blocking cache cleanup during runtime termination.
     caching: Option<Weak<Caching>>,
     /// The caching accelerator's claim set, forwarded to the refresh task so
@@ -552,7 +724,8 @@ pub struct Refresher {
     synchronize_with: Option<SynchronizedTable>,
     snapshot_config: Option<SnapshotCreationConfig>,
     snapshot_refresh_state: Option<crate::accelerated::snapshots::SnapshotRefreshState>,
-    snapshot_interval_task: Option<tokio::task::JoinHandle<()>>,
+    snapshot_task: Option<tokio::task::JoinHandle<()>>,
+    initial_snapshot: Option<InitialSnapshot>,
 
     initial_load_completed: Arc<AtomicBool>,
     disable_federation: bool,
@@ -566,6 +739,10 @@ pub struct Refresher {
     cdc_apply_runtime: Option<Handle>,
     io_runtime: Handle,
     resource_monitor: Option<runtime_resources::ResourceMonitor>,
+    /// The runtime's query `RuntimeEnv`: its memory pool bounds what a refresh holds in
+    /// memory, and its disk manager is where the refresh spills. `None` uses an unbounded
+    /// default.
+    query_runtime_env: Option<Arc<datafusion::execution::runtime_env::RuntimeEnv>>,
     /// Mutex to protect concurrent access to the accelerator during insert/update/delete/cache/snapshot operations
     /// Shared with `DataConnector` and `CachingAccelerationScanExec`.
     accelerator_write_mutex: Arc<Mutex<()>>,
@@ -615,6 +792,8 @@ impl Refresher {
             federated_source,
             refresh,
             accelerator,
+            change_sink: None,
+            cache_write_sender: None,
             caching: None,
             in_flight_revalidations: None,
             refresh_task_runner: None,
@@ -627,12 +806,14 @@ impl Refresher {
             refresh_completion: None,
             snapshot_config: None,
             snapshot_refresh_state: None,
-            snapshot_interval_task: None,
+            snapshot_task: None,
+            initial_snapshot: None,
             metrics: None,
             cpu_runtime,
             cdc_apply_runtime,
             io_runtime,
             resource_monitor: None,
+            query_runtime_env: None,
             accelerator_write_mutex,
             bootstrap_status: BootstrapStatus::none(),
             last_updated_at: Arc::new(AtomicI64::from(0)),
@@ -647,6 +828,22 @@ impl Refresher {
         in_flight_revalidations: crate::accelerated::caching::InFlightRevalidations,
     ) -> &mut Self {
         self.in_flight_revalidations = Some(in_flight_revalidations);
+        self
+    }
+
+    pub fn with_change_sink(
+        &mut self,
+        sink: Option<runtime_acceleration::change_sink::ChangeSink>,
+    ) -> &mut Self {
+        self.change_sink = sink;
+        self
+    }
+
+    pub fn with_cache_write_sender(
+        &mut self,
+        sender: Option<super::caching::CacheWriteSender>,
+    ) -> &mut Self {
+        self.cache_write_sender = sender;
         self
     }
 
@@ -752,11 +949,24 @@ impl Refresher {
         self.initial_load_completed.load(Ordering::Relaxed)
     }
 
+    #[must_use]
+    pub async fn refresh_mode(&self) -> RefreshMode {
+        self.refresh.read().await.mode
+    }
+
     pub fn with_resource_monitor(
         &mut self,
         monitor: runtime_resources::ResourceMonitor,
     ) -> &mut Self {
         self.resource_monitor = Some(monitor);
+        self
+    }
+
+    pub fn with_query_runtime_env(
+        &mut self,
+        runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+    ) -> &mut Self {
+        self.query_runtime_env = Some(runtime_env);
         self
     }
 
@@ -828,6 +1038,14 @@ impl Refresher {
                         "Skipped refresh for {}: existing acceleration is available",
                         self.dataset_name
                     );
+                    // No scheduled refresh this process. Answer the initial-load
+                    // question so callers (results-cache warmup) do not wait for
+                    // a completion that will never be recorded. Do not close():
+                    // a later manual trigger still has to answer its own `next`
+                    // waiter.
+                    if let Some(completion) = &self.refresh_completion {
+                        completion.record_untriggered();
+                    }
                     None
                 }
                 NextRefresh::WaitFor(duration) => {
@@ -841,6 +1059,22 @@ impl Refresher {
                 }
             }
         };
+
+        // The acceleration's last refresh, as its checkpoint records it, is reported
+        // from startup rather than only after the first refresh in this process. Only
+        // a refresh writes the checkpoint of a dataset that neither creates snapshots
+        // (whose interval checkpoints without refreshing) nor was restored from one
+        // (whose checkpoint is the snapshot's); for those, the last refresh is
+        // reported once one completes.
+        if self.snapshot_config.is_none()
+            && !self.bootstrap_status.is_bootstrapped()
+            && let Some(checkpointer) = &self.checkpointer
+            && let Ok(Some(last_refresh)) = checkpointer.last_checkpoint_time().await
+        {
+            self.runtime_status
+                .record_dataset_last_refresh(&dataset_name, last_refresh);
+            record_last_refresh_metric(&dataset_name, &self.refresh, last_refresh).await;
+        }
 
         let (snapshot_manager, snapshot_trigger) = match self.snapshot_config.as_ref() {
             Some(SnapshotCreationConfig {
@@ -858,7 +1092,13 @@ impl Refresher {
         // Captured once for the start-time checkpoint schema AND threaded into the
         // snapshot tasks so they can re-derive the canonical schema from the LIVE
         // accelerator at each checkpoint (live schema evolution under CDC).
-        let federated_schema = self.federated.schema();
+        // The checkpoint also records the primary key the acceleration was built
+        // with, so a registration without the source can rebuild it (see
+        // `checkpoint_primary_key`).
+        let federated_schema = super::checkpoint_primary_key::with_acceleration_primary_key(
+            self.federated.schema(),
+            &self.accelerator,
+        );
         let checkpoint_schema =
             canonical_checkpoint_schema(&self.accelerator.schema(), &federated_schema);
 
@@ -872,7 +1112,7 @@ impl Refresher {
                 _,
             ) => receiver,
             (AccelerationRefreshMode::Changes(stream), _) => {
-                let (snapshot_interval_task, on_batch_process_callback) = match snapshot_trigger {
+                let (snapshot_task, on_batch_process_callback) = match snapshot_trigger {
                     None | Some(SnapshotCreateTrigger::RefreshComplete) => (None, None),
                     Some(SnapshotCreateTrigger::Interval(duration)) => (
                         spawn_snapshot_interval_task(
@@ -891,8 +1131,7 @@ impl Refresher {
                         ),
                         None,
                     ),
-                    Some(SnapshotCreateTrigger::Batches(batches)) => (
-                        None,
+                    Some(SnapshotCreateTrigger::Batches(batches)) => {
                         create_periodic_snapshot_callback(
                             *batches,
                             checkpointer.clone(),
@@ -906,10 +1145,11 @@ impl Refresher {
                             Arc::clone(&self.last_updated_at),
                             Some(Arc::clone(&self.accelerator)),
                             Arc::clone(&self.refresh),
-                        ),
-                    ),
+                        )
+                        .unzip()
+                    }
                 };
-                self.snapshot_interval_task = snapshot_interval_task;
+                self.snapshot_task = snapshot_task;
 
                 return Ok(Some(
                     self.start_changes_stream(stream, on_batch_process_callback),
@@ -934,13 +1174,21 @@ impl Refresher {
             refresh_task_runner = refresh_task_runner.with_semaphore(Arc::clone(semaphore));
         }
 
-        refresh_task_runner = refresh_task_runner.with_metrics(self.metrics.clone());
+        refresh_task_runner = refresh_task_runner
+            .with_metrics(self.metrics.clone())
+            .with_change_sink(self.change_sink.clone())
+            .with_cache_write_sender(self.cache_write_sender.clone());
 
         refresh_task_runner = refresh_task_runner.with_cpu_runtime(self.cpu_runtime.clone());
 
         if let Some(ref resource_monitor) = self.resource_monitor {
             refresh_task_runner =
                 refresh_task_runner.with_resource_monitor(resource_monitor.clone());
+        }
+
+        if let Some(ref runtime_env) = self.query_runtime_env {
+            refresh_task_runner =
+                refresh_task_runner.with_query_runtime_env(Arc::clone(runtime_env));
         }
 
         refresh_task_runner =
@@ -983,32 +1231,31 @@ impl Refresher {
 
         let synchronize_with = self.synchronize_with.clone();
 
-        let (snapshot_interval_task, create_checkpoint_snapshot_after_refresh) =
-            match snapshot_trigger {
-                // This will only create checkpoint - default behavior when snapshots are not configured
-                #[expect(clippy::match_same_arms)]
-                None => (None, true),
-                Some(SnapshotCreateTrigger::Batches(_)) => (None, false),
-                Some(SnapshotCreateTrigger::RefreshComplete) => (None, true),
-                Some(SnapshotCreateTrigger::Interval(duration)) => (
-                    spawn_snapshot_interval_task(
-                        Some(*duration),
-                        checkpointer.clone(),
-                        snapshot_manager.clone(),
-                        Arc::clone(&self.accelerator_write_mutex),
-                        dataset_name.clone(),
-                        Arc::clone(&checkpoint_schema),
-                        Arc::clone(&federated_schema),
-                        Arc::clone(&self.runtime_status),
-                        self.bootstrap_status.clone(),
-                        Arc::clone(&self.last_updated_at),
-                        Some(Arc::clone(&self.accelerator)),
-                        Arc::clone(&self.refresh),
-                    ),
-                    false,
+        let (snapshot_task, create_checkpoint_snapshot_after_refresh) = match snapshot_trigger {
+            // This will only create checkpoint - default behavior when snapshots are not configured
+            #[expect(clippy::match_same_arms)]
+            None => (None, true),
+            Some(SnapshotCreateTrigger::Batches(_)) => (None, false),
+            Some(SnapshotCreateTrigger::RefreshComplete) => (None, true),
+            Some(SnapshotCreateTrigger::Interval(duration)) => (
+                spawn_snapshot_interval_task(
+                    Some(*duration),
+                    checkpointer.clone(),
+                    snapshot_manager.clone(),
+                    Arc::clone(&self.accelerator_write_mutex),
+                    dataset_name.clone(),
+                    Arc::clone(&checkpoint_schema),
+                    Arc::clone(&federated_schema),
+                    Arc::clone(&self.runtime_status),
+                    self.bootstrap_status.clone(),
+                    Arc::clone(&self.last_updated_at),
+                    Some(Arc::clone(&self.accelerator)),
+                    Arc::clone(&self.refresh),
                 ),
-            };
-        self.snapshot_interval_task = snapshot_interval_task;
+                false,
+            ),
+        };
+        self.snapshot_task = snapshot_task;
 
         // Gates when checkpoint counting/creation can start after runtime is ready.
         // Set to true immediately when snapshots are not configured, or after the initial
@@ -1032,14 +1279,19 @@ impl Refresher {
                 let last_updated_at_clone = Arc::clone(&self.last_updated_at);
                 let accelerator_clone = Arc::clone(&self.accelerator);
                 let refresh_clone = Arc::clone(&self.refresh);
+                let not_started = CancellationToken::new();
+                let start_gate = not_started.clone();
 
-                tokio::spawn(async move {
-                    // A shutdown before readiness means the initial load never
-                    // completed — checkpointing a partial accelerator would
-                    // publish it as a complete snapshot.
-                    if runtime_status_clone.wait_for_ready().await
-                        == runtime_status::WaitOutcome::ShuttingDown
-                    {
+                let task = tokio::spawn(async move {
+                    // A shutdown or drain before readiness means the initial
+                    // load never completed — checkpointing a partial
+                    // accelerator would publish it as a complete snapshot.
+                    let outcome = select! {
+                        biased;
+                        outcome = runtime_status_clone.wait_for_ready() => outcome,
+                        () = start_gate.cancelled() => return,
+                    };
+                    if outcome == runtime_status::WaitOutcome::ShuttingDown {
                         return;
                     }
                     if !bootstrap_status.is_bootstrapped() {
@@ -1070,6 +1322,10 @@ impl Refresher {
                         "Refresh-based snapshot creation for {dataset_name_clone} starting after runtime ready"
                     );
                 });
+                self.initial_snapshot = Some(InitialSnapshot {
+                    task: Some(task),
+                    not_started,
+                });
             }
         }
 
@@ -1082,9 +1338,23 @@ impl Refresher {
         //   1. Periodic and manual refreshes happening at the same time
         //   2. The periodic refresh happening less than `refresh_check_interval` after a manual
         //        refresh (the sleep future is reset when a manual refresh completes).
+        let refresh_status = Arc::clone(&self.runtime_status);
+        // Schedules the next periodic refresh after `delay` plus jitter, and records
+        // when it is due for a dataset with a refresh schedule.
+        let schedule_refresh = {
+            let runtime_status = Arc::clone(&self.runtime_status);
+            let dataset_name = dataset_name.clone();
+            move |delay: Duration| {
+                let delay = Self::compute_delay(delay, max_jitter);
+                if refresh_check_interval.is_some() {
+                    runtime_status
+                        .record_dataset_next_refresh(&dataset_name, SystemTime::now() + delay);
+                }
+                sleep(delay)
+            }
+        };
         Ok(Some(tokio::spawn(async move {
-            let mut next_scheduled_refresh_timer =
-                initial_refresh_delay.map(|delay| sleep(Self::compute_delay(delay, max_jitter)));
+            let mut next_scheduled_refresh_timer = initial_refresh_delay.map(&schedule_refresh);
 
             loop {
                 let scheduled_refresh_future: BoxFuture<()> =
@@ -1108,8 +1378,12 @@ impl Refresher {
                         // Apply jitter on manual refreshes. For periodic refreshes, jitter
                         // is added to the timer, `next_scheduled_refresh_timer`.
                         let override_jitter = overrides_opt.as_ref().and_then(|o| o.max_jitter);
-                        if let Some(max_jitter) = override_jitter.or(max_jitter) {
-                            sleep(Self::compute_delay(Duration::from_secs(0), Some(max_jitter))).await;
+                        let delay = Self::compute_delay(Duration::ZERO, override_jitter.or(max_jitter));
+                        // An external trigger replaces the interval timer. Retain its
+                        // due time until completion, including when it has no jitter.
+                        refresh_status.record_dataset_next_refresh(&dataset_name, SystemTime::now() + delay);
+                        if !delay.is_zero() {
+                            sleep(delay).await;
                         }
 
                         // Numbered here rather than at the trigger: a caller
@@ -1131,31 +1405,48 @@ impl Refresher {
                         let refresh_changed_accelerator = refresh_result_changed_accelerator(&res);
 
                         if refresh_succeeded {
-                            // Store the flag before recording the completion, so a
-                            // caller woken by the completion observes the initial
-                            // load as done. The CDC apply path already orders it
-                            // this way (`RefreshTask::signal_dataset_ready`).
-                            initial_load_completed.store(true, Ordering::Relaxed);
-                            if let Some(refresh_completion) = &refresh_completion {
-                                record_refresh_done(&dataset_name, &refresh, refresh_completion, request_id).await;
+                            let completed_at = SystemTime::now();
+                            for refreshed_dataset in refresh_task.get_dataset_names().await {
+                                refresh_status.record_dataset_last_refresh(&refreshed_dataset, completed_at);
                             }
                         }
-
-                        if refresh_changed_accelerator && let Some(cache_provider_ref) = caching.as_ref() {
-                            // No cache provider means runtime is shutting down and cache is already cleaned up
-                            if let Some(cache_provider) = cache_provider_ref.upgrade() {
-                                // The refresh rewrote every synchronized (e.g. localpod) child's
-                                // accelerator along with this dataset's, so cached results for the
-                                // children are exactly as stale as the parent's (#12887). Children
-                                // attach after their own initial load completes, so the set is
-                                // resolved live rather than captured when this loop started.
-                                for table_name in refresh_task.get_dataset_names().await {
-                                    if let Err(e) = cache_provider.invalidate_for_table(table_name.clone()).await {
-                                        tracing::warn!("Failed to invalidate cached results for dataset {table_name}: {e}");
+                        after_refresh_task_completed(
+                            refresh_succeeded,
+                            &initial_load_completed,
+                            async {
+                                if refresh_changed_accelerator && let Some(cache_provider_ref) = caching.as_ref() {
+                                    // No cache provider means runtime is shutting down and cache is already cleaned up
+                                    if let Some(cache_provider) = cache_provider_ref.upgrade() {
+                                        // The refresh rewrote every synchronized (e.g. localpod) child's
+                                        // accelerator along with this dataset's, so cached results for the
+                                        // children are exactly as stale as the parent's (#12887). Children
+                                        // attach after their own initial load completes, so the set is
+                                        // resolved live rather than captured when this loop started.
+                                        for table_name in refresh_task.get_dataset_names().await {
+                                            if let Err(e) = cache_provider.invalidate_for_table(table_name.clone()).await {
+                                                tracing::warn!("Failed to invalidate cached results for dataset {table_name}: {e}");
+                                            }
+                                        }
                                     }
                                 }
-                            }
-                        }
+                            },
+                            async {
+                                if let Some(refresh_completion) = &refresh_completion {
+                                    record_refresh_done(
+                                        &dataset_name,
+                                        &refresh,
+                                        refresh_completion,
+                                        request_id,
+                                        refresh_succeeded,
+                                    )
+                                    .await;
+                                }
+                            },
+                            retry_is_scheduled(
+                                refresh_check_interval,
+                                synchronize_with.is_none(),
+                            ),
+                        ).await;
 
                         if refresh_succeeded && checkpoint_counting_enabled.load(Ordering::Acquire) && create_checkpoint_snapshot_after_refresh && let Some(checkpointer) = &checkpointer {
                             let refresh_sql = refresh.read().await.sql.as_ref().map(RefreshSQL::to_sql);
@@ -1183,12 +1474,18 @@ impl Refresher {
                         }
 
                         // Restart periodic refresh timer (after either cron or manual dataset refresh).
-                        // For datasets with no periodic refresh, this will be a no-op.
+                        // For datasets with no periodic refresh, this will be a no-op. The next
+                        // refresh is due an interval after the last successful one, so a failed
+                        // refresh retries on the timer but leaves the recorded due time, now past.
+                        if refresh_check_interval.is_none() && refresh_succeeded {
+                            refresh_status.clear_dataset_next_refresh(&dataset_name);
+                        }
                         if let Some(refresh_check_interval) = refresh_check_interval {
-                            next_scheduled_refresh_timer = Some(sleep(Self::compute_delay(
-                                refresh_check_interval,
-                                max_jitter,
-                            )));
+                            next_scheduled_refresh_timer = Some(if refresh_succeeded {
+                                schedule_refresh(refresh_check_interval)
+                            } else {
+                                sleep(Self::compute_delay(refresh_check_interval, max_jitter))
+                            });
                         }
                     }
                 }
@@ -1209,14 +1506,39 @@ impl Refresher {
         }
 
         if let Some(refresh_task_runner) = &self.refresh_task_runner {
+            let child = synchronized_table.child_dataset_name();
+            let parent = synchronized_table.parent_dataset_name();
             refresh_task_runner
                 .add_synchronized_table(synchronized_table)
                 .await;
+            self.runtime_status
+                .record_dataset_refresh_source(&child, &parent);
         } else {
             unreachable!(
                 "Only tables configured with a full refresh mode can subscribe to new table providers - this is an implementation bug"
             );
         }
+    }
+
+    /// Transfer every nested worker to the table generation's drain owner.
+    pub(crate) fn take_background_tasks(&mut self) -> Vec<tokio::task::JoinHandle<()>> {
+        let mut tasks = Vec::with_capacity(2);
+        if let Some(task) = self
+            .refresh_task_runner
+            .as_mut()
+            .and_then(RefreshTaskRunner::take_task)
+        {
+            tasks.push(task);
+        }
+        if let Some(task) = self.snapshot_task.take() {
+            tasks.push(task);
+        }
+        tasks
+    }
+
+    /// Transfer the initial-load snapshot to the table generation's drain owner.
+    pub(crate) fn take_initial_snapshot(&mut self) -> Option<InitialSnapshot> {
+        self.initial_snapshot.take()
     }
 
     fn start_changes_stream(
@@ -1241,7 +1563,9 @@ impl Refresher {
         .with_s3_express_acceleration(self.is_s3_express_acceleration)
         .with_engine_type_rewrites(self.engine_type_rewrites)
         .with_initial_load_completed(Arc::clone(&self.initial_load_completed))
-        .with_cdc_param_overrides(self.cdc_param_overrides.clone());
+        .with_cdc_param_overrides(self.cdc_param_overrides.clone())
+        .with_change_sink(self.change_sink.clone())
+        .with_cache_write_sender(self.cache_write_sender.clone());
 
         let caching = self.caching.clone();
         let refresh = Arc::clone(&self.refresh);
@@ -1284,9 +1608,34 @@ impl Drop for Refresher {
         if let Some(mut refresh_task_runner) = self.refresh_task_runner.take() {
             refresh_task_runner.abort();
         }
-        if let Some(task) = self.snapshot_interval_task.take() {
+        if let Some(task) = self.snapshot_task.take() {
             task.abort();
         }
+    }
+}
+
+/// The one-shot snapshot of the initial load. It stops if its owner goes away
+/// before the runtime is ready; once it has started, it runs to completion, so
+/// a drain waits for it rather than cutting a snapshot off part-way.
+pub(crate) struct InitialSnapshot {
+    task: Option<tokio::task::JoinHandle<()>>,
+    not_started: CancellationToken,
+}
+
+impl InitialSnapshot {
+    /// Stop the snapshot if it has not started, otherwise wait for it to finish.
+    pub(crate) async fn finish(mut self) -> Result<(), tokio::task::JoinError> {
+        self.not_started.cancel();
+        match self.task.take() {
+            Some(task) => task.await,
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for InitialSnapshot {
+    fn drop(&mut self) {
+        self.not_started.cancel();
     }
 }
 
@@ -1303,6 +1652,51 @@ fn refresh_result_changed_accelerator(result: &super::Result<RefreshOutcome>) ->
     )
 }
 
+/// After a refresh task finishes: invalidate cached results, then publish
+/// `initial_load_completed`, then record the outcome.
+///
+/// Results-cache warmup waits on the outcome recorded here after the first
+/// full/append refresh. Publishing the flag before invalidation would let a
+/// poller of that flag store entries this callback then evicts. The flag still
+/// precedes `record_done`, so a waiter woken by a successful completion
+/// observes the initial load as done — the same pairing as
+/// `RefreshTask::signal_dataset_ready`.
+///
+/// A failed refresh does not publish the ready flag and does not record a
+/// successful completion. If `retry_scheduled` is true
+/// (`refresh_check_interval` will fire again), no outcome is recorded so
+/// warmup does not claim the once-only replay on a transient error. A
+/// one-shot failure records a terminal-failure outcome so warmup and the
+/// ready-hold do not wait forever, without answering success waiters (hot
+/// reload, `PartitionsLoaded`).
+async fn after_refresh_task_completed(
+    refresh_succeeded: bool,
+    initial_load_completed: &AtomicBool,
+    invalidate: impl std::future::Future<Output = ()>,
+    record_done: impl std::future::Future<Output = ()>,
+    retry_scheduled: bool,
+) {
+    invalidate.await;
+    if refresh_succeeded {
+        initial_load_completed.store(true, Ordering::Relaxed);
+        record_done.await;
+    } else if !retry_scheduled {
+        record_done.await;
+    }
+}
+
+/// Whether this refresher will run another attempt after the current one.
+///
+/// A `refresh_check_interval` only retries if the loop stays alive. A
+/// `synchronize_with` child returns after the first completion and never
+/// resets that timer, so an interval there is not a scheduled retry.
+fn retry_is_scheduled(
+    refresh_check_interval: Option<Duration>,
+    refresher_stays_alive: bool,
+) -> bool {
+    refresh_check_interval.is_some() && refresher_stays_alive
+}
+
 /// Numbers a refresh about to be requested, so its completion can be told from
 /// that of a refresh already running.
 ///
@@ -1312,34 +1706,55 @@ fn issue_refresh_request(refresh_completion: Option<&RefreshCompletion>) -> Refr
     refresh_completion.map_or(0, RefreshCompletion::issue)
 }
 
-/// Records a completed refresh under the request that started it: releases the
-/// callers waiting on that request, then publishes the refresh-time metric.
+/// Publishes `at` as `dataset_name`'s last refresh time, with the labels a completed
+/// refresh publishes it with.
+async fn record_last_refresh_metric(
+    dataset_name: &TableReference,
+    refresh: &Arc<RwLock<Refresh>>,
+    at: SystemTime,
+) {
+    let mut labels = vec![KeyValue::new("dataset", dataset_name.to_string())];
+    if let Some(sql) = &refresh.read().await.sql {
+        labels.push(KeyValue::new("sql", sql.display_sql()));
+    }
+    let at = at.duration_since(UNIX_EPOCH).unwrap_or_default();
+    metrics::LAST_REFRESH_TIME_MS.record(at.as_secs_f64() * 1000.0, &labels);
+}
+
+/// Records a completed refresh under the request that started it.
+///
+/// A successful refresh records a completion: releases callers waiting on
+/// that request as a successful answer and publishes the last-refresh metric
+/// (the time the load reached Ready).
+///
+/// A failed refresh records a terminal-failure outcome so warmup and the
+/// ready-hold can settle, without publishing the last-refresh metric or
+/// answering success waiters.
 async fn record_refresh_done(
     dataset_name: &TableReference,
     refresh: &Arc<RwLock<Refresh>>,
     refresh_completion: &RefreshCompletion,
     request_id: RefreshRequestId,
-) {
-    refresh_completion.record(request_id);
-
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-
-    let mut labels = vec![KeyValue::new("dataset", dataset_name.to_string())];
-    let refresh_guard = refresh.read().await;
-    if let Some(sql) = &refresh_guard.sql {
-        labels.push(KeyValue::new("sql", sql.display_sql()));
+    refresh_succeeded: bool,
+) -> bool {
+    if refresh_succeeded {
+        refresh_completion.record(request_id);
+        record_last_refresh_metric(dataset_name, refresh, SystemTime::now()).await;
+        return true;
     }
 
-    metrics::LAST_REFRESH_TIME_MS.record(now.as_secs_f64() * 1000.0, &labels);
+    refresh_completion.record_terminal_failure(request_id);
+    false
 }
 
 #[cfg(test)]
 mod tests {
     use arrow::{
-        array::{ArrowNativeTypeOp, RecordBatch, StringArray, StructArray, UInt64Array},
-        datatypes::{DataType, Field, Fields, Schema},
+        array::{
+            Array, ArrowNativeTypeOp, RecordBatch, StringArray, StructArray, TimestampSecondArray,
+            UInt64Array,
+        },
+        datatypes::{DataType, Field, Fields, Schema, TimeUnit},
     };
     use data_components::arrow::write::MemTable;
     use datafusion::{
@@ -1354,7 +1769,9 @@ mod tests {
 
     use arrow::datatypes::SchemaRef;
     use async_trait::async_trait;
+    use cache::QueryResultsCacheProvider;
     use runtime_status as status;
+    use spicepod::component::caching::SQLResultsCacheConfig;
 
     use super::*;
 
@@ -1494,6 +1911,217 @@ mod tests {
         }
     }
 
+    /// Regression test for #14178. Results-cache warmup polls
+    /// `initial_load_completed`; that flag must stay down until
+    /// invalidation finishes so a store cannot be evicted by this
+    /// same completion.
+    #[tokio::test]
+    async fn after_refresh_task_completed_invalidates_before_ready_flag() {
+        let initial_load_completed = AtomicBool::new(false);
+        let invalidated = AtomicBool::new(false);
+        let recorded = AtomicBool::new(false);
+
+        after_refresh_task_completed(
+            true,
+            &initial_load_completed,
+            async {
+                assert!(
+                    !initial_load_completed.load(Ordering::Relaxed),
+                    "the ready flag must stay down while invalidation is running"
+                );
+                invalidated.store(true, Ordering::Relaxed);
+            },
+            async {
+                assert!(
+                    initial_load_completed.load(Ordering::Relaxed),
+                    "the ready flag must be stored before the completion is recorded"
+                );
+                assert!(
+                    invalidated.load(Ordering::Relaxed),
+                    "invalidation must finish before the completion is recorded"
+                );
+                recorded.store(true, Ordering::Relaxed);
+            },
+            false,
+        )
+        .await;
+
+        assert!(invalidated.load(Ordering::Relaxed), "invalidation must run");
+        assert!(
+            initial_load_completed.load(Ordering::Relaxed),
+            "successful refresh must publish the ready flag"
+        );
+        assert!(
+            recorded.load(Ordering::Relaxed),
+            "successful refresh must record the completion"
+        );
+    }
+
+    /// A poller that waits on `initial_load_completed` (warmup) must
+    /// observe invalidation as already finished, so a store after the
+    /// flag cannot be evicted by this completion.
+    #[tokio::test]
+    async fn after_refresh_task_completed_warmup_store_survives_invalidation() {
+        let initial_load_completed = Arc::new(AtomicBool::new(false));
+        let invalidated = Arc::new(AtomicBool::new(false));
+
+        let flag = Arc::clone(&initial_load_completed);
+        let inv = Arc::clone(&invalidated);
+        let warmup = tokio::spawn(async move {
+            while !flag.load(Ordering::Relaxed) {
+                tokio::task::yield_now().await;
+            }
+            inv.load(Ordering::Relaxed)
+        });
+
+        after_refresh_task_completed(
+            true,
+            &initial_load_completed,
+            async {
+                invalidated.store(true, Ordering::Relaxed);
+            },
+            async {},
+            false,
+        )
+        .await;
+
+        let warmed_entry_survived = warmup.await.expect("warmup poller finishes");
+        assert!(
+            warmed_entry_survived,
+            "warmup that starts after the ready flag must see invalidation already done"
+        );
+    }
+
+    #[tokio::test]
+    async fn after_refresh_task_completed_failed_refresh_invalidates_without_ready_flag() {
+        let initial_load_completed = AtomicBool::new(false);
+        let invalidated = AtomicBool::new(false);
+        let recorded = AtomicBool::new(false);
+
+        after_refresh_task_completed(
+            false,
+            &initial_load_completed,
+            async {
+                invalidated.store(true, Ordering::Relaxed);
+            },
+            async {
+                recorded.store(true, Ordering::Relaxed);
+            },
+            true,
+        )
+        .await;
+
+        assert!(
+            invalidated.load(Ordering::Relaxed),
+            "a failed refresh that rewrote the accelerator must still invalidate"
+        );
+        assert!(
+            !initial_load_completed.load(Ordering::Relaxed),
+            "a failed refresh must not publish the ready flag"
+        );
+        assert!(
+            !recorded.load(Ordering::Relaxed),
+            "a failed refresh that will retry must not record completion"
+        );
+    }
+
+    #[tokio::test]
+    async fn after_refresh_task_completed_oneshot_failure_records_without_ready_flag() {
+        let initial_load_completed = AtomicBool::new(false);
+        let invalidated = AtomicBool::new(false);
+        let recorded = AtomicBool::new(false);
+
+        after_refresh_task_completed(
+            false,
+            &initial_load_completed,
+            async {
+                invalidated.store(true, Ordering::Relaxed);
+            },
+            async {
+                recorded.store(true, Ordering::Relaxed);
+            },
+            false,
+        )
+        .await;
+
+        assert!(
+            invalidated.load(Ordering::Relaxed),
+            "a failed one-shot refresh must still invalidate"
+        );
+        assert!(
+            !initial_load_completed.load(Ordering::Relaxed),
+            "a failed refresh must not publish the ready flag"
+        );
+        assert!(
+            recorded.load(Ordering::Relaxed),
+            "a one-shot failure must record a terminal-failure outcome so warmup does not hang"
+        );
+    }
+
+    #[tokio::test]
+    async fn record_refresh_done_oneshot_failure_does_not_publish_last_refresh_metric() {
+        let completion = RefreshCompletion::new();
+        let request_id = completion.issue();
+        let refresh = Arc::new(RwLock::new(Refresh::default()));
+        let dataset = TableReference::bare("orders");
+
+        let last_refresh_metric_recorded =
+            record_refresh_done(&dataset, &refresh, &completion, request_id, false).await;
+        eprintln!(
+            "failed_one_shot: completion_recorded={} terminal_failure={} last_refresh_metric_recorded={last_refresh_metric_recorded}",
+            completion.has_recorded(),
+            completion.has_terminal_failure()
+        );
+        assert!(
+            !completion.has_recorded(),
+            "a one-shot failure must not look like a successful completion"
+        );
+        assert!(
+            completion.has_terminal_failure(),
+            "a one-shot failure must record a terminal-failure outcome for warmup"
+        );
+        assert!(
+            !last_refresh_metric_recorded,
+            "a failed refresh must not publish dataset_acceleration_last_refresh_unix_time_ms"
+        );
+
+        let request_id = completion.issue();
+        let last_refresh_metric_recorded =
+            record_refresh_done(&dataset, &refresh, &completion, request_id, true).await;
+        assert!(
+            last_refresh_metric_recorded,
+            "a successful refresh must publish the last-refresh metric"
+        );
+    }
+
+    #[test]
+    fn retry_is_scheduled_only_when_this_refresher_stays_alive() {
+        let interval = Some(Duration::from_mins(1));
+        let completion_recorded = !retry_is_scheduled(interval, false);
+        let loop_returned = true;
+        let periodic_timer_reset = false;
+        let warmup_settled = completion_recorded;
+        eprintln!(
+            "synchronize_with failed refresh: completion_recorded={completion_recorded} loop_returned={loop_returned} periodic_timer_reset={periodic_timer_reset} warmup_settled={warmup_settled}"
+        );
+        assert!(
+            retry_is_scheduled(interval, true),
+            "a live refresher with an interval will retry"
+        );
+        assert!(
+            !retry_is_scheduled(interval, false),
+            "a synchronize_with child exits after the first completion; the interval cannot retry"
+        );
+        assert!(
+            !retry_is_scheduled(None, true),
+            "no interval means no automatic retry"
+        );
+        assert!(
+            completion_recorded && loop_returned && !periodic_timer_reset && warmup_settled,
+            "failed initial refresh on a synchronized child must record so warmup can settle"
+        );
+    }
+
     #[test]
     fn test_refresh_result_changed_accelerator() {
         assert!(refresh_result_changed_accelerator(&Ok(
@@ -1576,6 +2204,63 @@ mod tests {
             trigger,
             refresh_handle,
         )
+    }
+
+    #[tokio::test]
+    async fn snapshot_task_ownership_transfers_once_or_aborts_on_drop() {
+        timeout(Duration::from_secs(5), async {
+            for transfer in [false, true] {
+                let (mut refresher, _, _, outer) =
+                    started_full_refresher(status::RuntimeStatus::new()).await;
+                let (started_tx, started) = tokio::sync::oneshot::channel();
+                let (lifetime, cancelled) = tokio::sync::oneshot::channel::<()>();
+                let (ping, receive_ping) =
+                    tokio::sync::oneshot::channel::<tokio::sync::oneshot::Sender<()>>();
+                let snapshot = tokio::spawn(async move {
+                    let _lifetime = lifetime;
+                    started_tx.send(()).expect("snapshot started");
+                    if let Ok(reply) = receive_ping.await {
+                        let _ = reply.send(());
+                    }
+                    std::future::pending::<()>().await;
+                });
+                let snapshot_id = snapshot.id();
+                let refresher_mut = Arc::get_mut(&mut refresher).expect("unique refresher");
+                refresher_mut.snapshot_task = Some(snapshot);
+                started.await.expect("snapshot is running");
+                let tasks = if transfer {
+                    let tasks = refresher_mut.take_background_tasks();
+                    assert_eq!(tasks.len(), 2, "refresh and snapshot workers");
+                    assert!(tasks.iter().any(|task| task.id() == snapshot_id));
+                    assert!(refresher_mut.take_background_tasks().is_empty());
+                    tasks
+                } else {
+                    Vec::new()
+                };
+                drop(refresher);
+                if transfer {
+                    let (reply, alive) = tokio::sync::oneshot::channel();
+                    ping.send(reply)
+                        .expect("transferred snapshot remains owned");
+                    alive.await.expect("snapshot survives refresher drop");
+                    for task in tasks {
+                        let is_snapshot = task.id() == snapshot_id;
+                        task.abort();
+                        let result = task.await;
+                        if is_snapshot {
+                            assert!(result.expect_err("aborted snapshot").is_cancelled());
+                        }
+                    }
+                }
+                assert!(cancelled.await.is_err(), "snapshot future is destroyed");
+                if let Some(task) = outer {
+                    task.abort();
+                    let _ = task.await;
+                }
+            }
+        })
+        .await
+        .expect("snapshot ownership must settle");
     }
 
     /// A source that holds its scan open until the test lets it through, and
@@ -1740,6 +2425,273 @@ mod tests {
             entered,
             refresh_handle,
         )
+    }
+
+    fn results_cache() -> Arc<QueryResultsCacheProvider> {
+        Arc::new(
+            QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
+                .expect("valid results cache"),
+        )
+    }
+
+    async fn store_warmup_entry(cache: &QueryResultsCacheProvider, table: &str, key: u64) {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
+        cache
+            .put_raw_key(
+                &cache::key::RawCacheKey::new(key),
+                cache::result::query::CachedQueryResult::new_raw(
+                    vec![RecordBatch::new_empty(Arc::clone(&schema))],
+                    schema,
+                    Arc::new(std::collections::HashSet::from([TableReference::bare(
+                        table,
+                    )])),
+                    std::time::Instant::now(),
+                    std::time::Instant::now(),
+                ),
+            )
+            .await
+            .expect("store warmup entry");
+    }
+
+    async fn warmup_entry_present(cache: &QueryResultsCacheProvider, key: u64) -> bool {
+        cache.run_pending_tasks().await;
+        cache
+            .get_raw_key(&cache::key::RawCacheKey::new(key))
+            .await
+            .expect("read warmup entry")
+            .is_some()
+    }
+
+    /// Checkpoint-backed Full table whose startup refresh is held in the
+    /// source scan, with a results cache attached so invalidation is observable.
+    ///
+    /// The `Caching` `Arc` must stay alive: the refresher holds only a `Weak`
+    /// and skips invalidation when it cannot upgrade.
+    async fn started_gated_checkpoint_always_refresher() -> (
+        Arc<Refresher>,
+        RefreshCompletion,
+        watch::Sender<bool>,
+        Arc<QueryResultsCacheProvider>,
+        Arc<Caching>,
+        Option<tokio::task::JoinHandle<()>>,
+    ) {
+        let schema = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
+            "time_in_string",
+            DataType::Utf8,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(StringArray::from(vec!["1970-01-01"]))],
+        )
+        .expect("source batch builds");
+        let open = watch::Sender::new(false);
+        let entered = watch::Sender::new(0);
+        let source = Arc::new(GatedSource {
+            inner: Arc::new(
+                MemTable::try_new(Arc::clone(&schema), vec![vec![batch]])
+                    .expect("source table builds"),
+            ),
+            open: open.clone(),
+            entered: entered.clone(),
+        });
+        let federated = Arc::new(FederatedTable::new_unchecked(source));
+        let accelerator =
+            Arc::new(MemTable::try_new(schema, vec![vec![]]).expect("accelerator table builds"))
+                as Arc<dyn TableProvider>;
+
+        let cache = results_cache();
+        let caching = Arc::new(Caching::new().with_results_cache(Arc::clone(&cache)));
+        let refresh_completion = RefreshCompletion::new();
+        let mut refresher = Refresher::new(
+            status::RuntimeStatus::new(),
+            TableReference::bare("orders"),
+            federated,
+            Some("mem_table".to_string()),
+            Arc::new(RwLock::new(Refresh::new(RefreshMode::Full))),
+            accelerator,
+            None,
+            None,
+            Handle::current(),
+            Arc::new(Mutex::new(())),
+        );
+        refresher.with_refresh_completion(refresh_completion.clone());
+        refresher.caching(&Some(Arc::clone(&caching)));
+        refresher.checkpointer(Some(MockCheckpointer::new_arc(
+            true,
+            Some(SystemTime::now()),
+        )));
+        refresher.refresh_on_startup(RefreshOnStartup::Always);
+        refresher.set_initial_load_completed(true);
+
+        let mut entered_rx = entered.subscribe();
+        let (_trigger, receiver) = mpsc::channel::<Option<RefreshOverrides>>(1);
+        let refresh_handle = refresher
+            .start(AccelerationRefreshMode::Full(receiver))
+            .await
+            .expect("refresh task starts");
+        timeout(Duration::from_secs(5), entered_rx.changed())
+            .await
+            .expect("Always + checkpoint must start a refresh that reaches the source")
+            .expect("the source outlives the scan");
+
+        (
+            Arc::new(refresher),
+            refresh_completion,
+            open,
+            cache,
+            caching,
+            refresh_handle,
+        )
+    }
+
+    /// Reproduction for warmup vs checkpoint-backed startup refresh: the
+    /// reusable `initial_load_completed` flag is already true, so a poller
+    /// that waits on it stores while this process's first refresh is still
+    /// in flight; that refresh then invalidates the warmed entry.
+    #[tokio::test]
+    async fn checkpoint_ready_flag_lets_warmup_store_before_startup_invalidation() {
+        const WARMUP_KEY: u64 = 7;
+        let (refresher, refresh_completion, open, cache, _caching, refresh_handle) =
+            started_gated_checkpoint_always_refresher().await;
+
+        assert!(
+            refresher.initial_load_completed(),
+            "checkpoint-backed tables publish the reusable flag at construction"
+        );
+        assert_eq!(
+            refresh_completion.completed_requests(),
+            0,
+            "this process has not completed a refresh yet"
+        );
+
+        store_warmup_entry(&cache, "orders", WARMUP_KEY).await;
+        assert!(
+            warmup_entry_present(&cache, WARMUP_KEY).await,
+            "warmup that trusted the reusable flag stored before this refresh finished"
+        );
+
+        open.send_replace(true);
+        timeout(Duration::from_secs(5), refresh_completion.any().wait())
+            .await
+            .expect("the gated startup refresh completes after the source opens");
+
+        assert!(
+            !warmup_entry_present(&cache, WARMUP_KEY).await,
+            "the startup refresh must invalidate entries stored while it was in flight"
+        );
+
+        drop(refresh_handle);
+    }
+
+    /// The wait warmup must use: a store after the per-process completion
+    /// cannot be evicted by that same refresh, because invalidation already
+    /// ran.
+    #[tokio::test]
+    async fn warmup_store_after_refresh_completion_survives_startup_invalidation() {
+        const WARMUP_KEY: u64 = 11;
+        let (refresher, refresh_completion, open, cache, _caching, refresh_handle) =
+            started_gated_checkpoint_always_refresher().await;
+
+        assert!(
+            refresher.initial_load_completed(),
+            "the reusable flag is already true for a checkpoint-backed table"
+        );
+        assert!(
+            !refresh_completion.has_recorded(),
+            "this process's startup refresh has not finished"
+        );
+
+        open.send_replace(true);
+        timeout(Duration::from_secs(5), refresh_completion.any().wait())
+            .await
+            .expect("the gated startup refresh completes after the source opens");
+        assert!(
+            refresh_completion.has_recorded(),
+            "any() and has_recorded must agree after the refresh"
+        );
+
+        store_warmup_entry(&cache, "orders", WARMUP_KEY).await;
+        assert!(
+            warmup_entry_present(&cache, WARMUP_KEY).await,
+            "a store after the completion is recorded must survive that refresh's invalidation"
+        );
+
+        drop(refresh_handle);
+    }
+
+    /// Full + checkpoint + Auto + no interval schedules no refresh. Warmup
+    /// waiting on `any()` must not hang, and a later `next` waiter must still
+    /// wait for a manual trigger.
+    #[tokio::test]
+    async fn disabled_startup_answers_any_without_closing_next() {
+        let schema = Arc::new(Schema::new(vec![arrow::datatypes::Field::new(
+            "time_in_string",
+            DataType::Utf8,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(StringArray::from(vec!["1970-01-01"]))],
+        )
+        .expect("source batch builds");
+        let federated = Arc::new(FederatedTable::new_unchecked(Arc::new(
+            MemTable::try_new(Arc::clone(&schema), vec![vec![batch]]).expect("source table builds"),
+        )));
+        let accelerator =
+            Arc::new(MemTable::try_new(schema, vec![vec![]]).expect("accelerator table builds"))
+                as Arc<dyn TableProvider>;
+
+        let refresh_completion = RefreshCompletion::new();
+        let mut refresher = Refresher::new(
+            status::RuntimeStatus::new(),
+            TableReference::bare("orders"),
+            federated,
+            Some("mem_table".to_string()),
+            Arc::new(RwLock::new(Refresh::new(RefreshMode::Full))),
+            accelerator,
+            None,
+            None,
+            Handle::current(),
+            Arc::new(Mutex::new(())),
+        );
+        refresher.with_refresh_completion(refresh_completion.clone());
+        refresher.checkpointer(Some(MockCheckpointer::new_arc(
+            true,
+            Some(SystemTime::now()),
+        )));
+        refresher.refresh_on_startup(RefreshOnStartup::Auto);
+        refresher.set_initial_load_completed(true);
+
+        let (trigger, receiver) = mpsc::channel::<Option<RefreshOverrides>>(1);
+        let refresh_handle = refresher
+            .start(AccelerationRefreshMode::Full(receiver))
+            .await
+            .expect("refresh task starts");
+
+        timeout(Duration::from_secs(2), refresh_completion.any().wait())
+            .await
+            .expect("Disabled startup must answer any() so warmup cannot hang");
+        assert!(
+            refresh_completion.has_recorded(),
+            "record_untriggered must satisfy the initial-load poll"
+        );
+
+        let next = refresh_completion.next();
+        let _ = timeout(Duration::from_millis(200), next.wait())
+            .await
+            .expect_err("a later next() waiter must still wait for a manual trigger");
+
+        let next = refresh_completion.next();
+        trigger
+            .send(None)
+            .await
+            .expect("manual trigger is accepted");
+        timeout(Duration::from_secs(5), next.wait())
+            .await
+            .expect("a manual trigger after Disabled startup must still answer next()");
+
+        drop(refresh_handle);
     }
 
     /// Poll `initial_load_completed` rather than sleeping, so the refresh is
@@ -2174,6 +3126,134 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_refresh_append_batch_for_native_timestamp_with_iso8601_time_format() {
+        async fn test(
+            source_data: Vec<i64>,
+            existing_data: Vec<i64>,
+            expected_timestamps: Vec<i64>,
+            message: &str,
+        ) {
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "ts",
+                DataType::Timestamp(TimeUnit::Second, None),
+                false,
+            )]));
+            let arr = TimestampSecondArray::from(source_data);
+
+            let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(arr)])
+                .expect("data should be created");
+
+            let mem_table = Arc::new(
+                MemTable::try_new(Arc::clone(&schema), vec![vec![batch]])
+                    .expect("mem table should be created"),
+            );
+            let federated = Arc::new(FederatedTable::new_unchecked(mem_table));
+
+            let arr = TimestampSecondArray::from(existing_data);
+
+            let batch = RecordBatch::try_new(Arc::clone(&schema), vec![Arc::new(arr)])
+                .expect("data should be created");
+
+            let accelerator = Arc::new(
+                MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created"),
+            ) as Arc<dyn TableProvider>;
+
+            let refresh = Refresh::new(RefreshMode::Append)
+                .time_column("ts".to_string())
+                .time_format(TimeFormat::ISO8601);
+
+            let refresh_completion = RefreshCompletion::new();
+            let mut refresher = Refresher::new(
+                status::RuntimeStatus::new(),
+                TableReference::bare("test"),
+                federated,
+                Some("mem_table".to_string()),
+                Arc::new(RwLock::new(refresh)),
+                Arc::clone(&accelerator),
+                None,
+                None,
+                Handle::current(),
+                Arc::new(Mutex::new(())),
+            );
+
+            refresher.with_refresh_completion(refresh_completion.clone());
+            let (trigger, receiver) = mpsc::channel::<Option<RefreshOverrides>>(1);
+            let acceleration_refresh_mode = AccelerationRefreshMode::Append(receiver);
+            let refresh_handle = refresher
+                .start(acceleration_refresh_mode)
+                .await
+                .expect("Should start refresh task");
+
+            trigger
+                .send(None)
+                .await
+                .expect("trigger sent correctly to refresh");
+
+            timeout(Duration::from_secs(2), refresh_completion.any().wait())
+                .await
+                .expect("finish before the timeout");
+
+            let ctx = SessionContext::new();
+            let state = ctx.state();
+
+            let plan = accelerator
+                .scan(&state, None, &[], None)
+                .await
+                .expect("Scan plan can be constructed");
+
+            let result = collect(plan, ctx.task_ctx())
+                .await
+                .expect("Query successful");
+
+            let mut actual = Vec::new();
+            for batch in &result {
+                let array = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<TimestampSecondArray>()
+                    .expect("ts column is Timestamp(s)");
+                actual.extend(array.values().iter().copied());
+            }
+            let mut expected = expected_timestamps;
+            actual.sort_unstable();
+            expected.sort_unstable();
+            assert_eq!(actual, expected, "{message}");
+
+            drop(refresh_handle);
+        }
+
+        // 1970-01-01, 2012-12-01T11:11:11Z, 2012-12-01T11:11:12Z
+        test(
+            vec![0, 1_354_360_271, 1_354_360_272],
+            vec![],
+            vec![0, 1_354_360_271, 1_354_360_272],
+            "should insert all data into empty accelerator",
+        )
+        .await;
+        test(
+            vec![0, 1_354_360_271, 1_354_360_272],
+            vec![0, 1_354_360_271, 1_354_360_272, 1_354_360_275],
+            vec![0, 1_354_360_271, 1_354_360_272, 1_354_360_275],
+            "should not insert any stale data and keep original size",
+        )
+        .await;
+        test(
+            vec![1_354_360_276, 1_354_360_277],
+            vec![0, 1_354_360_271, 1_354_360_272, 1_354_360_275],
+            vec![
+                0,
+                1_354_360_271,
+                1_354_360_272,
+                1_354_360_275,
+                1_354_360_276,
+                1_354_360_277,
+            ],
+            "should apply new data onto existing data",
+        )
+        .await;
+    }
+
+    #[tokio::test]
     async fn test_refresh_append_batch_for_timestamp() {
         async fn test(
             source_data: Vec<u64>,
@@ -2582,7 +3662,7 @@ mod tests {
         let refresh = Refresh::new(RefreshMode::Full);
         let schema = Arc::new(Schema::empty());
         refresh
-            .validate_time_format("dataset_name".to_string(), &schema)
+            .validate_time_format("dataset_name", &schema)
             .expect("should validate successfully");
     }
 
@@ -2592,7 +3672,7 @@ mod tests {
 
         let schema = Arc::new(Schema::empty());
         assert!(matches!(
-            refresh.validate_time_format("test_dataset".to_string(), &schema),
+            refresh.validate_time_format("test_dataset", &schema),
             Err(Error::NoTimeColumnFound { .. })
         ));
     }
@@ -2612,7 +3692,7 @@ mod tests {
                 .time_format(format);
             let schema = Arc::new(Schema::new(vec![Field::new("time", DataType::Utf8, false)]));
             assert!(matches!(
-                refresh.validate_time_format("test_dataset".to_string(), &schema),
+                refresh.validate_time_format("test_dataset", &schema),
                 Err(Error::TimeFormatMismatch { .. })
             ));
         }
@@ -2636,7 +3716,7 @@ mod tests {
                 false,
             )]));
             assert!(matches!(
-                refresh.validate_time_format("test_dataset".to_string(), &schema),
+                refresh.validate_time_format("test_dataset", &schema),
                 Err(Error::TimeFormatMismatch { .. })
             ));
         }
@@ -2649,7 +3729,6 @@ mod tests {
             TimeFormat::UnixSeconds,
             TimeFormat::UnixNanos,
             TimeFormat::Timestamptz,
-            TimeFormat::ISO8601,
             TimeFormat::Date,
         ] {
             let refresh = Refresh::new(RefreshMode::Full)
@@ -2658,11 +3737,11 @@ mod tests {
 
             let schema = Arc::new(Schema::new(vec![Field::new(
                 "time",
-                DataType::Timestamp(arrow::datatypes::TimeUnit::Second, None),
+                DataType::Timestamp(TimeUnit::Second, None),
                 false,
             )]));
             assert!(matches!(
-                refresh.validate_time_format("test_dataset".to_string(), &schema),
+                refresh.validate_time_format("test_dataset", &schema),
                 Err(Error::TimeFormatMismatch { .. })
             ));
         }
@@ -2675,7 +3754,6 @@ mod tests {
             TimeFormat::UnixSeconds,
             TimeFormat::UnixNanos,
             TimeFormat::Timestamp,
-            TimeFormat::ISO8601,
             TimeFormat::Date,
         ] {
             let refresh = Refresh::new(RefreshMode::Full)
@@ -2684,11 +3762,11 @@ mod tests {
 
             let schema = Arc::new(Schema::new(vec![Field::new(
                 "time",
-                DataType::Timestamp(arrow::datatypes::TimeUnit::Second, Some("+00:00".into())),
+                DataType::Timestamp(TimeUnit::Second, Some("+00:00".into())),
                 false,
             )]));
             assert!(matches!(
-                refresh.validate_time_format("test_dataset".to_string(), &schema),
+                refresh.validate_time_format("test_dataset", &schema),
                 Err(Error::TimeFormatMismatch { .. })
             ));
         }
@@ -2702,7 +3780,7 @@ mod tests {
 
         let schema = Arc::new(Schema::new(vec![Field::new("time", DataType::Utf8, false)]));
         refresh
-            .validate_time_format("dataset_name".to_string(), &schema)
+            .validate_time_format("dataset_name", &schema)
             .expect("should validate successfully");
     }
 
@@ -2723,7 +3801,7 @@ mod tests {
                 false,
             )]));
             refresh
-                .validate_time_format("dataset_name".to_string(), &schema)
+                .validate_time_format("dataset_name", &schema)
                 .expect("should validate successfully");
         }
     }
@@ -2736,11 +3814,11 @@ mod tests {
 
         let schema = Arc::new(Schema::new(vec![Field::new(
             "time",
-            DataType::Timestamp(arrow::datatypes::TimeUnit::Second, None),
+            DataType::Timestamp(TimeUnit::Second, None),
             false,
         )]));
         refresh
-            .validate_time_format("dataset_name".to_string(), &schema)
+            .validate_time_format("dataset_name", &schema)
             .expect("should validate successfully");
     }
 
@@ -2752,11 +3830,11 @@ mod tests {
 
         let schema = Arc::new(Schema::new(vec![Field::new(
             "time",
-            DataType::Timestamp(arrow::datatypes::TimeUnit::Second, Some("+00:00".into())),
+            DataType::Timestamp(TimeUnit::Second, Some("+00:00".into())),
             false,
         )]));
         refresh
-            .validate_time_format("dataset_name".to_string(), &schema)
+            .validate_time_format("dataset_name", &schema)
             .expect("should validate successfully");
     }
 
@@ -2772,7 +3850,7 @@ mod tests {
             false,
         )]));
         refresh
-            .validate_time_format("dataset_name".to_string(), &schema)
+            .validate_time_format("dataset_name", &schema)
             .expect("should validate successfully");
     }
 
@@ -2784,7 +3862,6 @@ mod tests {
             TimeFormat::UnixNanos,
             TimeFormat::Timestamp,
             TimeFormat::Timestamptz,
-            TimeFormat::ISO8601,
         ] {
             let refresh = Refresh::new(RefreshMode::Full)
                 .time_column("time".to_string())
@@ -2796,10 +3873,251 @@ mod tests {
                 false,
             )]));
             assert!(matches!(
-                refresh.validate_time_format("test_dataset".to_string(), &schema),
+                refresh.validate_time_format("test_dataset", &schema),
                 Err(Error::TimeFormatMismatch { .. })
             ));
         }
+    }
+
+    #[test]
+    fn test_validate_time_column_when_iso8601_on_native_timestamp() {
+        for data_type in [
+            DataType::Timestamp(TimeUnit::Second, None),
+            DataType::Timestamp(TimeUnit::Millisecond, None),
+            DataType::Timestamp(TimeUnit::Microsecond, None),
+            DataType::Timestamp(TimeUnit::Nanosecond, None),
+            DataType::Timestamp(TimeUnit::Second, Some("+00:00".into())),
+            DataType::Timestamp(TimeUnit::Millisecond, Some("UTC".into())),
+            DataType::Timestamp(TimeUnit::Microsecond, Some("America/Los_Angeles".into())),
+            DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
+        ] {
+            let refresh = Refresh::new(RefreshMode::Full)
+                .time_column("ts".to_string())
+                .time_format(TimeFormat::ISO8601);
+            let schema = Arc::new(Schema::new(vec![Field::new("ts", data_type, false)]));
+            refresh
+                .validate_time_format("events", &schema)
+                .expect("iso8601 on a native timestamp must be accepted");
+        }
+    }
+
+    #[test]
+    fn test_validate_time_column_when_iso8601_on_date() {
+        for data_type in [DataType::Date32, DataType::Date64] {
+            let refresh = Refresh::new(RefreshMode::Full)
+                .time_column("ts".to_string())
+                .time_format(TimeFormat::ISO8601);
+            let schema = Arc::new(Schema::new(vec![Field::new("ts", data_type, false)]));
+            refresh
+                .validate_time_format("events", &schema)
+                .expect("iso8601 on a date column must be accepted");
+        }
+    }
+
+    #[test]
+    fn test_validate_time_column_when_date_on_date64() {
+        let refresh = Refresh::new(RefreshMode::Full)
+            .time_column("ts".to_string())
+            .time_format(TimeFormat::Date);
+        let schema = Arc::new(Schema::new(vec![Field::new("ts", DataType::Date64, false)]));
+        refresh
+            .validate_time_format("events", &schema)
+            .expect("date format matches a Date64 column");
+    }
+
+    #[test]
+    fn test_validate_time_column_unix_seconds_on_utf8_says_how_to_fix() {
+        let refresh = Refresh::new(RefreshMode::Full)
+            .time_column("ts".to_string())
+            .time_format(TimeFormat::UnixSeconds);
+        let schema = Arc::new(Schema::new(vec![Field::new("ts", DataType::Utf8, false)]));
+        let err = refresh
+            .validate_time_format("events", &schema)
+            .expect_err("unix_seconds on a string column is incompatible");
+        let message = err.to_string();
+        assert_eq!(
+            message,
+            time_format_mismatch_message(
+                "events",
+                "ts",
+                TimeFormat::UnixSeconds,
+                &DataType::Utf8,
+                TIME_COLUMN_FORMAT_KEYS,
+            )
+        );
+        assert!(
+            message.contains("Set `time_format` to `iso8601`"),
+            "{message}"
+        );
+        assert!(message.contains(TIME_FORMAT_DOCS), "{message}");
+    }
+
+    #[test]
+    fn test_validate_time_column_unix_seconds_on_timestamp_says_how_to_fix() {
+        let refresh = Refresh::new(RefreshMode::Full)
+            .time_column("ts".to_string())
+            .time_format(TimeFormat::UnixSeconds);
+        let data_type = DataType::Timestamp(TimeUnit::Second, None);
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            data_type.clone(),
+            false,
+        )]));
+        let err = refresh
+            .validate_time_format("events", &schema)
+            .expect_err("unix_seconds on a timestamp column is incompatible");
+        let message = err.to_string();
+        assert_eq!(
+            message,
+            time_format_mismatch_message(
+                "events",
+                "ts",
+                TimeFormat::UnixSeconds,
+                &data_type,
+                TIME_COLUMN_FORMAT_KEYS,
+            )
+        );
+        assert!(
+            message.contains("Set `time_format` to `timestamp`"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn test_ignored_string_time_format_warning_names_the_dataset_and_fix() {
+        let message = ignored_string_time_format_warning(
+            "events",
+            "ts",
+            TimeFormat::ISO8601,
+            &DataType::Timestamp(TimeUnit::Second, None),
+            TIME_COLUMN_FORMAT_KEYS,
+        );
+        assert_eq!(
+            message,
+            "Dataset 'events' ignores `time_format: iso8601` on `time_column` 'ts' because the column is already a timestamp (Timestamp(s)). Remove `time_format` from the dataset configuration. See: https://spiceai.org/docs/reference/spicepod/datasets#time_format"
+        );
+    }
+
+    #[test]
+    fn test_ignored_string_time_format_warning_for_date() {
+        let message = ignored_string_time_format_warning(
+            "events",
+            "day",
+            TimeFormat::ISO8601,
+            &DataType::Date32,
+            TIME_COLUMN_FORMAT_KEYS,
+        );
+        assert_eq!(
+            message,
+            "Dataset 'events' ignores `time_format: iso8601` on `time_column` 'day' because the column is already a date (Date32). Set `time_format` to `date`. See: https://spiceai.org/docs/reference/spicepod/datasets#time_format"
+        );
+    }
+
+    #[test]
+    fn test_ignored_string_time_format_warning_for_timestamptz() {
+        let data_type = DataType::Timestamp(TimeUnit::Second, Some("+00:00".into()));
+        let message = ignored_string_time_format_warning(
+            "events",
+            "ts",
+            TimeFormat::ISO8601,
+            &data_type,
+            TIME_COLUMN_FORMAT_KEYS,
+        );
+        assert_eq!(
+            message,
+            format!(
+                "Dataset 'events' ignores `time_format: iso8601` on `time_column` 'ts' because the column is already a timestamp ({data_type}). Set `time_format` to `timestamptz`. See: https://spiceai.org/docs/reference/spicepod/datasets#time_format"
+            )
+        );
+    }
+
+    #[test]
+    fn test_ignored_string_time_format_warning_for_partition() {
+        let message = ignored_string_time_format_warning(
+            "events",
+            "day",
+            TimeFormat::ISO8601,
+            &DataType::Date32,
+            TIME_PARTITION_FORMAT_KEYS,
+        );
+        assert_eq!(
+            message,
+            "Dataset 'events' ignores `time_partition_format: iso8601` on `time_partition_column` 'day' because the column is already a date (Date32). Set `time_partition_format` to `date`. See: https://spiceai.org/docs/reference/spicepod/datasets#time_format"
+        );
+    }
+
+    #[test]
+    fn test_validate_time_partition_iso8601_on_date_is_accepted() {
+        let refresh = Refresh::new(RefreshMode::Full)
+            .time_column("ts".to_string())
+            .time_format(TimeFormat::ISO8601)
+            .time_partition_column("day".to_string())
+            .time_partition_format(TimeFormat::ISO8601);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ts", DataType::Utf8, false),
+            Field::new("day", DataType::Date32, false),
+        ]));
+        refresh
+            .validate_time_format("events", &schema)
+            .expect("iso8601 on a Date32 partition column must be accepted");
+    }
+
+    #[test]
+    fn test_validate_time_partition_format_mismatch_names_partition_keys() {
+        let refresh = Refresh::new(RefreshMode::Full)
+            .time_column("ts".to_string())
+            .time_format(TimeFormat::ISO8601)
+            .time_partition_column("day".to_string())
+            .time_partition_format(TimeFormat::UnixSeconds);
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("ts", DataType::Utf8, false),
+            Field::new("day", DataType::Date32, false),
+        ]));
+        let err = refresh
+            .validate_time_format("events", &schema)
+            .expect_err("unix_seconds on a Date32 partition column is incompatible");
+        let message = err.to_string();
+        assert_eq!(
+            message,
+            time_format_mismatch_message(
+                "events",
+                "day",
+                TimeFormat::UnixSeconds,
+                &DataType::Date32,
+                TIME_PARTITION_FORMAT_KEYS,
+            )
+        );
+        assert!(
+            message.contains("Set `time_partition_format` to `date`"),
+            "{message}"
+        );
+        assert!(
+            !message.contains("Set `time_format` to `date`"),
+            "{message}"
+        );
+        assert!(
+            message.contains("`time_partition_column` 'day'"),
+            "{message}"
+        );
+    }
+
+    #[test]
+    fn test_time_format_mismatch_fix_does_not_recommend_removal_for_date_or_timestamptz() {
+        assert_eq!(
+            time_format_mismatch_fix(&DataType::Date32, "time_format"),
+            "Set `time_format` to `date`."
+        );
+        assert_eq!(
+            time_format_mismatch_fix(
+                &DataType::Timestamp(TimeUnit::Second, Some("+00:00".into())),
+                "time_format"
+            ),
+            "Set `time_format` to `timestamptz`."
+        );
+        assert_eq!(
+            time_format_mismatch_fix(&DataType::Timestamp(TimeUnit::Second, None), "time_format"),
+            "Set `time_format` to `timestamp`, or remove `time_format` if the column is already a timestamp."
+        );
     }
 
     #[tokio::test]

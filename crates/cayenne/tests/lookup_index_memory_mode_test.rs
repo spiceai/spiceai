@@ -26,25 +26,23 @@ limitations under the License.
 
 mod common;
 
-use std::sync::Arc;
-use std::time::{Duration, Instant};
+use common::lookup_index::{
+    TableSpec, counters, explain_total, memory_mode_config, open_table, overwrite, poll_until,
+    rendered, runtime_with_pool,
+};
 
-use arrow::array::{Array, Int64Array, StringArray};
+use std::sync::Arc;
+use std::time::Duration;
+
+use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
-use cayenne::lookup_index::LookupIndexCounters;
-use cayenne::metadata::{CdcDurability, CreateTableOptions, DeletionMode, VortexConfig};
-use cayenne::provider::CayenneContext;
-use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
+use cayenne::CayenneTableProvider;
 
 use datafusion::datasource::TableProvider;
-use datafusion::execution::memory_pool::{GreedyMemoryPool, MemoryPool};
-use datafusion::execution::runtime_env::{RuntimeEnv, RuntimeEnvBuilder};
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::prelude::{SessionContext, lit};
-use datafusion_table_providers::util::{
-    column_reference::ColumnReference, on_conflict::OnConflict,
-};
 
 /// A unique key and a heavily repeated one.
 const INDEXES: [&[&str]; 2] = [&["TenantId", "ServiceId"], &["TenantId", "PoolId"]];
@@ -101,73 +99,13 @@ async fn memory_table(
     indexes: &[&[&str]],
     upsert: bool,
 ) -> Arc<CayenneTableProvider> {
-    let vortex_config = VortexConfig {
-        memory_mode: true,
-        cdc_mem_tier_shards: 1,
-        cdc_mem_tier_max_age_ms: 0,
-        cdc_mem_tier_checkpoint_interval_ms: 0,
-        cdc_mem_tier_seal_age_ms: 0,
-        compaction_background_interval_ms: 0,
-        cold_tier_location: None,
-        inline_max_rows: 0,
-        inline_max_bytes: 0,
-        inline_max_buffer_bytes: 0,
-        cdc_mem_tier_max_bytes: 0,
-        cdc_durability: CdcDurability::Memory,
-        deletion_mode: DeletionMode::Key,
-        ..VortexConfig::default()
+    let spec = TableSpec::new(name, schema(), indexes).config(memory_mode_config());
+    let spec = if upsert {
+        spec.upsert_key("AutoId")
+    } else {
+        spec
     };
-    let context = CayenneContext::new(&vortex_config, Arc::clone(&runtime_env), name);
-    let options = CreateTableOptions {
-        table_name: name.to_string(),
-        schema: schema(),
-        primary_key: if upsert {
-            vec!["AutoId".to_string()]
-        } else {
-            vec![]
-        },
-        on_conflict: upsert
-            .then(|| OnConflict::Upsert(ColumnReference::new(vec!["AutoId".to_string()]))),
-        base_path: fixture.data_path.to_string_lossy().to_string(),
-        partition_column: None,
-        vortex_config,
-    };
-    let catalog = Arc::clone(&fixture.catalog);
-    let catalog: Arc<dyn MetadataCatalog> = catalog;
-    Arc::new(
-        CayenneTableProviderBuilder::new(catalog, runtime_env)
-            .with_context(context)
-            .with_secondary_indexes(
-                indexes
-                    .iter()
-                    .map(|columns| columns.iter().map(|c| (*c).to_string()).collect())
-                    .collect(),
-            )
-            .create(options)
-            .await
-            .expect("create memory table"),
-    )
-}
-
-async fn overwrite(provider: &Arc<CayenneTableProvider>, batches: Vec<RecordBatch>) {
-    let ctx = SessionContext::new();
-    let exec = datafusion::datasource::memory::MemorySourceConfig::try_new_exec(
-        &[batches],
-        schema(),
-        None,
-    )
-    .expect("overwrite source");
-    let plan = provider
-        .insert_into(
-            &ctx.state(),
-            exec,
-            datafusion_expr::dml::InsertOp::Overwrite,
-        )
-        .await
-        .expect("overwrite plan");
-    datafusion_physical_plan::collect(plan, ctx.task_ctx())
-        .await
-        .expect("overwrite");
+    open_table(fixture, runtime_env, spec).await
 }
 
 async fn append(provider: &Arc<CayenneTableProvider>, batch: RecordBatch) {
@@ -190,36 +128,9 @@ async fn delete_ids(provider: &Arc<CayenneTableProvider>, ids: &[i64]) {
 }
 
 /// The rows `sql` returns, rendered and sorted so two tables compare exactly.
+/// `sql`, with `{t}` naming the table, run against it and rendered.
 async fn query(provider: &Arc<CayenneTableProvider>, name: &str, sql: &str) -> Vec<String> {
-    let ctx = SessionContext::new();
-    ctx.register_table(name, Arc::clone(provider) as Arc<dyn TableProvider>)
-        .expect("register");
-    let batches = ctx
-        .sql(&sql.replace("{t}", name))
-        .await
-        .expect("plan")
-        .collect()
-        .await
-        .expect("execute");
-    let mut rendered = Vec::new();
-    for batch in &batches {
-        for row in 0..batch.num_rows() {
-            let cells: Vec<String> = (0..batch.num_columns())
-                .map(|column| {
-                    let array = batch.column(column);
-                    if array.is_null(row) {
-                        "NULL".to_string()
-                    } else {
-                        arrow::util::display::array_value_to_string(array, row)
-                            .expect("render cell")
-                    }
-                })
-                .collect();
-            rendered.push(cells.join("|"));
-        }
-    }
-    rendered.sort();
-    rendered
+    rendered(&common::lookup_index::query(provider, name, &sql.replace("{t}", name)).await)
 }
 
 fn unique_lookup(id: i64) -> String {
@@ -231,12 +142,6 @@ fn unique_lookup(id: i64) -> String {
 
 fn repeated_lookup(tenant: i64, pool: i64) -> String {
     format!("SELECT * FROM {{t}} WHERE \"TenantId\" = {tenant} AND \"PoolId\" = {pool}")
-}
-
-fn counters(provider: &Arc<CayenneTableProvider>) -> LookupIndexCounters {
-    provider
-        .lookup_index_counters()
-        .expect("the table declares indexes")
 }
 
 /// Runs the same lookups on both tables and requires identical rows. Returns
@@ -285,9 +190,9 @@ async fn memory_mode_lookups_match_an_unindexed_table() {
     );
 
     let after_refresh = counters(&indexed);
-    assert!(after_refresh.selected > 0, "{after_refresh:?}");
+    assert!(after_refresh.full > 0, "{after_refresh:?}");
     assert_eq!(
-        after_refresh.unbuilt, 0,
+        after_refresh.none, 0,
         "every batch fits an unbounded pool: {after_refresh:?}"
     );
     assert!(after_refresh.index_bytes > 0, "{after_refresh:?}");
@@ -307,7 +212,7 @@ async fn memory_mode_lookups_match_an_unindexed_table() {
     .join("\n");
     assert!(
         explain.contains("lookup_index=(TenantId, ServiceId)")
-            && explain.contains("lookup_index_outcome=selected")
+            && explain.contains("uncovered_batches=0")
             && explain.contains("candidate_rows=")
             && !explain.contains("candidate_files="),
         "memory-mode plan did not expose its lookup decision:\n{explain}"
@@ -322,7 +227,8 @@ async fn memory_mode_lookups_match_an_unindexed_table() {
     .join("\n");
     assert!(
         fallback.contains("lookup_index=none")
-            && fallback.contains("lookup_index_outcome=not_applicable"),
+            && !fallback.contains("lookup_index_outcome")
+            && fallback.contains("lookup_index_reason=no_key_pinned"),
         "memory-mode fallback did not explain why the index was skipped:\n{fallback}"
     );
 
@@ -334,7 +240,7 @@ async fn memory_mode_lookups_match_an_unindexed_table() {
         assert_eq!(query(&indexed, "indexed", sql).await, Vec::<String>::new());
         assert_eq!(query(&plain, "plain", sql).await, Vec::<String>::new());
     }
-    assert!(counters(&indexed).empty > 0);
+    assert!(counters(&indexed).full > 0);
 
     let rows_i64 = i64::try_from(ROWS).expect("fits");
     append(&indexed, rows(rows_i64, 5_000, "v1")).await;
@@ -375,8 +281,96 @@ async fn memory_mode_lookups_match_an_unindexed_table() {
     )
     .await;
     let end = counters(&indexed);
-    assert_eq!(end.unbuilt, 0, "{end:?}");
+    assert_eq!(end.none, 0, "{end:?}");
     println!("memory-mode index counters: {end:?}");
+}
+
+/// `IN` lists on the columns of a compound key are answered from the index,
+/// one probe per query over every tuple the lists pin: an equality with a list,
+/// lists on both columns (their cartesian product), a list holding NULL, and a
+/// short list the planner rewrites into `OR`s all return exactly what the
+/// unindexed table returns. A product past the lookup bound scans instead.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn memory_mode_in_lists_over_a_compound_key_use_the_index() {
+    let fixture = common::TestFixture::new(common::BackendType::Sqlite)
+        .await
+        .expect("fixture");
+    let env = Arc::new(RuntimeEnv::default());
+    let indexed = memory_table(&fixture, Arc::clone(&env), "indexed", &INDEXES, false).await;
+    let plain = memory_table(&fixture, Arc::clone(&env), "plain", &[], false).await;
+    let refresh: Vec<RecordBatch> = (0..4)
+        .map(|chunk| rows(chunk * 10_000, 10_000, "v1"))
+        .collect();
+    overwrite(&indexed, refresh.clone()).await;
+    overwrite(&plain, refresh).await;
+
+    let service = |id: i64| format!("'SV{id:032x}'");
+    let answered = [
+        // Consecutive integers, which the planner rewrites into a BETWEEN.
+        "SELECT * FROM {t} WHERE \"TenantId\" = 5 AND \"PoolId\" IN (1, 2, 3, 4)".to_string(),
+        "SELECT * FROM {t} WHERE \"TenantId\" = 5 AND \"PoolId\" IN (1, 3, 5, 8)".to_string(),
+        "SELECT * FROM {t} WHERE \"TenantId\" IN (5, 6, 7, 8) AND \"PoolId\" IN (1, NULL, 3, 4)"
+            .to_string(),
+        "SELECT * FROM {t} WHERE \"TenantId\" IN (5, 6) AND \"PoolId\" IN (2, 3)".to_string(),
+        format!(
+            "SELECT * FROM {{t}} WHERE \"TenantId\" = 5 AND \"ServiceId\" IN ({}, {}, {}, {})",
+            service(5),
+            service(102),
+            service(199),
+            service(999_999),
+        ),
+    ];
+    let mut found_rows = 0;
+    for sql in &answered {
+        let before = counters(&indexed);
+        let found = query(&indexed, "indexed", sql).await;
+        assert_eq!(found, query(&plain, "plain", sql).await, "{sql}");
+        found_rows += found.len();
+        let after = counters(&indexed);
+        assert_eq!(
+            (after.full + after.partial) - (before.full + before.partial),
+            1,
+            "{sql} was not answered from the index: {before:?} -> {after:?}"
+        );
+        assert_eq!(after.none, before.none, "{sql}: {after:?}");
+        let explain = query(&indexed, "indexed", &format!("EXPLAIN {sql}"))
+            .await
+            .join("\n");
+        assert!(
+            !explain.contains("lookup_index=none") && explain.contains("uncovered_batches=0"),
+            "{sql} did not plan an index lookup:\n{explain}"
+        );
+    }
+    assert!(
+        found_rows > 50,
+        "the lookups returned too few rows to prove anything: {found_rows}"
+    );
+
+    // 60 tenants by 40 pools is 2,400 tuples, past the 2,048 bound.
+    let tenants: Vec<String> = (0..60).map(|tenant| tenant.to_string()).collect();
+    let pools: Vec<String> = (0..40).map(|pool| pool.to_string()).collect();
+    let too_many = format!(
+        "SELECT * FROM {{t}} WHERE \"TenantId\" IN ({}) AND \"PoolId\" IN ({})",
+        tenants.join(", "),
+        pools.join(", ")
+    );
+    let before = counters(&indexed);
+    assert_eq!(
+        query(&indexed, "indexed", &too_many).await,
+        query(&plain, "plain", &too_many).await
+    );
+    let after = counters(&indexed);
+    assert_eq!(
+        after.full, before.full,
+        "a product past the bound must not be probed: {after:?}"
+    );
+    let explain = query(&indexed, "indexed", &format!("EXPLAIN {too_many}"))
+        .await
+        .join("\n");
+    assert!(
+        explain.contains("lookup_index_reason=too_many_keys"),
+        "a lookup past the key bound did not say why it scanned:\n{explain}"
+    );
 }
 
 /// An upsert leaves the superseded version of a row in memory, hidden only by a
@@ -421,17 +415,8 @@ async fn memory_mode_lookups_never_return_a_superseded_version() {
     )
     .await;
     let end = counters(&indexed);
-    assert!(end.selected > 0, "{end:?}");
-    assert_eq!(end.unbuilt, 0, "{end:?}");
-}
-
-fn runtime_with_pool(bytes: usize) -> (Arc<RuntimeEnv>, Arc<dyn MemoryPool>) {
-    let pool: Arc<dyn MemoryPool> = Arc::new(GreedyMemoryPool::new(bytes));
-    let runtime_env = RuntimeEnvBuilder::new()
-        .with_memory_pool(Arc::clone(&pool))
-        .build_arc()
-        .expect("runtime env");
-    (runtime_env, pool)
+    assert!(end.full > 0, "{end:?}");
+    assert_eq!(end.none, 0, "{end:?}");
 }
 
 /// The index's bytes are reserved in the query pool for exactly as long as the
@@ -466,11 +451,16 @@ async fn memory_mode_index_memory_follows_its_rows() {
 
     drop(table);
     drop(env);
-    let deadline = Instant::now() + Duration::from_secs(10);
-    while pool.reserved() > 0 && Instant::now() < deadline {
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert_eq!(pool.reserved(), 0, "a dropped table must release its index");
+    poll_until(
+        Duration::from_secs(10),
+        Duration::from_millis(50),
+        async || match pool.reserved() {
+            0 => Ok(()),
+            still => Err(still),
+        },
+        |still| format!("a dropped table must release its index: {still} bytes still reserved"),
+    )
+    .await;
 }
 
 /// When the pool cannot fit a batch's index, lookups read that batch in full
@@ -499,7 +489,58 @@ async fn memory_mode_batches_the_pool_cannot_fit_are_read_whole() {
     let end = counters(&indexed);
     assert!(end.builds_unpublished > 0, "{end:?}");
     assert!(
-        end.unbuilt > 0,
+        end.none > 0,
         "lookups must report reading unindexed rows: {end:?}"
+    );
+}
+
+/// When the pool fits the index of some batches but not others, a lookup
+/// narrows the indexed batches and reads the rest in full: its coverage is
+/// `partial`, as in file mode, and `none` means no batch read was indexed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn memory_mode_partly_indexed_lookups_report_partial() {
+    let fixture = common::TestFixture::new(common::BackendType::Sqlite)
+        .await
+        .expect("fixture");
+    let (env, _pool) = runtime_with_pool(512 * 1024);
+    let indexed = memory_table(&fixture, Arc::clone(&env), "indexed", &INDEXES, false).await;
+    let plain = memory_table(
+        &fixture,
+        Arc::new(RuntimeEnv::default()),
+        "plain",
+        &[],
+        false,
+    )
+    .await;
+    let refresh: Vec<RecordBatch> = (0..5)
+        .map(|chunk| rows(chunk * 8_000, 8_000, "v1"))
+        .collect();
+    overwrite(&indexed, refresh.clone()).await;
+    overwrite(&plain, refresh).await;
+    let built = counters(&indexed);
+    assert!(
+        built.builds_published > 0 && built.builds_unpublished > 0,
+        "the pool must fit some batches' index and not others: {built:?}"
+    );
+    compare(&indexed, &plain, (0..20).map(|i| i * 1_931), "partial").await;
+    let end = counters(&indexed);
+    assert!(
+        end.partial > 0 && end.none == 0,
+        "a lookup over partly indexed rows is partial, not none: {end:?}"
+    );
+    // `EXPLAIN` shows it as counts: some batches read are uncovered, not all.
+    let explain = query(
+        &indexed,
+        "indexed",
+        &format!("EXPLAIN {}", unique_lookup(1_931).replace("{t}", "indexed")),
+    )
+    .await
+    .join("\n");
+    let uncovered = explain_total(&explain, "uncovered_batches");
+    assert!(
+        explain.contains("lookup_index=(TenantId, ServiceId)")
+            && uncovered > 0
+            && uncovered < explain_total(&explain, "candidate_batches"),
+        "a partly indexed lookup must name its index and count the batches read in full:\n{explain}"
     );
 }

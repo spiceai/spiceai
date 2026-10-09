@@ -39,6 +39,7 @@ const AUTOMATIC_REFERENCE_SCHEMA: &str = "__test_reference";
 #[cfg(feature = "append")]
 pub(crate) mod append;
 pub(crate) mod bench;
+pub(crate) mod cold_start;
 pub(crate) mod data_consistency;
 pub(crate) mod dispatch;
 pub(crate) mod htap;
@@ -953,13 +954,8 @@ mod tests {
     /// - `mssql`, `mssql[catalog]` and `odbc[athena]`: their TPC-H tables hold
     ///   different text columns than the parquet the TPC-H answer files were
     ///   computed from, so no answer file is their oracle.
-    /// - TPC-DS `mysql-duckdb[file]` and `mysql-duckdb[memory]`: their reference
-    ///   reads the same data through `MySQL` federation, which evaluates the
-    ///   pushed-down SQL with `MySQL` semantics (`||` as logical OR, `/` as decimal
-    ///   division, no `FULL JOIN`), so it is no oracle for the answers the
-    ///   accelerator returns.
     ///
-    /// - The seven `ClickBench` arms whose acceleration holds only part of the
+    /// - The five `ClickBench` arms whose acceleration holds only part of the
     ///   source, because a runner cannot hold all of it: their `refresh_sql` keeps
     ///   a subset, while the `__test_reference.*` clone drops acceleration and
     ///   reads every row, so it answers a different question. A `LIMIT` subset
@@ -971,17 +967,13 @@ mod tests {
         "clickbench/sf1/accelerated/s3[parquet]-arrow.yaml",
         "clickbench/sf1/accelerated/s3[parquet]-arrow-partitioned.yaml",
         "clickbench/sf1/accelerated/s3[parquet]-postgres.yaml",
-        "clickbench/sf1/accelerated/s3[parquet]-sqlite[file].yaml",
         "clickbench/sf1/accelerated/s3[parquet]-sqlite[memory].yaml",
         "clickbench/sf1/accelerated/s3[parquet]-turso[file].yaml",
-        "clickbench/sf1/accelerated/spicecloud-arrow.yaml",
         "tpch/sf1/federated/glue[csv].yaml",
         "tpch/sf1/federated/iceberg[hadoop].yaml",
         "tpch/sf1/federated/mssql.yaml",
         "tpch/sf1/federated/mssql[catalog].yaml",
         "tpch/sf1/federated/odbc[athena].yaml",
-        "tpcds/sf1/accelerated/mysql-duckdb[file].yaml",
-        "tpcds/sf1/accelerated/mysql-duckdb[memory].yaml",
     ];
 
     /// rustc `--test` names this module's tests `commands::tests::<fn>`.

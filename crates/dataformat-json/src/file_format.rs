@@ -38,9 +38,10 @@ use arrow::json::reader::{ValueIter, infer_json_schema_from_iterator};
 use async_trait::async_trait;
 use bytes::Buf;
 use datafusion::common::parsers::CompressionTypeVariant;
+use datafusion::common::tree_node::TreeNodeRecursion;
 use datafusion::error::DataFusionError;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
-use datafusion::physical_expr::{EquivalenceProperties, LexOrdering};
+use datafusion::physical_expr::{EquivalenceProperties, LexOrdering, PhysicalExpr};
 use datafusion::physical_plan::metrics::ExecutionPlanMetricsSet;
 use datafusion::physical_plan::projection::ProjectionExprs;
 use datafusion::physical_plan::{DisplayFormatType, Partitioning};
@@ -580,6 +581,12 @@ impl DataSource for NonRepartitionedFileScanConfig {
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
         self.inner.partition_statistics(partition)
     }
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(&Arc<dyn PhysicalExpr>) -> Result<TreeNodeRecursion>,
+    ) -> Result<TreeNodeRecursion> {
+        self.inner.apply_expressions(f)
+    }
     fn with_fetch(&self, limit: Option<usize>) -> Option<Arc<dyn DataSource>> {
         self.inner.with_fetch(limit)
     }
@@ -764,12 +771,23 @@ mod tests {
 
     #[test]
     fn test_format_parse_invalid() {
-        let _ = ""
-            .parse::<Format>()
-            .expect_err("empty format should be rejected");
-        let _ = "invalid"
-            .parse::<Format>()
-            .expect_err("invalid format should be rejected");
+        // The message echoes the value exactly as written — not lowercased — and
+        // lists every accepted spelling.
+        for input in ["", "invalid", "Parquet"] {
+            let err = input
+                .parse::<Format>()
+                .expect_err("an unknown format must be rejected");
+            assert!(
+                matches!(&err, FormatParseError::InvalidFormat { s } if s == input),
+                "the error must carry {input:?}, got {err:?}"
+            );
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "Invalid JSON format '{input}'. Valid formats are: 'auto', 'json', 'jsonl', 'ndjson', 'ldjson', 'array', 'object', 'soda', 'socrata'"
+                )
+            );
+        }
     }
 
     #[test]
@@ -797,28 +815,79 @@ mod tests {
     /// This goes through `infer_json_schema_for_format`, the wiring the
     /// default `Format::Auto` actually uses; a test that constructs the
     /// adapter itself passes whether or not detection is correct.
+    ///
+    /// Each rejection is matched to the guard that raised it, because every
+    /// one of these bodies fails *somewhere*: an `is_err` check passes just as
+    /// well for a body that slipped past detection and failed later for an
+    /// unrelated reason.
     #[test]
     fn a_leading_form_feed_is_not_eaten_by_format_detection() {
-        for format in [Format::Auto, Format::Json, Format::Array] {
-            for body in [
-                &b"\x0c[{\"a\":1}]"[..],
-                &b"\x0b[{\"a\":1}]"[..],
-                // A prefix that starts like a BOM and is not one. Inference
-                // rejects these on its own — it re-parses the original buffer
-                // rather than the reader detection advanced — so these rows
-                // pin that, not the propagation fix. What the *scan* paths do
-                // with the same bodies is
-                // `array_detection_propagates_an_error_that_consumed_bytes`.
-                &b"\xEF{\"a\":1}"[..],
-                &b"\xEF\xBB{\"a\":1}"[..],
-            ] {
-                let mut take = || true;
-                assert!(
-                    infer_json_schema_for_format(body, format, &mut take).is_err(),
-                    "{format:?} accepted {:?}, which serde_json rejects",
+        /// The rejection, tagged with the reader that raised it.
+        fn rejection(body: &[u8], format: Format) -> String {
+            let mut take = || true;
+            match infer_json_schema_for_format(body, format, &mut take) {
+                Ok(schema) => panic!(
+                    "{format:?} accepted {:?}, which serde_json rejects, as {schema:?}",
+                    String::from_utf8_lossy(body)
+                ),
+                Err(DataFusionError::IoError(e)) => format!("io {:?}: {e}", e.kind()),
+                Err(DataFusionError::ArrowError(e, _)) => format!("arrow: {e}"),
+                Err(other) => format!("other: {other}"),
+            }
+        }
+        fn partial_bom(seen: usize) -> String {
+            format!(
+                "io InvalidData: Failed to read JSON: the body starts with {seen} of the 3 bytes of a UTF-8 byte-order mark and then something else, so it is neither a marked nor an unmarked JSON document. Check the file for a truncated or re-encoded header, or re-export it as UTF-8."
+            )
+        }
+
+        for format in [Format::Auto, Format::Json] {
+            // Detection stops at the form feed and answers "not an array", so
+            // the body never reaches the array reader (which would have accepted
+            // it had the byte been eaten). The line reader gets it instead,
+            // trims the byte as Unicode whitespace, and refuses the array behind
+            // it as a record.
+            for body in [&b"\x0c[{\"a\":1}]"[..], &b"\x0b[{\"a\":1}]"[..]] {
+                assert_eq!(
+                    rejection(body, format),
+                    "arrow: Json error: Expected JSON record to be an object, found Array [Object {\"a\": Number(1)}]",
+                    "{format:?} on {:?}",
                     String::from_utf8_lossy(body)
                 );
             }
+            // A prefix that starts like a BOM and is not one is refused by
+            // detection itself, which has already consumed it. What the *scan*
+            // paths do with the same bodies is
+            // `array_detection_propagates_an_error_that_consumed_bytes`.
+            assert_eq!(
+                rejection(b"\xEF{\"a\":1}", format),
+                partial_bom(1),
+                "{format:?}"
+            );
+            assert_eq!(
+                rejection(b"\xEF\xBB{\"a\":1}", format),
+                partial_bom(2),
+                "{format:?}"
+            );
+        }
+
+        // `Format::Array` skips detection, so the array reader's own prologue
+        // guard is what sees each of these bytes.
+        assert_eq!(
+            rejection(b"\x0c[{\"a\":1}]", Format::Array),
+            "io InvalidData: expected '[' but found '\u{c}'"
+        );
+        assert_eq!(
+            rejection(b"\x0b[{\"a\":1}]", Format::Array),
+            "io InvalidData: expected '[' but found '\u{b}'"
+        );
+        for body in [&b"\xEF{\"a\":1}"[..], &b"\xEF\xBB{\"a\":1}"[..]] {
+            assert_eq!(
+                rejection(body, Format::Array),
+                "io InvalidData: expected '[' but found non-ASCII byte while looking for array start",
+                "{:?}",
+                String::from_utf8_lossy(body)
+            );
         }
 
         // The four bytes JSON does admit still reach the array reader.
@@ -867,8 +936,16 @@ mod tests {
     fn test_infer_schema_object_invalid_json() {
         let buf = b"not json";
         let mut take = || true;
-        infer_json_schema_for_format(buf, Format::Object, &mut take)
+        let err = infer_json_schema_for_format(buf, Format::Object, &mut take)
             .expect_err("should fail on invalid JSON");
+        let DataFusionError::External(source) = &err else {
+            panic!("expected serde_json's parse error, got {err:?}");
+        };
+        let parse_error = source
+            .downcast_ref::<serde_json::Error>()
+            .expect("the external error is serde_json's");
+        // `n` opens `null`; the `o` after it is where the parse fails.
+        assert_eq!(parse_error.to_string(), "expected ident at line 1 column 2");
     }
 
     #[test]
@@ -902,17 +979,22 @@ mod tests {
 
     #[test]
     fn test_infer_schema_auto_ndjson_still_works() {
+        use arrow::datatypes::{DataType, Field};
+
         // NDJSON with multiple lines should still work via ValueIter fallback
         let buf = b"{\"a\": 1}\n{\"a\": 2, \"b\": 3}\n";
         let mut take = || true;
         let schema = infer_json_schema_for_format(buf, Format::Auto, &mut take)
             .expect("Auto should still handle NDJSON");
-        schema
-            .field_with_name("a")
-            .expect("field should exist in schema");
-        schema
-            .field_with_name("b")
-            .expect("field should exist in schema");
+        // `b` appears only on the second line, so it is there only if every
+        // line was read; both columns are integers in every row that has them.
+        assert_eq!(
+            schema,
+            Schema::new(vec![
+                Field::new("a", DataType::Int64, true),
+                Field::new("b", DataType::Int64, true),
+            ])
+        );
     }
 
     #[test]
@@ -1495,18 +1577,32 @@ mod tests {
         fn both_readers_reject_the_same_truncated_body() {
             let body = br#"[{"a":1},{"a":2}"#;
 
+            // Both readers classify the failure as the input ending early.
             let mut pulled = Vec::new();
             let pull = ArrayToNdjson::try_new(std::io::Cursor::new(body.to_vec()))
                 .expect("array start is present")
-                .read_to_end(&mut pulled);
-            assert!(pull.is_err(), "buffered reader accepted a truncated array");
+                .read_to_end(&mut pulled)
+                .expect_err("buffered reader accepted a truncated array");
+            assert_eq!(pull.kind(), std::io::ErrorKind::UnexpectedEof);
+            assert_eq!(pull.to_string(), "EOF while peeking next byte");
 
             let schema = schema();
             let mut dec = decoder(&schema);
             dec.decode(body).expect("decode should accept the prefix");
-            assert!(
-                dec.flush().is_err(),
-                "streaming adapter accepted a truncated array the buffered reader rejects"
+            let push = dec.flush().expect_err(
+                "streaming adapter accepted a truncated array the buffered reader rejects",
+            );
+            let ArrowError::IoError(message, source) = &push else {
+                panic!("expected the adapter's end-of-input verdict, got {push:?}");
+            };
+            assert_eq!(
+                source.kind(),
+                std::io::ErrorKind::UnexpectedEof,
+                "{message}"
+            );
+            assert_eq!(
+                message,
+                "Failed to read JSON array: the input ended before the closing ']' — the file is truncated. Rows read so far are only part of the file. Re-fetch the complete file, or set the dataset's 'format' to match its contents."
             );
         }
 
@@ -1516,24 +1612,34 @@ mod tests {
         /// the same file has to reach the same verdict.
         #[test]
         fn both_readers_reject_the_same_trailing_content() {
+            // Both readers raise the shared `trailing_content_error`, so the
+            // verdict is word for word the same whichever one scans the file.
+            const TRAILING_CONTENT: &str = "Failed to read JSON array: found '{' after the closing ']'. The body holds more than the single JSON array it was read as, so the rows returned are only its first array. Check the file for concatenated or trailing content, or set the dataset's 'format' to match its contents.";
             let body = br#"[{"a":1}]{"a":2}"#;
 
             let mut pulled = Vec::new();
             let pull = ArrayToNdjson::try_new(std::io::Cursor::new(body.to_vec()))
                 .expect("array start is present")
-                .read_to_end(&mut pulled);
+                .read_to_end(&mut pulled)
+                .expect_err("buffered reader read a second array as part of the first");
+            assert_eq!(pull.kind(), std::io::ErrorKind::InvalidData);
+            assert_eq!(pull.to_string(), TRAILING_CONTENT);
             assert!(
-                pull.is_err(),
-                "buffered reader read a second array as part of the first"
+                pulled.is_empty(),
+                "the first array's row was handed out before the verdict: {:?}",
+                String::from_utf8_lossy(&pulled)
             );
 
             let schema = schema();
             let mut dec = decoder(&schema);
-            let decoded = dec.decode(body);
-            assert!(
-                decoded.is_err() || dec.flush().is_err(),
-                "streaming adapter accepted trailing content the buffered reader rejects"
+            let push = dec.decode(body).expect_err(
+                "streaming adapter accepted trailing content the buffered reader rejects",
             );
+            let ArrowError::IoError(message, source) = &push else {
+                panic!("expected the adapter's trailing-content verdict, got {push:?}");
+            };
+            assert_eq!(source.kind(), std::io::ErrorKind::InvalidData, "{message}");
+            assert_eq!(message, TRAILING_CONTENT);
         }
     }
 }

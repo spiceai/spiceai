@@ -164,16 +164,16 @@ mod postgres;
 mod prepared_statements;
 #[cfg(any(feature = "mongodb", feature = "dynamodb", feature = "cosmosdb"))]
 mod pushdown_roundtrip;
-#[cfg(feature = "rate-control")]
-mod rate_control;
 mod ready_state;
 mod refresh_retry;
 mod refresh_sql;
 mod refresh_worker_panic;
 mod results_cache;
+mod results_cache_warmup;
 #[cfg(all(unix, feature = "duckdb", feature = "postgres"))]
 mod retention;
 mod s3;
+mod s3_folder_marker;
 mod s3_location_pruning;
 mod s3_parquet_overwrite;
 #[cfg(any(
@@ -194,6 +194,7 @@ mod snapshot_source;
 mod snowflake;
 #[cfg(feature = "snowflake")]
 mod snowflake_catalog;
+mod source_unavailable;
 #[cfg(feature = "spark")]
 mod spark;
 mod spiceai;
@@ -329,6 +330,8 @@ where
             filters => vec![
                 // Normalize HTTP server ports: http://127.0.0.1:12345 → http://127.0.0.1:<PORT>
                 (r"http://127\.0\.0\.1:\d+", "http://127.0.0.1:<PORT>"),
+                // Docker assigns fixture ports independently for each test instance.
+                (r"(compute_context=host=localhost,port=)\d+(,db=)", "$1<PORT>$2"),
                 // Spark Connect plans include Databricks connection details. Those identify
                 // the test fixture, not the plan being asserted.
                 (r"compute_context=sc://[^ ]+", "compute_context=<DATABRICKS_SPARK_CONNECT>"),

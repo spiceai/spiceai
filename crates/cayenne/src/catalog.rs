@@ -21,9 +21,9 @@ limitations under the License.
 //! (`SQLite`, Turso, etc.).
 
 use super::metadata::{
-    ColdTierFile, CreateTableOptions, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete,
-    PartitionMetadata, SnapshotFile, SnapshotFileStatistics, TableMetadata, TableStatistics,
-    TableStorageStats,
+    ColdTierFile, CreateTableOptions, DeleteFile, IndexRunRecord, InlinedData, InlinedDataStats,
+    InlinedDelete, PartitionMetadata, SnapshotFile, SnapshotFileStatistics, TableMetadata,
+    TableStatistics, TableStorageStats,
 };
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
@@ -289,6 +289,8 @@ pub trait MetadataCatalog: Send + Sync {
     /// in the same transaction: the table aggregate, the snapshot-file cache,
     /// and `cayenne_cold_tier_file.statistics_blob`.
     ///
+    /// Also used when schema evolution has an outstanding row-count delta,
+    /// whose process-local reservation cannot protect the count after reopening.
     /// Used when a widening changes a decimal column's scale. Vortex stores
     /// unscaled integers and decodes them with the current schema's scale, so
     /// publishing the new schema while leaving those blobs in place would
@@ -701,11 +703,15 @@ pub trait MetadataCatalog: Send + Sync {
     /// # Errors
     ///
     /// Returns an error if the transaction cannot be committed.
+    ///
+    /// `delete_files` are position deletion vectors on the new snapshot, hiding
+    /// the copies of keys its incoming data repeated across record batches.
     async fn commit_overwrite(
         &self,
         table_id: &str,
         new_snapshot_id: &str,
         inlined: Option<&InlinedData>,
+        delete_files: &[crate::metadata::DeleteFile],
     ) -> CatalogResult<()>;
 
     /// Add a partition to a table.
@@ -842,6 +848,20 @@ pub trait MetadataCatalog: Send + Sync {
 
     /// Clear the persisted PK existence index for a table.
     async fn clear_pk_index(&self, table_id: &str) -> CatalogResult<()>;
+
+    /// Record a persisted secondary index run, after its file is written.
+    async fn register_index_run(&self, run: &IndexRunRecord) -> CatalogResult<()>;
+
+    /// Every persisted secondary index run of a table.
+    async fn list_index_runs(&self, table_id: &str) -> CatalogResult<Vec<IndexRunRecord>>;
+
+    /// Forget a persisted secondary index run, before its file is deleted.
+    async fn remove_index_run(
+        &self,
+        table_id: &str,
+        index_key: &str,
+        run_name: &str,
+    ) -> CatalogResult<()>;
 
     // ── Inlined data (data inlining for small writes) ──────────────────
 

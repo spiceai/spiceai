@@ -17,8 +17,9 @@ limitations under the License.
 //! Turso implementation of the metastore backend.
 //!
 //! libSQL/Turso backend (gated on the `turso` feature). Unlike `SQLite`'s single writer,
-//! it uses `BEGIN CONCURRENT` MVCC writers that run in parallel and serialize at commit
-//! time only on actual conflicts, behind a fixed `K = 16` connection pool.
+//! it uses `BEGIN CONCURRENT` MVCC writers that run in parallel and conflict on the
+//! statement that writes a row another transaction has changed, or on `COMMIT`,
+//! behind a fixed `K = 16` connection pool.
 
 use super::{
     ExecuteParams, MetastoreBackend, MetastoreRow, MetastoreTransaction, MetastoreValue,
@@ -471,6 +472,22 @@ impl TursoMetastore {
         )
     ";
 
+    /// Schema for the `cayenne_index_run` table: one row per persisted
+    /// secondary index run (see `metadata::IndexRunRecord`). The run's bytes
+    /// live in the table's object store; captured in metastore snapshots via
+    /// `EXPECTED_TABLES`.
+    const INDEX_RUN_TABLE_DDL: &'static str = r"
+        CREATE TABLE IF NOT EXISTS cayenne_index_run (
+            table_id TEXT NOT NULL,
+            index_key TEXT NOT NULL,
+            run_name TEXT NOT NULL,
+            row_count BIGINT NOT NULL,
+            size_bytes BIGINT NOT NULL,
+            FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE,
+            PRIMARY KEY (table_id, index_key, run_name)
+        )
+    ";
+
     const INLINED_DATA_TABLE_DDL: &'static str = r"
         CREATE TABLE IF NOT EXISTS cayenne_inlined_data (
             inlined_id TEXT PRIMARY KEY,
@@ -683,7 +700,7 @@ impl MetastoreBackend for TursoMetastore {
 
         // Create tables
         let schema_sql = format!(
-            "{}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {};",
+            "{}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {};",
             Self::TABLE_TABLE_DDL,
             Self::TABLE_NAME_UNIQUE_INDEX_DDL,
             Self::DELETE_FILE_TABLE_DDL,
@@ -697,7 +714,8 @@ impl MetastoreBackend for TursoMetastore {
             Self::COLD_TIER_FILE_TABLE_DDL,
             Self::INLINED_DATA_TABLE_DDL,
             Self::INLINED_DELETE_TABLE_DDL,
-            Self::PK_INDEX_TABLE_DDL
+            Self::PK_INDEX_TABLE_DDL,
+            Self::INDEX_RUN_TABLE_DDL
         );
 
         conn.execute_batch(&schema_sql)
@@ -1170,6 +1188,13 @@ pub struct TursoTransaction {
 impl Drop for TursoTransaction {
     fn drop(&mut self) {
         if let Some(guard) = self.conn.take() {
+            // A statement's write-write conflict ends the transaction inside Turso and
+            // returns the connection to autocommit. Nothing is left to roll back then,
+            // so release the pool slot now rather than from a task whose `ROLLBACK`
+            // could only fail.
+            if matches!(guard.is_autocommit(), Ok(true)) {
+                return;
+            }
             let rollback = async move {
                 tracing::debug!(
                     "TursoTransaction dropped without explicit commit or rollback; \
@@ -1314,6 +1339,13 @@ impl MetastoreTransaction for TursoTransaction {
         let conn = self.conn.take().ok_or_else(|| CatalogError::Database {
             message: "Transaction already completed".to_string(),
         })?;
+
+        // A statement's write-write conflict ends the transaction inside Turso and
+        // returns the connection to autocommit, so the transaction is already rolled
+        // back; a `ROLLBACK` would only fail with "no transaction is active".
+        if matches!(conn.is_autocommit(), Ok(true)) {
+            return Ok(());
+        }
 
         conn.execute("ROLLBACK", ())
             .await
@@ -1611,5 +1643,158 @@ mod tests {
             unreadable.to_string().contains("Cannot confirm"),
             "the error should say the state could not be confirmed, got: {unreadable}"
         );
+    }
+
+    /// A metastore whose table `t` holds the row `(1, 0)`. With
+    /// `checkpoint_every_commit`, the database checkpoints after every commit, so the
+    /// row lives in the B-tree rather than the MVCC store.
+    async fn metastore_with_one_row(
+        checkpoint_every_commit: bool,
+    ) -> (tempfile::TempDir, TursoMetastore) {
+        let (dir, metastore) = temp_metastore();
+        if checkpoint_every_commit {
+            metastore
+                .execute(ExecuteParams {
+                    sql: "PRAGMA mvcc_checkpoint_threshold = 0",
+                    params: vec![],
+                })
+                .await
+                .expect("checkpoint after every commit");
+        }
+        metastore
+            .execute_batch("CREATE TABLE t (id INTEGER PRIMARY KEY, n INTEGER NOT NULL)")
+            .await
+            .expect("create table");
+        metastore
+            .execute(ExecuteParams {
+                sql: "INSERT INTO t (id, n) VALUES (1, 0)",
+                params: vec![],
+            })
+            .await
+            .expect("seed the row");
+        (dir, metastore)
+    }
+
+    /// The engine behavior the commit envelopes' retry and
+    /// `TursoTransaction::rollback` account for. A statement that writes a row
+    /// another open transaction has written fails at once with a write-write conflict,
+    /// and Turso ends the conflicted transaction itself: the connection is back in
+    /// autocommit, and a further `ROLLBACK` on it fails because no transaction is open.
+    async fn assert_a_write_conflict_fails_the_statement_and_ends_the_transaction(
+        checkpoint_every_commit: bool,
+    ) {
+        let (_dir, metastore) = metastore_with_one_row(checkpoint_every_commit).await;
+        let pool = Arc::clone(metastore.pool().await.expect("pool"));
+        let holder = pool
+            .acquire()
+            .await
+            .expect("acquire the connection that holds the row");
+        let conflicted = pool
+            .acquire()
+            .await
+            .expect("acquire the connection that conflicts");
+
+        holder
+            .execute("BEGIN CONCURRENT", ())
+            .await
+            .expect("begin the transaction that holds the row");
+        holder
+            .execute("UPDATE t SET n = n + 1 WHERE id = 1", ())
+            .await
+            .expect("write the row");
+        conflicted
+            .execute("BEGIN CONCURRENT", ())
+            .await
+            .expect("begin the transaction that conflicts");
+        let error = conflicted
+            .execute("UPDATE t SET n = n + 2 WHERE id = 1", ())
+            .await
+            .expect_err("writing a row another open transaction has written fails the statement");
+        assert!(
+            turso_shared::is_retryable_write_conflict_message(&error.to_string()),
+            "the statement should fail with a write-write conflict, got: {error}"
+        );
+        assert!(
+            conflicted.is_autocommit().expect("read autocommit state"),
+            "the conflict should have ended the conflicted transaction"
+        );
+        conflicted
+            .execute("ROLLBACK", ())
+            .await
+            .expect_err("a ROLLBACK after the conflict finds no transaction to roll back");
+        holder
+            .execute("ROLLBACK", ())
+            .await
+            .expect("end the transaction that holds the row");
+    }
+
+    /// Turso fails the conflicting statement for a row still in the MVCC store.
+    #[tokio::test]
+    async fn a_write_conflict_on_an_mvcc_row_fails_the_statement_and_ends_the_transaction() {
+        assert_a_write_conflict_fails_the_statement_and_ends_the_transaction(false).await;
+    }
+
+    /// Turso 0.8 also fails the conflicting statement for a row checkpointed into the
+    /// B-tree, a conflict 0.7 left to `COMMIT` (tursodatabase/turso#8961).
+    #[tokio::test]
+    async fn a_write_conflict_on_a_checkpointed_row_fails_the_statement_and_ends_the_transaction() {
+        assert_a_write_conflict_fails_the_statement_and_ends_the_transaction(true).await;
+    }
+
+    /// A transaction that a statement's write-write conflict has ended (see
+    /// [`assert_a_write_conflict_fails_the_statement_and_ends_the_transaction`])
+    /// still rolls back successfully: the commit envelopes roll a conflicted attempt
+    /// back before they retry it, and an error there would report an expected retry
+    /// as a failure. The connection it held must go back to the pool in autocommit,
+    /// so the next borrower is not refused.
+    #[tokio::test]
+    async fn rolling_back_a_transaction_a_write_conflict_ended_succeeds() {
+        let (_dir, metastore) = metastore_with_one_row(true).await;
+
+        let holder = metastore
+            .begin_transaction()
+            .await
+            .expect("begin the transaction that holds the row");
+        holder
+            .execute(ExecuteParams {
+                sql: "UPDATE t SET n = n + 1 WHERE id = 1",
+                params: vec![],
+            })
+            .await
+            .expect("write the row");
+
+        let conflicted = metastore
+            .begin_transaction()
+            .await
+            .expect("begin the transaction that conflicts");
+        let error = conflicted
+            .execute(ExecuteParams {
+                sql: "UPDATE t SET n = n + 2 WHERE id = 1",
+                params: vec![],
+            })
+            .await
+            .expect_err("writing a row another open transaction has written conflicts");
+        assert!(
+            crate::cayenne_catalog::is_retryable_write_conflict(&error),
+            "the statement should fail with a retryable write conflict, got: {error}"
+        );
+        conflicted
+            .rollback()
+            .await
+            .expect("rolling back a transaction the conflict already ended succeeds");
+        holder
+            .rollback()
+            .await
+            .expect("end the transaction that holds the row");
+
+        let pool = Arc::clone(metastore.pool().await.expect("pool"));
+        for _ in 0..pool.conns.len() {
+            let guard = pool.acquire().await.expect("acquire a pooled connection");
+            assert_eq!(
+                count_rows(&guard).await,
+                1,
+                "every pooled connection should read the committed row"
+            );
+        }
     }
 }

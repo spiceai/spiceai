@@ -21,6 +21,7 @@ use std::time::Instant;
 
 use arrow::datatypes::{DataType, Field, Schema};
 use datafusion::common::ScalarValue;
+use datafusion::common::TableReference;
 use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
 use datafusion::error::Result;
 use datafusion::logical_expr::LogicalPlan;
@@ -35,7 +36,6 @@ use datafusion::physical_plan::sorts::sort_preserving_merge::SortPreservingMerge
 use datafusion::physical_plan::windows::WindowAggExec;
 use datafusion::physical_plan::{ExecutionPlan, displayable};
 use datafusion::prelude::SessionContext;
-use datafusion::sql::TableReference;
 use datafusion_federation::schema_cast::SchemaCastScanExec;
 use datafusion_federation::sql::{SQLFederationPlanner, VirtualExecutionPlan};
 use datafusion_federation::{FederatedPlanNode, FederatedQueryType, FederationPlanner};
@@ -218,6 +218,72 @@ fn fully_federated(plan: &dyn ExecutionPlan) -> std::result::Result<(), String> 
     Ok(())
 }
 
+/// The queries a fractional-to-integer cast keeps from federating whole, and
+/// the number of remote subtrees each one keeps, as of issue #14482.
+///
+/// `BigQuery` rounds a fractional value on its way into an integer where
+/// `DataFusion` truncates, so `bigquery_can_evaluate_expression` refuses to
+/// push such a cast down. Each of these three queries computes one:
+///
+/// * query 033 — `CAST(v0057.v0201 AS INT)` over a `Float64` column, inside the
+///   CTE the outer aggregation joins, which splits the plan into three scans;
+/// * query 124 — `CAST(v0715 - TRUNC(CAST(v0715 AS DOUBLE) / 7.0) * 7 AS
+///   INTEGER)`, the day-of-week arithmetic, whose operand is `Float64` through
+///   `TRUNC`, splitting the plan into five scans;
+/// * query 147 — `CAST(v0006 / 1000 AS INTEGER)` over a `Float64` column, in
+///   the sole scan's `GROUP BY`, which keeps its one scan and lifts the
+///   aggregate and sort above it.
+///
+/// Refusing the cast is the trade the policy exists to make: the rows are right
+/// and the pushdown is what it costs. Issue #14607 tracks restoring federation
+/// by rendering the cast as a truncating one rather than declining it, which
+/// would return each of these queries to `fully_federated` and delete its entry
+/// here. Until then the counts pin the cost: de-federating further, or
+/// restoring it, fails this test and asks for the entry to be re-decided.
+const ROUNDING_CAST_PARTIAL: [(usize, usize); 3] = [(33, 3), (124, 5), (147, 1)];
+
+/// Arrow's names for the integer types a cast refused by the rounding policy
+/// targets, as a physical plan renders them.
+const INTEGER_TYPES: [&str; 8] = [
+    "Int8", "Int16", "Int32", "Int64", "UInt8", "UInt16", "UInt32", "UInt64",
+];
+
+/// The expected remote-subtree count where `index` is a [`ROUNDING_CAST_PARTIAL`]
+/// query, and `None` where it is not.
+fn rounding_cast_remotes(index: usize) -> Option<usize> {
+    ROUNDING_CAST_PARTIAL
+        .iter()
+        .find(|(query, _)| *query == index)
+        .map(|(_, remotes)| *remotes)
+}
+
+/// A query whose plan a rounding cast splits must keep exactly the remote
+/// subtrees [`ROUNDING_CAST_PARTIAL`] records, and must still carry the local
+/// integer cast that split it — a plan that lost the cast is not this case and
+/// belongs back under `fully_federated`.
+fn rounding_cast_partial(
+    plan: &dyn ExecutionPlan,
+    expected: usize,
+) -> std::result::Result<(), String> {
+    let remotes = remote_nodes(plan).len();
+    if remotes != expected {
+        return Err(format!(
+            "rounding-cast case expected {expected} remote nodes, got {remotes}"
+        ));
+    }
+    // A remote subtree renders as `base_sql=SELECT …` in `BigQuery`'s own
+    // spelling (`INT64`, `BIGINT`), so an Arrow integer type in this text is
+    // always a locally evaluated cast.
+    let rendered = displayable(plan).indent(false).to_string();
+    if !INTEGER_TYPES
+        .iter()
+        .any(|integer| rendered.contains(&format!("AS {integer})")))
+    {
+        return Err("rounding-cast case has no local integer cast left".into());
+    }
+    Ok(())
+}
+
 /// Query 241 computes median and approximate-percentile windows locally because
 /// the `BigQuery` policy rejects those window forms. The source joins, JSON
 /// extraction and aggregation must still form a single remote subtree.
@@ -312,6 +378,8 @@ async fn check_query(
     } else {
         let verdict = if index == 241 {
             percentile_window_partial(plan.as_ref())
+        } else if let Some(expected) = rounding_cast_remotes(index) {
+            rounding_cast_partial(plan.as_ref(), expected)
         } else {
             fully_federated(plan.as_ref())
         };
@@ -366,7 +434,8 @@ async fn run_corpus() {
         "planning attempted remote execution"
     );
     eprintln!(
-        "BigQuery corpus: 271 checked (262 full, 1 percentile partial, 8 table-free), {} failures, {:.2}s; no remote statements",
+        "BigQuery corpus: 271 checked (259 full, {} rounding-cast partial, 1 percentile partial, 8 table-free), {} failures, {:.2}s; no remote statements",
+        ROUNDING_CAST_PARTIAL.len(),
         failures.len(),
         started.elapsed().as_secs_f64()
     );

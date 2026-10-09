@@ -39,6 +39,13 @@ pub trait AccelerationSource: Send + Sync {
     /// Returns the secrets store associated with this source
     fn secrets(&self) -> Arc<RwLock<Secrets>>;
 
+    /// The runtime's shared snapshot notification consumers, when this source
+    /// can load snapshot accelerations locally. Bootstrap and refresh must use
+    /// the same registry so datasets never compete for messages on one queue.
+    fn snapshot_notifications(
+        &self,
+    ) -> Option<Arc<crate::snapshot::notifications::SnapshotNotifications>>;
+
     /// Returns the acceleration configuration if it exists
     fn acceleration(&self) -> Option<&Acceleration>;
 

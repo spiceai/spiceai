@@ -91,8 +91,8 @@ impl FileMetadata for CachedVortexMetadata {
         self.memory_size
     }
 
-    fn extra_info(&self) -> std::collections::HashMap<String, String> {
-        std::collections::HashMap::default()
+    fn extra_info(&self) -> datafusion_common::HashMap<String, String> {
+        datafusion_common::HashMap::default()
     }
 }
 
@@ -117,7 +117,7 @@ pub fn synthetic_object_meta(location: Path, size: u64) -> ObjectMeta {
 /// right-sizing telemetry (the accounted footer size is what fills the cache
 /// budget) shared by every population site.
 pub(crate) fn cache_footer(
-    cache: &Arc<dyn FileMetadataCache>,
+    cache: &Arc<FileMetadataCache>,
     meta: ObjectMeta,
     cached: Arc<CachedVortexMetadata>,
     src: &'static str,

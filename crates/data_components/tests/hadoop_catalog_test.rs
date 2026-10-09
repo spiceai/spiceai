@@ -48,9 +48,8 @@ fn get_file_hadoop_catalog(warehouse_root: &Path) -> HadoopCatalogBuilder {
 
     let mut fs_config = opendal::services::FsConfig::default();
     fs_config.root = Some(warehouse_root.to_string_lossy().into_owned());
-    let operator = opendal::Operator::new(fs_config.into_builder())
-        .expect("Should build FS operator")
-        .finish();
+    let operator =
+        opendal::Operator::new(fs_config.into_builder()).expect("Should build FS operator");
 
     HadoopCatalogBuilder::default()
         .with_warehouse_root(warehouse_url.to_string())
@@ -74,9 +73,8 @@ fn get_s3a_hadoop_catalog() -> HadoopCatalogBuilder {
     s3_config.access_key_id = Some(access_key.clone());
     s3_config.secret_access_key = Some(secret_key.clone());
 
-    let operator = opendal::Operator::new(s3_config.into_builder())
-        .expect("Should build S3 operator")
-        .finish();
+    let operator =
+        opendal::Operator::new(s3_config.into_builder()).expect("Should build S3 operator");
 
     HadoopCatalogBuilder::default()
         .with_warehouse_root("s3a://hadoop/")
@@ -112,9 +110,8 @@ fn get_s3_to_s3a_inferred_hadoop_catalog() -> HadoopCatalogBuilder {
     s3_config.access_key_id = Some(access_key.clone());
     s3_config.secret_access_key = Some(secret_key.clone());
 
-    let operator = opendal::Operator::new(s3_config.into_builder())
-        .expect("Should build S3 operator")
-        .finish();
+    let operator =
+        opendal::Operator::new(s3_config.into_builder()).expect("Should build S3 operator");
 
     HadoopCatalogBuilder::default()
         .with_warehouse_root("s3://hadoop/")
@@ -385,6 +382,17 @@ mod tests {
         assert!(
             table.readonly(),
             "{catalog_name} - The table should be readonly"
+        );
+
+        // An Iceberg client handed this table reads it from its metadata file,
+        // so the loaded table has to name that file.
+        let metadata_location = table
+            .metadata_location()
+            .expect("Should know the metadata file the table was loaded from");
+        assert!(
+            metadata_location.contains(&format!("/{table_name}/metadata/"))
+                && metadata_location.ends_with(".metadata.json"),
+            "{catalog_name} - The metadata location should be the table's metadata file, found: {metadata_location}"
         );
 
         // Read rows from the table

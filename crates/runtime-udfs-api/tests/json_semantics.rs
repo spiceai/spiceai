@@ -21,14 +21,12 @@ limitations under the License.
 
 //! What the JSON extraction functions return, value by value.
 //!
-//! These are the repo-side guards for the `datafusion-functions-json` pin
-//! recorded in `docs/dev/fork_patches.md`. The pin sits ahead of the last
-//! published release for three upstream correctness fixes, and every one of
-//! them is a wrong answer rather than an error: a published
-//! `datafusion-functions-json` returns NULL for every negative JSON number,
+//! These guard the `datafusion-functions-json` release the workspace takes from
+//! crates.io (see `docs/dev/fork_patches.md`). Every behaviour pinned here is a
+//! wrong answer rather than an error when it regresses: a release without
+//! upstream PRs #121, #124 and #125 returns NULL for every negative JSON number,
 //! panics on an integer outside jiter's `i64` fast path, and reads the wrong
-//! value out of a nested JSON string. Drop back to a published version and
-//! these tests fail; nothing else in the workspace would.
+//! value out of a nested JSON string. Nothing else in the workspace would notice.
 //!
 //! `runtime-udfs-api` hosts them because it is the crate that owns Spice's
 //! relationship with `datafusion-functions-json` — it derives the federation
@@ -207,14 +205,29 @@ fn json_get_str_is_null_for_a_miss_not_an_error() {
 #[test]
 fn json_get_int_rejects_every_non_integer() {
     for value in [
-        "1.5",  // a float is not an integer
-        "-1.5", // and neither is a negative one
-        "-1e3", // nor an exponent form, whatever it evaluates to
+        "1.5",   // a fractional number is not an integer
+        "-1.5",  // and neither is a negative one
+        "1e300", // nor an integral one outside `i64`
         "true", "false", "null", "{}", "[]",
         r#""abc""#, // a string that does not parse as an integer
         r#""1.5""#, // including one that parses only as a float
+        r#""1.0""#, // or only as an integral float
     ] {
         assert_eq!(get_int(&doc(value), A), None, "json_get_int over {value}");
+    }
+}
+
+/// JSON has one number type, so a whole number written in float or exponent form
+/// is still that integer. It is never rounded: a fractional value stays NULL
+/// (above), and so does one outside `i64`.
+#[test]
+fn json_get_int_reads_an_integral_float_as_that_integer() {
+    for (value, expected) in [("1.0", 1), ("-1e3", -1000), ("2e3", 2000), ("-0.0", 0)] {
+        assert_eq!(
+            get_int(&doc(value), A),
+            Some(expected),
+            "json_get_int over {value}"
+        );
     }
 }
 
@@ -266,11 +279,37 @@ fn a_missing_value_is_null_not_an_error() {
         None,
         "index on a non-array"
     );
-    assert_eq!(get_int("[-1]", &[Path::Index(-1)]), None, "negative index");
+    // A negative index counts from the end, as PostgreSQL's `->` does, so only one
+    // that reaches past the start misses.
+    assert_eq!(
+        get_int("[-1]", &[Path::Index(-2)]),
+        None,
+        "negative index past the start"
+    );
     assert_eq!(
         get_float(&doc("-1.5"), &[Path::Key("b")]),
         None,
         "wrong key"
+    );
+}
+
+/// A negative array index counts from the end, as `PostgreSQL`'s `->` does.
+#[test]
+fn a_negative_index_counts_from_the_end() {
+    assert_eq!(
+        get_int("[7, -1]", &[Path::Index(-1)]),
+        Some(-1),
+        "last element"
+    );
+    assert_eq!(
+        get_int("[7, -1]", &[Path::Index(-2)]),
+        Some(7),
+        "first element"
+    );
+    assert_eq!(
+        get_int("[7, -1]", &[Path::Index(-3)]),
+        None,
+        "past the start"
     );
 }
 

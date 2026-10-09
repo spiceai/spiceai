@@ -218,6 +218,21 @@ impl TableProvider for UpsertDedupTableProvider {
     ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
         self.inner.truncate(state).await
     }
+
+    /// Forwarded like UPDATE and DELETE: deduplication applies to `insert_into`'s
+    /// upsert input only, and the inner table resolves MERGE matches itself.
+    async fn merge_into(
+        &self,
+        state: &dyn Session,
+        source: Arc<dyn ExecutionPlan>,
+        merge_schema: datafusion::common::DFSchemaRef,
+        on: Expr,
+        clauses: Vec<datafusion::logical_expr::dml::MergeIntoClause>,
+    ) -> datafusion::error::Result<Arc<dyn ExecutionPlan>> {
+        self.inner
+            .merge_into(state, source, merge_schema, on, clauses)
+            .await
+    }
 }
 
 /// An execution plan that applies deduplication to batches before passing them downstream.
@@ -285,6 +300,17 @@ impl ExecutionPlan for UpsertDedupExec {
 
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -406,6 +432,7 @@ mod tests {
         UpsertDedupExec, UpsertDedupTableProvider, extract_upsert_options,
         wrap_with_upsert_dedup_if_needed,
     };
+    use datafusion::physical_plan::{ChildrenPropertiesMode, ReplaceChildrenOptions};
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -416,11 +443,12 @@ mod tests {
     use datafusion::datasource::TableProvider;
     use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::datasource::source::DataSourceExec;
+    use datafusion::error::DataFusionError;
     use datafusion::execution::TaskContext;
     use datafusion::logical_expr::dml::InsertOp;
     use datafusion::physical_plan::{ExecutionPlan, collect};
     use datafusion::prelude::SessionContext;
-    use datafusion_table_providers::util::constraints::UpsertOptions;
+    use datafusion_table_providers::util::constraints::{Error as ConstraintError, UpsertOptions};
 
     fn schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
@@ -664,9 +692,30 @@ mod tests {
         ));
 
         let ctx = Arc::new(TaskContext::default());
+        let err = collect(dedup, ctx)
+            .await
+            .expect_err("conflicting rows for one key must not be silently deduplicated");
+
+        // The failure must be the uniqueness violation on `id` itself, not an
+        // unrelated error (an internal invariant, a schema mismatch) that a
+        // bare `is_err()` would also accept.
+        let DataFusionError::External(external) = &err else {
+            panic!("expected the constraint violation as an external error, got: {err:?}");
+        };
+        let violation = external
+            .downcast_ref::<ConstraintError>()
+            .unwrap_or_else(|| panic!("expected a constraint validation error, got: {external:?}"));
         assert!(
-            collect(dedup, ctx).await.is_err(),
-            "conflicting rows for one key must not be silently deduplicated"
+            matches!(
+                violation,
+                ConstraintError::BatchViolatesUniquenessConstraint { unique_cols }
+                    if *unique_cols == ["id"]
+            ),
+            "expected a uniqueness violation on `id`, got: {violation:?}"
+        );
+        assert_eq!(
+            violation.to_string(),
+            "Incoming data violates uniqueness constraint on column(s): id"
         );
     }
 
@@ -841,7 +890,10 @@ mod tests {
         ));
 
         let rebuilt = Arc::clone(&dedup)
-            .with_new_children(vec![source(&[vec![batch(&[(1, "first"), (1, "second")])]])])
+            .replace_children(
+                vec![source(&[vec![batch(&[(1, "first"), (1, "second")])]])],
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
             .expect("rebuild with one child");
 
         assert_eq!(rows_of(rebuilt).await, vec![(1, "second".to_string())]);
@@ -887,20 +939,43 @@ mod tests {
 
     #[test]
     fn with_new_children_rejects_the_wrong_child_count() {
+        const WRONG_CHILD_COUNT: &str = "UpsertDedupExec requires exactly one child";
+
         let dedup = Arc::new(UpsertDedupExec::new(
             source(&[vec![batch(&[(1, "a")])]]),
             pk_constraints(),
             last_write_wins(),
         ));
 
-        Arc::clone(&dedup)
-            .with_new_children(vec![])
+        let no_children = Arc::clone(&dedup)
+            .replace_children(
+                vec![],
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
             .expect_err("no children must be rejected");
-        dedup
-            .with_new_children(vec![
-                source(&[vec![batch(&[(1, "a")])]]),
-                source(&[vec![batch(&[(2, "b")])]]),
-            ])
+        assert!(
+            matches!(
+                &no_children,
+                DataFusionError::Internal(msg) if msg == WRONG_CHILD_COUNT
+            ),
+            "unexpected error for no children: {no_children:?}"
+        );
+
+        let two_children = dedup
+            .replace_children(
+                vec![
+                    source(&[vec![batch(&[(1, "a")])]]),
+                    source(&[vec![batch(&[(2, "b")])]]),
+                ],
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+            )
             .expect_err("two children must be rejected");
+        assert!(
+            matches!(
+                &two_children,
+                DataFusionError::Internal(msg) if msg == WRONG_CHILD_COUNT
+            ),
+            "unexpected error for two children: {two_children:?}"
+        );
     }
 }

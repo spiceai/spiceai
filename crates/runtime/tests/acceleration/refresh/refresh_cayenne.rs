@@ -20,7 +20,6 @@ use crate::acceleration::refresh::common::{
     test_append_timestamp_for_engine, test_append_unix_seconds_for_engine,
 };
 use crate::postgres::common;
-use crate::postgres::common::get_random_port;
 use crate::{
     configure_test_datafusion, configure_test_datafusion_request_context, init_tracing,
     utils::{register_test_connectors, test_request_context, wait_until_true},
@@ -41,8 +40,8 @@ async fn test_acceleration_refresh_cayenne_append() -> Result<(), anyhow::Error>
 
     test_request_context()
         .scope(async {
-            let port: usize = get_random_port()?;
-            let running_container = common::start_postgres_docker_container(port).await?;
+            let running_container = common::start_postgres_docker_container().await?;
+            let port = usize::from(running_container.host_port(5432)?);
 
             let db_conn = initialize_postgres(port).await?;
 
@@ -103,8 +102,8 @@ async fn test_acceleration_refresh_cayenne_full() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
-            let port: usize = get_random_port()?;
-            let running_container = common::start_postgres_docker_container(port).await?;
+            let running_container = common::start_postgres_docker_container().await?;
+            let port = usize::from(running_container.host_port(5432)?);
 
             let db_conn = initialize_postgres(port).await?;
 
@@ -166,8 +165,8 @@ async fn test_cayenne_append_mode_with_pk_and_time_column() -> Result<(), anyhow
 
     test_request_context()
         .scope(async {
-            let port: usize = get_random_port()?;
-            let running_container = common::start_postgres_docker_container(port).await?;
+            let running_container = common::start_postgres_docker_container().await?;
+            let port = usize::from(running_container.host_port(5432)?);
 
             // Use table with value column for testing upserts
             let db_conn = initialize_postgres_with_value_column(port).await?;
@@ -329,8 +328,8 @@ async fn test_cayenne_partitioned_append_on_conflict_upsert() -> Result<(), anyh
 
     test_request_context()
         .scope(async {
-            let port: usize = get_random_port()?;
-            let running_container = common::start_postgres_docker_container(port).await?;
+            let running_container = common::start_postgres_docker_container().await?;
+            let port = usize::from(running_container.host_port(5432)?);
 
             // Use table with value column for observing upsert changes.
             let db_conn = initialize_postgres_with_value_column(port).await?;
@@ -461,8 +460,8 @@ async fn test_cayenne_append_mode_requires_constraint() -> Result<(), anyhow::Er
 
     test_request_context()
         .scope(async {
-            let port: usize = get_random_port()?;
-            let running_container = common::start_postgres_docker_container(port).await?;
+            let running_container = common::start_postgres_docker_container().await?;
+            let port = usize::from(running_container.host_port(5432)?);
 
             let _db_conn = initialize_postgres(port).await?;
 

@@ -96,6 +96,17 @@ impl ExecutionPlan for EmbeddingTableExec {
         &self.properties
     }
 
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        self.base_plan.apply_expressions(f)
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         self.base_plan.children()
     }
@@ -108,7 +119,12 @@ impl ExecutionPlan for EmbeddingTableExec {
             &Arc::clone(&self.projected_schema),
             &self.filters,
             self.limit,
-            Arc::clone(&self.base_plan).with_new_children(children)?,
+            Arc::clone(&self.base_plan).replace_children(
+                children,
+                datafusion::physical_plan::ReplaceChildrenOptions::new(
+                    datafusion::physical_plan::ChildrenPropertiesMode::Recompute,
+                ),
+            )?,
             Arc::clone(&self.embedded_columns),
             Arc::clone(&self.embedding_models),
         )) as Arc<dyn ExecutionPlan>)

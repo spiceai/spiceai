@@ -282,6 +282,19 @@ impl TableProvider for SwappableTableProvider {
     async fn truncate(&self, state: &dyn Session) -> DFResult<Arc<dyn ExecutionPlan>> {
         self.current().truncate(state).await
     }
+
+    async fn merge_into(
+        &self,
+        state: &dyn Session,
+        source: Arc<dyn ExecutionPlan>,
+        merge_schema: datafusion::common::DFSchemaRef,
+        on: Expr,
+        clauses: Vec<datafusion::logical_expr::dml::MergeIntoClause>,
+    ) -> DFResult<Arc<dyn ExecutionPlan>> {
+        self.current()
+            .merge_into(state, source, merge_schema, on, clauses)
+            .await
+    }
 }
 
 #[cfg(test)]

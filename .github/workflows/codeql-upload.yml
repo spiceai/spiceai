@@ -176,7 +176,13 @@ jobs:
           run-id: ${{ steps.source.outputs.run-id }}
           github-token: ${{ github.token }}
 
+      # A merge_group analysis outlives its queue entry: by the time it completes,
+      # the queue has often merged or ejected the batch and deleted its
+      # gh-readonly-queue ref, and code scanning rejects an upload to a ref that no
+      # longer exists. The next step decides whether a failure here is that.
       - name: Upload SARIF to code scanning
+        id: upload
+        continue-on-error: true
         uses: github/codeql-action/upload-sarif@2892aa5e19bbd11bc0cff5427e3b750a04d9e3c2 # v4
         with:
           sarif_file: sarif-results
@@ -184,3 +190,33 @@ jobs:
           sha: ${{ steps.source.outputs.sha }}
           ref: ${{ steps.source.outputs.ref }}
           wait-for-processing: true
+
+      # Only a deleted merge-queue ref is excused. A merged batch is scanned again
+      # by the trunk push, and an ejected one never reaches a protected branch.
+      # Every other failure, including one the ref probe cannot classify, fails.
+      - name: Fail unless the merge-queue ref is gone
+        if: steps.upload.outcome == 'failure'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          UPLOAD_REF: ${{ steps.source.outputs.ref }}
+        shell: bash
+        run: |
+          set -uo pipefail
+
+          if [[ "${UPLOAD_REF}" != refs/heads/gh-readonly-queue/* ]]; then
+            echo "::error::SARIF upload to '${UPLOAD_REF}' failed. See the 'Upload SARIF to code scanning' step."
+            exit 1
+          fi
+
+          probe_err="$(mktemp)"
+          if gh api "repos/${GITHUB_REPOSITORY}/git/ref/${UPLOAD_REF#refs/}" --silent 2>"${probe_err}"; then
+            echo "::error::SARIF upload to '${UPLOAD_REF}' failed while the ref still exists. See the 'Upload SARIF to code scanning' step."
+            exit 1
+          fi
+          if grep -q 'HTTP 404' "${probe_err}"; then
+            echo "::notice::'${UPLOAD_REF}' was deleted by the merge queue before this upload ran, so there is nothing to attach SARIF to. Not a failure."
+            exit 0
+          fi
+          echo "::error::SARIF upload to '${UPLOAD_REF}' failed, and probing the ref failed too, so the cause is unknown:"
+          head -c 2000 "${probe_err}"
+          exit 1

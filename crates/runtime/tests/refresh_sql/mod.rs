@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use arrow::array::RecordBatch;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use futures::TryStreamExt;
 use std::{collections::HashMap, sync::Arc, time::Duration};
 

@@ -105,9 +105,9 @@ fn write_regexp_source(path: &Path) -> Result<(), anyhow::Error> {
 /// a start offset to drop matches, and a row holding an Arabic-Indic digit
 /// (`U+0661`) that the kernel's `\d` matches and RE2's does not.
 ///
-/// The NULL cases are the point (issue #13870): `regexp_count` counts zero
-/// matches in a NULL input or against a NULL pattern and answers `0`, where
-/// `DuckDB`'s `regexp_extract_all` answers NULL for either.
+/// The NULL cases are the point (issue #13870): `regexp_count` answers NULL
+/// for a NULL input or a NULL pattern, and the pushed-down rendering must
+/// answer NULL there too rather than a count.
 fn write_regexp_count_source(path: &Path) -> Result<(), anyhow::Error> {
     std::fs::write(
         path,
@@ -700,8 +700,8 @@ async fn duckdb_accelerated_regexp_builtins_agree_with_local() -> Result<(), any
 
             // All three remaining regexp built-ins agree with local evaluation over
             // every row, the NULL one included, and all three are pushed down —
-            // `regexp_count` at a rendering that coalesces DuckDB's NULL count of a
-            // NULL input to the kernel's 0 (#13870).
+            // `regexp_count` as `len(regexp_extract_all(..))`, which is NULL for a
+            // NULL input exactly as the kernel is (#13870).
             let siblings = "SELECT id, regexp_like(s, '(a)(b)') AS l, \
                             regexp_replace(s, '(a)(b)', 'X') AS r, \
                             regexp_count(s, 'a') AS c FROM {table} ORDER BY id";
@@ -713,16 +713,14 @@ async fn duckdb_accelerated_regexp_builtins_agree_with_local() -> Result<(), any
                 "regexp_like/replace/count must agree with local evaluation on every row"
             );
 
-            // The NULL row is where `regexp_count` used to part company: the dialect
-            // rendered it `len(regexp_extract_all(..))`, and `regexp_extract_all(NULL,
-            // p)` is NULL in DuckDB, so the federated answer was NULL where
-            // DataFusion counts zero matches and answers 0 (#13870). Both sides must
-            // answer 0 with the call pushed down.
+            // The NULL row is where the two engines can part company (#13870): a
+            // rendering that answered a count there would disagree with the
+            // kernel's NULL. Both sides must answer NULL with the call pushed down.
             let null_row = "SELECT regexp_count(s, 'a') AS c FROM {table} WHERE s IS NULL";
             let accelerated = run_query(&rt, &null_row.replace("{table}", "accelerated")).await?;
             let local = run_query(&rt, &null_row.replace("{table}", "local")).await?;
             for batches in [&accelerated, &local] {
-                assert_batches_eq!(["+---+", "| c |", "+---+", "| 0 |", "+---+",], batches);
+                assert_batches_eq!(["+---+", "| c |", "+---+", "|   |", "+---+",], batches);
             }
 
             let plan = to_pretty_display(
@@ -730,8 +728,9 @@ async fn duckdb_accelerated_regexp_builtins_agree_with_local() -> Result<(), any
             )?
             .to_string();
             assert!(
-                pushed_down_sql(&plan).contains("coalesce(len(regexp_extract_all("),
-                "regexp_count must be pushed down as coalesce(len(regexp_extract_all(..)), 0); \
+                pushed_down_sql(&plan).contains("len(regexp_extract_all(")
+                    && !pushed_down_sql(&plan).contains("coalesce("),
+                "regexp_count must be pushed down as len(regexp_extract_all(..)); \
                  plan was:\n{plan}"
             );
 
@@ -821,14 +820,15 @@ async fn duckdb_accelerated_regexp_count_is_pushed_down_and_agrees_with_local()
                 .to_string();
                 let remote_sql = pushed_down_sql(&plan);
                 assert!(
-                    remote_sql.contains("coalesce(len(regexp_extract_all("),
-                    "{what} ({call}) must be pushed down as coalesce(len(regexp_extract_all(..)), 0); \
+                    remote_sql.contains("len(regexp_extract_all(")
+                        && !remote_sql.contains("coalesce("),
+                    "{what} ({call}) must be pushed down as len(regexp_extract_all(..)); \
                      plan was:\n{plan}"
                 );
             }
 
             // The values themselves, so the agreement above is not two engines
-            // agreeing on a wrong answer: a NULL input counts 0, and the start
+            // agreeing on a wrong answer: a NULL input or pattern counts NULL, and the start
             // offset drops the match before it (a `start - 1` offset into
             // DuckDB's 1-based SUBSTRING would keep it).
             let pinned = "SELECT id, regexp_count(s, 'a') AS plain, regexp_count(s, 'a', 2) AS from_2 \
@@ -841,9 +841,9 @@ async fn duckdb_accelerated_regexp_count_is_pushed_down_and_agrees_with_local()
                     "| 1  | 1     | 0      |",
                     "| 2  | 0     | 0      |",
                     "| 3  | 1     | 0      |",
-                    "| 4  | 0     | 0      |",
+                    "| 4  |       |        |",
                     "| 5  | 1     | 0      |",
-                    "| 6  | 0     | 0      |",
+                    "| 6  |       |        |",
                     "| 7  | 3     | 2      |",
                     "| 8  | 0     | 0      |",
                     "| 9  | 0     | 0      |",
@@ -855,14 +855,13 @@ async fn duckdb_accelerated_regexp_count_is_pushed_down_and_agrees_with_local()
 
             // A count that is NULL rather than 0 changes which rows a predicate
             // keeps, which is why the divergence mattered: the NULL rows must
-            // survive `= 0` accelerated exactly as they do locally.
+            // drop out of `= 0` accelerated exactly as they do locally.
             let filtered = "SELECT id FROM {table} WHERE regexp_count(s, 'a') = 0 ORDER BY id";
             let accelerated = run_query(&rt, &filtered.replace("{table}", "accelerated")).await?;
             let local = run_query(&rt, &filtered.replace("{table}", "local")).await?;
             assert_batches_eq!(
                 [
-                    "+----+", "| id |", "+----+", "| 2  |", "| 4  |", "| 6  |", "| 8  |", "| 9  |",
-                    "| 10 |", "+----+",
+                    "+----+", "| id |", "+----+", "| 2  |", "| 8  |", "| 9  |", "| 10 |", "+----+",
                 ],
                 &accelerated
             );
@@ -1071,8 +1070,8 @@ async fn duckdb_regexp_like_and_replace_stay_local_where_the_engines_disagree()
                 ),
                 (
                     r"regexp_replace(s, '(a)(b)', '\2\1')",
-                    "the POSIX spelling of that rewrite",
-                    None,
+                    "the POSIX spelling of that rewrite, which both engines read alike",
+                    Some("regexp_replace("),
                 ),
                 (
                     r"regexp_like(s, 'a')",
@@ -1183,6 +1182,256 @@ async fn duckdb_regexp_like_and_replace_stay_local_where_the_engines_disagree()
                     r"SELECT id FROM accelerated WHERE regexp_like(s, '\w') ORDER BY id"
                 )
                 .await?
+            );
+
+            rt.shutdown().await;
+            Ok(())
+        })
+        .await
+}
+
+/// `arrow_typeof` describes the `DataFusion` plan's type, and `DuckDB` has no
+/// function of that name: unparsed into the accelerator's SQL, the query failed
+/// with `Catalog Error: Scalar Function with name arrow_typeof does not exist!`
+/// (regression test for #14334). The call must stay above the federated scan
+/// and answer what local evaluation answers.
+#[tokio::test]
+async fn duckdb_accelerated_arrow_typeof_stays_local_and_agrees_with_local()
+-> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let dir = tempfile::tempdir()?;
+            let csv = dir.path().join("typeof.csv");
+            write_csv_source(&csv)?;
+            let from = format!("file://{}", csv.display());
+
+            let app = AppBuilder::new("duckdb_builtin_pushdown_arrow_typeof")
+                .with_dataset(duckdb_accelerated(&from, "accelerated"))
+                .with_dataset(unaccelerated(&from, "local"))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            load_runtime_datasets(&rt, LOAD_TIMEOUT).await?;
+
+            let query = "SELECT id, arrow_typeof(id) AS id_type, arrow_typeof(name) AS name_type \
+                         FROM {table} ORDER BY id";
+            let plan = to_pretty_display(
+                &run_query(
+                    &rt,
+                    &format!("EXPLAIN {}", query.replace("{table}", "accelerated")),
+                )
+                .await?,
+            )?
+            .to_string();
+            let remote_sql = pushed_down_sql(&plan);
+            assert!(
+                !remote_sql.is_empty(),
+                "the scan must still be federated to DuckDB; plan was:\n{plan}"
+            );
+            assert!(
+                !remote_sql.contains("arrow_typeof"),
+                "arrow_typeof must be evaluated above the federated scan, not sent to DuckDB; \
+                 plan was:\n{plan}"
+            );
+
+            let accelerated = run_query(&rt, &query.replace("{table}", "accelerated")).await?;
+            let local = run_query(&rt, &query.replace("{table}", "local")).await?;
+            assert_eq!(
+                to_pretty_display(&accelerated)?.to_string(),
+                to_pretty_display(&local)?.to_string(),
+                "DuckDB-accelerated arrow_typeof must agree with local evaluation"
+            );
+            assert_eq!(
+                accelerated
+                    .iter()
+                    .map(arrow::array::RecordBatch::num_rows)
+                    .sum::<usize>(),
+                4,
+                "every source row is answered"
+            );
+
+            rt.shutdown().await;
+            Ok(())
+        })
+        .await
+}
+
+/// URL-shaped rows for the capture-group rewrites, plus a row where an
+/// optional group does not take part in the match (`b` under `(a)?b`) and
+/// the NULL row.
+fn write_regexp_group_reference_source(path: &Path) -> Result<(), anyhow::Error> {
+    std::fs::write(
+        path,
+        "id,s\n\
+         1,https://www.google.com/search?q=1\n\
+         2,http://yandex.ru/a/b\n\
+         3,https://example.org/\n\
+         4,ab\n\
+         5,aab\n\
+         6,b\n\
+         7,xyz\n\
+         8,\n",
+    )?;
+    Ok(())
+}
+
+/// A `regexp_replace` whose replacement names a capture group as `\N` is
+/// pushed down to `DuckDB` and agrees with local evaluation on every row, and
+/// every other backslash form stays local (#13966). The rule is
+/// `re2::engine_neutral_replacement`.
+///
+/// The first shape is `ClickBench` q29's, whose `DuckDB` benchmark plans
+/// snapshot the aggregate federated; refusing it evaluated the whole
+/// `GROUP BY` above a bare scan.
+#[tokio::test]
+async fn duckdb_regexp_replace_group_references_push_down_where_the_engines_agree()
+-> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let dir = tempfile::tempdir()?;
+            let csv = dir.path().join("regexp_group_reference.csv");
+            write_regexp_group_reference_source(&csv)?;
+            let from = format!("file://{}", csv.display());
+
+            let app = AppBuilder::new("duckdb_builtin_pushdown_regexp_group_reference")
+                .with_dataset(duckdb_accelerated(&from, "accelerated"))
+                .with_dataset(unaccelerated(&from, "local"))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            load_runtime_datasets(&rt, LOAD_TIMEOUT).await?;
+
+            // `true` — must be rendered as DuckDB's `regexp_replace`; `false`
+            // — must not reach DuckDB at all.
+            let calls: [(&str, &str, bool); 10] = [
+                (
+                    r"regexp_replace(s, '^https?://(?:www\.)?([^/]+)/.*$', '\1')",
+                    "the ClickBench q29 host extraction",
+                    true,
+                ),
+                (
+                    r"regexp_replace(s, '(a)?b', '<\1>')",
+                    "a group that does not take part in the match (row 6)",
+                    true,
+                ),
+                (
+                    r"regexp_replace(s, '(a)(b)', '\0-\2\1')",
+                    "the whole match and two groups",
+                    true,
+                ),
+                (
+                    r"regexp_replace(s, 'a(b)?', '[\1]', 'g')",
+                    "a global replace naming an optional group",
+                    true,
+                ),
+                (
+                    r"regexp_replace(s, '(a)(b)', '\10')",
+                    "a two-digit group reference",
+                    false,
+                ),
+                (
+                    r"regexp_replace(s, '(a)(b)', '\\1')",
+                    "a doubled backslash",
+                    false,
+                ),
+                (
+                    r"regexp_replace(s, '(a)(b)', '\3')",
+                    "a group the pattern does not have",
+                    false,
+                ),
+                (
+                    r"regexp_replace(s, '(?:a)(b)', '\2')",
+                    "a group counted from a non-capturing one",
+                    false,
+                ),
+                (
+                    "regexp_replace(s, '(a)(b)', '\\1\u{661}')",
+                    "a group reference followed by a non-ASCII digit",
+                    false,
+                ),
+                (
+                    r"regexp_replace(s, '(a)(b)', '\q')",
+                    "an escape that is not a group reference",
+                    false,
+                ),
+            ];
+            for (call, what, pushed_down) in calls {
+                let sql = |table: &str| format!("SELECT id, {call} AS v FROM {table} ORDER BY id");
+                let accelerated =
+                    to_pretty_display(&run_query(&rt, &sql("accelerated")).await?)?.to_string();
+                let local = to_pretty_display(&run_query(&rt, &sql("local")).await?)?.to_string();
+                assert_eq!(
+                    accelerated, local,
+                    "{what} ({call}) must answer what local evaluation answers on every row"
+                );
+
+                let plan = to_pretty_display(
+                    &run_query(&rt, &format!("EXPLAIN SELECT {call} FROM accelerated")).await?,
+                )?
+                .to_string();
+                let remote_sql = pushed_down_sql(&plan);
+                assert_eq!(
+                    remote_sql.contains("regexp_replace("),
+                    pushed_down,
+                    "{what} ({call}): expected pushed down = {pushed_down}; the SQL sent was:\n{remote_sql}"
+                );
+            }
+
+            // The values, so the agreement is not two engines agreeing on a
+            // wrong answer: the host of each URL row, and an empty group where
+            // the optional one did not take part.
+            assert_batches_eq!(
+                [
+                    "+----+-------------+",
+                    "| id | k           |",
+                    "+----+-------------+",
+                    "| 1  | google.com  |",
+                    "| 2  | yandex.ru   |",
+                    "| 3  | example.org |",
+                    "+----+-------------+",
+                ],
+                &run_query(
+                    &rt,
+                    r"SELECT id, regexp_replace(s, '^https?://(?:www\.)?([^/]+)/.*$', '\1') AS k FROM accelerated WHERE id <= 3 ORDER BY id"
+                )
+                .await?
+            );
+            assert_batches_eq!(
+                ["+----+", "| k  |", "+----+", "| <> |", "+----+",],
+                &run_query(
+                    &rt,
+                    r"SELECT regexp_replace(s, '(a)?b', '<\1>') AS k FROM accelerated WHERE id = 6"
+                )
+                .await?
+            );
+
+            // The ClickBench q29 shape: the aggregate over the extraction is
+            // evaluated by DuckDB, not above a bare scan.
+            let q29 = r"SELECT regexp_replace(s, '^https?://(?:www\.)?([^/]+)/.*$', '\1') AS k, count(*) AS c FROM {table} WHERE s <> '' GROUP BY 1 ORDER BY k";
+            let accelerated = run_query(&rt, &q29.replace("{table}", "accelerated")).await?;
+            let local = run_query(&rt, &q29.replace("{table}", "local")).await?;
+            assert_eq!(
+                to_pretty_display(&accelerated)?.to_string(),
+                to_pretty_display(&local)?.to_string(),
+                "the ClickBench q29 shape must answer what local evaluation answers"
+            );
+            let plan = to_pretty_display(
+                &run_query(&rt, &format!("EXPLAIN {}", q29.replace("{table}", "accelerated")))
+                    .await?,
+            )?
+            .to_string();
+            let remote_sql = pushed_down_sql(&plan);
+            assert!(
+                remote_sql.contains("regexp_replace(") && remote_sql.contains("GROUP BY"),
+                "the ClickBench q29 aggregate must be evaluated by DuckDB; the SQL sent was:\n{remote_sql}"
             );
 
             rt.shutdown().await;

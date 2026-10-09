@@ -145,22 +145,32 @@ impl Error {
     }
 }
 
+/// Whether `dataset` reads published snapshots (`file_format: snapshot`).
+fn reads_snapshots(dataset: &Dataset) -> bool {
+    dataset
+        .params
+        .as_ref()
+        .and_then(|params| params.data.get("file_format"))
+        .is_some_and(|format| format.as_string().trim().eq_ignore_ascii_case("snapshot"))
+}
+
 fn cayenne_file_path_conflict(datasets: &[Dataset]) -> Option<String> {
     let cayenne_datasets: Vec<(String, String, Option<String>)> = datasets
         .iter()
         .filter_map(|dataset| {
             let acceleration = dataset.acceleration.as_ref()?;
-            if !acceleration.enabled
-                || !acceleration.engine.as_deref().is_some_and(|engine| {
-                    engine.eq_ignore_ascii_case("cayenne") || engine.eq_ignore_ascii_case("vortex")
-                })
-                || !matches!(
+            let engine = acceleration.engine_name();
+            let declared_cayenne_file = (engine.eq_ignore_ascii_case("cayenne")
+                || engine.eq_ignore_ascii_case("vortex"))
+                && matches!(
                     acceleration.mode,
                     AccelerationMode::File
                         | AccelerationMode::FileCreate
                         | AccelerationMode::FileUpdate
-                )
-            {
+                );
+            // A snapshot dataset names neither: its engine comes from the snapshots and
+            // its mode is always file, so a `cayenne_file_path` on it is a Cayenne file path.
+            if !acceleration.enabled || !(declared_cayenne_file || reads_snapshots(dataset)) {
                 return None;
             }
 
@@ -686,6 +696,52 @@ mod tests {
             .expect("acceleration")
             .engine = Some("vortex".into());
 
+        // Both spellings must be recognized as Cayenne, so the error names both datasets.
+        assert_eq!(
+            cayenne_file_path_conflict(&datasets).as_deref(),
+            Some("`orders` (`/mnt/a/cayenne`), `customers` (`/mnt/b/cayenne`)")
+        );
+    }
+
+    #[test]
+    #[cfg(not(windows))]
+    fn cayenne_rejects_conflicts_for_datasets_that_name_no_engine() {
+        let mut datasets = vec![
+            cayenne_dataset("orders", "/mnt/a/cayenne", None),
+            cayenne_dataset("customers", "/mnt/b/cayenne", None),
+        ];
+        for dataset in &mut datasets {
+            dataset.acceleration.as_mut().expect("acceleration").engine = None;
+        }
+
         assert!(cayenne_file_path_conflict(&datasets).is_some());
+    }
+
+    #[test]
+    fn cayenne_rejects_conflicts_for_snapshot_datasets() {
+        let snapshot_dataset = |name: &str, file_path: &str, metadata_dir: Option<&str>| {
+            let mut dataset = cayenne_dataset(name, file_path, metadata_dir);
+            dataset.from = "s3://bucket/snapshots/".to_string();
+            dataset.params = Some(Params::from_string_map(HashMap::from([(
+                "file_format".to_string(),
+                "snapshot".to_string(),
+            )])));
+            let acceleration = dataset.acceleration.as_mut().expect("acceleration");
+            acceleration.engine = None;
+            acceleration.mode = AccelerationMode::default();
+            dataset
+        };
+
+        let datasets = vec![
+            snapshot_dataset("orders", "/data/orders", None),
+            snapshot_dataset("customers", "/data/customers", None),
+        ];
+        assert!(cayenne_file_path_conflict(&datasets).is_some());
+
+        let datasets = vec![
+            snapshot_dataset("orders", "/data/orders", Some("/data/metadata")),
+            snapshot_dataset("customers", "/data/customers", Some("/data/metadata")),
+        ];
+        assert!(cayenne_file_path_conflict(&datasets).is_none());
     }
 }

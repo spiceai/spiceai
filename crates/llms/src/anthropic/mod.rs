@@ -16,7 +16,7 @@ limitations under the License.
 #![allow(clippy::missing_errors_doc)]
 use async_openai::{Client, error::OpenAIError};
 use reqwest::header::HeaderValue;
-use types::validate_model_variant;
+use types::{MessageCreateParams, validate_model_variant};
 
 mod chat;
 mod list_models;
@@ -145,14 +145,107 @@ fn explain_model_not_found(
     OpenAIError::ApiError(api_error)
 }
 
+/// The sampling controls a request forwards to Anthropic, by the request field carrying each.
+///
+/// `top_k` is deliberately absent: no `OpenAI` request field maps onto it, so the converter never
+/// sets it (see `MessageCreateParams::try_from`).
+fn forwarded_sampling_controls(params: &MessageCreateParams) -> Vec<&'static str> {
+    let mut controls = Vec::new();
+    if params.temperature.is_some() {
+        controls.push("temperature");
+    }
+    if params.top_p.is_some() {
+        controls.push("top_p");
+    }
+    controls
+}
+
+/// Anthropic's documented answer to a sampling control the model does not accept.
+fn rejected_control_sentence(control: &str) -> String {
+    format!("`{control}` is deprecated for this model.")
+}
+
+/// Replaces the message of an `invalid_request_error` Anthropic answers to a sampling control the
+/// model no longer accepts with one that names the model, the control, and where to remove it.
+///
+/// Anthropic's newest generation rejects `temperature` and `top_p` outright — not a degraded
+/// result, a `400` on every request — and its error says only ``temperature` is deprecated for
+/// this model.``: it names no model, and does not say that the value reaches the request from the
+/// model's `params` as readily as from the request itself
+/// (<https://github.com/spiceai/spiceai/issues/13564>).
+///
+/// `invalid_request_error` is the type Anthropic uses for *every* malformed request, and its
+/// message echoes request detail the caller wrote, so the type alone cannot say a control was the
+/// problem and the message is never searched for one. The rejection is recognised only when the
+/// whole message is Anthropic's documented sentence for a control this adapter actually forwarded
+/// (`controls`) — an echoed tool name or message fragment cannot equal that sentence.
+///
+/// Returns the explained error as `Ok`, and every other error untouched as `Err`, so a caller
+/// that formats errors further (the streaming path) knows which ones are already explained
+/// without reading a field for it — `param` and `code` are public `OpenAI` fields a gateway can
+/// set too. The `ApiError` variant and its `type` are preserved either way, so callers
+/// classifying the failure still see the same error kind.
+fn explain_rejected_sampling_control(
+    model: &str,
+    model_from_default: bool,
+    controls: &[&'static str],
+    err: OpenAIError,
+) -> Result<OpenAIError, OpenAIError> {
+    let mut api_error = match err {
+        OpenAIError::ApiError(api_error)
+            if api_error.r#type.as_deref() == Some("invalid_request_error") =>
+        {
+            api_error
+        }
+        other => return Err(other),
+    };
+
+    let Some(control) = controls
+        .iter()
+        .copied()
+        .find(|control| api_error.message == rejected_control_sentence(control))
+    else {
+        return Err(OpenAIError::ApiError(api_error));
+    };
+
+    // Reads as a clause of the sentence below, so it carries its own leading comma.
+    let default_note = if model_from_default {
+        ", and that id is the built-in default used when no model id is configured"
+    } else {
+        ""
+    };
+
+    api_error.message = format!(
+        "Failed to run a chat completion with Anthropic model '{model}': the model does not \
+         accept the `{control}` parameter{default_note}. Remove `{control}` from the request and \
+         from the model's `params` (as `{control}`, `anthropic_{control}` or `openai_{control}`), \
+         or set `from: anthropic:<model_id>` to a model that accepts it. Cause: {cause} \
+         See: {ANTHROPIC_DOCS}",
+        cause = api_error.message,
+    );
+    // The model refused what the caller asked for, so it is the caller's request that is invalid:
+    // `openai_error_to_response` reads `code` to pick the status, and without one the refusal
+    // reports as a `500`. `param` names the control for a caller that reads fields rather than
+    // prose.
+    api_error.param = Some(control.to_string());
+    api_error.code = Some("invalid_request_error".to_string());
+
+    Ok(OpenAIError::ApiError(api_error))
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
         ANTHROPIC_DOCS, Anthropic, DEFAULT_ANTHROPIC_MODEL, explain_model_not_found,
-        types::validate_model_variant,
+        explain_rejected_sampling_control, forwarded_sampling_controls, rejected_control_sentence,
+        types::{MessageCreateParams, validate_model_variant},
     };
     use crate::config::GenericAuthMechanism;
     use async_openai::error::{ApiError, OpenAIError};
+    use async_openai::types::chat::{
+        ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequest,
+        CreateChatCompletionRequestArgs,
+    };
 
     /// The error Anthropic answers with for a model it no longer serves: `model: <id>` and nothing
     /// else. Captured from
@@ -396,5 +489,217 @@ mod tests {
             validate_model_variant(DEFAULT_ANTHROPIC_MODEL).is_ok(),
             "the default model must pass the model-id validation in `Anthropic::new`"
         );
+    }
+
+    /// Anthropic's answer to a sampling control the model does not accept, exactly as the live API
+    /// returns it (measured in <https://github.com/spiceai/spiceai/issues/13564>): a bare
+    /// `invalid_request_error` with no `param` and no `code`.
+    fn rejected_control(control: &str) -> OpenAIError {
+        OpenAIError::ApiError(ApiError {
+            message: rejected_control_sentence(control),
+            r#type: Some("invalid_request_error".to_string()),
+            param: None,
+            code: None,
+        })
+    }
+
+    fn params_for(configure: impl FnOnce(&mut CreateChatCompletionRequest)) -> MessageCreateParams {
+        let mut request = CreateChatCompletionRequestArgs::default()
+            .model("claude-sonnet-5")
+            .messages(vec![
+                ChatCompletionRequestUserMessageArgs::default()
+                    .content("hello")
+                    .build()
+                    .expect("build the user message")
+                    .into(),
+            ])
+            .build()
+            .expect("build the request");
+        configure(&mut request);
+        MessageCreateParams::try_from(("claude-sonnet-5".to_string(), request))
+            .expect("a request with one sampling control converts")
+    }
+
+    /// Only the controls the converter actually puts on the wire can be blamed for a rejection, and
+    /// the list is read from the converted request so it cannot drift from the conversion. One
+    /// control per request: Claude 4 and later reject `temperature` and `top_p` set together.
+    #[test]
+    fn forwarded_sampling_controls_are_read_from_the_converted_request() {
+        assert!(forwarded_sampling_controls(&params_for(|_| {})).is_empty());
+        assert_eq!(
+            forwarded_sampling_controls(&params_for(|r| r.temperature = Some(0.2))),
+            ["temperature"]
+        );
+        assert_eq!(
+            forwarded_sampling_controls(&params_for(|r| r.top_p = Some(0.9))),
+            ["top_p"]
+        );
+    }
+
+    #[test]
+    fn a_rejected_control_names_the_model_the_control_and_where_to_remove_it() {
+        let err = explain_rejected_sampling_control(
+            "claude-sonnet-5",
+            false,
+            &["temperature"],
+            rejected_control("temperature"),
+        )
+        .expect("a forwarded control's rejection is explained");
+        let message = message_of(&err);
+
+        assert!(
+            message.contains("'claude-sonnet-5'"),
+            "the message must name the model that refused the control: {message}"
+        );
+        assert!(
+            message.contains("Remove `temperature` from the request and from the model's `params` (as `temperature`, `anthropic_temperature` or `openai_temperature`)"),
+            "the message must name the control and both places it can come from: {message}"
+        );
+        assert!(
+            message.contains("`from: anthropic:<model_id>`"),
+            "switching model is the other remedy and must be named: {message}"
+        );
+        assert!(
+            message.contains("`temperature` is deprecated for this model."),
+            "Anthropic's own wording is the diagnostic and must survive as the cause: {message}"
+        );
+        assert!(
+            !message.contains("built-in default"),
+            "this id came from the configuration, so the message must not call it the default: \
+             {message}"
+        );
+        assert!(
+            message.contains(ANTHROPIC_DOCS),
+            "the message must link the docs: {message}"
+        );
+        assert!(
+            !message.contains('\n'),
+            "a user-facing message stays on one line: {message}"
+        );
+    }
+
+    #[test]
+    fn a_rejected_control_on_the_default_model_says_where_the_id_came_from() {
+        let message = message_of(
+            &explain_rejected_sampling_control(
+                DEFAULT_ANTHROPIC_MODEL,
+                true,
+                &["top_p"],
+                rejected_control("top_p"),
+            )
+            .expect("a forwarded control's rejection is explained"),
+        );
+
+        assert!(
+            message.contains("built-in default"),
+            "the user never chose this id, so the message must say where it came from: {message}"
+        );
+        assert!(
+            message.contains("Remove `top_p`"),
+            "the control is named whichever one it is: {message}"
+        );
+    }
+
+    /// The explanation keeps the error kind Anthropic sent, and adds what the HTTP layer needs:
+    /// `openai_error_to_response` reports an `ApiError` without a `code` as a `500`, which would
+    /// present the caller's own invalid request as a server fault.
+    #[test]
+    fn a_rejected_control_reports_as_a_client_error() {
+        let OpenAIError::ApiError(api_error) = explain_rejected_sampling_control(
+            "claude-sonnet-5",
+            false,
+            &["temperature"],
+            rejected_control("temperature"),
+        )
+        .expect("a forwarded control's rejection is explained") else {
+            panic!("rewriting the message must not change the error variant");
+        };
+
+        assert_eq!(api_error.r#type.as_deref(), Some("invalid_request_error"));
+        assert_eq!(api_error.code.as_deref(), Some("invalid_request_error"));
+        assert_eq!(api_error.param.as_deref(), Some("temperature"));
+    }
+
+    /// The rejection is recognised by the whole message equalling Anthropic's documented sentence
+    /// for a control this request forwarded — never by searching the message, which echoes request
+    /// detail the caller wrote.
+    #[test]
+    fn an_invalid_request_that_is_not_a_rejected_forwarded_control_is_left_alone() {
+        // The request forwarded no control, so no control can be the cause — whatever the text.
+        let not_forwarded = explain_rejected_sampling_control(
+            "claude-sonnet-5",
+            false,
+            &[],
+            rejected_control("temperature"),
+        )
+        .expect_err("no forwarded control, nothing to explain");
+        assert_eq!(
+            message_of(&not_forwarded),
+            rejected_control_sentence("temperature")
+        );
+
+        // A different control than the one forwarded.
+        let other_control = explain_rejected_sampling_control(
+            "claude-sonnet-5",
+            false,
+            &["top_p"],
+            rejected_control("temperature"),
+        )
+        .expect_err("a control the request did not forward cannot be the cause");
+        assert_eq!(
+            message_of(&other_control),
+            rejected_control_sentence("temperature")
+        );
+
+        // An echoed request fragment that merely contains the sentence.
+        let echoed_message = format!(
+            "tools.0.description: {}",
+            rejected_control_sentence("temperature")
+        );
+        let echoed = OpenAIError::ApiError(ApiError {
+            message: echoed_message.clone(),
+            r#type: Some("invalid_request_error".to_string()),
+            param: None,
+            code: None,
+        });
+        assert_eq!(
+            message_of(
+                &explain_rejected_sampling_control(
+                    "claude-sonnet-5",
+                    false,
+                    &["temperature"],
+                    echoed
+                )
+                .expect_err("a message that merely contains the sentence is not the sentence")
+            ),
+            echoed_message
+        );
+
+        // Other error kinds pass through whatever they say.
+        let other_kind = OpenAIError::ApiError(ApiError {
+            message: rejected_control_sentence("temperature"),
+            r#type: Some("authentication_error".to_string()),
+            param: None,
+            code: None,
+        });
+        assert_eq!(
+            api_error_type(
+                &explain_rejected_sampling_control(
+                    "claude-sonnet-5",
+                    false,
+                    &["temperature"],
+                    other_kind
+                )
+                .expect_err("another error kind is never a refused control")
+            ),
+            Some("authentication_error".to_string())
+        );
+    }
+
+    fn api_error_type(err: &OpenAIError) -> Option<String> {
+        match err {
+            OpenAIError::ApiError(api_error) => api_error.r#type.clone(),
+            other => panic!("expected an ApiError, got {other:?}"),
+        }
     }
 }

@@ -7,7 +7,9 @@ credentials, service or network connection.
 The E2E Test CI workflow's `run_all_tests` release gate executes every corpus
 statement through real BigQuery using `test/scripts/bigquery_corpus.py`. It creates
 isolated tables from `schemas.json`, checks federation plans and successful
-execution, and requires 263 successful data-query jobs. The eight table-free
+execution, and requires 269 successful data-query jobs — one per remote subtree,
+so the three queries a rounding cast splits contribute nine between them.
+The eight table-free
 statements execute locally. Queries 168 and 169 divide by cohort counts, so they
 execute last against synthetic cohorts with nonzero denominators and exact
 expected results. The other queries execute against empty tables, which does not
@@ -40,6 +42,16 @@ cooperative scheduling, byte accounting and partition coalescing without a limit
 are permitted. Query 241 is the explicit partial-federation case: its median and
 approximate-percentile windows and dependent projections/sorts stay local; its
 source joins, JSON extraction and aggregation must remain one remote subtree.
+
+Queries 033, 124 and 147 are the rounding-cast partial cases. Each computes a
+cast from a fractional value into an integer, which BigQuery rounds where
+DataFusion truncates, so the connector policy declines to push it down (issue
+#14482) and the plan splits into 3, 5 and 1 remote subtrees respectively. Both
+gates pin those counts and require the local integer cast to still be there:
+de-federating further, or restoring the pushdown, fails and asks for the entry
+to be re-decided. Issue #14607 tracks restoring full federation by rendering the
+cast as a truncating one instead of declining it.
+
 Table-free statements are individually identified in the test and must contain
 no table scan or remote node. Final SQL rendering errors also fail the test.
 

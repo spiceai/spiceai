@@ -279,7 +279,7 @@ jobs:
           # Pass the notes by path, not by value: a release body over 128 KiB
           # exceeds MAX_ARG_STRLEN and the exec fails with E2BIG (exit 126)
           # after every build has already succeeded.
-          if [ "$LATEST_RELEASE" = "true" ]; then
+          if [ "$HAS_RELEASE_NOTES" = "true" ]; then
             BODY_ARGS=(--body-file "./docs/release_notes/v${{ env.REL_VERSION }}.md")
           else
             BODY_ARGS=(--body "This is the release candidate ${{ env.REL_VERSION }}")

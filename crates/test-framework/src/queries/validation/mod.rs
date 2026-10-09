@@ -616,6 +616,8 @@ fn numeric_strings_match(expected: &str, actual: &str) -> bool {
     if diff <= (expected_num.abs() * NUMERIC_RELATIVE_TOLERANCE).max(1e-12) {
         return true;
     }
+    let within_rounding_share =
+        diff <= expected_num.abs().max(actual_num.abs()) * ROUNDED_RELATIVE_TOLERANCE;
     match (decimal_places(expected), decimal_places(actual)) {
         (Some(places), Some(actual_places))
             if places == actual_places && places >= ROUNDED_PLACES_MIN =>
@@ -624,11 +626,42 @@ fn numeric_strings_match(expected: &str, actual: &str) -> bool {
                 return false;
             };
             // `f64` leaves `0.000813 - 0.000812` a hair over one unit.
-            diff <= 10_f64.powi(-exponent) * (1.0 + 1e-9)
-                && diff <= expected_num.abs().max(actual_num.abs()) * ROUNDED_RELATIVE_TOLERANCE
+            diff <= 10_f64.powi(-exponent) * (1.0 + 1e-9) && within_rounding_share
+        }
+        // One engine carried fewer places than the other — DataFusion keeps six for
+        // a decimal quotient where DuckDB returns a full double, as in TPC-DS Q20's
+        // `0.000200` against `0.00020044651747561313`. The coarser value is the same
+        // answer only if it is the finer one cut to its places, by truncation or by
+        // rounding; anything else is a different value at the coarser precision.
+        (Some(places), Some(actual_places)) if places != actual_places => {
+            let (coarse, coarse_places, fine) = if places < actual_places {
+                (expected_num, places, actual_num)
+            } else {
+                (actual_num, actual_places, expected_num)
+            };
+            coarse_places >= ROUNDED_PLACES_MIN
+                && within_rounding_share
+                && is_cut_to_places(coarse, coarse_places, fine)
         }
         _ => false,
     }
+}
+
+/// Whether `coarse`, written to `places` decimal places, is `fine` truncated or
+/// rounded to that many places.
+fn is_cut_to_places(coarse: f64, places: usize, fine: f64) -> bool {
+    let Ok(exponent) = i32::try_from(places) else {
+        return false;
+    };
+    let scale = 10_f64.powi(exponent);
+    let coarse_units = (coarse * scale).round();
+    let fine_units = fine * scale;
+    // Both sides are whole numbers of units, so they are equal exactly when
+    // they differ by less than half of one.
+    let same_units = |units: f64| (coarse_units - units).abs() < 0.5;
+    // Truncation and rounding both count: an exact boundary value that `f64`
+    // stores a hair low truncates one unit short but still rounds to it.
+    same_units(fine_units.trunc()) || same_units(fine_units.round())
 }
 
 /// The digits after the decimal point of a plainly written number, or `None` for
@@ -692,13 +725,35 @@ pub fn validate_batches_as_strings(
     Ok(QueryValidationResult::Pass)
 }
 
+/// Whether a column holds exact whole numbers: an integer, or a decimal with no
+/// fractional digits — the type `DuckDB` returns for a `SUM` over `BIGINT`.
+fn is_integral(data_type: &DataType) -> bool {
+    data_type.is_integer()
+        || matches!(
+            data_type,
+            DataType::Decimal32(_, 0)
+                | DataType::Decimal64(_, 0)
+                | DataType::Decimal128(_, 0)
+                | DataType::Decimal256(_, 0)
+        )
+}
+
+/// Whether two numeric cells may be matched within a tolerance rather than
+/// exactly. Two whole-number columns never may: a count or a key has no rounding
+/// to absorb, so `1478493` against `1478494` is a wrong answer, not arithmetic
+/// noise, however large the value.
+fn numeric_tolerance_applies(expected_type: &DataType, actual_type: &DataType) -> bool {
+    expected_type.is_numeric() && !(is_integral(expected_type) && is_integral(actual_type))
+}
+
 /// Whether two rendered cells hold the same value, by the rule every comparison
 /// here uses: the same text, numbers that [`numeric_strings_match`], timestamps
 /// that differ only in trailing fractional-second zeros (nanosecond and
 /// microsecond engines pad differently), or a date and a timestamp at its
 /// midnight. Rendered cells no longer carry their type, so the numeric rule
-/// applies only to a numeric expected column, and the midnight rule only when one
-/// column is a date and the other a timestamp.
+/// applies only to a numeric expected column that is not a whole number on both
+/// sides, and the midnight rule only when one column is a date and the other a
+/// timestamp.
 fn cells_match(
     expected: Option<&str>,
     actual: Option<&str>,
@@ -709,7 +764,8 @@ fn cells_match(
         (None, None) => true,
         (Some(expected), Some(actual)) => {
             expected == actual
-                || (expected_type.is_numeric() && numeric_strings_match(expected, actual))
+                || (numeric_tolerance_applies(expected_type, actual_type)
+                    && numeric_strings_match(expected, actual))
                 || timestamp_strings_equivalent(expected, actual)
                 || (is_date_and_timestamp_pair(expected_type, actual_type)
                     && date_and_midnight_timestamp_equivalent(expected, actual))
@@ -1915,7 +1971,8 @@ fn compare_limit_results_allowing_cutoff_ties(
 
 /// Compares `right`'s sort key at `row` with `run_key`, the key of the tie group
 /// `left` has there, and names the first key column that differs. A numeric key
-/// column compares with [`numeric_strings_match`].
+/// column compares with [`numeric_strings_match`] unless it is a whole number on
+/// both sides, where only equal values tie.
 fn sort_key_mismatch(
     left: &RecordBatch,
     right: &RecordBatch,
@@ -1928,12 +1985,10 @@ fn sort_key_mismatch(
         |(column, (left_value, right_value))| match (left_value, right_value) {
             (Some(left_value), Some(right_value)) => {
                 left_value != right_value
-                    && !(left
-                        .schema_ref()
-                        .field(column.index)
-                        .data_type()
-                        .is_numeric()
-                        && numeric_strings_match(left_value, right_value))
+                    && !(numeric_tolerance_applies(
+                        left.schema_ref().field(column.index).data_type(),
+                        right.schema_ref().field(column.index).data_type(),
+                    ) && numeric_strings_match(left_value, right_value))
             }
             (left_value, right_value) => left_value != right_value,
         },
@@ -3187,6 +3242,58 @@ mod test {
     }
 
     #[test]
+    fn test_whole_number_cells_match_only_exactly() {
+        fn one_cell(data_type: DataType, column: ArrayRef) -> RecordBatch {
+            RecordBatch::try_new(
+                Arc::new(Schema::new(vec![Field::new("c", data_type, false)])),
+                vec![column],
+            )
+            .expect("one-cell batch")
+        }
+        let int64 = |value: i64| one_cell(DataType::Int64, Arc::new(Int64Array::from(vec![value])));
+        // DuckDB returns `SUM` over `BIGINT` as a `HUGEINT`, which arrives as a
+        // scale-0 decimal.
+        let hugeint = |value: i128| {
+            one_cell(
+                DataType::Decimal128(38, 0),
+                Arc::new(
+                    Decimal128Array::from(vec![value])
+                        .with_precision_and_scale(38, 0)
+                        .expect("decimal(38, 0)"),
+                ),
+            )
+        };
+        let float64 =
+            |value: f64| one_cell(DataType::Float64, Arc::new(Float64Array::from(vec![value])));
+        let mismatch = |expected: &RecordBatch, actual: &RecordBatch| {
+            matches!(
+                validate_batches_as_strings(expected, actual).expect("compare"),
+                QueryValidationResult::Fail(QueryValidationFailReason::DataMismatch { .. })
+            )
+        };
+
+        // TPC-H SF1 Q1's A|F `count_order` against the same count one row off —
+        // 0.00007% apart, far inside the float tolerance, and still a wrong answer.
+        assert!(mismatch(&int64(1_478_493), &int64(1_478_494)));
+        assert!(mismatch(&int64(1_478_493), &hugeint(1_478_494)));
+        assert!(mismatch(&hugeint(1_478_494), &int64(1_478_493)));
+        assert_eq!(
+            validate_batches_as_strings(&int64(1_478_493), &hugeint(1_478_493)).expect("compare"),
+            QueryValidationResult::Pass
+        );
+
+        // A whole number against a float is a representation the float side may
+        // have rounded — SQLite averages and sums in `REAL` — so the tolerance
+        // still applies there.
+        assert_eq!(
+            validate_batches_as_strings(&int64(1_478_493), &float64(1_478_493.000_1))
+                .expect("compare"),
+            QueryValidationResult::Pass
+        );
+        assert!(mismatch(&int64(1_478_493), &float64(1_449_049.0)));
+    }
+
+    #[test]
     fn test_binary_cells_render_as_the_text_they_hold() {
         let bytes: &[u8] = b"google";
         for array in [
@@ -3633,6 +3740,25 @@ mod test {
         // Rounding one way or the other moves only the last of several decimal places.
         assert!(numeric_strings_match("0.000812", "0.000813"));
         assert!(numeric_strings_match("224.796666", "224.796667"));
+        // A decimal quotient kept to six places against the same ratio as a double
+        // (TPC-DS Q20 and Q98, DataFusion against DuckDB), in either order.
+        assert!(numeric_strings_match("0.000200", "0.00020044651747561313"));
+        assert!(numeric_strings_match("0.0008128277417277396", "0.000812"));
+        assert!(numeric_strings_match("0.000813", "0.0008128277417277396"));
+        // The coarser value must be the finer one cut to its places — one unit off
+        // either cut is a different value, and so is a cut kept to too few places.
+        for (expected, actual) in [
+            ("0.000201", "0.00020044651747561313"),
+            ("0.000199", "0.00020044651747561313"),
+            ("0.000814", "0.0008128277417277396"),
+            ("0.01", "0.0149"),
+            ("0.0001", "0.000199"),
+        ] {
+            assert!(
+                !numeric_strings_match(expected, actual),
+                "{expected} against {actual}"
+            );
+        }
         // A coarse last place is not rounding noise: 0.1 against 0.0 is a different
         // answer, and so is a unit that is most of the value.
         for (expected, actual) in [

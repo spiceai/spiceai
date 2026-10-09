@@ -5,22 +5,17 @@
 //! filter, isolated from any scan.
 //!
 //! Before a Vortex file (or any of its zones) is read, the pushed-down filter is
-//! turned into a statistics predicate — `Expression::falsify` — and that
-//! predicate is optimized before it is evaluated. None of this depends on how
+//! bound to the file's type and turned into a statistics predicate —
+//! `BoundExpression::falsify`. None of this depends on how
 //! many rows the file holds, so whatever it costs is paid per file (and again
 //! per zone map) even when the file emits one row, which is why it is measured
 //! apart from the kernel.
 //!
-//! The shape of the predicate is what decides that cost. A form with one
-//! top-level conjunct per list element hands `Expression::try_optimize_recursive`
-//! an `AND` of M terms, and its closing `find_between` pass compares every pair
-//! of them; a form that stays a single top-level `OR` never enters that search.
-//!
 //! The three arms separate the translation from the pruning work:
 //!
 //! - `convert` is the `DataFusion` `InListExpr` -> Vortex `Expression` translation.
-//! - `falsify` builds the statistics predicate from the converted filter.
-//! - `falsify_then_optimize` adds the optimize pass the readers run on it.
+//! - `bind` type-checks the converted filter against the file's type.
+//! - `falsify` builds the statistics predicate from the bound filter.
 //!
 //! None of this depends on how many rows the file holds, so whatever it costs is
 //! paid per file (and again per zone map) even when the file emits one row.
@@ -93,8 +88,9 @@ fn bench_in_list_pruning(c: &mut Criterion) {
         let vortex_expr = convertor
             .convert_predicate(df_expr.as_ref())
             .expect("convert");
-        let falsified = vortex_expr
-            .falsify(&scope, &session)
+        let bound = vortex_expr.bind(&scope).expect("bind");
+        bound
+            .falsify(&session)
             .expect("falsify")
             .expect("list_contains has a falsifier");
 
@@ -102,17 +98,19 @@ fn bench_in_list_pruning(c: &mut Criterion) {
         // filter pushes — carries any of this cost at all. `ListContains`
         // registers only `falsify` rules and no `satisfy`, and falsifying a
         // `not(x)` requires satisfying `x`, so there should be no statistics
-        // predicate to build or optimize here. Reported rather than assumed,
-        // because it decides whether the falsifier work applies to the live
-        // path or only to a positive `IN`.
+        // predicate to build here. Reported rather than assumed, because it
+        // decides whether the falsifier work applies to the live path or only to
+        // a positive `IN`.
         let negated_falsifier = not(vortex_expr.clone())
-            .falsify(&scope, &session)
+            .bind(&scope)
+            .expect("bind negated")
+            .falsify(&session)
             .expect("falsify negated");
         eprintln!(
             "[M={list_len}] negated (NOT IN) falsifier: {}",
             match &negated_falsifier {
                 Some(expr) => format!("Some({expr})"),
-                None => "None (no zone pruning, and no predicate to optimize)".to_string(),
+                None => "None (no zone pruning)".to_string(),
             }
         );
 
@@ -123,20 +121,12 @@ fn bench_in_list_pruning(c: &mut Criterion) {
                     .expect("convert")
             });
         });
-        group.bench_with_input(BenchmarkId::new("falsify", list_len), &list_len, |b, _| {
-            b.iter(|| vortex_expr.falsify(&scope, &session).expect("falsify"));
+        group.bench_with_input(BenchmarkId::new("bind", list_len), &list_len, |b, _| {
+            b.iter(|| vortex_expr.bind(&scope).expect("bind"));
         });
-        group.bench_with_input(
-            BenchmarkId::new("optimize_falsified", list_len),
-            &list_len,
-            |b, _| {
-                b.iter(|| {
-                    falsified
-                        .optimize_recursive(&scope)
-                        .expect("optimize falsified predicate")
-                });
-            },
-        );
+        group.bench_with_input(BenchmarkId::new("falsify", list_len), &list_len, |b, _| {
+            b.iter(|| bound.falsify(&session).expect("falsify"));
+        });
     }
     group.finish();
 }

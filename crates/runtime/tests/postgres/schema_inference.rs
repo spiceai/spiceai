@@ -195,8 +195,8 @@ async fn test_schema_inference_loads_and_queries() -> Result<(), anyhow::Error> 
 
     test_request_context()
         .scope(async {
-            let port = common::get_random_port()?;
-            let _container = common::start_postgres_docker_container(port).await?;
+            let container = common::start_postgres_docker_container().await?;
+            let port = usize::from(container.host_port(5432)?);
 
             seed_inventory(port).await?;
 

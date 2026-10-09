@@ -102,12 +102,13 @@ impl TableLayer for IndexLayer {
             // stop here rather than see past it.
             LayerWalk::CdcDetection => None,
             // An index adds no columns and rewrites no write, so everything else
-            // reaches the table beneath.
+            // reaches the table beneath: a scan returns that table's rows.
             LayerWalk::Read
             | LayerWalk::Source
             | LayerWalk::Write
             | LayerWalk::RetentionDelete
-            | LayerWalk::Index => Some(below),
+            | LayerWalk::Index
+            | LayerWalk::Passthrough => Some(below),
         }
     }
 

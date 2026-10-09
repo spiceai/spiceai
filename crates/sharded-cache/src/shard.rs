@@ -160,6 +160,20 @@ impl<V> Shard<V> {
         self.map.contains_key(&key)
     }
 
+    /// The resident at `key` when it is still inside `ttl`, otherwise `None`.
+    ///
+    /// An expired resident is absent here so a conditional insert can replace
+    /// it. Expiry matches [`Self::get`]: `now - inserted_at >= ttl`.
+    pub(crate) fn peek_live(&self, key: u64, now: Instant, ttl: Duration) -> Option<&V> {
+        let &idx = self.map.get(&key)?;
+        match self.slots.get(idx as usize) {
+            Some(Slot::Occupied(node)) if now.saturating_duration_since(node.inserted_at) < ttl => {
+                Some(node.value.as_ref())
+            }
+            _ => None,
+        }
+    }
+
     pub(crate) fn window_weight(&self) -> u64 {
         self.window_weight
     }

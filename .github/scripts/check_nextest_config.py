@@ -60,6 +60,10 @@ QUIET_BASELINE_SECONDS = {
     # disk. CI regenerates them with `dsdgen` on every fresh runner, so the
     # baseline is rounded up from the observed 127.7s to cover that.
     "result_correctness_vs_duckdb_test": 180.0,
+    # tpcds_full_result_parity_vs_sqlite at SF 0.1: 166.9s locally with the
+    # fixture on disk, plus the 25.4s `tpcdsgen` takes to write it on a fresh
+    # runner, rounded up.
+    "result_correctness_vs_sqlite_test": 200.0,
 }
 
 # Worst same-test slowdown measured between a quiet pool and a saturated one.
@@ -93,8 +97,9 @@ ZERO_RETRY_BINARIES = frozenset(
         "cdc_compaction_delete_race_test",
         "maintained_aggregate_filter_test",
         # Engine-vs-engine parity: a mismatch is deterministic, so a retry buys
-        # nothing but five more runs of a ~250s binary before the same failure.
+        # nothing but repeated runs of a ~250s binary before the same failure.
         "result_correctness_vs_duckdb_test",
+        "result_correctness_vs_sqlite_test",
     }
 )
 

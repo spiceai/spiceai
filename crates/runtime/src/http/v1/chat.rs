@@ -16,12 +16,13 @@ limitations under the License.
 
 use core::time;
 use std::{
+    collections::HashMap,
     convert::Infallible,
     sync::Arc,
     time::{Duration, SystemTime},
 };
 
-use crate::model::{EvaluateModelStore, LLMChatCompletionsModelStore};
+use crate::model::{LLMChatCompletionsModelStore, ResponsesApiSupport};
 use crate::status::RuntimeStatus;
 #[cfg(feature = "openapi")]
 use async_openai::types::chat::CreateChatCompletionResponse;
@@ -122,7 +123,7 @@ pub static KEEP_ALIVE_INTERVAL: u64 = 30;
 ))]
 pub(crate) async fn post(
     Extension(llms): Extension<Arc<RwLock<LLMChatCompletionsModelStore>>>,
-    Extension(evaluate_models): Extension<Arc<RwLock<EvaluateModelStore>>>,
+    Extension(responses_api_support): Extension<Arc<RwLock<HashMap<String, ResponsesApiSupport>>>>,
     Extension(status): Extension<Arc<RuntimeStatus>>,
     headers: HeaderMap,
     Json(req): Json<CreateChatCompletionRequest>,
@@ -172,7 +173,10 @@ pub(crate) async fn post(
                 }
             }
             None => {
-                if evaluate_models.read().await.contains_key(&model_id) {
+                if matches!(
+                    responses_api_support.read().await.get(&model_id),
+                    Some(ResponsesApiSupport::EvaluateOnly { .. })
+                ) {
                     evaluate_only_chat_response(&model_id)
                 } else {
                     let message = status
@@ -408,11 +412,12 @@ pub fn openai_error_to_response(e: OpenAIError) -> Response {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::sync::Arc;
 
     use crate::{
         http::v1::chat::{SPICE_COMPLETION_PROGRESS_HEADER, post},
-        model::{EvaluateModelStore, LLMChatCompletionsModelStore},
+        model::{LLMChatCompletionsModelStore, ResponsesApiSupport},
         status::{ComponentStatus, RuntimeStatus},
     };
     use async_openai::{
@@ -467,7 +472,7 @@ mod tests {
         let mut store = LLMChatCompletionsModelStore::new();
         store.insert("dummy".to_string(), Arc::new(DummyChat {}));
         let llms = Arc::new(RwLock::new(store));
-        let evaluate_models = Arc::new(RwLock::new(EvaluateModelStore::new()));
+        let responses_api_support = Arc::new(RwLock::new(HashMap::new()));
 
         let mut headers = HeaderMap::new();
         if let Some(v) = progress_header {
@@ -495,7 +500,7 @@ mod tests {
 
         let response = post(
             Extension(llms),
-            Extension(evaluate_models),
+            Extension(responses_api_support),
             Extension(RuntimeStatus::new()),
             headers,
             Json(req_payload),
@@ -558,30 +563,16 @@ mod tests {
         );
     }
 
-    #[derive(Debug)]
-    struct DummyEvaluate;
-
-    #[async_trait::async_trait]
-    impl evaluate_api::Evaluate for DummyEvaluate {
-        async fn evaluate(
-            &self,
-            _request: evaluate_api::EvaluateRequest,
-        ) -> evaluate_api::Result<evaluate_api::EvaluateResponse> {
-            evaluate_api::InvalidRequestSnafu {
-                model: "jev",
-                message: "unused",
-            }
-            .fail()
-        }
-    }
-
     /// Evaluate-only models return the `OpenAI` JSON error envelope, not plain text.
     #[tokio::test]
     async fn evaluate_only_model_returns_openai_json_400() {
         let llms = Arc::new(RwLock::new(LLMChatCompletionsModelStore::new()));
-        let mut store = EvaluateModelStore::new();
-        store.insert("jev".into(), Arc::new(DummyEvaluate));
-        let evaluate_models = Arc::new(RwLock::new(store));
+        let responses_api_support = Arc::new(RwLock::new(HashMap::from([(
+            "jev".to_string(),
+            ResponsesApiSupport::EvaluateOnly {
+                provider: "typesafe".to_string(),
+            },
+        )])));
 
         let req_payload: CreateChatCompletionRequest = serde_json::from_value(json!({
             "model": "jev",
@@ -593,7 +584,7 @@ mod tests {
 
         let response = post(
             Extension(llms),
-            Extension(evaluate_models),
+            Extension(responses_api_support),
             Extension(RuntimeStatus::new()),
             HeaderMap::new(),
             Json(req_payload),
@@ -624,7 +615,7 @@ mod tests {
 
     async fn post_to_absent_model(status: Arc<RuntimeStatus>) -> (axum::http::StatusCode, String) {
         let llms = Arc::new(RwLock::new(LLMChatCompletionsModelStore::new()));
-        let evaluate_models = Arc::new(RwLock::new(EvaluateModelStore::new()));
+        let responses_api_support = Arc::new(RwLock::new(HashMap::new()));
         let req: CreateChatCompletionRequest = serde_json::from_value(json!({
             "model": "deepseek",
             "messages": [{"role": "user", "content": "hi"}]
@@ -633,7 +624,7 @@ mod tests {
 
         let response = post(
             Extension(llms),
-            Extension(evaluate_models),
+            Extension(responses_api_support),
             Extension(status),
             HeaderMap::new(),
             Json(req),

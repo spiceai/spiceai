@@ -19,6 +19,7 @@ use datafusion_datasource::file_stream::FileOpenFuture;
 use datafusion_datasource::file_stream::FileOpener;
 use datafusion_execution::cache::cache_manager::FileMetadataCache;
 use datafusion_expr::Operator;
+use datafusion_physical_expr::DynamicFilterTracking;
 use datafusion_physical_expr::PhysicalExprRef;
 use datafusion_physical_expr::projection::ProjectionExprs;
 use datafusion_physical_expr::simplifier::PhysicalExprSimplifier;
@@ -26,7 +27,6 @@ use datafusion_physical_expr::split_conjunction;
 use datafusion_physical_expr::utils::reassign_expr_columns;
 use datafusion_physical_expr_adapter::PhysicalExprAdapterFactory;
 use datafusion_physical_expr_adapter::replace_columns_with_literals;
-use datafusion_physical_expr_common::physical_expr::is_dynamic_physical_expr;
 use datafusion_physical_plan::expressions as df_expr;
 use datafusion_physical_plan::metrics::Count;
 use datafusion_pruning::FilePruner;
@@ -51,6 +51,7 @@ use vortex::error::VortexError;
 use vortex::error::VortexExpect;
 use vortex::error::VortexResult;
 use vortex::error::vortex_err;
+use vortex::expr::BoundExpression;
 use vortex::file::OpenOptionsSessionExt;
 use vortex::io::InstrumentedReadAt;
 use vortex::layout::LayoutReader;
@@ -115,7 +116,7 @@ pub(crate) struct VortexOpener {
     pub has_output_ordering: bool,
 
     pub expression_convertor: Arc<dyn ExpressionConvertor>,
-    pub file_metadata_cache: Option<Arc<dyn FileMetadataCache>>,
+    pub file_metadata_cache: Option<Arc<FileMetadataCache>>,
     pub segment_cache: Option<Arc<SharedSegmentCache>>,
     /// URL of the object store this scan reads from. Part of every segment-cache
     /// key: `ObjectMeta::location` is store-relative, and the cache is shared by
@@ -157,7 +158,7 @@ impl FileOpener for VortexOpener {
         let reader =
             InstrumentedReadAt::new_with_labels(reader, metrics_registry.as_ref(), labels.clone());
 
-        let file_pruning_predicate = self.file_pruning_predicate.as_ref().map(Arc::clone);
+        let mut file_pruning_predicate = self.file_pruning_predicate.as_ref().map(Arc::clone);
         let expr_adapter_factory = Arc::clone(&self.expr_adapter_factory);
         let file_metadata_cache = self.file_metadata_cache.as_ref().map(Arc::clone);
         let segment_cache = self.segment_cache.as_ref().map(Arc::clone);
@@ -195,6 +196,12 @@ impl FileOpener for VortexOpener {
             filter = filter
                 .map(|p| replace_columns_with_literals(p, &literal_value_cols))
                 .transpose()?;
+            // `FilePruner` evaluates its predicate against the file schema, which
+            // has no partition columns, so it expects them already folded to this
+            // file's values.
+            file_pruning_predicate = file_pruning_predicate
+                .map(|p| replace_columns_with_literals(p, &literal_value_cols))
+                .transpose()?;
         }
 
         Ok(async move {
@@ -222,7 +229,7 @@ impl FileOpener for VortexOpener {
             // cannot rule out a key the blocks hold, and a predicate that is not
             // dynamic gives it nothing to re-check while the file is read.
             let early_key_ranges = match (key_column.as_ref(), filter.as_ref(), &file.range) {
-                (Some(column), Some(predicate), None) if !is_dynamic_physical_expr(predicate) => {
+                (Some(column), Some(predicate), None) if !contains_dynamic_filter(predicate) => {
                     match key_equality(predicate, column, &unified_file_schema) {
                         Some(key) => key_blocks::cached_key_blocks(
                             &object_store_url,
@@ -250,7 +257,7 @@ impl FileOpener for VortexOpener {
                 .filter(|p| {
                     // Only create pruner if we have dynamic expressions or file statistics
                     // to work with. Static predicates without stats won't benefit from pruning.
-                    is_dynamic_physical_expr(p) || file.has_statistics()
+                    contains_dynamic_filter(p) || file.has_statistics()
                 })
                 .and_then(|predicate| {
                     FilePruner::try_new(
@@ -344,9 +351,12 @@ impl FileOpener for VortexOpener {
 
             // The schema of the stream returned from the vortex scan.
             // We use a reference schema for types that don't roundtrip (Dictionary, Utf8, etc.).
-            let scan_dtype = scan_projection.return_dtype(vxf.dtype()).map_err(|_e| {
-                exec_datafusion_err!("Couldn't get the dtype for the underlying Vortex scan")
+            // The scan takes the projection bound to the file's type; a point read
+            // optimizes the unbound projection against that type before binding it.
+            let bound_scan_projection = scan_projection.bind(vxf.dtype()).map_err(|e| {
+                exec_datafusion_err!("Couldn't get the dtype for the underlying Vortex scan: {e}")
             })?;
+            let scan_dtype = bound_scan_projection.dtype().clone();
 
             // When projection pushdown is enabled, the scan outputs the projected columns.
             // When disabled, the scan outputs raw columns and the projection is applied after.
@@ -434,7 +444,7 @@ impl FileOpener for VortexOpener {
             // changes after the file opens, so it keeps the scan.
             let key_ranges = match (key_column.as_ref(), filter.as_ref(), &row_range) {
                 _ if early_key_ranges.is_some() => early_key_ranges,
-                (Some(column), Some(predicate), None) if !is_dynamic_physical_expr(predicate) => {
+                (Some(column), Some(predicate), None) if !contains_dynamic_filter(predicate) => {
                     match key_equality(predicate, column, &this_file_schema) {
                         Some(key) => key_blocks::key_blocks(
                             &layout_reader,
@@ -505,6 +515,13 @@ impl FileOpener for VortexOpener {
                     }
                 })
                 .transpose()?;
+            // The scan takes the filter bound to the file's type; a point read splits
+            // and optimizes the unbound filter before binding each conjunct.
+            let bound_filter = filter
+                .as_ref()
+                .map(|predicate| predicate.bind(vxf.dtype()))
+                .transpose()
+                .map_err(|e| exec_datafusion_err!("Failed to bind the Vortex filter to the file's type: {e}"))?;
 
             // A point read needs the whole filter in Vortex form and no row selection: a
             // planning-time or runtime access plan (deleted rows, say) is applied by the
@@ -534,6 +551,7 @@ impl FileOpener for VortexOpener {
                 )
                 .map_err(|e| exec_datafusion_err!("Failed to create Vortex point read: {e}"))?
             } else {
+                let filter = bound_filter;
                 // Drop a split whose zones cannot satisfy the filter before the scan is
                 // built. Vortex prunes these same zones inside the scan, but only after
                 // `ScanBuilder::build` has optimized the projection and the filter
@@ -621,7 +639,7 @@ impl FileOpener for VortexOpener {
 
                 scan_builder
                     .with_metrics_registry(metrics_registry)
-                    .with_projection(scan_projection)
+                    .with_projection(bound_scan_projection)
                     .with_some_filter(filter)
                     .with_ordered(has_output_ordering)
                     .map(move |chunk| {
@@ -736,17 +754,21 @@ fn point_read_stream(
     projection: &Expression,
     target: Field,
 ) -> VortexResult<BoxStream<'static, VortexResult<RecordBatch>>> {
-    let conjuncts: Arc<[Expression]> =
-        conjuncts(&filter.optimize_recursive(reader.dtype())?).into();
+    let dtype = reader.dtype();
+    let conjuncts: Arc<[BoundExpression]> = conjuncts(&filter.optimize_recursive(dtype)?)
+        .iter()
+        .map(|conjunct| conjunct.bind(dtype))
+        .collect::<VortexResult<Vec<_>>>()?
+        .into();
     // A projection of every field in file order is the root itself. The struct
     // reader rewrites a projection against its own expansion of the root before
-    // partitioning it by field, and for that `pack` the rewrite nests the
-    // expansion once per field; handed `root()`, it has nothing to rewrite.
-    let projection = if is_identity_projection(projection, reader.dtype()) {
+    // partitioning it by field; handed `root()`, it has nothing to rewrite.
+    let projection = if is_identity_projection(projection, dtype) {
         root()
     } else {
-        projection.optimize_recursive(reader.dtype())?
-    };
+        projection.optimize_recursive(dtype)?
+    }
+    .bind(dtype)?;
     let reads = ranges.into_iter().map(move |range| {
         read_range(
             Arc::clone(&reader),
@@ -777,8 +799,8 @@ async fn read_range(
     reader: Arc<dyn LayoutReader>,
     session: VortexSession,
     range: Range<u64>,
-    conjuncts: Arc<[Expression]>,
-    projection: Expression,
+    conjuncts: Arc<[BoundExpression]>,
+    projection: BoundExpression,
     target: Field,
 ) -> VortexResult<Option<RecordBatch>> {
     let rows = usize::try_from(range.end - range.start)
@@ -863,7 +885,7 @@ fn collect_vortex_pushdown_conjunct(
 
     if expr_convertor.can_be_pushed_down(&expr, schema) {
         conjuncts.pushed.push(expr);
-    } else if from_dynamic_filter || is_dynamic_physical_expr(&expr) {
+    } else if from_dynamic_filter || contains_dynamic_filter(&expr) {
         conjuncts.skipped_dynamic.push(expr);
     } else {
         conjuncts.unpushed.push(expr);
@@ -890,6 +912,12 @@ fn natural_split_ranges_for_file(
             Ok(split_ranges)
         }
     }
+}
+
+/// Whether `expr` holds a dynamic filter (for example a hash-join or `TopK` bound), whose
+/// value can change after planning.
+fn contains_dynamic_filter(expr: &PhysicalExprRef) -> bool {
+    DynamicFilterTracking::classify(expr).contains_dynamic_filter()
 }
 
 fn compute_natural_split_ranges(layout_reader: &dyn LayoutReader) -> DFResult<Arc<[Range<u64>]>> {
@@ -954,12 +982,12 @@ mod tests {
     use datafusion::arrow::array::RecordBatch;
     use datafusion::arrow::array::StringArray;
     use datafusion::arrow::array::StructArray;
+    use datafusion::arrow::array::record_batch;
     use datafusion::arrow::datatypes::DataType;
     use datafusion::arrow::datatypes::Schema;
     use datafusion::arrow::datatypes::UInt32Type;
     use datafusion::arrow::util::display::FormatOptions;
     use datafusion::arrow::util::pretty::pretty_format_batches_with_options;
-    use datafusion::common::record_batch;
     use datafusion::logical_expr::col;
     use datafusion::logical_expr::lit;
     use datafusion::physical_expr::planner::logical2physical;
@@ -975,19 +1003,16 @@ mod tests {
     use rstest::rstest;
     use std::cell::Cell;
     use vortex::VortexSessionDefault;
-    use vortex::array::ArrayRef;
     use vortex::array::IntoArray;
     use vortex::array::arrays::ChunkedArray;
     use vortex::array::arrays::StructArray as VortexStructArray;
     use vortex::array::arrays::VarBinArray;
     use vortex::array::validity::Validity;
-    use vortex::arrow::FromArrowArray;
     use vortex::buffer::Buffer;
     use vortex::file::WriteOptionsSessionExt;
     use vortex::io::VortexWrite;
     use vortex::io::object_store::ObjectStoreWrite;
     use vortex::metrics::DefaultMetricsRegistry;
-    use vortex::scan::selection::Selection;
     use vortex::session::VortexSession;
 
     use super::*;
@@ -1057,7 +1082,8 @@ mod tests {
         path: &str,
         rb: RecordBatch,
     ) -> anyhow::Result<u64> {
-        let array = ArrayRef::from_arrow(rb, false)?;
+        let schema = rb.schema();
+        let array = SESSION.arrow().from_arrow_record_batch(rb, &schema)?;
         let path = Path::parse(path)?;
 
         let mut write = ObjectStoreWrite::new(object_store, &path).await?;
@@ -1202,10 +1228,9 @@ mod tests {
         let mut file = PartitionedFile::new(file_path.to_string(), data_size);
         file.partition_values = vec![ScalarValue::Int32(Some(1))];
 
-        let table_schema = TableSchema::new(
-            file_schema.clone(),
-            vec![Arc::new(Field::new("part", DataType::Int32, false))],
-        );
+        let table_schema = TableSchema::builder(file_schema.clone())
+            .with_table_partition_cols(vec![Arc::new(Field::new("part", DataType::Int32, false))])
+            .build();
 
         // filter matches partition value
         let filter = col("part").eq(lit(1));
@@ -1274,7 +1299,7 @@ mod tests {
             Field::new("a", DataType::Int32, false),
             Field::new("p", DataType::Utf8, false),
         ]));
-        let table_schema = TableSchema::from_file_schema(file_schema);
+        let table_schema = TableSchema::from(file_schema);
         let splits = u64::try_from(SPLITS).expect("split count fits u64");
         let byte_splits: Vec<PartitionedFile> = (0..splits)
             .map(|i| {
@@ -1415,7 +1440,7 @@ mod tests {
         use datafusion::arrow::array::AsArray;
         use datafusion::arrow::datatypes::Int64Type;
 
-        let table_schema = TableSchema::from_file_schema(Arc::clone(schema));
+        let table_schema = TableSchema::from(Arc::clone(schema));
         let filter = logical2physical(predicate, table_schema.table_schema());
         let mut opener = make_opener(Arc::clone(object_store), table_schema, Some(filter));
         opener.projection = ProjectionExprs::from_indices(&[0, 1], schema);
@@ -1462,7 +1487,7 @@ mod tests {
     ) -> anyhow::Result<Vec<String>> {
         use datafusion::arrow::util::display::ArrayFormatter;
 
-        let table_schema = TableSchema::from_file_schema(Arc::clone(schema));
+        let table_schema = TableSchema::from(Arc::clone(schema));
         let filter = logical2physical(predicate, table_schema.table_schema());
         let mut opener = make_opener(Arc::clone(object_store), table_schema, Some(filter));
         opener.projection = ProjectionExprs::from_indices(&[1], schema);
@@ -1615,7 +1640,6 @@ mod tests {
     #[tokio::test]
     async fn key_lookups_leave_selections_and_wide_keys_to_the_scan() -> anyhow::Result<()> {
         use vortex::buffer::Buffer;
-        use vortex::scan::selection::Selection;
 
         const BLOCK: i64 = 8_192;
 
@@ -1649,7 +1673,7 @@ mod tests {
         let keep: Vec<u64> = (0..9 * 8_192_u64).filter(|row| *row != 8_197).collect();
         selected.extensions.insert(
             VortexAccessPlan::default()
-                .with_selection(Selection::IncludeByIndex(Buffer::from_iter(keep))),
+                .with_selection(crate::include_by_index(&Buffer::from_iter(keep))),
         );
         let scanned = read_keyed(&object_store, &schema, &selected, &predicate, None).await?;
         take_scans_built();
@@ -1689,7 +1713,7 @@ mod tests {
         let file =
             PartitionedFile::new_with_range(file_path.to_string(), file_size, 0, file_size as i64);
 
-        let table_schema = TableSchema::from_file_schema(Arc::clone(&file_schema));
+        let table_schema = TableSchema::from(Arc::clone(&file_schema));
 
         let opener = make_opener(object_store, table_schema, None);
         let stream = opener.open(file)?.await?;
@@ -1724,7 +1748,7 @@ mod tests {
         };
 
         // Table schema has can accommodate both files
-        let table_schema = TableSchema::from_file_schema(Arc::new(Schema::new(vec![Field::new(
+        let table_schema = TableSchema::from(Arc::new(Schema::new(vec![Field::new(
             "a",
             DataType::Int32,
             true,
@@ -1764,31 +1788,19 @@ mod tests {
         let format_opts = FormatOptions::new().with_types_info(true);
 
         let data = stream.try_collect::<Vec<_>>().await?;
-        assert_snapshot!(pretty_format_batches_with_options(&data, &format_opts)?.to_string(), @r"
-        +-------+
-        | a     |
-        | Int32 |
-        +-------+
-        | 1     |
-        | 2     |
-        | 3     |
-        +-------+
-        ");
+        assert_snapshot!(
+            "open_files_different_table_schema_int32_file",
+            pretty_format_batches_with_options(&data, &format_opts)?.to_string()
+        );
 
         let opener2 = make_opener(filter.clone());
         let stream = opener2.open(file2)?.await?;
 
         let data = stream.try_collect::<Vec<_>>().await?;
-        assert_snapshot!(pretty_format_batches_with_options(&data, &format_opts)?.to_string(), @r"
-        +-------+
-        | a     |
-        | Int32 |
-        +-------+
-        | -1    |
-        | -2    |
-        | -3    |
-        +-------+
-        ");
+        assert_snapshot!(
+            "open_files_different_table_schema_int16_file_widened",
+            pretty_format_batches_with_options(&data, &format_opts)?.to_string()
+        );
 
         Ok(())
     }
@@ -1829,7 +1841,7 @@ mod tests {
             filter: None,
             file_pruning_predicate: None,
             expr_adapter_factory: Arc::new(DefaultPhysicalExprAdapterFactory),
-            table_schema: TableSchema::from_file_schema(table_schema.clone()),
+            table_schema: TableSchema::from(table_schema.clone()),
             batch_size: 100,
             limit: None,
             metrics_registry: Arc::new(DefaultMetricsRegistry::default()),
@@ -1853,16 +1865,10 @@ mod tests {
 
         // Verify the output has columns in table schema order (a, b, c)
         // not file order (c, b, a)
-        assert_snapshot!(pretty_format_batches_with_options(&data, &format_opts)?.to_string(), @r"
-        +-------+-------+-------+
-        | a     | b     | c     |
-        | Int32 | Int32 | Int32 |
-        +-------+-------+-------+
-        | 100   | 200   | 300   |
-        | 101   | 201   | 301   |
-        | 102   | 202   | 302   |
-        +-------+-------+-------+
-        ");
+        assert_snapshot!(
+            "schema_different_column_order_table_order",
+            pretty_format_batches_with_options(&data, &format_opts)?.to_string()
+        );
 
         Ok(())
     }
@@ -1897,7 +1903,7 @@ mod tests {
         let data_size = write_arrow_to_vortex(object_store.clone(), file_path, batch).await?;
 
         // Table schema has an extra utf8 field.
-        let table_schema = TableSchema::from_file_schema(Arc::new(Schema::new(vec![Field::new(
+        let table_schema = TableSchema::from(Arc::new(Schema::new(vec![Field::new(
             "my_struct",
             DataType::Struct(Fields::from(vec![
                 Field::new(
@@ -1959,18 +1965,15 @@ mod tests {
 
         // Table schema has columns in DIFFERENT order: c, a, b
         // and different types that require casting (Utf8 -> Dictionary)
-        let table_schema = TableSchema::new(
-            Arc::new(Schema::new(vec![
-                Field::new("c", DataType::Int32, true),
-                Field::new("a", DataType::Int32, true),
-                Field::new(
-                    "b",
-                    DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
-                    true,
-                ),
-            ])),
-            vec![],
-        );
+        let table_schema = TableSchema::from(Arc::new(Schema::new(vec![
+            Field::new("c", DataType::Int32, true),
+            Field::new("a", DataType::Int32, true),
+            Field::new(
+                "b",
+                DataType::Dictionary(Box::new(DataType::UInt32), Box::new(DataType::Utf8)),
+                true,
+            ),
+        ])));
 
         // Project columns [0, 2] from table schema, which should give us: c, b
         // Before the fix, the schema adapter would get confused about which fields
@@ -2015,14 +2018,10 @@ mod tests {
         // Verify the columns are in the right order and have the right values
         use datafusion::arrow::util::pretty::pretty_format_batches_with_options;
         let format_opts = FormatOptions::new().with_types_info(true);
-        assert_snapshot!(pretty_format_batches_with_options(&data, &format_opts)?.to_string(), @r"
-        +-------+--------------------------+
-        | c     | b                        |
-        | Int32 | Dictionary(UInt32, Utf8) |
-        +-------+--------------------------+
-        | 2     | test                     |
-        +-------+--------------------------+
-        ");
+        assert_snapshot!(
+            "projection_bug_minimal_repro_projected_and_cast",
+            pretty_format_batches_with_options(&data, &format_opts)?.to_string()
+        );
 
         Ok(())
     }
@@ -2052,7 +2051,7 @@ mod tests {
             filter: None,
             file_pruning_predicate: None,
             expr_adapter_factory: Arc::new(DefaultPhysicalExprAdapterFactory),
-            table_schema: TableSchema::from_file_schema(schema),
+            table_schema: TableSchema::from(schema),
             batch_size: 100,
             limit: None,
             metrics_registry: Arc::new(DefaultMetricsRegistry::default()),
@@ -2082,7 +2081,7 @@ mod tests {
         ) -> Option<Arc<VortexAccessPlan>> {
             Some(Arc::new(
                 VortexAccessPlan::default()
-                    .with_selection(Selection::IncludeByIndex(Buffer::empty())),
+                    .with_selection(crate::include_by_index(&Buffer::empty())),
             ))
         }
     }
@@ -2111,9 +2110,6 @@ mod tests {
     // Test that Selection::IncludeByIndex filters to specific row indices.
     async fn test_selection_include_by_index() -> anyhow::Result<()> {
         use datafusion::arrow::util::pretty::pretty_format_batches_with_options;
-        use vortex::buffer::Buffer;
-        use vortex::scan::selection::Selection;
-
         let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
         let file_path = "/path/file.vortex";
 
@@ -2125,8 +2121,8 @@ mod tests {
         let mut file = PartitionedFile::new(file_path.to_string(), data_size);
         file.extensions
             .insert(
-                VortexAccessPlan::default().with_selection(Selection::IncludeByIndex(
-                    Buffer::from_iter(vec![1, 3, 5, 7]),
+                VortexAccessPlan::default().with_selection(crate::include_by_index(
+                    &Buffer::from_iter(vec![1, 3, 5, 7]),
                 )),
             );
 
@@ -2140,17 +2136,10 @@ mod tests {
         let data = stream.try_collect::<Vec<_>>().await?;
         let format_opts = FormatOptions::new().with_types_info(true);
 
-        assert_snapshot!(pretty_format_batches_with_options(&data, &format_opts)?.to_string(), @r"
-        +-------+------+
-        | a     | b    |
-        | Int32 | Utf8 |
-        +-------+------+
-        | 1     | r1   |
-        | 3     | r3   |
-        | 5     | r5   |
-        | 7     | r7   |
-        +-------+------+
-        ");
+        assert_snapshot!(
+            "selection_include_by_index_rows",
+            pretty_format_batches_with_options(&data, &format_opts)?.to_string()
+        );
 
         Ok(())
     }
@@ -2169,8 +2158,8 @@ mod tests {
         let mut file = PartitionedFile::new(file_path.to_string(), data_size);
         file.extensions
             .insert(
-                VortexAccessPlan::default().with_selection(Selection::ExcludeByIndex(
-                    Buffer::from_iter(vec![0, 2, 4, 6, 8]),
+                VortexAccessPlan::default().with_selection(crate::exclude_by_index(
+                    &Buffer::from_iter(vec![0, 2, 4, 6, 8]),
                 )),
             );
 
@@ -2184,18 +2173,10 @@ mod tests {
         let data = stream.try_collect::<Vec<_>>().await?;
         let format_opts = FormatOptions::new().with_types_info(true);
 
-        assert_snapshot!(pretty_format_batches_with_options(&data, &format_opts)?.to_string(), @r"
-        +-------+------+
-        | a     | b    |
-        | Int32 | Utf8 |
-        +-------+------+
-        | 1     | r1   |
-        | 3     | r3   |
-        | 5     | r5   |
-        | 7     | r7   |
-        | 9     | r9   |
-        +-------+------+
-        ");
+        assert_snapshot!(
+            "selection_exclude_by_index_rows",
+            pretty_format_batches_with_options(&data, &format_opts)?.to_string()
+        );
 
         Ok(())
     }
@@ -2275,7 +2256,7 @@ mod tests {
             write_arrow_to_vortex(object_store.clone(), file_path, batch.clone()).await?;
 
         let file_schema = batch.schema();
-        let table_schema = TableSchema::from_file_schema(file_schema.clone());
+        let table_schema = TableSchema::from(file_schema.clone());
 
         // Create a projection that includes an arithmetic expression: a + b * 2
         let col_a = df_expr::col("a", &file_schema)?;
@@ -2325,16 +2306,11 @@ mod tests {
         // row 0: 1 + 10 * 2 = 21
         // row 1: 2 + 20 * 2 = 42
         // row 2: 3 + 30 * 2 = 63
-        assert_snapshot!(pretty_format_batches_with_options(&data, &FormatOptions::new().with_types_info(true))?.to_string(), @r"
-        +--------+
-        | result |
-        | Int32  |
-        +--------+
-        | 21     |
-        | 42     |
-        | 63     |
-        +--------+
-        ");
+        assert_snapshot!(
+            "projection_expr_pushdown_result",
+            pretty_format_batches_with_options(&data, &FormatOptions::new().with_types_info(true))?
+                .to_string()
+        );
 
         Ok(())
     }
@@ -2453,5 +2429,120 @@ mod tests {
             "the InList membership conjunct is declined"
         );
         assert!(conjuncts.skipped_dynamic[0].is::<df_expr::InListExpr>());
+    }
+
+    /// A dynamic filter over the columns of `bounds`, each `(name, index, lo,
+    /// hi)` naming a column at `index` of the scanned table. Its current value
+    /// is `lo <= name AND name <= hi` for every column, as a hash join builds
+    /// it for its keys.
+    fn bounds_dynamic_filter(bounds: &[(&str, usize, i32, i32)]) -> PhysicalExprRef {
+        let columns: Vec<PhysicalExprRef> = bounds
+            .iter()
+            .map(|&(name, index, _, _)| {
+                Arc::new(df_expr::Column::new(name, index)) as PhysicalExprRef
+            })
+            .collect();
+        let current = bounds
+            .iter()
+            .zip(&columns)
+            .flat_map(|(&(_, _, lo, hi), column)| {
+                [(Operator::GtEq, lo), (Operator::LtEq, hi)].map(|(op, value)| {
+                    Arc::new(df_expr::BinaryExpr::new(
+                        Arc::clone(column),
+                        op,
+                        Arc::new(df_expr::Literal::new(ScalarValue::Int32(Some(value)))),
+                    )) as PhysicalExprRef
+                })
+            })
+            .reduce(|left, right| {
+                Arc::new(df_expr::BinaryExpr::new(left, Operator::And, right)) as PhysicalExprRef
+            })
+            .expect("a dynamic filter needs at least one bound");
+        let dynamic_filter = Arc::new(df_expr::DynamicFilterPhysicalExpr::new(
+            columns,
+            Arc::new(df_expr::Literal::new(ScalarValue::Boolean(Some(true)))),
+        ));
+        dynamic_filter
+            .update(current)
+            .expect("dynamic filter update should succeed");
+        dynamic_filter as PhysicalExprRef
+    }
+
+    /// A hash-join dynamic filter on a partition column, scanned through the
+    /// source `try_pushdown_filters` plans for it. `FilePruner` evaluates its
+    /// predicate against the file schema, which has no partition columns, so
+    /// the opener folds each file's partition value into it first. With file
+    /// statistics the pruner runs: it skips a file whose partition value the
+    /// bound excludes, and keeps a NULL partition, whose bound is unknown.
+    #[tokio::test]
+    async fn dynamic_filter_on_a_partition_column_prunes_by_partition_value() -> anyhow::Result<()>
+    {
+        use datafusion_common::config::ConfigOptions;
+        use datafusion_datasource::file::FileSource;
+        use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
+        use datafusion_execution::object_store::ObjectStoreUrl;
+
+        use crate::VortexSource;
+
+        let batch = record_batch!(("a", Int32, vec![Some(1), Some(2), Some(3)]))
+            .expect("partition test batch should build");
+        let object_store = Arc::new(InMemory::new()) as Arc<dyn ObjectStore>;
+        let file_path = "/path/partitioned.vortex";
+        let data_size =
+            write_arrow_to_vortex(Arc::clone(&object_store), file_path, batch.clone()).await?;
+        let table_schema = TableSchema::builder(batch.schema())
+            .with_table_partition_cols(vec![Arc::new(Field::new("part", DataType::Int32, true))])
+            .build();
+
+        // `part` follows the file's `a` in the table schema.
+        let planned = VortexSource::new(table_schema, SESSION.clone()).try_pushdown_filters(
+            vec![bounds_dynamic_filter(&[("part", 1, 3, 7)])],
+            &ConfigOptions::default(),
+        )?;
+        let source = planned
+            .updated_node
+            .expect("pushing a filter should update the source")
+            .with_batch_size(100);
+
+        let mut scanned = Vec::new();
+        for partition_value in [None, Some(5), Some(100)] {
+            for with_statistics in [false, true] {
+                let mut file = PartitionedFile::new(file_path.to_string(), data_size);
+                file.partition_values = vec![ScalarValue::Int32(partition_value)];
+                file.statistics = with_statistics
+                    .then(|| Arc::new(datafusion_common::Statistics::new_unknown(&batch.schema())));
+                let config = FileScanConfigBuilder::new(
+                    ObjectStoreUrl::parse("memory:///")?,
+                    Arc::clone(&source),
+                )
+                .with_file(file.clone())
+                .build();
+                let rows: usize = source
+                    .create_file_opener(Arc::clone(&object_store), &config, 0)?
+                    .open(file)?
+                    .await?
+                    .try_collect::<Vec<_>>()
+                    .await?
+                    .iter()
+                    .map(RecordBatch::num_rows)
+                    .sum();
+                scanned.push((partition_value, with_statistics, rows));
+            }
+        }
+
+        // Without statistics no pruner runs and the row filter leaves the file
+        // whole; with them only the partition outside `3..=7` is skipped.
+        assert_eq!(
+            scanned,
+            vec![
+                (None, false, 3),
+                (None, true, 3),
+                (Some(5), false, 3),
+                (Some(5), true, 3),
+                (Some(100), false, 3),
+                (Some(100), true, 0),
+            ]
+        );
+        Ok(())
     }
 }

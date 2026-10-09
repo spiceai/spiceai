@@ -84,7 +84,7 @@ pub fn get_arrow_large_binary_record_batch() -> (RecordBatch, SchemaRef) {
 #[must_use]
 pub fn get_arrow_fixed_sized_binary_record_batch() -> (RecordBatch, SchemaRef) {
     // FixedSizeBinary Array with edge cases (16 bytes = common UUID size)
-    // Note: FixedSizeBinaryArray::from requires Option<&[u8]>, not Option<[u8; N]>
+    // Note: FixedSizeBinaryArray::try_from_sparse_iter_with_size takes Option<&[u8]>, not Option<[u8; N]>
     let val_sequential: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
     let val_zeros: [u8; 16] = [0; 16];
     let val_ones: [u8; 16] = [0xFF; 16];
@@ -104,7 +104,9 @@ pub fn get_arrow_fixed_sized_binary_record_batch() -> (RecordBatch, SchemaRef) {
         Some(&val_uuid_like),   // UUID-like pattern
         None,                   // null value
     ];
-    let fixed_size_binary_array = FixedSizeBinaryArray::from(input_arg);
+    let fixed_size_binary_array =
+        FixedSizeBinaryArray::try_from_sparse_iter_with_size(input_arg.into_iter(), 16)
+            .expect("failed to create arrow fixed size binary array");
 
     let schema = Arc::new(Schema::new(vec![Field::new(
         "fixed_size_binary",

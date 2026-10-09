@@ -23,7 +23,10 @@ use datafusion::datasource::TableType;
 use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::physical_optimizer::optimizer::{PhysicalOptimizerContext, PhysicalOptimizerRule};
 use datafusion::physical_plan::execution_plan::reset_plan_states;
-use datafusion::physical_plan::{ExecutionPlanProperties, collect};
+use datafusion::physical_plan::{
+    ChildrenPropertiesMode, ExecutionPlanProperties, ReplaceChildrenOptions, StatisticsArgs,
+    StatisticsContext, collect,
+};
 use datafusion::prelude::{SessionConfig, SessionContext};
 use datafusion_datasource::{memory::MemorySourceConfig, source::DataSourceExec};
 use runtime_request_context::{CacheNamespace, Protocol, RequestContext};
@@ -210,10 +213,15 @@ impl Fixture {
             .caching_stale_while_revalidate_ttl(Some(swr))
             .caching_stale_if_error(stale_if_error);
         let mut table = builder.build().await.expect("accelerated table");
-        // Keep write-side scans out of the read-plan counter. The channel still
-        // exercises real enqueueing and the in-flight claim stays held by it.
-        for handler in table.handlers.drain(..) {
+        // Keep write-side and eviction scans out of the read-plan counter. The
+        // channel still exercises real enqueueing and the in-flight claim stays
+        // held by it. Abort every task before awaiting any: awaiting yields, and
+        // a task not yet aborted could then run its first sweep.
+        let handlers = std::mem::take(table.handlers.get_mut());
+        for handler in &handlers {
             handler.abort();
+        }
+        for handler in handlers {
             let _ = handler.await;
         }
         let (tx, rx) = caching::create_cache_write_channel();
@@ -278,23 +286,34 @@ async fn healthy_queries_never_plan_the_accelerator() {
         node = Arc::clone(node.children()[0]);
     }
     assert!(node.children().is_empty());
-    assert!(node.required_input_distribution().is_empty());
+    assert!(
+        node.input_distribution_requirements()
+            .into_per_child()
+            .is_empty()
+    );
     assert_eq!(node.output_partitioning().partition_count(), 1);
     assert!(node.equivalence_properties().oeq_class().is_empty());
     assert_eq!(
-        node.partition_statistics(None)
+        StatisticsContext::new()
+            .compute(node.as_ref(), &StatisticsArgs::new())
             .expect("statistics")
             .num_rows,
         datafusion::common::stats::Precision::Absent
     );
     assert!(Arc::ptr_eq(
         &Arc::clone(&node)
-            .with_new_children(vec![])
+            .replace_children(
+                vec![],
+                ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute)
+            )
             .expect("no children"),
         &node
     ));
     Arc::clone(&node)
-        .with_new_children(vec![Arc::clone(&plan)])
+        .replace_children(
+            vec![Arc::clone(&plan)],
+            ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
+        )
         .expect_err("deferred input must reject a physical child");
     assert!(node.execute(1, fixture.ctx.task_ctx()).is_err());
     let batches = collect(plan, fixture.ctx.task_ctx())

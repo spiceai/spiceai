@@ -18,7 +18,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use arrow_schema::{DataType, Field, Schema, SchemaRef};
 use data_components::poly::PolyTableProvider;
-use datafusion::{datasource::TableProvider, sql::TableReference};
+use datafusion::{common::TableReference, datasource::TableProvider};
 use datafusion_table_providers::{
     duckdb::{TableDefinition, write::DuckDBTableWriter},
     sql::db_connection_pool::duckdbpool::DuckDbConnectionPool,

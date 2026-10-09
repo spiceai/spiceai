@@ -230,12 +230,18 @@ mod tests {
 
     #[test]
     fn rejects_surrounding_whitespace() {
-        for raw in [format!(" {}", valid_key()), format!("{}\n", valid_key())] {
-            assert!(
-                EnrollmentKey::parse(&raw).is_err(),
-                "the canonical key must be passed verbatim"
-            );
-        }
+        // The canonical key must be passed verbatim, and the variant decides which
+        // fix the user is told.
+        assert_eq!(
+            EnrollmentKey::parse(&format!(" {}", valid_key())).err(),
+            Some(InvalidEnrollmentKey::WrongPrefix),
+            "a leading space hides the prefix"
+        );
+        assert_eq!(
+            EnrollmentKey::parse(&format!("{}\n", valid_key())).err(),
+            Some(InvalidEnrollmentKey::WrongLength),
+            "a trailing newline makes the secret 33 characters long"
+        );
     }
 
     #[test]

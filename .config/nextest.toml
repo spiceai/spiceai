@@ -1,5 +1,5 @@
 [profile.default]
-retries = { backoff = "exponential", count = 5, delay = "2s", max-delay = "30s", jitter = true }
+retries = { backoff = "exponential", count = 3, delay = "2s", max-delay = "30s", jitter = true }
 fail-fast = false
 # Timeout for slow tests to prevent hung tests blocking CI
 slow-timeout = { period = "120s", terminate-after = 3 }
@@ -104,10 +104,12 @@ slow-timeout = { period = "120s", terminate-after = 12 }
 # The same wall-clock margin, for the long-running cayenne binaries that are NOT
 # in the zero-retry group above. These keep the default retries, so a timeout is
 # recoverable rather than a hard gate failure — but recovering costs up to
-# 5 x 360s = 30 minutes of runner time for a test that only ever needed wall
-# clock. That is not hypothetical: in merge-queue run 30723487049
+# 3 x 360s = 18 minutes of runner time for a test that only ever needed wall
+# clock, and a fourth timeout fails the run. That is not hypothetical: in
+# merge-queue run 30723487049, under the five-retry default of the time,
 # `partition_chunking_test …timestamp_partition_with_date_part` hit the cap on
-# tries 1-5 and then passed on try 6 at 305.5s.
+# tries 1-5 and then passed on try 6 at 305.5s, a run the current four-attempt
+# budget would have failed.
 #
 # A cap that clears contention is what makes that retry budget cheap rather than
 # expensive: the retries are there to absorb a genuine flake, and every one spent
@@ -135,8 +137,8 @@ slow-timeout = { period = "120s", terminate-after = 12 }
 # because the ceiling is already above what the model predicts under the worst
 # contention measured plus headroom — the reason the other two moved. Something,
 # because this binary keeps the default retries: a genuine hang is killed once
-# per attempt, so every second added to the ceiling is spent six times over
-# (5 retries + the first try). Going to 12 would add 480s x 6 = 48 minutes to
+# per attempt, so every second added to the ceiling is spent four times over
+# (3 retries + the first try). Going to 12 would add 480s x 4 = 32 minutes to
 # the cost of catching one, on the binary least likely to need the room.
 #
 # The rule this follows is the one stated above: the ceiling is derived from the
@@ -158,9 +160,20 @@ test-group = 'github-api-tests'
 retries = 0
 
 # Same reasoning for the MySQL CDC convergence tests: a retry that passes hides a lost update.
+#
+# Without nextest retries, a Docker stall while the container starts would be a
+# hard failure, so the tests retry that one step themselves
+# (`start_mysql_docker_container_retrying_startup`, up to 3 attempts) and
+# nothing after it. `slow-timeout` gives that room: a failed startup attempt has
+# taken up to 330s and a passing run up to 285s, so two failed attempts and a
+# slow pass come to 945s, and 1200s keeps 1.25x headroom over that. A genuine
+# hang is still killed, at 20 minutes instead of 6. Unlike the binary overrides
+# above, `.github/scripts/check_nextest_config.py` does not check this one: it
+# resolves `binary(=...)` filters only.
 [[profile.default.overrides]]
 filter = 'test(=mysql::replication_e2e::mysql_binlog_replication_survives_a_dump_reconnect_cayenne) | test(=mysql::replication_e2e::mysql_binlog_replication_decodes_every_column_type_cayenne)'
 retries = 0
+slow-timeout = { period = "120s", terminate-after = 10 }
 
 # Result-correctness parity lanes: Cayenne (and the Spice accelerators) against
 # standalone DuckDB/SQLite on the same rows.
@@ -168,7 +181,7 @@ retries = 0
 # `retries = 0` for the same reason the convergence binaries have it: these
 # compare two engines' answers to the same SQL over the same data, so a mismatch
 # is deterministic and a retry cannot turn a real one into a pass — it only pays
-# the ~250s runtime up to five more times before reporting the failure it already
+# the ~250s runtime repeatedly before reporting the failure it already
 # had. The one genuinely environmental step, installing DuckDB's tpch/tpcds
 # extensions, is handled in the test: an unavailable fixture is reported as a
 # counted exclusion rather than a failure, so there is nothing here for a retry

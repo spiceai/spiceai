@@ -43,7 +43,7 @@ use url::Url;
 use vortex::VortexSessionDefault;
 use vortex::array::ArrayRef as VortexArrayRef;
 use vortex::array::stream::ArrayStreamAdapter;
-use vortex::arrow::FromArrowArray;
+use vortex::arrow::ArrowSessionExt;
 use vortex::file::WriteOptionsSessionExt;
 use vortex::io::VortexWrite;
 use vortex::io::object_store::ObjectStoreWrite;
@@ -255,7 +255,9 @@ async fn write_files(shape: Shape, dir: &std::path::Path) {
     for file in 0..FILES {
         let arrays: Vec<VortexArrayRef> = (0..CHUNKS)
             .map(|chunk| {
-                VortexArrayRef::from_arrow(shape.batch(&schema, file, chunk), false)
+                session
+                    .arrow()
+                    .from_arrow_record_batch(shape.batch(&schema, file, chunk), &schema)
                     .expect("arrow batch converts to vortex")
             })
             .collect();

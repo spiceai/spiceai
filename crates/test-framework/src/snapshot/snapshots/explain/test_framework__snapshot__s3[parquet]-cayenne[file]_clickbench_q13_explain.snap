@@ -11,8 +11,8 @@ description: "Query: clickbench_q13"
 |               |       Filter: hits.SearchPhrase != LargeUtf8("")                                                                                                     |
 |               |         TableScan: hits projection=[SearchPhrase], partial_filters=[hits.SearchPhrase != LargeUtf8("")]                                              |
 | physical_plan | SortPreservingMergeExec: [c@1 DESC], fetch=10                                                                                                        |
-|               |   SortExec: TopK(fetch=10), expr=[c@1 DESC], preserve_partitioning=[true]                                                                            |
-|               |     ProjectionExec: expr=[SearchPhrase@0 as SearchPhrase, count(Int64(1))@1 as c]                                                                    |
+|               |   ProjectionExec: expr=[SearchPhrase@0 as SearchPhrase, count(Int64(1))@1 as c]                                                                      |
+|               |     SortExec: TopK(fetch=10), expr=[count(Int64(1))@1 DESC], preserve_partitioning=[true]                                                            |
 |               |       AggregateExec: mode=FinalPartitioned, gby=[SearchPhrase@0 as SearchPhrase], aggr=[count(Int64(1))]                                             |
 |               |         RepartitionExec: partitioning=Hash([SearchPhrase@0], 16), input_partitions=16                                                                |
 |               |           AggregateExec: mode=Partial, gby=[SearchPhrase@0 as SearchPhrase], aggr=[count(Int64(1))]                                                  |

@@ -109,20 +109,20 @@ fn ingest_command_path_override(
     }
 }
 
-fn resolve_table_path(path: &[String]) -> datafusion::sql::TableReference {
+fn resolve_table_path(path: &[String]) -> datafusion::common::TableReference {
     match path.len() {
-        3 => datafusion::sql::TableReference::full(
+        3 => datafusion::common::TableReference::full(
             path[0].as_str(),
             path[1].as_str(),
             path[2].as_str(),
         ),
-        2 => datafusion::sql::TableReference::partial(path[0].as_str(), path[1].as_str()),
-        _ => datafusion::sql::TableReference::parse_str(&path.join(".")),
+        2 => datafusion::common::TableReference::partial(path[0].as_str(), path[1].as_str()),
+        _ => datafusion::common::TableReference::parse_str(&path.join(".")),
     }
 }
 
 async fn decode_flight_batches(
-    table: &datafusion::sql::TableReference,
+    table: &datafusion::common::TableReference,
     streaming: Peekable<Streaming<FlightData>>,
 ) -> Result<
     (
@@ -131,8 +131,19 @@ async fn decode_flight_batches(
     ),
     Status,
 > {
-    let streaming = tokio_stream::StreamExt::map(streaming, |r| {
-        r.map_err(|s| FlightError::Tonic(Box::new(s)))
+    // A client is free to declare a MAP's `entries` field nullable, which the Arrow map layout
+    // forbids and the decode itself refuses. `FlightDataDecoder` reads its schema off the stream
+    // rather than taking one from here, so the repair has to reach it as bytes: the schema
+    // message is replaced on the way past with the form that decodes, and what the client
+    // actually declared is kept, since that — not the substitution the decoder will report — is
+    // what the batches have to be put back under.
+    let decodable = crate::flightsql::DecodableSchema::default();
+    let streaming = tokio_stream::StreamExt::map(streaming, {
+        let decodable = decodable.clone();
+        move |r| {
+            r.map_err(|s| FlightError::Tonic(Box::new(s)))
+                .map(|message| decodable.repair(message))
+        }
     });
     let mut decoder = FlightDataDecoder::new(streaming);
 
@@ -167,6 +178,7 @@ async fn decode_flight_batches(
     let schema = schema.ok_or_else(|| {
         Status::invalid_argument("DoPut stream must include at least one schema message")
     })?;
+    let schema = decodable.declared(schema);
 
     normalize_map_entries(table, &schema, batches)
 }
@@ -179,7 +191,7 @@ async fn decode_flight_batches(
 /// schema, so what its batches need is resolved once, and the corrected schema is returned with
 /// them — it is the one they now carry.
 fn normalize_map_entries(
-    table: &datafusion::sql::TableReference,
+    table: &datafusion::common::TableReference,
     schema: &SchemaRef,
     batches: Vec<RecordBatch>,
 ) -> Result<(SchemaRef, Vec<RecordBatch>), Status> {
@@ -300,8 +312,8 @@ mod tests {
     use super::normalize_map_entries;
 
     /// The table a `DoPut` resolved to, as `do_put_raw` would have resolved it.
-    fn test_table() -> datafusion::sql::TableReference {
-        datafusion::sql::TableReference::partial("sales", "orders")
+    fn test_table() -> datafusion::common::TableReference {
+        datafusion::common::TableReference::partial("sales", "orders")
     }
     use arrow::array::RecordBatch;
     use arrow::datatypes::{DataType, Schema};
@@ -345,12 +357,15 @@ mod tests {
         .expect("entries struct");
 
         let offsets: Vec<i32> = (0..=i32::try_from(rows).expect("row count")).collect();
-        let data = ArrayData::builder(data_type.clone())
+        let builder = ArrayData::builder(data_type.clone())
             .len(rows)
             .add_buffer(Buffer::from_slice_ref(&offsets))
-            .add_child_data(entries.to_data())
-            .build()
-            .expect("map array data");
+            .add_child_data(entries.to_data());
+        // SAFETY: the offsets, buffers and child data are well formed. Only the
+        // `entries` nullability declaration is what `ArrayData::validate` rejects,
+        // and reproducing it is the point of the fixture — the IPC reader builds
+        // such a map without either entries check.
+        let data = unsafe { builder.build_unchecked() };
 
         RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("m", data_type, true)])),

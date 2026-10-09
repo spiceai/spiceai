@@ -26,7 +26,7 @@ limitations under the License.
 
 use std::collections::BTreeSet;
 
-use arrow::datatypes::SchemaRef;
+use arrow::datatypes::{Field, SchemaRef};
 use data_components::inferred_schema::InferredSchema;
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, constraints::UpsertOptions,
@@ -44,7 +44,8 @@ use super::acceleration::{Acceleration, Engine, IndexType, OnConflictBehavior, R
 ///   inferring one would silently reroute `write_mode: write_through` DML away
 ///   from the federated source.
 /// - **indexes**: applied when none are configured (skipping any that merely
-///   duplicate the primary key).
+///   duplicate the primary key, and any the engine cannot build — see
+///   `unindexable_column`).
 /// - **sort columns**: applied when no engine sort param is configured, routed to
 ///   the engine-appropriate `acceleration.params` key. Never applied for `DuckDB`
 ///   when the acceleration carries a primary key, indexes, or `on_conflict`:
@@ -180,6 +181,15 @@ pub fn apply_inferred_schema(
             if pk_set.as_ref() == Some(&index_set) {
                 continue; // duplicates the primary key
             }
+            // An index the engine would refuse at registration is dropped here
+            // instead: the user never declared it, so it must not become a
+            // configuration error that keeps the whole dataset from loading.
+            if let Some(field) = unindexable_column(engine, effective_schema, &index.columns) {
+                let warning =
+                    inferred_index_skip_warning(dataset_name, engine, &index.columns, field);
+                tracing::warn!("{warning}");
+                continue;
+            }
             let index_type = if index.unique {
                 IndexType::Unique
             } else {
@@ -216,6 +226,48 @@ pub fn apply_inferred_schema(
         shard_key_applied = applied_shard_key,
         "Applied schema inference to acceleration settings"
     );
+}
+
+/// The first column of an inferred index that `engine` cannot key, or `None` when
+/// the engine accepts every column of the index.
+///
+/// Cayenne keys a column by its value with `key_index`, and refuses a column
+/// type that cannot be encoded, such as a list or a struct, at registration. A
+/// *declared* index still reaches Cayenne and fails with that actionable error;
+/// an *inferred* one is skipped by the caller, because the user never asked for
+/// it. The other engines index any column type.
+///
+/// Columns absent from `schema` are ignored here; the caller has already skipped
+/// an index naming one.
+fn unindexable_column<'a>(
+    engine: Engine,
+    schema: &'a SchemaRef,
+    columns: &[String],
+) -> Option<&'a Field> {
+    if engine != Engine::Cayenne {
+        return None;
+    }
+    columns
+        .iter()
+        .filter_map(|column| schema.field_with_name(column).ok())
+        .find(|field| !key_index::can_key(field.data_type()))
+}
+
+/// The warning logged when an inferred secondary index is skipped because
+/// `engine` cannot key `field`: names the dataset and the index, says what the
+/// user will observe, and gives the cause and the fix.
+fn inferred_index_skip_warning(
+    dataset_name: &str,
+    engine: Engine,
+    index_columns: &[String],
+    field: &Field,
+) -> String {
+    format!(
+        "Dataset '{dataset_name}' ({engine}): skipped the secondary index on ({}) inferred from the source, so equality lookups on those columns scan the table instead. Cause: column '{}' has type {}, which the {engine} accelerator cannot index; to index it, declare an index on columns of a scalar type such as an integer, decimal, float, string or timestamp. See: https://spiceai.org/docs/features/data-acceleration/indexes",
+        index_columns.join(", "),
+        field.name(),
+        field.data_type()
+    )
 }
 
 /// Inject the inferred sort order into the engine-appropriate `acceleration.params`
@@ -416,7 +468,7 @@ fn apply_inferred_shard_key(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::datatypes::{DataType, Field, Schema};
+    use arrow::datatypes::{DataType, Schema};
     use data_components::inferred_schema::{InferredIndex, InferredSortColumn};
     use std::sync::Arc;
 
@@ -424,6 +476,14 @@ mod tests {
         Arc::new(Schema::new(
             cols.iter()
                 .map(|c| Field::new(*c, DataType::Int64, true))
+                .collect::<Vec<_>>(),
+        ))
+    }
+
+    fn typed_schema(cols: &[(&str, DataType)]) -> SchemaRef {
+        Arc::new(Schema::new(
+            cols.iter()
+                .map(|(name, data_type)| Field::new(*name, data_type.clone(), true))
                 .collect::<Vec<_>>(),
         ))
     }
@@ -853,6 +913,146 @@ mod tests {
         );
         assert_eq!(acc.indexes.len(), 1);
         assert!(acc.indexes.contains_key(&col_ref(&["existing"])));
+    }
+
+    /// The issue's table: a source with b-tree indexes on `(a, b)` and on the
+    /// `double precision` column `v`, and no `indexes` declared.
+    fn float_indexed_source() -> (InferredSchema, SchemaRef) {
+        let inferred = InferredSchema {
+            primary_key: vec!["id".to_string()],
+            indexes: vec![
+                InferredIndex {
+                    columns: vec!["a".to_string(), "b".to_string()],
+                    unique: false,
+                },
+                InferredIndex {
+                    columns: vec!["v".to_string()],
+                    unique: false,
+                },
+            ],
+            ..InferredSchema::default()
+        };
+        let schema = typed_schema(&[
+            ("id", DataType::Int64),
+            ("a", DataType::Int32),
+            ("b", DataType::Int32),
+            ("v", DataType::Float64),
+        ]);
+        (inferred, schema)
+    }
+
+    /// Applies the issue's table to `acc`.
+    fn apply_float_indexed_source(acc: &mut Acceleration, refresh_mode: RefreshMode) {
+        let (inferred, schema) = float_indexed_source();
+        apply_inferred_schema(acc, &inferred, &schema, "t", refresh_mode);
+    }
+
+    // regression test for #14590
+    #[test]
+    fn cayenne_applies_inferred_index_on_float_column() {
+        // Cayenne indexes a floating-point key, so an index the source holds on
+        // one is applied like any other, alone or within a composite key.
+        for refresh_mode in [RefreshMode::Full, RefreshMode::Changes] {
+            let mut acc = accel(Engine::Cayenne);
+            apply_float_indexed_source(&mut acc, refresh_mode);
+
+            assert_eq!(acc.primary_key, Some(col_ref(&["id"])));
+            assert_eq!(
+                acc.indexes.len(),
+                2,
+                "{refresh_mode:?}: both inferred indexes apply"
+            );
+            assert!(acc.indexes.contains_key(&col_ref(&["a", "b"])));
+            assert!(acc.indexes.contains_key(&col_ref(&["v"])));
+        }
+        for float in [DataType::Float16, DataType::Float32, DataType::Float64] {
+            let mut acc = accel(Engine::Cayenne);
+            let inferred = InferredSchema {
+                indexes: vec![InferredIndex {
+                    columns: vec!["a".to_string(), "score".to_string()],
+                    unique: true,
+                }],
+                ..InferredSchema::default()
+            };
+            let schema = typed_schema(&[("a", DataType::Int32), ("score", float.clone())]);
+            apply_inferred_schema(&mut acc, &inferred, &schema, "t", RefreshMode::Full);
+
+            assert_eq!(
+                acc.indexes.get(&col_ref(&["a", "score"])),
+                Some(&IndexType::Unique),
+                "{float}: composite key with a float column applies"
+            );
+        }
+    }
+
+    #[test]
+    fn cayenne_skips_inferred_index_on_a_column_it_cannot_key() {
+        // Cayenne refuses a key column it cannot encode, such as an array, at
+        // registration. An index the source holds on one is skipped instead, so
+        // a dataset that never declared it still loads with its other indexes.
+        let inferred = InferredSchema {
+            indexes: vec![
+                InferredIndex {
+                    columns: vec!["a".to_string()],
+                    unique: false,
+                },
+                InferredIndex {
+                    columns: vec!["tags".to_string()],
+                    unique: false,
+                },
+                InferredIndex {
+                    columns: vec!["a".to_string(), "tags".to_string()],
+                    unique: false,
+                },
+                InferredIndex {
+                    columns: vec!["status".to_string()],
+                    unique: false,
+                },
+            ],
+            ..InferredSchema::default()
+        };
+        let tags = DataType::List(Arc::new(Field::new_list_field(DataType::Int32, true)));
+        let status = DataType::Dictionary(Box::new(DataType::Int8), Box::new(DataType::Utf8));
+        let schema = typed_schema(&[("a", DataType::Int32), ("tags", tags), ("status", status)]);
+
+        let mut acc = accel(Engine::Cayenne);
+        apply_inferred_schema(&mut acc, &inferred, &schema, "t", RefreshMode::Full);
+        assert_eq!(acc.indexes.len(), 2, "{:?}", acc.indexes.keys());
+        assert!(acc.indexes.contains_key(&col_ref(&["a"])));
+        assert!(
+            acc.indexes.contains_key(&col_ref(&["status"])),
+            "a dictionary column is keyed by its values"
+        );
+
+        let mut acc = accel(Engine::Sqlite);
+        apply_inferred_schema(&mut acc, &inferred, &schema, "t", RefreshMode::Full);
+        assert_eq!(acc.indexes.len(), 4, "other engines index any column type");
+    }
+
+    #[test]
+    fn inferred_index_skip_warning_names_the_dataset_index_and_cause() {
+        let columns = vec!["a".to_string(), "tags".to_string()];
+        let tags = DataType::List(Arc::new(Field::new_list_field(DataType::Int32, true)));
+        let message = inferred_index_skip_warning(
+            "orders",
+            Engine::Cayenne,
+            &columns,
+            &Field::new("tags", tags, true),
+        );
+        assert!(
+            message.starts_with("Dataset 'orders' (cayenne): "),
+            "{message}"
+        );
+        assert!(
+            message.contains("secondary index on (a, tags)"),
+            "{message}"
+        );
+        assert!(message.contains("scan the table instead"), "{message}");
+        assert!(
+            message.contains("column 'tags' has type List("),
+            "{message}"
+        );
+        assert!(message.contains("https://spiceai.org/docs/"), "{message}");
     }
 
     #[test]

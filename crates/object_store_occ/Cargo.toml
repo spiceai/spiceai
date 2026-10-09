@@ -7,18 +7,23 @@ description = "Type-safe object storage with optimistic concurrency control"
 
 [dependencies]
 async-trait.workspace = true
-bytes.workspace = true
+bytes = { workspace = true, features = ["serde"] }
+blake3.workspace = true
 futures.workspace = true
 object_store.workspace = true
 parking_lot.workspace = true
+rand.workspace = true
+rayon.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 snafu.workspace = true
-tokio = { workspace = true, features = ["rt", "sync"] }
+tokio = { workspace = true, features = ["rt", "sync", "time"] }
+tracing.workspace = true
+uuid = { workspace = true, features = ["v4", "v7"] }
 
 [dev-dependencies]
 tempfile.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
 
 [lints]
 workspace = true

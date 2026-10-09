@@ -15,8 +15,8 @@ limitations under the License.
 */
 
 //! End-to-end integration test for the Postgres logical-replication path,
-//! driven through the full Spice Runtime (Spicepod datasets + `DuckDB`
-//! accelerator) using a TPC-H-shaped schema.
+//! driven through the full Spice Runtime (Spicepod datasets on the `DuckDB`
+//! and Cayenne accelerators) using a TPC-H-shaped schema.
 //!
 //! What this test validates that the pure-library test at `replication.rs`
 //! does not:
@@ -197,7 +197,7 @@ async fn setup_schema_and_seed(port: u16) -> Result<tokio_postgres::Client, anyh
     Ok(client)
 }
 
-fn make_dataset(ds: &TpchDataset, pg_params: &HashMap<String, String>) -> Dataset {
+fn make_dataset(ds: &TpchDataset, pg_params: &HashMap<String, String>, engine: &str) -> Dataset {
     let mut dataset = Dataset::new(
         format!("postgres:{}", ds.pg_table),
         ds.dataset_name.to_string(),
@@ -205,12 +205,16 @@ fn make_dataset(ds: &TpchDataset, pg_params: &HashMap<String, String>) -> Datase
     dataset.params = Some(Params::from_string_map(pg_params.clone()));
     dataset.acceleration = Some(Acceleration {
         enabled: true,
-        engine: Some("duckdb".to_string()),
+        engine: Some(engine.to_string()),
         refresh_mode: Some(RefreshMode::Changes),
         primary_key: Some(ds.primary_key.to_string()),
-        on_conflict: vec![(ds.primary_key.to_string(), OnConflictBehavior::Upsert)]
-            .into_iter()
-            .collect(),
+        // Cayenne keeps one row per primary key on its own; the other engines
+        // replace a row only through an `on_conflict` upsert keyed on it.
+        on_conflict: if engine == "cayenne" {
+            HashMap::new()
+        } else {
+            HashMap::from([(ds.primary_key.to_string(), OnConflictBehavior::Upsert)])
+        },
         ..Acceleration::default()
     });
     dataset
@@ -338,6 +342,17 @@ async fn assert_scalar_f64_approx(
 
 #[tokio::test(flavor = "multi_thread")]
 async fn tpch_postgres_replication_end_to_end() -> Result<(), anyhow::Error> {
+    run_tpch_postgres_replication("duckdb").await
+}
+
+/// The same lifecycle on Cayenne, keyed by `primary_key` alone.
+#[cfg(not(target_os = "windows"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn tpch_postgres_replication_end_to_end_cayenne() -> Result<(), anyhow::Error> {
+    run_tpch_postgres_replication("cayenne").await
+}
+
+async fn run_tpch_postgres_replication(engine: &str) -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(
         "integration=debug,runtime=debug,data_components=debug,\
          data_components::postgres_replication=trace,info",
@@ -346,10 +361,10 @@ async fn tpch_postgres_replication_end_to_end() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
-            let port = common::get_random_port()?;
-            let _container = common::start_postgres_docker_container_with_logical_wal(port)
+            let container = common::start_postgres_docker_container_with_logical_wal()
                 .await
                 .map_err(|e| anyhow!("start container: {e}"))?;
+            let port = usize::from(container.host_port(5432)?);
 
             // -------------------------------------------------------------
             // 1. Create schema + seed on the source.
@@ -364,9 +379,9 @@ async fn tpch_postgres_replication_end_to_end() -> Result<(), anyhow::Error> {
                 .map(|(k, v)| (k, v.expose_secret().to_string()))
                 .collect();
 
-            let mut builder = AppBuilder::new("tpch_replication_integration");
+            let mut builder = AppBuilder::new(format!("tpch_replication_integration_{engine}"));
             for ds in TPCH_DATASETS {
-                builder = builder.with_dataset(make_dataset(ds, &pg_params));
+                builder = builder.with_dataset(make_dataset(ds, &pg_params, engine));
             }
             let app = builder.build();
 
@@ -392,7 +407,7 @@ async fn tpch_postgres_replication_end_to_end() -> Result<(), anyhow::Error> {
             }
 
             // Snapshot a few aggregations to prove type fidelity across the
-            // WAL → Arrow → DuckDB path.
+            // WAL → Arrow → accelerator path.
             assert_scalar_i64(
                 &rt,
                 "SELECT count(*) FROM tpch_customer WHERE c_mktsegment = 'AUTOMOBILE'",

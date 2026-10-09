@@ -168,8 +168,12 @@ impl SnapshotEngine for DuckDBSnapshotEngine {
         .context(CheckpointJoinSnafu {
             dataset: dataset_name.to_string(),
         })
-        .map_err(|e| super::SnapshotEngineError::DuckDB { source: e })?
-        .map_err(|e| super::SnapshotEngineError::DuckDB { source: e })
+        .map_err(|e| super::SnapshotEngineError::DuckDB {
+            source: Box::new(e),
+        })?
+        .map_err(|e| super::SnapshotEngineError::DuckDB {
+            source: Box::new(e),
+        })
     }
 
     async fn prepare_for_upload(
@@ -181,7 +185,9 @@ impl SnapshotEngine for DuckDBSnapshotEngine {
             let compacted_path = source_path.with_extension("compacted");
             self.compact_duckdb(source_path, &compacted_path, dataset_name)
                 .await
-                .map_err(|e| super::SnapshotEngineError::DuckDB { source: e })?;
+                .map_err(|e| super::SnapshotEngineError::DuckDB {
+                    source: Box::new(e),
+                })?;
             Ok(compacted_path)
         } else {
             Ok(source_path.to_path_buf())

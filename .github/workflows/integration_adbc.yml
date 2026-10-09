@@ -72,9 +72,12 @@ jobs:
           persist-credentials: false
           fetch-depth: 1
 
-      - name: Cache Cargo registry
+      # Saved by the "Save Cargo registry" step at the end of this job, and never
+      # from the merge queue (see there).
+      - name: Restore Cargo registry
+        id: cargo-registry
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index/
@@ -123,3 +126,17 @@ jobs:
           AWS_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
         run: |
           cargo test -p runtime --features adbc --test integration -- adbc::
+
+      # Not from the merge queue: a cache saved there is scoped to the queue
+      # entry's temporary `gh-readonly-queue/...` ref, which later entries and
+      # trunk cannot restore from, so each save there stored ~3 GiB that was
+      # almost never read. Merge-queue runs restore the cache trunk saves.
+      - name: Save Cargo registry
+        if: needs.check_changes.outputs.relevant_changes == 'true' && github.event_name != 'merge_group' && steps.cargo-registry.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ steps.cargo-registry.outputs.cache-primary-key }}

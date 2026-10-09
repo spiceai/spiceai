@@ -25,10 +25,10 @@ use arrow::array::{RecordBatch, UInt64Array};
 use cache::Caching;
 use datafusion::{
     catalog::TableProvider,
+    common::TableReference,
     logical_expr::Operator,
     physical_plan::collect,
     prelude::{Expr, SessionContext},
-    sql::TableReference,
 };
 use runtime_component::dataset::TimeFormat;
 use runtime_datafusion::{is_spice_internal_dataset, session_config::get_df_default_config};
@@ -580,13 +580,14 @@ mod tests {
             MemTable::try_new(create_test_schema(), vec![]).expect("mem table should be created"),
         );
 
+        // Each case must yield the very provider the layers wrap — the one a
+        // retention DELETE executes against — not merely some `MemTable`.
+
         // An index layer alone.
         let wrapped: Arc<dyn TableProvider> =
             SpiceTable::over(Arc::new(IndexLayer::new()), Arc::clone(&mem_table));
         assert!(
-            strip_index_wrapper_layers(&wrapped)
-                .downcast_ref::<MemTable>()
-                .is_some(),
+            Arc::ptr_eq(&strip_index_wrapper_layers(&wrapped), &mem_table),
             "stripping an IndexLayer must yield the underlying MemTable"
         );
 
@@ -602,17 +603,17 @@ mod tests {
         let wrapped_with_metadata: Arc<dyn TableProvider> =
             SpiceTable::over(Arc::new(IndexLayer::new()), metadata_enriched);
         assert!(
-            strip_index_wrapper_layers(&wrapped_with_metadata)
-                .downcast_ref::<MemTable>()
-                .is_some(),
+            Arc::ptr_eq(
+                &strip_index_wrapper_layers(&wrapped_with_metadata),
+                &mem_table
+            ),
             "stripping must peel through a nested metadata layer"
         );
 
         // A provider with no wrapper layers is returned unchanged.
         assert!(
-            strip_index_wrapper_layers(&mem_table)
-                .downcast_ref::<MemTable>()
-                .is_some()
+            Arc::ptr_eq(&strip_index_wrapper_layers(&mem_table), &mem_table),
+            "a bare provider is its own retention target"
         );
     }
 }

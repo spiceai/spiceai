@@ -22,10 +22,12 @@
 #
 # The paths that must be gated are DERIVED, not listed: from what the `lint-rust`
 # recipe reads (`CLIPPY_CONF_DIR`, each `$(PYTHON) scripts/…` guard), from the
-# tracked files whose name marks them as lint/test config, and from every tracked
-# `.rs` file. So this catches "a config file the gate reads is in none of the
-# lists" and "a Rust source tree is in none of the lists" — the actual bugs — and
-# not merely "the lists disagree about a path someone already thought of".
+# tracked files whose name marks them as lint/test config, from every tracked
+# `.rs` file, and from the files outside the source trees that a Rust source
+# names by relative path. So this catches "a config file the gate reads is in
+# none of the lists" and "a Rust source tree is in none of the lists" — the
+# actual bugs — and not merely "the lists disagree about a path someone already
+# thought of".
 #
 # Usage:
 #   scripts/check_rust_gate_paths.py    # validate (exit 1 on drift, 2 if unreadable)
@@ -34,6 +36,8 @@
 
 from __future__ import annotations
 
+import ast
+import posixpath
 import re
 import subprocess
 import sys
@@ -57,6 +61,19 @@ GATE_CONFIG_BASENAMES = (
     "layers.toml",
 )
 
+# Test fixtures and build inputs can have arbitrary extensions. Every tracked
+# file in a workspace source tree therefore participates in the Rust gate.
+WORKSPACE_SOURCE_TREES = ("crates/", "bin/", "tools/", "vendor/")
+
+# A Rust source reaches a file outside those trees through a `../` string
+# literal: `include_bytes!`/`include_str!` resolve it against the source's own
+# directory at compile time, and a test that opens it resolves it against its
+# package directory, which is the working directory `cargo test` runs it in.
+# `crates/runtime-tls` pins the SHA-256 of `test/tls/spiced_cert.pem` this way,
+# so a certificate-only change can fail a unit test. A leading `/` covers the
+# `concat!(env!("CARGO_MANIFEST_DIR"), "/../…")` spelling.
+RELATIVE_PATH_LITERAL = re.compile(r'"/?((?:\.\./)+[^"\\\n]+)"')
+
 # Rust inputs that are neither config files nor `.rs` sources, so there is
 # nothing to derive them from.
 RUST_SOURCE_PATHS = (
@@ -67,6 +84,7 @@ RUST_SOURCE_PATHS = (
     ".cargo/config.toml",
     # Holds every -Dclippy::… flag the gate enforces.
     "Makefile",
+    "version.txt",
     # `check_fork_patches.py` validates this file against `Cargo.lock`, so it is
     # an input the gate reads. Gated by name rather than derived: nothing in the
     # `lint-rust` recipe names it, only the guard it feeds. Left ungated, a
@@ -163,12 +181,106 @@ def tracked_files() -> tuple[list[str], list[str]]:
     return [p for p in listing.split("\0") if p], []
 
 
-def derived_gate_paths(tracked: list[str]) -> tuple[list[str], list[str]]:
+def read_script(path: str) -> str | None:
+    """A repo file's text, or None when there is no such file."""
+    try:
+        return (REPO / path).read_text(encoding="utf-8")
+    except OSError:
+        return None
+
+
+def imported_modules(source: str) -> set[str]:
+    """Top-level names of every absolute import in a Python source."""
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        # The guard itself fails when `lint-rust` runs it, which reports this.
+        return set()
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names.update(alias.name.split(".")[0] for alias in node.names)
+        elif isinstance(node, ast.ImportFrom) and node.module and not node.level:
+            names.add(node.module.split(".")[0])
+    return names
+
+
+def sibling_imports(guards: list[str], read=read_script) -> set[str]:
+    """The `scripts/` modules the guards import, followed transitively.
+
+    A guard's behavior lives in every module it imports, so a helper shared by
+    several guards is as much a gate input as the guards are — yet nothing in the
+    `lint-rust` recipe names it. An imported name with no `scripts/<name>.py`
+    behind it (the standard library) is skipped.
+    """
+    found: set[str] = set()
+    pending = [text for text in map(read, guards) if text is not None]
+    while pending:
+        for name in imported_modules(pending.pop()):
+            module = f"scripts/{name}.py"
+            if module in found:
+                continue
+            text = read(module)
+            if text is not None:
+                found.add(module)
+                pending.append(text)
+    return found
+
+
+def read_source(path: str) -> str | None:
+    """A tracked source's text, or None when it cannot be read.
+
+    Undecodable bytes are replaced rather than raised: a path literal is ASCII,
+    and one stray byte elsewhere in a file must not stop the guard from reading it.
+    """
+    try:
+        return (REPO / path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+
+
+def referenced_inputs(tracked: list[str], read=read_source) -> set[str]:
+    """Tracked files outside the workspace source trees that a Rust source names.
+
+    Each `../` literal is resolved against both directories it can be relative
+    to: the source's own (an `include_*!` macro) and its package's (a test that
+    opens the path). A resolution that is not a tracked file names nothing and is
+    dropped, so trying both can only add a path to the "must be gated" set, which
+    fails closed.
+    """
+    files = set(tracked)
+    packages = {posixpath.dirname(p) for p in tracked if posixpath.basename(p) == "Cargo.toml"}
+    found: set[str] = set()
+    for source in tracked:
+        if not source.endswith(".rs"):
+            continue
+        text = read(source)
+        literals = RELATIVE_PATH_LITERAL.findall(text) if text else []
+        if not literals:
+            continue
+        bases = {posixpath.dirname(source)}
+        package = posixpath.dirname(source)
+        while package and package not in packages:
+            package = posixpath.dirname(package)
+        bases.add(package)
+        for literal in literals:
+            for base in bases:
+                path = posixpath.normpath(posixpath.join(base, literal))
+                if path in files and not path.startswith(WORKSPACE_SOURCE_TREES):
+                    found.add(path)
+    return found
+
+
+def derived_gate_paths(
+    tracked: list[str], imports=sibling_imports, references=referenced_inputs
+) -> tuple[list[str], list[str]]:
     """Paths the Rust gate reads, plus notes on anything that could not be derived.
 
     Derived from the `lint-rust` recipe (the clippy config directory it points
-    at, and every `$(PYTHON) scripts/…` guard it runs) plus the tracked files whose
-    basename marks them as lint/test config.
+    at, every `$(PYTHON) scripts/…` guard it runs, and the `scripts/` modules those
+    guards import), the tracked files whose basename marks them as lint/test
+    config, every tracked file in a workspace source tree, and the files outside
+    those trees that a Rust source names by relative path.
     """
     paths: set[str] = set(RUST_SOURCE_PATHS)
     notes: list[str] = []
@@ -190,14 +302,19 @@ def derived_gate_paths(tracked: list[str]) -> tuple[list[str], list[str]]:
     # from it and is the exact failure this script exists to catch. So the
     # accepted spellings are deliberately broad, and only a spelling that would
     # drop a guard — a different variable, or a bare `python` — is left unmatched.
-    paths.update(
-        re.findall(
-            r"(?:\$\(PYTHON\)|\$\{PYTHON\}|python3)(?:\\\n|[ \t])+(scripts/[\w./-]+\.py)",
-            recipe,
-        )
+    guards = re.findall(
+        r"(?:\$\(PYTHON\)|\$\{PYTHON\}|python3)(?:\\\n|[ \t])+(scripts/[\w./-]+\.py)",
+        recipe,
     )
+    paths.update(guards)
+    paths.update(imports(guards))
 
     paths.update(p for p in tracked if Path(p).name in GATE_CONFIG_BASENAMES)
+    paths.update(
+        p for p in tracked
+        if p.startswith(WORKSPACE_SOURCE_TREES) or p.endswith((".snap", ".proto"))
+    )
+    paths.update(references(tracked))
 
     return sorted(paths), notes
 

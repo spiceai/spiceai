@@ -36,11 +36,11 @@ use std::{fmt, sync::Arc};
 use async_trait::async_trait;
 use datafusion::{
     catalog::Session,
+    common::TableReference,
     datasource::TableProvider,
     error::Result as DataFusionResult,
     logical_expr::{Expr, TableProviderFilterPushDown, TableType},
     physical_plan::ExecutionPlan,
-    sql::TableReference,
 };
 use datafusion_table_providers::sql::{
     db_connection_pool::DbConnectionPool,

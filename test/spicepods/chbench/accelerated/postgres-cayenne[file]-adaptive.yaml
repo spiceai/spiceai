@@ -72,6 +72,19 @@ name: postgres-cayenne[file]-adaptive
 # a 20-core host, which is why query latency does not move. WHY freshness improves is NOT
 # established: every write-path metric scraped (files on disk, write MiB/s, metastore and
 # mem-tier checkpoints, files reclaimed, encode waits) is flat between the arms.
+#
+# DATALAKE (COLD) TIER: the six high-volume CDC tables (district, customer, new_order, oorder,
+# order_line, stock) also carry the datalake tier, so this config runs all three storage tiers:
+# RAM mem-tier -> warm local-disk Vortex -> cold object store. No datalake knob is an adaptive
+# actuator, and only the tier's location and credentials are set, so warm data moves on the
+# engine default trigger: 16 x the 512 MB cold file size (8 GiB) of warm data. customer,
+# order_line and stock cross it at SF1000; small scale factors stay below it. warehouse and the
+# full-refresh reference tables stay on the warm tier. The cold store is the shared MinIO
+# (`s3://benchmarks`). Each run writes under its own prefix, the Actions run id, so the HTAP
+# workflow can delete that run's objects afterwards without touching a concurrent run's.
+# spiced does not resolve `${env:…}` in `cayenne_datalake_location` yet (#14711), so the HTAP
+# workflow substitutes the run id into it before spiced starts. A move holds the table's write
+# lock for its whole duration (#12849), so CDC apply on that table pauses while it runs.
 
 postgres_connection_params: &postgres_params
   pg_host: ${env:CHBENCH_PG_HOST}
@@ -151,7 +164,17 @@ datasets:
       <<: *postgres_params
       pg_replication_slot: spice_light
       pg_replication_initial_snapshot: auto
-    acceleration: *cayenne_accel
+    acceleration: &cayenne_accel_cold
+      <<: *cayenne_accel
+      params: &cayenne_params_cold
+        <<: *cayenne_params
+        # Datalake (cold) tier: location and credentials only (see the header).
+        cayenne_datalake_location: s3://benchmarks/cayenne-datalake/${env:GITHUB_RUN_ID}/
+        cayenne_datalake_s3_auth: key
+        cayenne_datalake_s3_endpoint: ${secrets:S3_ENDPOINT}
+        cayenne_datalake_s3_key: ${secrets:S3_KEY}
+        cayenne_datalake_s3_secret: ${secrets:S3_SECRET}
+        cayenne_datalake_s3_allow_http: 'true'
 
   - from: postgres:customer
     name: customer
@@ -160,9 +183,9 @@ datasets:
       pg_replication_slot: spice_light
       pg_replication_initial_snapshot: auto
     acceleration:
-      <<: *cayenne_accel
+      <<: *cayenne_accel_cold
       params:
-        <<: *cayenne_params
+        <<: *cayenne_params_cold
         # q3's `c_state LIKE 'A%'` (one state prefix in 26) is the only customer
         # predicate a zone map can prune — q22 filters on `substr(c_phone, 1, 1)`
         # and a scalar subquery. c_w_id leads the primary key.
@@ -174,7 +197,7 @@ datasets:
       <<: *postgres_params
       pg_replication_slot: spice_new_order
       pg_replication_initial_snapshot: auto
-    acceleration: *cayenne_accel
+    acceleration: *cayenne_accel_cold
 
   - from: postgres:oorder
     name: oorder
@@ -183,9 +206,9 @@ datasets:
       pg_replication_slot: spice_light
       pg_replication_initial_snapshot: auto
     acceleration:
-      <<: *cayenne_accel
+      <<: *cayenne_accel_cold
       params:
-        <<: *cayenne_params
+        <<: *cayenne_params_cold
         # q13 filters `o_carrier_id > 8` (the Delivery txn sets it, NULL until then).
         # o_w_id leads the primary key and is the join key q3/q5/q10/q12/q18/q21 read
         # oorder through.
@@ -198,9 +221,9 @@ datasets:
       pg_replication_slot: spice_order_line
       pg_replication_initial_snapshot: auto
     acceleration:
-      <<: *cayenne_accel
+      <<: *cayenne_accel_cold
       params:
-        <<: *cayenne_params
+        <<: *cayenne_params_cold
         # The two selective CH-benCH predicates over the heaviest table: q8
         # `ol_i_id < 1000` (999 of the 100,000 item ids the seed draws from, ~1% of
         # rows) and q19's `ol_w_id IN (...)` lists (3 warehouses of the scale factor;
@@ -244,7 +267,7 @@ datasets:
       <<: *postgres_params
       pg_replication_slot: spice_stock
       pg_replication_initial_snapshot: auto
-    acceleration: *cayenne_accel
+    acceleration: *cayenne_accel_cold
 
   # ---- Static reference tables (no OLTP mutations, full refresh) ----
   # Same: PK / indexes come from schema inference (always on); on_conflict is seeded only

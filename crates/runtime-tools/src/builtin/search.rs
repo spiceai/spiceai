@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 use async_trait::async_trait;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use serde_json::Value;
 use snafu::ResultExt;
 use std::{borrow::Cow, sync::Arc};

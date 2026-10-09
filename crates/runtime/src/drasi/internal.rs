@@ -36,7 +36,7 @@ use std::collections::HashMap;
 use arrow::array::RecordBatch;
 use arrow::datatypes::SchemaRef;
 use datafusion::common::Constraints;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use runtime_query_engine::query_engine::UpdateType;
 use spicepod::drasi::{RuntimeDrasi, RuntimeDrasiTable};
 
@@ -235,6 +235,7 @@ fn declared_primary_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::drasi::dead_letter::DeadLetterStore;
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::common::Constraint;
     use std::sync::Arc;
@@ -436,23 +437,100 @@ mod tests {
         );
     }
 
-    /// A write to an unconfigured table must not queue anything, and must not
-    /// panic on the missing entry.
+    /// One `runtime.task_history`-shaped row.
+    fn task_history_batch() -> RecordBatch {
+        RecordBatch::try_new(
+            schema(),
+            vec![
+                Arc::new(arrow::array::StringArray::from(vec!["t"])),
+                Arc::new(arrow::array::StringArray::from(vec!["s"])),
+                Arc::new(arrow::array::StringArray::from(vec!["task"])),
+            ],
+        )
+        .expect("valid batch")
+    }
+
+    /// Builds the forwarder for runtime table `name` by hand rather than through
+    /// `try_new`, which opens its dead-letter store under the working
+    /// directory: here the store is whatever the test passes. The sink points at
+    /// a port nothing listens on, so a delivery attempt fails at once rather
+    /// than waiting on a hostname lookup.
+    fn forwarders_for(name: &str, store: Option<Arc<DeadLetterStore>>) -> InternalForwarders {
+        let table = table_ref(name);
+        let component = table.to_string();
+        let params = spicepod::param::Params::from_string_map(
+            [(
+                "drasi_http_endpoint".to_string(),
+                "http://127.0.0.1:1".to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        );
+        let sink = crate::drasi::build_sink(
+            component.clone(),
+            "spice-runtime",
+            vec![component.clone()],
+            spicepod::drasi::DrasiTransport::Http,
+            crate::drasi::QUEUED_SINK_POLICY,
+            Some(&params),
+        )
+        .expect("builds the sink");
+        InternalForwarders {
+            by_table: HashMap::from([(
+                table,
+                TableForwarder {
+                    queue: DeliveryQueue::spawn(sink, component, DEFAULT_QUEUE_DEPTH, store),
+                    configured_key: vec![],
+                },
+            )]),
+        }
+    }
+
+    /// A write to an unconfigured table must not reach any forwarder, and must
+    /// not panic on the missing entry.
     #[tokio::test]
     async fn an_unconfigured_table_is_ignored() {
-        let forwarders = InternalForwarders::try_new(&spec(vec![table("task_history")]))
-            .await
-            .expect("builds");
+        let forwarders = forwarders_for("task_history", None);
+        let batch = task_history_batch();
 
+        // An overwrite is dead-lettered by whichever forwarder receives it, so
+        // the count shows whether a write reached one at all. A user table that
+        // shares the runtime table's name is not the runtime table.
+        for unconfigured in [
+            TableReference::bare("orders"),
+            TableReference::bare("task_history"),
+        ] {
+            forwarders
+                .forward(
+                    &unconfigured,
+                    &UpdateType::Overwrite,
+                    None,
+                    &schema(),
+                    std::slice::from_ref(&batch),
+                )
+                .await;
+        }
+        let forwarder = forwarders
+            .by_table
+            .get(&table_ref("task_history"))
+            .expect("configured");
+        assert_eq!(
+            forwarder.queue.dead_lettered(),
+            0,
+            "a write to an unconfigured table must not reach a forwarder"
+        );
+
+        // The same write to the configured table does reach it.
         forwarders
             .forward(
-                &TableReference::bare("orders"),
-                &UpdateType::Append,
+                &table_ref("task_history"),
+                &UpdateType::Overwrite,
                 None,
                 &schema(),
-                &[],
+                std::slice::from_ref(&batch),
             )
             .await;
+        assert_eq!(forwarder.queue.dead_lettered(), 1);
     }
 
     /// An overwrite cannot be expressed as element changes, so it is counted as
@@ -485,43 +563,52 @@ mod tests {
     /// already committed these rows, so losing them here loses them for good.
     #[tokio::test]
     async fn a_full_queue_is_retained_rather_than_blocking_the_writer() {
-        let forwarders = InternalForwarders::try_new(&spec(vec![table("task_history")]))
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Arc::new(
+            DeadLetterStore::open(
+                dir.path().join("task_history"),
+                table_ref("task_history").to_string(),
+                crate::drasi::dead_letter::DEFAULT_MAX_BATCHES,
+            )
             .await
-            .expect("builds");
+            .expect("opens the dead-letter store"),
+        );
+        let forwarders = forwarders_for("task_history", Some(Arc::clone(&store)));
+        let batch = task_history_batch();
+        let constraints = Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![1])]);
+
+        // Twice the queue depth: the first half fills the queue, the rest must
+        // spill to the store. Drasi is unreachable, so a writer that waited on
+        // it would never get through the loop.
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            for _ in 0..(DEFAULT_QUEUE_DEPTH * 2) {
+                forwarders
+                    .forward(
+                        &table_ref("task_history"),
+                        &UpdateType::Append,
+                        Some(&constraints),
+                        &schema(),
+                        std::slice::from_ref(&batch),
+                    )
+                    .await;
+            }
+        })
+        .await
+        .expect("every write must hand off without waiting on the unreachable Drasi endpoint");
+
         let forwarder = forwarders
             .by_table
             .get(&table_ref("task_history"))
             .expect("configured");
-
-        // Fill the queue without letting the delivery task drain it. The task
-        // is parked on an unreachable endpoint, so nothing is consumed.
-        let batch = RecordBatch::try_new(
-            schema(),
-            vec![
-                Arc::new(arrow::array::StringArray::from(vec!["t"])),
-                Arc::new(arrow::array::StringArray::from(vec!["s"])),
-                Arc::new(arrow::array::StringArray::from(vec!["task"])),
-            ],
-        )
-        .expect("valid batch");
-        let constraints = Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![1])]);
-
-        for _ in 0..(DEFAULT_QUEUE_DEPTH * 2) {
-            forwarders
-                .forward(
-                    &table_ref("task_history"),
-                    &UpdateType::Append,
-                    Some(&constraints),
-                    &schema(),
-                    std::slice::from_ref(&batch),
-                )
-                .await;
-        }
-
-        // The assertion is that the loop above returned at all: every enqueue
-        // completed without waiting on Drasi, which is unreachable here. Where
-        // the overflow *went* is asserted directly, against an explicit store,
-        // by `queue::tests::a_full_queue_retains_overflow_in_the_store`.
-        let _ = forwarder;
+        assert_eq!(
+            forwarder.queue.dead_lettered(),
+            0,
+            "the runtime already committed these rows: overflow must be retained, not dropped"
+        );
+        assert_eq!(store.discarded(), 0, "the store must not discard any batch");
+        assert!(
+            !store.is_empty().await,
+            "the overflow must be held in the dead-letter store"
+        );
     }
 }

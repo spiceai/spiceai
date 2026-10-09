@@ -1,0 +1,16 @@
+# Standalone package: an empty workspace table keeps cargo from joining the
+# repo workspace, which pins `turso = 0.8.1` and would unify this generator
+# onto that version.
+[workspace]
+
+[package]
+name = "turso-072-fixture-gen"
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+publish = false
+description = "One-off generator: writes Turso 0.7.2 on-disk fixtures the 0.8.1 compat test opens"
+
+[dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "fs"] }
+turso = { version = "=0.7.2", default-features = false }

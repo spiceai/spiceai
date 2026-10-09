@@ -50,7 +50,6 @@ use crate::utils::{
 };
 use crate::{configure_test_datafusion, init_tracing};
 
-const PORT: u16 = 8040;
 const TABLE: &str = "pushdown_roundtrip";
 /// A table with items that unnesting reads `m.x.y` from by different paths.
 const COLLIDING: &str = "pushdown_roundtrip_colliding";
@@ -289,17 +288,18 @@ async fn create_table(client: &Client, table: &str) -> Result<(), anyhow::Error>
     Ok(())
 }
 
-fn dataset(name: &str, accelerated: bool) -> Dataset {
+fn dataset(port: u16, name: &str, accelerated: bool) -> Dataset {
     // Pin the types a sample of every item would otherwise widen.
     let columns = vec![
         Column::new("n").with_type("bigint"),
         Column::new("b").with_type("boolean"),
         Column::new("d").with_type("date"),
     ];
-    dataset_with(name, accelerated, &[], columns)
+    dataset_with(port, name, accelerated, &[], columns)
 }
 
 fn dataset_with(
+    port: u16,
     name: &str,
     accelerated: bool,
     params: &[(&str, &str)],
@@ -316,7 +316,7 @@ fn dataset_with(
         ("dynamodb_aws_auth".to_string(), "key".to_string()),
         (
             "endpoint_url".to_string(),
-            format!("http://localhost:{PORT}"),
+            format!("http://localhost:{port}"),
         ),
         // Sample every item, so the inferred types do not depend on scan order.
         ("schema_infer_max_records".to_string(), "100".to_string()),
@@ -329,6 +329,7 @@ fn dataset_with(
     if accelerated {
         dataset.acceleration = Some(Acceleration {
             enabled: true,
+            engine: Some("arrow".to_string()),
             ..Acceleration::default()
         });
     }
@@ -522,8 +523,9 @@ async fn dynamodb_pushdown_round_trips() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
-            let _container = start_dynamodb_docker_container(PORT).await?;
-            let client = get_client(PORT, "fake", "fake");
+            let container = start_dynamodb_docker_container().await?;
+            let port = container.host_port(8000)?;
+            let client = get_client(port, "fake", "fake");
             seed(&client).await?;
             seed_colliding(&client).await?;
 
@@ -532,17 +534,17 @@ async fn dynamodb_pushdown_round_trips() -> Result<(), anyhow::Error> {
             let micro_columns = || vec![Column::new("ts6").with_type("Timestamp(Millisecond)")];
             let unnested = [("unnest_depth", "2")];
             let shallow = [("unnest_depth", "1")];
-            let mut colliding = dataset_with("colliding", false, &unnested, Vec::new());
+            let mut colliding = dataset_with(port, "colliding", false, &unnested, Vec::new());
             colliding.from = format!("dynamodb:{COLLIDING}");
             let app = AppBuilder::new("dynamodb_pushdown_round_trips")
-                .with_dataset(dataset("federated", false))
-                .with_dataset(dataset("local", true))
-                .with_dataset(dataset_with("micro", false, &micro, micro_columns()))
-                .with_dataset(dataset_with("micro_local", true, &micro, micro_columns()))
-                .with_dataset(dataset_with("unnested", false, &unnested, Vec::new()))
-                .with_dataset(dataset_with("unnested_local", true, &unnested, Vec::new()))
-                .with_dataset(dataset_with("shallow", false, &shallow, Vec::new()))
-                .with_dataset(dataset_with("shallow_local", true, &shallow, Vec::new()))
+                .with_dataset(dataset(port, "federated", false))
+                .with_dataset(dataset(port, "local", true))
+                .with_dataset(dataset_with(port, "micro", false, &micro, micro_columns()))
+                .with_dataset(dataset_with(port, "micro_local", true, &micro, micro_columns()))
+                .with_dataset(dataset_with(port, "unnested", false, &unnested, Vec::new()))
+                .with_dataset(dataset_with(port, "unnested_local", true, &unnested, Vec::new()))
+                .with_dataset(dataset_with(port, "shallow", false, &shallow, Vec::new()))
+                .with_dataset(dataset_with(port, "shallow_local", true, &shallow, Vec::new()))
                 .with_dataset(colliding)
                 .with_sql_cache(SQLResultsCacheConfig {
                     enabled: false,

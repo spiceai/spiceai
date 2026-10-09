@@ -34,6 +34,9 @@ pub struct SuiteDefinition {
     pub version: String,
     #[serde(default)]
     pub description: String,
+    /// TPC-H scale factor of the suite's own CSVs and goldens.
+    #[serde(default)]
+    pub scale_factor: Option<f64>,
     #[serde(rename = "testCases", default)]
     pub test_cases: Vec<TestCaseDefinition>,
 }
@@ -62,6 +65,7 @@ pub struct LoadedSuite {
     pub name: String,
     pub version: String,
     pub description: String,
+    pub scale_factor: Option<f64>,
     pub root: PathBuf,
     pub cases: Vec<LoadedCase>,
 }
@@ -82,7 +86,10 @@ pub struct InputTable {
     pub csv_path: PathBuf,
 }
 
-pub fn load_tpch_suite(root: &Path) -> Result<LoadedSuite> {
+/// Load the suite at `root`. With `expected_dir`, every case's golden is
+/// `<expected_dir>/<id>.csv` and must exist; without it, the goldens are the
+/// suite's own (`expectedOutput`, else `expected/<id>.csv`, else SKIP).
+pub fn load_tpch_suite(root: &Path, expected_dir: Option<&Path>) -> Result<LoadedSuite> {
     let metadata_path = root.join("metadata.yaml");
     ensure_exists(&metadata_path, "metadata.yaml")?;
     let text = std::fs::read_to_string(&metadata_path).context(error::ReadFileSnafu {
@@ -102,7 +109,19 @@ pub fn load_tpch_suite(root: &Path) -> Result<LoadedSuite> {
         // A declared golden is required: a missing file must fail the load, not
         // turn the case into a SKIP that a report-only run would accept. Only
         // omitted metadata falls back to the conventional path, then to SKIP.
-        let expected = {
+        // An `--expected` directory has no metadata to omit, so it must cover
+        // every case.
+        let expected = if let Some(dir) = expected_dir {
+            let csv_path = dir.join(format!("{}.csv", tc.id));
+            ensure!(
+                csv_path.exists(),
+                error::MissingExpectedFileSnafu {
+                    test_id: &tc.id,
+                    path: csv_path,
+                }
+            );
+            Some(read_golden(&csv_path)?)
+        } else {
             let csv_path = match &tc.expected_output {
                 Some(rel) => {
                     let declared = root.join(rel);
@@ -118,10 +137,7 @@ pub fn load_tpch_suite(root: &Path) -> Result<LoadedSuite> {
                 None => root.join("expected").join(format!("{}.csv", tc.id)),
             };
             if csv_path.exists() {
-                let csv = std::fs::read_to_string(&csv_path).context(error::ReadFileSnafu {
-                    path: csv_path.clone(),
-                })?;
-                Some(parse_typed_csv(&csv).context(error::InvalidGoldenSnafu { path: csv_path })?)
+                Some(read_golden(&csv_path)?)
             } else {
                 None
             }
@@ -153,9 +169,15 @@ pub fn load_tpch_suite(root: &Path) -> Result<LoadedSuite> {
         name: def.name,
         version: def.version,
         description: def.description,
+        scale_factor: def.scale_factor,
         root: root.to_path_buf(),
         cases,
     })
+}
+
+fn read_golden(path: &Path) -> Result<TableData> {
+    let csv = std::fs::read_to_string(path).context(error::ReadFileSnafu { path })?;
+    parse_typed_csv(&csv).context(error::InvalidGoldenSnafu { path })
 }
 
 /// Cases matching `--query`, or the whole suite when it is omitted.
@@ -281,7 +303,7 @@ testCases:
     #[test]
     fn declared_missing_golden_is_a_load_error() {
         let dir = write_mini_suite_with("declared-missing", true, None);
-        let err = load_tpch_suite(&dir).expect_err("declared golden is missing");
+        let err = load_tpch_suite(&dir, None).expect_err("declared golden is missing");
         assert!(
             matches!(err, error::Error::MissingGolden { ref test_id, .. } if test_id == "q99"),
             "{err}"
@@ -355,18 +377,18 @@ testCases:
     #[test]
     fn omitted_expected_output_falls_back_then_skips() {
         let with_default = write_mini_suite_with("omitted-default", false, Some(b"n:integer\n1\n"));
-        let suite = load_tpch_suite(&with_default).expect("conventional golden");
+        let suite = load_tpch_suite(&with_default, None).expect("conventional golden");
         assert!(suite.cases[0].expected.is_some());
 
         let without = write_mini_suite_with("omitted-none", false, None);
-        let suite = load_tpch_suite(&without).expect("no golden declared or present");
+        let suite = load_tpch_suite(&without, None).expect("no golden declared or present");
         assert!(suite.cases[0].expected.is_none());
     }
 
     #[test]
     fn zero_byte_golden_is_a_load_error() {
         let dir = write_mini_suite("zero-byte", &[]);
-        let err = load_tpch_suite(&dir).expect_err("zero-byte golden must fail load");
+        let err = load_tpch_suite(&dir, None).expect_err("zero-byte golden must fail load");
         let msg = err.to_string();
         assert!(
             msg.contains("typed header"),
@@ -382,7 +404,7 @@ testCases:
     #[test]
     fn header_only_golden_loads_as_empty_typed_table() {
         let dir = write_mini_suite("header-only", b"flag:string|n:integer\n");
-        let suite = load_tpch_suite(&dir).expect("header-only golden must load");
+        let suite = load_tpch_suite(&dir, None).expect("header-only golden must load");
         let expected = suite.cases[0]
             .expected
             .as_ref()
@@ -392,5 +414,50 @@ testCases:
         assert_eq!(expected.columns[1].type_token, "integer");
         assert!(expected.rows.is_empty());
         std::fs::remove_dir_all(&dir).expect("cleanup mini suite");
+    }
+
+    /// An `--expected` directory replaces the suite's golden for every case,
+    /// declared or not.
+    #[test]
+    fn expected_dir_replaces_the_suite_golden() {
+        let dir = write_mini_suite("override", b"n:integer\n1\n");
+        let scaled = dir.join("sf1");
+        std::fs::create_dir_all(&scaled).expect("expected dir");
+        std::fs::write(scaled.join("q99.csv"), b"n:bigint\n6001215\n").expect("write golden");
+
+        let suite = load_tpch_suite(&dir, Some(&scaled)).expect("override loads");
+        let expected = suite.cases[0].expected.as_ref().expect("golden present");
+        assert_eq!(expected.columns[0].type_token, "bigint");
+        assert_eq!(expected.rows, vec![vec!["6001215".to_string()]]);
+        std::fs::remove_dir_all(&dir).expect("cleanup mini suite");
+    }
+
+    /// A case the `--expected` directory has no golden for fails the load
+    /// rather than falling back to the suite's golden or to SKIP.
+    #[test]
+    fn expected_dir_without_a_case_golden_is_a_load_error() {
+        let dir = write_mini_suite("override-missing", b"n:integer\n1\n");
+        let scaled = dir.join("sf1");
+        std::fs::create_dir_all(&scaled).expect("expected dir");
+
+        let err = load_tpch_suite(&dir, Some(&scaled)).expect_err("golden missing");
+        assert!(
+            matches!(err, error::Error::MissingExpectedFile { ref test_id, .. } if test_id == "q99"),
+            "{err}"
+        );
+        assert!(err.to_string().contains("q99.csv"), "{err}");
+        std::fs::remove_dir_all(&dir).expect("cleanup mini suite");
+    }
+
+    #[test]
+    fn metadata_scale_factor_is_read() {
+        let yaml = r#"
+name: "tpch"
+version: "1.0.0"
+scale_factor: 0.01
+testCases: []
+"#;
+        let def: SuiteDefinition = yaml::from_str(yaml).expect("parse metadata");
+        assert_eq!(def.scale_factor, Some(0.01));
     }
 }

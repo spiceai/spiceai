@@ -19,11 +19,15 @@ limitations under the License.
 //! Callers ask two different questions of a refresh:
 //!
 //! * *"has the initial load landed?"* — [`RefreshCompletion::any`], satisfied by
-//!   any refresh that has finished, including one that finished before the
-//!   caller asked.
+//!   a *successful* refresh that has finished, including one that finished
+//!   before the caller asked. A terminal (non-retrying) failure is a different
+//!   outcome: it ends the wait so warmup and the ready-hold are not stranded,
+//!   but it is not a successful load.
 //! * *"has the refresh I just triggered finished?"* — [`RefreshCompletion::next`],
 //!   satisfied only by the completion of a refresh *requested* after the waiter
-//!   was taken.
+//!   was taken. Success and terminal failure are reported separately so a
+//!   caller that treats completion as proof the table loaded does not proceed
+//!   on a failed one-shot refresh.
 //!
 //! The second question is why a refresh carries a [`RefreshRequestId`]. A
 //! refresh already in flight when the waiter was taken can finish a moment
@@ -69,8 +73,13 @@ struct CompletionState {
     /// "nothing requested yet" and doubles as the threshold a waiter for *any*
     /// completion is decided against.
     issued: RefreshRequestId,
-    /// Highest [`RefreshRequestId`] whose refresh has been recorded complete.
+    /// Highest [`RefreshRequestId`] whose refresh has been recorded complete
+    /// *successfully*. Terminal failures do not move this.
     completed: RefreshRequestId,
+    /// Highest [`RefreshRequestId`] whose refresh failed and will not be
+    /// retried. Distinct from `completed` so success waiters do not treat a
+    /// one-shot load failure as a loaded table.
+    failed: RefreshRequestId,
     /// Set once no further refresh can be recorded here, so a waiter taken
     /// afterwards resolves instead of blocking on one that cannot arrive.
     closed: bool,
@@ -98,6 +107,7 @@ impl RefreshCompletion {
             state: watch::Sender::new(CompletionState {
                 issued: 0,
                 completed: 0,
+                failed: 0,
                 closed: false,
             }),
         }
@@ -125,14 +135,28 @@ impl RefreshCompletion {
         id
     }
 
-    /// Records the refresh requested as `id` as complete, resolving every waiter
-    /// that was taken before `id` was issued.
+    /// Records the refresh requested as `id` as complete *successfully*,
+    /// resolving every waiter that was taken before `id` was issued as
+    /// [`RefreshCompletionOutcome::Answered`].
     pub fn record(&self, id: RefreshRequestId) {
         // `max` rather than assignment: completions arrive in request order
         // today, and a reordering must not walk the threshold backwards and
         // un-answer a waiter that has already been released.
         self.state
             .send_modify(|state| state.completed = state.completed.max(id));
+    }
+
+    /// Records that the refresh requested as `id` failed and will not be retried.
+    ///
+    /// Resolves waiters the same way [`Self::record`] does — so warmup and the
+    /// ready-hold are not stranded — but as
+    /// [`RefreshCompletionOutcome::TerminalFailure`], not
+    /// [`RefreshCompletionOutcome::Answered`]. Callers that treat a completion
+    /// as proof the table loaded (hot reload, `PartitionsLoaded`) must not
+    /// proceed.
+    pub fn record_terminal_failure(&self, id: RefreshRequestId) {
+        self.state
+            .send_modify(|state| state.failed = state.failed.max(id));
     }
 
     /// Records a completion for refresh work that no caller requested — the CDC
@@ -181,6 +205,43 @@ impl RefreshCompletion {
         self.waiter(true)
     }
 
+    /// Whether [`RefreshCompletion::any`] is already answered as a *successful*
+    /// completion: a refresh has been recorded since the table was built, or
+    /// the signal was closed because no refresh will run here.
+    ///
+    /// A terminal failure does not set this. Results-cache warmup uses
+    /// [`Self::has_terminal_failure`] for that case, and
+    /// [`Self::closed_without_a_refresh`] together with this for the cluster
+    /// scheduler: `close()` answers schedule-creation waiters, but it does not
+    /// mean distributed data is queryable.
+    #[must_use]
+    pub fn has_recorded(&self) -> bool {
+        let state = self.state.borrow();
+        state.closed || state.completed > 0
+    }
+
+    /// Whether a one-shot refresh failed and will not be retried.
+    ///
+    /// Warmup and the ready-hold settle on this so `/v1/ready` is not held
+    /// forever after a permanent load failure. It is not a successful
+    /// completion: [`Self::has_recorded`] stays false.
+    #[must_use]
+    pub fn has_terminal_failure(&self) -> bool {
+        self.state.borrow().failed > 0
+    }
+
+    /// The signal was closed and no refresh was recorded.
+    ///
+    /// A cluster scheduler closes completion because accelerated tables are
+    /// not refreshed locally. Warmup must wait for the distributed
+    /// dataset-ready / `PartitionsLoaded` path instead of treating this as
+    /// settled.
+    #[must_use]
+    pub fn closed_without_a_refresh(&self) -> bool {
+        let state = self.state.borrow();
+        state.closed && state.completed == 0
+    }
+
     /// The highest request id recorded complete so far.
     ///
     /// Test-only: it lets a test assert that the refresh it is holding open has
@@ -216,21 +277,23 @@ impl RefreshCompletion {
 }
 
 /// How a wait ended, so a caller that *acts* on a completion can tell a refresh
-/// that happened from one that never will.
+/// that happened from one that failed terminally and from one that never will.
 ///
-/// Both variants mean the caller should stop waiting; they differ in what it may
-/// do next. A caller merely gating on the initial load can proceed either way; a
-/// caller that treats the wait as proof a refresh landed — broadcasting
-/// readiness, creating a follow-on schedule — must not proceed on
-/// [`RefreshCompletionOutcome::Abandoned`].
+/// Every variant means the caller should stop waiting; they differ in what it
+/// may do next. A caller that treats the wait as proof a refresh landed —
+/// broadcasting readiness, creating a follow-on schedule, accepting a hot
+/// reload — must proceed only on [`RefreshCompletionOutcome::Answered`].
+/// [`RefreshCompletionOutcome::TerminalFailure`] releases warmup and the
+/// ready-hold without that proof. [`RefreshCompletionOutcome::Abandoned`]
+/// means no refresh ran and none can.
 ///
-/// `Answered` says the refresh this waiter was taken for completed — a `next`
-/// waiter is bound to its own request by [`RefreshRequestId`] — but not that the
-/// table it was taken from is still the live one. This type cannot answer that
-/// second question: it has no view of the registry. So a caller that acts on a
-/// completion re-resolves the table itself, capturing it before the wait and
-/// waiting via `DataFusion::await_refresh_completion`, which reports a removed or
-/// rebuilt table separately from an abandoned one.
+/// `Answered` says the refresh this waiter was taken for completed successfully
+/// — a `next` waiter is bound to its own request by [`RefreshRequestId`] — but
+/// not that the table it was taken from is still the live one. This type cannot
+/// answer that second question: it has no view of the registry. So a caller
+/// that acts on a completion re-resolves the table itself, capturing it before
+/// the wait and waiting via `DataFusion::await_refresh_completion`, which
+/// reports a removed or rebuilt table separately from an abandoned one.
 ///
 /// Deliberately not `#[must_use]`: most waits are taken by a caller that acts on
 /// nothing afterwards and only wants to block, and marking the type would make
@@ -238,9 +301,12 @@ impl RefreshCompletion {
 /// on a completion are the ones this enum exists for, and each of them reads it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RefreshCompletionOutcome {
-    /// The question the waiter was taken for was answered: a refresh was
-    /// recorded, or the signal was closed to say none will run here.
+    /// The question the waiter was taken for was answered: a refresh completed
+    /// successfully, or the signal was closed to say none will run here.
     Answered,
+    /// The refresh this waiter was taken for failed and will not be retried.
+    /// The table is not loaded; do not treat this as a successful completion.
+    TerminalFailure,
     /// Every [`RefreshCompletion`] was dropped before the question was answered,
     /// so no refresh ran and none can. The table the waiter was taken from is
     /// gone.
@@ -248,10 +314,16 @@ pub enum RefreshCompletionOutcome {
 }
 
 impl RefreshCompletionOutcome {
-    /// Whether a refresh completed, or was declared never to run here.
+    /// Whether a refresh completed successfully, or was declared never to run here.
     #[must_use]
     pub fn is_answered(self) -> bool {
         matches!(self, Self::Answered)
+    }
+
+    /// Whether the refresh failed and will not be retried.
+    #[must_use]
+    pub fn is_terminal_failure(self) -> bool {
+        matches!(self, Self::TerminalFailure)
     }
 
     /// Whether the wait ended only because every recorder was dropped.
@@ -274,21 +346,22 @@ impl RefreshCompletionWaiter {
     /// Waits for the completion this waiter was taken for, reporting whether one
     /// arrived.
     ///
-    /// Returns [`RefreshCompletionOutcome::Answered`] without waiting when the
-    /// question was already answered when the waiter was taken, and
-    /// [`RefreshCompletionOutcome::Abandoned`] when every recorder is dropped
-    /// before it could be. Blocking on the latter would strand the caller rather
-    /// than inform it, but it is not a completed refresh: the state is
-    /// re-examined before each wait, so a completion recorded before the last
-    /// recorder went still reads as `Answered`.
+    /// Returns [`RefreshCompletionOutcome::Answered`] without waiting when a
+    /// successful completion already answers the waiter,
+    /// [`RefreshCompletionOutcome::TerminalFailure`] when a one-shot failure
+    /// already does, and [`RefreshCompletionOutcome::Abandoned`] when every
+    /// recorder is dropped before either could be. Blocking on the latter would
+    /// strand the caller rather than inform it, but it is not a completed
+    /// refresh: the state is re-examined before each wait, so a completion
+    /// recorded before the last recorder went still reads as `Answered`.
     ///
-    /// The wait loops because not every transition answers this waiter — an
+    /// The wait loops because not every transition decides this waiter — an
     /// issue, or the completion of a refresh already running when the waiter was
     /// taken, both wake it without deciding it.
     pub async fn wait(mut self) -> RefreshCompletionOutcome {
         loop {
-            if self.is_answered() {
-                return RefreshCompletionOutcome::Answered;
+            if let Some(outcome) = self.decided_outcome() {
+                return outcome;
             }
             if self.receiver.changed().await.is_err() {
                 return RefreshCompletionOutcome::Abandoned;
@@ -296,10 +369,20 @@ impl RefreshCompletionWaiter {
         }
     }
 
-    /// Whether the current state answers the question this waiter was taken for.
-    fn is_answered(&self) -> bool {
+    /// The outcome the current state decides for this waiter, if any.
+    ///
+    /// A successful completion (or close) wins over a terminal failure when
+    /// both exceed the threshold, so a later success still answers an
+    /// earlier waiter the same way a later `record` does today.
+    fn decided_outcome(&self) -> Option<RefreshCompletionOutcome> {
         let state = *self.receiver.borrow();
-        state.closed || state.completed > self.threshold
+        if state.closed || state.completed > self.threshold {
+            Some(RefreshCompletionOutcome::Answered)
+        } else if state.failed > self.threshold {
+            Some(RefreshCompletionOutcome::TerminalFailure)
+        } else {
+            None
+        }
     }
 }
 
@@ -489,6 +572,66 @@ mod tests {
             .expect_err("no completion has been recorded, so there is nothing to observe");
     }
 
+    #[test]
+    fn has_recorded_is_false_until_a_completion_or_close() {
+        let completion = RefreshCompletion::new();
+        assert!(
+            !completion.has_recorded(),
+            "a new table has not completed a refresh"
+        );
+
+        record_one(&completion);
+        assert!(
+            completion.has_recorded(),
+            "a recorded refresh must answer the initial-load poll"
+        );
+
+        let closed = RefreshCompletion::new();
+        closed.close();
+        assert!(
+            closed.has_recorded(),
+            "closing is an answer that no refresh will run here"
+        );
+        assert!(
+            closed.closed_without_a_refresh(),
+            "close() without a recorded refresh is the scheduler signal"
+        );
+
+        let untriggered = RefreshCompletion::new();
+        untriggered.record_untriggered();
+        assert!(
+            untriggered.has_recorded(),
+            "an untriggered completion answers the initial-load poll without closing"
+        );
+        assert!(
+            !untriggered.closed_without_a_refresh(),
+            "record_untriggered is a recorded completion, not a scheduler close"
+        );
+
+        let recorded_then_closed = RefreshCompletion::new();
+        record_one(&recorded_then_closed);
+        recorded_then_closed.close();
+        assert!(
+            !recorded_then_closed.closed_without_a_refresh(),
+            "close after a recorded refresh is not the scheduler-without-refresh signal"
+        );
+
+        let failed = RefreshCompletion::new();
+        failed.record_terminal_failure(failed.issue());
+        assert!(
+            !failed.has_recorded(),
+            "a terminal failure is not a successful completion"
+        );
+        assert!(
+            failed.has_terminal_failure(),
+            "a one-shot failure must be visible to warmup"
+        );
+        assert!(
+            !failed.closed_without_a_refresh(),
+            "a terminal failure is not a scheduler close"
+        );
+    }
+
     /// A request that has been issued but not completed is not a completion, so
     /// it must not satisfy the initial-load question either.
     #[tokio::test]
@@ -667,5 +810,91 @@ mod tests {
             .await
             .expect("an id below the ceiling must still resolve its waiter");
         assert_eq!(outcome, RefreshCompletionOutcome::Answered);
+    }
+
+    #[tokio::test]
+    async fn a_terminal_failure_is_not_a_successful_completion() {
+        let completion = RefreshCompletion::new();
+        let waiter = completion.any();
+        completion.record_terminal_failure(completion.issue());
+
+        let outcome = timeout(SHORT, waiter.wait())
+            .await
+            .expect("a terminal failure must end the wait");
+        assert_eq!(outcome, RefreshCompletionOutcome::TerminalFailure);
+        assert!(
+            !outcome.is_answered(),
+            "hot reload must not accept a failed one-shot load"
+        );
+        assert!(
+            !completion.has_recorded(),
+            "success-only has_recorded stays false after a terminal failure"
+        );
+        assert!(completion.has_terminal_failure());
+    }
+
+    #[tokio::test]
+    async fn next_observes_a_terminal_failure_of_its_own_request() {
+        let completion = RefreshCompletion::new();
+        let waiter = completion.next();
+        completion.record_terminal_failure(completion.issue());
+
+        let outcome = timeout(SHORT, waiter.wait())
+            .await
+            .expect("a terminal failure must resolve the waiter that triggered it");
+        assert_eq!(outcome, RefreshCompletionOutcome::TerminalFailure);
+    }
+
+    #[tokio::test]
+    async fn a_later_success_answers_ahead_of_an_earlier_terminal_failure() {
+        let completion = RefreshCompletion::new();
+        let waiter = completion.any();
+        let failed = completion.issue();
+        let succeeded = completion.issue();
+        completion.record_terminal_failure(failed);
+        completion.record(succeeded);
+
+        let outcome = timeout(SHORT, waiter.wait())
+            .await
+            .expect("a later success must still answer an any() waiter");
+        assert_eq!(outcome, RefreshCompletionOutcome::Answered);
+        assert!(completion.has_recorded());
+        assert!(completion.has_terminal_failure());
+    }
+
+    /// The consumer model Copilot printed for a failed non-retrying refresh:
+    /// recording failure as `record()` made every success waiter proceed.
+    /// Terminal failure must settle warmup without those side effects.
+    #[tokio::test]
+    async fn failed_oneshot_refresh_does_not_look_like_success_to_consumers() {
+        let completion = RefreshCompletion::new();
+        // Partition path: take `next()` before the request is issued, the way
+        // `refresh_table` hands a waiter to `await_refresh_completion`.
+        let partition_waiter = completion.next();
+        let hot_reload_waiter = completion.any();
+        completion.record_terminal_failure(completion.issue());
+
+        let completion_recorded = completion.has_recorded();
+        let hot_reload_returns_ok = timeout(SHORT, hot_reload_waiter.wait())
+            .await
+            .expect("terminal failure ends the hot-reload wait")
+            .is_answered();
+        let partitions_loaded_broadcast = timeout(SHORT, partition_waiter.wait())
+            .await
+            .expect("terminal failure ends the partition wait")
+            .is_answered();
+        let warmup_settled = completion.has_terminal_failure();
+
+        eprintln!(
+            "failed_oneshot_refresh consumers: completion_recorded={completion_recorded} hot_reload_returns_ok={hot_reload_returns_ok} partitions_loaded_broadcast={partitions_loaded_broadcast} warmup_settled={warmup_settled}"
+        );
+
+        assert!(
+            !completion_recorded
+                && !hot_reload_returns_ok
+                && !partitions_loaded_broadcast
+                && warmup_settled,
+            "a one-shot failure must settle warmup without looking like success"
+        );
     }
 }

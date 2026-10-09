@@ -290,6 +290,14 @@ jobs:
       SIGNOFF_REMOTE_RUN: '1'
       SIGNOFF_ACTOR: ${{ github.actor }}
       SIGNOFF_DEBUG: '1'
+      # The `Sign off` step's budget, declared once here and read twice: as that
+      # step's `timeout-minutes`, and by scripts/signoff as its own deadline, so
+      # an expiry — which the runner enforces without signalling the script —
+      # is classified as one and publishes no verdict (#13843; the mechanism is
+      # at `budget_expired` in the script). Measured on this pool, passing
+      # sign-offs peak at 345 minutes, so this gives up only on a run that was
+      # within minutes of the ~360-minute job wall anyway.
+      SIGNOFF_STEP_BUDGET_MINUTES: '353'
 
     steps:
       - name: Check out branch/PR
@@ -472,10 +480,10 @@ jobs:
         # clean/pushed guards would otherwise refuse to run. The branch ref was
         # just checked out from origin, so HEAD is exactly the remote tip.
         run: .trusted-ci/signoff -f
-        # Measured on this pool, passing sign-offs peak at 345 minutes, so this
-        # gives up only on a run that was within minutes of the wall anyway —
-        # and gives up as a failed step, which the run after it can read.
-        timeout-minutes: 353
+        # Gives up as a failed step, which the steps after it can read. The
+        # number lives in SIGNOFF_STEP_BUDGET_MINUTES above so the script's
+        # deadline and this budget cannot drift apart.
+        timeout-minutes: ${{ fromJSON(env.SIGNOFF_STEP_BUDGET_MINUTES) }}
         env:
           RUSTC_WRAPPER: ${{ env.RUSTC_WRAPPER }}
           AWS_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
@@ -516,13 +524,17 @@ jobs:
         run: .trusted-ci/signoff correct-cancelled "" "${{ github.repository }}"
 
       # A run that does not reach a verdict — its budget expires, the runner dies —
-      # never gets back to scripts/signoff, so the `pending` status it posted outlives
-      # it. A run that evicted this one re-posts its own `pending` after checkout and
-      # setup (~25s), well after this step has run.
+      # posts no verdict of its own: the runner's death never gets back to
+      # scripts/signoff, and a budget expiry does get back to it (the runner reaps
+      # the step's `make` before the script, during `Complete job`) but is
+      # classified as signalled through SIGNOFF_STEP_BUDGET_MINUTES and publishes
+      # nothing. So the `pending` status the run posted outlives it. A run that
+      # evicted this one re-posts its own `pending` after checkout and setup
+      # (~25s), well after this step has run.
       #
       # `!cancelled()` partitions this against the cancellation handler above, along the
-      # grain of #12343's own design: `timeout-minutes: 353` makes budget expiry land here
-      # as a *failed step* rather than a cancellation, leaving this step the incomplete-run
+      # grain of #12343's own design: the `Sign off` step's `timeout-minutes` makes budget
+      # expiry land here as a *failed step* rather than a cancellation, leaving this step the incomplete-run
       # cases and the handler above the externally-cancelled ones.
       #
       # Neither handler writes a verdict, so the two agree on the end state rather than

@@ -448,6 +448,7 @@ impl DeletionSink for FileBasedDeletionSink {
     ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         // Acquire write lock to prevent racing with concurrent inserts or catalog refreshes.
         let _write_guard = self.write_lock.lock().await;
+        self.provider.ensure_publication_outcome_known()?;
         // Acquire the listing fence in write mode so new scan plan-builds
         // cannot resolve a file listing while we are physically unlinking
         // files. In-flight scans that already released their read fence

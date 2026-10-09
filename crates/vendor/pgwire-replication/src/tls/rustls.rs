@@ -76,12 +76,14 @@ pub enum MaybeTlsStream {
 
 impl MaybeTlsStream {
     /// Returns `true` if this is a TLS-encrypted stream.
+    #[must_use]
     #[inline]
     pub fn is_tls(&self) -> bool {
         matches!(self, MaybeTlsStream::Tls(_))
     }
 
     /// Returns `true` if this is a plain (unencrypted) stream.
+    #[must_use]
     #[inline]
     pub fn is_plain(&self) -> bool {
         matches!(self, MaybeTlsStream::Plain(_))
@@ -90,6 +92,7 @@ impl MaybeTlsStream {
     /// Returns a reference to the underlying `TcpStream`.
     ///
     /// For TLS streams, this returns the inner TCP stream.
+    #[must_use]
     pub fn get_ref(&self) -> &TcpStream {
         match self {
             MaybeTlsStream::Plain(s) => s,

@@ -14,6 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+mod completeness;
+pub use completeness::HttpFetchCompletion;
+
 use super::json_nest::{HttpJsonNesting, decompose_json_row};
 use crate::rate_limit::RateLimiter;
 use arrow::{
@@ -46,7 +49,7 @@ use reqwest::{
     Client,
     header::{CACHE_CONTROL, HeaderMap, HeaderName, HeaderValue},
 };
-use runtime_rate_control::{Permit, RateController};
+use runtime_rate_control::{Permit, RateController, RequestOutcome};
 use snafu::prelude::*;
 use std::collections::{HashSet, VecDeque, hash_map::DefaultHasher};
 use std::{
@@ -65,22 +68,18 @@ use util::{
 
 #[derive(Debug, Snafu)]
 pub enum Error {
-    #[snafu(display("HTTP request failed: {source}"))]
-    HttpRequest { source: reqwest::Error },
-
-    #[snafu(display("HTTP request failed with status code {status}"))]
-    HttpServerError { status: u16 },
+    /// Build with [`Error::http_request`].
+    #[snafu(display("HTTP request to {endpoint} failed: {source}"))]
+    HttpRequest {
+        endpoint: String,
+        source: reqwest::Error,
+    },
 
     #[snafu(display("HTTP client error ({status}): {message}"))]
     HttpClientError { status: u16, message: String },
 
     #[snafu(display("HTTP request was rate limited: {message}"))]
     RateLimited { message: String },
-
-    #[snafu(display(
-        "All {max_retries} retry attempts failed for HTTP request to {url}. Check network connectivity and endpoint availability."
-    ))]
-    AllRetriesFailed { max_retries: usize, url: String },
 
     #[snafu(display("Invalid URL: {source}"))]
     InvalidUrl { source: url::ParseError },
@@ -102,20 +101,184 @@ pub enum Error {
 
     #[snafu(display("Failed to decompose HTTP response row into declared columns: {source}"))]
     JsonNesting { source: super::json_nest::Error },
+
+    #[snafu(display(
+        "Failed to fetch {endpoint} for {dataset}: the origin answered {status}, so the request \
+        failed rather than becoming data. {} \
+        See: https://spiceai.org/docs/components/data-connectors/https",
+        error_response_remedy(*status)
+    ))]
+    ErrorResponse {
+        status: u16,
+        endpoint: String,
+        dataset: String,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, Error>;
 
-/// A retryable HTTP status retains its response so the final allowed attempt
-/// can supply its body and metadata after the retry budget is exhausted.
-enum RequestAttemptError {
-    Response {
-        // `reqwest::Response` alone is over clippy's `result_large_err` limit.
-        response: Box<reqwest::Response>,
-        attempt_started: Instant,
-        permit: Option<Permit>,
-    },
-    Failure(Error),
+/// The part of a *configured* endpoint that is safe to put in an error or a log line:
+/// scheme, host and port, and nothing else.
+///
+/// **Pass the dataset's `base_url`, never a built request URL.** Everything a query
+/// contributes to a request is out of bounds: `request_query_filters` puts a query's own
+/// values in the query string, and `build_request_url` appends a `request_path` the query
+/// chose — which `allowed_request_paths` admits by glob, so a wildcard allowlist lets a
+/// filter name any path under the endpoint.
+///
+/// **The path is dropped even though the operator wrote it**, because a path is a place
+/// credentials are routinely kept rather than a merely descriptive part of a URL: a
+/// webhook endpoint carries its whole secret there, and so do the "unguessable URL"
+/// designs several APIs use in place of a header. The reader of these messages is whoever
+/// ran the query, who need not be the operator who can see the spicepod, so the path is
+/// theirs to keep. Nothing is lost that the reader needs: every message built from this
+/// also names the dataset, which identifies the endpoint uniquely and is what an operator
+/// looks up to fix it.
+fn endpoint_label(url: &Url) -> String {
+    // `Origin::ascii_serialization` renders scheme, host and a non-default port and can
+    // carry nothing else — no path, query, fragment or userinfo — so the redaction is a
+    // property of the type rather than of remembering to clear each field.
+    url.origin().ascii_serialization()
+}
+
+/// The half of an [`Error::ErrorResponse`] message that tells the operator what to do.
+///
+/// It differs by status class because only client errors are selectable — see
+/// [`ErrorResponseAction`] for why. Offering `warn` for any other status would name a
+/// remedy that does not work.
+fn error_response_remedy(status: u16) -> &'static str {
+    if HttpTableProvider::is_retryable_status(status) {
+        "The origin did not recover after the configured retries, and a server error is never \
+         recorded as a row, so the dataset keeps its previous contents. Fix the origin, or raise \
+         `max_retries` if it recovers on its own."
+    } else if (300..400).contains(&status) {
+        "Only a client error can be recorded as a row, so the dataset keeps its previous \
+         contents. A `304` answers a conditional header such as `If-None-Match` sent through \
+         `http_headers` or a `request_headers` filter, and any other `3xx` is a redirect that \
+         was not followed: change the request."
+    } else if !HttpTableProvider::is_recordable_status(status) {
+        "Only a client error can be recorded as a row, so the dataset keeps its previous \
+         contents. Fix the origin or the request."
+    } else {
+        "`on_error_response` treats it as a failed request. Fix the origin, or set \
+         `on_error_response: warn` on this dataset to record the body as a row and log that a \
+         full refresh would replace the dataset's previous contents. `store` records it without \
+         the log line and is not recommended."
+    }
+}
+
+/// What the connector does with a response the origin did not mark as successful.
+///
+/// A non-2xx body is otherwise recorded as an ordinary row, and on a dataset with
+/// `refresh_mode: full` that row *replaces* the previously good contents — a transient
+/// origin failure substitutes error pages for data without the query result marking it
+/// (spiceai/spiceai#13515).
+///
+/// [`Warn`] and [`Store`] reach only client errors, a 4xx other than 429: the class
+/// whose body answers for the resource. Any other status outside 2xx fails the request
+/// whatever the action says. A `3xx` carries no content to record — a `304` answering
+/// a conditional request would replace the dataset with one empty row on a full
+/// refresh. A 5xx or 429 that outlives the retry ladder is a statement about the
+/// origin's health rather than about the resource (RFC 9110 S15.6) — the same line
+/// `cache::batches_cacheable` draws when it keeps a row carrying such a status out of
+/// the results cache. Because the status is refused
+/// before it becomes a row, a caller that keeps its previous result when the origin
+/// fails tells it apart from other failures with [`is_transient_origin_failure`].
+/// Without that scoping, the setting a dataset picks to keep a meaningful 404 working
+/// would also let an outage overwrite its contents (spiceai/spiceai#13578).
+///
+/// [`Warn`]: ErrorResponseAction::Warn
+/// [`Store`]: ErrorResponseAction::Store
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ErrorResponseAction {
+    /// Fail the request, so a refresh fails and the accelerated table keeps what it had.
+    #[default]
+    Error,
+    /// Record a client error's response (a 4xx other than 429) as a row, and warn that
+    /// it happened. Any other status still fails — see the type's documentation.
+    Warn,
+    /// Record a client error's response (a 4xx other than 429) as a row, silently. Any
+    /// other status still fails — see the type's documentation.
+    Store,
+}
+
+impl ErrorResponseAction {
+    /// The value that selects this variant in a dataset's `params`.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ErrorResponseAction::Error => "error",
+            ErrorResponseAction::Warn => "warn",
+            ErrorResponseAction::Store => "store",
+        }
+    }
+
+    /// Every action, in the order they are listed to the user. Holds the variants
+    /// rather than their spellings so the list and [`Self::as_str`] cannot disagree.
+    pub const VARIANTS: [Self; 3] = [Self::Error, Self::Warn, Self::Store];
+
+    /// The accepted values, joined for a message that has to list them.
+    #[must_use]
+    pub fn accepted_values() -> String {
+        Self::VARIANTS
+            .iter()
+            .map(|action| action.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    }
+}
+
+impl std::fmt::Display for ErrorResponseAction {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for ErrorResponseAction {
+    type Err = ();
+
+    fn from_str(s: &str) -> std::result::Result<Self, Self::Err> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "error" => Ok(ErrorResponseAction::Error),
+            "warn" => Ok(ErrorResponseAction::Warn),
+            "store" => Ok(ErrorResponseAction::Store),
+            _ => Err(()),
+        }
+    }
+}
+
+impl Error {
+    /// A transport failure on a request to `endpoint`. `reqwest::Error`'s `Display` appends
+    /// the full request URL, so it is stripped and only [`endpoint_label`] is named.
+    fn http_request(endpoint: &Url, source: reqwest::Error) -> Self {
+        Error::HttpRequest {
+            endpoint: endpoint_label(endpoint),
+            source: source.without_url(),
+        }
+    }
+}
+
+/// Whether `error`, or any error it was built from, is this connector refusing a status it
+/// retries (5xx/429) once its retries ran out: an origin that is down, rather than an
+/// answer about the resource.
+///
+/// The connector refuses such a status before it becomes a row (see
+/// [`ErrorResponseAction`]), so a caller that keeps its previous result when the origin
+/// fails sees it as an error rather than as a row carrying the status. This is how such a
+/// caller tells the two kinds of failure apart; the error may arrive wrapped in any number
+/// of `DataFusionError` layers.
+#[must_use]
+pub fn is_transient_origin_failure(error: &(dyn std::error::Error + 'static)) -> bool {
+    let mut current = Some(error);
+    while let Some(err) = current {
+        if let Some(Error::ErrorResponse { status, .. }) = err.downcast_ref::<Error>()
+            && HttpTableProvider::is_retryable_status(*status)
+        {
+            return true;
+        }
+        current = err.source();
+    }
+    false
 }
 
 impl From<Error> for DataFusionError {
@@ -125,25 +288,35 @@ impl From<Error> for DataFusionError {
             Error::HttpClientError { status, message } => {
                 DataFusionError::Plan(format!("HTTP client error ({status}): {message}"))
             }
-            // Server errors (5xx) are external errors
-            Error::HttpServerError { status } => DataFusionError::External(Box::new(
-                std::io::Error::other(format!("HTTP request failed with status code {status}")),
-            )),
-            // Retry exhaustion is an external error
-            Error::AllRetriesFailed { max_retries, url } => {
-                DataFusionError::External(Box::new(std::io::Error::other(format!(
-                    "All {max_retries} retry attempts failed for HTTP request to {url}. Check network connectivity and endpoint availability."
-                ))))
+            // The origin answered, and said the answer was not a success. Which
+            // DataFusionError this becomes decides whether a *refresh* retries it:
+            // `check_and_mark_retriable_error` wraps everything except `Plan`/`SQL`/
+            // `SchemaError` as retriable, so an `External` 404 would have one refresh
+            // invocation re-asking an origin that will keep saying no. The statuses worth
+            // re-asking are the ones the request ladder already retries, so both read the
+            // same predicate rather than two taxonomies that can drift apart.
+            //
+            // The retryable case keeps the typed error rather than its text, so a caller
+            // can still tell an origin that is down from any other failure once the error
+            // has been wrapped on its way out of the plan — see
+            // [`is_transient_origin_failure`].
+            Error::ErrorResponse { status, .. } => {
+                if HttpTableProvider::is_retryable_status(status) {
+                    DataFusionError::External(Box::new(err))
+                } else {
+                    DataFusionError::Plan(err.to_string())
+                }
             }
             Error::RateLimited { message } => DataFusionError::External(Box::new(
                 std::io::Error::other(format!("HTTP request was rate limited: {message}")),
             )),
             // All other errors are internal/external errors
-            Error::HttpRequest { source } => DataFusionError::External(Box::new(source)),
             Error::InvalidUrl { source } => DataFusionError::External(Box::new(source)),
             Error::Arrow { source } => DataFusionError::ArrowError(Box::new(source), None),
             Error::DataFusion { source } => source,
-            err @ Error::JsonNesting { .. } => DataFusionError::External(Box::new(err)),
+            err @ (Error::HttpRequest { .. } | Error::JsonNesting { .. }) => {
+                DataFusionError::External(Box::new(err))
+            }
             Error::FilterRejected { message } | Error::Configuration { message } => {
                 DataFusionError::Plan(message)
             }
@@ -661,6 +834,10 @@ pub struct HttpTableProvider {
     /// static columns plus a catch-all JSON column. Schema is replaced
     /// with the user-declared columns (all `Utf8`).
     json_nesting: Option<HttpJsonNesting>,
+    error_response_action: ErrorResponseAction,
+    /// The dataset this provider serves, for messages that have to name it. Absent when
+    /// the provider is built outside a dataset (tests, the optimizer's fixtures).
+    dataset_name: Option<String>,
 }
 
 impl std::fmt::Debug for HttpTableProvider {
@@ -670,6 +847,7 @@ impl std::fmt::Debug for HttpTableProvider {
             .field("file_format", &self.file_format)
             .field("acceleration_enabled", &self.acceleration_enabled)
             .field("pagination", &self.pagination)
+            .field("error_response_action", &self.error_response_action)
             .finish_non_exhaustive()
     }
 }
@@ -715,7 +893,48 @@ impl HttpTableProvider {
             rate_limiter: None,
             rate_controller: None,
             json_nesting: None,
+            error_response_action: ErrorResponseAction::default(),
+            dataset_name: None,
         }
+    }
+
+    /// Name the dataset this provider serves, so a failure can say which one it was.
+    /// Several datasets can share one endpoint with different request filters, so the
+    /// endpoint alone does not identify the failure for an operator.
+    #[must_use]
+    pub fn with_dataset_name(mut self, dataset_name: impl Into<String>) -> Self {
+        self.dataset_name = Some(dataset_name.into());
+        self
+    }
+
+    /// The error a response the origin did not mark successful becomes.
+    ///
+    /// One constructor so every refusal — the retry ladder, the accepting attempt, and
+    /// the zero-row guards in `HttpExec` — names the same endpoint and dataset.
+    fn error_response(&self, status: u16) -> Error {
+        Error::ErrorResponse {
+            status,
+            endpoint: endpoint_label(&self.base_url),
+            dataset: self.dataset_subject(),
+        }
+    }
+
+    /// How a message refers to the dataset: by name when there is one, and by a phrase
+    /// that still reads as a sentence when there is not.
+    fn dataset_subject(&self) -> String {
+        self.dataset_name.as_ref().map_or_else(
+            || "this dataset".to_string(),
+            |name| format!("dataset '{name}'"),
+        )
+    }
+
+    /// Set what a response the origin did not mark successful becomes: a failed
+    /// request, or, for a client error, a row (with or without a warning). See
+    /// [`ErrorResponseAction`].
+    #[must_use]
+    pub fn with_error_response_action(mut self, action: ErrorResponseAction) -> Self {
+        self.error_response_action = action;
+        self
     }
 
     /// Associates this provider with its registered `DataFusion` table.
@@ -1195,7 +1414,9 @@ impl HttpTableProvider {
             test_url
         };
 
-        tracing::debug!("Validating HTTP endpoint: {test_url}");
+        // The probe URL keeps the configured query string, so log only its origin.
+        let endpoint = endpoint_label(&test_url);
+        tracing::debug!("Validating HTTP endpoint: {endpoint}");
 
         let _rate_control_permit = self.acquire_rate_control_permit().await?;
 
@@ -1206,22 +1427,21 @@ impl HttpTableProvider {
                 let status = response.status();
                 if self.health_probe.is_some() {
                     tracing::debug!(
-                        "HTTP endpoint validation response using health probe: {test_url} (status: {status})"
+                        "HTTP endpoint validation response using health probe: {endpoint} (status: {status})"
                     );
                     // For custom health probe, require successful status (2xx)
                     if !status.is_success() {
                         return Err(Error::HttpClientError {
                             status: status.as_u16(),
                             message: format!(
-                                "Failed to validate HTTP endpoint {}: Health probe {} returned non-success status {status}. Ensure the health probe endpoint is accessible and returns a 2xx status code.",
-                                self.base_url,
+                                "Failed to validate HTTP endpoint {endpoint}: Health probe {} returned non-success status {status}. Ensure the health probe endpoint is accessible and returns a 2xx status code.",
                                 test_url.path()
                             ),
                         });
                     }
                 } else {
                     tracing::debug!(
-                        "HTTP endpoint validation response: {test_url} (status: {status}). Any status (including 404) is expected for the random probe path."
+                        "HTTP endpoint validation response: {endpoint} (status: {status}). Any status (including 404) is expected for the random probe path."
                     );
                     // Any response (including 404) means the endpoint is reachable
                 }
@@ -1229,7 +1449,7 @@ impl HttpTableProvider {
             }
             Err(e) => {
                 // Check the error type to provide more specific messages and just return the error
-                Err(Error::HttpRequest { source: e })
+                Err(Error::http_request(&self.base_url, e))
             }
         }
     }
@@ -1484,11 +1704,13 @@ impl HttpTableProvider {
             url.set_query(Some(q));
         }
 
-        let final_url = url.as_str().to_owned();
-        final_url
+        url.as_str()
             .parse::<Uri>()
             .map_err(|err| Error::FilterRejected {
-                message: format!("Constructed request URI '{final_url}' is invalid: {err}"),
+                message: format!(
+                    "Constructed request URI for {} is invalid: {err}",
+                    endpoint_label(&url)
+                ),
             })?;
 
         Ok(url)
@@ -1523,6 +1745,15 @@ impl HttpTableProvider {
         }
     }
 
+    /// Feed a request's outcome to the origin's rate limiter so an adaptive
+    /// controller can raise or lower the effective rate. A no-op for limiters
+    /// without adaptive control.
+    fn record_request_outcome(&self, outcome: RequestOutcome) {
+        if let Some(rate_controller) = &self.rate_controller {
+            rate_controller.record_outcome(outcome);
+        }
+    }
+
     async fn perform_request_with_retry(
         &self,
         url: Url,
@@ -1537,7 +1768,11 @@ impl HttpTableProvider {
         let request_headers_owned = request_headers.cloned();
         let path_owned = path_label.to_string();
 
-        let result = retry(retry_strategy, || {
+        // The ladder spends exactly the configured budget: no request follows the last
+        // attempt it allows. When that attempt ended on a 5xx/429, its error is the
+        // request's answer, because a retryable status is never recorded as a row under
+        // any `on_error_response` (see [`ErrorResponseAction`]).
+        retry(retry_strategy, || {
             let this = this.clone();
             let url = url_clone.clone();
             let body = body_owned.clone();
@@ -1549,30 +1784,7 @@ impl HttpTableProvider {
                     .await
             }
         })
-        .await;
-
-        match result {
-            Ok(fetch_result) => Ok(fetch_result),
-            Err(RequestAttemptError::Response {
-                response,
-                attempt_started,
-                permit: _rate_control_permit,
-            }) => {
-                let status_code = response.status().as_u16();
-                Self::extract_response(
-                    *response,
-                    status_code,
-                    path_label,
-                    attempt_started,
-                    self.auth.as_ref().map(|auth| auth.header_name()),
-                )
-                .await
-                .map_err(|e| match e {
-                    RetryError::Permanent(err) | RetryError::Transient { err, .. } => err,
-                })
-            }
-            Err(RequestAttemptError::Failure(err)) => Err(err),
-        }
+        .await
     }
 
     /// Returns true for HTTP status codes that should trigger retry with backoff.
@@ -1584,20 +1796,30 @@ impl HttpTableProvider {
         (500..600).contains(&status_code) || status_code == 429
     }
 
+    /// Whether `on_error_response: warn` or `store` may record a response with this
+    /// status as a row: a client error (4xx) this connector does not retry. Anything
+    /// else outside 2xx is refused under every action — see [`ErrorResponseAction`].
+    fn is_recordable_status(status_code: u16) -> bool {
+        (400..500).contains(&status_code) && !Self::is_retryable_status(status_code)
+    }
+
     /// Perform a single HTTP request without retry logic.
     ///
-    /// Retains a 5xx/429 response in the transient error for retry or final extraction.
+    /// A 5xx/429 is returned as a transient error, so the ladder retries it while its
+    /// budget lasts and answers with it once the budget is spent.
     async fn perform_single_request(
         &self,
         url: &Url,
         body: Option<&str>,
         request_headers: Option<&HeaderMap>,
         path_label: &str,
-    ) -> std::result::Result<HttpFetchResult, RetryError<RequestAttemptError>> {
-        let rate_control_permit = self
+    ) -> std::result::Result<HttpFetchResult, RetryError<Error>> {
+        // Held until the body below has been read, so a response still streaming counts
+        // against the rate controller's concurrency limit.
+        let _rate_control_permit = self
             .acquire_rate_control_permit()
             .await
-            .map_err(|err| RetryError::transient(RequestAttemptError::Failure(err)))?;
+            .map_err(RetryError::transient)?;
 
         // The freshness window is spent from the moment the origin generated the
         // response, so the round trip spends it too — waiting on the origin and
@@ -1635,47 +1857,90 @@ impl HttpTableProvider {
         }
 
         let response = request_builder.send().await.map_err(|e| {
-            tracing::debug!("HTTP request failed: {e}");
-            RetryError::transient(RequestAttemptError::Failure(Error::HttpRequest {
-                source: e,
-            }))
+            let err = Error::http_request(&self.base_url, e);
+            tracing::debug!("{err}");
+            // A timeout or connection error is a failure signal for adaptive
+            // rate control: the origin is unreachable or too slow, so admit
+            // fewer requests until it recovers.
+            self.record_request_outcome(RequestOutcome::Failure);
+            RetryError::transient(err)
         })?;
 
-        let status_code = response.status().as_u16();
+        let status = response.status();
+        let status_code = status.as_u16();
         let response_headers = response.headers().clone();
         self.update_rate_limiter_from_headers(&response_headers)
             .await;
-
-        if Self::is_retryable_status(status_code) {
-            tracing::debug!("HTTP retryable status ({status_code}), will retry");
-            return Err(RetryError::transient(RequestAttemptError::Response {
-                response: Box::new(response),
-                attempt_started,
-                permit: rate_control_permit,
-            }));
+        // Classify the response for adaptive rate control:
+        // - retryable (408/429/5xx): a failure signal — the origin is struggling,
+        //   so admit fewer requests until it recovers.
+        // - 2xx: a success — the origin served the request under load.
+        // - anything else (a non-retryable 4xx such as 401/403/404): discarded, not
+        //   recorded. The origin answered promptly, but the failure is a
+        //   client/auth/config condition that throttling cannot remediate, so it
+        //   must move the coefficient in neither direction.
+        if crate::resilient_http::status_is_retryable(status) {
+            self.record_request_outcome(RequestOutcome::Failure);
+        } else if status.is_success() {
+            self.record_request_outcome(RequestOutcome::Success);
         }
 
-        // 2xx, 3xx, 4xx: valid response; 4xx may be a business response.
-        Self::extract_response(
+        // 5xx/429: retry with backoff (transient server issue or rate limiting). The body
+        // is not read, on this attempt or on the last one the budget allows: a retryable
+        // status fails the request whatever `on_error_response` says, because it is an
+        // origin that is down rather than an answer about the resource, and recording one
+        // would let the setting a dataset picked to keep a 404 working overwrite its
+        // contents during an outage. See [`ErrorResponseAction`].
+        if Self::is_retryable_status(status_code) {
+            tracing::debug!("HTTP retryable status ({status_code}), will retry");
+            return Err(RetryError::transient(self.error_response(status_code)));
+        }
+
+        // A non-2xx that reaches here is a status this connector does not retry.
+        // `error_response_action` decides whether a client error's body is data — a 404
+        // "not found" can be a business fact for an API-shaped dataset. Any other status
+        // is refused under every action: a `3xx` (a `304` answering a conditional header,
+        // or a redirect that was not followed) carries no content to record. Anything that
+        // is not recorded has to answer here rather than downstream of the row: the row is
+        // what a full refresh writes over good data with.
+        let is_error_response = !(200..300).contains(&status_code);
+
+        if is_error_response
+            && (self.error_response_action == ErrorResponseAction::Error
+                || !Self::is_recordable_status(status_code))
+        {
+            // Permanent: asking again would get the same answer.
+            return Err(RetryError::Permanent(self.error_response(status_code)));
+        }
+
+        let fetched = Self::extract_response(
             response,
+            &self.base_url,
             status_code,
             path_label,
             attempt_started,
             self.auth.as_ref().map(|auth| auth.header_name()),
         )
-        .await
-        .map_err(|error| match error {
-            RetryError::Permanent(err) => RetryError::Permanent(RequestAttemptError::Failure(err)),
-            RetryError::Transient { err, retry_after } => RetryError::Transient {
-                err: RequestAttemptError::Failure(err),
-                retry_after,
-            },
-        })
+        .await?;
+
+        // Warned only once the body is in hand. `extract_response` treats a broken read as
+        // transient and the request is retried, so warning before it would claim a row on
+        // every attempt, including the ones that never produce one.
+        if is_error_response && self.error_response_action == ErrorResponseAction::Warn {
+            tracing::warn!(
+                "The request to {} for {} answered {status_code}. If that response body parses, it is recorded as a row, and on a full refresh that row replaces the dataset's previous contents. Set `on_error_response: error` to fail the request instead, so a refresh keeps what it had. See: https://spiceai.org/docs/components/data-connectors/https",
+                endpoint_label(&self.base_url),
+                self.dataset_subject()
+            );
+        }
+
+        Ok(fetched)
     }
 
     /// Extract content and metadata from an HTTP response.
     async fn extract_response(
         response: reqwest::Response,
+        endpoint: &Url,
         status_code: u16,
         path_label: &str,
         attempt_started: Instant,
@@ -1798,7 +2063,7 @@ impl HttpTableProvider {
         let content = response
             .text()
             .await
-            .map_err(|e| RetryError::transient(Error::HttpRequest { source: e }))?;
+            .map_err(|e| RetryError::transient(Error::http_request(endpoint, e)))?;
 
         let detected_format = if detected_format.is_empty() {
             let inferred = Self::infer_format_from_content(&content);
@@ -2086,9 +2351,22 @@ pub struct HttpExec {
     /// prunes `response_status` out of the batch before `cache::batches_cacheable`
     /// ever sees it.
     metrics: ExecutionPlanMetricsSet,
+    completion: Option<HttpFetchCompletion>,
 }
 
 impl HttpExec {
+    /// Clone a cache-owned source execution with a fresh completion token.
+    /// Execute each partition once; reuse invalidates this execution's token.
+    /// Request and response metadata are unchanged.
+    #[must_use]
+    pub fn for_cache_fetch(&self) -> (Self, HttpFetchCompletion) {
+        let completion = HttpFetchCompletion::new(self.partitions.len());
+        let mut plan = self.clone();
+        plan.completion = Some(completion.clone());
+        plan.metrics = ExecutionPlanMetricsSet::new();
+        (plan, completion)
+    }
+
     /// Returns the provider used by this exec.
     #[must_use]
     pub fn provider(&self) -> &Arc<HttpTableProvider> {
@@ -2140,6 +2418,7 @@ impl HttpExec {
             properties,
             deferred_partitions: false,
             metrics: ExecutionPlanMetricsSet::new(),
+            completion: None,
         }
     }
 
@@ -2337,9 +2616,7 @@ impl HttpExec {
                             .to_string(),
                     }
                 } else {
-                    Error::HttpServerError {
-                        status: fetch_result.response_status,
-                    }
+                    self.provider.error_response(fetch_result.response_status)
                 }
                 .into());
             }
@@ -2438,9 +2715,14 @@ impl HttpExec {
             "request_headers" => {
                 Ok(Arc::new(StringArray::from(vec![headers_for_batch; num_rows])) as ArrayRef)
             }
-            "content" => Ok(Arc::new(StringArray::from_iter_values(
-                content_rows.iter().map(String::as_str),
-            )) as ArrayRef),
+            "content" => {
+                let bytes = Self::content_byte_capacity(content_rows.iter().map(String::len))?;
+                let mut builder = StringBuilder::with_capacity(content_rows.len(), bytes);
+                for row in content_rows {
+                    builder.append_value(row);
+                }
+                Ok(Arc::new(builder.finish()) as ArrayRef)
+            }
             "response_status" => Ok(Arc::new(UInt16Array::from(vec![
                 fetch_result.response_status;
                 num_rows
@@ -2477,6 +2759,18 @@ impl HttpExec {
                 "Unsupported field name: {other}"
             ))),
         }
+    }
+
+    fn content_byte_capacity(mut lengths: impl Iterator<Item = usize>) -> DataFusionResult<usize> {
+        let bytes = lengths.try_fold(0usize, |bytes, length| {
+            bytes.checked_add(length).ok_or_else(|| {
+                DataFusionError::Execution("HTTP content byte length overflow".into())
+            })
+        })?;
+        i32::try_from(bytes).map_err(|_| {
+            DataFusionError::Execution("HTTP content exceeds Utf8's 32-bit offset capacity".into())
+        })?;
+        Ok(bytes)
     }
 
     /// Compute the per-batch `_fetched_at` timestamp in nanoseconds since
@@ -2742,6 +3036,17 @@ impl ExecutionPlan for HttpExec {
         &self.properties
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
@@ -2771,6 +3076,13 @@ impl ExecutionPlan for HttpExec {
         let exec = Arc::new(self.clone());
         let provider = Arc::clone(&self.provider);
         let schema = Arc::clone(&self.projected_schema);
+        let completion = self
+            .completion
+            .as_ref()
+            .map(|token| token.start(partition, self.limit.is_some()));
+        let progress = completion
+            .as_ref()
+            .map(completeness::CompletionGuard::progress);
 
         if provider.is_paginated() {
             let (path, query, body, request_headers) = self.partitions[partition].clone();
@@ -2794,6 +3106,7 @@ impl ExecutionPlan for HttpExec {
             let stream = futures::stream::try_unfold(initial_state, move |mut state| {
                 let exec = Arc::clone(&exec);
                 let provider = Arc::clone(&provider);
+                let progress = progress.clone();
 
                 async move {
                     loop {
@@ -2808,6 +3121,9 @@ impl ExecutionPlan for HttpExec {
                         if let Some(max_pages) = config.max_pages
                             && state.page >= max_pages
                         {
+                            if let Some(progress) = &progress {
+                                progress.truncated();
+                            }
                             tracing::warn!(
                                 "HTTP pagination reached the configured safety limit of {} pages. Increase `pagination_max_pages` to fetch additional pages.",
                                 max_pages
@@ -2859,6 +3175,9 @@ impl ExecutionPlan for HttpExec {
                                 .await
                                 .map_err(DataFusionError::from)?
                         } else {
+                            if let Some(progress) = &progress {
+                                progress.followed_page();
+                            }
                             let parsed_request_headers = state
                                 .request_headers
                                 .as_deref()
@@ -3046,9 +3365,7 @@ impl ExecutionPlan for HttpExec {
                                             .to_string(),
                                     }
                                 } else {
-                                    Error::HttpServerError {
-                                        status: fetch_result.response_status,
-                                    }
+                                    exec.provider.error_response(fetch_result.response_status)
                                 }
                                 .into());
                             }
@@ -3069,6 +3386,9 @@ impl ExecutionPlan for HttpExec {
                         )?;
 
                         if HttpTableProvider::is_retryable_status(fetch_result.response_status) {
+                            if let Some(progress) = &progress {
+                                progress.failed();
+                            }
                             MetricBuilder::new(&exec.metrics)
                                 .counter(crate::HTTP_TRANSIENT_FAILURE_METRIC_NAME, partition)
                                 .add(1);
@@ -3089,12 +3409,22 @@ impl ExecutionPlan for HttpExec {
             });
 
             let stream_adapter = RecordBatchStreamAdapter::new(schema, stream);
-            Ok(Box::pin(stream_adapter))
+            Ok(completeness::track(Box::pin(stream_adapter), completion))
         } else {
             // Non-paginated: single fetch
             let stream = futures::stream::once(async move {
                 tracing::trace!("Fetching partition {}", partition);
                 let batch = exec.fetch_and_create_batch(&provider, partition).await?;
+                if batch
+                    .schema()
+                    .metadata()
+                    .get(crate::HTTP_RESPONSE_STATUS_METADATA_KEY)
+                    .and_then(|status| status.parse::<u16>().ok())
+                    .is_some_and(HttpTableProvider::is_retryable_status)
+                    && let Some(progress) = &progress
+                {
+                    progress.failed();
+                }
                 tracing::trace!(
                     "Yielding batch for partition {}: {} rows",
                     partition,
@@ -3104,7 +3434,7 @@ impl ExecutionPlan for HttpExec {
             });
 
             let stream_adapter = RecordBatchStreamAdapter::new(schema, stream);
-            Ok(Box::pin(stream_adapter))
+            Ok(completeness::track(Box::pin(stream_adapter), completion))
         }
     }
 }
@@ -3175,8 +3505,8 @@ fn resolve_and_validate_url(raw: &str, base_url: &Url, context: &str) -> Result<
         return Err(Error::Pagination {
             message: format!(
                 "{context} URL origin '{}' does not match base URL origin '{}'. The next page URL must stay on the same origin.",
-                resolved.origin().ascii_serialization(),
-                base_url.origin().ascii_serialization(),
+                endpoint_label(&resolved),
+                endpoint_label(base_url),
             ),
         });
     }
@@ -3743,6 +4073,59 @@ impl HttpTableProvider {
         Ok(())
     }
 
+    /// The values `filters` make this connector send for the request column
+    /// `column` (`request_path`, `request_query` or `request_body`), in filter
+    /// order. None means the request goes without one: the dataset's own path
+    /// and query, and a GET rather than a POST.
+    ///
+    /// Follows the shapes `extract_filter_values` records a value from —
+    /// `<column> = '<literal>'` and `<column> IN (<literals>)`, under any
+    /// nesting of `AND`/`OR` — so a cache keyed on stored request values can
+    /// tell which request a lookup will make. Other predicates (`<>`, `LIKE`,
+    /// a literal on the left) record nothing.
+    #[must_use]
+    pub fn request_filter_values<'a>(filters: &'a [Expr], column: &str) -> Vec<&'a str> {
+        fn walk<'a>(expr: &'a Expr, name: &str, values: &mut Vec<&'a str>) {
+            match expr {
+                Expr::BinaryExpr(BinaryExpr { left, op, right }) => match op {
+                    Operator::Eq => {
+                        if let (
+                            Expr::Column(column),
+                            Expr::Literal(ScalarValue::Utf8(Some(value)), _),
+                        ) = (left.as_ref(), right.as_ref())
+                            && column.name == name
+                        {
+                            values.push(value);
+                        }
+                    }
+                    Operator::And | Operator::Or => {
+                        walk(left, name, values);
+                        walk(right, name, values);
+                    }
+                    _ => {}
+                },
+                Expr::InList(in_list) => {
+                    if let Expr::Column(column) = in_list.expr.as_ref()
+                        && column.name == name
+                    {
+                        values.extend(in_list.list.iter().filter_map(|item| match item {
+                            Expr::Literal(ScalarValue::Utf8(Some(value)), _) => {
+                                Some(value.as_str())
+                            }
+                            _ => None,
+                        }));
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut values = Vec::new();
+        for filter in filters {
+            walk(filter, column, &mut values);
+        }
+        values
+    }
+
     /// Check if a filter expression can be pushed down to HTTP requests
     /// Note: This returns true if the filter is on `request_path`, `request_query`, `request_body`, or `request_headers` columns.
     /// Actual validation (whether the feature is enabled/configured) happens in `extract_partitions` with user-friendly errors.
@@ -4147,14 +4530,41 @@ mod response_cache_tests {
         );
     }
 
+    /// The positive control for `an_entry_past_its_window_is_not_served`: inside
+    /// its window an entry is served, and it is the entry stored under that key.
     #[tokio::test]
     async fn a_fresh_entry_is_served() {
         let cache = build_response_cache(1024 * 1024);
         cache
             .insert(key(1), entry(4096, Duration::from_mins(5)))
             .await;
+        cache
+            .insert(key(2), entry(1024, Duration::from_mins(5)))
+            .await;
         settle(&cache).await;
-        assert!(cache.get(&key(1)).await.is_some());
+
+        let served = cache
+            .get(&key(1))
+            .await
+            .expect("an entry inside its retention window must be served");
+        assert_eq!(
+            *served.content,
+            "x".repeat(4096),
+            "the body stored under the key"
+        );
+        assert_eq!(served.response_status, 200);
+        assert_eq!(served.max_age, Duration::from_mins(5));
+        assert_eq!(served.detected_format.as_deref(), Some("json"));
+
+        let other = cache
+            .get(&key(2))
+            .await
+            .expect("a second fresh entry must be served too");
+        assert_eq!(
+            *other.content,
+            "x".repeat(1024),
+            "each key serves its own entry"
+        );
     }
 
     /// The invariant the admission path exists to hold: a response the origin
@@ -4893,21 +5303,33 @@ mod response_cache_tests {
 
     /// An error body is not served back from the cache afterwards.
     ///
-    /// A 5xx that outlives its retries is accepted as content rather than
-    /// raised — a choice of the fetch path, not of this cache — so what keeps it
-    /// out is that the origin never marked it retainable. Worth pinning because
-    /// retaining an outage response would serve it for the whole of its window,
-    /// long after the origin recovered.
+    /// What keeps an error body out of the cache is that the origin never marked it
+    /// retainable — not that the fetch refused it. Worth pinning because retaining one
+    /// would serve it for the whole of its window, long after the origin recovered.
+    ///
+    /// A 404 under `store` is the status that still reaches admission: it is content by
+    /// the dataset's own choice, so the assertion below is about this cache rather than
+    /// about the fetch path. A 500 would not do — it is refused before a body exists
+    /// (see [`crate::http::provider::ErrorResponseAction`]), which would leave the cache
+    /// empty however broken admission was.
     #[tokio::test]
     async fn an_unmarked_error_body_is_not_retained() {
         let origin = MockServer::start().await;
         Mock::given(method("GET"))
-            .respond_with(ResponseTemplate::new(500).set_body_string("upstream unavailable"))
+            .respond_with(ResponseTemplate::new(404).set_body_string("no such report"))
             .mount(&origin)
             .await;
 
-        let provider = provider_for(&origin);
-        let _ = provider.get_response("/report", None, None, None).await;
+        let provider = provider_for(&origin)
+            .with_error_response_action(crate::http::provider::ErrorResponseAction::Store);
+        let fetched = provider
+            .get_response("/report", None, None, None)
+            .await
+            .expect("`store` must answer a 404 with its body, or this asserts nothing");
+        assert_eq!(
+            fetched.response_status, 404,
+            "the body under test has to be the error response itself"
+        );
 
         settle(&provider.cache).await;
         assert_eq!(
@@ -4951,9 +5373,22 @@ mod response_cache_tests {
     /// `a_cacheable_response_is_admitted_and_then_served_without_the_origin`.
     #[test]
     fn an_ordinary_entry_is_chargeable() {
-        assert!(
-            entry_weight(&key(1), &entry(4096, Duration::from_mins(5))).is_some(),
-            "an ordinary response must be chargeable, or nothing would ever be cached"
+        let weigh = |body_bytes: usize| {
+            entry_weight(&key(1), &entry(body_bytes, Duration::from_mins(5)))
+                .expect("an ordinary response must be chargeable, or nothing would ever be cached")
+        };
+        // `"x".repeat(n)` allocates exactly `n` bytes of capacity, so two entries
+        // that differ only in body size must be charged exactly that difference.
+        // Undercharging the body is how a byte budget silently stops binding.
+        assert_eq!(
+            weigh(8192) - weigh(4096),
+            4096,
+            "every byte of the body must be billed"
+        );
+        assert_eq!(
+            weigh(4096) - weigh(0),
+            4096,
+            "a body is charged its bytes on top of the entry's fixed overhead"
         );
     }
 
@@ -5114,12 +5549,39 @@ mod response_cache_tests {
     /// small response on a request-keyed workload.
     #[tokio::test]
     async fn the_key_is_weighed_alongside_the_response() {
-        let cache = build_response_cache(1024 * 1024);
-        cache.insert(key(1), entry(0, Duration::from_mins(5))).await;
-        settle(&cache).await;
-        assert!(
-            cache.weighted_size() > 0,
-            "an empty response still costs its key"
+        // Two keys that differ only in a query 1000 bytes longer. `repeat`
+        // allocates exactly the requested capacity, so the key accounts differ by
+        // exactly those bytes and everything else about the entries is equal.
+        let key_with_query = |query: String| CacheKey {
+            path: "/v1/messages".to_string(),
+            query: Some(query),
+            body: None,
+            request_headers: None,
+        };
+
+        let short = build_response_cache(1024 * 1024);
+        short
+            .insert(
+                key_with_query("q".repeat(10)),
+                entry(0, Duration::from_mins(5)),
+            )
+            .await;
+        settle(&short).await;
+
+        let long = build_response_cache(1024 * 1024);
+        long.insert(
+            key_with_query("q".repeat(1010)),
+            entry(0, Duration::from_mins(5)),
+        )
+        .await;
+        settle(&long).await;
+
+        assert_eq!(short.entry_count(), 1, "the short-keyed entry is admitted");
+        assert_eq!(long.entry_count(), 1, "the long-keyed entry is admitted");
+        assert_eq!(
+            long.weighted_size(),
+            short.weighted_size() + 1000,
+            "every byte the key holds must be charged against the budget"
         );
     }
 }
@@ -5144,6 +5606,8 @@ mod tests {
         net::TcpListener,
     };
     use url::Url;
+    use wiremock::matchers::{method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[derive(Debug)]
     struct TestAuthenticator;
@@ -5311,7 +5775,7 @@ mod tests {
             else {
                 panic!("connection refusal should fail");
             };
-            assert!(matches!(error, Error::HttpRequest { source } if source.is_connect()));
+            assert!(matches!(error, Error::HttpRequest { source, .. } if source.is_connect()));
             assert_eq!(permits.permits_acquired_total(), budget as u64 + 1);
         }
 
@@ -5324,43 +5788,117 @@ mod tests {
         else {
             panic!("timed out origin should fail");
         };
-        assert!(matches!(error, Error::HttpRequest { source } if source.is_timeout()));
+        assert!(matches!(error, Error::HttpRequest { source, .. } if source.is_timeout()));
         assert_eq!(requests.load(Ordering::SeqCst), 1);
         assert_eq!(permits.permits_acquired_total(), 1);
         server.abort();
     }
 
+    /// A transport failure names the endpoint's origin and nothing a URL can carry a
+    /// secret in: userinfo, path or query (regression test for #13534).
     #[tokio::test]
-    async fn http_retry_budget_keeps_last_allowed_response() {
-        for status in [429, 500, 503] {
-            for budget in [0, 2] {
-                let replies = (0..=budget)
-                    .map(|i| (status, format!("{{\"attempt\":{i}}}")))
-                    .collect::<Vec<_>>();
-                // The server replies with a distinct body on every request, including an
-                // unexpected extra attempt beyond the configured budget.
-                let (url, requests, server) = retry_test_server(replies, Duration::ZERO).await;
-                let (provider, permits) =
-                    retry_test_provider(url.clone(), budget, Duration::from_secs(3));
-                let result = provider
-                    .perform_request_with_retry(url, None, None, "/lookup")
-                    .await
-                    .expect("final error response is data");
-                assert_eq!(result.response_status, status);
-                assert_eq!(result.content, format!("{{\"attempt\":{budget}}}"));
-                assert!(
-                    result
-                        .response_headers
-                        .iter()
-                        .any(|(name, value)| name == "x-reply" && value == &budget.to_string())
-                );
-                assert_eq!(requests.load(Ordering::SeqCst), budget + 1);
-                assert_eq!(permits.permits_acquired_total(), (budget + 1) as u64);
-                server.abort();
+    async fn http_transport_failure_does_not_render_request_url() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind refusal socket");
+        let addr = listener.local_addr().expect("socket address");
+        drop(listener);
+        let url = Url::parse(&format!(
+            "http://user:pass-secret@{addr}/path-secret?api_key=query-secret"
+        ))
+        .expect("valid URL");
+        let origin = format!("http://{addr}");
+        let (provider, _) = retry_test_provider(url.clone(), 0, Duration::from_secs(2));
+
+        let Err(send_error) = provider
+            .perform_request_with_retry(url, None, None, "/path-secret")
+            .await
+        else {
+            panic!("connection refusal should fail");
+        };
+        let validate_error = provider
+            .validate_endpoint()
+            .await
+            .expect_err("connection refusal should fail validation");
+
+        for error in [send_error, validate_error] {
+            assert!(matches!(&error, Error::HttpRequest { source, .. } if source.is_connect()));
+            let rendered = [error.to_string(), DataFusionError::from(error).to_string()];
+            for message in rendered {
+                assert_names_only_origin(&message, &origin);
             }
         }
     }
 
+    /// A health probe that answers non-2xx names the endpoint's origin, not the configured
+    /// URL with its userinfo and query (regression test for #13534).
+    #[tokio::test]
+    async fn http_health_probe_failure_does_not_render_configured_url() {
+        let (mut url, _, server) =
+            retry_test_server(vec![(404, String::new())], Duration::ZERO).await;
+        let origin = endpoint_label(&url);
+        url.set_username("user").expect("set username");
+        url.set_password(Some("pass-secret")).expect("set password");
+        url.set_path("/path-secret");
+        url.set_query(Some("api_key=query-secret"));
+        let (provider, _) = retry_test_provider(url, 0, Duration::from_secs(2));
+        let provider = provider
+            .with_health_probe(Some("/health".to_string()))
+            .expect("valid health probe");
+
+        let error = provider
+            .validate_endpoint()
+            .await
+            .expect_err("a 404 health probe should fail validation");
+        assert_names_only_origin(&error.to_string(), &origin);
+        server.abort();
+    }
+
+    fn assert_names_only_origin(message: &str, origin: &str) {
+        assert!(message.contains(origin), "names the origin: {message}");
+        for secret in ["pass-secret", "path-secret", "query-secret", "user:"] {
+            assert!(!message.contains(secret), "leaks {secret}: {message}");
+        }
+    }
+
+    /// The ladder spends exactly the configured budget, and a retryable status that
+    /// outlives it fails the request under every `on_error_response`: a 5xx or 429 is
+    /// never recorded as a row, so its last body is not read either.
+    #[tokio::test]
+    async fn http_retry_budget_refuses_the_last_retryable_status() {
+        for action in ErrorResponseAction::VARIANTS {
+            for status in [429, 500, 503] {
+                for budget in [0, 2] {
+                    // One reply past the budget, so an extra attempt would be answered
+                    // rather than hang, and would show in the request count.
+                    let replies = (0..=budget + 1)
+                        .map(|i| (status, format!("{{\"attempt\":{i}}}")))
+                        .collect::<Vec<_>>();
+                    let (url, requests, server) = retry_test_server(replies, Duration::ZERO).await;
+                    let (provider, permits) =
+                        retry_test_provider(url.clone(), budget, Duration::from_secs(3));
+                    let provider = provider.with_error_response_action(action);
+                    let Err(error) = provider
+                        .perform_request_with_retry(url, None, None, "/lookup")
+                        .await
+                    else {
+                        panic!("{status} under `{action}` must fail the request");
+                    };
+                    assert!(
+                        matches!(error, Error::ErrorResponse { status: refused, .. } if refused == status),
+                        "{status} under `{action}`: {error}"
+                    );
+                    assert_eq!(requests.load(Ordering::SeqCst), budget + 1);
+                    assert_eq!(permits.permits_acquired_total(), (budget + 1) as u64);
+                    server.abort();
+                }
+            }
+        }
+    }
+
+    /// A body that is recorded as a row is read under the rate-control permit, so a
+    /// response still streaming counts against the concurrency limit. A 404 under
+    /// `store` is the non-2xx case whose body is read.
     #[tokio::test]
     async fn http_retry_budget_holds_permit_until_final_body_is_read() {
         let listener = TcpListener::bind("127.0.0.1:0")
@@ -5379,9 +5917,9 @@ mod tests {
             let mut buffer = [0; 4096];
             let bytes_read = stream.read(&mut buffer).await.expect("read request");
             assert_ne!(bytes_read, 0, "request must contain bytes");
-            let body = "{\"error\":\"final-response\"}";
+            let body = "{\"message\":\"final-response\"}";
             let headers = format!(
-                "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
                 body.len()
             );
             stream
@@ -5415,7 +5953,8 @@ mod tests {
             .expect("streaming test client");
         let provider = HttpTableProvider::new(url.clone(), client, "json".to_string(), false)
             .with_rate_controller(Some(controller))
-            .with_max_retries(0);
+            .with_max_retries(0)
+            .with_error_response_action(ErrorResponseAction::Store);
         let second_provider = provider.clone();
         let second_url = url.clone();
         let request = tokio::spawn(async move {
@@ -5450,9 +5989,72 @@ mod tests {
             .await
             .expect("request task completed")
             .expect("final HTTP response retained");
-        assert_eq!(result.response_status, 503);
-        assert_eq!(result.content, "{\"error\":\"final-response\"}");
+        assert_eq!(result.response_status, 404);
+        assert_eq!(result.content, "{\"message\":\"final-response\"}");
         assert_eq!(metrics.inflight_permits(), 0);
+        server.await.expect("streaming origin finished");
+    }
+
+    /// A refused retryable status is answered from its status line: the request fails
+    /// without waiting for a body it will not record, and gives its permit back.
+    #[tokio::test]
+    async fn http_retry_budget_refuses_a_retryable_status_without_reading_its_body() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind streaming origin");
+        let url = Url::parse(&format!(
+            "http://{}/lookup",
+            listener.local_addr().expect("streaming origin address")
+        ))
+        .expect("valid URL");
+        let (release_body, body_ready) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("accept request");
+            let mut buffer = [0; 4096];
+            let bytes_read = stream.read(&mut buffer).await.expect("read request");
+            assert_ne!(bytes_read, 0, "request must contain bytes");
+            let body = "{\"error\":\"unavailable\"}";
+            let headers = format!(
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                body.len()
+            );
+            stream
+                .write_all(headers.as_bytes())
+                .await
+                .expect("write response headers");
+            // The body is withheld until the request has already answered.
+            let _ = body_ready.await;
+            let _ = stream.write_all(body.as_bytes()).await;
+        });
+        let metrics = Arc::new(RateControllerMetrics::default());
+        let controller = RateControllerBuilder::new()
+            .with_metrics(Arc::clone(&metrics))
+            .with_max_concurrent_requests(1)
+            .build();
+        let client = Client::builder()
+            .timeout(Duration::from_secs(3))
+            .build()
+            .expect("streaming test client");
+        let provider = HttpTableProvider::new(url.clone(), client, "json".to_string(), false)
+            .with_rate_controller(Some(controller))
+            .with_max_retries(0)
+            .with_error_response_action(ErrorResponseAction::Store);
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            provider.perform_request_with_retry(url, None, None, "/lookup"),
+        )
+        .await
+        .expect("the refusal must not wait for the withheld body");
+        let Err(error) = result else {
+            panic!("a 503 must fail the request even under `store`");
+        };
+        assert!(
+            matches!(error, Error::ErrorResponse { status: 503, .. }),
+            "{error}"
+        );
+        assert_eq!(metrics.permits_acquired_total(), 1);
+        assert_eq!(metrics.inflight_permits(), 0, "the permit is released");
+        let _ = release_body.send(());
         server.await.expect("streaming origin finished");
     }
 
@@ -5482,6 +6084,8 @@ mod tests {
             let (url, requests, server) = retry_test_server(replies, Duration::ZERO).await;
             let (provider, permits) =
                 retry_test_provider(url.clone(), budget, Duration::from_secs(3));
+            // `store`, so the 404 body is data and the case can assert what was read.
+            let provider = provider.with_error_response_action(ErrorResponseAction::Store);
             let result = provider
                 .perform_request_with_retry(url, None, None, "/lookup")
                 .await
@@ -5492,6 +6096,28 @@ mod tests {
             assert_eq!(permits.permits_acquired_total(), expected_attempts as u64);
             server.abort();
         }
+
+        // Under the default `error` the same 404 fails the request, still after one
+        // request: a status this connector does not retry is not asked again.
+        let (url, requests, server) = retry_test_server(
+            vec![(404, "{\"message\":\"missing\"}".to_string())],
+            Duration::ZERO,
+        )
+        .await;
+        let (provider, permits) = retry_test_provider(url.clone(), 2, Duration::from_secs(3));
+        let Err(error) = provider
+            .perform_request_with_retry(url, None, None, "/lookup")
+            .await
+        else {
+            panic!("a 404 under the default `on_error_response` must fail the request");
+        };
+        assert!(
+            matches!(error, Error::ErrorResponse { status: 404, .. }),
+            "{error}"
+        );
+        assert_eq!(requests.load(Ordering::SeqCst), 1);
+        assert_eq!(permits.permits_acquired_total(), 1);
+        server.abort();
     }
 
     /// Test helper: build the legacy all-Utf8 nesting schema that
@@ -5892,6 +6518,114 @@ mod tests {
                 assert!(message.contains("request_query_filters"));
             }
             other => panic!("Unexpected error: {other:?}"),
+        }
+    }
+
+    /// `request_filter_values` names exactly the bodies and queries the scan
+    /// sends: the distinct values `extract_partitions` produces, or none when
+    /// the request goes without one.
+    #[test]
+    fn request_filter_values_matches_extracted_partitions() {
+        use datafusion::prelude::{col, lit};
+        let provider = base_provider()
+            .with_allowed_paths(["/items"])
+            .expect("allowed path")
+            .enable_body_filters(1024)
+            .enable_query_filters(1024);
+        let body = || col("request_body");
+        let cases: Vec<(&str, Vec<Expr>, Vec<&str>)> = vec![
+            ("eq", vec![body().eq(lit("x"))], vec!["x"]),
+            ("eq empty", vec![body().eq(lit(""))], vec![""]),
+            (
+                "in list",
+                vec![body().in_list(vec![lit("a"), lit("")], false)],
+                vec!["a", ""],
+            ),
+            (
+                "or",
+                vec![body().eq(lit("a")).or(body().eq(lit("b")))],
+                vec!["a", "b"],
+            ),
+            (
+                "and with path",
+                vec![
+                    col("request_path")
+                        .eq(lit("/items"))
+                        .and(body().eq(lit("x"))),
+                ],
+                vec!["x"],
+            ),
+            ("not eq", vec![body().not_eq(lit("x"))], vec![]),
+            ("like", vec![body().like(lit("%x%"))], vec![]),
+            ("literal on the left", vec![lit("x").eq(body())], vec![]),
+            (
+                "path only",
+                vec![col("request_path").eq(lit("/items"))],
+                vec![],
+            ),
+            ("no filters", vec![], vec![]),
+        ];
+        for (name, filters, expected) in cases {
+            assert_eq!(
+                HttpTableProvider::request_filter_values(&filters, "request_body"),
+                expected,
+                "{name}"
+            );
+            let mut sent: Vec<Option<String>> = provider
+                .extract_partitions(&filters)
+                .expect("extract partitions")
+                .into_iter()
+                .map(|partition| partition.2)
+                .collect();
+            sent.dedup();
+            let expected_sent: Vec<Option<String>> = if expected.is_empty() {
+                vec![None]
+            } else {
+                expected
+                    .iter()
+                    .map(|value| Some((*value).to_string()))
+                    .collect()
+            };
+            assert_eq!(sent, expected_sent, "{name}: bodies the scan sends");
+        }
+
+        let query = || col("request_query");
+        let query_cases: Vec<(&str, Vec<Expr>, Vec<&str>)> = vec![
+            ("eq", vec![query().eq(lit("q=a"))], vec!["q=a"]),
+            (
+                "in list",
+                vec![query().in_list(vec![lit("q=a"), lit("q=b")], false)],
+                vec!["q=a", "q=b"],
+            ),
+            ("not eq", vec![query().not_eq(lit("q=a"))], vec![]),
+            (
+                "path only",
+                vec![col("request_path").eq(lit("/items"))],
+                vec![],
+            ),
+        ];
+        for (name, filters, expected) in query_cases {
+            assert_eq!(
+                HttpTableProvider::request_filter_values(&filters, "request_query"),
+                expected,
+                "query {name}"
+            );
+            let mut sent: Vec<Option<String>> = provider
+                .extract_partitions(&filters)
+                .expect("extract partitions")
+                .into_iter()
+                .map(|partition| partition.1)
+                .collect();
+            sent.dedup();
+            let expected_sent: Vec<Option<String>> = if expected.is_empty() {
+                vec![None]
+            } else {
+                expected
+                    .iter()
+                    .map(|value| Some((*value).to_string()))
+                    .collect()
+            };
+            assert_eq!(sent, expected_sent, "query {name}: queries the scan sends");
         }
     }
 
@@ -6597,52 +7331,151 @@ mod tests {
         assert_eq!(result, vec![TableProviderFilterPushDown::Inexact]);
     }
 
-    #[tokio::test]
-    #[ignore = "hits a live external API (api.tvmaze.com); not deterministic in CI — run with --ignored"]
-    async fn test_query_params_any_order_works() {
-        use datafusion::prelude::SessionContext;
+    // The SQL-level tests below stand a local `wiremock` origin in for the public
+    // JSON APIs whose shapes they model, serving fixed fixtures, so every row they
+    // assert is known exactly and they run deterministically without a network.
 
-        let url = Url::parse("https://api.tvmaze.com").expect("valid URL");
-        let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
-            .with_allowed_paths(vec!["/search/people".to_string()])
+    // Response fixtures as compact JSON with every object's keys in sorted order.
+    // The connector stores each JSON row compactly serialized, and sorted keys
+    // serialize identically whether or not `serde_json`'s `preserve_order`
+    // feature is unified into the build.
+    const POST_1: &str = r#"{"body":"quia et suscipit","id":1,"title":"sunt aut facere repellat provident","userId":1}"#;
+    const POST_2: &str =
+        r#"{"body":"est rerum tempore vitae","id":2,"title":"qui est esse","userId":1}"#;
+    const POST_3: &str = r#"{"body":"et iusto sed quo iure","id":3,"title":"ea molestias quasi exercitationem","userId":1}"#;
+    const SHOW_1: &str = r#"{"genres":["Drama","Science-Fiction","Thriller"],"id":1,"name":"Under the Dome","type":"Scripted"}"#;
+    const SHOW_2: &str = r#"{"genres":["Action","Crime","Science-Fiction"],"id":2,"name":"Person of Interest","type":"Scripted"}"#;
+    const SHOW_82: &str = r#"{"genres":["Adventure","Drama","Fantasy"],"id":82,"name":"Game of Thrones","type":"Scripted"}"#;
+
+    /// `compact` re-indented across lines, the way public JSON APIs commonly
+    /// serve it. Serving this and expecting `compact` back in `content` also
+    /// pins that each row is stored compactly serialized.
+    fn pretty_json(compact: &str) -> String {
+        let value: serde_json::Value =
+            serde_json::from_str(compact).expect("the fixture is valid JSON");
+        serde_json::to_string_pretty(&value).expect("the fixture re-serializes")
+    }
+
+    /// A reply carrying `body` with an `application/json` content type.
+    fn json_response(status: u16, body: String) -> ResponseTemplate {
+        ResponseTemplate::new(status).set_body_raw(body, "application/json")
+    }
+
+    /// An unaccelerated provider whose base URL is the mock origin's root.
+    fn origin_provider(origin: &MockServer) -> HttpTableProvider {
+        HttpTableProvider::new(
+            Url::parse(&origin.uri()).expect("the mock server's URI is a valid URL"),
+            Client::new(),
+            "json".to_string(),
+            false,
+        )
+    }
+
+    /// A session with `provider` registered as `table`.
+    fn http_session(
+        table: &str,
+        provider: HttpTableProvider,
+    ) -> datafusion::prelude::SessionContext {
+        let ctx = datafusion::prelude::SessionContext::new();
+        ctx.register_table(table, Arc::new(provider))
+            .expect("the HTTP table registers");
+        ctx
+    }
+
+    /// Runs `sql` and returns every row, each column rendered as text, in the
+    /// order the query returned them.
+    async fn sql_rows(ctx: &datafusion::prelude::SessionContext, sql: &str) -> Vec<Vec<String>> {
+        let batches = ctx
+            .sql(sql)
+            .await
+            .expect("the query plans")
+            .collect()
+            .await
+            .expect("the query executes");
+        let mut rows = Vec::new();
+        for batch in &batches {
+            for row in 0..batch.num_rows() {
+                rows.push(
+                    batch
+                        .columns()
+                        .iter()
+                        .map(|column| {
+                            arrow::util::display::array_value_to_string(column, row)
+                                .expect("the column renders as text")
+                        })
+                        .collect::<Vec<_>>(),
+                );
+            }
+        }
+        rows
+    }
+
+    fn row(values: &[&str]) -> Vec<String> {
+        values.iter().copied().map(String::from).collect()
+    }
+
+    /// A `request_query` filter is sent to the origin exactly as written, in
+    /// whichever order its parameters appear. Re-ordering it (say, sorting) would
+    /// still fetch the right body but stamp every row's `request_query` with a
+    /// value the query's own filter no longer matches, so every row would be
+    /// filtered out above the scan.
+    #[tokio::test]
+    async fn test_query_params_any_order_works() {
+        const LAUREN_1: &str = r#"{"person":{"id":1,"name":"Lauren Ambrose"},"score":9}"#;
+        const LAUREN_2: &str = r#"{"person":{"id":2,"name":"Lauren Graham"},"score":8}"#;
+        const MICHAEL: &str = r#"{"person":{"id":3,"name":"Michael Emerson"},"score":7}"#;
+
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/search/people"))
+            .and(query_param("q", "lauren"))
+            .and(query_param("page", "1"))
+            .respond_with(json_response(
+                200,
+                pretty_json(&format!("[{LAUREN_1},{LAUREN_2}]")),
+            ))
+            .expect(1)
+            .mount(&origin)
+            .await;
+        Mock::given(method("GET"))
+            .and(path("/search/people"))
+            .and(query_param("q", "michael"))
+            .and(query_param("page", "1"))
+            .respond_with(json_response(200, pretty_json(&format!("[{MICHAEL}]"))))
+            .expect(1)
+            .mount(&origin)
+            .await;
+
+        let provider = origin_provider(&origin)
+            .with_allowed_paths(["/search/people"])
             .expect("allowed paths")
             .enable_query_filters(128);
+        let ctx = http_session("tvmaze", provider);
 
-        let ctx = SessionContext::new();
-        ctx.register_table("tvmaze", Arc::new(provider))
-            .expect("register table");
-
-        // Query with unordered params (q first, page second)
-        let df1 = ctx
-            .sql("SELECT content FROM tvmaze WHERE request_path = '/search/people' AND request_query = 'q=lauren&page=1'")
-            .await
-            .expect("unordered query should succeed");
-
-        let results1 = df1.collect().await.expect("collect should succeed");
-        assert!(
-            !results1.is_empty(),
-            "Should have results for unordered params"
-        );
-        assert!(
-            results1[0].num_rows() > 0,
-            "Should have rows for unordered params"
+        // Parameters in the order the user wrote them (q first, page second).
+        assert_eq!(
+            sql_rows(
+                &ctx,
+                "SELECT request_query, content FROM tvmaze WHERE request_path = '/search/people' AND request_query = 'q=lauren&page=1' ORDER BY content"
+            )
+            .await,
+            vec![
+                row(&["q=lauren&page=1", LAUREN_1]),
+                row(&["q=lauren&page=1", LAUREN_2]),
+            ]
         );
 
-        // Query with alphabetically ordered params (page first, q second)
-        let df2 = ctx
-            .sql("SELECT content FROM tvmaze WHERE request_path = '/search/people' AND request_query = 'page=1&q=michael'")
-            .await
-            .expect("alphabetical query should succeed");
+        // And alphabetically (page first, q second).
+        assert_eq!(
+            sql_rows(
+                &ctx,
+                "SELECT request_query, content FROM tvmaze WHERE request_path = '/search/people' AND request_query = 'page=1&q=michael' ORDER BY content"
+            )
+            .await,
+            vec![row(&["page=1&q=michael", MICHAEL])]
+        );
 
-        let results2 = df2.collect().await.expect("collect should succeed");
-        assert!(
-            !results2.is_empty(),
-            "Should have results for alphabetical params"
-        );
-        assert!(
-            results2[0].num_rows() > 0,
-            "Should have rows for alphabetical params"
-        );
+        origin.verify().await;
     }
 
     #[test]
@@ -6659,8 +7492,8 @@ mod tests {
             HttpTableProvider::is_retryable_status(429),
             "429 should be retryable"
         );
-        // 2xx/3xx success-ish and 4xx client errors (other than 429) are NOT retried —
-        // they are deterministic responses the caller should see, not transient faults.
+        // 2xx, 3xx and 4xx (other than 429) are NOT retried — asking again would get
+        // the same answer, unlike a transient fault.
         for status in [200_u16, 204, 301, 400, 401, 403, 404, 410, 422, 600] {
             assert!(
                 !HttpTableProvider::is_retryable_status(status),
@@ -6668,13 +7501,6 @@ mod tests {
             );
         }
     }
-
-    // Integration tests that make real HTTP requests.
-    // These are marked with #[ignore] because they depend on live external services and are
-    // therefore not deterministic in CI; run them explicitly with `cargo test -- --ignored`.
-    // The runtime's resilience against transient upstream failures (timeouts, connection
-    // resets mid-body, 5xx, 429) is exercised in production via the configured retry/backoff
-    // and timeouts; the retry *policy* is unit-tested above without depending on the network.
 
     // Tests for globset pattern matching
     #[test]
@@ -6972,597 +7798,367 @@ mod tests {
             .expect_err("should not match");
     }
 
+    /// One path filter is one request, and its JSON object body is one row.
     #[tokio::test]
-    #[ignore = "hits a live external API (jsonplaceholder.typicode.com); not deterministic in CI — run with --ignored"]
     async fn test_integration_jsonplaceholder_single_post() {
-        use datafusion::prelude::SessionContext;
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/posts/1"))
+            .respond_with(json_response(200, pretty_json(POST_1)))
+            .expect(1)
+            .mount(&origin)
+            .await;
 
-        let url = Url::parse("https://jsonplaceholder.typicode.com").expect("valid URL");
-        let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
-            .with_allowed_paths(vec!["/posts/1".to_string()])
+        let provider = origin_provider(&origin)
+            .with_allowed_paths(["/posts/1"])
             .expect("allowed paths");
+        let ctx = http_session("posts", provider);
 
-        let ctx = SessionContext::new();
-        ctx.register_table("posts", Arc::new(provider))
-            .expect("register table");
-
-        // Test basic query
-        let df = ctx
-            .sql("SELECT request_path, content, response_status FROM posts WHERE request_path = '/posts/1'")
-            .await
-            .expect("query should succeed");
-
-        let results = df.collect().await.expect("collect should succeed");
-        assert!(!results.is_empty(), "Should have results");
-
-        let batch = &results[0];
-        assert!(batch.num_rows() > 0, "Should have rows");
-        assert_eq!(batch.num_columns(), 3);
-
-        // Validate response_status is 200 for successful request
-        let status_col = batch
-            .column(2)
-            .as_any()
-            .downcast_ref::<arrow::array::UInt16Array>()
-            .expect("response_status should be UInt16Array");
         assert_eq!(
-            status_col.value(0),
-            200,
-            "Successful request should have response_status 200"
+            sql_rows(
+                &ctx,
+                "SELECT request_path, content, response_status FROM posts WHERE request_path = '/posts/1'"
+            )
+            .await,
+            vec![row(&["/posts/1", POST_1, "200"])]
         );
 
-        // Validate content contains expected post fields
-        let content_col = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
-            .expect("content should be string array");
-
-        let content = content_col.value(0);
-        assert!(content.contains("userId"), "Should contain userId field");
-        assert!(
-            content.contains("\"id\"") && content.contains('1'),
-            "Should contain id field with value 1"
-        );
-        assert!(content.contains("title"), "Should contain title field");
-        assert!(content.contains("body"), "Should contain body field");
-
-        // Validate actual field values from the API
-        assert!(
-            content.contains("sunt aut facere repellat provident"),
-            "Should contain expected title text"
-        );
-        assert!(
-            content.contains("quia et suscipit"),
-            "Should contain expected body text"
-        );
+        origin.verify().await;
     }
 
+    /// An `IN` list over `request_path` fans out to one request per path, and
+    /// every row carries the path it was fetched from.
     #[tokio::test]
-    #[ignore = "hits a live external API (jsonplaceholder.typicode.com); not deterministic in CI — run with --ignored"]
     async fn test_integration_jsonplaceholder_multiple_posts() {
-        use datafusion::prelude::SessionContext;
-
-        let url = Url::parse("https://jsonplaceholder.typicode.com").expect("valid URL");
-        let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
-            .with_allowed_paths(vec![
-                "/posts/1".to_string(),
-                "/posts/2".to_string(),
-                "/posts/3".to_string(),
-            ])
-            .expect("allowed paths");
-
-        let ctx = SessionContext::new();
-        ctx.register_table("posts", Arc::new(provider))
-            .expect("register table");
-
-        // Test IN list filter for multiple paths
-        let df = ctx
-            .sql("SELECT request_path, content, response_status FROM posts WHERE request_path IN ('/posts/1', '/posts/2', '/posts/3')")
-            .await
-            .expect("query should succeed");
-
-        let results = df.collect().await.expect("collect should succeed");
-        assert!(!results.is_empty(), "Should have results");
-
-        let total_rows: usize = results.iter().map(arrow_array::RecordBatch::num_rows).sum();
-        assert_eq!(total_rows, 3, "Should have exactly 3 rows for 3 posts");
-
-        // Verify response_status is 200 for all successful requests and content contains expected post IDs
-        let mut found_posts = [false, false, false]; // Track posts 1, 2, 3
-        for batch in &results {
-            let content_col = batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<arrow::array::StringArray>()
-                .expect("content should be string array");
-
-            let status_col = batch
-                .column(2)
-                .as_any()
-                .downcast_ref::<arrow::array::UInt16Array>()
-                .expect("response_status should be UInt16Array");
-
-            for i in 0..batch.num_rows() {
-                // Validate response_status is 200
-                assert_eq!(
-                    status_col.value(i),
-                    200,
-                    "All successful requests should have response_status 200"
-                );
-
-                let content = content_col.value(i);
-                assert!(content.contains("userId"), "Should contain userId field");
-                assert!(content.contains("id"), "Should contain id field");
-                assert!(content.contains("title"), "Should contain title field");
-
-                // Check which post this is by title
-                if content.contains("sunt aut facere repellat provident") {
-                    found_posts[0] = true;
-                } else if content.contains("qui est esse") {
-                    found_posts[1] = true;
-                } else if content.contains("ea molestias quasi exercitationem") {
-                    found_posts[2] = true;
-                }
-            }
+        let origin = MockServer::start().await;
+        for (route, post) in [
+            ("/posts/1", POST_1),
+            ("/posts/2", POST_2),
+            ("/posts/3", POST_3),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(route))
+                .respond_with(json_response(200, pretty_json(post)))
+                .expect(1)
+                .mount(&origin)
+                .await;
         }
 
-        assert!(found_posts[0], "Should have found post 1");
-        assert!(found_posts[1], "Should have found post 2");
-        assert!(found_posts[2], "Should have found post 3");
+        let provider = origin_provider(&origin)
+            .with_allowed_paths(["/posts/1", "/posts/2", "/posts/3"])
+            .expect("allowed paths");
+        let ctx = http_session("posts", provider);
+
+        assert_eq!(
+            sql_rows(
+                &ctx,
+                "SELECT request_path, content, response_status FROM posts WHERE request_path IN ('/posts/1', '/posts/2', '/posts/3') ORDER BY request_path"
+            )
+            .await,
+            vec![
+                row(&["/posts/1", POST_1, "200"]),
+                row(&["/posts/2", POST_2, "200"]),
+                row(&["/posts/3", POST_3, "200"]),
+            ]
+        );
+
+        origin.verify().await;
     }
+
+    /// A JSON array body is split into one row per element.
     #[tokio::test]
-    #[ignore = "hits a live external API (jsonplaceholder.typicode.com); not deterministic in CI — run with --ignored"]
     async fn test_integration_jsonplaceholder_all_posts() {
-        use datafusion::prelude::SessionContext;
+        let posts: Vec<String> = (1..=5)
+            .map(|id| format!(r#"{{"id":{id},"title":"post {id}","userId":1}}"#))
+            .collect();
 
-        let url = Url::parse("https://jsonplaceholder.typicode.com").expect("valid URL");
-        let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
-            .with_allowed_paths(vec!["/posts".to_string()])
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/posts"))
+            .respond_with(json_response(
+                200,
+                pretty_json(&format!("[{}]", posts.join(","))),
+            ))
+            .expect(1)
+            .mount(&origin)
+            .await;
+
+        let provider = origin_provider(&origin)
+            .with_allowed_paths(["/posts"])
             .expect("allowed paths");
+        let ctx = http_session("posts", provider);
 
-        let ctx = SessionContext::new();
-        ctx.register_table("posts", Arc::new(provider))
-            .expect("register table");
-
-        // Test fetching all posts (returns JSON array)
-        let df = ctx
-            .sql("SELECT request_path, content FROM posts WHERE request_path = '/posts'")
-            .await
-            .expect("query should succeed");
-
-        let results = df.collect().await.expect("collect should succeed");
-        assert!(!results.is_empty(), "Should have results");
-
-        // JSONPlaceholder /posts returns exactly 100 posts as a JSON array
-        let total_rows: usize = results.iter().map(arrow_array::RecordBatch::num_rows).sum();
         assert_eq!(
-            total_rows, 100,
-            "Should have exactly 100 posts from /posts endpoint"
+            sql_rows(
+                &ctx,
+                "SELECT request_path, content FROM posts WHERE request_path = '/posts' ORDER BY content"
+            )
+            .await,
+            vec![
+                row(&["/posts", posts[0].as_str()]),
+                row(&["/posts", posts[1].as_str()]),
+                row(&["/posts", posts[2].as_str()]),
+                row(&["/posts", posts[3].as_str()]),
+                row(&["/posts", posts[4].as_str()]),
+            ]
         );
 
-        // Verify first post has expected structure
-        let batch = &results[0];
-        let content_col = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
-            .expect("content should be string array");
-
-        let first_post = content_col.value(0);
-        assert!(first_post.contains("userId"), "Should contain userId field");
-        assert!(first_post.contains("id"), "Should contain id field");
-        assert!(first_post.contains("title"), "Should contain title field");
-        assert!(first_post.contains("body"), "Should contain body field");
-
-        // Validate first post has expected values
-        assert!(
-            first_post.contains("sunt aut facere repellat provident"),
-            "First post should have expected title"
-        );
-
-        // Verify we can find a post with id 100 (last post)
-        let mut found_last_post = false;
-        for batch in &results {
-            let content_col = batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<arrow::array::StringArray>()
-                .expect("content should be string array");
-
-            for i in 0..batch.num_rows() {
-                let content = content_col.value(i);
-                // Last post has id 100
-                if content.contains("\"id\"")
-                    && content.contains("100")
-                    && !content.contains("1000")
-                {
-                    found_last_post = true;
-                    break;
-                }
-            }
-        }
-        assert!(found_last_post, "Should have found post with id 100");
+        origin.verify().await;
     }
+
+    /// A request path is joined onto the base URL's own path, while the row's
+    /// `request_path` stays the path the query filtered on.
     #[tokio::test]
-    #[ignore = "hits a live external API (api.tvmaze.com); not deterministic in CI — run with --ignored"]
     async fn test_integration_tvmaze_single_show() {
-        use datafusion::prelude::SessionContext;
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/api/v1/shows/1"))
+            .respond_with(json_response(200, pretty_json(SHOW_1)))
+            .expect(1)
+            .mount(&origin)
+            .await;
 
-        let url = Url::parse("https://api.tvmaze.com").expect("valid URL");
-        let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
-            .with_allowed_paths(vec!["/shows/1".to_string()])
+        let base_url = Url::parse(&format!("{}/api/v1", origin.uri()))
+            .expect("the mock server's URI is a valid URL");
+        let provider = HttpTableProvider::new(base_url, Client::new(), "json".to_string(), false)
+            .with_allowed_paths(["/shows/1"])
             .expect("allowed paths");
+        let ctx = http_session("shows", provider);
 
-        let ctx = SessionContext::new();
-        ctx.register_table("shows", Arc::new(provider))
-            .expect("register table");
-
-        // Test basic query with filter
-        let df = ctx
-            .sql("SELECT request_path, content FROM shows WHERE request_path = '/shows/1'")
-            .await
-            .expect("query should succeed");
-
-        let results = df.collect().await.expect("collect should succeed");
-        assert!(!results.is_empty(), "Should have results");
-
-        let batch = &results[0];
-        assert!(batch.num_rows() > 0, "Should have rows");
-
-        // Verify content is JSON
-        let content_col = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
-            .expect("content should be string array");
-
-        let content = content_col.value(0);
-        assert!(content.starts_with('{'), "Should be JSON object");
-        assert!(
-            content.contains("\"id\"") && content.contains('1'),
-            "Should contain id field with value 1"
+        assert_eq!(
+            sql_rows(
+                &ctx,
+                "SELECT request_path, content FROM shows WHERE request_path = '/shows/1'"
+            )
+            .await,
+            vec![row(&["/shows/1", SHOW_1])]
         );
-        assert!(
-            content.contains("\"name\"") && content.contains("Under the Dome"),
-            "Should be 'Under the Dome'"
-        );
-        assert!(content.contains("url"), "Should contain url field");
-        assert!(content.contains("genres"), "Should contain genres field");
-        assert!(content.contains("summary"), "Should contain summary field");
 
-        // Validate specific field values
-        assert!(content.contains("Scripted"), "Should have type 'Scripted'");
-        assert!(content.contains("Drama"), "Should have Drama genre");
-        assert!(
-            content.contains("Science-Fiction"),
-            "Should have Science-Fiction genre"
-        );
-        assert!(
-            content.contains("sealed off from the rest of the world"),
-            "Should contain expected summary text"
-        );
+        origin.verify().await;
     }
 
+    /// A 4xx is the origin's answer rather than a transient failure: it is not
+    /// retried, and it comes back as one row carrying the status and the error
+    /// body, not as a query error.
     #[tokio::test]
-    #[ignore = "hits a live external API (api.tvmaze.com); not deterministic in CI — run with --ignored"]
     async fn test_integration_tvmaze_404_not_found() {
-        use datafusion::prelude::SessionContext;
+        const NOT_FOUND: &str =
+            r#"{"code":0,"message":"Page not found.","name":"Not Found","status":404}"#;
 
-        // Use an invalid route that returns 404 with JSON error body
-        let url = Url::parse("https://api.tvmaze.com").expect("valid URL");
-        let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
-            .with_allowed_paths(vec!["/search/invalid_404".to_string()])
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/search/invalid_404"))
+            .respond_with(json_response(404, pretty_json(NOT_FOUND)))
+            .expect(1)
+            .mount(&origin)
+            .await;
+
+        // What this asserts is that the connector can record a client-error
+        // response as a row, which is `store` rather than the default.
+        let provider = origin_provider(&origin)
+            .with_error_response_action(ErrorResponseAction::Store)
+            .with_allowed_paths(["/search/invalid_404"])
             .expect("allowed paths");
+        let ctx = http_session("tvmaze", provider);
 
-        let ctx = SessionContext::new();
-        ctx.register_table("tvmaze", Arc::new(provider))
-            .expect("register table");
-
-        // Query for an invalid route - should return a row with 404 status and error JSON
-        let df = ctx
-            .sql("SELECT request_path, content, response_status FROM tvmaze WHERE request_path = '/search/invalid_404'")
-            .await
-            .expect("query should succeed");
-
-        let results = df.collect().await.expect("collect should succeed");
-        assert!(!results.is_empty(), "Should have results even for 404");
-
-        let batch = &results[0];
-        assert_eq!(batch.num_rows(), 1, "Should have exactly 1 row");
-
-        // Validate response_status is 404
-        let status_col = batch
-            .column(2)
-            .as_any()
-            .downcast_ref::<arrow::array::UInt16Array>()
-            .expect("response_status should be UInt16Array");
         assert_eq!(
-            status_col.value(0),
-            404,
-            "Invalid route should have response_status 404"
+            sql_rows(
+                &ctx,
+                "SELECT request_path, content, response_status FROM tvmaze WHERE request_path = '/search/invalid_404'"
+            )
+            .await,
+            vec![row(&["/search/invalid_404", NOT_FOUND, "404"])]
         );
 
-        // Validate content contains the 404 JSON error response body
-        let content_col = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
-            .expect("content should be string array");
-
-        let content = content_col.value(0);
-        // TVMaze returns JSON error: {"name":"Not Found","message":"Page not found.","code":0,"status":404,...}
-        assert!(
-            content.contains("Not Found"),
-            "404 response should contain 'Not Found' in body"
-        );
+        origin.verify().await;
     }
 
+    /// A 5xx is refused under every action — including `store`, which exists to
+    /// keep a 404 working — so an outage cannot replace the dataset's rows.
+    /// See [`ErrorResponseAction`].
     #[tokio::test]
-    #[ignore = "hits a live external API (httpbin.org); not deterministic in CI — run with --ignored"]
-    async fn test_integration_httpbin_500_server_error() {
-        use datafusion::prelude::SessionContext;
+    async fn test_integration_httpbin_500_server_error_is_refused_under_every_action() {
+        // The SQL counterpart of the unit coverage: a server error is refused by
+        // its status class, so even `store` does not record one.
+        for action in [ErrorResponseAction::Store, ErrorResponseAction::Warn] {
+            let origin = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/status/500"))
+                .respond_with(ResponseTemplate::new(500))
+                .expect(1)
+                .mount(&origin)
+                .await;
 
-        // httpbin.org provides endpoints that return specific HTTP status codes
-        let url = Url::parse("https://httpbin.org").expect("valid URL");
-        let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
-            .with_allowed_paths(vec!["/status/500".to_string()])
-            .expect("allowed paths");
+            let provider = origin_provider(&origin)
+                .with_max_retries(0)
+                .with_error_response_action(action)
+                .with_allowed_paths(["/status/500"])
+                .expect("allowed paths");
+            let ctx = http_session("httpbin", provider);
 
-        let ctx = SessionContext::new();
-        ctx.register_table("httpbin", Arc::new(provider))
-            .expect("register table");
+            let error = ctx
+                .sql("SELECT request_path, content, response_status FROM httpbin WHERE request_path = '/status/500'")
+                .await
+                .expect("query should plan")
+                .collect()
+                .await
+                .expect_err("a server error must not be answered with rows");
 
-        // Query for a 500 status endpoint - should return a row with 500 status
-        let df = ctx
-            .sql("SELECT request_path, content, response_status FROM httpbin WHERE request_path = '/status/500'")
-            .await
-            .expect("query should succeed");
+            assert!(
+                is_transient_origin_failure(&error),
+                "{action}: a 500 is an origin that is down, not a row: {error}"
+            );
+            assert!(
+                error.to_string().contains("500"),
+                "{action}: the failure must name the status the origin gave: {error}"
+            );
 
-        let results = df.collect().await.expect("collect should succeed");
-        assert!(!results.is_empty(), "Should have results even for 5xx");
-
-        let batch = &results[0];
-        assert_eq!(batch.num_rows(), 1, "Should have exactly 1 row");
-
-        // Validate response_status is 500
-        let status_col = batch
-            .column(2)
-            .as_any()
-            .downcast_ref::<arrow::array::UInt16Array>()
-            .expect("response_status should be UInt16Array");
-        assert_eq!(
-            status_col.value(0),
-            500,
-            "Server error should have response_status 500"
-        );
-
-        // Validate content is empty (httpbin /status/500 returns empty body)
-        let content_col = batch
-            .column(1)
-            .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
-            .expect("content should be string array");
-        let content = content_col.value(0);
-        assert!(
-            content.is_empty(),
-            "httpbin 500 response should have empty content body"
-        );
+            origin.verify().await;
+        }
     }
 
+    /// An `OR` of equalities on `request_path` fans out to one request per path,
+    /// like an `IN` list.
     #[tokio::test]
-    #[ignore = "hits a live external API (api.tvmaze.com); not deterministic in CI — run with --ignored"]
     async fn test_integration_tvmaze_multiple_shows() {
-        use datafusion::prelude::SessionContext;
-
-        let url = Url::parse("https://api.tvmaze.com").expect("valid URL");
-        let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
-            .with_allowed_paths(vec![
-                "/shows/1".to_string(),
-                "/shows/2".to_string(),
-                "/shows/82".to_string(),
-            ])
-            .expect("allowed paths");
-
-        let ctx = SessionContext::new();
-        ctx.register_table("shows", Arc::new(provider))
-            .expect("register table");
-
-        // Test OR filter for multiple paths
-        let df = ctx
-            .sql("SELECT request_path, content FROM shows WHERE request_path = '/shows/1' OR request_path = '/shows/2' OR request_path = '/shows/82'")
-            .await
-            .expect("query should succeed");
-
-        let results = df.collect().await.expect("collect should succeed");
-        assert!(!results.is_empty(), "Should have results");
-
-        let total_rows: usize = results.iter().map(arrow_array::RecordBatch::num_rows).sum();
-        assert_eq!(total_rows, 3, "Should have exactly 3 rows for 3 shows");
-
-        // Collect all show names to verify we got the right shows
-        let mut show_names = Vec::new();
-        let mut found_under_dome = false;
-        let mut found_person_interest = false;
-        let mut found_game_thrones = false;
-
-        for batch in &results {
-            let content_col = batch
-                .column(1)
-                .as_any()
-                .downcast_ref::<arrow::array::StringArray>()
-                .expect("content should be string array");
-
-            for i in 0..batch.num_rows() {
-                let content = content_col.value(i);
-                if content.contains("Under the Dome") {
-                    show_names.push("Under the Dome");
-                    // Validate Under the Dome specific values
-                    assert!(content.contains("\"id\"") && content.contains('1'));
-                    assert!(content.contains("Drama"));
-                    assert!(content.contains("Science-Fiction"));
-                    found_under_dome = true;
-                } else if content.contains("Person of Interest") {
-                    show_names.push("Person of Interest");
-                    // Validate Person of Interest specific values
-                    assert!(content.contains("\"id\"") && content.contains('2'));
-                    assert!(content.contains("Action"));
-                    assert!(content.contains("Crime"));
-                    found_person_interest = true;
-                } else if content.contains("Game of Thrones") {
-                    show_names.push("Game of Thrones");
-                    // Validate Game of Thrones specific values
-                    assert!(content.contains("\"id\"") && content.contains("82"));
-                    assert!(content.contains("Fantasy"));
-                    assert!(content.contains("Adventure"));
-                    found_game_thrones = true;
-                }
-            }
+        let origin = MockServer::start().await;
+        for (route, show) in [
+            ("/shows/1", SHOW_1),
+            ("/shows/2", SHOW_2),
+            ("/shows/82", SHOW_82),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(route))
+                .respond_with(json_response(200, pretty_json(show)))
+                .expect(1)
+                .mount(&origin)
+                .await;
         }
 
-        assert_eq!(show_names.len(), 3, "Should have found all 3 shows");
-        assert!(found_under_dome, "Should have found Under the Dome");
-        assert!(
-            found_person_interest,
-            "Should have found Person of Interest"
+        let provider = origin_provider(&origin)
+            .with_allowed_paths(["/shows/1", "/shows/2", "/shows/82"])
+            .expect("allowed paths");
+        let ctx = http_session("shows", provider);
+
+        assert_eq!(
+            sql_rows(
+                &ctx,
+                "SELECT request_path, content FROM shows WHERE request_path = '/shows/1' OR request_path = '/shows/2' OR request_path = '/shows/82' ORDER BY request_path"
+            )
+            .await,
+            vec![
+                row(&["/shows/1", SHOW_1]),
+                row(&["/shows/2", SHOW_2]),
+                row(&["/shows/82", SHOW_82]),
+            ]
         );
-        assert!(found_game_thrones, "Should have found Game of Thrones");
+
+        origin.verify().await;
     }
+
+    /// Selecting only `content` while filtering on `request_path` returns just
+    /// that one column, with the filter still applied.
     #[tokio::test]
-    #[ignore = "hits a live external API (api.tvmaze.com); not deterministic in CI — run with --ignored"]
     async fn test_integration_tvmaze_projection() {
-        use datafusion::prelude::SessionContext;
+        let origin = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/shows/1"))
+            .respond_with(json_response(200, pretty_json(SHOW_1)))
+            .expect(1)
+            .mount(&origin)
+            .await;
 
-        let url = Url::parse("https://api.tvmaze.com").expect("valid URL");
-        let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
-            .with_allowed_paths(vec!["/shows/1".to_string()])
+        let provider = origin_provider(&origin)
+            .with_allowed_paths(["/shows/1"])
             .expect("allowed paths");
+        let ctx = http_session("shows", provider);
 
-        let ctx = SessionContext::new();
-        ctx.register_table("shows", Arc::new(provider))
-            .expect("register table");
-
-        // Test with projection - only select content column
-        let df = ctx
-            .sql("SELECT content FROM shows WHERE request_path = '/shows/1'")
-            .await
-            .expect("query should succeed");
-
-        let results = df.collect().await.expect("collect should succeed");
-        assert!(!results.is_empty(), "Should have results");
-
-        let batch = &results[0];
-        assert_eq!(batch.num_columns(), 1, "Should only have content column");
-        assert!(batch.num_rows() > 0, "Should have rows");
-
-        // Verify the content is valid JSON with expected fields
-        let content_col = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
-            .expect("content should be string array");
-
-        let content = content_col.value(0);
-        assert!(
-            content.contains("Under the Dome"),
-            "Should be Under the Dome"
+        assert_eq!(
+            sql_rows(
+                &ctx,
+                "SELECT content FROM shows WHERE request_path = '/shows/1'"
+            )
+            .await,
+            vec![row(&[SHOW_1])]
         );
-        assert!(content.contains("genres"), "Should contain genres field");
 
-        // Validate specific values in the projection
-        assert!(content.contains("Drama"), "Should contain Drama genre");
-        assert!(
-            content.contains("Science-Fiction"),
-            "Should contain Science-Fiction genre"
-        );
+        origin.verify().await;
     }
 
+    /// Aggregates count one row per fetched response.
     #[tokio::test]
-    #[ignore = "hits a live external API (api.tvmaze.com); not deterministic in CI — run with --ignored"]
     async fn test_integration_tvmaze_aggregation() {
-        use datafusion::prelude::SessionContext;
-
-        let url = Url::parse("https://api.tvmaze.com").expect("valid URL");
-        let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
-            .with_allowed_paths(vec!["/shows/1".to_string(), "/shows/2".to_string()])
-            .expect("allowed paths");
-
-        let ctx = SessionContext::new();
-        ctx.register_table("shows", Arc::new(provider))
-            .expect("register table");
-
-        // First validate that we get the actual content before testing aggregation
-        let df_content = ctx
-            .sql("SELECT content FROM shows WHERE request_path IN ('/shows/1', '/shows/2')")
-            .await
-            .expect("query should succeed");
-
-        let content_results = df_content.collect().await.expect("collect should succeed");
-        assert!(!content_results.is_empty(), "Should have content results");
-
-        let mut found_under_dome = false;
-        let mut found_person_interest = false;
-
-        for batch in &content_results {
-            let content_col = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<arrow::array::StringArray>()
-                .expect("content should be string array");
-
-            for i in 0..batch.num_rows() {
-                let content = content_col.value(i);
-                if content.contains("Under the Dome") {
-                    assert!(content.contains("Drama"));
-                    found_under_dome = true;
-                }
-                if content.contains("Person of Interest") {
-                    assert!(content.contains("Action"));
-                    found_person_interest = true;
-                }
-            }
+        let origin = MockServer::start().await;
+        for (route, show) in [("/shows/1", SHOW_1), ("/shows/2", SHOW_2)] {
+            Mock::given(method("GET"))
+                .and(path(route))
+                .respond_with(json_response(200, pretty_json(show)))
+                // Once per query: the origin sends no `Cache-Control`, so no
+                // response is retained between the two queries below.
+                .expect(2)
+                .mount(&origin)
+                .await;
         }
 
-        assert!(
-            found_under_dome,
-            "Should have found Under the Dome with Drama genre"
+        let provider = origin_provider(&origin)
+            .with_allowed_paths(["/shows/1", "/shows/2"])
+            .expect("allowed paths");
+        let ctx = http_session("shows", provider);
+
+        assert_eq!(
+            sql_rows(
+                &ctx,
+                "SELECT content FROM shows WHERE request_path IN ('/shows/1', '/shows/2') ORDER BY content"
+            )
+            .await,
+            vec![row(&[SHOW_2]), row(&[SHOW_1])]
         );
-        assert!(
-            found_person_interest,
-            "Should have found Person of Interest with Action genre"
+        assert_eq!(
+            sql_rows(
+                &ctx,
+                "SELECT COUNT(*) AS total FROM shows WHERE request_path IN ('/shows/1', '/shows/2')"
+            )
+            .await,
+            vec![row(&["2"])]
         );
 
-        // Test count aggregation
-        let df = ctx
-            .sql("SELECT COUNT(*) as total FROM shows WHERE request_path IN ('/shows/1', '/shows/2')")
-            .await
-            .expect("query should succeed");
-
-        let results = df.collect().await.expect("collect should succeed");
-        assert!(!results.is_empty(), "Should have results");
-
-        let batch = &results[0];
-        let count_col = batch
-            .column(0)
-            .as_any()
-            .downcast_ref::<arrow::array::Int64Array>()
-            .expect("count should be int64 array");
-
-        let count = count_col.value(0);
-        assert_eq!(count, 2, "Should have counted exactly 2 rows for 2 shows");
+        origin.verify().await;
     }
 
-    /// Integration test: Open Library search API with query-parameter pagination.
-    /// Uses `pagination_query_params` with `offset={offset}&limit={limit}` to
-    /// paginate through search results, and `pagination_data_pointer` to extract
-    /// the `docs` array from each page.
+    /// Query-parameter pagination in the shape of a search API: an
+    /// `offset={offset}&limit={limit}` template merged into the base URL's own
+    /// query, a page size of 3, rows taken from `/docs`, and at most two pages.
+    /// The origin has a third page, which `max_pages` must keep the connector
+    /// from fetching.
     #[tokio::test]
-    #[ignore = "hits a live external API (openlibrary.org); not deterministic in CI — run with --ignored"]
     async fn test_integration_openlibrary_query_param_pagination() {
-        use datafusion::prelude::SessionContext;
+        let docs: Vec<String> = (1..=7)
+            .map(|n| format!(r#"{{"key":"/works/OL{n}W","title":"Book {n}"}}"#))
+            .collect();
 
-        let url = Url::parse("https://openlibrary.org/search.json?q=tolkien").expect("valid URL");
-        let provider = HttpTableProvider::new(url, Client::new(), "json".to_string(), false)
+        let origin = MockServer::start().await;
+        for (offset, page, expected_requests) in [
+            ("0", &docs[0..3], 1_u64),
+            ("3", &docs[3..6], 1),
+            ("6", &docs[6..7], 0),
+        ] {
+            Mock::given(method("GET"))
+                .and(path("/search.json"))
+                .and(query_param("q", "tolkien"))
+                .and(query_param("offset", offset))
+                .and(query_param("limit", "3"))
+                .respond_with(json_response(
+                    200,
+                    pretty_json(&format!(r#"{{"docs":[{}],"numFound":7}}"#, page.join(","))),
+                ))
+                .expect(expected_requests)
+                .mount(&origin)
+                .await;
+        }
+
+        let base_url = Url::parse(&format!("{}/search.json?q=tolkien", origin.uri()))
+            .expect("the mock server's URI is a valid URL");
+        let provider = HttpTableProvider::new(base_url, Client::new(), "json".to_string(), false)
             .with_pagination(PaginationConfig {
                 query_params: Some("offset={offset}&limit={limit}".to_string()),
                 page_size: Some(3),
@@ -7572,41 +8168,28 @@ mod tests {
                 ..Default::default()
             })
             .expect("pagination config");
+        let ctx = http_session("books", provider);
 
-        let ctx = SessionContext::new();
-        ctx.register_table("books", Arc::new(provider))
-            .expect("register table");
-
-        let df = ctx
-            .sql("SELECT content FROM books")
-            .await
-            .expect("query should succeed");
-
-        let results = df.collect().await.expect("collect should succeed");
-        let total_rows: usize = results.iter().map(RecordBatch::num_rows).sum();
-
-        // With page_size=3 and max_pages=2, we expect up to 6 rows.
-        // If the last page has fewer than 3 rows, we get fewer.
-        assert!(
-            total_rows >= 4,
-            "Should have fetched multiple pages of results, got {total_rows}"
-        );
-        assert!(
-            total_rows <= 6,
-            "Should not exceed 2 pages * 3 items = 6 rows, got {total_rows}"
+        // Exactly two full pages, each row stamped with the query that fetched it.
+        let first_page = "q=tolkien&offset=0&limit=3";
+        let second_page = "q=tolkien&offset=3&limit=3";
+        assert_eq!(
+            sql_rows(
+                &ctx,
+                "SELECT request_query, content FROM books ORDER BY content"
+            )
+            .await,
+            vec![
+                row(&[first_page, docs[0].as_str()]),
+                row(&[first_page, docs[1].as_str()]),
+                row(&[first_page, docs[2].as_str()]),
+                row(&[second_page, docs[3].as_str()]),
+                row(&[second_page, docs[4].as_str()]),
+                row(&[second_page, docs[5].as_str()]),
+            ]
         );
 
-        // Verify content looks like book records
-        let content_col = results[0]
-            .column(0)
-            .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
-            .expect("content should be string array");
-        let first_row = content_col.value(0);
-        assert!(
-            first_row.contains("title"),
-            "Book records should contain a title field: {first_row}"
-        );
+        origin.verify().await;
     }
 
     // --- Pagination tests ---
@@ -7790,8 +8373,17 @@ mod tests {
             ..Default::default()
         };
         let content = r#"{"results": [1, 2, 3]}"#;
-        let result = extract_page_data(content, &config, None);
-        assert!(result.is_err(), "missing pointer should return error");
+        // A mistyped pointer must fail and name the pointer, rather than quietly
+        // yield zero rows from a page that has data.
+        match extract_page_data(content, &config, None) {
+            Err(DataFusionError::Execution(message)) => assert_eq!(
+                message,
+                "Failed to extract paginated HTTP response data: configured data pointer '/nonexistent' was not found in the response"
+            ),
+            other => panic!(
+                "a missing data pointer must be an execution error that names it, got: {other:?}"
+            ),
+        }
     }
 
     #[test]
@@ -8183,6 +8775,729 @@ mod tests {
         );
     }
 
+    /// Serve `status` with `body` on every request, counting them, and return the URL to
+    /// point a provider at. Kept off `wiremock` so the request count is observed the same
+    /// way the sibling pagination server does it.
+    async fn start_status_server(status: u16, body: &'static str) -> (Url, Arc<AtomicUsize>) {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock server should bind");
+        let address = listener.local_addr().expect("mock server should have addr");
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_count_for_server = Arc::clone(&request_count);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let request_count = Arc::clone(&request_count_for_server);
+
+                tokio::spawn(async move {
+                    let mut buffer = [0_u8; 1024];
+                    let _ = stream.read(&mut buffer).await;
+                    request_count.fetch_add(1, Ordering::SeqCst);
+
+                    let response = format!(
+                        "HTTP/1.1 {status} STATUS\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len(),
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        (
+            Url::parse(&format!("http://{address}/items")).expect("mock URL should be valid"),
+            request_count,
+        )
+    }
+
+    const TEST_DATASET: &str = "http_items";
+
+    fn status_provider(base_url: Url, action: ErrorResponseAction) -> HttpTableProvider {
+        HttpTableProvider::new(base_url, Client::new(), "json".to_string(), false)
+            // The ladder is not what these assert, and every retry is a real sleep.
+            .with_max_retries(0)
+            .with_error_response_action(action)
+            .with_dataset_name(TEST_DATASET)
+    }
+
+    /// Run `SELECT content, response_status` against a provider serving one status.
+    async fn scan_status_dataset(
+        base_url: Url,
+        action: ErrorResponseAction,
+    ) -> std::result::Result<Vec<RecordBatch>, DataFusionError> {
+        scan_provider(status_provider(base_url, action)).await
+    }
+
+    /// Run `SELECT content, response_status` against `provider`.
+    async fn scan_provider(
+        provider: HttpTableProvider,
+    ) -> std::result::Result<Vec<RecordBatch>, DataFusionError> {
+        use datafusion::prelude::SessionContext;
+
+        let ctx = SessionContext::new();
+        ctx.register_table("items", Arc::new(provider))
+            .expect("table should register");
+        ctx.sql("SELECT content, response_status FROM items")
+            .await?
+            .collect()
+            .await
+    }
+
+    #[test]
+    fn refusing_a_permanent_status_is_not_a_retriable_refresh_failure() {
+        use datafusion_table_providers::util::retriable_error::is_retriable_error;
+
+        // What this pins is not the DataFusionError variant but what the refresh layer
+        // does with it: `check_and_mark_retriable_error` treats everything except
+        // Plan/SQL/SchemaError as retriable, so an over-broad mapping has one refresh
+        // invocation re-asking an origin that will keep answering 404.
+        for status in [400, 401, 403, 404, 410, 451] {
+            let df: DataFusionError = Error::ErrorResponse {
+                status,
+                endpoint: "https://api.example.com/items".to_string(),
+                dataset: "dataset 'items'".to_string(),
+            }
+            .into();
+            assert!(
+                !is_retriable_error(&check_retriable(df)),
+                "{status} will not change on a retry, so a refresh must not re-ask for it"
+            );
+        }
+
+        // The statuses the request ladder itself retries are the ones a later refresh may
+        // usefully retry too; the two read the same predicate so they cannot drift.
+        for status in [429, 500, 502, 503, 504] {
+            let df: DataFusionError = Error::ErrorResponse {
+                status,
+                endpoint: "https://api.example.com/items".to_string(),
+                dataset: "dataset 'items'".to_string(),
+            }
+            .into();
+            assert!(
+                is_retriable_error(&check_retriable(df)),
+                "{status} is transient, so a later refresh should retry it"
+            );
+        }
+    }
+
+    /// Put a `DataFusionError` through the same wrapping the refresh path applies before
+    /// it asks whether the error is retriable.
+    fn check_retriable(err: DataFusionError) -> DataFusionError {
+        datafusion_table_providers::util::retriable_error::check_and_mark_retriable_error(err)
+    }
+
+    #[test]
+    fn a_refused_transient_status_is_recognisable_through_any_wrapping() {
+        let refused = |status| -> DataFusionError {
+            Error::ErrorResponse {
+                status,
+                endpoint: "https://api.example.com".to_string(),
+                dataset: "dataset 'items'".to_string(),
+            }
+            .into()
+        };
+        for status in [429, 500, 503] {
+            assert!(is_transient_origin_failure(&refused(status)), "{status}");
+            // The shapes an execution error takes on its way out of a plan.
+            let wrapped = DataFusionError::Context(
+                "scan".to_string(),
+                Box::new(DataFusionError::Shared(Arc::new(refused(status)))),
+            );
+            assert!(is_transient_origin_failure(&wrapped), "{status} wrapped");
+        }
+        for status in [400, 404] {
+            assert!(
+                !is_transient_origin_failure(&refused(status)),
+                "{status} is an answer about the resource, not an origin that is down"
+            );
+        }
+        assert!(!is_transient_origin_failure(&DataFusionError::Execution(
+            "connection reset".to_string()
+        )));
+    }
+
+    #[test]
+    fn an_error_never_prints_the_part_of_a_url_that_carries_secrets() {
+        let url = Url::parse(
+            "https://tenant:hunter2@api.example.com:8443/v1/items?api_key=SECRET&cursor=TOKEN#frag",
+        )
+        .expect("valid URL");
+
+        let label = endpoint_label(&url);
+        for secret in ["hunter2", "tenant", "SECRET", "TOKEN", "api_key", "frag"] {
+            assert!(
+                !label.contains(secret),
+                "the label must not carry '{secret}': {label}"
+            );
+        }
+
+        // Still has to say which host was fetched, or the error is not worth reading.
+        assert!(
+            label.contains("api.example.com"),
+            "the label must still name the host: {label}"
+        );
+        assert!(
+            label.contains("8443"),
+            "a non-default port is part of the endpoint: {label}"
+        );
+        // The path goes too. An operator keeps credentials there — a webhook's secret is
+        // the path — and the reader of this message is whoever ran the query, not
+        // necessarily someone entitled to see the spicepod. The dataset named alongside it
+        // is what identifies the endpoint.
+        assert!(
+            !label.contains("/v1/items"),
+            "the configured path is not the reader's to see: {label}"
+        );
+
+        // And the message built from it inherits that, on both the error and the row-keeping
+        // path — the warning interpolates the same label.
+        let message = Error::ErrorResponse {
+            status: 503,
+            endpoint: label,
+            dataset: "dataset 'items'".to_string(),
+        }
+        .to_string();
+        assert!(
+            !message.contains("SECRET") && !message.contains("hunter2"),
+            "the rendered error must not carry the query or userinfo: {message}"
+        );
+    }
+
+    /// The secret-in-the-path shape specifically: a webhook endpoint keeps its whole
+    /// credential in the path the operator configured, so a label that renders the path
+    /// hands it to anyone who can provoke a non-2xx.
+    #[test]
+    fn an_error_never_prints_a_secret_the_configured_path_carries() {
+        let url = Url::parse("https://hooks.example.com/services/T0000/B0000/tOkEnSeCrEt")
+            .expect("valid URL");
+
+        let label = endpoint_label(&url);
+        for secret in ["tOkEnSeCrEt", "B0000", "T0000", "services"] {
+            assert!(
+                !label.contains(secret),
+                "the label must not carry '{secret}' from the path: {label}"
+            );
+        }
+        assert_eq!(label, "https://hooks.example.com");
+
+        let message = Error::ErrorResponse {
+            status: 401,
+            endpoint: label,
+            dataset: "dataset 'alerts'".to_string(),
+        }
+        .to_string();
+        assert!(
+            !message.contains("tOkEnSeCrEt"),
+            "the rendered error must not carry the path secret: {message}"
+        );
+        // The message is still actionable: it names the dataset to look up.
+        assert!(
+            message.contains("dataset 'alerts'"),
+            "the error must still name the dataset: {message}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_error_never_prints_a_path_the_query_chose() {
+        // `allowed_request_paths` admits paths by glob, so a wildcard allowlist lets a
+        // SQL filter name any path under the endpoint — and `build_request_url` appends
+        // it. A path segment can therefore be a webhook secret or an embedded token, so
+        // the label has to come from the configured endpoint rather than the request.
+        let (base_url, _) = start_status_server(404, r#"{"error":"not found"}"#).await;
+
+        let provider = status_provider(base_url, ErrorResponseAction::Error)
+            .with_allowed_paths(vec!["/*".to_string()])
+            .expect("a wildcard allowlist is valid");
+
+        let ctx = datafusion::prelude::SessionContext::new();
+        ctx.register_table("items", Arc::new(provider))
+            .expect("table should register");
+
+        let error = ctx
+            .sql("SELECT content FROM items WHERE request_path = '/webhook/PATH-TOKEN'")
+            .await
+            .expect("query should plan")
+            .collect()
+            .await
+            .expect_err("a 404 must not be answered with rows");
+
+        let message = error.to_string();
+        assert!(
+            !message.contains("PATH-TOKEN"),
+            "a path the query chose must not reach the failure: {message}"
+        );
+        assert!(
+            message.contains("404"),
+            "the failure must still name the status: {message}"
+        );
+    }
+
+    #[test]
+    fn error_response_action_reads_every_documented_value() {
+        for action in ErrorResponseAction::VARIANTS {
+            let spelling = action.as_str();
+            let parsed: ErrorResponseAction = spelling
+                .parse()
+                .unwrap_or_else(|()| panic!("'{spelling}' is documented and must parse"));
+            assert_eq!(
+                parsed, action,
+                "'{spelling}' must round-trip through as_str"
+            );
+            assert!(
+                ErrorResponseAction::accepted_values().contains(spelling),
+                "'{spelling}' must be listed to the user"
+            );
+        }
+
+        // Case and surrounding whitespace are the operator's, not the parser's.
+        assert_eq!(
+            "  ERROR ".parse::<ErrorResponseAction>(),
+            Ok(ErrorResponseAction::Error)
+        );
+
+        // A value that is not one of them must not fall back to a policy: the connector
+        // reports it, and the operator learns their setting did not take.
+        for rejected in ["", "fail", "retain", "eror", "true"] {
+            assert!(
+                rejected.parse::<ErrorResponseAction>().is_err(),
+                "'{rejected}' is not a documented action and must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn error_response_action_defaults_to_refusing() {
+        // The default decides whether an origin failure can replace an accelerated
+        // table's contents with error bodies (#13515), so it is asserted rather than
+        // left to the derive.
+        assert_eq!(ErrorResponseAction::default(), ErrorResponseAction::Error);
+    }
+
+    #[tokio::test]
+    async fn a_server_error_response_does_not_become_a_row() {
+        use std::sync::atomic::Ordering;
+
+        let (base_url, request_count) =
+            start_status_server(503, r#"{"error":"unavailable"}"#).await;
+
+        let error = scan_status_dataset(base_url, ErrorResponseAction::Error)
+            .await
+            .expect_err("a 503 must not be answered with rows");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("503"),
+            "the failure must name the status the origin gave: {message}"
+        );
+        assert!(
+            message.contains("spiceai.org/docs/components/data-connectors/https"),
+            "the failure must link the connector's docs: {message}"
+        );
+        // A 503 is refused by its status class, not by the action, so the remedy must not
+        // name a setting that would not change it. Offering `warn` here would send the
+        // operator to a value that leaves the refusal exactly where it was.
+        assert!(
+            !message.contains("`on_error_response: warn`")
+                && !message.contains("`on_error_response: store`"),
+            "no action records a server error, so neither may be offered as the remedy: {message}"
+        );
+        assert!(
+            message.contains("max_retries"),
+            "the remedy for an origin that stayed down is the retry budget: {message}"
+        );
+        // Several datasets can share one endpoint with different request filters, so the
+        // endpoint alone does not say which one failed.
+        assert!(
+            message.contains(TEST_DATASET),
+            "the failure must name the dataset: {message}"
+        );
+
+        // The extra request that existed only to turn an exhausted retry into a row is
+        // not worth spending on an origin that has already failed.
+        assert_eq!(
+            request_count.load(Ordering::SeqCst),
+            1,
+            "refusing must not cost a second request"
+        );
+    }
+
+    /// Hang up on the first `hangups` connections without answering, then answer
+    /// `status`: a ladder that meets a network failure before the status it ends on.
+    async fn start_hangup_then_status_server(
+        hangups: usize,
+        status: u16,
+        body: &'static str,
+    ) -> (Url, Arc<AtomicUsize>) {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock server should bind");
+        let address = listener.local_addr().expect("mock server should have addr");
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_count_for_server = Arc::clone(&request_count);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let request_count = Arc::clone(&request_count_for_server);
+                tokio::spawn(async move {
+                    let mut buffer = [0_u8; 1024];
+                    let _ = stream.read(&mut buffer).await;
+                    let seen = request_count.fetch_add(1, Ordering::SeqCst);
+                    if seen < hangups {
+                        drop(stream);
+                        return;
+                    }
+                    let response = format!(
+                        "HTTP/1.1 {status} STATUS\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len(),
+                    );
+                    let _ = stream.write_all(response.as_bytes()).await;
+                });
+            }
+        });
+
+        (
+            Url::parse(&format!("http://{address}/items")).expect("mock URL should be valid"),
+            request_count,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_transient_status_after_a_network_failure_is_still_refused() {
+        use std::sync::atomic::Ordering;
+
+        // A ladder whose earlier attempt failed on the network and whose last allowed
+        // attempt is answered with a 5xx: the status is refused rather than recorded
+        // under every action, and nothing is asked past the budget.
+        for action in [ErrorResponseAction::Store, ErrorResponseAction::Warn] {
+            let (base_url, requests) =
+                start_hangup_then_status_server(1, 503, r#"{"error":"upstream is down"}"#).await;
+
+            let error = scan_provider(status_provider(base_url, action).with_max_retries(1))
+                .await
+                .expect_err("the last allowed attempt must not record a 503 either");
+
+            assert!(
+                error.to_string().contains("503"),
+                "{action}: the failure must name the status the origin gave: {error}"
+            );
+            assert_eq!(
+                requests.load(Ordering::SeqCst),
+                2,
+                "{action}: one hung-up attempt, then the one retry the budget allows"
+            );
+        }
+    }
+
+    /// Serve `status` with a `Content-Length` that overstates the body, then hang up — the
+    /// read fails after a valid status line, which `extract_response` treats as transient.
+    async fn start_truncated_body_server(status: u16) -> (Url, Arc<AtomicUsize>) {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("mock server should bind");
+        let address = listener.local_addr().expect("mock server should have addr");
+        let request_count = Arc::new(AtomicUsize::new(0));
+        let request_count_for_server = Arc::clone(&request_count);
+
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut stream, _)) = listener.accept().await else {
+                    break;
+                };
+                let request_count = Arc::clone(&request_count_for_server);
+                tokio::spawn(async move {
+                    let mut buffer = [0_u8; 1024];
+                    let _ = stream.read(&mut buffer).await;
+                    request_count.fetch_add(1, Ordering::SeqCst);
+                    let head = format!(
+                        "HTTP/1.1 {status} STATUS\r\nContent-Type: application/json\r\nContent-Length: 400\r\n\r\n"
+                    );
+                    let _ = stream.write_all(head.as_bytes()).await;
+                    let _ = stream.write_all(b"{\"partial\":").await;
+                    let _ = stream.flush().await;
+                    drop(stream);
+                });
+            }
+        });
+
+        (
+            Url::parse(&format!("http://{address}/items")).expect("mock URL should be valid"),
+            request_count,
+        )
+    }
+
+    /// Collect the `warn`-level lines emitted while `body` runs.
+    async fn warnings_emitted_during<F>(body: F) -> Vec<String>
+    where
+        F: std::future::Future<Output = ()>,
+    {
+        use std::sync::Mutex;
+        use tracing_subscriber::fmt::MakeWriter;
+
+        #[derive(Clone)]
+        struct Buffer(Arc<Mutex<Vec<u8>>>);
+        impl std::io::Write for Buffer {
+            fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+                self.0
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner)
+                    .extend_from_slice(buf);
+                Ok(buf.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+        impl<'a> MakeWriter<'a> for Buffer {
+            type Writer = Self;
+            fn make_writer(&'a self) -> Self::Writer {
+                self.clone()
+            }
+        }
+
+        let sink = Buffer(Arc::new(Mutex::new(Vec::new())));
+        let subscriber = tracing_subscriber::fmt()
+            .with_writer(sink.clone())
+            .with_max_level(tracing::Level::WARN)
+            .with_ansi(false)
+            .finish();
+
+        // `set_default` rather than `with_default`: the latter takes a closure, which would
+        // force a `block_on` inside the test's own current-thread runtime and deadlock
+        // against the mock server's spawned tasks. The guard covers the provider's
+        // emissions because `#[tokio::test]` keeps this future on one thread.
+        let guard = tracing::subscriber::set_default(subscriber);
+        body.await;
+        drop(guard);
+
+        let captured = sink
+            .0
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        String::from_utf8_lossy(&captured)
+            .lines()
+            .filter(|line| line.contains("WARN"))
+            .map(ToString::to_string)
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn warn_speaks_only_for_a_body_it_actually_has() {
+        use std::sync::atomic::Ordering;
+
+        // The warning claims a row is being recorded. `extract_response` treats a broken
+        // read as transient and the request is retried, so a warning emitted before it
+        // would make that claim on every attempt while producing no row at all. A 404,
+        // because `warn` reaches the body read only for a status it may record: a 5xx is
+        // refused before that, which would leave this test passing whatever the
+        // warning's placement.
+        let (base_url, request_count) = start_truncated_body_server(404).await;
+        let url = base_url.clone();
+
+        let warnings = warnings_emitted_during(async move {
+            let _ = scan_status_dataset(url, ErrorResponseAction::Warn).await;
+        })
+        .await;
+
+        assert!(
+            request_count.load(Ordering::SeqCst) >= 1,
+            "the server must have been asked at least once"
+        );
+        assert!(
+            warnings.is_empty(),
+            "no row was produced, so nothing should have claimed one: {warnings:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn warn_speaks_once_for_the_row_it_records() {
+        let (base_url, _) = start_status_server(404, r#"{"error":"not found"}"#).await;
+        let url = base_url.clone();
+
+        let warnings = warnings_emitted_during(async move {
+            let _ = scan_status_dataset(url, ErrorResponseAction::Warn).await;
+        })
+        .await;
+
+        assert_eq!(
+            warnings.len(),
+            1,
+            "one recorded row is one warning: {warnings:#?}"
+        );
+        assert!(
+            warnings[0].contains("404") && warnings[0].contains("on_error_response"),
+            "the warning must name the status and the parameter: {warnings:#?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_client_error_response_does_not_become_a_row() {
+        // 404 is never retried, so it reaches the decision on the first response rather
+        // than through the exhausted ladder — a separate route to the same substitution.
+        let (base_url, _) = start_status_server(404, r#"{"error":"not found"}"#).await;
+
+        let error = scan_status_dataset(base_url, ErrorResponseAction::Error)
+            .await
+            .expect_err("a 404 must not be answered with rows");
+
+        let message = error.to_string();
+        assert!(
+            message.contains("404"),
+            "the failure must name the status the origin gave: {message}"
+        );
+        // A client error *is* selectable, so this is the message that must carry the
+        // remedy — and it has to be `warn`, which records the body and says so, not the
+        // silent `store` this parameter exists to stop being the accident.
+        assert!(
+            message.contains("`on_error_response: warn`"),
+            "a selectable status must offer `warn` as the remedy: {message}"
+        );
+        assert!(
+            !message.contains("`on_error_response: store`"),
+            "the failure must not offer the silent form as the remedy: {message}"
+        );
+    }
+
+    /// `warn` and `store` record client errors only, as the parameter documents. A
+    /// `304` answers a conditional request header, and a `300` or a `302` without a
+    /// `Location` is a redirect the client did not follow: none carries content to
+    /// record, so none becomes a row under any action, asking again would get the same
+    /// answer, and the failure does not offer `warn` as the remedy.
+    #[tokio::test]
+    async fn a_status_outside_the_client_error_class_is_never_recorded() {
+        use std::sync::atomic::Ordering;
+
+        for status in [300, 302, 304] {
+            for action in ErrorResponseAction::VARIANTS {
+                let (base_url, requests) = start_status_server(status, "").await;
+
+                let error = scan_provider(status_provider(base_url, action).with_max_retries(2))
+                    .await
+                    .expect_err("a status outside the client-error class must not become a row");
+                assert_eq!(
+                    requests.load(Ordering::SeqCst),
+                    1,
+                    "{action}/{status}: a status that is not retried is asked once"
+                );
+
+                let message = error.to_string();
+                assert!(
+                    message.contains(&status.to_string()),
+                    "{action}/{status}: the failure must name the status: {message}"
+                );
+                assert!(
+                    !message.contains("`on_error_response: warn`"),
+                    "{action}/{status}: `warn` cannot record this status, so it must not be offered: {message}"
+                );
+            }
+        }
+    }
+
+    /// The redirect wording belongs to `3xx` only. Any other status outside the
+    /// recordable class still names the remedy that applies, without `warn`.
+    #[test]
+    fn the_remedy_names_redirects_only_for_a_redirect() {
+        for status in [100, 600, 999] {
+            let remedy = error_response_remedy(status);
+            assert!(
+                !remedy.contains("304") && !remedy.contains("redirect"),
+                "{status}: {remedy}"
+            );
+            assert!(
+                !remedy.contains("`on_error_response: warn`"),
+                "{status}: {remedy}"
+            );
+        }
+        assert!(error_response_remedy(304).contains("If-None-Match"));
+    }
+
+    #[tokio::test]
+    async fn store_keeps_recording_an_error_response_as_a_row() {
+        // The 404-as-a-business-fact dataset this connector already serves: `store` is
+        // the setting that keeps it working, so it is what makes the default a choice
+        // rather than a removal.
+        for action in [ErrorResponseAction::Store, ErrorResponseAction::Warn] {
+            let (base_url, _) = start_status_server(404, r#"{"error":"not found"}"#).await;
+
+            let batches = scan_status_dataset(base_url, action)
+                .await
+                .unwrap_or_else(|e| panic!("{action} must answer with the response body: {e}"));
+
+            let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+            assert_eq!(total_rows, 1, "{action} must record the response as a row");
+
+            let statuses = batches[0]
+                .column(1)
+                .as_any()
+                .downcast_ref::<UInt16Array>()
+                .expect("response_status should be UInt16Array");
+            assert_eq!(
+                statuses.value(0),
+                404,
+                "{action} must record the status the origin gave"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn an_exhausted_transient_status_is_never_recorded_as_a_row() {
+        use std::sync::atomic::Ordering;
+
+        // `store`/`warn` exist for the dataset that reads a 404 body as a business fact;
+        // a 5xx or 429 is never that (see [`ErrorResponseAction`]). Admitting one here
+        // would let an outage replace an accelerated table's contents under the very
+        // setting chosen to keep a 404 working — the gap spiceai/spiceai#13578 reports.
+        for status in [500, 502, 503, 504, 429] {
+            for action in [ErrorResponseAction::Store, ErrorResponseAction::Warn] {
+                let (base_url, requests) =
+                    start_status_server(status, r#"{"error":"upstream is down"}"#).await;
+
+                let error = scan_status_dataset(base_url, action)
+                    .await
+                    .expect_err("a transient status must not be answered with rows");
+
+                assert!(
+                    error.to_string().contains(&status.to_string()),
+                    "the failure must name the status the origin gave: {error}"
+                );
+                assert_eq!(
+                    requests.load(Ordering::SeqCst),
+                    1,
+                    "{action}/{status}: one request, the whole of a zero-retry budget"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn refusing_an_error_response_leaves_a_successful_one_alone() {
+        // The control for the two refusal tests: the guard must decide on the status,
+        // not on every response reaching it.
+        let (base_url, _) = start_status_server(200, r#"{"id":1}"#).await;
+
+        let batches = scan_status_dataset(base_url, ErrorResponseAction::Error)
+            .await
+            .expect("a 200 must still be answered with rows");
+
+        let total_rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        assert_eq!(total_rows, 1, "a successful response is still data");
+    }
+
     #[test]
     fn test_extract_next_page_info_nested_pointer() {
         let base_url = Url::parse("https://api.example.com").expect("valid URL");
@@ -8318,11 +9633,15 @@ mod tests {
         // When next_pointer is set but parsed_json is None, it should error
         let headers = vec![];
 
-        let result = super::extract_next_page_info(None, &headers, &config, &base_url, 0);
-        assert!(
-            result.is_err(),
-            "missing parsed JSON should return error when next_pointer is configured"
-        );
+        match super::extract_next_page_info(None, &headers, &config, &base_url, 0) {
+            Err(Error::Pagination { message }) => assert_eq!(
+                message,
+                "JSON not parsed but next_pointer '/next' is configured"
+            ),
+            other => panic!(
+                "missing parsed JSON with a next_pointer configured must be a pagination error, got: {other:?}"
+            ),
+        }
     }
 
     #[test]
@@ -8357,11 +9676,16 @@ mod tests {
         let content = r#"{"data": [1, 2], "page": 3}"#;
         let headers = vec![];
 
-        let result = extract_next_page_info(content, &headers, &config, &base_url);
-        assert!(
-            result.is_err(),
-            "numeric pointer without token_param should error"
-        );
+        match extract_next_page_info(content, &headers, &config, &base_url) {
+            Err(Error::Pagination { message }) => assert_eq!(
+                message,
+                "Failed to extract pagination value from JSON pointer '/page': numeric values require 'pagination_token_param' to be configured",
+                "the error must name the setting that fixes it"
+            ),
+            other => panic!(
+                "a numeric pointer value without token_param must be a pagination error, got: {other:?}"
+            ),
+        }
     }
 
     #[test]
@@ -8371,15 +9695,24 @@ mod tests {
             next_pointer: Some("/next".to_string()),
             ..Default::default()
         };
-        // Boolean value is not a valid pagination pointer
-        let content = r#"{"next": true}"#;
+        // A boolean, array or object is not a valid pagination value. Unlike null
+        // or an empty string (`test_extract_next_page_info_null_means_no_more_pages`),
+        // it must not end pagination quietly.
         let headers = vec![];
 
-        let result = extract_next_page_info(content, &headers, &config, &base_url);
-        assert!(
-            result.is_err(),
-            "non-string/non-number pointer value should return error"
-        );
+        for value in ["true", "[1, 2]", r#"{"page": 2}"#] {
+            let content = format!(r#"{{"next": {value}}}"#);
+            match extract_next_page_info(&content, &headers, &config, &base_url) {
+                Err(Error::Pagination { message }) => assert_eq!(
+                    message,
+                    "Failed to extract pagination value from JSON pointer '/next': expected a string, number, or null",
+                    "next = {value}"
+                ),
+                other => {
+                    panic!("next = {value} must be rejected as a pagination error, got: {other:?}")
+                }
+            }
+        }
     }
 
     #[test]
@@ -8389,11 +9722,15 @@ mod tests {
             ..Default::default()
         };
         // When data_pointer is set but parsed_json is None, it should error
-        let result = super::extract_page_data("", None, &config, None);
-        assert!(
-            result.is_err(),
-            "missing parsed JSON should return error when data_pointer is configured"
-        );
+        match super::extract_page_data("", None, &config, None) {
+            Err(DataFusionError::Execution(message)) => assert_eq!(
+                message,
+                "JSON not parsed but data_pointer '/results' is configured"
+            ),
+            other => panic!(
+                "missing parsed JSON with a data_pointer configured must be an execution error, got: {other:?}"
+            ),
+        }
     }
 
     #[test]
@@ -8973,8 +10310,18 @@ mod tests {
             ..empty_fetch_result()
         };
 
-        exec.create_batch_from_rows(None, None, None, None, &[], &fetch_result)
+        let err = exec
+            .create_batch_from_rows(None, None, None, None, &[], &fetch_result)
             .expect_err("a zero-row 429 must be an error, not a successful empty batch");
+        // A rate limit, not a server failure: the message names the 429 the
+        // origin actually answered.
+        let DataFusionError::External(source) = &err else {
+            panic!("a zero-row 429 must surface as an external (origin) error, got: {err:?}");
+        };
+        assert_eq!(
+            source.to_string(),
+            "HTTP request was rate limited: the origin answered 429 Too Many Requests with an empty body"
+        );
     }
 
     /// A genuinely empty 2xx result (the origin really has no rows to
@@ -9579,6 +10926,173 @@ mod tests {
             partitions,
             None,
         )
+    }
+
+    #[test]
+    fn content_builder_preserves_utf8_empty_nul_and_duplicate_values() {
+        let plain = make_exec(vec![(None, None, None, None)], None);
+        let (cached, _) = plain.for_cache_fetch();
+        let rows: Vec<String> = ["", "雪🌶", "before\0after", "same", "same"]
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        let bytes = rows.iter().map(String::len).sum::<usize>();
+        assert_eq!(
+            HttpExec::content_byte_capacity(rows.iter().map(String::len)).expect("valid bytes"),
+            bytes
+        );
+        for exec in [plain, cached] {
+            let batch = exec
+                .create_batch_from_rows(None, None, None, None, &rows, &empty_fetch_result())
+                .expect("content batch");
+            assert_eq!(
+                string_col(&batch, "content"),
+                rows.iter().cloned().map(Some).collect::<Vec<_>>()
+            );
+            let content = batch.column_by_name("content").expect("content column");
+            assert_eq!(content.data_type(), &DataType::Utf8);
+            assert_eq!(content.null_count(), 0);
+            let content = content
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("Utf8 content");
+            assert_eq!(content.value_data().len(), bytes);
+        }
+    }
+
+    #[test]
+    fn content_byte_capacity_checks_sum_and_utf8_offsets_without_allocating() {
+        let max = usize::try_from(i32::MAX).expect("Utf8 offset fits usize");
+        assert_eq!(
+            HttpExec::content_byte_capacity(std::iter::empty()).expect("empty"),
+            0
+        );
+        assert_eq!(
+            HttpExec::content_byte_capacity([max].into_iter()).expect("maximum offset"),
+            max
+        );
+        HttpExec::content_byte_capacity([max, 1].into_iter())
+            .expect_err("capacity past the largest Utf8 offset");
+        HttpExec::content_byte_capacity([usize::MAX, 1].into_iter())
+            .expect_err("capacity overflows usize");
+    }
+
+    #[test]
+    fn cache_fetch_metadata_matches_plain_http() {
+        let plain = make_exec(vec![(None, None, None, None)], None);
+        let (cached, completion) = plain.for_cache_fetch();
+        let rows = vec!["same".to_string(), "same".to_string()];
+        for query in [None, Some("")] {
+            for body in [None, Some("")] {
+                let batch = cached
+                    .create_batch_from_rows(None, query, body, None, &rows, &empty_fetch_result())
+                    .expect("cache metadata batch");
+                assert_eq!(
+                    string_col(&batch, "request_query"),
+                    vec![Some(query.unwrap_or("").to_string()); 2]
+                );
+                assert_eq!(
+                    string_col(&batch, "request_body"),
+                    vec![Some(body.unwrap_or("").to_string()); 2]
+                );
+                assert_eq!(
+                    string_col(&batch, "content"),
+                    vec![Some("same".to_string()); 2]
+                );
+                let ordinary = plain
+                    .create_batch_from_rows(None, query, body, None, &rows, &empty_fetch_result())
+                    .expect("ordinary metadata batch");
+                assert_eq!(
+                    string_col(&ordinary, "request_query"),
+                    vec![Some(String::new()); 2]
+                );
+                assert_eq!(
+                    string_col(&ordinary, "request_body"),
+                    vec![Some(String::new()); 2]
+                );
+                assert_eq!(batch.schema(), ordinary.schema());
+            }
+        }
+        assert!(
+            !completion.is_complete(),
+            "metadata construction is not exhaustion proof"
+        );
+    }
+
+    #[test]
+    fn cache_fetch_preserves_base_query_and_empty_override_behavior() {
+        let mut provider = base_provider();
+        provider.base_url.set_query(Some("base=one"));
+        let exec = HttpExec::new(
+            provider.schema(),
+            Arc::new(provider),
+            vec![(None, None, None, None)],
+            None,
+        );
+        let (cached, _) = exec.for_cache_fetch();
+        assert_eq!(
+            cached
+                .provider
+                .build_request_url("", None)
+                .expect("default URL")
+                .query(),
+            Some("base=one")
+        );
+        assert_eq!(
+            cached
+                .provider
+                .build_request_url("", Some(""))
+                .expect("override URL")
+                .query(),
+            Some("")
+        );
+        assert_eq!(cached.partitions, exec.partitions);
+    }
+
+    #[test]
+    fn cache_fetch_nested_metadata_matches_plain_http() {
+        let metadata = ["request_query".to_string(), "request_body".to_string()]
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let nesting = HttpJsonNesting::new(
+            vec![
+                "request_query".into(),
+                "request_body".into(),
+                "payload".into(),
+            ],
+            "payload".into(),
+            metadata.clone(),
+            metadata,
+        );
+        let provider = Arc::new(
+            base_provider()
+                .with_json_nesting(nesting.clone(), nesting_schema_with_metadata(&nesting)),
+        );
+        let (cached, _) = HttpExec::new(
+            provider.schema(),
+            provider,
+            vec![(None, None, None, None)],
+            None,
+        )
+        .for_cache_fetch();
+        let batch = cached
+            .create_batch_from_rows(
+                None,
+                None,
+                None,
+                None,
+                &["{\"value\":1}".into()],
+                &empty_fetch_result(),
+            )
+            .expect("nested cache metadata");
+        assert_eq!(
+            string_col(&batch, "request_query"),
+            vec![Some(String::new())]
+        );
+        assert_eq!(
+            string_col(&batch, "request_body"),
+            vec![Some(String::new())]
+        );
     }
 
     #[test]

@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use arrow::array::{ArrayRef, RecordBatch, StringArray, TimestampSecondArray};
 use arrow_schema::{ArrowError, DataType, Field, Schema, SchemaRef, TimeUnit};
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use uuid::Uuid;
 
 use app::App;

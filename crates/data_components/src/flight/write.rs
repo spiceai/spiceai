@@ -18,6 +18,7 @@ use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::{
     catalog::Session,
+    common::TableReference,
     datasource::{
         TableProvider, TableType,
         sink::{DataSink, DataSinkExec},
@@ -26,7 +27,6 @@ use datafusion::{
     execution::{SendableRecordBatchStream, TaskContext},
     logical_expr::{Expr, dml::InsertOp},
     physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, metrics::MetricsSet},
-    sql::TableReference,
 };
 use datafusion_table_providers::util::retriable_error::check_and_mark_retriable_error;
 use flight_client::FlightClient;

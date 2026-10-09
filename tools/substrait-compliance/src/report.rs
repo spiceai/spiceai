@@ -64,6 +64,13 @@ pub struct ComplianceReport {
     pub mode: String,
     pub suite_ref: String,
     pub datafusion_pin: String,
+    /// TPC-H scale factor of the tables the plans ran on.
+    pub scale_factor: Option<f64>,
+    /// Where those tables came from: `suite` (its CSVs) or `tpchgen`.
+    pub data_source: String,
+    /// Where the goldens came from: `suite` (its `expectedOutput` files) or
+    /// the `--expected` directory.
+    pub expected_source: String,
     pub start_time: DateTime<Utc>,
     pub end_time: DateTime<Utc>,
     pub passed: usize,
@@ -83,6 +90,9 @@ pub struct ReportMeta {
     pub mode: String,
     pub suite_ref: String,
     pub datafusion_pin: String,
+    pub scale_factor: Option<f64>,
+    pub data_source: String,
+    pub expected_source: String,
     pub start_time: DateTime<Utc>,
 }
 
@@ -96,6 +106,9 @@ impl ComplianceReport {
             mode,
             suite_ref,
             datafusion_pin,
+            scale_factor,
+            data_source,
+            expected_source,
             start_time,
         } = meta;
         let passed = results
@@ -132,6 +145,9 @@ impl ComplianceReport {
             mode,
             suite_ref,
             datafusion_pin,
+            scale_factor,
+            data_source,
+            expected_source,
             start_time,
             end_time: Utc::now(),
             passed,
@@ -223,6 +239,9 @@ mod tests {
                 mode: "mode-a".to_string(),
                 suite_ref: "spiceai/substrait-compliance@test".to_string(),
                 datafusion_pin: "test".to_string(),
+                scale_factor: Some(0.01),
+                data_source: "suite".to_string(),
+                expected_source: "suite".to_string(),
                 start_time: Utc::now(),
             },
             results,
@@ -261,6 +280,9 @@ mod tests {
                 mode: "mode-a".to_string(),
                 suite_ref: "spiceai/substrait-compliance@test".to_string(),
                 datafusion_pin: "test".to_string(),
+                scale_factor: Some(0.01),
+                data_source: "suite".to_string(),
+                expected_source: "suite".to_string(),
                 start_time: Utc::now(),
             },
             results,

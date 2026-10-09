@@ -142,8 +142,12 @@ pub fn ensure_dml_restriction_reaches_the_table(plan: &LogicalPlan) -> Result<()
             affected: "updated",
         },
         // An insert names its rows outright, and a truncate means every row on
-        // purpose; neither has a condition that could be dropped.
-        WriteOp::Insert(_) | WriteOp::Ctas | WriteOp::Truncate => return Ok(()),
+        // purpose; neither has a condition that could be dropped. A merge carries
+        // its conditions in the merge operation itself rather than in a filter
+        // list extracted from the input, and any other write names no row
+        // condition this guard knows how to check.
+        // (`Insert`, `Ctas`, `Truncate`, `MergeInto`, and any write op added later.)
+        _ => return Ok(()),
     };
 
     let mut found = None;

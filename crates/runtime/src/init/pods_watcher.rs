@@ -69,6 +69,7 @@ fn start_time_only_changes(
         query,
         cpu,
         metrics,
+        state,
         scheduler,
         source_rate_control,
         drasi,
@@ -144,11 +145,17 @@ fn start_time_only_changes(
             !same_start_time_config(cpu.as_ref(), current.cpu.as_ref()),
         ),
         ("runtime.metrics", Process, *metrics != current.metrics),
+        // Read once at startup by the scheduler, results-cache warmup, and
+        // cluster HTTP rate control. A reload rebuilds none of them, so
+        // rate-control state stays at the old location until a restart.
+        ("runtime.state", Process, *state != current.state),
         (
             "runtime.scheduler",
             Process,
             *scheduler != current.scheduler,
         ),
+        // `refresh_interval` is read once at startup; a GitHub connector the
+        // reload recreates re-reads `github_concurrent_connections_limit`.
         (
             "runtime.source_rate_control",
             ProcessAndRecreatedComponents,
@@ -337,6 +344,7 @@ impl Runtime {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
     use std::io::Write;
 
     use parking_lot::Mutex;
@@ -345,14 +353,15 @@ mod tests {
             caching::{CacheConfig, SQLResultsCacheConfig},
             runtime::{
                 ApiKey, ApiKeyAuth, Auth, Cpu, CpuQuantity, Flight, McpConfig, OutputLevel,
-                RuntimeReadyState, Scheduler, SourceRateControl, TlsConfig, TracingConfig,
-                default_max_partition_assignments_per_interval,
+                RuntimeReadyState, RuntimeState, Scheduler, SourceRateControl, TlsConfig,
+                TracingConfig, default_max_partition_assignments_per_interval,
                 default_max_partitions_per_executor, default_partition_assignment_interval,
                 default_partition_discovery_timeout,
             },
         },
         drasi::{DrasiForwarding, DrasiTransport, RuntimeDrasi},
         metric::{Metric, Metrics},
+        param::Params,
     };
     use tracing_subscriber::fmt::MakeWriter;
 
@@ -384,13 +393,20 @@ mod tests {
 
     fn scheduler(state_location: &str) -> Scheduler {
         Scheduler {
-            state_location: state_location.to_string(),
+            state_location: Some(state_location.to_string()),
             params: None,
             partition_assignment_interval: default_partition_assignment_interval(),
             max_partition_assignments_per_interval: default_max_partition_assignments_per_interval(
             ),
             max_partitions_per_executor: default_max_partitions_per_executor(),
             partition_discovery_timeout: default_partition_discovery_timeout(),
+        }
+    }
+
+    fn shared_state(location: &str) -> RuntimeState {
+        RuntimeState {
+            location: location.to_string(),
+            params: None,
         }
     }
 
@@ -522,6 +538,12 @@ mod tests {
                 }),
             ),
             (
+                "runtime.state",
+                Box::new(|rt: &mut SpicepodRuntime| {
+                    rt.state = Some(shared_state("s3://bucket/state"));
+                }),
+            ),
+            (
                 "runtime.scheduler",
                 Box::new(|rt: &mut SpicepodRuntime| {
                     rt.scheduler = Some(scheduler("s3://bucket/state"));
@@ -558,6 +580,40 @@ mod tests {
                 changed_sections(edit),
                 vec![section],
                 "editing {section} must report {section} and nothing else"
+            );
+        }
+    }
+
+    /// Cluster rate control opens its state at `runtime.state` once at
+    /// startup. Moving, re-configuring, or removing that location must ask for
+    /// a full restart, not claim a reload applied part of it.
+    #[test]
+    fn a_runtime_state_change_needs_a_full_restart() {
+        let current = SpicepodRuntime {
+            state: Some(shared_state("s3://bucket/state")),
+            ..SpicepodRuntime::default()
+        };
+        let with_params = RuntimeState {
+            params: Some(Params::from_string_map(HashMap::from([(
+                "s3_region".to_string(),
+                "us-east-1".to_string(),
+            )]))),
+            ..shared_state("s3://bucket/state")
+        };
+
+        for (case, state) in [
+            ("moved", Some(shared_state("s3://other-bucket/state"))),
+            ("given new params", Some(with_params)),
+            ("removed", None),
+        ] {
+            let new = SpicepodRuntime {
+                state,
+                ..current.clone()
+            };
+            assert_eq!(
+                start_time_only_changes(&current, &new),
+                vec![("runtime.state", StartTimeScope::Process)],
+                "runtime.state {case} must be reported as needing a restart"
             );
         }
     }

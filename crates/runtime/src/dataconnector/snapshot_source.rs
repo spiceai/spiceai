@@ -28,11 +28,11 @@ use arrow_tools::map_entries::conforming_schema;
 use async_trait::async_trait;
 use datafusion::{
     catalog::Session,
+    common::TableReference,
     datasource::{TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
     logical_expr::Expr,
     physical_plan::ExecutionPlan,
-    sql::TableReference,
 };
 use runtime_acceleration::sidecar::OpenOption;
 use runtime_acceleration::snapshot::{SnapshotBehavior, SnapshotManager, snapshots_enabled};

@@ -83,6 +83,13 @@ impl TestAccelerationSource {
         self
     }
 
+    /// The secrets its acceleration parameters resolve against; empty unless set.
+    #[must_use]
+    pub fn with_secrets(mut self, secrets: Secrets) -> Self {
+        self.secrets = Arc::new(RwLock::new(secrets));
+        self
+    }
+
     #[must_use]
     pub fn with_acceleration(mut self, acceleration: Acceleration) -> Self {
         self.acceleration = Some(acceleration);
@@ -162,6 +169,12 @@ impl AccelerationSource for TestAccelerationSource {
 
     fn secrets(&self) -> Arc<RwLock<Secrets>> {
         Arc::clone(&self.secrets)
+    }
+
+    fn snapshot_notifications(
+        &self,
+    ) -> Option<Arc<crate::snapshot::notifications::SnapshotNotifications>> {
+        None
     }
 
     fn acceleration(&self) -> Option<&Acceleration> {

@@ -73,7 +73,10 @@ async fn scan_statistics(
     ctx: &SessionContext,
 ) -> TestResult<(Precision<usize>, Vec<Precision<usize>>)> {
     let plan = table.scan(&ctx.state(), None, &[], None).await?;
-    let stats = plan.partition_statistics(None)?;
+    let stats = datafusion::physical_plan::StatisticsContext::new().compute(
+        plan.as_ref(),
+        &datafusion::physical_plan::StatisticsArgs::new(),
+    )?;
     let per_column = stats
         .column_statistics
         .iter()
@@ -82,15 +85,63 @@ async fn scan_statistics(
     Ok((stats.total_byte_size, per_column))
 }
 
-/// The manifest rows a settle produces, waited for rather than read once.
-///
-/// `flush_pending_maintenance` does not guarantee the checkpoint/maintenance passes
-/// have committed their manifest rows by the time it returns, so on a loaded runner
-/// the first read comes back empty — a readiness race in the test, not a missing
-/// file. #13904 observed exactly that here (`TRY 1 FAIL` / `TRY 2 PASS` at the
-/// `!files.is_empty()` premise), and spiceai/spiceai#13906 is the same shape in a
-/// neighbouring suite. Poll the condition with a bound rather than sleeping a fixed
-/// amount, and name the last observed state on failure.
+/// Compare actual rows only after the statistics-source assertions, so the
+/// query cannot populate the blob used as the first footer reference.
+async fn assert_input_rows(table: &Arc<CayenneTableProvider>) -> TestResult<()> {
+    let ctx = SessionContext::new();
+    ctx.register_table("input_rows", Arc::clone(table) as Arc<dyn TableProvider>)?;
+    let widened = table.schema().fields().len() == 3;
+    let sql = if widened {
+        "SELECT id, name, extra FROM input_rows ORDER BY id"
+    } else {
+        "SELECT id, name FROM input_rows ORDER BY id"
+    };
+    let batches = ctx.sql(sql).await?.collect().await?;
+    let mut actual = Vec::new();
+    for batch in batches {
+        assert_eq!(
+            batch.column(0).null_count(),
+            0,
+            "input keys must remain non-NULL"
+        );
+        assert_eq!(
+            batch.column(1).null_count(),
+            0,
+            "input values must remain non-NULL"
+        );
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id array");
+        let names = batch
+            .column(1)
+            .as_any()
+            .downcast_ref::<StringArray>()
+            .expect("name array");
+        if widened {
+            assert_eq!(
+                batch.column(2).null_count(),
+                batch.num_rows(),
+                "the added column is NULL for every original row"
+            );
+        }
+        for row in 0..batch.num_rows() {
+            actual.push((ids.value(row), names.value(row).to_string()));
+        }
+    }
+    let expected: Vec<_> = (0..512).map(|id| (id, format!("name-{id}"))).collect();
+    assert_eq!(actual, expected, "every input row survives reopen");
+    eprintln!(
+        "POST_STATISTICS_ROWS count={} first={:?} last={:?} widened_extra_all_null={widened}",
+        actual.len(),
+        actual.first(),
+        actual.last()
+    );
+    Ok(())
+}
+
+/// Wait for the manifest rows needed to author legacy or poisoned blobs.
 async fn await_manifest_rows(
     fixture: &common::TestFixture,
     table_id: &str,
@@ -108,25 +159,6 @@ async fn await_manifest_rows(
         );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
-}
-
-/// The key a per-file statistics row is stored under: the object-store location,
-/// which is the store-relative path. The manifest carries only the bare filename.
-fn statistics_row_key(
-    data_path: &std::path::Path,
-    table_id: &str,
-    file: &cayenne::metadata::SnapshotFile,
-) -> String {
-    format!(
-        "{}/{}/{}/{}",
-        data_path
-            .to_string_lossy()
-            .trim_start_matches('/')
-            .trim_end_matches('/'),
-        table_id,
-        file.snapshot_id,
-        file.file_path
-    )
 }
 
 async fn file_scan_byte_size_statistics_do_not_depend_on_their_source(
@@ -148,16 +180,20 @@ async fn file_scan_byte_size_statistics_do_not_depend_on_their_source(
                 on_conflict: None,
                 base_path: fixture.data_path.to_string_lossy().to_string(),
                 partition_column: None,
-                vortex_config: VortexConfig::default(),
+                vortex_config: VortexConfig {
+                    inline_max_rows: 0,
+                    ..VortexConfig::default()
+                },
             },
             ctx.runtime_env(),
         )
         .await?,
     );
     insert_rows(&table, 0..512).await?;
-    let _ = table.checkpoint_inlined_data().await;
-    let _ = table.checkpoint_mem_tier().await;
-    table.flush_pending_maintenance().await?;
+    table.drain_in_flight_maintenance().await?;
+    assert_eq!(table.checkpoint_inlined_data().await?, 0);
+    assert_eq!(table.checkpoint_mem_tier().await?, 0);
+    table.drain_in_flight_maintenance().await?;
 
     let (footer_total, footer_columns) = scan_statistics(&table, &ctx).await?;
 
@@ -194,6 +230,8 @@ async fn file_scan_byte_size_statistics_do_not_depend_on_their_source(
         blob_columns, footer_columns,
         "the same file must report the same per-column byte sizes whichever source served it"
     );
+
+    assert_input_rows(&reopened).await?;
 
     Ok(())
 }
@@ -244,16 +282,20 @@ async fn a_blob_without_byte_sizes_is_re_inferred_from_its_footer(
                 on_conflict: None,
                 base_path: fixture.data_path.to_string_lossy().to_string(),
                 partition_column: None,
-                vortex_config: VortexConfig::default(),
+                vortex_config: VortexConfig {
+                    inline_max_rows: 0,
+                    ..VortexConfig::default()
+                },
             },
             ctx.runtime_env(),
         )
         .await?,
     );
     insert_rows(&table, 0..512).await?;
-    let _ = table.checkpoint_inlined_data().await;
-    let _ = table.checkpoint_mem_tier().await;
-    table.flush_pending_maintenance().await?;
+    table.drain_in_flight_maintenance().await?;
+    assert_eq!(table.checkpoint_inlined_data().await?, 0);
+    assert_eq!(table.checkpoint_mem_tier().await?, 0);
+    table.drain_in_flight_maintenance().await?;
 
     let (footer_total, _) = scan_statistics(&table, &ctx).await?;
     assert!(
@@ -267,7 +309,7 @@ async fn a_blob_without_byte_sizes_is_re_inferred_from_its_footer(
     let files = await_manifest_rows(&fixture, &table_id).await?;
     let scan_snapshot_id = files[0].snapshot_id.clone();
     let stats_key = |file: &cayenne::metadata::SnapshotFile| {
-        statistics_row_key(&fixture.data_path, &table_id, file)
+        common::statistics_row_key(&fixture.data_path, &table_id, file)
     };
     for file in &files {
         fixture
@@ -344,6 +386,8 @@ async fn a_blob_without_byte_sizes_is_re_inferred_from_its_footer(
         files.len()
     );
 
+    assert_input_rows(&reopened).await?;
+
     Ok(())
 }
 
@@ -386,16 +430,20 @@ async fn a_widened_table_still_serves_its_files_from_the_persisted_blob(
                 on_conflict: None,
                 base_path: fixture.data_path.to_string_lossy().to_string(),
                 partition_column: None,
-                vortex_config: VortexConfig::default(),
+                vortex_config: VortexConfig {
+                    inline_max_rows: 0,
+                    ..VortexConfig::default()
+                },
             },
             ctx.runtime_env(),
         )
         .await?,
     );
     insert_rows(&table, 0..512).await?;
-    let _ = table.checkpoint_inlined_data().await;
-    let _ = table.checkpoint_mem_tier().await;
-    table.flush_pending_maintenance().await?;
+    table.drain_in_flight_maintenance().await?;
+    assert_eq!(table.checkpoint_inlined_data().await?, 0);
+    assert_eq!(table.checkpoint_mem_tier().await?, 0);
+    table.drain_in_flight_maintenance().await?;
 
     let evolution_ctx = arrow_tools::schema_evolution::EvolutionContext {
         constraint_columns: &[],
@@ -423,7 +471,7 @@ async fn a_widened_table_still_serves_its_files_from_the_persisted_blob(
     let stored_schema = table.schema();
     let files = await_manifest_rows(&fixture, &table_id).await?;
     let stats_key = |file: &cayenne::metadata::SnapshotFile| {
-        statistics_row_key(&fixture.data_path, &table_id, file)
+        common::statistics_row_key(&fixture.data_path, &table_id, file)
     };
     let mut poisoned = 0;
     for file in &files {
@@ -480,6 +528,8 @@ async fn a_widened_table_still_serves_its_files_from_the_persisted_blob(
          reporting the footer's size instead means the blob was rejected and the \
          file re-read, which repeats on every cold scan for the life of the file"
     );
+
+    assert_input_rows(&reopened).await?;
 
     Ok(())
 }

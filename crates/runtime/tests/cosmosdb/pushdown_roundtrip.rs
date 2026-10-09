@@ -52,7 +52,6 @@ use crate::utils::{
 };
 use crate::{configure_test_datafusion, init_tracing};
 
-const PORT: u16 = 8082;
 const IMAGE: &str = "mcr.microsoft.com/cosmosdb/linux/azure-cosmos-emulator:vnext-preview";
 /// The emulator's well-known account key.
 const KEY: &str =
@@ -63,16 +62,14 @@ const CONTAINER: &str = "people";
 /// cannot hold.
 const MIXED_PARTITION_KEYS: &str = "mixed_partition_keys";
 
-fn endpoint() -> String {
-    format!("http://localhost:{PORT}/")
+fn endpoint(port: u16) -> String {
+    format!("http://localhost:{port}/")
 }
 
-async fn start_emulator() -> Result<RunningContainer<'static>, anyhow::Error> {
-    let name: &'static str =
-        Box::leak(format!("runtime-integration-test-cosmosdb-{PORT}").into_boxed_str());
-    ContainerRunnerBuilder::new(name)
+async fn start_emulator() -> Result<RunningContainer, anyhow::Error> {
+    ContainerRunnerBuilder::new("runtime-integration-test-cosmosdb")
         .image(IMAGE.to_string())
-        .add_port_binding(8081, PORT)
+        .publish_port(8081)
         .command(["--enable-explorer", "false"])
         .healthcheck(HealthConfig {
             test: Some(vec![
@@ -108,8 +105,8 @@ fn documents() -> Vec<Value> {
     ]
 }
 
-async fn seed() -> Result<(), anyhow::Error> {
-    let client = CosmosClient::with_key(&endpoint(), Secret::from(KEY), None)?;
+async fn seed(port: u16) -> Result<(), anyhow::Error> {
+    let client = CosmosClient::with_key(&endpoint(port), Secret::from(KEY), None)?;
     let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(20)).build();
     // The emulator answers before it serves requests; creating the database
     // is what shows it is up.
@@ -166,15 +163,16 @@ async fn seed() -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-fn dataset(container: &str, name: &str, accelerated: bool) -> Dataset {
+fn dataset(port: u16, container: &str, name: &str, accelerated: bool) -> Dataset {
     let mut dataset = Dataset::new(format!("cosmosdb:{DATABASE}.{container}"), name.to_string());
     dataset.params = Some(Params::from_string_map(HashMap::from([(
         "cosmosdb_connection_string".to_string(),
-        format!("AccountEndpoint={};AccountKey={KEY};", endpoint()),
+        format!("AccountEndpoint={};AccountKey={KEY};", endpoint(port)),
     )])));
     if accelerated {
         dataset.acceleration = Some(Acceleration {
             enabled: true,
+            engine: Some("arrow".to_string()),
             ..Acceleration::default()
         });
     }
@@ -273,13 +271,19 @@ async fn cosmosdb_pushdown_round_trips() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
-            let _container = start_emulator().await?;
-            seed().await?;
+            let container = start_emulator().await?;
+            let port = container.host_port(8081)?;
+            seed(port).await?;
 
             let app = AppBuilder::new("cosmosdb_pushdown_round_trips")
-                .with_dataset(dataset(CONTAINER, "federated", false))
-                .with_dataset(dataset(CONTAINER, "local", true))
-                .with_dataset(dataset(MIXED_PARTITION_KEYS, MIXED_PARTITION_KEYS, false))
+                .with_dataset(dataset(port, CONTAINER, "federated", false))
+                .with_dataset(dataset(port, CONTAINER, "local", true))
+                .with_dataset(dataset(
+                    port,
+                    MIXED_PARTITION_KEYS,
+                    MIXED_PARTITION_KEYS,
+                    false,
+                ))
                 .with_sql_cache(SQLResultsCacheConfig {
                     enabled: false,
                     ..Default::default()

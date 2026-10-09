@@ -15,7 +15,7 @@ limitations under the License.
 */
 
 use app::App;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use std::ops::{Deref, DerefMut};
 use std::sync::Arc;
 
@@ -188,6 +188,12 @@ impl AccelerationSource for Dataset {
 
     fn secrets(&self) -> Arc<tokio::sync::RwLock<crate::secrets::Secrets>> {
         self.runtime.secrets()
+    }
+
+    fn snapshot_notifications(
+        &self,
+    ) -> Option<Arc<runtime_acceleration::snapshot::notifications::SnapshotNotifications>> {
+        self.runtime.datafusion().snapshot_notifications()
     }
 
     fn acceleration(&self) -> Option<&Acceleration> {

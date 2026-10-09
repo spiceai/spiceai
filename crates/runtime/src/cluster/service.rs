@@ -32,14 +32,12 @@ use arrow_ipc::writer::StreamWriter;
 use data_components::flightsql::FlightSqlClient;
 
 use datafusion::{
+    common::TableReference,
     prelude::Expr,
-    sql::{
-        TableReference,
-        sqlparser::{
-            ast::{Ident, ObjectNamePart, visit_relations_mut},
-            dialect::PostgreSqlDialect,
-            parser::Parser,
-        },
+    sql::sqlparser::{
+        ast::{Ident, ObjectNamePart, visit_relations_mut},
+        dialect::PostgreSqlDialect,
+        parser::Parser,
     },
 };
 
@@ -1519,9 +1517,11 @@ fn rewrite_task_history_sql(sql: &str) -> Result<String, String> {
 mod tests {
     use super::*;
     use app::AppBuilder;
+    use arrow::array::StringArray;
     use arrow::datatypes::{DataType, Field, Schema};
     use async_trait::async_trait;
     use datafusion::datasource::MemTable;
+    use opentelemetry_sdk::metrics::SdkMeterProvider;
     use runtime_proto::{
         cluster_service_client::ClusterServiceClient, cluster_service_server::ClusterServiceServer,
     };
@@ -1570,6 +1570,19 @@ mod tests {
         secrets: Secrets,
         allow_secret_expansion: bool,
     ) -> ClusterServiceImpl {
+        make_test_service_full(app, secrets, allow_secret_expansion, None, &[]).await
+    }
+
+    /// Builds the service under test. `trace_ids` seed the local task history
+    /// table (a single `trace_id` column), and `metrics_reader` is what
+    /// `GetMetrics` collects from.
+    async fn make_test_service_full(
+        app: Option<Arc<App>>,
+        secrets: Secrets,
+        allow_secret_expansion: bool,
+        metrics_reader: Option<MetricsReader>,
+        trace_ids: &[&str],
+    ) -> ClusterServiceImpl {
         let runtime = crate::Runtime::builder().build().await;
         let datafusion = Arc::new(
             DataFusion::builder(
@@ -1584,9 +1597,20 @@ mod tests {
             DataType::Utf8,
             false,
         )]));
+        let task_history_batches = if trace_ids.is_empty() {
+            vec![]
+        } else {
+            vec![
+                RecordBatch::try_new(
+                    Arc::clone(&task_history_schema),
+                    vec![Arc::new(StringArray::from(trace_ids.to_vec()))],
+                )
+                .expect("seeded task history batch should be valid"),
+            ]
+        };
         let task_history_table = Arc::new(
-            MemTable::try_new(Arc::clone(&task_history_schema), vec![vec![]])
-                .expect("empty task history table should be created"),
+            MemTable::try_new(Arc::clone(&task_history_schema), vec![task_history_batches])
+                .expect("task history table should be created"),
         );
         datafusion
             .ctx
@@ -1635,7 +1659,7 @@ mod tests {
             Arc::new(TokioRwLock::new(HashMap::new())),
             datafusion,
             executor_registry,
-            None,
+            metrics_reader,
             allow_secret_expansion,
         )
     }
@@ -1644,8 +1668,73 @@ mod tests {
         make_test_service_with(None, Secrets::default(), true).await
     }
 
-    async fn make_test_client() -> (ClusterServiceClient<Channel>, CancellationToken) {
-        let service = make_test_service().await;
+    /// A service whose local task history holds `trace_ids`.
+    async fn make_test_service_with_task_history(trace_ids: &[&str]) -> ClusterServiceImpl {
+        make_test_service_full(None, Secrets::default(), true, None, trace_ids).await
+    }
+
+    /// A metrics reader holding one cumulative counter,
+    /// `cluster_rpc_test_counter`, at 7, so a `GetMetrics` payload carries a
+    /// known value. The provider is local rather than global, so no other test
+    /// sees it, and must be held for as long as the reader is collected.
+    fn metrics_reader_with_test_counter() -> (MetricsReader, SdkMeterProvider) {
+        use opentelemetry::metrics::MeterProvider as _;
+
+        let reader = MetricsReader::new_cumulative();
+        let provider = SdkMeterProvider::builder()
+            .with_reader(reader.clone())
+            .build();
+        provider
+            .meter("cluster_service_test")
+            .u64_counter("cluster_rpc_test_counter")
+            .build()
+            .add(7, &[]);
+        (reader, provider)
+    }
+
+    /// Every integer data point of the sum `name` in an OTLP `GetMetrics`
+    /// payload.
+    fn otlp_sum_points(payload: &[u8], name: &str) -> Vec<i64> {
+        use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest;
+        use opentelemetry_proto::tonic::metrics::v1::{metric::Data, number_data_point::Value};
+        use prost::Message as _;
+
+        let request = ExportMetricsServiceRequest::decode(payload)
+            .expect("GetMetrics payload should be an OTLP export request");
+        request
+            .resource_metrics
+            .iter()
+            .flat_map(|resource| &resource.scope_metrics)
+            .flat_map(|scope| &scope.metrics)
+            .filter(|metric| metric.name == name)
+            .flat_map(|metric| match &metric.data {
+                Some(Data::Sum(sum)) => sum.data_points.iter(),
+                other => panic!("{name} should be a sum, got {other:?}"),
+            })
+            .map(|point| match &point.value {
+                Some(Value::AsInt(value)) => *value,
+                other => panic!("{name} should have an integer value, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// Decodes a `GetTaskHistory` Arrow IPC payload and renders it as a table.
+    fn render_task_history(arrow_ipc: Vec<u8>) -> String {
+        let reader =
+            arrow_ipc::reader::StreamReader::try_new(std::io::Cursor::new(arrow_ipc), None)
+                .expect("task history payload should be an Arrow IPC stream");
+        let batches = reader
+            .collect::<Result<Vec<_>, _>>()
+            .expect("task history batches should decode");
+        arrow::util::pretty::pretty_format_batches(&batches)
+            .expect("task history batches should render")
+            .to_string()
+    }
+
+    /// Serves `service` over a real tonic transport on a loopback port.
+    async fn serve_test_service(
+        service: ClusterServiceImpl,
+    ) -> (ClusterServiceClient<Channel>, CancellationToken) {
         let listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("test cluster service listener should bind");
@@ -1851,52 +1940,77 @@ mod tests {
         assert!(err.message().contains("Unable to expand secret PG_PASS"));
     }
 
+    /// Back-to-back requests a transport test issues: well past any burst a
+    /// rate limiter would let through.
+    const REPEATED_REQUESTS: usize = 20;
+
     #[tokio::test]
     async fn test_internal_get_metrics_transport_allows_repeated_requests() {
-        let (mut client, shutdown) = make_test_client().await;
+        let (metrics_reader, _provider) = metrics_reader_with_test_counter();
+        let service =
+            make_test_service_full(None, Secrets::default(), true, Some(metrics_reader), &[]).await;
+        let (mut client, shutdown) = serve_test_service(service).await;
 
         // Internal cluster RPCs are intentionally not rate-limited; the Prometheus HTTP
-        // metrics endpoint applies the external scrape limit.
-        client
-            .get_metrics(Request::new(GetMetricsRequest {}))
-            .await
-            .expect("first metrics request should succeed");
-
-        client
-            .get_metrics(Request::new(GetMetricsRequest {}))
-            .await
-            .expect("second metrics request should also succeed");
+        // metrics endpoint applies the external scrape limit. Every request must succeed
+        // and carry the node's metrics.
+        for attempt in 1..=REPEATED_REQUESTS {
+            let response = client
+                .get_metrics(Request::new(GetMetricsRequest {}))
+                .await
+                .unwrap_or_else(|status| {
+                    panic!("metrics request {attempt} should succeed, got {status:?}")
+                });
+            assert_eq!(
+                otlp_sum_points(
+                    &response.into_inner().otlp_metrics,
+                    "cluster_rpc_test_counter"
+                ),
+                vec![7],
+                "metrics request {attempt}"
+            );
+        }
 
         shutdown.cancel();
     }
 
     #[tokio::test]
     async fn test_internal_get_task_history_transport_allows_repeated_requests() {
-        let (mut client, shutdown) = make_test_client().await;
+        let service = make_test_service_with_task_history(&["trace-a", "trace-b"]).await;
+        let (mut client, shutdown) = serve_test_service(service).await;
         let request = || {
             Request::new(GetTaskHistoryRequest {
                 sql: format!(
-                    "SELECT trace_id FROM \"{SPICE_RUNTIME_SCHEMA}\".\"{DEFAULT_TASK_HISTORY_TABLE}\""
+                    "SELECT trace_id FROM \"{SPICE_RUNTIME_SCHEMA}\".\"{DEFAULT_TASK_HISTORY_TABLE}\" ORDER BY trace_id"
                 ),
             })
         };
 
-        client
-            .get_task_history(request())
-            .await
-            .expect("first task history request should succeed");
-
-        client
-            .get_task_history(request())
-            .await
-            .expect("second task history request should also succeed");
+        for attempt in 1..=REPEATED_REQUESTS {
+            let response = client
+                .get_task_history(request())
+                .await
+                .unwrap_or_else(|status| {
+                    panic!("task history request {attempt} should succeed, got {status:?}")
+                });
+            assert_eq!(
+                render_task_history(response.into_inner().arrow_ipc),
+                "+----------+\n\
+                 | trace_id |\n\
+                 +----------+\n\
+                 | trace-a  |\n\
+                 | trace-b  |\n\
+                 +----------+",
+                "task history request {attempt}"
+            );
+        }
 
         shutdown.cancel();
     }
 
     #[tokio::test]
     async fn get_task_history_allows_select() {
-        let service = make_test_service().await;
+        let service = make_test_service_with_task_history(&["trace-a"]).await;
         let response = service
             .get_task_history(Request::new(GetTaskHistoryRequest {
                 sql: format!(
@@ -1905,8 +2019,16 @@ mod tests {
             }))
             .await
             .expect("SELECT against task_history must succeed under read-only");
-        // Empty MemTable still produces a valid response (possibly empty IPC).
-        let _ = response.into_inner().arrow_ipc;
+        // The query named `task_history`; the row can only have come from the
+        // seeded `local_task_history`, so the rewrite ran under the read-only gate.
+        assert_eq!(
+            render_task_history(response.into_inner().arrow_ipc),
+            "+----------+\n\
+             | trace_id |\n\
+             +----------+\n\
+             | trace-a  |\n\
+             +----------+"
+        );
     }
 
     #[tokio::test]
@@ -2069,17 +2191,20 @@ mod tests {
     #[test]
     fn test_rewrite_task_history_sql_rejects_other_tables() {
         let sql = r#"SELECT * FROM "runtime"."other_table""#;
-        let result = rewrite_task_history_sql(sql);
-        assert!(result.is_err(), "Should reject queries to other tables");
+        assert_eq!(
+            rewrite_task_history_sql(sql),
+            Err(r#"Query must reference the "runtime"."task_history" table"#.to_string())
+        );
     }
 
     #[test]
     fn test_rewrite_task_history_sql_rejects_multiple_statements() {
+        // Both statements parse, so this is the statement-smuggling guard, not a
+        // parse failure.
         let sql = r#"SELECT * FROM "runtime"."task_history"; DROP TABLE foo"#;
-        let result = rewrite_task_history_sql(sql);
-        assert!(
-            result.is_err(),
-            "Should reject multiple statements: {result:?}"
+        assert_eq!(
+            rewrite_task_history_sql(sql),
+            Err("Expected single SQL statement, got 2".to_string())
         );
     }
 

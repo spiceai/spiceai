@@ -19,9 +19,9 @@ use std::{collections::HashMap, sync::Arc};
 use app::App;
 
 use datafusion::{
+    common::{ResolvedTableReference, TableReference},
     execution::TaskContext,
     logical_expr::Expr,
-    sql::{ResolvedTableReference, TableReference},
 };
 use datafusion_proto::bytes::Serializeable;
 use runtime_datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};

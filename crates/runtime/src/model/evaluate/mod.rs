@@ -14,22 +14,28 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! System One evaluation model loader (`TypeSafe` Jev).
+//! System One evaluation model loader (`TypeSafe` Jev). Chat models get their
+//! evaluator from [`super::LoadedChatModel::evaluator`].
 
 #![expect(clippy::implicit_hasher)]
 
+use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Instant;
+
+use async_trait::async_trait;
 use llms::chat::Error as LlmError;
-use llms::evaluate::Evaluate;
+use llms::evaluate::{Evaluate, EvaluateRequest, EvaluateResponse, Result as EvaluateResult};
 use llms::typesafe::TypeSafe;
+use opentelemetry::{Key, KeyValue, Value};
 use runtime_rate_control::RateController;
 use runtime_secrets::Secrets;
 use secrecy::ExposeSecret;
 use spicepod::component::model::{Model, ModelSource};
-use std::collections::HashMap;
-use std::sync::Arc;
 use tokio::sync::RwLock;
 
 use super::chat::typed_params;
+use super::metrics::{handle_metrics, handle_token_metrics};
 use super::params::typesafe::TypeSafeModelParams;
 use super::rate_limit::build_model_rate_controller;
 
@@ -98,7 +104,50 @@ async fn typesafe(
         client = client.with_base_url(typed.endpoint);
     }
 
-    Ok((Arc::new(client) as Arc<dyn Evaluate>, rate_controller))
+    let metered = Metered {
+        name: component.name.clone(),
+        model: Arc::new(client),
+    };
+    Ok((Arc::new(metered) as Arc<dyn Evaluate>, rate_controller))
+}
+
+/// A System One model recorded in the LLM request, failure, duration and token metrics.
+///
+/// Evaluations are inference, so they belong in the same series as chat and responses.
+/// A chat model's evaluator needs no such wrapper: every call it makes goes through the
+/// chat model, which records it.
+#[derive(Debug)]
+struct Metered {
+    name: String,
+    model: Arc<dyn Evaluate>,
+}
+
+#[async_trait]
+impl Evaluate for Metered {
+    async fn evaluate(&self, request: EvaluateRequest) -> EvaluateResult<EvaluateResponse> {
+        let labels = [KeyValue::new(
+            Key::new("model"),
+            Value::String(self.name.clone().into()),
+        )];
+        let start = Instant::now();
+        let result = self.model.evaluate(request).await;
+        handle_metrics(start.elapsed(), result.is_err(), &labels);
+        if let Ok(EvaluateResponse {
+            usage: Some(usage), ..
+        }) = &result
+        {
+            handle_token_metrics(
+                u32::try_from(usage.input_tokens).unwrap_or(u32::MAX),
+                u32::try_from(usage.output_tokens).unwrap_or(u32::MAX),
+                &labels,
+            );
+        }
+        result
+    }
+
+    async fn health(&self) -> EvaluateResult<()> {
+        self.model.health().await
+    }
 }
 
 /// Whether this Spicepod model is an evaluation-only (non-chat) source.

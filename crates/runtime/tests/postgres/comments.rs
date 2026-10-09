@@ -133,8 +133,8 @@ async fn test_postgres_obj_description_with_duckdb_acceleration() -> Result<(), 
 
     test_request_context()
         .scope(async {
-            let port = common::get_random_port()?;
-            let _container = common::start_postgres_docker_container(port).await?;
+            let container = common::start_postgres_docker_container().await?;
+            let port = usize::from(container.host_port(5432)?);
 
             seed_orders(port).await?;
 
@@ -166,8 +166,8 @@ async fn test_postgres_col_description_with_duckdb_acceleration() -> Result<(), 
 
     test_request_context()
         .scope(async {
-            let port = common::get_random_port()?;
-            let _container = common::start_postgres_docker_container(port).await?;
+            let container = common::start_postgres_docker_container().await?;
+            let port = usize::from(container.host_port(5432)?);
 
             seed_orders(port).await?;
 

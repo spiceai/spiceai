@@ -121,6 +121,7 @@ impl DataSink for CayennePartitionedOverwriteSink {
         // file writers; the session config drives that count to match the
         // rest of the query (see PR #10822).
         let target_partitions = context.session_config().target_partitions();
+        let superseded = util::session_state::superseded_rows(context.session_config());
 
         // Step 1: route each input batch to its partition's writer task.
         // On first-seen partition, spawn a `tokio::task` that calls
@@ -151,7 +152,11 @@ impl DataSink for CayennePartitionedOverwriteSink {
                     s.clone()
                 } else {
                     let (handle, tx) = self
-                        .prepare_new_provider_for_partition(partition_values, target_partitions)
+                        .prepare_new_provider_for_partition(
+                            partition_values,
+                            target_partitions,
+                            superseded.clone(),
+                        )
                         .await?;
                     senders.insert(partition_key.clone(), tx.clone());
                     handles.push(handle);
@@ -185,7 +190,11 @@ impl DataSink for CayennePartitionedOverwriteSink {
             };
             for partition_values in unreached {
                 match self
-                    .prepare_new_provider_for_partition(partition_values, target_partitions)
+                    .prepare_new_provider_for_partition(
+                        partition_values,
+                        target_partitions,
+                        superseded.clone(),
+                    )
                     .await
                 {
                     Ok((handle, sender)) => {
@@ -315,7 +324,8 @@ impl CayennePartitionedOverwriteSink {
     /// cross-partition case.
     ///
     /// Retries on `SQLITE_BUSY` / `SQLITE_LOCKED` (and the equivalent Turso
-    /// `BEGIN CONCURRENT` write-conflict at commit time). Each retry opens a
+    /// `BEGIN CONCURRENT` write-write conflict, which a partition's statement can
+    /// raise as well as the commit). Each retry opens a
     /// fresh transaction and re-runs every `PreparedOverwrite::apply_in_txn`
     /// — the prepared receipts are immutable (data already on disk in their
     /// new snapshot directories), so re-applying their catalog mutations is
@@ -339,9 +349,18 @@ impl CayennePartitionedOverwriteSink {
                 }
             }
             if let Some(e) = apply_err {
-                // Drop the transaction (auto-rollback). Retry if the failure
+                // Roll back explicitly (not via the transaction's best-effort,
+                // possibly-detached Drop) so the metastore connection is released
+                // before this attempt backs off and retries. Retry if the failure
                 // looks transient.
-                drop(txn);
+                if let Err(rollback_error) = txn.rollback().await {
+                    tracing::debug!(
+                        attempt,
+                        max_attempts,
+                        %rollback_error,
+                        "Rolling back the multi-partition commit before retrying reported an error"
+                    );
+                }
                 if attempt < max_attempts && cayenne::is_retryable_write_conflict(&e) {
                     let delay = turso_shared::retry_backoff_delay(attempt);
                     tracing::debug!(
@@ -384,6 +403,7 @@ impl CayennePartitionedOverwriteSink {
         &self,
         partition_values: Vec<ScalarValue>,
         target_partitions: usize,
+        superseded: Option<Arc<util::session_state::SupersededRows>>,
     ) -> Result<
         (
             JoinHandle<cayenne::provider::Result<PreparedOverwrite>>,
@@ -402,7 +422,9 @@ impl CayennePartitionedOverwriteSink {
             )
         })?;
 
-        let cayenne_owned = cayenne.clone_for_write_operations();
+        let cayenne_owned = cayenne
+            .clone_for_write_operations()
+            .with_superseded_rows(superseded);
         let (tx, rx) = mpsc::channel::<datafusion::common::Result<RecordBatch>>(
             PARTITION_WRITER_CHANNEL_DEPTH,
         );
