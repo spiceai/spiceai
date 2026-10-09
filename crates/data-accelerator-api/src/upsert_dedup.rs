@@ -443,11 +443,12 @@ mod tests {
     use datafusion::datasource::TableProvider;
     use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::datasource::source::DataSourceExec;
+    use datafusion::error::DataFusionError;
     use datafusion::execution::TaskContext;
     use datafusion::logical_expr::dml::InsertOp;
     use datafusion::physical_plan::{ExecutionPlan, collect};
     use datafusion::prelude::SessionContext;
-    use datafusion_table_providers::util::constraints::UpsertOptions;
+    use datafusion_table_providers::util::constraints::{Error as ConstraintError, UpsertOptions};
 
     fn schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
@@ -691,9 +692,30 @@ mod tests {
         ));
 
         let ctx = Arc::new(TaskContext::default());
+        let err = collect(dedup, ctx)
+            .await
+            .expect_err("conflicting rows for one key must not be silently deduplicated");
+
+        // The failure must be the uniqueness violation on `id` itself, not an
+        // unrelated error (an internal invariant, a schema mismatch) that a
+        // bare `is_err()` would also accept.
+        let DataFusionError::External(external) = &err else {
+            panic!("expected the constraint violation as an external error, got: {err:?}");
+        };
+        let violation = external
+            .downcast_ref::<ConstraintError>()
+            .unwrap_or_else(|| panic!("expected a constraint validation error, got: {external:?}"));
         assert!(
-            collect(dedup, ctx).await.is_err(),
-            "conflicting rows for one key must not be silently deduplicated"
+            matches!(
+                violation,
+                ConstraintError::BatchViolatesUniquenessConstraint { unique_cols }
+                    if *unique_cols == ["id"]
+            ),
+            "expected a uniqueness violation on `id`, got: {violation:?}"
+        );
+        assert_eq!(
+            violation.to_string(),
+            "Incoming data violates uniqueness constraint on column(s): id"
         );
     }
 
@@ -917,19 +939,29 @@ mod tests {
 
     #[test]
     fn with_new_children_rejects_the_wrong_child_count() {
+        const WRONG_CHILD_COUNT: &str = "UpsertDedupExec requires exactly one child";
+
         let dedup = Arc::new(UpsertDedupExec::new(
             source(&[vec![batch(&[(1, "a")])]]),
             pk_constraints(),
             last_write_wins(),
         ));
 
-        Arc::clone(&dedup)
+        let no_children = Arc::clone(&dedup)
             .replace_children(
                 vec![],
                 ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
             )
             .expect_err("no children must be rejected");
-        dedup
+        assert!(
+            matches!(
+                &no_children,
+                DataFusionError::Internal(msg) if msg == WRONG_CHILD_COUNT
+            ),
+            "unexpected error for no children: {no_children:?}"
+        );
+
+        let two_children = dedup
             .replace_children(
                 vec![
                     source(&[vec![batch(&[(1, "a")])]]),
@@ -938,5 +970,12 @@ mod tests {
                 ReplaceChildrenOptions::new(ChildrenPropertiesMode::Recompute),
             )
             .expect_err("two children must be rejected");
+        assert!(
+            matches!(
+                &two_children,
+                DataFusionError::Internal(msg) if msg == WRONG_CHILD_COUNT
+            ),
+            "unexpected error for two children: {two_children:?}"
+        );
     }
 }

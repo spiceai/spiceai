@@ -78,11 +78,9 @@ pub enum Error {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VersionsByTime {
     /// The accelerator resolves a full refresh's repeated keys as it writes them, by
-    /// the row versions the refresh supplies (unpartitioned Cayenne).
+    /// the row versions the refresh supplies. An append's first load into an empty
+    /// table gets them too when the accelerator says it would take it.
     pub versions_resolved_after_write: bool,
-    /// It also resolves them for an append into an empty table (unpartitioned
-    /// file-mode Cayenne; a table with `retention_sql` refuses such a load).
-    pub appends_resolved_after_write: bool,
 }
 
 #[derive(Clone, Debug)]

@@ -3469,6 +3469,38 @@ mod tests {
             .expect(
                 "an entries declaration the Arrow map layout forbids is not a schema change and must not fail the write",
             );
+
+        // Control: a genuinely different map — its values `Utf8` -> `Int64` — reaches
+        // the classifier on the same task and `on_schema_change: fail` rejects it, so
+        // the pass above is the entries rule (#13549) and not an early return.
+        let int_values = DataType::Map(
+            Arc::new(Field::new(
+                "entries",
+                DataType::Struct(
+                    vec![
+                        Field::new("keys", DataType::Utf8, false),
+                        Field::new("values", DataType::Int64, true),
+                    ]
+                    .into(),
+                ),
+                false,
+            )),
+            false,
+        );
+        let changed = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("headers", int_values, true),
+        ]));
+        let Err(e) = task.maybe_evolve_schema_for_cdc(&changed).await else {
+            panic!("expected `on_schema_change: fail` to reject a map whose value type changed")
+        };
+        let message = e.to_string();
+        assert!(
+            message.contains(
+                "incompatible schema change detected on the CDC stream for cdc_map_entries_accepted"
+            ) && message.contains("The type of `headers` changed from"),
+            "unexpected error: {message}"
+        );
     }
 
     #[tokio::test]
@@ -7246,17 +7278,34 @@ mod tests {
         );
     }
 
+    /// A CDC delete keyed on a `NULL` string primary key is refused rather than
+    /// turned into `name IN ('')`, which would delete whatever row holds an empty
+    /// key. Drives the production delete-predicate builder the CDC apply uses.
     #[test]
-    fn test_get_primary_key_value_null_utf8_returns_error() {
-        let schema = Arc::new(Schema::new(vec![Field::new("name", DataType::Utf8, true)]));
-        let name_array: ArrayRef = Arc::new(StringArray::from(vec![Option::<&str>::None]));
-        let batch =
-            RecordBatch::try_new(schema, vec![name_array]).expect("Failed to create RecordBatch");
+    fn a_cdc_delete_with_a_null_utf8_primary_key_is_an_error() {
+        use runtime_acceleration::change_sink::provider::deletion::build_batch_delete_expr_from_change_batch;
 
-        let result = get_primary_key_value(&batch, "name");
+        let change_batch =
+            create_test_change_batch(vec!["d"], &[vec!["name"]], vec![1], vec![None]);
+
+        let err = build_batch_delete_expr_from_change_batch(&change_batch, &[0], "test_dataset")
+            .expect_err("a NULL primary key must not become a delete predicate");
+        let datafusion::error::DataFusionError::External(source) = &err else {
+            panic!("expected the predicate builder's NULL-key error, got: {err}");
+        };
         assert!(
-            result.is_err(),
-            "NULL primary key should return an error, not silently produce empty string"
+            matches!(
+                source.downcast_ref::<data_components::pk_filter_expr::Error>(),
+                Some(data_components::pk_filter_expr::Error::PrimaryKeyNullValue {
+                    field_name,
+                    row: 0,
+                }) if field_name == "name"
+            ),
+            "expected the NULL-key error for 'name' at row 0, got: {err}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "External error: Primary key column 'name' has NULL value at row 0"
         );
     }
 

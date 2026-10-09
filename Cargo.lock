@@ -6919,7 +6919,7 @@ dependencies = [
 [[package]]
 name = "datafusion-federation"
 version = "0.4.2"
-source = "git+https://github.com/spiceai/datafusion-federation.git?rev=9ca84a39760d7728bdeb5eac8480a3f9ee8422be#9ca84a39760d7728bdeb5eac8480a3f9ee8422be"
+source = "git+https://github.com/spiceai/datafusion-federation.git?rev=750561d79e88fd48afd06b6a136e3bc1dc2b8a12#750561d79e88fd48afd06b6a136e3bc1dc2b8a12"
 dependencies = [
  "arrow-json",
  "async-stream",
@@ -7418,7 +7418,7 @@ dependencies = [
 [[package]]
 name = "datafusion-table-providers"
 version = "0.1.0"
-source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=465926a30443ebfbbc95366b6f0277bff80a8ba9#465926a30443ebfbbc95366b6f0277bff80a8ba9"
+source = "git+https://github.com/spiceai/datafusion-table-providers.git?rev=b4a86350d571921829e5ad141d94dc2470f98b17#b4a86350d571921829e5ad141d94dc2470f98b17"
 dependencies = [
  "adbc_core",
  "adbc_driver_manager",
@@ -8001,7 +8001,7 @@ checksum = "ab23e69df104e2fd85ee63a533a22d2132ef5975dc6b36f9f3e5a7305e4a8ed7"
 [[package]]
 name = "duckdb"
 version = "1.4.4"
-source = "git+https://github.com/spiceai/duckdb-rs.git?rev=8ee430737cb6999025d0b29672ec6cb92df19b6d#8ee430737cb6999025d0b29672ec6cb92df19b6d"
+source = "git+https://github.com/spiceai/duckdb-rs.git?rev=504debbf8269a76aef74daa2247b6296c2fe2290#504debbf8269a76aef74daa2247b6296c2fe2290"
 dependencies = [
  "arrow",
  "calamine",
@@ -11671,7 +11671,7 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 [[package]]
 name = "libduckdb-sys"
 version = "1.4.4"
-source = "git+https://github.com/spiceai/duckdb-rs.git?rev=8ee430737cb6999025d0b29672ec6cb92df19b6d#8ee430737cb6999025d0b29672ec6cb92df19b6d"
+source = "git+https://github.com/spiceai/duckdb-rs.git?rev=504debbf8269a76aef74daa2247b6296c2fe2290#504debbf8269a76aef74daa2247b6296c2fe2290"
 dependencies = [
  "cc",
  "flate2",
@@ -17959,6 +17959,7 @@ dependencies = [
  "object_store 0.13.2",
  "object_store_occ",
  "opentelemetry",
+ "opentelemetry_sdk",
  "parking_lot",
  "prost 0.14.3",
  "runtime-datafusion",
@@ -18160,6 +18161,7 @@ name = "runtime-metrics"
 version = "2.4.0-unstable"
 dependencies = [
  "opentelemetry",
+ "opentelemetry_sdk",
  "runtime-api-types",
  "snafu",
  "telemetry",

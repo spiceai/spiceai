@@ -376,21 +376,22 @@ github_compare_files() {
   # three-dot compare: merge-base of trunk...head → head (same as a PR diff).
   # GitHub caps the files list at 300; when truncated, skip targeted pre-lint
   # rather than linting an incomplete package set.
-  # Emit: first line "true"/"false" (truncated), then one filename per line.
+  # Emit the file count, then both paths of each rename and other filenames.
   # Keep stderr so auth/rate-limit/network errors from `gh` are visible when
   # the compare fallback fails (caller still degrades to full workspace lint).
   payload=$(gh api "repos/${repo}/compare/${LINT_BASE_BRANCH}...${head_sha}" \
-    --jq '(.truncated // false | tostring), (.files[]?.filename // empty)') \
+    --jq 'if (.files | type) != "array" then error("compare response has no file list") else (.files | length), (.files[] | .filename, .previous_filename // empty) end') \
     || return 1
 
-  local truncated rest
-  truncated="${payload%%$'\n'*}"
-  if [[ "$truncated" == "true" ]]; then
+  local count rest
+  count="${payload%%$'\n'*}"
+  # The compare API caps its file list at 300 without a truncation flag.
+  if [[ ! "$count" =~ ^[0-9]+$ ]] || (( count >= 300 )); then
     debug "GitHub compare is truncated (300+ files) — skipping targeted pre-lint"
     return 1
   fi
   rest="${payload#*$'\n'}"
-  # When there are no files, payload is a single line ("false") and rest==payload.
+  # When there are no files, payload is a single line ("0") and rest==payload.
   if [[ "$rest" == "$payload" ]]; then
     return 0
   fi
@@ -409,7 +410,12 @@ changed_files_vs_trunk() {
     if base_ref=$(resolve_local_trunk_ref); then
       # `jj diff --from A --to B` is the branch delta; working-copy edits on an
       # empty @ parent are already in `revision` when current_revision selected @.
-      jj --color=never --no-pager diff --from "$base_ref" --to "$revision" --name-only
+      # Name-only emits rename destinations. The reverse diff supplies their
+      # source paths, which may be the side that affects Rust.
+      {
+        jj --color=never --no-pager diff --from "$base_ref" --to "$revision" --name-only || return 1
+        jj --color=never --no-pager diff --from "$revision" --to "$base_ref" --name-only || return 1
+      } | sort -u || return 1
       return 0
     fi
     debug "JJ trunk not local — trying GitHub compare API"
@@ -424,9 +430,9 @@ changed_files_vs_trunk() {
     # Untracked files are invisible to `git diff` but still need package mapping
     # under `scripts/signoff -f` (dirty tree).
     {
-      git diff --name-only --diff-filter=ACDMRT "$base_sha"
-      git ls-files --others --exclude-standard
-    } | sort -u
+      git diff --no-renames --name-only --diff-filter=ACDMRT "$base_sha" || return 1
+      git ls-files --others --exclude-standard || return 1
+    } | sort -u || return 1
     return 0
   fi
 
@@ -553,7 +559,13 @@ workspace_features_for_packages() {
 
   # A resolve carrying dependencies is ~10 MB here, an order of magnitude past
   # ARG_MAX, so it can only reach python over stdin.
-  cargo metadata --format-version 1 2>/dev/null | python3 -c '
+  # Read the gate's feature set from this branch's Makefile. Older branches may
+  # lack the helper, in which case the full gate still supplies its own defaults.
+  local gate_features
+  local -a metadata_args=(--format-version 1)
+  gate_features=$(signoff_make --no-print-directory -s print-rust-gate-features 2>/dev/null) || gate_features=""
+  [[ -z "$gate_features" ]] || metadata_args+=(--features "$gate_features")
+  cargo metadata "${metadata_args[@]}" 2>/dev/null | python3 -c '
 import json, sys
 
 try:
@@ -805,7 +817,7 @@ post_pending_status() {
 # sync with `rustAffecting` in .github/workflows/pr.yml and covered by the
 # check-code-changes filter; `scripts/check_rust_gate_paths.py` enforces both,
 # and docs/dev/ci_signoff.md explains why each path is here.
-RUST_AFFECTING_PATH_PATTERN='(\.rs$|(^|/)Cargo\.(toml|lock)$|(^|/)rust-toolchain(\.toml)?$|(^|/)\.cargo/|(^|/)\.?(clippy|rustfmt)\.toml$|(^|/)nextest\.toml$|(^|/)layers\.toml$|^scripts/(test_)?check_(crate_layers|table_layers|rust_gate_paths|module_reachability|fork_patches|bench_mysql_load_nulls)\.py$|^scripts/(test_)?rust_guard_common\.py$|^docs/dev/fork_patches\.md$|^Makefile$|^test/tpc-bench/(Makefile|mysql-null-spec\.awk)$)'
+RUST_AFFECTING_PATH_PATTERN='(^(crates|bin|tools|vendor)/|\.(rs|snap|proto)$|(^|/)Cargo\.(toml|lock)$|(^|/)rust-toolchain(\.toml)?$|(^|/)\.cargo/|(^|/)\.?(clippy|rustfmt)\.toml$|(^|/)nextest\.toml$|(^|/)layers\.toml$|^scripts/(test_)?check_(crate_layers|table_layers|rust_gate_paths|module_reachability|fork_patches|bench_mysql_load_nulls)\.py$|^scripts/(test_)?rust_guard_common\.py$|^docs/dev/fork_patches\.md$|^(Makefile|version\.txt)$|^test/tpc-bench/(Makefile|mysql-null-spec\.awk)$|^test/tls/|^test/spicepods/tpch/sf1/accelerated/postgres\[catalog\]\[changes\]\.yaml$)'
 
 # True when the branch delta vs trunk can affect Rust lint/build/tests.
 # Prints nothing. Exit 0 = has Rust-affecting changes (or unknown — run checks).
@@ -1084,13 +1096,22 @@ disarm_disk_watch() {
   SIGNOFF_DISK_WATCH=""
 }
 
+# Every make invocation that selects or runs checks uses the same environment.
+# Ambient filters and recursive make overrides cannot narrow an attestation or
+# turn its checks into a dry run. Nextest's checked-in profile owns retries and
+# the empty-suite verdict; thread-count and output preferences remain usable.
+signoff_make() {
+  env -u MAKEFLAGS -u GNUMAKEFLAGS -u MFLAGS -u MAKEOVERRIDES -u MAKEFILES \
+    -u NEXTEST_FLAG -u NEXTEST_FILTER_EXTRA -u NEXTEST_PROFILE \
+    -u NEXTEST_RETRIES -u NEXTEST_NO_TESTS make "$@"
+}
+
 # Run one `make` step, recording whether it died for want of disk or for want of
 # a reachable compiler cache. Returns make's own status, never the watcher's.
-# With the watch off — every local run — make is invoked exactly as before, so
-# local output is untouched.
+# With the watch off, local output streams directly to the terminal.
 run_make_step() {
   if [[ -z "$SIGNOFF_DISK_WATCH" ]]; then
-    make "$@"
+    signoff_make "$@"
     return $?
   fi
   local status watch_status probe_status=0
@@ -1114,10 +1135,10 @@ run_make_step() {
   disk_watch_probe || probe_status=$?
   if [[ "$probe_status" -ne 0 ]]; then
     disarm_disk_watch "$probe_status"
-    make "$@"
+    signoff_make "$@"
     return $?
   fi
-  make "$@" 2>&1 | awk \
+  signoff_make "$@" 2>&1 | awk \
       -v pat="$DISK_FULL_PATTERN" -v hit_status="$DISK_WATCH_HIT_STATUS" \
       -v cache_pat="$CACHE_UNUSABLE_PATTERN" -v cache_status="$CACHE_WATCH_HIT_STATUS" \
       -v artifact_pat="$CORRUPT_ARTIFACT_PATTERN" -v list_pat="$TEST_LIST_FAILURE_PATTERN" \
@@ -1611,7 +1632,7 @@ make_target_exists() {
   local target="$1" output
   # LC_ALL=C so a localized make cannot word the message out of recognition and
   # read as a target that is present.
-  output=$(LC_ALL=C make -n "$target" 2>&1) && return 0
+  output=$(LC_ALL=C signoff_make -n "$target" 2>&1) && return 0
 
   # A missing *prerequisite* reports the same phrase, with a "needed by" clause
   # naming who wanted it — a different condition, since the target itself does
@@ -2274,14 +2295,12 @@ cmd_signoff() {
     if [[ "$check_status" -ne 0 || -n "$SIGNOFF_SIGNALLED" ]]; then
       elapsed=$(( $(date +%s) - start ))
       describe_check_failure "$check_status" "$elapsed" "$user"
+      # A completed failure invalidates prior success from either execution
+      # path. Interrupted checks have no verdict and leave the status alone.
+      if [[ -n "$SIGNOFF_FAILURE_STATUS_DESC" ]]; then
+        post_failure_status "$repo" "$sha" "$SIGNOFF_FAILURE_STATUS_DESC"
+      fi
       if is_remote_run; then
-        # An empty description means this run reached no verdict, so it has none
-        # to publish — leaving the status it posted at the start untouched. The
-        # summary still goes out: it is where an operator reads *why* the run
-        # ended without one.
-        if [[ -n "$SIGNOFF_FAILURE_STATUS_DESC" ]]; then
-          post_failure_status "$repo" "$sha" "$SIGNOFF_FAILURE_STATUS_DESC"
-        fi
         append_step_summary "$SIGNOFF_FAILURE_SUMMARY"
       fi
       fail "$SIGNOFF_FAILURE_MESSAGE"

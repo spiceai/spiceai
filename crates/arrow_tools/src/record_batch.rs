@@ -1553,10 +1553,26 @@ mod test {
             true,
         )]));
 
-        let result = try_cast_to(batch, target_schema);
+        let casted = try_cast_to(batch, Arc::clone(&target_schema))
+            .expect("Decimal cast should succeed when value fits");
+        assert_eq!(casted.schema(), target_schema);
+        assert_eq!(casted.num_rows(), 1);
+        let amounts = casted
+            .column(0)
+            .as_any()
+            .downcast_ref::<Decimal128Array>()
+            .expect("the cast column is a Decimal128Array");
+        assert_eq!(amounts.data_type(), &DataType::Decimal128(38, 27));
+        // The same number rescaled from 9 to 27 fractional digits, not a NULL from an
+        // overflow fallback and not a value rescaled by the wrong power of ten.
         assert!(
-            result.is_ok(),
-            "Decimal cast should succeed when value fits: {result:?}"
+            amounts.is_valid(0),
+            "the value fits and must not become NULL"
+        );
+        assert_eq!(amounts.value(0), value_i128 * 10_i128.pow(18));
+        assert_eq!(
+            amounts.value_as_string(0),
+            format!("99999999999.{}", "0".repeat(27))
         );
     }
 
@@ -1679,10 +1695,21 @@ mod test {
             true,
         )]));
 
-        let result = try_cast_to(batch, target_schema);
+        let err = try_cast_to(batch, target_schema)
+            .expect_err("non-timestamp overflow should still return an error");
         assert!(
-            result.is_err(),
-            "non-timestamp overflow should still return an error"
+            matches!(
+                err,
+                Error::UnableToConvertRecordBatch {
+                    source: ArrowError::InvalidArgumentError(_)
+                }
+            ),
+            "Expected the precision overflow from the strict cast, got: {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "Error converting record batch: Invalid argument error: 99999999999.00 is too large \
+             to store in a Decimal128 of precision 10. Max is 99999999.99"
         );
     }
 

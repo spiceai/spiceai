@@ -4815,30 +4815,59 @@ mod tests {
 
     #[tokio::test]
     async fn test_listing_table_metadata_columns_are_applied() {
-        let mut dataset = DatasetSpec::new("s3://bucket/prefix/", TableReference::bare("test"));
-        dataset.metadata = HashMap::from([(
-            MetadataColumn::Location(None).name().to_string(),
-            "enabled".to_string(),
-        )]);
+        use datafusion_datasource::metadata::MetadataColumn as ListingMetadataColumn;
 
-        let options =
-            ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension(".parquet");
+        let table_url = Url::parse("s3://bucket/prefix/").expect("parse table url");
         let schema = Schema::new(vec![Field::new(
             "compression",
             arrow_schema::DataType::Utf8,
             true,
         )]);
+        let listing_options = || {
+            ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension(".parquet")
+        };
 
-        let result = add_metadata_columns_if_required(
-            options,
-            &Url::parse("s3://bucket/prefix/").expect("parse table url"),
-            &schema,
-            &dataset,
+        let mut dataset = DatasetSpec::new("s3://bucket/prefix/", TableReference::bare("test"));
+        dataset.metadata = HashMap::from([(
+            MetadataColumn::Location(None).name().to_string(),
+            "enabled".to_string(),
+        )]);
+        let result =
+            add_metadata_columns_if_required(listing_options(), &table_url, &schema, &dataset);
+        // `_location` values are built from the bucket-level prefix, not the
+        // table path.
+        assert_eq!(
+            result.metadata_cols,
+            vec![ListingMetadataColumn::Location(Some(Arc::from(
+                "s3://bucket/"
+            )))]
         );
 
-        assert!(
-            !result.metadata_cols.is_empty(),
-            "metadata columns should be set on listing options"
+        // Every enabled column is forwarded as its DataFusion counterpart, in
+        // a fixed order.
+        dataset.metadata = HashMap::from([
+            (
+                MetadataColumn::LastModified.name().to_string(),
+                "enabled".to_string(),
+            ),
+            (
+                MetadataColumn::Location(None).name().to_string(),
+                "enabled".to_string(),
+            ),
+            (
+                MetadataColumn::Size.name().to_string(),
+                "enabled".to_string(),
+            ),
+        ]);
+        let result =
+            add_metadata_columns_if_required(listing_options(), &table_url, &schema, &dataset);
+        assert_eq!(
+            result.metadata_cols,
+            vec![
+                ListingMetadataColumn::LastModified,
+                ListingMetadataColumn::Location(Some(Arc::from("s3://bucket/"))),
+                ListingMetadataColumn::Size,
+            ]
         );
     }
 
@@ -4866,7 +4895,24 @@ mod tests {
         )
         .await;
 
-        result.expect_err("should error on no matching extension");
+        let err = result.expect_err("should error on no matching extension");
+        let DataConnectorError::InvalidConfigurationNoSource {
+            dataconnector,
+            message,
+            ..
+        } = &err
+        else {
+            panic!("an extension mismatch must be a configuration error, got: {err:?}");
+        };
+        assert_eq!(dataconnector, "TestListingConnector");
+        assert_eq!(
+            message,
+            "Failed to find any files matching the extension '.csv'. Is your `file_format` parameter correct? Spice found the following file extensions: '.parquet'. For details, visit: https://spiceai.org/docs/components/data-connectors#object-store-file-formats"
+        );
+        assert!(
+            !err.is_retriable(),
+            "files that are present but none match `file_format` is a permanent configuration error, not a wait-for-data retry"
+        );
     }
 
     #[tokio::test]

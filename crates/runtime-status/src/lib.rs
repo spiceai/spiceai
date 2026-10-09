@@ -875,6 +875,11 @@ mod tests {
     /// waits never returned at all, so any finite bound fails on the old code.
     const SHUTDOWN_WAIT_BOUND: Duration = Duration::from_secs(5);
 
+    /// How long a parked waiter gets to observe the status update that wakes it.
+    /// Only an upper bound on a wake-up that should be immediate: it turns a
+    /// missed notification into a failure instead of a hung test.
+    const WAKE_BOUND: Duration = Duration::from_secs(5);
+
     #[test]
     fn test_get_component_status() {
         let status = RuntimeStatus::new();
@@ -1036,6 +1041,30 @@ mod tests {
         );
     }
 
+    /// Spawns `wait_for_dataset_ready` and lets it run until it parks.
+    ///
+    /// The `#[tokio::test]` runtime is current-thread, so `yield_now` polls the
+    /// spawned waiter once before this returns: it subscribes, checks the status,
+    /// and either parks on the change notification or has already finished.
+    async fn spawn_parked_waiter(
+        status: &Arc<RuntimeStatus>,
+        dataset: &TableReference,
+    ) -> tokio::task::JoinHandle<WaitOutcome> {
+        let status = Arc::clone(status);
+        let dataset = dataset.clone();
+        let waiter = tokio::spawn(async move { status.wait_for_dataset_ready(&dataset).await });
+        tokio::task::yield_now().await;
+        waiter
+    }
+
+    /// The outcome of a waiter that the last status update should have woken.
+    async fn woken_outcome(waiter: tokio::task::JoinHandle<WaitOutcome>) -> WaitOutcome {
+        tokio::time::timeout(WAKE_BOUND, waiter)
+            .await
+            .expect("the status update should wake the waiter")
+            .expect("waiter task should not panic")
+    }
+
     #[tokio::test]
     async fn test_wait_for_dataset_ready_becomes_ready() {
         let status = RuntimeStatus::new();
@@ -1044,19 +1073,14 @@ mod tests {
         // Set dataset to initializing
         status.update_dataset(&dataset, ComponentStatus::Initializing);
 
-        // Spawn a task to set the dataset ready after a short delay
-        let status_clone = Arc::clone(&status);
-        let dataset_clone = dataset.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            status_clone.update_dataset(&dataset_clone, ComponentStatus::Ready);
-        });
-
-        // Wait for ready
-        assert_eq!(
-            status.wait_for_dataset_ready(&dataset).await,
-            WaitOutcome::Reached
+        let waiter = spawn_parked_waiter(&status, &dataset).await;
+        assert!(
+            !waiter.is_finished(),
+            "the wait must block while the dataset is Initializing"
         );
+
+        status.update_dataset(&dataset, ComponentStatus::Ready);
+        assert_eq!(woken_outcome(waiter).await, WaitOutcome::Reached);
     }
 
     #[tokio::test]
@@ -1064,19 +1088,16 @@ mod tests {
         let status = RuntimeStatus::new();
         let dataset = TableReference::bare("test_dataset");
 
-        // Dataset not registered - should start with Initializing and wait
-        // Spawn a task to register and set ready after a delay
-        let status_clone = Arc::clone(&status);
-        let dataset_clone = dataset.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            status_clone.update_dataset(&dataset_clone, ComponentStatus::Ready);
-        });
-
-        assert_eq!(
-            status.wait_for_dataset_ready(&dataset).await,
-            WaitOutcome::Reached
+        // Dataset not registered: the waiter subscribes to it as Initializing and
+        // parks until the dataset is registered as Ready.
+        let waiter = spawn_parked_waiter(&status, &dataset).await;
+        assert!(
+            !waiter.is_finished(),
+            "the wait must block while the dataset is not registered"
         );
+
+        status.update_dataset(&dataset, ComponentStatus::Ready);
+        assert_eq!(woken_outcome(waiter).await, WaitOutcome::Reached);
     }
 
     #[tokio::test]
@@ -1086,33 +1107,25 @@ mod tests {
 
         status.update_dataset(&dataset, ComponentStatus::Initializing);
 
-        // Create multiple waiters
-        let status1 = Arc::clone(&status);
-        let status2 = Arc::clone(&status);
-        let dataset1 = dataset.clone();
-        let dataset2 = dataset.clone();
-
-        let handle1 = tokio::spawn(async move { status1.wait_for_dataset_ready(&dataset1).await });
-
-        let handle2 = tokio::spawn(async move { status2.wait_for_dataset_ready(&dataset2).await });
-
-        // Give tasks time to start waiting
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Both waiters are parked subscribers before the update, so it is the
+        // update that wakes them, not an already-Ready status.
+        let handle1 = spawn_parked_waiter(&status, &dataset).await;
+        let handle2 = spawn_parked_waiter(&status, &dataset).await;
+        assert!(
+            !handle1.is_finished() && !handle2.is_finished(),
+            "both waiters must be parked while the dataset is Initializing"
+        );
 
         // Set ready - both should wake up
         status.update_dataset(&dataset, ComponentStatus::Ready);
 
-        assert_eq!(
-            handle1.await.expect("task 1 should complete"),
-            WaitOutcome::Reached
-        );
-        assert_eq!(
-            handle2.await.expect("task 2 should complete"),
-            WaitOutcome::Reached
-        );
+        assert_eq!(woken_outcome(handle1).await, WaitOutcome::Reached);
+        assert_eq!(woken_outcome(handle2).await, WaitOutcome::Reached);
     }
 
-    #[tokio::test]
+    /// The wait has no deadline of its own: an hour on the (paused) clock with no
+    /// status change leaves it parked, and only the update releases it.
+    #[tokio::test(start_paused = true)]
     async fn test_wait_for_dataset_ready_waits_indefinitely() {
         let status = RuntimeStatus::new();
         let dataset = TableReference::bare("test_dataset");
@@ -1120,19 +1133,15 @@ mod tests {
         // Set dataset to initializing
         status.update_dataset(&dataset, ComponentStatus::Initializing);
 
-        // Spawn a task to set the dataset ready after a short delay
-        let status_clone = Arc::clone(&status);
-        let dataset_clone = dataset.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            status_clone.update_dataset(&dataset_clone, ComponentStatus::Ready);
-        });
-
-        // Wait indefinitely
-        assert_eq!(
-            status.wait_for_dataset_ready(&dataset).await,
-            WaitOutcome::Reached
+        let waiter = spawn_parked_waiter(&status, &dataset).await;
+        tokio::time::advance(Duration::from_hours(1)).await;
+        assert!(
+            !waiter.is_finished(),
+            "the wait must not give up while the runtime is running"
         );
+
+        status.update_dataset(&dataset, ComponentStatus::Ready);
+        assert_eq!(woken_outcome(waiter).await, WaitOutcome::Reached);
     }
 
     /// A component wait must return once shutdown starts, even though the
@@ -1401,23 +1410,15 @@ mod tests {
         status.hold_dataset_ready();
         status.update_dataset(&dataset, ComponentStatus::Ready);
 
-        let waiter = {
-            let status = Arc::clone(&status);
-            let dataset = dataset.clone();
-            tokio::spawn(async move { status.wait_for_dataset_ready(&dataset).await })
-        };
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // The waiter has been polled once against the held Ready before this check.
+        let waiter = spawn_parked_waiter(&status, &dataset).await;
         assert!(
             !waiter.is_finished(),
             "wait_for_dataset_ready must not observe a held Ready"
         );
 
         status.release_dataset_ready();
-        assert_eq!(
-            waiter.await.expect("waiter task should not panic"),
-            WaitOutcome::Reached
-        );
+        assert_eq!(woken_outcome(waiter).await, WaitOutcome::Reached);
     }
 
     #[test]

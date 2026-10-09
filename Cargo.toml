@@ -272,7 +272,7 @@ datafusion-common-runtime = "55.2.0"
 datafusion-datasource = "55.2.0"
 datafusion-execution = "55.2.0"
 datafusion-expr = "55.2.0"
-datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "9ca84a39760d7728bdeb5eac8480a3f9ee8422be", features = ["sql"] } # branch: spiceai-55 (merged in #88)
+datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "750561d79e88fd48afd06b6a136e3bc1dc2b8a12", features = ["sql"] } # branch: spiceai-55
 datafusion-functions = "55.2.0"
 datafusion-functions-aggregate = "55.2.0"
 datafusion-functions-aggregate-common = "55.2.0"
@@ -287,7 +287,7 @@ datafusion-proto-common = "55.2.0"
 datafusion-pruning = "55.2.0"
 datafusion-spark = "55.2.0"
 datafusion-substrait = "55.2.0"
-datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "465926a30443ebfbbc95366b6f0277bff80a8ba9" } # branch: spiceai-55
+datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "b4a86350d571921829e5ad141d94dc2470f98b17" } # branch: spiceai-55
 delta_kernel = { version = "0.27.1", features = ["arrow-59", "internal-api"] }
 delta_kernel_default_engine = { version = "0.27.1", default-features = false, features = [
     "arrow-59",
@@ -614,7 +614,7 @@ candle-index-select-cu = { git = "https://github.com/spiceai/candle-index-select
 delta_kernel = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "16ac28606464d742b6837de4a51f41011c3f6dc0" } # branch: spiceai-0.27 (Delta Kernel 0.27.1)
 delta_kernel_default_engine = { git = "https://github.com/spiceai/delta-kernel-rs.git", rev = "16ac28606464d742b6837de4a51f41011c3f6dc0" } # branch: spiceai-0.27 (Delta Kernel 0.27.1)
 
-duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "8ee430737cb6999025d0b29672ec6cb92df19b6d" } # branch: spiceai-1.4.4-patches-2 (DuckDB v1.4.4, arrow 59; must match the rev datafusion-table-providers pins, or cargo resolves two copies of duckdb)
+duckdb = { git = "https://github.com/spiceai/duckdb-rs.git", rev = "504debbf8269a76aef74daa2247b6296c2fe2290" } # branch: spiceai-1.4.4 (DuckDB v1.4.4, arrow 59; must match the rev datafusion-table-providers pins, or cargo resolves two copies of duckdb)
 rusqlite = { git = "https://github.com/spiceai/rusqlite.git", rev = "e39c9c46dea1f0983cd8d87dabb69b41c9efe1fd" } # master @ tip (PR #2 merged: rusqlite 0.40.1 + bundled-decimal)
 tokio-rusqlite = { git = "https://github.com/spiceai/tokio-rusqlite.git", rev = "b10df82e3bbc4f4700562a14a3a00714cbc2f0c7" }
 

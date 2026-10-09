@@ -842,7 +842,14 @@ mod tests {
             time_format: invalid_format
         ";
         let result: Result<Dataset, _> = yaml::from_str(yaml);
-        result.expect_err("invalid time_format should fail to parse");
+        // The accepted values are listed by the custom `TimeFormat` deserializer, so
+        // they are pinned here exactly as a user sees them.
+        assert_eq!(
+            result
+                .expect_err("invalid time_format should fail to parse")
+                .to_string(),
+            "unknown variant `invalid_format`, expected one of `timestamp`, `timestamptz`, `unix_seconds`, `unix_millis`, `unix_nanos`, `ISO8601`, `date`"
+        );
     }
 
     #[test]

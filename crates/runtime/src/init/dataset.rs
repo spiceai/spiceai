@@ -5383,6 +5383,7 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
             let loaded = || checks.fetch_add(1, Ordering::SeqCst) >= 1;
 
             let (_recorder, waiter) = silent();
+            let started = tokio::time::Instant::now();
             await_hot_reload_initial_refresh(
                 &reloading(),
                 &loaded,
@@ -5392,6 +5393,15 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
             )
             .await
             .expect("a load that lands at the bound must not discard the table");
+
+            // The wait ran to the bound, and the table was accepted by the
+            // backstop re-check after it: exactly the pre-wait check and one more.
+            assert_eq!(started.elapsed(), TIMEOUT, "the wait must end at the bound");
+            assert_eq!(
+                checks.load(Ordering::SeqCst),
+                2,
+                "the pre-wait check and the backstop check after the bound"
+            );
         }
 
         /// A one-shot load failure must not accept the unloaded table. Recording

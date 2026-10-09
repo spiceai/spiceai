@@ -3956,7 +3956,12 @@ mod tests {
     /// losing the intended backpressure and against leaking / never releasing a
     /// permit (a deadlock). The block is real — A holds the only permit — not
     /// timing-dependent: B can finish early only if admission is broken.
-    #[tokio::test]
+    ///
+    /// The clock is paused, so it advances only once every task on the runtime
+    /// (B's query included, since the query runtime here is the test's own) is
+    /// blocked: the observation window below cannot close before B has gone as
+    /// far as it can, which with working admission is the permit wait.
+    #[tokio::test(start_paused = true)]
     async fn query_admission_blocks_second_query_until_first_stream_drops() {
         use std::time::Duration;
         let df = Arc::new(
@@ -3980,18 +3985,38 @@ mod tests {
         // B uses different query text (`SELECT 43`, a cache miss → it actually
         // reaches the admission gate, not an early cache-hit return) and is spawned
         // so the test task can observe whether run() blocks.
+        let query_id = uuid::Uuid::new_v4();
         let df_b = Arc::clone(&df);
         let mut b_handle = tokio::spawn(async move {
             QueryBuilder::new("SELECT 43 AS value", df_b)
+                .query_id(query_id)
                 .build()
                 .run()
                 .await
                 .map(|_q| ())
         });
 
+        // Wait until B has entered `run`: it registers in the cancel registry
+        // before the results-cache probe and the admission permit.
+        let registry = df.query_cancel_registry();
+        let mut registered = false;
+        for _ in 0..500 {
+            if registry
+                .list_all()
+                .iter()
+                .any(|info| info.query_id == query_id)
+            {
+                registered = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(registered, "query B never entered run()");
+
         // While A's stream lives, B's run() must NOT return. `biased` polls B's
         // completion before the timer, so a regression that lets B through is
-        // caught immediately.
+        // caught immediately, and the paused clock only lets the timer fire once
+        // B is parked.
         tokio::select! {
             biased;
             r = &mut b_handle => panic!(
@@ -3999,6 +4024,10 @@ mod tests {
             ),
             () = tokio::time::sleep(Duration::from_millis(750)) => {}
         }
+        assert!(
+            !b_handle.is_finished(),
+            "query B must still be waiting for the permit A holds"
+        );
 
         // Releasing A's stream frees the permit; B can now finish run().
         drop(query_a);

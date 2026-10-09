@@ -359,7 +359,13 @@ mod tests {
     }
 
     /// Without a store there is nowhere to put overflow, so it is counted.
-    #[tokio::test]
+    ///
+    /// On the current-thread runtime the store-less `enqueue` never yields, so
+    /// the delivery task cannot run during the loop: the first 4 batches fill
+    /// the queue and every one after them is overflow. That makes the count
+    /// exact, and pins that overflow (not a delivery failure, which the same
+    /// counter also records) is what was counted.
+    #[tokio::test(flavor = "current_thread")]
     async fn a_full_queue_without_a_store_counts_the_drop() {
         let queue = DeliveryQueue::spawn(unreachable_sink(), "orders".to_string(), 4, None);
 
@@ -374,9 +380,10 @@ mod tests {
                 .await;
         }
 
-        assert!(
-            queue.dead_lettered() > 0,
-            "a full queue must dead-letter rather than block the producer"
+        assert_eq!(
+            queue.dead_lettered(),
+            60,
+            "a full queue must dead-letter each overflowing batch rather than block the producer"
         );
     }
 
