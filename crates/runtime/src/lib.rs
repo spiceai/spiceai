@@ -365,12 +365,13 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to register dataset {dataset_name} ({connector}): durable write-back records each committed write for delivery from the primary-key check Cayenne runs on it, but this dataset sets '{param}: none', which turns that check off. Every write would be acknowledged and then never reach the source. Remove '{param}', or use a different 'acceleration.write_mode'. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
+        "Failed to register dataset {dataset_name} ({connector}): '{param}: none' turns off the primary-key check Cayenne uses to replace a stored row, but {consequence}. Remove '{param}'. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
     ))]
-    DurableWriteBackWithoutPkConflictDetection {
+    PkConflictDetectionDisabled {
         dataset_name: String,
         connector: String,
         param: String,
+        consequence: String,
     },
 
     #[snafu(display(

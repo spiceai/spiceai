@@ -39,8 +39,7 @@ use crate::{
     DataConnectorNotInBuildSnafu, DrasiWithoutChangeStreamSnafu,
     DurableWriteBackCompositePrimaryKeySnafu, DurableWriteBackPrerequisitesUnmetSnafu,
     DurableWriteBackRecreatingModeSnafu, DurableWriteBackUndeclaredPrimaryKeySnafu,
-    DurableWriteBackUnsupportedBySourceSnafu, DurableWriteBackWithRetentionSnafu,
-    DurableWriteBackWithoutPkConflictDetectionSnafu, Error,
+    DurableWriteBackUnsupportedBySourceSnafu, DurableWriteBackWithRetentionSnafu, Error,
     FullTextSearchRequiresAccelerationSnafu, HotReloadRefreshFailedSnafu,
     HotReloadRefreshTimedOutSnafu, LogErrors, OdbcNotInstalledSnafu, PermanentDatasetFailureSnafu,
     Result, Runtime, UnableToAttachDataConnectorSnafu, UnableToBuildDatasetSnafu,
@@ -2452,6 +2451,18 @@ impl Runtime {
             }
             .fail()?;
         }
+        if let Some((param, writes)) = pk_conflict_detection_refusal(
+            acceleration_settings,
+            data_connector.resolve_refresh_mode(acceleration_settings.refresh_mode),
+        ) {
+            crate::PkConflictDetectionDisabledSnafu {
+                dataset_name: ds.name.to_string(),
+                connector: ds.source().to_string(),
+                param,
+                consequence: writes.consequence(),
+            }
+            .fail()?;
+        }
 
         self.accelerator_engine_registry
             .get_accelerator_engine(acceleration_settings.engine)
@@ -3311,10 +3322,10 @@ pub(crate) fn is_permanent_dataset_failure(err: &Error) -> bool {
         | Error::FullTextSearchRequiresAcceleration { .. }
         | Error::AcceleratedWriteBackWithoutReplication { .. }
         | Error::AccelerationWriteModeWithChanges { .. }
+        | Error::PkConflictDetectionDisabled { .. }
         // Durable write-back configurations that would acknowledge a write the
         // dataset cannot then deliver.
         | Error::DurableWriteBackWithRetention { .. }
-        | Error::DurableWriteBackWithoutPkConflictDetection { .. }
         | Error::DurableWriteBackRecreatingMode { .. }
         | Error::DurableWriteBackCompositePrimaryKey { .. }
         | Error::DurableWriteBackUndeclaredPrimaryKey { .. }
@@ -3392,6 +3403,57 @@ fn disabled_pk_conflict_detection_param(acceleration: &Acceleration) -> Option<&
         .find_map(|key| acceleration.params.get(key).map(|value| (key, value)))
         .filter(|(_, value)| value.eq_ignore_ascii_case("none"))
         .map(|(key, _)| key)
+}
+
+/// A way a dataset rewrites a key it already stores, which Cayenne can do
+/// correctly only with its primary-key check on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyedWrites {
+    /// `write_mode: write_back`: the check also records each committed write
+    /// for delivery to the source.
+    WriteBack,
+    /// `refresh_mode: changes`: the source's changes replace stored rows.
+    Changes,
+    /// `write_mode: acceleration`: writes land only in the accelerator.
+    AcceleratorWrites,
+}
+
+impl KeyedWrites {
+    fn consequence(self) -> &'static str {
+        match self {
+            Self::WriteBack => {
+                "this dataset uses 'acceleration.write_mode: write_back', which records each committed write for delivery from that check, so every write would be acknowledged and never reach the source"
+            }
+            Self::Changes => {
+                "this dataset applies its source's changes ('refresh_mode: changes'), so a change to an existing key would add a second row for that key instead of replacing it"
+            }
+            Self::AcceleratorWrites => {
+                "this dataset keeps its writes in the accelerator ('acceleration.write_mode: acceleration'), so a write to an existing key would add a second row for that key instead of replacing it"
+            }
+        }
+    }
+}
+
+/// The conflict-detection parameter to refuse, and the keyed writes it would
+/// break, for an acceleration whose refresh mode resolves to `refresh_mode`.
+///
+/// With the check off, a staged upsert neither supersedes the stored row for
+/// its key nor records the key for write-back delivery. v2.3.2 refused these
+/// configurations by refusing `none` beside the `on_conflict` upsert each of
+/// them needed; Cayenne no longer receives `on_conflict`, so they are refused
+/// here instead. A full or append refresh still loads, as it did then.
+fn pk_conflict_detection_refusal(
+    acceleration: &Acceleration,
+    refresh_mode: RefreshMode,
+) -> Option<(&'static str, KeyedWrites)> {
+    let param = disabled_pk_conflict_detection_param(acceleration)?;
+    let writes = match (&acceleration.write_mode, refresh_mode) {
+        (spicepod::acceleration::WriteMode::WriteBack, _) => KeyedWrites::WriteBack,
+        (_, RefreshMode::Changes) => KeyedWrites::Changes,
+        (spicepod::acceleration::WriteMode::Acceleration, _) => KeyedWrites::AcceleratorWrites,
+        _ => return None,
+    };
+    Some((param, writes))
 }
 
 /// Refuse a dataset whose configuration cannot be made to work, reporting the
@@ -3498,19 +3560,6 @@ fn validate_dataset(ds: &Arc<Dataset>) -> Result<()> {
                 dataset_name,
                 connector,
                 retention_setting,
-            }
-            .build());
-        }
-
-        // Cayenne records the keys a commit owes the source from the primary-key
-        // validation of the staged rows. With conflict detection off that
-        // validation never runs, so the commit records nothing: the write is
-        // acknowledged and stays in the accelerator, and the source never sees it.
-        if let Some(param) = disabled_pk_conflict_detection_param(acceleration) {
-            return Err(DurableWriteBackWithoutPkConflictDetectionSnafu {
-                dataset_name,
-                connector,
-                param,
             }
             .build());
         }
@@ -4019,47 +4068,6 @@ mod tests {
             "retention can prune a row that was acknowledged and not yet delivered"
         );
 
-        // Regression test for #14889: with conflict detection off the commit
-        // records no write for delivery, so the write never reaches the source.
-        for (key, value) in [
-            ("cayenne_pk_conflict_detection", "none"),
-            ("cayenne_pk_conflict_detection", "NONE"),
-            ("pk_conflict_detection", "none"),
-        ] {
-            let acceleration = spicepod::acceleration::Acceleration {
-                params: Some(spicepod::param::Params::from_string_map(
-                    [(key.to_string(), value.to_string())].into_iter().collect(),
-                )),
-                ..durable_write_back_acceleration()
-            };
-            match validate_dataset(&dataset_with_acceleration(&runtime, acceleration)) {
-                Err(Error::DurableWriteBackWithoutPkConflictDetection { param, .. }) => {
-                    assert_eq!(
-                        param, key,
-                        "the refusal must name the parameter that was set"
-                    );
-                }
-                other => panic!(
-                    "{key}: {value} records no write for delivery and must be refused, got: {other:?}"
-                ),
-            }
-        }
-        let detection_on = spicepod::acceleration::Acceleration {
-            params: Some(spicepod::param::Params::from_string_map(
-                [(
-                    "cayenne_pk_conflict_detection".to_string(),
-                    "auto".to_string(),
-                )]
-                .into_iter()
-                .collect(),
-            )),
-            ..durable_write_back_acceleration()
-        };
-        assert!(
-            validate_dataset(&dataset_with_acceleration(&runtime, detection_on)).is_ok(),
-            "conflict detection left on records every write for delivery"
-        );
-
         for mode in [
             spicepod::acceleration::Mode::Memory,
             spicepod::acceleration::Mode::FileCreate,
@@ -4263,19 +4271,140 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_pk_conflict_detection_rejection_names_the_setting_and_a_way_out() {
-        let message = DurableWriteBackWithoutPkConflictDetectionSnafu {
-            dataset_name: "orders".to_string(),
-            connector: "postgres".to_string(),
-            param: "cayenne_pk_conflict_detection".to_string(),
+    fn acceleration_with_params(
+        write_mode: spicepod::acceleration::WriteMode,
+        params: &[(&str, &str)],
+    ) -> Acceleration {
+        Acceleration {
+            engine: Engine::Cayenne,
+            write_mode,
+            primary_key: Some(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "id".to_string(),
+                ]),
+            ),
+            params: params
+                .iter()
+                .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                .collect(),
+            ..Acceleration::default()
         }
-        .build()
-        .to_string();
+    }
+
+    /// Regression test for #14889 and its siblings: v2.3.2 refused
+    /// `cayenne_pk_conflict_detection: none` on every dataset that rewrites a
+    /// stored key, and loaded it everywhere else.
+    #[test]
+    fn pk_conflict_detection_none_is_refused_wherever_a_stored_key_is_rewritten() {
+        use spicepod::acceleration::WriteMode;
+        let none = [("cayenne_pk_conflict_detection", "none")];
+        for (write_mode, refresh_mode, expected) in [
+            (
+                WriteMode::WriteBack,
+                RefreshMode::Changes,
+                Some(KeyedWrites::WriteBack),
+            ),
+            (
+                WriteMode::WriteThrough,
+                RefreshMode::Changes,
+                Some(KeyedWrites::Changes),
+            ),
+            (
+                WriteMode::Acceleration,
+                RefreshMode::Full,
+                Some(KeyedWrites::AcceleratorWrites),
+            ),
+            (
+                WriteMode::Acceleration,
+                RefreshMode::Append,
+                Some(KeyedWrites::AcceleratorWrites),
+            ),
+            (WriteMode::WriteThrough, RefreshMode::Full, None),
+            (WriteMode::WriteThrough, RefreshMode::Append, None),
+            (WriteMode::WriteThrough, RefreshMode::Disabled, None),
+        ] {
+            let label = format!("{write_mode:?} + {refresh_mode:?}");
+            let acceleration = acceleration_with_params(write_mode, &none);
+            assert_eq!(
+                pk_conflict_detection_refusal(&acceleration, refresh_mode),
+                expected.map(|writes| ("cayenne_pk_conflict_detection", writes)),
+                "{label}"
+            );
+        }
+
+        // Both spellings take effect in the accelerator, the prefixed one first,
+        // and the value is matched without regard to case.
+        for (params, expected) in [
+            (
+                vec![("pk_conflict_detection", "none")],
+                Some("pk_conflict_detection"),
+            ),
+            (
+                vec![("cayenne_pk_conflict_detection", "NONE")],
+                Some("cayenne_pk_conflict_detection"),
+            ),
+            (
+                vec![
+                    ("cayenne_pk_conflict_detection", "auto"),
+                    ("pk_conflict_detection", "none"),
+                ],
+                None,
+            ),
+            (vec![("cayenne_pk_conflict_detection", "auto")], None),
+            (vec![], None),
+        ] {
+            let acceleration = acceleration_with_params(WriteMode::WriteThrough, &params);
+            assert_eq!(
+                pk_conflict_detection_refusal(&acceleration, RefreshMode::Changes)
+                    .map(|(param, _)| param),
+                expected,
+                "{params:?}"
+            );
+        }
+
+        let not_cayenne = Acceleration {
+            engine: Engine::DuckDB,
+            ..acceleration_with_params(WriteMode::WriteThrough, &none)
+        };
         assert_eq!(
-            message,
-            "Failed to register dataset orders (postgres): durable write-back records each committed write for delivery from the primary-key check Cayenne runs on it, but this dataset sets 'cayenne_pk_conflict_detection: none', which turns that check off. Every write would be acknowledged and then never reach the source. Remove 'cayenne_pk_conflict_detection', or use a different 'acceleration.write_mode'. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
+            pk_conflict_detection_refusal(&not_cayenne, RefreshMode::Changes),
+            None,
+            "only Cayenne reads the parameter"
         );
+    }
+
+    #[test]
+    fn the_pk_conflict_detection_refusal_names_the_setting_and_the_consequence() {
+        for (writes, consequence) in [
+            (KeyedWrites::WriteBack, "never reach the source"),
+            (KeyedWrites::Changes, "add a second row for that key"),
+            (
+                KeyedWrites::AcceleratorWrites,
+                "add a second row for that key",
+            ),
+        ] {
+            let message = crate::PkConflictDetectionDisabledSnafu {
+                dataset_name: "orders".to_string(),
+                connector: "postgres".to_string(),
+                param: "cayenne_pk_conflict_detection",
+                consequence: writes.consequence(),
+            }
+            .build()
+            .to_string();
+            for expected in [
+                "Failed to register dataset orders (postgres)",
+                "'cayenne_pk_conflict_detection: none'",
+                consequence,
+                "Remove 'cayenne_pk_conflict_detection'",
+                "https://spiceai.org/docs/components/data-accelerators/cayenne",
+            ] {
+                assert!(
+                    message.contains(expected),
+                    "{writes:?}: the refusal must contain {expected:?}: {message}"
+                );
+            }
+            assert!(!message.contains('\n'), "{writes:?}: one line: {message}");
+        }
     }
 
     /// The rejection is the only account a user gets of why the dataset will not
@@ -5407,10 +5536,11 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
             mode: "file_create".to_string(),
         }
         .build();
-        let pk_detection_off = DurableWriteBackWithoutPkConflictDetectionSnafu {
+        let pk_detection_off = crate::PkConflictDetectionDisabledSnafu {
             dataset_name: "orders".to_string(),
             connector: "postgres".to_string(),
-            param: "cayenne_pk_conflict_detection".to_string(),
+            param: "cayenne_pk_conflict_detection",
+            consequence: KeyedWrites::Changes.consequence(),
         }
         .build();
         let undeclared_key = DurableWriteBackUndeclaredPrimaryKeySnafu {
