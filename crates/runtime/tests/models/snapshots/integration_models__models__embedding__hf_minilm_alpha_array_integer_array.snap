@@ -18,7 +18,7 @@ expression: normalize_embeddings_response(response_raw)
   "model": "hf_minilm",
   "object": "list",
   "usage": {
-    "prompt_tokens": 256,
-    "total_tokens": 256
+    "prompt_tokens": 35,
+    "total_tokens": 35
   }
 }
