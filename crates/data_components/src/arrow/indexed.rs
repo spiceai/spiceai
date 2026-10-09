@@ -100,7 +100,7 @@ const HASH_INDEX_DOCS: &str = "https://spiceai.org/docs/features/data-accelerati
 /// The warning a dataset gets when a rebuild cannot use one of its secondary indexes.
 fn index_unusable_warning(dataset: &str, columns: &[String], cause: &dyn fmt::Display) -> String {
     format!(
-        "Dataset '{dataset}' (arrow): the index on ({}) cannot be used, so lookups on that column read the whole table until a refresh changes the data. Cause: {cause}. See: {HASH_INDEX_DOCS}",
+        "Dataset '{dataset}' (arrow): the index on ({}) cannot be used, so lookups on it read the whole table until a refresh changes the data. Cause: {cause}. See: {HASH_INDEX_DOCS}",
         columns.join(", ")
     )
 }
@@ -113,7 +113,7 @@ fn index_unusable_warning(dataset: &str, columns: &[String], cause: &dyn fmt::Di
 #[must_use]
 pub fn unique_index_warning(dataset: &str) -> String {
     format!(
-        "Dataset '{dataset}' (arrow): a `unique` entry in `indexes` speeds up lookups but does not constrain writes, so duplicate rows are not rejected; while a value repeats, lookups on that column read the whole table. Set `primary_key` with `on_conflict` to deduplicate on a column set. See: {HASH_INDEX_DOCS}"
+        "Dataset '{dataset}' (arrow): a `unique` entry in `indexes` does not constrain writes, so duplicate rows are not rejected. A single-column entry speeds up lookups while its values are distinct, and while a value repeats, lookups on it read the whole table; a compound entry is not used for lookups. Set `primary_key` with `on_conflict` to deduplicate on a column set. See: {HASH_INDEX_DOCS}"
     )
 }
 
@@ -426,6 +426,17 @@ impl IndexedMemTable {
         // state only, since the rebuild runs after every refresh.
         let dataset = self.table_name.as_deref().unwrap_or("<unnamed>");
         for secondary in &self.secondary_indexes {
+            // A compound index is built but never probed (see `find_secondary_index_match`),
+            // so a repeated key costs it nothing and warrants no warning.
+            if secondary.columns.len() != 1 {
+                secondary.index.rebuild(&partitions).map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "Failed to rebuild secondary index '{}': {e}",
+                        secondary.name
+                    ))
+                })?;
+                continue;
+            }
             let was_usable = secondary.is_usable();
             match secondary.index.rebuild_strict(&partitions) {
                 Ok(()) => {
