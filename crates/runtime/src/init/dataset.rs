@@ -1547,7 +1547,7 @@ impl Runtime {
                 let warning = if acceleration.engine == Engine::Cayenne {
                     cayenne_on_conflict_warning(&dataset_name, acceleration, rule)
                 } else {
-                    deprecated_on_conflict_warning(&dataset_name, acceleration)
+                    deprecated_on_conflict_warning(&dataset_name, acceleration, refresh_mode)
                 };
                 tracing::warn!("{warning}");
             }
@@ -3274,10 +3274,14 @@ fn cayenne_on_conflict_warning(
 }
 
 /// The warning for a dataset on another accelerator that sets `on_conflict`.
-fn deprecated_on_conflict_warning(dataset_name: &str, acceleration: &Acceleration) -> String {
+fn deprecated_on_conflict_warning(
+    dataset_name: &str,
+    acceleration: &Acceleration,
+    refresh_mode: RefreshMode,
+) -> String {
     // File mode keeps CDC acceleration durable across restarts.
-    let mode = if acceleration.mode != Mode::File
-        && acceleration.refresh_mode == Some(RefreshMode::Changes)
+    let mode = if matches!(acceleration.mode, Mode::Memory | Mode::FileCreate)
+        && refresh_mode == RefreshMode::Changes
     {
         " with `mode: file`"
     } else {
@@ -3879,6 +3883,8 @@ mod tests {
                 for (mode, refresh_mode) in [
                     (Mode::File, None),
                     (Mode::File, Some(RefreshMode::Changes)),
+                    (Mode::FileUpdate, None),
+                    (Mode::FileUpdate, Some(RefreshMode::Changes)),
                     (Mode::Memory, None),
                     (Mode::Memory, Some(RefreshMode::Full)),
                     (Mode::Memory, Some(RefreshMode::Append)),
@@ -3886,7 +3892,11 @@ mod tests {
                     acceleration.mode = mode;
                     acceleration.refresh_mode = refresh_mode;
                     assert_eq!(
-                        deprecated_on_conflict_warning("orders", &acceleration),
+                        deprecated_on_conflict_warning(
+                            "orders",
+                            &acceleration,
+                            refresh_mode.unwrap_or(RefreshMode::Full),
+                        ),
                         "Dataset 'orders' sets `acceleration.on_conflict`, which is deprecated and removed in 3.0. Use `engine: cayenne` to keep one row per primary key without it."
                     );
                 }
@@ -3898,14 +3908,15 @@ mod tests {
             let mut acceleration = acceleration("duckdb", Some("upsert"));
             assert_eq!(acceleration.mode, Mode::Memory);
             for (mode, refresh_mode) in [
+                (Mode::Memory, None),
                 (Mode::Memory, Some(RefreshMode::Changes)),
+                (Mode::FileCreate, None),
                 (Mode::FileCreate, Some(RefreshMode::Changes)),
-                (Mode::FileUpdate, Some(RefreshMode::Changes)),
             ] {
                 acceleration.mode = mode;
                 acceleration.refresh_mode = refresh_mode;
                 assert_eq!(
-                    deprecated_on_conflict_warning("orders", &acceleration),
+                    deprecated_on_conflict_warning("orders", &acceleration, RefreshMode::Changes),
                     "Dataset 'orders' sets `acceleration.on_conflict`, which is deprecated and removed in 3.0. Use `engine: cayenne` with `mode: file` to keep one row per primary key without it."
                 );
             }
