@@ -101,6 +101,7 @@ jobs:
           filters: |
             code_changes:
               - 'test/source_versions.json'
+              - 'crates/test-framework/src/source_versions.rs'
               - '.github/workflows/integration.yml'
               - 'crates/data-connectors/connector-postgres/**'
               - 'crates/data-connectors/connector-postgres-common/**'
@@ -112,8 +113,19 @@ jobs:
               - 'crates/data_components/src/mysql_replication/**'
               - 'crates/vendor/pgwire-replication/**'
               - 'crates/runtime/tests/docker/**'
+              # Every test module the source-versions filters below select.
               - 'crates/runtime/tests/postgres/**'
+              - 'crates/runtime/tests/schema_evolution/**'
+              - 'crates/runtime/tests/retention/**'
+              - 'crates/runtime/tests/tpcds_postgres/**'
+              - 'crates/runtime/tests/hashicorp_vault/**'
+              - 'crates/runtime/tests/acceleration/refresh/**'
+              - 'crates/runtime/tests/acceleration/checkpoint_postgres.rs'
+              - 'crates/runtime/tests/acceleration/on_conflict.rs'
+              - 'crates/runtime/tests/acceleration/query_push_down.rs'
               - 'crates/runtime/tests/mysql/**'
+              - 'crates/runtime/tests/rehydration/**'
+              - 'crates/runtime/tests/refresh_retry/mysql.rs'
               - 'crates/runtime/tests/mongo/**'
 
       # Every listed release line except each source's newest, which the
