@@ -4689,12 +4689,18 @@ mod tests {
         status.update_dataset(&dataset, ComponentStatus::Refreshing);
 
         health.record_failure(&"write failed");
-        assert!(
+        // The re-report names the dataset and carries the run as it now stands: a
+        // fourth consecutive failure, not the third the first report counted.
+        assert_eq!(
             status
                 .get_dataset_status(&dataset)
                 .as_ref()
-                .and_then(ComponentStatus::error_message)
-                .is_some(),
+                .and_then(ComponentStatus::error_message),
+            Some(
+                "Dataset 'api_data' failed to write to its accelerator 4 times in a row, so no new \
+                 result is being cached and anything already cached will not be updated. Cause: \
+                 write failed. See: https://spiceai.org/docs/components/data-accelerators"
+            ),
             "a still-failing accelerator must report itself again once its status is replaced"
         );
     }
@@ -5037,6 +5043,55 @@ mod tests {
     /// Counts the rows a stream yields.
     async fn drain_rows(stream: SendableRecordBatchStream) -> usize {
         drain(stream).await.iter().map(RecordBatch::num_rows).sum()
+    }
+
+    /// Waits for a batched cache writer to exit. It exits once every sender is
+    /// gone, after flushing whatever is still queued, so the accelerator then
+    /// holds every write that was ever enqueued: a test can assert the absence
+    /// of a write as firmly as its presence, with no flush-interval guess.
+    async fn await_writer_exit(writer: tokio::task::JoinHandle<()>) {
+        tokio::time::timeout(Duration::from_secs(5), writer)
+            .await
+            .expect("the cache writer should exit within 5s of its last sender dropping")
+            .expect("the cache writer task should not panic");
+    }
+
+    /// Waits until `accelerator` holds at least `rows` rows, so a test can
+    /// observe a periodic flush while the write channel stays open.
+    async fn wait_for_accelerator_rows(accelerator: &MockAcceleratorTableProvider, rows: usize) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let held: usize = accelerator
+                .get_data()
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum();
+            if held >= rows {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the accelerator held {held} row(s) within 5s, expected {rows}"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    /// The `content` of every row the accelerator holds, in storage order.
+    fn stored_contents(accelerator: &MockAcceleratorTableProvider) -> Vec<String> {
+        accelerator
+            .get_data()
+            .iter()
+            .flat_map(|batch| {
+                let content = batch
+                    .column_by_name("content")
+                    .and_then(|c| c.as_any().downcast_ref::<StringArray>())
+                    .expect("content column");
+                (0..batch.num_rows())
+                    .map(|row| content.value(row).to_string())
+                    .collect::<Vec<_>>()
+            })
+            .collect()
     }
 
     /// Waits until `origin` has been scanned `scans` times, so a test can start a
@@ -5843,7 +5898,7 @@ mod tests {
         let in_flight_revalidations: InFlightRevalidations =
             Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
 
-        let (batch_write_tx, _consumer_handle) =
+        let (batch_write_tx, consumer_handle) =
             spawn_test_cache_write_consumer(&accelerator, &in_flight_revalidations);
 
         // Create a tokio runtime handle for the background task
@@ -5866,9 +5921,11 @@ mod tests {
             &batch_write_tx,
             CacheNamespace::Public,
         );
-
-        // Wait for flush interval `CACHE_WRITE_FLUSH_INTERVAL_MS` + buffer 100ms
-        tokio::time::sleep(Duration::from_millis(CACHE_WRITE_FLUSH_INTERVAL_MS + 100)).await;
+        // `handle_cache_hit` clones the sender it is lent, so dropping this one
+        // leaves the background refresh holding the only sender: once it has queued
+        // its write and finished, the writer flushes that write and exits.
+        drop(batch_write_tx);
+        await_writer_exit(consumer_handle).await;
 
         // Verify the federated source was called with the SPECIFIC filters only
         let recorded = federated.get_recorded_filters();
@@ -5952,7 +6009,11 @@ mod tests {
     }
 
     /// Tests that batched cache writer accumulates multiple requests and flushes them periodically.
-    #[tokio::test]
+    ///
+    /// Paused time: the flush interval elapses only when the test advances the
+    /// clock, so "not yet written" and "written at the interval" are both checked
+    /// deterministically, with the channel left open throughout.
+    #[tokio::test(start_paused = true)]
     async fn test_batched_cache_writer_flushes_multiple_requests() {
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, false)]));
 
@@ -5983,15 +6044,33 @@ mod tests {
             .expect("to send write request");
         }
 
-        // Wait for flush interval `CACHE_WRITE_FLUSH_INTERVAL_MS` + buffer 100ms
-        tokio::time::sleep(Duration::from_millis(CACHE_WRITE_FLUSH_INTERVAL_MS + 100)).await;
+        // The writer takes the requests but holds them: nothing is written per
+        // request, only when the flush interval elapses.
+        tokio::task::yield_now().await;
+        assert!(
+            accelerator.get_data().is_empty(),
+            "requests must be buffered until the flush interval, not written one by one"
+        );
 
-        // Verify accelerator received data
-        let data = accelerator.get_data();
-        assert!(!data.is_empty(), "Accelerator should have data after flush");
+        tokio::time::advance(Duration::from_millis(CACHE_WRITE_FLUSH_INTERVAL_MS)).await;
+        wait_for_accelerator_rows(&accelerator, 3).await;
 
-        let total_rows: usize = data.iter().map(RecordBatch::num_rows).sum();
-        assert_eq!(total_rows, 3, "Should have 3 rows from 3 requests");
+        // All three requests landed in that one flush, each row exactly once.
+        let mut ids: Vec<i32> = accelerator
+            .get_data()
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("id column")
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec![0, 1, 2], "Should have the 3 rows from 3 requests");
     }
 
     /// Test that 5xx and 429 responses are returned to users but NOT written to the cache.
@@ -6017,7 +6096,7 @@ mod tests {
         let in_flight: InFlightRevalidations =
             Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
 
-        let (batch_write_tx, _handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
+        let (batch_write_tx, handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
 
         // --- 500 request ---
         let mut stream = CacheRefreshHelper::handle_cache_miss(
@@ -6100,8 +6179,10 @@ mod tests {
             .expect("status column");
         assert_eq!(status_col.value(0), 429, "User should see status 429");
 
-        // Wait for cache write flush
-        tokio::time::sleep(Duration::from_millis(CACHE_WRITE_FLUSH_INTERVAL_MS + 100)).await;
+        // Both misses have returned and dropped their senders, so the writer
+        // flushes anything they enqueued and exits: the check below covers every
+        // write ever queued, not only those flushed within a guessed window.
+        await_writer_exit(handle).await;
 
         // Verify accelerator is empty — neither 5xx nor 429 should be cached
         let cached_data = accelerator.get_data();
@@ -6754,8 +6835,9 @@ mod tests {
 
         drop(stream);
         drop(leader);
-        tokio::time::sleep(Duration::from_millis(CACHE_WRITE_FLUSH_INTERVAL_MS + 200)).await;
-        handle.abort();
+        // The follower's sender went with the miss, so the writer flushes
+        // anything ever enqueued and exits.
+        await_writer_exit(handle).await;
 
         assert!(
             accelerator.get_data().is_empty(),
@@ -6772,12 +6854,13 @@ mod tests {
     /// callers rather than one.
     #[tokio::test]
     async fn concurrent_cache_misses_for_one_key_fetch_the_origin_once() {
-        // A delay long enough that the followers reach `acquire` and coalesce
-        // while the leader is still inside its single scan.
+        // Any delay makes the leader's scan await, and `join!` below drives all
+        // five misses on one task: the followers reach `acquire` and coalesce
+        // while the leader is parked inside its single scan.
         let origin = Arc::new(CountingHttpTableProvider::new(
             200,
             "shared-body",
-            Duration::from_millis(200),
+            Duration::from_millis(1),
         ));
         let schema = origin.schema();
         let accelerator = Arc::new(MockAcceleratorTableProvider::new(
@@ -6845,8 +6928,15 @@ mod tests {
             );
         }
 
-        tokio::time::sleep(Duration::from_millis(CACHE_WRITE_FLUSH_INTERVAL_MS + 200)).await;
-        handle.abort();
+        // Single-flight writes once too: only the leader holds the claim. With
+        // every sender gone the writer flushes all that was queued and exits.
+        drop(batch_write_tx);
+        await_writer_exit(handle).await;
+        assert_eq!(
+            stored_contents(&accelerator),
+            vec!["shared-body".to_string()],
+            "five misses for one key must cache its response exactly once"
+        );
     }
 
     /// Single-flight applies to an empty origin too: N concurrent misses for a
@@ -6910,8 +7000,10 @@ mod tests {
             "every caller is served the shared empty result"
         );
 
-        tokio::time::sleep(Duration::from_millis(CACHE_WRITE_FLUSH_INTERVAL_MS + 200)).await;
-        handle.abort();
+        // With every sender gone the writer flushes all that was queued and
+        // exits, so the check covers every write ever enqueued.
+        drop(batch_write_tx);
+        await_writer_exit(handle).await;
         assert!(
             accelerator.get_data().is_empty(),
             "an empty result is not written to the cache"
@@ -6982,16 +7074,12 @@ mod tests {
             "the bounded-below fetch cannot be shared, so the origin is asked twice"
         );
 
-        tokio::time::sleep(Duration::from_millis(CACHE_WRITE_FLUSH_INTERVAL_MS + 200)).await;
-        handle.abort();
-        let written: usize = accelerator
-            .get_data()
-            .iter()
-            .map(RecordBatch::num_rows)
-            .sum();
+        drop(batch_write_tx);
+        await_writer_exit(handle).await;
         assert_eq!(
-            written, 1,
-            "only the leader writes; the caller that fetched for itself holds no claim"
+            stored_contents(&accelerator),
+            vec!["row".to_string()],
+            "only the leader writes its one row; the caller that fetched for itself holds no claim"
         );
     }
 
@@ -7086,8 +7174,15 @@ mod tests {
             .expect("content column");
         assert_eq!(content.value(0), "revalidated-body");
 
-        tokio::time::sleep(Duration::from_millis(CACHE_WRITE_FLUSH_INTERVAL_MS + 200)).await;
-        handle.abort();
+        // The revalidation's write is the only one: the miss followed it and
+        // holds no claim. With every sender gone the writer flushes and exits.
+        drop(batch_write_tx);
+        await_writer_exit(handle).await;
+        assert_eq!(
+            stored_contents(&accelerator),
+            vec!["revalidated-body".to_string()],
+            "the revalidation writes its one row and the coalesced miss writes nothing"
+        );
     }
 
     /// The periodic stale-row refresh holds the claim for each entry across its
@@ -7426,8 +7521,9 @@ mod tests {
             batch.expect("stream");
         }
         drop(stream);
-        tokio::time::sleep(Duration::from_millis(CACHE_WRITE_FLUSH_INTERVAL_MS + 200)).await;
-        handle.abort();
+        // The miss took the only sender with it, so the writer flushes anything
+        // enqueued (and releases its claim) before it exits.
+        await_writer_exit(handle).await;
 
         assert!(
             in_flight.lock().is_empty(),
@@ -7535,7 +7631,7 @@ mod tests {
         let in_flight: InFlightRevalidations =
             Arc::new(parking_lot::Mutex::new(std::collections::HashMap::new()));
 
-        let (batch_write_tx, _handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
+        let (batch_write_tx, handle) = spawn_test_cache_write_consumer(&accelerator, &in_flight);
 
         // 2. Call handle_cache_miss - this is what happens when user queries and cache is empty
         let mut stream = CacheRefreshHelper::handle_cache_miss(
@@ -7580,8 +7676,9 @@ mod tests {
             .expect("status column");
         assert_eq!(status_col.value(0), 404, "User should see status 404");
 
-        // Wait for cache write flush
-        tokio::time::sleep(Duration::from_millis(CACHE_WRITE_FLUSH_INTERVAL_MS + 100)).await;
+        // The miss took the only sender with it, so the writer flushes what it
+        // enqueued and exits.
+        await_writer_exit(handle).await;
 
         // 4. Verify accelerator has the 404 response cached
         let cached_data = accelerator.get_data();

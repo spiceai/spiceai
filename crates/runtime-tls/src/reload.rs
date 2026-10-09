@@ -995,19 +995,42 @@ mod tests {
 
     #[test]
     fn build_from_pem_round_trips() {
+        use std::fmt::Write as _;
+
+        use sha2::{Digest, Sha256};
+
         install_crypto_provider();
         let cert = include_bytes!("../../../test/tls/spiced_cert.pem");
         let key = include_bytes!("../../../test/tls/spiced_key.pem");
         let r = ReloadableServerCerts::from_pem(cert, key, ReloadScope::Public)
             .expect("build from pem");
-        let resolved = r
-            .inner
-            .load()
-            .cert
-            .first()
-            .map(|c| c.as_ref().to_vec())
-            .unwrap_or_default();
-        assert!(!resolved.is_empty(), "cert chain should be non-empty");
+
+        // The served chain is the fixture's chain, certificate for certificate.
+        let expected = CertificateDer::pem_slice_iter(cert)
+            .collect::<Result<Vec<_>, _>>()
+            .expect("the fixture is a PEM certificate chain");
+        let served = r.current_cert_chain();
+        assert_eq!(served, expected);
+
+        // Pinned without any PEM parser: the fixture holds one certificate,
+        // and these are the length and SHA-256 of its base64-decoded DER.
+        let [leaf] = served.as_slice() else {
+            panic!(
+                "expected a single-certificate chain, got {} certificates",
+                served.len()
+            );
+        };
+        assert_eq!(leaf.as_ref().len(), 1275);
+        let digest = Sha256::digest(leaf.as_ref())
+            .iter()
+            .fold(String::new(), |mut hex, byte| {
+                let _ = write!(hex, "{byte:02x}");
+                hex
+            });
+        assert_eq!(
+            digest,
+            "a4563153133eb4b263d1e801ab4599e20cc28f1637819365810b4f952e8cde8f"
+        );
     }
 
     #[test]

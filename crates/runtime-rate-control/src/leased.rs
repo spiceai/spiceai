@@ -1900,6 +1900,7 @@ fn unix_millis(time: SystemTime) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use futures::FutureExt;
     use insta::assert_snapshot;
     use object_store::memory::InMemory;
     use serde_json::Value;
@@ -3451,13 +3452,40 @@ mod tests {
         res.expect("join").expect("acquire ok");
     }
 
+    /// Polls the wall clock the bucket windows by until window `target` has
+    /// begun. Bounded, so a window that never arrives fails the test instead
+    /// of hanging it, and a clock that skipped the window entirely is named.
+    async fn wait_for_window(target: u64, window: Duration) {
+        let deadline = tokio::time::Instant::now() + window * 10;
+        loop {
+            let now_window = window_id_for(SystemTime::now(), window);
+            if now_window >= target {
+                assert_eq!(now_window, target, "the clock skipped past window {target}");
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "window {target} never began; still in window {now_window}"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
     #[tokio::test]
     async fn pre_lease_lands_in_next_window_and_promotes_on_roll() {
         // 200 ms windows make the test quick; burst=20 so MAX_LEASE_PER_REPLICA = 19.
-        let bucket = LeasedBucket::new(config_for(20, "a", Duration::from_millis(200)));
+        let window = Duration::from_millis(200);
+        let bucket = LeasedBucket::new(config_for(20, "a", window));
+
+        // Lease at the top of a fresh window, so the refresh and the drain
+        // finish inside it. Refreshing at the very end of a window could let
+        // the clock skip the pre-leased window, which is then discarded.
+        let start = window_id_for(SystemTime::now(), window);
+        wait_for_window(start + 1, window).await;
         bucket.refresh_lease().await.expect("lease");
 
-        // After refresh, both current and next slots should be granted.
+        // After refresh, both current and next slots are granted: a replica
+        // with no demand history holds the minimum lease of one in each.
         let (cur_window, cur_grant, next_window, next_grant) = {
             let inner = bucket.inner.lock().await;
             (
@@ -3468,8 +3496,11 @@ mod tests {
             )
         };
         assert_eq!(next_window, cur_window + 1);
-        assert!(cur_grant > 0, "current grant should be non-zero");
-        assert!(next_grant > 0, "next-window pre-lease should be non-zero");
+        assert_eq!(cur_grant, 1, "current window holds the minimum lease");
+        assert_eq!(
+            next_grant, 1,
+            "next-window pre-lease holds the minimum lease"
+        );
 
         // Drain the current window's lease so the next acquire would block on
         // a roll.
@@ -3477,18 +3508,17 @@ mod tests {
             bucket.acquire().await.expect("acquire ok");
         }
 
-        // Wait for the window to roll. With pre-leasing, acquire() must NOT
-        // block on a fresh OCC round-trip — the next-window slot is promoted
-        // immediately.
-        tokio::time::sleep(Duration::from_millis(220)).await;
-
-        let started = std::time::Instant::now();
-        bucket.acquire().await.expect("post-roll acquire ok");
-        assert!(
-            started.elapsed() < Duration::from_millis(50),
-            "post-roll acquire took {:?}, expected pre-leased slot to be promoted",
-            started.elapsed()
-        );
+        // Once the window rolls, acquire() must NOT block on a fresh OCC
+        // round-trip: the next-window slot is promoted within its first poll,
+        // so it completes without waiting at all.
+        wait_for_window(next_window, window).await;
+        bucket
+            .acquire()
+            .now_or_never()
+            .expect(
+                "post-roll acquire must complete without waiting: the pre-leased slot is promoted",
+            )
+            .expect("post-roll acquire ok");
 
         // Inner state should reflect that the previous next-window is now current.
         let inner = bucket.inner.lock().await;

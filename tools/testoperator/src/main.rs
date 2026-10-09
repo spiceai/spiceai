@@ -26,6 +26,8 @@ mod probe;
 mod spiced_metrics;
 mod stats;
 mod system_adapter;
+#[cfg(test)]
+mod test_support;
 
 use args::{
     ColdStartArgs, Commands, DataConsistencyArgs, DatasetTestArgs, HtapArgs, LoadTestArgs,

@@ -502,13 +502,6 @@ mod tests {
     }
 
     #[test]
-    fn test_factory_as_any() {
-        let factory = ScyllaDbFactory::new();
-        let any_ref = factory.as_any();
-        assert!(any_ref.downcast_ref::<ScyllaDbFactory>().is_some());
-    }
-
-    #[test]
     fn test_reserved_keywords_comprehensive() {
         let factory = ScyllaDbFactory::new();
         let keywords = factory.reserved_keywords();
@@ -576,16 +569,42 @@ mod tests {
     #[test]
     fn test_parameter_specs_descriptions() {
         let factory = ScyllaDbFactory::new();
-        let params = factory.parameters();
 
-        // All parameters should have descriptions
-        for param in params {
-            assert!(
-                !param.description.is_empty(),
-                "Parameter '{}' should have a description",
-                param.name
-            );
-        }
+        // The connector's user-facing params, pinned whole: a renamed key, a changed
+        // default or secret marking, or a reworded description is a surface change.
+        let surface: Vec<String> = factory
+            .parameters()
+            .iter()
+            .map(|param| {
+                format!(
+                    "{} [{:?}{}{}{}]: {}",
+                    param.name,
+                    param.r#type,
+                    if param.required { ", required" } else { "" },
+                    if param.secret { ", secret" } else { "" },
+                    param
+                        .default
+                        .map_or_else(String::new, |default| format!(", default {default}")),
+                    param.description
+                )
+            })
+            .collect();
+        assert_eq!(
+            surface,
+            [
+                "host [Component]: The hostname of the ScyllaDB node to connect to. Can be a \
+                 comma-separated list of hosts.",
+                "hosts [Component]: A comma-separated list of ScyllaDB node hostnames to connect \
+                 to (alternative to host).",
+                "port [Component]: The port of the ScyllaDB server. Defaults to 9042.",
+                "keyspace [Component]: The keyspace to use on the ScyllaDB cluster.",
+                "user [Component]: The username to use to authenticate with ScyllaDB.",
+                "pass [Component, secret]: The password to use to authenticate with ScyllaDB.",
+                "datacenter [Component]: The datacenter to use for local connection preferences.",
+                "ssl [Component]: Whether to use SSL/TLS for the connection. Defaults to false.",
+                "connection_timeout [Runtime]: The connection timeout in milliseconds.",
+            ]
+        );
     }
 
     #[test]

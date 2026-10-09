@@ -3809,8 +3809,17 @@ mod tests {
             }],
         };
 
-        MaintainedAggregateRegistry::try_new(&[spec], &schema)
+        let err = MaintainedAggregateRegistry::try_new(&[spec], &schema)
             .expect_err("unsupported group key type should be rejected");
+        // The group-key type guard is what refused it, not a column-resolution failure.
+        assert!(
+            matches!(
+                &err,
+                DataFusionError::Plan(message) if message
+                    == "Maintained aggregate GROUP BY column 'group_key' uses unsupported type Float64"
+            ),
+            "{err:?}"
+        );
     }
 
     #[test]

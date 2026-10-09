@@ -289,11 +289,20 @@ mod tests {
         let dialect = create_dialect();
         let unparser = Unparser::new(&dialect);
 
-        // Only one argument - should fail
+        // Only one argument - should fail on the argument count, before the first argument (a
+        // non-array literal, which has its own error) is inspected.
         let args = vec![lit(1)];
 
-        let result = array_has_to_array_contains(&unparser, &args);
-        assert!(result.is_err(), "Expected error for wrong argument count");
+        let err = array_has_to_array_contains(&unparser, &args)
+            .expect_err("Expected error for wrong argument count");
+        assert!(
+            matches!(
+                &err,
+                DataFusionError::Plan(message)
+                    if message == "array_has requires exactly 2 arguments, got 1"
+            ),
+            "a one-argument array_has must be rejected for its argument count, got: {err:?}"
+        );
     }
 
     #[test]

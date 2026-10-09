@@ -794,9 +794,15 @@ mod tests {
 
         // Before the fix this returned the `ExprBoundaries` col_index
         // out-of-bounds internal error instead of `Ok`.
-        StatisticsContext::new()
+        let stats = StatisticsContext::new()
             .compute(&filter, &StatisticsArgs::new())
             .expect("filter statistics analysis must not go out of bounds");
+        // The analysis ran over the stripped two-column schema it indexes.
+        assert_eq!(
+            stats.column_statistics.len(),
+            2,
+            "one column statistic per column of the stripped output schema"
+        );
     }
 
     #[test]
@@ -821,9 +827,30 @@ mod tests {
 
         let schema_cast = SchemaCastScanExec::new(sorted_input, target_schema);
 
-        assert!(
-            schema_cast.properties().output_ordering().is_some(),
-            "Ordering should be propagated when types match"
+        // The exact ordering, not just some ordering: a wrong advertised sort key
+        // or direction would let the optimizer drop a sort the plan needs.
+        let output_ordering = schema_cast
+            .properties()
+            .output_ordering()
+            .expect("Ordering should be propagated when types match");
+        assert_eq!(
+            output_ordering.len(),
+            1,
+            "exactly the input's one sort key: {output_ordering:?}"
+        );
+        let sort_expr = &output_ordering[0];
+        let column = sort_expr
+            .expr
+            .downcast_ref::<Column>()
+            .expect("the sort key should remain a column");
+        assert_eq!(column.name(), "id");
+        assert_eq!(column.index(), 0, "column index should match output schema");
+        assert_eq!(
+            sort_expr.options,
+            SortOptions {
+                descending: false,
+                nulls_first: true,
+            }
         );
     }
 

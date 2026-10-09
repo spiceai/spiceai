@@ -2964,9 +2964,17 @@ mod tests {
 
         // Taken after the build, which is the only order a caller can manage:
         // the table has to exist before its refresher can be reached.
-        tokio::time::timeout(Duration::from_secs(5), completion.next().wait())
+        let outcome = tokio::time::timeout(Duration::from_secs(5), completion.next().wait())
             .await
             .expect("a scheduler must release a waiter for a refresh it will never run");
+        // Released by the scheduler's `close()` with no refresh recorded locally —
+        // not by a terminal failure, and not by a local refresh, which warmup
+        // would then mistake for distributed data being queryable.
+        assert_eq!(outcome, RefreshCompletionOutcome::Answered);
+        assert!(
+            completion.closed_without_a_refresh(),
+            "the scheduler closes the signal without recording a refresh"
+        );
     }
 
     /// The contrast that keeps the test above honest: off the scheduler path a
@@ -3468,7 +3476,11 @@ mod tests {
     ///
     /// Taking the lock where the plan is *built* would not have shown up here:
     /// the rows move when the plan executes, which is what this drives.
-    #[tokio::test]
+    ///
+    /// Paused time: the 250 ms sleep below elapses only once every other task is
+    /// idle, so the spawned write has either finished or parked on the lock by
+    /// then — the check no longer depends on how fast the runner is.
+    #[tokio::test(start_paused = true)]
     async fn test_a_direct_insert_waits_for_the_accelerator_write_lock() {
         let (table, accelerator, write_mutex) =
             table_with_write_lock(WriteMode::AcceleratorOnly).await;
@@ -3481,9 +3493,8 @@ mod tests {
 
         let write = tokio::spawn(datafusion::physical_plan::collect(plan, ctx.task_ctx()));
 
-        // Long enough that a write which does not wait would have finished:
-        // the unguarded path completed this insert in well under a
-        // millisecond, and the assertion below is what proves it now waits.
+        // A write that does not wait runs to completion before the paused clock
+        // can advance; one that waits is parked on the lock.
         tokio::time::sleep(Duration::from_millis(250)).await;
 
         assert!(
@@ -3518,7 +3529,11 @@ mod tests {
     /// snapshot holding the lock ahead of it — and the next on-change snapshot
     /// would read an unchanged marker and skip, leaving the acknowledged write
     /// out of every snapshot until some later mutation moved it again.
-    #[tokio::test]
+    ///
+    /// Paused time: the 250 ms sleep elapses only once the spawned write is idle
+    /// — parked on the lock — so the marker is checked against a write that has
+    /// provably reached it.
+    #[tokio::test(start_paused = true)]
     async fn test_a_waiting_write_does_not_move_the_freshness_marker_early() {
         let (table, accelerator, write_mutex) =
             table_with_write_lock(WriteMode::AcceleratorOnly).await;
@@ -3581,7 +3596,9 @@ mod tests {
     /// The same gap, on the other two write verbs that reach the accelerator —
     /// a snapshot taken beside an unserialized `DELETE` or `UPDATE` captures a
     /// row set no point in time produced just as an `INSERT` does.
-    #[tokio::test]
+    ///
+    /// Paused time, as above: the sleep elapses only once the delete has parked.
+    #[tokio::test(start_paused = true)]
     async fn test_a_direct_delete_waits_for_the_accelerator_write_lock() {
         let (table, accelerator, write_mutex) =
             table_with_write_lock(WriteMode::AcceleratorOnly).await;

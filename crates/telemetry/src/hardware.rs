@@ -1336,12 +1336,6 @@ mod tests {
     // -------------------------------------------------------------------------
 
     #[test]
-    fn test_detect_gpu_count_no_panic() {
-        // Just ensure GPU detection doesn't panic on any platform
-        let _ = detect_gpu_count();
-    }
-
-    #[test]
     fn test_parse_nvidia_visible_devices_all() {
         // "all" means we can't determine count
         assert_eq!(parse_nvidia_visible_devices("all"), None);

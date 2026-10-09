@@ -736,8 +736,22 @@ mod tests {
     #[test]
     fn test_metrics_reader_default() {
         let reader = MetricsReader::default();
-        // Should not panic
-        let _ = reader.collect_otlp();
+        // No meter provider has registered this reader, so there is nothing to collect from:
+        // the best-effort collection yields an empty payload...
+        assert_eq!(reader.collect_otlp(), Vec::<u8>::new());
+        // ...and the fallible export reports the failed collection instead.
+        let err = reader
+            .collect_otlp_export("app")
+            .expect_err("an unregistered reader cannot collect");
+        assert!(
+            matches!(
+                err,
+                Error::Collect {
+                    source: opentelemetry_sdk::error::OTelSdkError::InternalFailure(_)
+                }
+            ),
+            "{err:?}"
+        );
     }
 
     fn app_id_of(request: &ExportMetricsServiceRequest) -> Vec<String> {
