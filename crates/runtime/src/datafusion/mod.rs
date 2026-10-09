@@ -3983,22 +3983,16 @@ impl DataFusion {
         refresh = refresh.versions_by_time(
             acceleration_settings
                 .orders_versions_by_time(dataset.time_column.as_deref(), refresh_mode)
-                .then(|| {
-                    VersionsByTime {
-                        // An unpartitioned Cayenne table resolves a full refresh's repeated
-                        // keys as it writes them, ordered by the row versions the refresh
-                        // supplies: in file mode after writing, in memory mode over the
-                        // buffered write. Only file mode does so for an append into an
-                        // empty table, and not when the table has `retention_sql`.
-                        versions_resolved_after_write: acceleration_settings.engine
-                            == Engine::Cayenne
-                            && acceleration_settings.partition_by.is_empty(),
-                        appends_resolved_after_write: acceleration_settings.engine
-                            == Engine::Cayenne
-                            && acceleration_settings.mode == Mode::File
-                            && acceleration_settings.partition_by.is_empty()
-                            && acceleration_settings.retention_sql.is_none(),
-                    }
+                .then(|| VersionsByTime {
+                    // An unpartitioned Cayenne table resolves a full refresh's repeated
+                    // keys as it writes them, ordered by the row versions the refresh
+                    // supplies: in file mode after writing, in memory mode over the
+                    // buffered write. With `cayenne_pk_conflict_detection: none` it
+                    // resolves no keys and keeps every row, which that setting reserves
+                    // for a source whose keys are unique. The refresh asks the table itself
+                    // whether it takes an append's versions.
+                    versions_resolved_after_write: acceleration_settings.engine == Engine::Cayenne
+                        && acceleration_settings.partition_by.is_empty(),
                 }),
         );
         if let Some(caching_ttl) = acceleration_settings.caching_ttl {

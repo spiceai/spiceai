@@ -4818,6 +4818,161 @@ mod tests {
         );
     }
 
+    /// The files at the bottom of `plan`'s chain of single-child nodes.
+    fn planned_files(plan: &Arc<dyn datafusion::physical_plan::ExecutionPlan>) -> Vec<String> {
+        use datafusion_datasource::file_scan_config::FileScanConfig;
+        use datafusion_datasource::source::DataSourceExec;
+        if let Some(config) = plan
+            .downcast_ref::<DataSourceExec>()
+            .and_then(|scan| scan.data_source().downcast_ref::<FileScanConfig>())
+        {
+            return config
+                .file_groups
+                .iter()
+                .flat_map(FileGroup::iter)
+                .map(|file| file.object_meta.location.to_string())
+                .collect();
+        }
+        plan.children()
+            .into_iter()
+            .flat_map(planned_files)
+            .collect()
+    }
+
+    /// A runtime-restricted scan of two indexed files, holding keys 1 and 2,
+    /// whose hash-join filter has not been published yet, with that filter
+    /// and its key column.
+    async fn restricted_scan_of_two_files() -> (
+        super::super::runtime_restricted_scan::RuntimeRestrictedScanExec,
+        Arc<DynamicFilterPhysicalExpr>,
+        Arc<dyn PhysicalExpr>,
+    ) {
+        use datafusion::datasource::physical_plan::ParquetSource;
+        use datafusion_datasource::file_scan_config::FileScanConfigBuilder;
+        use datafusion_datasource::source::DataSourceExec;
+        use datafusion_execution::object_store::ObjectStoreUrl;
+
+        let pool = unbounded_pool();
+        let state = keyed_state(&pool);
+        write(
+            &state,
+            &[
+                ("a.vortex", 0, keyed_batch(&[Some(1)], &[None])),
+                ("b.vortex", 0, keyed_batch(&[Some(2)], &[None])),
+            ],
+        )
+        .await;
+        let provider = Arc::new(DynamicLookupAccessPlanProvider::new(
+            Arc::clone(&state),
+            state.published(),
+            Arc::new([
+                scan_file(path("a.vortex").as_ref()),
+                scan_file(path("b.vortex").as_ref()),
+            ]),
+            None,
+        ));
+        let column = Arc::new(Column::new("tenant", 0)) as Arc<dyn PhysicalExpr>;
+        let dynamic = Arc::new(DynamicFilterPhysicalExpr::new(
+            vec![Arc::clone(&column)],
+            Arc::new(Literal::new(ScalarValue::Boolean(Some(true)))),
+        ));
+        let file = |name: &str| PartitionedFile::new(path(name).to_string(), 1);
+        let input = DataSourceExec::from_data_source(
+            FileScanConfigBuilder::new(
+                ObjectStoreUrl::local_filesystem(),
+                Arc::new(
+                    ParquetSource::new(keyed_schema())
+                        .with_predicate(Arc::clone(&dynamic) as Arc<dyn PhysicalExpr>),
+                ),
+            )
+            .with_file_groups(vec![
+                FileGroup::new(vec![file("a.vortex")]),
+                FileGroup::new(vec![file("b.vortex")]),
+            ])
+            .build(),
+        );
+        (
+            super::super::runtime_restricted_scan::RuntimeRestrictedScanExec::new(input, provider),
+            dynamic,
+            column,
+        )
+    }
+
+    /// Regression test: a partition that starts after the join publishes its
+    /// keys runs the scan a partition that started before them chose. A file
+    /// scan's partitions drain one queue of files per plan, so the narrowed
+    /// scan it would otherwise run reads files the unrestricted scan's
+    /// partitions also read. TPC-H q11 over an index on `supplier.s_nationkey`
+    /// read every German supplier twice that way and returned 6 of its 1048
+    /// rows.
+    #[tokio::test]
+    async fn a_partition_starting_after_the_keys_runs_the_scan_chosen_before_them() {
+        let (scan, dynamic, column) = restricted_scan_of_two_files().await;
+
+        let before_keys = scan
+            .chosen_scan()
+            .await
+            .expect("the first partition's scan");
+        dynamic
+            .update(tenant_in_list(&column, &[1]))
+            .expect("the build side's keys");
+        dynamic.mark_complete();
+        let after_keys = scan
+            .chosen_scan()
+            .await
+            .expect("the second partition's scan");
+
+        assert_eq!(
+            planned_files(&before_keys),
+            vec![
+                "table/snapshot/a.vortex".to_string(),
+                "table/snapshot/b.vortex".to_string()
+            ],
+            "with no keys published the scan reads every file"
+        );
+        assert!(
+            Arc::ptr_eq(&before_keys, &after_keys),
+            "the second partition ran a separately narrowed scan over {:?}, which the first \
+             partition's unrestricted scan also reads",
+            planned_files(&after_keys)
+        );
+    }
+
+    /// Regression test: every partition of one execution runs the scan the
+    /// first partition chose, even when a later probe resolves the same keys to
+    /// a new selection, as a new generation of the filter does.
+    #[tokio::test]
+    async fn every_partition_of_a_restricted_scan_runs_the_plan_the_first_chose() {
+        let (scan, dynamic, column) = restricted_scan_of_two_files().await;
+        dynamic
+            .update(tenant_in_list(&column, &[1]))
+            .expect("the build side's keys");
+        dynamic.mark_complete();
+
+        let first = scan
+            .chosen_scan()
+            .await
+            .expect("the first partition's scan");
+        dynamic
+            .update(tenant_in_list(&column, &[1]))
+            .expect("the same keys, a later generation");
+        let second = scan
+            .chosen_scan()
+            .await
+            .expect("the second partition's scan");
+
+        assert_eq!(
+            planned_files(&first),
+            vec!["table/snapshot/a.vortex".to_string()],
+            "the index narrows the scan to the file holding key 1"
+        );
+        assert!(
+            Arc::ptr_eq(&first, &second),
+            "the second partition ran a separately narrowed scan, which reads {:?} again",
+            planned_files(&second)
+        );
+    }
+
     #[tokio::test]
     async fn a_claim_dropped_before_its_build_runs_frees_the_slot() {
         let pool = unbounded_pool();

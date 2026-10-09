@@ -412,6 +412,7 @@ scylla = "1.4.1"
 secrecy = "0.10.3"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1"
+serde_path_to_error = "0.1.20"
 sha2 = "0.10.8"
 snafu = "0.8.6"
 cloud-connect-crypto = { path = "crates/cloud-connect-crypto" }
