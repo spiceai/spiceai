@@ -333,6 +333,35 @@ impl CayenneLayout {
         self.layout.to_string()
     }
 
+    /// Panics unless `provider` was created the way this layout asks for
+    /// `table`: the check that keeps a layout run from comparing Cayenne's
+    /// default layout under the layout's label.
+    fn assert_applied(&self, table: &str, provider: &CayenneTableProvider) {
+        let (primary_key, config, indexes) = self.table_options(table);
+        let metadata = provider.metadata();
+        assert_eq!(
+            metadata.primary_key, primary_key,
+            "layout '{}': table '{table}' has the wrong primary key",
+            self.layout
+        );
+        assert_eq!(
+            metadata.vortex_config.sort_columns, config.sort_columns,
+            "layout '{}': table '{table}' has the wrong sort columns",
+            self.layout
+        );
+        assert_eq!(
+            metadata.vortex_config.cluster_by, config.cluster_by,
+            "layout '{}': table '{table}' has the wrong clustering columns",
+            self.layout
+        );
+        assert_eq!(
+            provider.lookup_index_counters().is_some(),
+            !indexes.is_empty(),
+            "layout '{}': table '{table}' should declare secondary indexes exactly when the layout gives it some",
+            self.layout
+        );
+    }
+
     /// The primary key, Vortex configuration and secondary indexes to create
     /// `table` with.
     fn table_options(
@@ -375,6 +404,26 @@ impl CayenneLayout {
         };
         (primary_key, config, indexes)
     }
+}
+
+/// Secondary-index probes summed over a harness's tables: how many scans the
+/// layout's indexes narrowed (`full` + `partial` coverage) and how many files
+/// they handed a row selection, or `None` when no table declares an index.
+#[must_use]
+pub fn secondary_index_use(harness: &CayenneHarness) -> Option<(u64, u64)> {
+    let counters: Vec<_> = harness
+        .tables
+        .values()
+        .filter_map(|table| table.lookup_index_counters())
+        .collect();
+    (!counters.is_empty()).then(|| {
+        counters.iter().fold((0, 0), |(probes, selections), c| {
+            (
+                probes + c.full + c.partial,
+                selections + c.access_plans_attached,
+            )
+        })
+    })
 }
 
 /// The layouts the oracle lanes load a benchmark suite under besides Cayenne's
@@ -509,6 +558,9 @@ impl CayenneHarness {
             .await
             .expect("create cayenne table"),
         );
+        if let Some(layout) = &self.layout {
+            layout.assert_applied(table_name, &table);
+        }
 
         match mode {
             LoadMode::Full => {

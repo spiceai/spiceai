@@ -24,7 +24,7 @@ use crate::args::{CommonArgs, DatasetTestArgs};
 use test_framework::{
     anyhow,
     app::{App, AppBuilder},
-    layout::{apply_layout, benchmark_tables},
+    layout::{Layout, apply_layout, benchmark_tables},
     opentelemetry_sdk::Resource,
     queries::{Query, QuerySet},
     spiced::{SpicedInstance, StartRequest},
@@ -502,9 +502,14 @@ fn apply_layout_option(args: &DatasetTestArgs, app: &mut App) -> anyhow::Result<
         )
     })?;
     let applied = apply_layout(&mut app.datasets, tables, layout)?;
+    // A layout run is a different test of the same spicepod: its own name keeps
+    // its timings and plans out of the default layout's metric series and
+    // snapshots.
+    app.name = layout_test_name(&app.name, layout);
     println!(
-        "Configured layout '{layout}' on {} accelerated datasets:",
-        applied.len()
+        "Configured layout '{layout}' on {} accelerated datasets of '{}':",
+        applied.len(),
+        app.name
     );
     for dataset in &applied {
         println!("  {dataset}");
@@ -669,6 +674,12 @@ pub(crate) fn ensure_shared_client_connections(
          --queries-per-client); they apply to 'run throughput' and 'run load'"
     );
     Ok(())
+}
+
+/// The test name of `name`'s spicepod run under `layout`, following the spicepod
+/// naming convention's test-variant suffix.
+fn layout_test_name(name: &str, layout: &Layout) -> String {
+    format!("{name}-layout[{layout}]")
 }
 
 /// `--layout` rewrites the spicepod testoperator starts `spiced` with, so it
@@ -1113,15 +1124,18 @@ mod tests {
         assert!(runs > 0, "should find CH-benCH HTAP dispatches");
     }
 
-    /// Every scale factor 1 TPC-H, TPC-DS and `ClickBench` benchmark dispatch
-    /// validates its results against an oracle it can actually resolve, except
-    /// those in `BENCH_DISPATCHES_THAT_SKIP_RESULT_VALIDATION`. Benchmarks at
-    /// larger scale factors measure performance and leave `validate_results` unset.
+    /// Every scale factor 1 TPC-H, TPC-DS, `ClickBench` and CH-benCH benchmark
+    /// dispatch validates its results against an oracle it can actually resolve,
+    /// except those in `BENCH_DISPATCHES_THAT_SKIP_RESULT_VALIDATION`. Benchmarks
+    /// at larger scale factors measure performance and leave `validate_results`
+    /// unset.
     ///
     /// Each `bench` entry is resolved the way `testoperator_run_bench.yml` runs
-    /// it — the inputs `testoperator dispatch` sends, the spicepod under
-    /// `test/spicepods/<query set>/sf<scale factor>/`, `spiced` started by
-    /// testoperator — through the same calls a run makes before its first query.
+    /// it — the inputs `testoperator dispatch` sends (one run per layout and
+    /// `PostgreSQL` line it expands to), the spicepod under
+    /// `test/spicepods/<query set>/sf<scale factor>/` (`test/spicepods/chbench/`
+    /// for CH-benCH), `spiced` started by testoperator — through the same calls a
+    /// run makes before its first query, layout included.
     /// `--validate` stops a run that has no oracle, so a dispatch that could not
     /// be validated fails here instead of in the scheduled run.
     #[tokio::test]
@@ -1131,7 +1145,7 @@ mod tests {
         let dispatch_root = repo_root.join("tools/testoperator/dispatch");
         let mut checked = 0;
         let mut seen_opt_outs = BTreeSet::new();
-        for query_set_directory in ["tpch", "tpcds", "clickbench"] {
+        for query_set_directory in ["tpch", "tpcds", "clickbench", "chbench"] {
             let dispatch_directory = dispatch_root.join(query_set_directory);
             for dispatch_path in scan_directory_for_yamls(&dispatch_directory)
                 .expect("should scan the dispatch directory")
@@ -1211,11 +1225,19 @@ mod tests {
                             "{dispatch_name} sets `postgres_version`, but testoperator_run_bench.yml starts its local postgres_tpch service only for a `postgres` spicepod (not DuckLake) on TPC-H or TPC-DS at scale factor 1 or 10, or for ClickBench's s3[parquet]-postgres, so the version would not apply"
                         );
                     }
-                    let spicepod_path = repo_root
-                        .join("test/spicepods")
-                        .join(query_set.split('[').next().unwrap_or(query_set))
-                        .join(format!("sf{scale_factor}"))
-                        .join(&bench.spicepod_path);
+                    // testoperator_run_bench.yml's path: CH-benCH spicepods carry no
+                    // scale-factor directory, since the scale factor sets the source.
+                    let spicepod_path = if query_set == "chbench" {
+                        repo_root
+                            .join("test/spicepods/chbench")
+                            .join(&bench.spicepod_path)
+                    } else {
+                        repo_root
+                            .join("test/spicepods")
+                            .join(query_set.split('[').next().unwrap_or(query_set))
+                            .join(format!("sf{scale_factor}"))
+                            .join(&bench.spicepod_path)
+                    };
                     let spicepod_path = spicepod_path.to_string_lossy();
 
                     let mut command_line = vec![

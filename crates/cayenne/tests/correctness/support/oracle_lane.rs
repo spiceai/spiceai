@@ -310,6 +310,11 @@ pub async fn run_fixture_suite_with_layouts(
                 lane.run_suite(&cayenne, suite, &label, queries, &inventory, &cayenne_query)
                     .await,
             );
+            if let Some((narrowed, selections)) = super::secondary_index_use(&cayenne) {
+                eprintln!(
+                    "{label}: secondary indexes narrowed {narrowed} scans and handed {selections} files a row selection"
+                );
+            }
         }
     }
     results

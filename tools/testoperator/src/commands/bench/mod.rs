@@ -190,9 +190,17 @@ async fn run_inner(
 
     let benchmark_test = SpiceTest::new(app.name.clone(), test_builder)
         .with_spiced_instance(spiced_instance)
-        .with_results_snapshot(snapshot_predicate)
-        .with_progress_bars(!args.common.disable_progress_bars)
-        .with_explain_plan_snapshot();
+        .with_progress_bars(!args.common.disable_progress_bars);
+    // A layout run's answers are checked by `--validate` against the unaccelerated
+    // oracle, and its plans legitimately differ from the default layout's (index
+    // lookups, sorts), so it records no result or explain-plan snapshots.
+    let benchmark_test = if args.layout.is_some() {
+        benchmark_test
+    } else {
+        benchmark_test
+            .with_results_snapshot(snapshot_predicate)
+            .with_explain_plan_snapshot()
+    };
 
     let benchmark_test = benchmark_test.start()?;
 

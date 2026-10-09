@@ -1,0 +1,14 @@
+# chbench/sf1-layouts/postgres-cayenne[file].yaml's HTAP layouts, combined,
+# over the MySQL binlog source.
+schedule: weekly
+tests:
+  htap:
+    spicepod_path: accelerated/mysql-cayenne[file].yaml
+    runner_type: spiceai-dev-large-runners
+    scale_factor: 1
+    duration: 1800
+    ready_wait: 60
+    rate: 9250
+    layouts:
+      - indexes,sort,time_column
+      - indexes,cluster,time_column,partition

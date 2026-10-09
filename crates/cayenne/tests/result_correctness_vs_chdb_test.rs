@@ -609,7 +609,7 @@ async fn chbench_load_mode_matrix_vs_chdb() {
         CHBENCH_TABLES, chbench_sql_for_datafusion, ensure_chbench_fixture,
     };
     use support::chdb_engine::ChdbOracle;
-    use support::oracle_lane::run_fixture_suite;
+    use support::oracle_lane::run_fixture_suite_with_layouts;
     use test_framework::queries::get_chbench_test_queries;
 
     let _session = CHDB_SESSION.lock().await;
@@ -618,13 +618,17 @@ async fn chbench_load_mode_matrix_vs_chdb() {
     ensure_chbench_fixture(&dir, warehouses);
     let chdb = ChdbOracle::new();
     chdb.load_parquet_dir(&dir, CHBENCH_TABLES);
-    let results = run_fixture_suite(
+    let results = run_fixture_suite_with_layouts(
         &chdb,
         &dir,
         CHBENCH_TABLES,
         "chbench",
         &get_chbench_test_queries(None),
         support::LoadMode::all(),
+        &support::with_layouts(
+            &test_framework::queries::QuerySet::ChBench,
+            support::KEYED_LAYOUTS,
+        ),
         |q| {
             Query::new(
                 Arc::clone(&q.name),
@@ -638,6 +642,8 @@ async fn chbench_load_mode_matrix_vs_chdb() {
         &results,
         &[],
         "cayenne_chdb_chbench_parity.log",
-        &format!("CH-benCHmark SF={warehouses} full|append|changes Cayenne vs chDB"),
+        &format!(
+            "CH-benCHmark SF={warehouses} full|append|changes x default and keyed layouts Cayenne vs chDB"
+        ),
     );
 }

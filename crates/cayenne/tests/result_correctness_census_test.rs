@@ -131,6 +131,11 @@ const LANE_LAYOUTS: &[(&str, &str, &[&str])] = &[
         &["primary_key,indexes,sort", "primary_key,cluster"],
     ),
     ("clickbench", "chdb", &["indexes,sort", "cluster"]),
+    (
+        "chbench",
+        "chdb",
+        &["primary_key,indexes,sort", "primary_key,cluster"],
+    ),
 ];
 
 /// The layouts a lane loads under: Cayenne's default, then `LANE_LAYOUTS`'.
@@ -339,7 +344,7 @@ fn print_comparison_cell_census() {
     }
     println!("| **total** | | **{flat_cells_total}** | **{layout_cells_total}** |");
     println!(
-        "\n> Layouts come from a hand-maintained table in this file. The SQLite and\n> chDB lanes reload TPC-H, TPC-DS and ClickBench under two layouts besides\n> Cayenne's default; every other lane uses the default.\n"
+        "\n> Layouts come from a hand-maintained table in this file. The SQLite and\n> chDB lanes reload TPC-H, TPC-DS and ClickBench, and the chDB lane CH-benCH,\n> under two layouts besides Cayenne's default; every other lane uses the default.\n"
     );
 
     // Row order is a third thing a cell can check. Content compared as a multiset

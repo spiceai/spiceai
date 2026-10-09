@@ -248,6 +248,30 @@ where
 /// The `postgres_version` that expands to every listed `PostgreSQL` line.
 pub const ALL_SOURCE_VERSIONS: &str = "all";
 
+/// A test entry's runs per layout: its `layout`, or one per entry of `layouts`.
+/// Each layout is parsed here, so a misspelled feature fails the dispatch
+/// rather than the dispatched run.
+fn expand_layouts(
+    layout: Option<&String>,
+    layouts: &[String],
+) -> anyhow::Result<Vec<Option<String>>> {
+    anyhow::ensure!(
+        layout.is_none() || layouts.is_empty(),
+        "a test sets either `layout` or `layouts`, not both"
+    );
+    let layouts: Vec<Option<String>> = if layouts.is_empty() {
+        vec![layout.cloned()]
+    } else {
+        layouts.iter().cloned().map(Some).collect()
+    };
+    for layout in layouts.iter().flatten() {
+        layout
+            .parse::<Layout>()
+            .map_err(|e| anyhow::anyhow!("layout '{layout}': {e}"))?;
+    }
+    Ok(layouts)
+}
+
 impl BenchArgs {
     #[must_use]
     pub fn with_update_snapshots(mut self, update_snapshots: UpdateSnapshots) -> Self {
@@ -265,20 +289,7 @@ impl BenchArgs {
     /// starting an unsupported server; when a layout does not parse; or when
     /// the entry sets both `layout` and `layouts`.
     pub fn expand_runs(&self) -> anyhow::Result<Vec<Self>> {
-        anyhow::ensure!(
-            self.layout.is_none() || self.layouts.is_empty(),
-            "a bench test sets either `layout` or `layouts`, not both"
-        );
-        let layouts: Vec<Option<String>> = if self.layouts.is_empty() {
-            vec![self.layout.clone()]
-        } else {
-            self.layouts.iter().cloned().map(Some).collect()
-        };
-        for layout in layouts.iter().flatten() {
-            layout
-                .parse::<Layout>()
-                .map_err(|e| anyhow::anyhow!("layout '{layout}': {e}"))?;
-        }
+        let layouts = expand_layouts(self.layout.as_ref(), &self.layouts)?;
         let versions = self.postgres_versions()?;
         Ok(versions
             .iter()
@@ -610,6 +621,12 @@ pub struct HtapDispatchArgs {
     /// of them. Unset runs the workflow's default line.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub source_version: Option<String>,
+    /// The acceleration layout the run configures (`testoperator --layout`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub layout: Option<String>,
+    /// Several layouts: one run each, dispatched as its `layout`.
+    #[serde(default, skip_serializing)]
+    pub layouts: Vec<String>,
 }
 
 impl HtapDispatchArgs {
@@ -629,15 +646,32 @@ impl HtapDispatchArgs {
     }
 
     /// The runs this entry dispatches: one per listed release line of its
-    /// source for `source_version: all`, otherwise just this one.
+    /// source for `source_version: all`, times one per entry of `layouts`.
     ///
     /// # Errors
     ///
     /// When `source_version` names a version `test/source_versions.json` does
-    /// not list for the spicepod's source.
+    /// not list for the spicepod's source, when a layout does not parse, or when
+    /// the entry sets both `layout` and `layouts`.
     pub fn expand_runs(&self) -> anyhow::Result<Vec<Self>> {
+        let layouts = expand_layouts(self.layout.as_ref(), &self.layouts)?;
+        let versions = self.source_lines()?;
+        Ok(versions
+            .iter()
+            .flat_map(|version| {
+                layouts.iter().map(move |layout| Self {
+                    source_version: version.clone(),
+                    layout: layout.clone(),
+                    layouts: Vec::new(),
+                    ..self.clone()
+                })
+            })
+            .collect())
+    }
+
+    fn source_lines(&self) -> anyhow::Result<Vec<Option<String>>> {
         let Some(requested) = self.source_version.as_deref() else {
-            return Ok(vec![self.clone()]);
+            return Ok(vec![None]);
         };
         let source = self.source();
         let listed = source_versions(source)?;
@@ -649,10 +683,7 @@ impl HtapDispatchArgs {
         if requested == ALL_SOURCE_VERSIONS {
             return Ok(versions
                 .into_iter()
-                .map(|version| Self {
-                    source_version: Some(version.to_string()),
-                    ..self.clone()
-                })
+                .map(|version| Some(version.to_string()))
                 .collect());
         }
         anyhow::ensure!(
@@ -661,7 +692,7 @@ impl HtapDispatchArgs {
             source.key(),
             versions.join(", ")
         );
-        Ok(vec![self.clone()])
+        Ok(vec![Some(requested.to_string())])
     }
 }
 
