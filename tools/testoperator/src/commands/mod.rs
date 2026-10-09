@@ -1173,13 +1173,14 @@ mod tests {
                     continue;
                 }
                 for throughput in &dispatch.tests.throughput {
-                    assert!(
-                        throughput.postgres_version.is_none()
-                            && throughput.layout.is_none()
-                            && throughput.layouts.is_empty(),
-                        "{} sets `postgres_version` or a layout on a throughput test; only the bench workflow takes them",
-                        dispatch_path.display()
-                    );
+                    throughput
+                        .ensure_only_bench_settings_unset("throughput")
+                        .unwrap_or_else(|e| panic!("{}: {e}", dispatch_path.display()));
+                }
+                for load in &dispatch.tests.load {
+                    load.bench_args
+                        .ensure_only_bench_settings_unset("load")
+                        .unwrap_or_else(|e| panic!("{}: {e}", dispatch_path.display()));
                 }
                 let runs = dispatch
                     .tests
