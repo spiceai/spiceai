@@ -129,6 +129,8 @@ limitations under the License.
 //! starts with a lower limit holds the cluster to it from the second window
 //! after it first leases. Each replica logs a warning naming the origin and
 //! the limits when they start to differ, and a note when they agree again.
+//! A limiter no replica has written for as many windows as the file retains
+//! is dropped, so limit changes leave no trail in the file.
 //!
 //! Window ids come from each replica's own clock, so the budget of a window
 //! holds in real time only while the replicas' clocks agree to well within a
@@ -307,6 +309,20 @@ impl PersistedRateControlState {
         limiter
     }
 
+    /// Drop every limiter but `keep` that no replica has written a lease
+    /// under since `cutoff_unix_ms`.
+    ///
+    /// A replica prunes the windows of its own limiter only, so a limiter whose
+    /// replicas have all stopped or changed their limit would otherwise stay in
+    /// the file for good, and every replica would read it on every refresh.
+    /// Judged by the leases' write times rather than by window ids, so a
+    /// limiter written under a different window length is judged the same way.
+    /// A running replica writes a lease at least once per window.
+    fn drop_retired_limiters(&mut self, keep: &str, cutoff_unix_ms: u64) {
+        self.limiters
+            .retain(|key, limiter| key == keep || limiter.last_written_unix_ms() >= cutoff_unix_ms);
+    }
+
     /// The other limiters of `own_key`'s quota: the same quota name, written
     /// by replicas that configure a different limit for it.
     fn siblings<'a>(
@@ -457,6 +473,17 @@ impl PersistedLimiter {
         self.windows
             .entry(window_id.to_string())
             .or_insert_with(|| PersistedWindow::new(burst_if_absent))
+    }
+
+    /// When a replica last wrote a lease under this limiter, by that replica's
+    /// clock; `0` when none has.
+    fn last_written_unix_ms(&self) -> u64 {
+        self.windows
+            .values()
+            .flat_map(|window| window.leases.values())
+            .map(|lease| lease.updated_at_unix_ms)
+            .max()
+            .unwrap_or(0)
     }
 
     /// Tokens granted under this limiter in `window_id`, across replicas.
@@ -1659,6 +1686,14 @@ impl LeasedBucket {
             // flag would drop a whole window of upstream outcomes whenever
             // neither the current nor the pre-leased window changed.
             let mut tail_published = false;
+            // Limiters no replica writes any more go after the same horizon as
+            // the windows of a live one.
+            state.drop_retired_limiters(
+                &self.config.limiter_key,
+                unix_millis(now).saturating_sub(
+                    STALE_WINDOW_RETENTION.saturating_mul(duration_millis_u64(window)),
+                ),
+            );
             if let Some(limiter) = state.limiter_mut(&self.config.limiter_key) {
                 limiter.retain_recent_windows(now_window);
 
@@ -4158,6 +4193,115 @@ mod tests {
             .filter(|window_id| limiter.is_leasing(*window_id))
             .collect();
         assert_eq!(leasing, vec![98, 99, 100, 101, 102]);
+    }
+
+    /// A limiter no replica has written for the retention horizon is dropped,
+    /// whatever its window ids; the replica's own limiter and every limiter
+    /// written since are kept.
+    #[test]
+    fn retired_limiters_are_dropped_after_the_retention_horizon() {
+        let lease_written_at = |updated_at_unix_ms| PersistedLease {
+            granted: 1,
+            consumed: 0,
+            attempted: 0,
+            ok: None,
+            failed: None,
+            expires_at_unix_ms: updated_at_unix_ms,
+            updated_at_unix_ms,
+        };
+        let mut state = PersistedRateControlState::fresh(Duration::from_secs(1));
+        for (key, window_id, written_at) in [
+            (
+                "requests_per_second:burst=10:replenish_ns=100000000",
+                100,
+                100_000,
+            ),
+            (
+                "requests_per_second:burst=20:replenish_ns=50000000",
+                159,
+                159_000,
+            ),
+            (
+                "requests_per_second:burst=30:replenish_ns=33333333",
+                7,
+                160_000,
+            ),
+            (
+                "requests_per_minute:burst=60:replenish_ns=1000000000",
+                99,
+                99_999,
+            ),
+        ] {
+            state
+                .limiter_entry(key, 1)
+                .window_entry(window_id, 1)
+                .leases
+                .insert("replica".to_string(), lease_written_at(written_at));
+        }
+        state.limiter_entry("requests_per_second:burst=40:replenish_ns=25000000", 1);
+
+        state.drop_retired_limiters(
+            "requests_per_second:burst=40:replenish_ns=25000000",
+            100_000,
+        );
+
+        let mut kept: Vec<&str> = state.limiters.keys().map(String::as_str).collect();
+        kept.sort_unstable();
+        assert_eq!(
+            kept,
+            vec![
+                "requests_per_second:burst=10:replenish_ns=100000000",
+                "requests_per_second:burst=20:replenish_ns=50000000",
+                "requests_per_second:burst=30:replenish_ns=33333333",
+                "requests_per_second:burst=40:replenish_ns=25000000",
+            ]
+        );
+    }
+
+    /// Repeated limit changes leave no trail: each refresh drops the limiters
+    /// of configurations that stopped leasing more than the retention horizon
+    /// ago, so the shared file holds only the live ones.
+    #[tokio::test]
+    async fn limiters_of_retired_limits_leave_the_shared_file() {
+        let window = Duration::from_millis(20);
+        let horizon =
+            window * u32::try_from(STALE_WINDOW_RETENTION).expect("retention fits in u32");
+        let store = Arc::new(InMemory::new());
+        let live = per_second_bucket(&store, "live", 10, window);
+
+        // Five rolling changes, each leasing once under its own limit and then
+        // stopping.
+        for limit in 11..16 {
+            refresh_with_demand(&per_second_bucket(&store, "retired", limit, window)).await;
+        }
+        refresh_with_demand(&live).await;
+        let limiters = |state: PersistedRateControlState| {
+            let mut keys: Vec<String> = state.limiters.into_keys().collect();
+            keys.sort_unstable();
+            keys
+        };
+        let state = live
+            .read_state()
+            .await
+            .expect("read the shared state")
+            .expect("the shared state exists");
+        assert_eq!(limiters(state).len(), 6);
+
+        // The live replica keeps leasing past the horizon.
+        let deadline = tokio::time::Instant::now() + horizon + window * 10;
+        while tokio::time::Instant::now() < deadline {
+            refresh_with_demand(&live).await;
+            tokio::time::sleep(window).await;
+        }
+        let state = live
+            .read_state()
+            .await
+            .expect("read the shared state")
+            .expect("the shared state exists");
+        assert_eq!(
+            limiters(state),
+            vec!["requests_per_second:burst=10:replenish_ns=100000000".to_string()]
+        );
     }
 
     /// Replicas whose clocks run a window apart, each leasing the windows its
