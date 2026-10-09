@@ -454,13 +454,17 @@ impl<'a> FunctionSupportBuilder<'a> {
     }
 }
 
-/// Aggregates whose answer does not depend on the order of their input, though
-/// `DataFusion` does not declare them order-insensitive the way it does `count`,
-/// `sum`, `min` and `max`: they keep `AggregateUDFImpl::order_sensitivity`'s
-/// conservative default. `median` is a function of the values alone. `avg` was
-/// measured for the `BigQuery` dialect's filter rewriting, which relies on the
-/// same reading: `1e16, 1.0, -1e16, 2.0, -1.0` averages to `0.4` under `ASC`,
-/// under `DESC` and unordered.
+/// Aggregates whose `ORDER BY` may be dropped although `DataFusion` does not
+/// declare them order-insensitive the way it does `count`, `sum`, `min` and
+/// `max`: they keep `AggregateUDFImpl::order_sensitivity`'s conservative default.
+///
+/// `median` is a function of the values alone. So is `avg` in exact arithmetic.
+/// In floating point, the order of the additions can change the result, as it
+/// can for `sum`. But an `ORDER BY` does not fix that order in `DataFusion`
+/// either. Over `1e16, -1e16, 1` it answers `0.0` for `avg(x ORDER BY id)`, for
+/// `ORDER BY id DESC` and with no `ORDER BY` at all, where `PostgreSQL` answers
+/// `0.333…` for each. So the clause asks the backend for nothing an unordered
+/// `avg` does not.
 const ORDER_INDEPENDENT_AGGREGATES: &[&str] = &["avg", "median"];
 
 /// Whether the SQL the unparser writes for this aggregate call asks the backend
