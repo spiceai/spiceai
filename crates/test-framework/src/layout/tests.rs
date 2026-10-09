@@ -289,3 +289,91 @@ fn every_benchmark_table_has_one_entry_and_a_key() {
         );
     }
 }
+
+/// The columns a partition expression reads. Covers the forms the catalogs
+/// use; any other form fails the test rather than going unchecked.
+fn partition_columns(expression: &str) -> BTreeSet<String> {
+    use datafusion::sql::sqlparser::{
+        ast::{Expr, FunctionArg, FunctionArgExpr, FunctionArguments},
+        dialect::GenericDialect,
+        parser::Parser,
+    };
+
+    fn visit(expr: &Expr, columns: &mut BTreeSet<String>) {
+        match expr {
+            Expr::Identifier(ident) => {
+                columns.insert(ident.value.clone());
+            }
+            Expr::Value(_) => {}
+            Expr::Nested(inner) => visit(inner, columns),
+            Expr::Function(function) => {
+                let FunctionArguments::List(list) = &function.args else {
+                    panic!("unexpected arguments in partition expression: {expr}");
+                };
+                for arg in &list.args {
+                    let FunctionArg::Unnamed(FunctionArgExpr::Expr(arg)) = arg else {
+                        panic!("unexpected argument in partition expression: {expr}");
+                    };
+                    visit(arg, columns);
+                }
+            }
+            other => panic!("unexpected partition expression form: {other}"),
+        }
+    }
+
+    let expr = Parser::new(&GenericDialect {})
+        .try_with_sql(expression)
+        .and_then(|mut parser| parser.parse_expr())
+        .expect("partition expression parses");
+    let mut columns = BTreeSet::new();
+    visit(&expr, &mut columns);
+    columns
+}
+
+/// The HTAP workload updates CH-benCH tables, and a keyed partitioned
+/// acceleration resolves a key within its partition, so an expression over a
+/// column an update changes would leave the old version of a moved row behind
+/// (#14596) and fail the HTAP gates on that alone.
+#[test]
+fn chbench_partitions_each_keyed_table_on_its_primary_key() {
+    let tables = benchmark_tables(&QuerySet::ChBench).expect("CH-benCH layout keys");
+    let partitioned: Vec<(&str, BTreeSet<String>)> = tables
+        .iter()
+        .filter(|keys| !keys.primary_key.is_empty())
+        .filter_map(|keys| {
+            keys.partition_by
+                .map(|expression| (keys.table, partition_columns(expression)))
+        })
+        .collect();
+    assert_eq!(
+        partitioned
+            .iter()
+            .map(|(table, _)| *table)
+            .collect::<Vec<_>>(),
+        [
+            "customer",
+            "new_order",
+            "oorder",
+            "order_line",
+            "stock",
+            "item"
+        ],
+        "keyed CH-benCH tables with a partition expression"
+    );
+    for (table, columns) in partitioned {
+        let keys = tables
+            .iter()
+            .find(|keys| keys.table == table)
+            .expect("table keys");
+        let outside_key: Vec<&String> = columns
+            .iter()
+            .filter(|column| !keys.primary_key.contains(&column.as_str()))
+            .collect();
+        assert_eq!(
+            outside_key,
+            Vec::<&String>::new(),
+            "{table} partitions on columns outside its primary key {:?}",
+            keys.primary_key
+        );
+    }
+}
