@@ -82,8 +82,8 @@ pub struct TableSpec<'a> {
     pub indexes: &'a [&'a [&'a str]],
     pub config: VortexConfig,
     pub upsert_key: Option<&'a str>,
-    /// Disabled unless a test opts in, so the runtime default does not
-    /// decide what a test exercises.
+    /// Enabled, as at runtime; a test of the unpersisted path opts out. Set
+    /// explicitly, so the environment does not decide what a test exercises.
     pub persistence: IndexPersistence,
 }
 
@@ -96,7 +96,7 @@ impl<'a> TableSpec<'a> {
             indexes,
             config: file_mode_config(),
             upsert_key: None,
-            persistence: IndexPersistence::Disabled,
+            persistence: IndexPersistence::Enabled,
         }
     }
 

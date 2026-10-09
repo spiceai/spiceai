@@ -258,7 +258,8 @@ async fn indexes_follow_each_registration_not_the_stored_table() {
 
 /// A runtime join lookup queues the same paced read-back build as a literal
 /// lookup. Its first execution scans; a later execution uses the published
-/// index without requiring a literal query to prime it.
+/// index without requiring a literal query to prime it. Without persistence,
+/// so the reopened table has no index to load.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_dynamic_lookup_rebuilds_the_index_after_reopen() {
     const ROWS: usize = 4_000;
@@ -267,12 +268,13 @@ async fn a_dynamic_lookup_rebuilds_the_index_after_reopen() {
         .expect("fixture");
     let env = Arc::new(RuntimeEnv::default());
     let name = "dynamic_rebuild";
+    let spec = || TableSpec::new(name, schema(), &[&KEY]).persistence(IndexPersistence::Disabled);
 
-    let initial = open(&fixture, Arc::clone(&env), name, &[&KEY]).await;
+    let initial = open_table(&fixture, Arc::clone(&env), spec()).await;
     overwrite(&initial, vec![rows(0, ROWS)]).await;
     drop(initial);
 
-    let reopened = open(&fixture, env, name, &[&KEY]).await;
+    let reopened = open_table(&fixture, env, spec()).await;
     reopened.init_scan_view_cache();
     assert_eq!(counters(&reopened).index_bytes, 0);
 
