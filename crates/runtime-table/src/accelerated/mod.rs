@@ -1248,12 +1248,6 @@ impl Builder {
                 // refresh that cannot arrive. Dataset readiness is a separate
                 // concern handled above.
                 refresh_completion.close();
-                // Without a refresher start, nothing else reports the existing
-                // acceleration's initial status, so report it here.
-                if let Some(initial_status) = self.initial_status.clone() {
-                    self.runtime_status
-                        .update_dataset(&self.dataset_name, initial_status);
-                }
                 (None, None)
             } else {
                 (

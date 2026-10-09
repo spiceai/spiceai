@@ -1039,11 +1039,17 @@ impl Refresher {
         let start = std::time::Instant::now();
         let dataset_name = self.dataset_name.clone();
         let accelerator = Arc::clone(&self.accelerator);
+        // The runtime's query environment carries the object-store registrations an
+        // object-store-backed acceleration is read through, and the memory pool that bounds it.
+        let runtime_env = self.query_runtime_env.clone().unwrap_or_else(|| {
+            runtime_object_store::registry::default_runtime_env(self.io_runtime.clone())
+        });
         let rebuild = async move {
             super::index_rebuild::rebuild_indexes_from_accelerator(
                 &dataset_name,
                 &accelerator,
                 &indexes,
+                runtime_env,
             )
             .await
         };

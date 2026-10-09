@@ -28,7 +28,9 @@ use std::sync::Arc;
 use datafusion::catalog::TableProvider;
 use datafusion::common::TableReference;
 use datafusion::error::DataFusionError;
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::physical_plan::execute_stream;
+use datafusion::prelude::SessionContext;
 use futures::TryStreamExt;
 use spice_table::{Index, WriteWindow};
 
@@ -51,10 +53,15 @@ const SINK_NAME: &str = "IndexRebuild";
 /// Returns the first error from scanning the accelerator, preparing, computing or finalizing an
 /// index. The indexes that opened a window are rolled back first, so a partial replay is never
 /// published.
+///
+/// The scan runs in `runtime_env`, which must carry the object-store registrations the
+/// accelerator reads through: a default `RuntimeEnv` has none, and an object-store-backed
+/// acceleration would fail to scan.
 pub(crate) async fn rebuild_indexes_from_accelerator(
     dataset_name: &TableReference,
     accelerator: &Arc<dyn TableProvider>,
     indexes: &[Arc<dyn Index + Send + Sync>],
+    runtime_env: Arc<RuntimeEnv>,
 ) -> Result<Option<usize>, DataFusionError> {
     let indexes: Vec<Arc<dyn Index + Send + Sync>> = indexes
         .iter()
@@ -72,7 +79,7 @@ pub(crate) async fn rebuild_indexes_from_accelerator(
 
     prepare_indexes(SINK_NAME, indexes.iter(), WriteWindow::Rebuild).await?;
 
-    match replay(accelerator, &indexes).await {
+    match replay(accelerator, &indexes, runtime_env).await {
         Ok(rows) => {
             finalize_indexes(SINK_NAME, indexes.iter()).await?;
             Ok(Some(rows))
@@ -87,8 +94,10 @@ pub(crate) async fn rebuild_indexes_from_accelerator(
 async fn replay(
     accelerator: &Arc<dyn TableProvider>,
     indexes: &[Arc<dyn Index + Send + Sync>],
+    runtime_env: Arc<RuntimeEnv>,
 ) -> Result<usize, DataFusionError> {
-    let ctx = util::session_state::session_context();
+    let ctx =
+        SessionContext::new_with_config_rt(util::session_state::session_config(), runtime_env);
     let state = ctx.state();
     let plan = accelerator.scan(&state, None, &[], None).await?;
     let mut stream = execute_stream(plan, ctx.task_ctx())?;
@@ -221,6 +230,7 @@ mod tests {
             &TableReference::bare("docs"),
             &accelerator(&[1, 2, 3, 4, 5]),
             &erase(&[&empty]),
+            Arc::new(RuntimeEnv::default()),
         )
         .await
         .expect("rebuild succeeds");
@@ -242,6 +252,7 @@ mod tests {
             &TableReference::bare("docs"),
             &accelerator(&[1, 2]),
             &erase(&[&populated, &empty]),
+            Arc::new(RuntimeEnv::default()),
         )
         .await
         .expect("rebuild succeeds");
@@ -259,6 +270,7 @@ mod tests {
             &TableReference::bare("docs"),
             &accelerator(&[1, 2]),
             &erase(&[&populated]),
+            Arc::new(RuntimeEnv::default()),
         )
         .await
         .expect("rebuild succeeds");
@@ -276,6 +288,7 @@ mod tests {
             &TableReference::bare("docs"),
             &accelerator(&[]),
             &erase(&[&empty]),
+            Arc::new(RuntimeEnv::default()),
         )
         .await
         .expect("rebuild succeeds");
@@ -296,6 +309,7 @@ mod tests {
             &TableReference::bare("docs"),
             &accelerator(&[1, 2]),
             &erase(&[&failing]),
+            Arc::new(RuntimeEnv::default()),
         )
         .await
         .expect_err("a failed index write fails the rebuild");
@@ -303,6 +317,77 @@ mod tests {
         assert!(err.to_string().contains("index write failed"), "{err}");
         assert!(failing.failed.load(Ordering::SeqCst));
         assert!(!failing.completed.load(Ordering::SeqCst));
+    }
+
+    /// The replay scans the accelerator through the `RuntimeEnv` it is given. An acceleration
+    /// read through an object store is registered only in the runtime's own environment, and a
+    /// default environment cannot read it at all.
+    #[tokio::test]
+    async fn the_rebuild_scans_through_the_runtime_env_it_is_given() {
+        use datafusion::datasource::file_format::csv::CsvFormat;
+        use datafusion::datasource::listing::{
+            ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
+        };
+        use datafusion::execution::object_store::ObjectStoreUrl;
+        use object_store::{ObjectStoreExt, PutPayload, memory::InMemory, path::Path};
+
+        let store = Arc::new(InMemory::new());
+        store
+            .put(
+                &Path::from("docs/part.csv"),
+                PutPayload::from_static(b"id\n1\n2\n3\n"),
+            )
+            .await
+            .expect("the object is written");
+        let runtime_env = Arc::new(RuntimeEnv::default());
+        runtime_env.register_object_store(
+            ObjectStoreUrl::parse("mem://bucket")
+                .expect("valid object store URL")
+                .as_ref(),
+            store,
+        );
+
+        let config = ListingTableConfig::new(
+            ListingTableUrl::parse("mem://bucket/docs/").expect("valid table URL"),
+        )
+        .with_listing_options(
+            ListingOptions::new(Arc::new(CsvFormat::default())).with_file_extension(".csv"),
+        )
+        .with_schema(Arc::new(Schema::new(vec![Field::new(
+            "id",
+            DataType::Int64,
+            false,
+        )])));
+        let accelerator: Arc<dyn TableProvider> =
+            Arc::new(ListingTable::try_new(config).expect("valid listing table"));
+
+        let unreadable = RecordingIndex::new(true);
+        let err = rebuild_indexes_from_accelerator(
+            &TableReference::bare("docs"),
+            &accelerator,
+            &erase(&[&unreadable]),
+            Arc::new(RuntimeEnv::default()),
+        )
+        .await
+        .expect_err("a default environment has no store registered for the acceleration");
+        assert!(
+            err.to_string().contains("No suitable object store found"),
+            "{err}"
+        );
+        assert!(unreadable.failed.load(Ordering::SeqCst));
+
+        let rebuilt = RecordingIndex::new(true);
+        let rows = rebuild_indexes_from_accelerator(
+            &TableReference::bare("docs"),
+            &accelerator,
+            &erase(&[&rebuilt]),
+            runtime_env,
+        )
+        .await
+        .expect("the rebuild reads the acceleration through the runtime's environment");
+        assert_eq!(rows, Some(3));
+        assert_eq!(rebuilt.rows.load(Ordering::SeqCst), 3);
+        assert!(rebuilt.completed.load(Ordering::SeqCst));
     }
 
     /// The error a failed rebuild surfaces names the dataset, says it is not loaded, and links

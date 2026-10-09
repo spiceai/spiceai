@@ -18456,6 +18456,7 @@ dependencies = [
  "fundu",
  "futures",
  "insta",
+ "object_store 0.13.2",
  "opentelemetry",
  "opentelemetry-prometheus",
  "opentelemetry_sdk",
