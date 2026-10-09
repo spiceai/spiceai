@@ -304,4 +304,23 @@ mod tests {
         assert!(failing.failed.load(Ordering::SeqCst));
         assert!(!failing.completed.load(Ordering::SeqCst));
     }
+
+    /// The error a failed rebuild surfaces names the dataset, says it is not loaded, and links
+    /// the docs, so a reword cannot quietly drop the resource, the consequence, or the fix.
+    #[test]
+    fn a_failed_rebuild_names_the_dataset_and_that_it_is_not_loaded() {
+        let err = super::super::Error::FailedToRebuildIndex {
+            dataset_name: "docs".to_string(),
+            source: DataFusionError::Execution("index write failed".to_string()),
+        };
+
+        assert_eq!(
+            err.to_string(),
+            "Failed to rebuild the search index of dataset 'docs' from its acceleration, so the \
+             dataset is not loaded rather than answering searches from an incomplete index. Fix \
+             the cause below and restart; for details, visit: \
+             https://spiceai.org/docs/features/search/full-text-search. Cause: Execution error: \
+             index write failed"
+        );
+    }
 }

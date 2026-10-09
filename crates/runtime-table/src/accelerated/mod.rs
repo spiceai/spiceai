@@ -229,7 +229,7 @@ pub enum Error {
     NoPrimaryKeysDefined { dataset_name: String },
 
     #[snafu(display(
-        "Failed to rebuild the search index of dataset '{dataset_name}' from its acceleration, so searches over it would return no results. Cause: {}",
+        "Failed to rebuild the search index of dataset '{dataset_name}' from its acceleration, so the dataset is not loaded rather than answering searches from an incomplete index. Fix the cause below and restart; for details, visit: https://spiceai.org/docs/features/search/full-text-search. Cause: {}",
         format_datafusion_error(source)
     ))]
     FailedToRebuildIndex {
