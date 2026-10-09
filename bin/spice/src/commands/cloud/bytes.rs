@@ -388,7 +388,22 @@ mod tests {
 
     #[test]
     fn serde_deserialize_rejects_invalid() {
-        serde_json::from_str::<NumBytes>(r#""16gibb""#)
+        let err = serde_json::from_str::<NumBytes>(r#""16gibb""#)
             .expect_err("invalid NumBytes JSON should be rejected");
+
+        // The decode side must surface `NumBytes::parse`'s own message as a data
+        // error, not fail for an unrelated reason such as a JSON syntax error.
+        assert_eq!(err.classify(), serde_json::error::Category::Data);
+        assert_eq!(
+            err.to_string(),
+            "Invalid argument: Invalid byte suffix 'gibb'. Expected one of: Gi, GiB, Mi, MiB, \
+             Ki, KiB, G, GB, M, MB, K, KB, B, or no suffix for bytes"
+        );
+        assert_eq!(
+            err.to_string(),
+            NumBytes::parse("16gibb")
+                .expect_err("an unknown suffix should be rejected")
+                .to_string()
+        );
     }
 }

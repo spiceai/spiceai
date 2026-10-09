@@ -696,7 +696,11 @@ mod tests {
             .expect("acceleration")
             .engine = Some("vortex".into());
 
-        assert!(cayenne_file_path_conflict(&datasets).is_some());
+        // Both spellings must be recognized as Cayenne, so the error names both datasets.
+        assert_eq!(
+            cayenne_file_path_conflict(&datasets).as_deref(),
+            Some("`orders` (`/mnt/a/cayenne`), `customers` (`/mnt/b/cayenne`)")
+        );
     }
 
     #[test]

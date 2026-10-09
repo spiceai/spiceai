@@ -500,9 +500,20 @@ mod tests {
         let broadcaster = DataUpdateBroadcaster::new();
         let table_reference = TableReference::bare("cdc_table");
         let receiver = broadcaster.subscribe(&table_reference).await;
+
+        // The subscription registered exactly this table's channel, so the
+        // pruning asserted below has a registered channel to remove.
+        {
+            let channels = broadcaster.channels.read().await;
+            assert_eq!(channels.len(), 1);
+            let sender = channels
+                .get(&table_reference)
+                .expect("subscribe registers the table's channel");
+            assert_eq!(sender.receiver_count(), 1);
+        }
         drop(receiver);
 
-        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        let pruned = tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
                 if broadcaster.channels.read().await.is_empty() {
                     break;
@@ -510,8 +521,14 @@ mod tests {
                 tokio::task::yield_now().await;
             }
         })
-        .await
-        .expect("dropped receiver should prune the channel");
+        .await;
+        let remaining: Vec<TableReference> =
+            broadcaster.channels.read().await.keys().cloned().collect();
+        assert!(
+            remaining.is_empty(),
+            "dropped receiver should prune the channel within 1s; still registered: {remaining:?}"
+        );
+        pruned.expect("the prune poll ends as soon as no channel is registered");
     }
 
     #[tokio::test]

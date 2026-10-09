@@ -268,7 +268,8 @@ mod tests {
         let column = Arc::new(StringArray::from(vec![Some("x")]));
         let batch =
             RecordBatch::try_from_iter(vec![("id", column as _)]).expect("failed to build batch");
-        read_text_column(&batch, "missing").expect_err("missing column should error");
+        let err = read_text_column(&batch, "missing").expect_err("missing column should error");
+        assert_eq!(err.to_string(), "Missing 'missing' column");
     }
 
     #[test]

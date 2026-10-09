@@ -383,8 +383,8 @@ fn try_new_rejects_primary_fields_mismatch() {
     assert!(matches!(err, Error::PrimaryFieldsMismatch { .. }), "{err}");
 }
 
-#[test]
-fn try_new_accepts_primary_fields_in_different_order() {
+#[tokio::test]
+async fn try_new_accepts_primary_fields_in_different_order() {
     let events = Arc::new(Mutex::new(vec![]));
     let pk_a = vec![
         Field::new("id", DataType::Int64, false),
@@ -394,17 +394,72 @@ fn try_new_accepts_primary_fields_in_different_order() {
         Field::new("tenant", DataType::Utf8, false),
         Field::new("id", DataType::Int64, false),
     ];
+    // Each index reports its results with its key columns in its own order.
+    let primary_results = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("tenant", DataType::Utf8, false),
+        Field::new("source", DataType::Utf8, false),
+    ]));
+    let secondary_results = Arc::new(Schema::new(vec![
+        Field::new("tenant", DataType::Utf8, false),
+        Field::new("id", DataType::Int64, false),
+        Field::new("source", DataType::Utf8, false),
+    ]));
     let mut primary = MockIndex::new("primary", &events);
-    primary.primary_fields = pk_a;
+    primary.primary_fields = pk_a.clone();
+    primary.query_batches = vec![RecordBatch::new_empty(primary_results)];
     let mut secondary = MockIndex::new("secondary", &events);
     secondary.primary_fields = pk_b;
+    secondary.query_batches = vec![
+        RecordBatch::try_new(
+            secondary_results,
+            vec![
+                Arc::new(StringArray::from(vec!["t2", "t1"])),
+                Arc::new(Int64Array::from(vec![2_i64, 1])),
+                Arc::new(StringArray::from(vec!["secondary"; 2])),
+            ],
+        )
+        .expect("valid secondary batch"),
+    ];
 
-    CompoundSearchIndex::try_new(
+    let idx = CompoundSearchIndex::try_new(
         Arc::new(primary),
         Arc::new(secondary),
-        CompoundReadMode::PrimaryOnly,
+        CompoundReadMode::FallbackToSecondary,
     )
     .expect("field order must not matter for key compatibility");
+    assert_eq!(
+        idx.primary_fields(),
+        pk_a,
+        "the compound is keyed by the primary's fields"
+    );
+
+    // The primary has no results, so the secondary answers: its key columns are matched to
+    // the primary's by name, not by position.
+    let plan = idx.query_table_provider("q").expect("plan builds");
+    let batches = SessionContext::new()
+        .execute_logical_plan(Arc::unwrap_or_clone(plan))
+        .await
+        .expect("plan executes")
+        .sort(vec![datafusion::prelude::col("id").sort(true, false)])
+        .expect("sorts")
+        .collect()
+        .await
+        .expect("plan collects");
+    assert_eq!(
+        datafusion::arrow::util::pretty::pretty_format_batches(&batches)
+            .expect("format results")
+            .to_string(),
+        [
+            "+----+--------+-----------+",
+            "| id | tenant | source    |",
+            "+----+--------+-----------+",
+            "| 1  | t1     | secondary |",
+            "| 2  | t2     | secondary |",
+            "+----+--------+-----------+",
+        ]
+        .join("\n")
+    );
 }
 
 #[test]

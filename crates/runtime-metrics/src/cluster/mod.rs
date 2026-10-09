@@ -653,7 +653,166 @@ pub fn record_task_retry(node_id: &str, role: &str) {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, OnceLock, Weak};
+    use std::time::Duration;
+
+    use opentelemetry_sdk::error::OTelSdkResult;
+    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData, ResourceMetrics};
+    use opentelemetry_sdk::metrics::reader::MetricReader;
+    use opentelemetry_sdk::metrics::{
+        InstrumentKind, ManualReader, Pipeline, SdkMeterProvider, Temporality,
+    };
+
     use super::*;
+
+    /// A [`ManualReader`] the global provider and the tests can share: the
+    /// provider takes ownership of its readers, and the tests collect from it.
+    #[derive(Clone, Debug)]
+    struct SharedManualReader(Arc<ManualReader>);
+
+    impl MetricReader for SharedManualReader {
+        fn register_pipeline(&self, pipeline: Weak<Pipeline>) {
+            self.0.register_pipeline(pipeline);
+        }
+
+        fn collect(&self, metrics: &mut ResourceMetrics) -> OTelSdkResult {
+            self.0.collect(metrics)
+        }
+
+        fn force_flush(&self) -> OTelSdkResult {
+            self.0.force_flush()
+        }
+
+        fn shutdown_with_timeout(&self, timeout: Duration) -> OTelSdkResult {
+            self.0.shutdown_with_timeout(timeout)
+        }
+
+        fn temporality(&self, kind: InstrumentKind) -> Temporality {
+            self.0.temporality(kind)
+        }
+    }
+
+    /// The reader every test collects from, behind a real SDK provider
+    /// installed as the global one.
+    ///
+    /// The cluster instruments are statics built from `global::meter`, so they
+    /// record into whichever provider is global when they are first used, for
+    /// the rest of the process. Every test calls this before it records, so the
+    /// first use always finds this provider rather than the no-op default.
+    fn install_metrics_reader() -> &'static SharedManualReader {
+        static READER: OnceLock<SharedManualReader> = OnceLock::new();
+        READER.get_or_init(|| {
+            let reader = SharedManualReader(Arc::new(ManualReader::builder().build()));
+            global::set_meter_provider(
+                SdkMeterProvider::builder()
+                    .with_reader(reader.clone())
+                    .build(),
+            );
+            reader
+        })
+    }
+
+    /// Every collected series of the `cluster` meter labelled with `node_id`,
+    /// one line each, sorted: `name kind [unit] {labels} = value`, where a
+    /// histogram's value is its sample count and sum.
+    ///
+    /// Each test records under its own `node_id`, so tests running in parallel
+    /// against the shared provider read only their own series, and a series
+    /// recorded by mistake under the right node shows up as an extra line.
+    fn series_of(node_id: &str) -> Vec<String> {
+        let mut collected = ResourceMetrics::default();
+        install_metrics_reader()
+            .collect(&mut collected)
+            .expect("collect the cluster metrics");
+
+        let node_label = format!("node_id={node_id}");
+        let mut lines = Vec::new();
+        for metric in collected
+            .scope_metrics()
+            .filter(|scope| scope.scope().name() == "cluster")
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
+        {
+            let mut push = |kind: &str, attributes: Vec<&KeyValue>, value: String| {
+                let mut labels: Vec<String> = attributes
+                    .iter()
+                    .map(|kv| format!("{}={}", kv.key.as_str(), kv.value.as_str()))
+                    .collect();
+                if !labels.contains(&node_label) {
+                    return;
+                }
+                labels.sort();
+                lines.push(format!(
+                    "{} {kind} [{}] {{{}}} = {value}",
+                    metric.name(),
+                    metric.unit(),
+                    labels.join(",")
+                ));
+            };
+            match metric.data() {
+                AggregatedMetrics::U64(MetricData::Gauge(gauge)) => {
+                    for point in gauge.data_points() {
+                        push(
+                            "gauge<u64>",
+                            point.attributes().collect(),
+                            point.value().to_string(),
+                        );
+                    }
+                }
+                AggregatedMetrics::U64(MetricData::Sum(sum)) => {
+                    let kind = if sum.is_monotonic() {
+                        "counter<u64>"
+                    } else {
+                        "updown<u64>"
+                    };
+                    for point in sum.data_points() {
+                        push(
+                            kind,
+                            point.attributes().collect(),
+                            point.value().to_string(),
+                        );
+                    }
+                }
+                AggregatedMetrics::I64(MetricData::Sum(sum)) => {
+                    let kind = if sum.is_monotonic() {
+                        "counter<i64>"
+                    } else {
+                        "updown<i64>"
+                    };
+                    for point in sum.data_points() {
+                        push(
+                            kind,
+                            point.attributes().collect(),
+                            point.value().to_string(),
+                        );
+                    }
+                }
+                AggregatedMetrics::U64(MetricData::Histogram(histogram)) => {
+                    for point in histogram.data_points() {
+                        push(
+                            "histogram<u64>",
+                            point.attributes().collect(),
+                            format!("count {}, sum {}", point.count(), point.sum()),
+                        );
+                    }
+                }
+                AggregatedMetrics::F64(MetricData::Histogram(histogram)) => {
+                    for point in histogram.data_points() {
+                        push(
+                            "histogram<f64>",
+                            point.attributes().collect(),
+                            format!("count {}, sum {:?}", point.count(), point.sum()),
+                        );
+                    }
+                }
+                other => panic!(
+                    "cluster metric {} has an unexpected shape: {other:?}",
+                    metric.name()
+                ),
+            }
+        }
+        lines.sort();
+        lines
+    }
 
     // =========================================================================
     // Task Metrics Helper Function Tests
@@ -661,32 +820,66 @@ mod tests {
 
     #[test]
     fn test_record_task_started() {
-        // Should not panic
-        record_task_started("node-1", "executor");
-        record_task_started("node-2", "scheduler");
+        install_metrics_reader();
+        let node = "task-started-node";
+        record_task_started(node, "executor");
+        record_task_started(node, "executor");
+        record_task_started(node, "scheduler");
+        assert_eq!(
+            series_of(node),
+            vec![
+                "node_tasks_active updown<i64> [tasks] {node_id=task-started-node,role=executor} = 2",
+                "node_tasks_active updown<i64> [tasks] {node_id=task-started-node,role=scheduler} = 1",
+            ]
+        );
+
+        // A started task leaves the active count when it completes or fails.
+        record_task_completed(node, "executor", 1.0);
+        record_task_failed(node, "executor", "timeout");
+        record_task_failed(node, "scheduler", "timeout");
+        let active: Vec<String> = series_of(node)
+            .into_iter()
+            .filter(|line| line.starts_with("node_tasks_active "))
+            .collect();
+        assert_eq!(
+            active,
+            vec![
+                "node_tasks_active updown<i64> [tasks] {node_id=task-started-node,role=executor} = 0",
+                "node_tasks_active updown<i64> [tasks] {node_id=task-started-node,role=scheduler} = 0",
+            ]
+        );
     }
 
     #[test]
     fn test_record_task_completed() {
-        // Should not panic
-        record_task_completed("node-1", "executor", 100.5);
-        record_task_completed("node-2", "scheduler", 0.0);
-        record_task_completed("node-3", "executor", 10000.0);
+        install_metrics_reader();
+        let node = "task-completed-node";
+        record_task_started(node, "executor");
+        record_task_completed(node, "executor", 100.5);
+        assert_eq!(
+            series_of(node),
+            vec![
+                "executor_task_duration_ms histogram<f64> [ms] {node_id=task-completed-node} = count 1, sum 100.5",
+                "node_tasks_active updown<i64> [tasks] {node_id=task-completed-node,role=executor} = 0",
+                "node_tasks_total counter<u64> [tasks] {node_id=task-completed-node,role=executor,status=completed} = 1",
+            ]
+        );
     }
 
     #[test]
     fn test_record_task_failed() {
-        // Should not panic
-        record_task_failed("node-1", "executor", "timeout");
-        record_task_failed("node-1", "scheduler", "out_of_memory");
-        record_task_failed("node-2", "executor", "network_error");
-    }
-
-    #[test]
-    fn test_record_task_retry() {
-        // Should not panic
-        record_task_retry("node-1", "executor");
-        record_task_retry("node-2", "scheduler");
+        install_metrics_reader();
+        let node = "task-failed-node";
+        record_task_started(node, "executor");
+        record_task_failed(node, "executor", "timeout");
+        assert_eq!(
+            series_of(node),
+            vec![
+                "node_task_failures counter<u64> [tasks] {error_type=timeout,node_id=task-failed-node,role=executor} = 1",
+                "node_tasks_active updown<i64> [tasks] {node_id=task-failed-node,role=executor} = 0",
+                "node_tasks_total counter<u64> [tasks] {node_id=task-failed-node,role=executor,status=failed} = 1",
+            ]
+        );
     }
 
     // =========================================================================
@@ -695,25 +888,62 @@ mod tests {
 
     #[test]
     fn test_record_shuffle_write() {
-        // Should not panic
-        record_shuffle_write("node-1", 1024, 100, 50.0);
-        record_shuffle_write("node-2", 0, 0, 0.0);
-        record_shuffle_write("node-3", u64::MAX, u64::MAX, f64::MAX);
+        install_metrics_reader();
+        record_shuffle_write("shuffle-write-node", 1024, 100, 50.0);
+        assert_eq!(
+            series_of("shuffle-write-node"),
+            vec![
+                "executor_shuffle_write_bytes counter<u64> [By] {node_id=shuffle-write-node} = 1024",
+                "executor_shuffle_write_duration_ms histogram<f64> [ms] {node_id=shuffle-write-node} = count 1, sum 50.0",
+                "executor_shuffle_write_rows counter<u64> [rows] {node_id=shuffle-write-node} = 100",
+            ]
+        );
+
+        // The largest values pass through unclamped.
+        record_shuffle_write("shuffle-write-max-node", u64::MAX, u64::MAX, f64::MAX);
+        assert_eq!(
+            series_of("shuffle-write-max-node"),
+            vec![
+                "executor_shuffle_write_bytes counter<u64> [By] {node_id=shuffle-write-max-node} = 18446744073709551615",
+                "executor_shuffle_write_duration_ms histogram<f64> [ms] {node_id=shuffle-write-max-node} = count 1, sum 1.7976931348623157e308",
+                "executor_shuffle_write_rows counter<u64> [rows] {node_id=shuffle-write-max-node} = 18446744073709551615",
+            ]
+        );
     }
 
     #[test]
     fn test_record_shuffle_read_local() {
-        // Should not panic
-        record_shuffle_read_local("node-1", 1024, 100, 10.0);
-        record_shuffle_read_local("node-2", 0, 0, 0.0);
-        record_shuffle_read_local("node-3", u64::MAX, u64::MAX, f64::MAX);
+        install_metrics_reader();
+        let node = "shuffle-read-local-node";
+        record_shuffle_read_local(node, 1024, 100, 10.0);
+        record_shuffle_read_local(node, 1024, 100, 10.0);
+        // Only the local series move: nothing lands in the remote ones.
+        assert_eq!(
+            series_of(node),
+            vec![
+                "executor_shuffle_read_local_bytes counter<u64> [By] {node_id=shuffle-read-local-node} = 2048",
+                "executor_shuffle_read_local_count counter<u64> [operations] {node_id=shuffle-read-local-node} = 2",
+                "executor_shuffle_read_local_duration_ms histogram<f64> [ms] {node_id=shuffle-read-local-node} = count 2, sum 20.0",
+                "executor_shuffle_read_local_rows counter<u64> [rows] {node_id=shuffle-read-local-node} = 200",
+            ]
+        );
     }
 
     #[test]
     fn test_record_shuffle_read_remote() {
-        // Should not panic
-        record_shuffle_read_remote("node-1", 2048, 200, 50.0);
-        record_shuffle_read_remote("node-2", 0, 0, 0.0);
+        install_metrics_reader();
+        let node = "shuffle-read-remote-node";
+        record_shuffle_read_remote(node, 2048, 200, 50.0);
+        // Only the remote series move: the local ones stay untouched.
+        assert_eq!(
+            series_of(node),
+            vec![
+                "executor_shuffle_read_remote_bytes counter<u64> [By] {node_id=shuffle-read-remote-node} = 2048",
+                "executor_shuffle_read_remote_count counter<u64> [operations] {node_id=shuffle-read-remote-node} = 1",
+                "executor_shuffle_read_remote_duration_ms histogram<f64> [ms] {node_id=shuffle-read-remote-node} = count 1, sum 50.0",
+                "executor_shuffle_read_remote_rows counter<u64> [rows] {node_id=shuffle-read-remote-node} = 200",
+            ]
+        );
     }
 
     // =========================================================================
@@ -722,91 +952,108 @@ mod tests {
 
     #[test]
     fn test_record_stage_completed() {
-        // Should not panic
-        record_stage_completed("node-1", 1000.0, 4);
-        record_stage_completed("node-1", 0.0, 0);
+        install_metrics_reader();
+        let node = "stage-completed-node";
+        record_stage_completed(node, 1000.0, 4);
+        // Exactly one tasks-per-stage sample, equal to the stage's task count.
+        assert_eq!(
+            series_of(node),
+            vec![
+                "scheduler_stage_duration_ms histogram<f64> [ms] {node_id=stage-completed-node} = count 1, sum 1000.0",
+                "scheduler_stages_total counter<u64> [stages] {node_id=stage-completed-node,status=completed} = 1",
+                "scheduler_tasks_per_stage histogram<u64> [tasks] {node_id=stage-completed-node} = count 1, sum 4",
+            ]
+        );
     }
 
     #[test]
     fn test_record_stage_failed() {
-        // Should not panic
-        record_stage_failed("node-1", "resource_exhausted");
-        record_stage_failed("node-2", "timeout");
-    }
-
-    #[test]
-    fn test_record_stage_retry() {
-        // Should not panic
-        record_stage_retry("node-1");
-        record_stage_retry("node-2");
+        install_metrics_reader();
+        let node = "stage-failed-node";
+        record_stage_failed(node, "resource_exhausted");
+        assert_eq!(
+            series_of(node),
+            vec![
+                "scheduler_stage_failures counter<u64> [stages] {error_type=resource_exhausted,node_id=stage-failed-node} = 1",
+                "scheduler_stages_total counter<u64> [stages] {node_id=stage-failed-node,status=failed} = 1",
+            ]
+        );
     }
 
     // =========================================================================
-    // Scheduler Metrics Helper Function Tests
+    // The Published Metric Set
     // =========================================================================
 
+    /// Every cluster metric a helper records, as a dashboard reads it: name,
+    /// instrument kind, unit, labels and value after one call to each helper.
+    /// Metric names and labels are user-facing, so a rename, a dropped label or
+    /// a helper writing into the wrong instrument shows up here.
     #[test]
-    fn test_record_planning_duration() {
-        // Should not panic
-        record_planning_duration("node-1", 250.0);
-        record_planning_duration("node-1", 0.0);
-    }
+    fn every_cluster_metric_is_published_under_its_name_unit_and_labels() {
+        install_metrics_reader();
+        let node = "metric-set-node";
+        set_node_status(node, "scheduler", 1);
+        set_active_executor_count(node, 5);
+        set_scheduler_count(node, 3);
+        record_task_started(node, "executor");
+        record_task_started(node, "executor");
+        record_task_completed(node, "executor", 100.5);
+        record_task_failed(node, "executor", "timeout");
+        record_task_retry(node, "executor");
+        record_shuffle_write(node, 1024, 100, 50.0);
+        record_shuffle_read_local(node, 512, 50, 10.0);
+        record_shuffle_read_remote(node, 2048, 200, 20.0);
+        record_result_fetch(node, 4096, 400, 30.0);
+        record_stage_completed(node, 1000.0, 4);
+        record_stage_failed(node, "resource_exhausted");
+        record_stage_retry(node);
+        record_planning_duration(node, 250.0);
+        record_executor_assignment(node);
+        set_task_queue_depth(node, 10);
+        set_job_queue_depth(node, 2);
+        set_executor_memory_available(node, 1_073_741_824);
+        set_executor_task_slots(node, 8);
 
-    #[test]
-    fn test_set_active_executor_count() {
-        // Should not panic
-        set_active_executor_count("node-1", 5);
-        set_active_executor_count("node-1", 0);
-    }
-
-    #[test]
-    fn test_record_executor_assignment() {
-        // Should not panic
-        record_executor_assignment("node-1");
-    }
-
-    #[test]
-    fn test_set_node_status() {
-        // Should not panic - test all status values
-        set_node_status("node-1", "scheduler", 0); // Unknown
-        set_node_status("node-1", "scheduler", 1); // Healthy
-        set_node_status("node-1", "executor", 2); // Unhealthy
-        set_node_status("node-2", "executor", 3); // Draining
-    }
-
-    #[test]
-    fn test_set_task_queue_depth() {
-        // Should not panic
-        set_task_queue_depth("node-1", 10);
-        set_task_queue_depth("node-1", 0);
-    }
-
-    #[test]
-    fn test_set_job_queue_depth() {
-        // Should not panic
-        set_job_queue_depth("node-1", 5);
-        set_job_queue_depth("node-1", 0);
-    }
-
-    #[test]
-    fn test_set_executor_memory_available() {
-        // Should not panic
-        set_executor_memory_available("node-1", 1024 * 1024 * 1024); // 1 GB
-        set_executor_memory_available("node-1", 0);
-    }
-
-    #[test]
-    fn test_set_executor_task_slots() {
-        // Should not panic
-        set_executor_task_slots("node-1", 8); // Typical CPU core count
-        set_executor_task_slots("node-2", 16);
-        set_executor_task_slots("node-3", 1); // Minimum
-    }
-
-    #[test]
-    fn test_set_scheduler_count() {
-        // Should not panic
-        set_scheduler_count("node-1", 3);
-        set_scheduler_count("node-1", 1);
+        assert_eq!(
+            series_of(node),
+            vec![
+                "executor_memory_available_bytes gauge<u64> [By] {node_id=metric-set-node} = 1073741824",
+                "executor_shuffle_read_local_bytes counter<u64> [By] {node_id=metric-set-node} = 512",
+                "executor_shuffle_read_local_count counter<u64> [operations] {node_id=metric-set-node} = 1",
+                "executor_shuffle_read_local_duration_ms histogram<f64> [ms] {node_id=metric-set-node} = count 1, sum 10.0",
+                "executor_shuffle_read_local_rows counter<u64> [rows] {node_id=metric-set-node} = 50",
+                "executor_shuffle_read_remote_bytes counter<u64> [By] {node_id=metric-set-node} = 2048",
+                "executor_shuffle_read_remote_count counter<u64> [operations] {node_id=metric-set-node} = 1",
+                "executor_shuffle_read_remote_duration_ms histogram<f64> [ms] {node_id=metric-set-node} = count 1, sum 20.0",
+                "executor_shuffle_read_remote_rows counter<u64> [rows] {node_id=metric-set-node} = 200",
+                "executor_shuffle_write_bytes counter<u64> [By] {node_id=metric-set-node} = 1024",
+                "executor_shuffle_write_duration_ms histogram<f64> [ms] {node_id=metric-set-node} = count 1, sum 50.0",
+                "executor_shuffle_write_rows counter<u64> [rows] {node_id=metric-set-node} = 100",
+                "executor_task_duration_ms histogram<f64> [ms] {node_id=metric-set-node} = count 1, sum 100.5",
+                "executor_task_slots gauge<u64> [tasks] {node_id=metric-set-node} = 8",
+                "node_status gauge<u64> [] {node_id=metric-set-node,role=scheduler} = 1",
+                "node_task_failures counter<u64> [tasks] {error_type=timeout,node_id=metric-set-node,role=executor} = 1",
+                "node_task_retries counter<u64> [tasks] {node_id=metric-set-node,role=executor} = 1",
+                "node_tasks_active updown<i64> [tasks] {node_id=metric-set-node,role=executor} = 0",
+                "node_tasks_total counter<u64> [tasks] {node_id=metric-set-node,role=executor,status=completed} = 1",
+                "node_tasks_total counter<u64> [tasks] {node_id=metric-set-node,role=executor,status=failed} = 1",
+                "scheduler_active_executors_count gauge<u64> [] {node_id=metric-set-node} = 5",
+                "scheduler_count gauge<u64> [] {node_id=metric-set-node} = 3",
+                "scheduler_executor_assignments counter<u64> [assignments] {node_id=metric-set-node} = 1",
+                "scheduler_job_queue_depth gauge<u64> [jobs] {node_id=metric-set-node} = 2",
+                "scheduler_planning_duration_ms histogram<f64> [ms] {node_id=metric-set-node} = count 1, sum 250.0",
+                "scheduler_result_fetch_bytes counter<u64> [By] {node_id=metric-set-node} = 4096",
+                "scheduler_result_fetch_count counter<u64> [operations] {node_id=metric-set-node} = 1",
+                "scheduler_result_fetch_duration_ms histogram<f64> [ms] {node_id=metric-set-node} = count 1, sum 30.0",
+                "scheduler_result_fetch_rows counter<u64> [rows] {node_id=metric-set-node} = 400",
+                "scheduler_stage_duration_ms histogram<f64> [ms] {node_id=metric-set-node} = count 1, sum 1000.0",
+                "scheduler_stage_failures counter<u64> [stages] {error_type=resource_exhausted,node_id=metric-set-node} = 1",
+                "scheduler_stage_retries counter<u64> [stages] {node_id=metric-set-node} = 1",
+                "scheduler_stages_total counter<u64> [stages] {node_id=metric-set-node,status=completed} = 1",
+                "scheduler_stages_total counter<u64> [stages] {node_id=metric-set-node,status=failed} = 1",
+                "scheduler_task_queue_depth gauge<u64> [tasks] {node_id=metric-set-node} = 10",
+                "scheduler_tasks_per_stage histogram<u64> [tasks] {node_id=metric-set-node} = count 1, sum 4",
+            ]
+        );
     }
 }

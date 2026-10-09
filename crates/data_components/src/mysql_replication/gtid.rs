@@ -490,22 +490,66 @@ mod tests {
 
     #[test]
     fn parse_rejects_bad_uuid() {
-        GtidSet::parse("not-a-uuid:1-5").expect_err("invalid uuid must be rejected");
+        // The UUID parser's own diagnostic is appended verbatim; derive it from
+        // the same call so the assertion pins this module's wording, not the
+        // dependency's.
+        let uuid_error =
+            Uuid::parse_str("not-a-uuid").expect_err("`not-a-uuid` must not parse as a UUID");
+        assert_eq!(
+            GtidSet::parse("not-a-uuid:1-5").expect_err("invalid uuid must be rejected"),
+            format!("invalid GTID source uuid \"not-a-uuid\": {uuid_error}")
+        );
     }
 
     #[test]
     fn parse_rejects_zero_gno() {
-        GtidSet::parse(&format!("{U1}:0")).expect_err("zero gno must be rejected");
-        GtidSet::parse(&format!("{U1}:0-5")).expect_err("zero range start must be rejected");
+        assert_eq!(
+            GtidSet::parse(&format!("{U1}:0")).expect_err("zero gno must be rejected"),
+            "GTID sequence numbers start at 1, got \"0\""
+        );
+        assert_eq!(
+            GtidSet::parse(&format!("{U1}:0-5")).expect_err("zero range start must be rejected"),
+            "GTID sequence numbers start at 1, got \"0-5\""
+        );
+        // A zero end must not slip through by being swapped into the start of
+        // an inclusive range.
+        assert_eq!(
+            GtidSet::parse(&format!("{U1}:3-0")).expect_err("zero range end must be rejected"),
+            "GTID sequence numbers start at 1, got \"3-0\""
+        );
     }
 
     #[test]
     fn parse_rejects_block_without_interval() {
-        GtidSet::parse(U1).expect_err("block without a sequence interval must be rejected");
+        assert_eq!(
+            GtidSet::parse(U1).expect_err("block without a sequence interval must be rejected"),
+            format!("GTID block for \"{U1}\" has no sequence interval in \"{U1}\"")
+        );
+        // A trailing `:` with nothing after it is still a block with no interval,
+        // not an empty set for that source.
+        assert_eq!(
+            GtidSet::parse(&format!("{U1}:"))
+                .expect_err("block with an empty interval list must be rejected"),
+            format!("GTID block for \"{U1}\" has no sequence interval in \"{U1}:\"")
+        );
     }
 
     #[test]
     fn parse_rejects_non_numeric_range() {
-        GtidSet::parse(&format!("{U1}:a-b")).expect_err("non-numeric range must be rejected");
+        assert_eq!(
+            GtidSet::parse(&format!("{U1}:a-b")).expect_err("non-numeric range must be rejected"),
+            format!(
+                "invalid GTID range start \"a\" in \"{U1}:a-b\": invalid digit found in string"
+            )
+        );
+        assert_eq!(
+            GtidSet::parse(&format!("{U1}:1-b"))
+                .expect_err("non-numeric range end must be rejected"),
+            format!("invalid GTID range end \"b\" in \"{U1}:1-b\": invalid digit found in string")
+        );
+        assert_eq!(
+            GtidSet::parse(&format!("{U1}:x")).expect_err("non-numeric sequence must be rejected"),
+            format!("invalid GTID sequence \"x\" in \"{U1}:x\": invalid digit found in string")
+        );
     }
 }

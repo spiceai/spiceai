@@ -365,9 +365,13 @@ mod tests {
     #[test]
     fn an_unknown_op_code_is_rejected_rather_than_coerced() {
         let value = serde_json::json!({"before": null, "after": {}, "op": "z"});
-        assert!(
-            ChangeEvent::from_json_value(value).is_err(),
-            "unknown op codes must not parse"
+        let Err(err) = ChangeEvent::from_json_value(value) else {
+            panic!("unknown op codes must not parse");
+        };
+        assert_eq!(
+            err.to_string(),
+            "unknown variant `z`, expected one of `c`, `u`, `d`, `r`, `t`, `m`",
+            "the message must be rejected for its op code, not for any other part of it"
         );
     }
 
@@ -464,6 +468,13 @@ mod tests {
         // `op` has no default: a message that cannot say what it does must not
         // be silently treated as an insert.
         let parsed = serde_json::from_value::<Payload>(serde_json::json!({"after": {"id": 1}}));
-        assert!(parsed.is_err(), "a payload with no `op` must not parse");
+        let Err(err) = parsed else {
+            panic!("a payload with no `op` must not parse");
+        };
+        assert_eq!(
+            err.to_string(),
+            "missing field `op`",
+            "the payload must be rejected for its missing `op`, not for any other field"
+        );
     }
 }

@@ -409,21 +409,48 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_invalid_num_buckets() {
-        let udf = Bucket::new();
-        let args = ScalarFunctionArgs {
+    /// `bucket(num_buckets, value)` with scalar arguments.
+    fn bucket_args(num_buckets: i64, value: ScalarValue) -> ScalarFunctionArgs {
+        ScalarFunctionArgs {
             args: vec![
-                ColumnarValue::Scalar(ScalarValue::Int64(Some(0))),
-                ColumnarValue::Scalar(ScalarValue::Utf8(Some("test".to_string()))),
+                ColumnarValue::Scalar(ScalarValue::Int64(Some(num_buckets))),
+                ColumnarValue::Scalar(value),
             ],
             number_rows: 1,
             arg_fields: vec![],
             return_field: Arc::new(Field::new("ignored_name", DataType::Int32, false)),
             config_options: Arc::new(ConfigOptions::default()),
-        };
-        let result = udf.invoke_with_args(args);
-        result.expect_err("Should fail for invalid num_buckets");
+        }
+    }
+
+    /// The text of a `bucket` refusal, which reaches `DataFusion` as an external error.
+    fn refusal(err: &DataFusionError) -> String {
+        match err {
+            DataFusionError::External(inner) => inner.to_string(),
+            other => panic!("expected the bucket refusal as an external error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_invalid_num_buckets() {
+        let udf = Bucket::new();
+        let err = udf
+            .invoke_with_args(bucket_args(0, ScalarValue::Utf8(Some("test".to_string()))))
+            .expect_err("Should fail for invalid num_buckets");
+        let message = refusal(&err);
+        assert!(
+            message.starts_with("Invalid number of buckets: 0. Must be a positive integer"),
+            "{message}"
+        );
+
+        // One bucket is the smallest valid count, and every value lands in it.
+        let one = udf
+            .invoke_with_args(bucket_args(1, ScalarValue::Utf8(Some("test".to_string()))))
+            .expect("a single bucket is a valid count");
+        assert!(
+            matches!(one, ColumnarValue::Scalar(ScalarValue::Int64(Some(0)))),
+            "{one:?}"
+        );
     }
 
     #[test]

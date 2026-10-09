@@ -146,8 +146,28 @@ mod tests {
 
     #[test]
     fn assert_true_passes() {
-        let _ = call(ColumnarValue::Scalar(ScalarValue::Boolean(Some(true))))
+        let passed = call(ColumnarValue::Scalar(ScalarValue::Boolean(Some(true))))
             .expect("TRUE should pass the assertion");
+        assert!(
+            matches!(
+                passed,
+                ColumnarValue::Scalar(ScalarValue::Boolean(Some(true)))
+            ),
+            "the gate returns TRUE: {passed:?}"
+        );
+
+        // An all-TRUE column passes through unchanged.
+        let column = BooleanArray::from(vec![true, true, true]);
+        let passed = call(ColumnarValue::Array(std::sync::Arc::new(column.clone())))
+            .expect("an all-TRUE column should pass the assertion");
+        let ColumnarValue::Array(passed) = passed else {
+            panic!("an array argument must return an array, got {passed:?}");
+        };
+        assert_eq!(
+            passed.as_any().downcast_ref::<BooleanArray>(),
+            Some(&column),
+            "the gate returns its column unchanged"
+        );
     }
 
     #[test]

@@ -319,9 +319,16 @@ mod chat_backend_tests {
 
     #[test]
     fn rejects_values_outside_the_spec() {
-        for raw in ["", "legacy", "true", "false"] {
-            assert!(
-                raw.parse::<ChatBackend>().is_err(),
+        for (raw, expected) in [
+            // Unlike the other model params, a blank value is not read as unset.
+            ("", "must be one of: enabled, disabled. Found "),
+            ("legacy", "must be one of: enabled, disabled. Found legacy"),
+            ("true", "must be one of: enabled, disabled. Found true"),
+            ("false", "must be one of: enabled, disabled. Found false"),
+        ] {
+            assert_eq!(
+                raw.parse::<ChatBackend>(),
+                Err(expected.to_string()),
                 "{raw:?} should be rejected"
             );
         }

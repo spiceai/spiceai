@@ -337,7 +337,14 @@ fn test_duplicate_keys_rejected() {
         .allow_duplicates(false)
         .build(&partitions);
 
-    let _err = result.expect_err("expected duplicate key error");
+    // Equal key bytes must be reported as a duplicate key, never as a hash
+    // collision between different keys: the two errors ask for different fixes.
+    let err = result.expect_err("expected duplicate key error");
+    assert!(
+        matches!(err, crate::Error::DuplicateKey),
+        "expected Error::DuplicateKey, got {err:?}"
+    );
+    assert_eq!(err.to_string(), "Duplicate key detected");
 }
 
 #[test]
@@ -541,14 +548,18 @@ fn test_concurrent_reads() {
             .expect("failed to build index"),
     );
 
-    // Spawn multiple reader threads
+    // Spawn multiple reader threads; every reader must see each key at the
+    // exact row it was built from (one partition, one batch, row == key).
     let handles: Vec<_> = (0..8)
         .map(|thread_id| {
             let index = Arc::clone(&index);
             thread::spawn(move || {
                 for i in 0..1000_i64 {
-                    let loc = index.get(&i);
-                    assert!(loc.is_some(), "Thread {thread_id} failed to find {i}");
+                    assert_eq!(
+                        index.get(&i),
+                        Some(RowLocation::new(0, 0, i as u32)),
+                        "Thread {thread_id} read the wrong location for key {i}"
+                    );
                 }
             })
         })
@@ -569,19 +580,28 @@ fn test_concurrent_reads_and_writes() {
         for i in 0..1000_i64 {
             let hash = hash_key(&i);
             let loc = RowLocation::simple(0, i as u32);
-            writer_index.insert(hash, loc);
+            assert_eq!(
+                writer_index.insert(hash, loc),
+                InsertResult::Inserted,
+                "distinct key {i} must insert"
+            );
         }
     });
 
-    // Reader threads (start slightly after)
+    // Reader threads race the writer: a key is either not written yet or at
+    // exactly the location the writer gave it, never anything else.
     let handles: Vec<_> = (0..4)
         .map(|_| {
             let index = Arc::clone(&index);
             thread::spawn(move || {
                 for _ in 0..100 {
-                    // Keep reading, some may be found, some may not yet
                     for i in 0..100_i64 {
-                        let _ = index.get(&i);
+                        let observed = index.get(&i);
+                        assert!(
+                            observed.is_none()
+                                || observed == Some(RowLocation::simple(0, i as u32)),
+                            "reader saw key {i} at {observed:?}, which the writer never wrote"
+                        );
                     }
                 }
             })
@@ -593,9 +613,14 @@ fn test_concurrent_reads_and_writes() {
         handle.join().expect("Reader panicked");
     }
 
-    // After writer completes, all should be findable
+    // After the writer completes, every key is present at its location.
+    assert_eq!(index.len(), 1000);
     for i in 0..1000_i64 {
-        assert!(index.get(&i).is_some());
+        assert_eq!(
+            index.get(&i),
+            Some(RowLocation::simple(0, i as u32)),
+            "key {i} after the writer finished"
+        );
     }
 }
 
@@ -948,7 +973,13 @@ fn test_composite_key_duplicate_detection() {
         .allow_duplicates(false)
         .build(&partitions);
 
-    let _err = result.expect_err("expected duplicate key error");
+    // Composite duplicates are confirmed by comparing the encoded key bytes, so a
+    // wrong encoding would surface as a hash collision rather than a duplicate.
+    let err = result.expect_err("expected duplicate key error");
+    assert!(
+        matches!(err, crate::Error::DuplicateKey),
+        "expected Error::DuplicateKey, got {err:?}"
+    );
 }
 
 #[test]
@@ -1022,7 +1053,11 @@ fn test_composite_key_three_columns_with_duplicates() {
     .allow_duplicates(false)
     .build(&partitions);
 
-    result.expect_err("expected duplicate key error for compound key");
+    let err = result.expect_err("expected duplicate key error for compound key");
+    assert!(
+        matches!(err, crate::Error::DuplicateKey),
+        "expected Error::DuplicateKey for (US, 2024, 100), got {err:?}"
+    );
 }
 
 #[test]
@@ -1374,12 +1409,24 @@ fn test_high_load_factor() {
         index.insert(hash, loc);
     }
 
-    // Verify all expected entries
-    for i in (1..1000_i64).step_by(2) {
-        assert!(index.get(&i).is_some(), "Missing odd key {i}");
+    // 1000 inserted - 500 removed + 500 new.
+    assert_eq!(index.len(), 1000);
+
+    // Surviving odd keys keep their original location; removed even keys are gone.
+    for i in 0..1000_i64 {
+        let expected = if i % 2 == 1 {
+            Some(RowLocation::simple(0, i as u32))
+        } else {
+            None
+        };
+        assert_eq!(index.get(&i), expected, "key {i} after deleting even keys");
     }
     for i in 1000..1500_i64 {
-        assert!(index.get(&i).is_some(), "Missing new key {i}");
+        assert_eq!(
+            index.get(&i),
+            Some(RowLocation::simple(1, (i - 1000) as u32)),
+            "new key {i}"
+        );
     }
 }
 
@@ -1850,20 +1897,6 @@ fn test_data_integrity_concurrent_consistency() {
     assert_eq!(index.len(), num_threads * keys_per_thread);
 }
 
-/// Test that duplicate key detection works.
-#[test]
-fn test_data_integrity_duplicate_detection() {
-    let ids: Vec<i64> = vec![1, 2, 3, 2, 5]; // Note: 2 is duplicated
-    let batch = create_int64_batch(ids);
-    let partitions = vec![vec![batch]];
-
-    let result = HashIndexBuilder::new(vec!["id".to_string()])
-        .allow_duplicates(false)
-        .build(&partitions);
-
-    let _err = result.expect_err("Should detect duplicate key");
-}
-
 /// Test that `allow_duplicates` mode uses last-write-wins.
 #[test]
 fn test_data_integrity_allow_duplicates_last_wins() {
@@ -2024,27 +2057,64 @@ fn test_error_empty_key_columns() {
 }
 
 #[test]
-fn test_error_unsupported_key_type_timestamp() {
+fn test_timestamp_keys_indexed_by_value_via_rowconverter() {
     use arrow::array::TimestampNanosecondArray;
 
-    // Timestamp types fall back to RowConverter which should work
-    let schema = Arc::new(Schema::new(vec![Field::new(
-        "ts",
-        DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
-        false,
-    )]));
-    let array = TimestampNanosecondArray::from(vec![1_000_000_000, 2_000_000_000]);
-    let batch =
-        RecordBatch::try_new(schema, vec![Arc::new(array)]).expect("failed to create batch");
+    use crate::{KeyExtractor, RowConverterKeyExtractor};
 
-    let partitions = vec![vec![batch]];
+    // Timestamp types have no dedicated extractor and fall back to RowConverter.
+    let timestamp_batch = |values: Vec<i64>| {
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "ts",
+            DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
+            false,
+        )]));
+        RecordBatch::try_new(
+            schema,
+            vec![Arc::new(TimestampNanosecondArray::from(values))],
+        )
+        .expect("failed to create batch")
+    };
+    let key_columns = vec!["ts".to_string()];
 
-    // Timestamp should work via RowConverter fallback
-    let result = HashIndexBuilder::new(vec!["ts".to_string()]).build(&partitions);
+    let partitions = vec![vec![timestamp_batch(vec![1_000_000_000, 2_000_000_000])]];
+    let index = HashIndexBuilder::new(key_columns.clone())
+        .build(&partitions)
+        .expect("timestamps should index via RowConverter");
+    assert_eq!(index.len(), 2);
+
+    // Look each value up from a differently ordered probe batch: the index must
+    // resolve the timestamp's value, not the probe row's position.
+    let probe = timestamp_batch(vec![2_000_000_000, 1_000_000_000, 3_000_000_000]);
+    let probe_keys = RowConverterKeyExtractor::new(&probe, &key_columns).expect("probe extractor");
+    let probe_hash = |row: usize| probe_keys.hash_key(row).expect("non-null probe key");
+    assert_eq!(
+        index.get_by_hash(probe_hash(0)),
+        Some(RowLocation::new(0, 0, 1))
+    );
+    assert_eq!(
+        index.get_by_hash(probe_hash(1)),
+        Some(RowLocation::new(0, 0, 0))
+    );
+    assert_eq!(
+        index.get_by_hash(probe_hash(2)),
+        None,
+        "a timestamp that was never indexed"
+    );
+
+    // A repeated timestamp is a duplicate key, not two distinct keys.
+    let duplicated = vec![vec![timestamp_batch(vec![
+        1_000_000_000,
+        2_000_000_000,
+        1_000_000_000,
+    ])]];
+    let err = HashIndexBuilder::new(key_columns)
+        .allow_duplicates(false)
+        .build(&duplicated)
+        .expect_err("a repeated timestamp must be rejected");
     assert!(
-        result.is_ok(),
-        "Timestamp should work via RowConverter: {:?}",
-        result.err()
+        matches!(err, crate::Error::DuplicateKey),
+        "expected Error::DuplicateKey, got {err:?}"
     );
 }
 
@@ -2500,27 +2570,45 @@ fn test_delete_chain_maintenance() {
 fn test_insert_delete_insert_cycle() {
     let index = HashIndex::new(vec!["id".to_string()]);
 
-    // Perform multiple cycles of insert-delete-insert
-    for cycle in 0..5 {
+    // Perform multiple cycles of insert-delete-insert. Keys never repeat across
+    // cycles, so every insert is new and the end state is fully determined.
+    for cycle in 0..5_i64 {
         // Insert 100 entries
         for i in 0..100_i64 {
             let key = cycle * 1000 + i;
             let hash = hash_key(&key);
-            // Both outcomes are acceptable: successful insert or hash collision
-            // with a key from a previous cycle that wasn't deleted
-            let _ = index.insert(hash, RowLocation::simple(cycle as u32, i as u32));
+            assert_eq!(
+                index.insert(hash, RowLocation::simple(cycle as u32, i as u32)),
+                InsertResult::Inserted,
+                "cycle {cycle}: key {key} is new"
+            );
         }
 
         // Delete half
         for i in 0..50_i64 {
             let key = cycle * 1000 + i;
             let hash = hash_key(&key);
-            index.remove(hash);
+            assert_eq!(
+                index.remove(hash),
+                Some(RowLocation::simple(cycle as u32, i as u32)),
+                "cycle {cycle}: removing key {key}"
+            );
         }
     }
 
-    // Verify index is in consistent state
-    assert!(!index.is_empty(), "Index should have some entries");
+    // 5 cycles x (100 inserted - 50 removed).
+    assert_eq!(index.len(), 250);
+    for cycle in 0..5_i64 {
+        for i in 0..100_i64 {
+            let key = cycle * 1000 + i;
+            let expected = if i >= 50 {
+                Some(RowLocation::simple(cycle as u32, i as u32))
+            } else {
+                None
+            };
+            assert_eq!(index.get(&key), expected, "cycle {cycle}: key {key}");
+        }
+    }
 }
 
 // =============================================================================

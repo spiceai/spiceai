@@ -1,0 +1,12 @@
+---
+source: crates/test-framework/src/spicetest/text_to_sql/parse.rs
+expression: "format_result(&tables, &projections)"
+---
+Tables:
+  spice.public.orders
+  spice.public.users
+
+Projections:
+  spice.public.orders.total
+  spice.public.users.id
+  spice.public.users.name

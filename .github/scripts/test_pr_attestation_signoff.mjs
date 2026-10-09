@@ -166,11 +166,15 @@ function stubCore() {
  * `statuses` maps a commit SHA to the `signoff` state it carries (omit for a
  * commit with no status), and `commits` maps a SHA to its parent SHAs.
  */
-async function runScript({ script, statuses = {}, commits = {}, headSha = HEAD, baseSha = BASE }) {
+async function runScript({
+  script, statuses = {}, commits = {}, files = [], headSha = HEAD, baseSha = BASE,
+}) {
   const { calls, core } = stubCore();
   const reads = [];
   const github = {
+    paginate: async () => files,
     rest: {
+      pulls: { listFiles: () => {} },
       repos: {
         getCombinedStatusForRef: async ({ ref }) => {
           reads.push(ref);
@@ -207,7 +211,13 @@ async function runScript({ script, statuses = {}, commits = {}, headSha = HEAD, 
   };
   const context = {
     repo: { owner: 'spiceai', repo: 'spiceai' },
-    payload: { pull_request: { head: { sha: headSha }, base: { sha: baseSha } } },
+    payload: {
+      pull_request: {
+        number: 1,
+        head: { sha: headSha, repo: { full_name: 'spiceai/spiceai' } },
+        base: { sha: baseSha, repo: { full_name: 'spiceai/spiceai' } },
+      },
+    },
   };
 
   const AsyncFunction = Object.getPrototypeOf(async () => {}).constructor;
@@ -219,6 +229,7 @@ const workflow = readFileSync(WORKFLOW, 'utf8');
 const job = attestationJob(workflow);
 const rejectScript = stepScript(job, REJECT_STEP);
 const inspectScript = stepScript(job, INSPECT_STEP);
+const noRustScript = stepScript(job, 'Fast-track branches with no Rust-affecting files');
 
 const tests = [];
 const test = (name, body) => tests.push({ name, body });
@@ -402,6 +413,48 @@ test('an unsigned non-merge commit cannot inherit', async () => {
   });
   assert.equal(result.failed.length, 1);
   assert.match(result.failed[0], /not a two-parent merge/);
+});
+
+for (const filename of [
+  'crates/runtime/tests/fixtures/result.snap',
+  'crates/runtime/tests/fixtures/input.csv',
+  'bin/spice/tests/fixtures/config.yaml',
+  'tools/testoperator/fixtures/results.json',
+  'vendor/library/schema.proto',
+  'fixtures/result.snap',
+  'version.txt',
+  'test/tls/spiced_cert.pem',
+  'test/spicepods/tpch/sf1/accelerated/postgres[catalog][changes].yaml',
+]) {
+  test(`test/build input ${filename} requires sign-off`, async () => {
+    const result = await runScript({ script: noRustScript, files: [{ filename }] });
+    assert.deepEqual(result.outputs, {});
+    assert.match(result.infos[0], /can affect Rust lint\/build\/tests/);
+  });
+}
+
+test('renaming a test input out of a crate still requires sign-off', async () => {
+  const result = await runScript({
+    script: noRustScript,
+    files: [{ filename: 'docs/fixture.csv', previous_filename: 'crates/probe/input.csv' }],
+  });
+  assert.deepEqual(result.outputs, {});
+});
+
+test('documentation outside source trees can still fast-track', async () => {
+  const result = await runScript({
+    script: noRustScript,
+    files: [{ filename: 'docs/dev/example.md' }, { filename: 'README.md' }],
+  });
+  assert.equal(result.outputs.fast_track, 'true');
+});
+
+test('a test input no Rust source names can still fast-track', async () => {
+  const result = await runScript({
+    script: noRustScript,
+    files: [{ filename: 'test/spicepods/chbench/accelerated/mysql-cayenne[file]-adaptive.yaml' }],
+  });
+  assert.equal(result.outputs.fast_track, 'true');
 });
 
 let failures = 0;

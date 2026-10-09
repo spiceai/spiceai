@@ -281,12 +281,20 @@ mod tests {
         );
     }
 
+    /// `spice version` prints the bare semver for a release build, and names
+    /// the commit for any other build.
     #[test]
     fn test_cli_version_format() {
-        let version = cli_version();
-        assert!(version.starts_with('v'));
-        assert!(version.contains('('));
-        assert!(version.contains(')'));
+        let semver = format!("v{}", env!("CARGO_PKG_VERSION"));
+        let expected = if cfg!(feature = "release") {
+            semver
+        } else {
+            format!(
+                "{semver} ({})",
+                option_env!("GIT_COMMIT_HASH").unwrap_or("unknown")
+            )
+        };
+        assert_eq!(cli_version(), expected);
     }
 
     #[test]

@@ -14,39 +14,29 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::sync::Arc;
-
 use super::{
     error::{IcebergResponseError, InternalServerErrorCode},
     namespace::{Namespace, NamespacePath},
+    passthrough::{not_served_as_iceberg_message, passthrough_source},
 };
 use crate::datafusion::is_spice_internal_schema;
 use crate::datafusion::request_context_extension::get_current_datafusion;
-use arrow::datatypes::{DataType, Field, Fields, Schema as ArrowSchema, TimeUnit};
 use axum::{
-    Json,
     extract::Path,
-    http::status,
+    http::{header, status},
     response::{IntoResponse, Response},
 };
 use datafusion::common::TableReference;
-use iceberg::{
-    arrow::{UTC_TIME_ZONE, arrow_schema_to_schema},
-    spec::{PartitionSpec, Schema, SortOrder},
-};
+use iceberg::spec::TableMetadata;
 use runtime_request_context::{AsyncMarker, RequestContext};
-use serde::{Serialize, Serializer};
-use uuid::Uuid;
-
-const PARQUET_FIELD_ID_META_KEY: &str = "PARQUET:field_id";
-const MAX_SCHEMA_RECURSION_DEPTH: usize = 10;
+use serde::Serialize;
 
 /// Check if a table exists.
 ///
 /// This endpoint returns a 200 OK response if the table exists, otherwise it returns a 404 Not Found response.
 #[cfg_attr(feature = "openapi", utoipa::path(
     head,
-    path = "/v1/iceberg/namespaces/{namespace}/tables/{table}",
+    path = "/v1/namespaces/{namespace}/tables/{table}",
     operation_id = "head_table",
     tag = "Iceberg",
     responses(
@@ -69,62 +59,35 @@ pub(crate) async fn head(Path((namespace, table)): Path<(NamespacePath, String)>
     }
 }
 
-#[derive(Debug, Serialize)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-struct LoadTableResponse {
-    metadata: TableMetadata,
-}
-
-#[derive(Debug)]
-#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-enum TableFormatVersion {
-    V2,
-}
-
-impl Serialize for TableFormatVersion {
-    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
-    where
-        S: Serializer,
-    {
-        match self {
-            TableFormatVersion::V2 => serializer.serialize_u8(2),
-        }
-    }
-}
-
+/// The Iceberg REST `LoadTableResult`: the table's metadata and where it is
+/// stored. No `config` or `storage-credentials`: a client reads the table's
+/// files with its own credentials.
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "kebab-case")]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
-struct TableMetadata {
-    format_version: TableFormatVersion,
-    #[cfg_attr(feature = "openapi", schema(value_type=String, example="2b9da507-2c07-4bb3-9f0b-8df66a5e9e53"))]
-    table_uuid: Uuid,
-    location: String,
-
-    /// Iceberg schemas, see `<https://apache.github.io/iceberg/spec/#schemas>`.
-    #[cfg_attr(feature = "openapi", schema(value_type=Type::Object))]
-    schemas: Vec<Schema>,
-
-    // The following fields are part of the Iceberg Table Metadata V2 spec - but we don't do anything with them yet
-    last_updated_ms: i64,
-    last_column_id: i32,
-    last_sequence_number: u64,
-    current_schema_id: u32,
-    #[cfg_attr(feature = "openapi", schema(value_type=Type::Object))]
-    partition_specs: Vec<PartitionSpec>,
-    default_spec_id: u32,
-    last_partition_id: u32,
-    #[cfg_attr(feature = "openapi", schema(value_type=Type::Object))]
-    sort_orders: Vec<SortOrder>,
-    default_sort_order_id: u32,
+struct LoadTableResponse {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    metadata_location: Option<String>,
+    /// Iceberg table metadata, see `<https://iceberg.apache.org/spec/#table-metadata>`.
+    #[cfg_attr(feature = "openapi", schema(value_type = Object))]
+    metadata: TableMetadata,
 }
 
-/// Get a table.
+/// Load a table.
 ///
-/// This endpoint returns the table if it exists, otherwise it returns a 404 Not Found response.
+/// A table Spice reads unchanged from an Iceberg table (a federated `iceberg:`
+/// or `glue:` dataset, a table in an Iceberg or Glue catalog, or an Iceberg DDL
+/// table) is returned as that Iceberg table: its current metadata and metadata
+/// location, loaded from its catalog on every request, so an Iceberg client
+/// reads the snapshot Spice's next query reads. A column added to the table
+/// outside Spice reaches the client at once, while Spice keeps the columns the
+/// table had when it was registered until it is reloaded. Any other table
+/// (accelerated, with columns Spice computes such as embeddings, a view, or a
+/// source that is not Iceberg) is refused with `400`, naming the reason: query
+/// it with SQL through Spice instead.
 #[cfg_attr(feature = "openapi", utoipa::path(
     get,
-    path = "/v1/iceberg/namespaces/{namespace}/tables/{table}",
+    path = "/v1/namespaces/{namespace}/tables/{table}",
     operation_id = "get_table",
     tag = "Iceberg",
     params(
@@ -132,17 +95,29 @@ struct TableMetadata {
         ("table" = String, Path, description = "The name of the table.")
     ),
     responses(
-        (status = 200, description = "Table exists", body = LoadTableResponse),
-        (status = 404, description = "Table does not exist"),
-        (status = 500, description = "An internal server error occurred while getting the table", content((
+        (status = 200, description = "The Iceberg table Spice reads the table from", body = LoadTableResponse),
+        (status = 400, description = "The table cannot be read as an Iceberg table", content((
             IcebergResponseError = "application/json",
             example = json!({
                 "error": {
-                    "message": "Request failed. An internal server error occurred while getting the table.",
-                    "r#type": "InternalServerError",
-                    "code": 500
+                    "message": "Failed to load table 'spice.public.orders' as an Iceberg table: it is accelerated, so Spice answers queries from its acceleration rather than from an Iceberg table that Iceberg clients can read directly. Query it with SQL through Spice instead, over HTTP (`/v1/sql`) or Arrow Flight SQL. See: https://spiceai.org/docs/api/HTTP/get-table",
+                    "type": "BadRequestException",
+                    "code": 400
                 }
             })
+        ))),
+        (status = 404, description = "Table does not exist", content((
+            IcebergResponseError = "application/json",
+            example = json!({
+                "error": {
+                    "message": "Table 'spice.public.orders' does not exist",
+                    "type": "NoSuchTableException",
+                    "code": 404
+                }
+            })
+        ))),
+        (status = 503, description = "The table's Iceberg catalog could not be reached", content((
+            IcebergResponseError = "application/json"
         )))
     )
 ))]
@@ -152,55 +127,74 @@ pub(crate) async fn get(Path((namespace, table)): Path<(NamespacePath, String)>)
 
     let namespace = Namespace::from(namespace);
     let Some(table_reference) = table_reference(&namespace, &table) else {
-        return status::StatusCode::NOT_FOUND.into_response();
+        return IcebergResponseError::no_such_table(no_such_table_message(&namespace, &table))
+            .into_response();
+    };
+    let Some(provider) = df.get_table(&table_reference).await else {
+        return IcebergResponseError::no_such_table(no_such_table_message(&namespace, &table))
+            .into_response();
     };
 
-    let Some(table) = df.get_table(&table_reference).await else {
-        return status::StatusCode::NOT_FOUND.into_response();
-    };
-
-    let iceberg_schema = match iceberg_schema_for(&table.schema()) {
-        Ok(schema) => schema,
-        Err(e) => {
-            tracing::debug!(
-                "Error converting arrow schema to iceberg schema for {table_reference}: {e}"
-            );
-            return IcebergResponseError::internal(InternalServerErrorCode::InvalidSchema)
-                .into_response();
+    let source = match passthrough_source(&provider) {
+        Ok(source) => source,
+        Err(reason) => {
+            return IcebergResponseError::bad_request(not_served_as_iceberg_message(
+                &table_reference,
+                reason,
+            ))
+            .into_response();
         }
     };
 
-    let last_updated_ms = chrono::Utc::now().timestamp_millis();
-
-    let partition_specs = if let Ok(partition_spec) = PartitionSpec::builder(iceberg_schema.clone())
-        .with_spec_id(0)
-        .build()
-    {
-        vec![partition_spec]
-    } else {
-        vec![]
+    // The table the provider scans, loaded the way the provider loads it before
+    // every scan, so a client sees the snapshot Spice's next read would use.
+    let loaded = match source.catalog().load_table(source.table_ident()).await {
+        Ok(loaded) => loaded,
+        Err(e) if e.kind() == iceberg::ErrorKind::TableNotFound => {
+            return IcebergResponseError::no_such_table(no_such_table_message(&namespace, &table))
+                .into_response();
+        }
+        Err(e) => {
+            tracing::warn!(
+                "Failed to load table '{table_reference}' from its Iceberg catalog, so Iceberg clients cannot load it through Spice until the catalog answers. Queries through Spice read the same catalog. Cause: {e}"
+            );
+            return IcebergResponseError::service_unavailable(format!(
+                "Failed to load table '{table_reference}' from its Iceberg catalog. Retry, or query it with SQL through Spice."
+            ))
+            .into_response();
+        }
     };
 
-    let last_column_id = iceberg_schema.highest_field_id();
-    let metadata = TableMetadata {
-        format_version: TableFormatVersion::V2,
-        table_uuid: Uuid::new_v4(),
-        location: format!("spice.ai/{table_reference}"),
-        schemas: vec![iceberg_schema],
-        last_column_id,
-        last_updated_ms,
-        last_sequence_number: 0,
-        current_schema_id: 0,
-        partition_specs,
-        default_spec_id: 0,
-        last_partition_id: 1000,
-        sort_orders: vec![SortOrder::unsorted_order()],
-        default_sort_order_id: 0,
-    };
+    match load_table_body(&loaded) {
+        Ok(body) => (
+            status::StatusCode::OK,
+            [(header::CONTENT_TYPE, "application/json")],
+            body,
+        )
+            .into_response(),
+        Err(e) => {
+            tracing::warn!(
+                "Failed to serialize the Iceberg metadata of table '{table_reference}', so Iceberg clients cannot load it through Spice. Cause: {e}"
+            );
+            IcebergResponseError::internal(InternalServerErrorCode::InvalidTableMetadata)
+                .into_response()
+        }
+    }
+}
 
-    let response = LoadTableResponse { metadata };
+/// The `LoadTableResult` body for `table`.
+pub(super) fn load_table_body(table: &iceberg::table::Table) -> serde_json::Result<Vec<u8>> {
+    serde_json::to_vec(&LoadTableResponse {
+        metadata_location: table.metadata_location().map(str::to_string),
+        metadata: table.metadata().clone(),
+    })
+}
 
-    (status::StatusCode::OK, Json(response)).into_response()
+fn no_such_table_message(namespace: &Namespace, table: &str) -> String {
+    format!(
+        "Table '{}.{table}' does not exist",
+        namespace.parts.join(".")
+    )
 }
 
 fn table_reference(namespace: &Namespace, table: &str) -> Option<TableReference> {
@@ -216,750 +210,4 @@ fn table_reference(namespace: &Namespace, table: &str) -> Option<TableReference>
     }
 
     Some(TableReference::full(catalog, schema, table))
-}
-
-/// Convert a table's Arrow schema into the Iceberg v2 schema the catalog API serves:
-/// every field, nested ones included, is coerced to an Iceberg-compatible type and
-/// assigned a field ID.
-fn iceberg_schema_for(schema: &ArrowSchema) -> iceberg::Result<Schema> {
-    arrow_schema_to_schema(&assign_field_ids(schema))
-}
-
-/// The Iceberg v2 equivalent of a non-nested Arrow type that `arrow_schema_to_schema`
-/// cannot map directly, or `None` when the type needs no coercion. Each coercion
-/// represents every value of the original type.
-///
-/// This is a superset of the `CREATE TABLE` coercion in `iceberg_ddl`, which writes data
-/// into the schema it creates and so only coerces what its write path casts; this API
-/// only describes a schema.
-fn coerce_leaf_for_iceberg_v2(data_type: &DataType) -> Option<DataType> {
-    match data_type {
-        // An Arrow timestamp with any time zone holds UTC instants and uses the zone only
-        // for display, which is exactly Iceberg's `timestamptz`.
-        DataType::Timestamp(_, Some(tz)) if !matches!(tz.as_ref(), "UTC" | UTC_TIME_ZONE) => Some(
-            DataType::Timestamp(TimeUnit::Microsecond, Some(UTC_TIME_ZONE.into())),
-        ),
-        DataType::Float16 => Some(DataType::Float32),
-        DataType::Dictionary(key, value) => coerce_leaf_for_iceberg_v2(value)
-            .map(|value| DataType::Dictionary(key.clone(), Box::new(value))),
-        other => crate::datafusion::iceberg_ddl::coerce_temporal_type_for_iceberg_v2(other),
-    }
-}
-
-struct DepthExceeded;
-
-/// Iceberg requires field IDs to be set for all fields, including nested fields in Struct, List, and Map types.
-/// The iceberg-rust crate expects them to be set in the `PARQUET:field_id` metadata key.
-///
-/// Every non-nested type, at any depth, is also coerced with [`coerce_leaf_for_iceberg_v2`].
-fn assign_field_ids(schema: &ArrowSchema) -> ArrowSchema {
-    if let Ok(new_schema) = try_assign_field_ids(schema) {
-        new_schema
-    } else {
-        tracing::warn!(
-            "Schema recursion depth limit ({MAX_SCHEMA_RECURSION_DEPTH}) exceeded, returning original schema"
-        );
-        schema.clone()
-    }
-}
-
-fn try_assign_field_ids(schema: &ArrowSchema) -> Result<ArrowSchema, DepthExceeded> {
-    let mut counter: i32 = 0;
-    let fields: Vec<Arc<Field>> = schema
-        .fields
-        .iter()
-        .map(|f| Ok(Arc::new(assign_field_id_recursive(f, &mut counter, 0)?)))
-        .collect::<Result<Vec<_>, _>>()?;
-
-    Ok(ArrowSchema::new(fields))
-}
-
-fn assign_field_id_recursive(
-    field: &Field,
-    counter: &mut i32,
-    depth: usize,
-) -> Result<Field, DepthExceeded> {
-    if depth > MAX_SCHEMA_RECURSION_DEPTH {
-        return Err(DepthExceeded);
-    }
-
-    let id = *counter;
-    *counter += 1;
-
-    let new_data_type = match field.data_type() {
-        DataType::Struct(fields) => {
-            let new_fields: Vec<Arc<Field>> = fields
-                .iter()
-                .map(|f| Ok(Arc::new(assign_field_id_recursive(f, counter, depth + 1)?)))
-                .collect::<Result<Vec<_>, _>>()?;
-            DataType::Struct(Fields::from(new_fields))
-        }
-        DataType::List(element_field) => DataType::List(Arc::new(assign_field_id_recursive(
-            element_field,
-            counter,
-            depth + 1,
-        )?)),
-        DataType::LargeList(element_field) => DataType::LargeList(Arc::new(
-            assign_field_id_recursive(element_field, counter, depth + 1)?,
-        )),
-        DataType::FixedSizeList(element_field, size) => DataType::FixedSizeList(
-            Arc::new(assign_field_id_recursive(
-                element_field,
-                counter,
-                depth + 1,
-            )?),
-            *size,
-        ),
-        DataType::Map(struct_field, keys_sorted) => DataType::Map(
-            Arc::new(assign_field_id_recursive(struct_field, counter, depth + 1)?),
-            *keys_sorted,
-        ),
-        other => coerce_leaf_for_iceberg_v2(other).unwrap_or_else(|| other.clone()),
-    };
-
-    // Preserve existing metadata and add/update the field ID
-    let mut metadata = field.metadata().clone();
-    metadata.insert(PARQUET_FIELD_ID_META_KEY.to_string(), id.to_string());
-
-    Ok(Field::new(field.name(), new_data_type, field.is_nullable()).with_metadata(metadata))
-}
-
-#[cfg(test)]
-mod tests {
-    use std::collections::HashMap;
-
-    use super::*;
-    use iceberg::arrow::arrow_schema_to_schema;
-    use iceberg::spec::{PrimitiveType, Type};
-
-    fn get_field_id(field: &Field) -> Option<i32> {
-        field
-            .metadata()
-            .get(PARQUET_FIELD_ID_META_KEY)
-            .and_then(|v| v.parse().ok())
-    }
-
-    fn create_nested_schema(depth: usize) -> ArrowSchema {
-        let mut current_type = DataType::Int32;
-        for i in (0..depth).rev() {
-            current_type = DataType::Struct(Fields::from(vec![Field::new(
-                format!("level_{i}"),
-                current_type,
-                false,
-            )]));
-        }
-        ArrowSchema::new(vec![Field::new("root", current_type, false)])
-    }
-
-    #[test]
-    fn test_assign_field_ids_primitive_fields() {
-        let schema = ArrowSchema::new(vec![
-            Field::new("a", DataType::Int32, false),
-            Field::new("b", DataType::Utf8, true),
-            Field::new("c", DataType::Float64, false),
-        ]);
-
-        let result = assign_field_ids(&schema);
-
-        assert_eq!(result.fields.len(), 3);
-        assert_eq!(get_field_id(&result.fields[0]), Some(0));
-        assert_eq!(get_field_id(&result.fields[1]), Some(1));
-        assert_eq!(get_field_id(&result.fields[2]), Some(2));
-
-        // Verify iceberg conversion succeeds
-        arrow_schema_to_schema(&result).expect("Should convert to iceberg schema");
-    }
-
-    #[test]
-    fn test_assign_field_ids_nested_struct() {
-        let inner_fields = Fields::from(vec![
-            Field::new("inner_a", DataType::Int32, false),
-            Field::new("inner_b", DataType::Utf8, true),
-        ]);
-        let schema = ArrowSchema::new(vec![
-            Field::new("outer", DataType::Struct(inner_fields), false),
-            Field::new("other", DataType::Int64, false),
-        ]);
-
-        let result = assign_field_ids(&schema);
-
-        // outer gets id 0, inner_a gets id 1, inner_b gets id 2, other gets id 3
-        assert_eq!(get_field_id(&result.fields[0]), Some(0));
-        if let DataType::Struct(inner) = result.fields[0].data_type() {
-            assert_eq!(get_field_id(&inner[0]), Some(1));
-            assert_eq!(get_field_id(&inner[1]), Some(2));
-        } else {
-            panic!("Expected struct type");
-        }
-        assert_eq!(get_field_id(&result.fields[1]), Some(3));
-
-        // Verify iceberg conversion succeeds
-        arrow_schema_to_schema(&result).expect("Should convert to iceberg schema");
-    }
-
-    #[test]
-    fn test_assign_field_ids_list() {
-        let schema = ArrowSchema::new(vec![
-            Field::new(
-                "list_col",
-                DataType::List(Arc::new(Field::new("element", DataType::Int32, false))),
-                true,
-            ),
-            Field::new("other", DataType::Utf8, false),
-        ]);
-
-        let result = assign_field_ids(&schema);
-
-        // list_col gets id 0, element gets id 1, other gets id 2
-        assert_eq!(get_field_id(&result.fields[0]), Some(0));
-        if let DataType::List(element_field) = result.fields[0].data_type() {
-            assert_eq!(get_field_id(element_field), Some(1));
-        } else {
-            panic!("Expected list type");
-        }
-        assert_eq!(get_field_id(&result.fields[1]), Some(2));
-
-        // Verify iceberg conversion succeeds
-        arrow_schema_to_schema(&result).expect("Should convert to iceberg schema");
-    }
-
-    #[test]
-    fn test_assign_field_ids_map() {
-        let map_field = Field::new(
-            "entries",
-            DataType::Struct(Fields::from(vec![
-                Field::new("key", DataType::Utf8, false),
-                Field::new("value", DataType::Int32, true),
-            ])),
-            false,
-        );
-        let schema = ArrowSchema::new(vec![Field::new(
-            "map_col",
-            DataType::Map(Arc::new(map_field), false),
-            true,
-        )]);
-
-        let result = assign_field_ids(&schema);
-
-        // map_col gets id 0, entries (struct) gets id 1, key gets id 2, value gets id 3
-        assert_eq!(get_field_id(&result.fields[0]), Some(0));
-        if let DataType::Map(struct_field, _) = result.fields[0].data_type() {
-            assert_eq!(get_field_id(struct_field), Some(1));
-            if let DataType::Struct(kv_fields) = struct_field.data_type() {
-                assert_eq!(get_field_id(&kv_fields[0]), Some(2));
-                assert_eq!(get_field_id(&kv_fields[1]), Some(3));
-            } else {
-                panic!("Expected struct type inside map");
-            }
-        } else {
-            panic!("Expected map type");
-        }
-
-        // Verify iceberg conversion succeeds
-        arrow_schema_to_schema(&result).expect("Should convert to iceberg schema");
-    }
-
-    #[test]
-    fn test_assign_field_ids_deeply_nested() {
-        // List of structs containing lists
-        let inner_list = Field::new(
-            "inner_list",
-            DataType::List(Arc::new(Field::new("item", DataType::Int32, false))),
-            true,
-        );
-        let struct_fields =
-            Fields::from(vec![Field::new("name", DataType::Utf8, false), inner_list]);
-        let schema = ArrowSchema::new(vec![Field::new(
-            "outer_list",
-            DataType::List(Arc::new(Field::new(
-                "element",
-                DataType::Struct(struct_fields),
-                false,
-            ))),
-            true,
-        )]);
-
-        let result = assign_field_ids(&schema);
-
-        // Verify all fields have IDs assigned and iceberg conversion succeeds
-        arrow_schema_to_schema(&result).expect("Should convert deeply nested schema to iceberg");
-    }
-
-    #[test]
-    fn test_assign_field_ids_large_list() {
-        let schema = ArrowSchema::new(vec![Field::new(
-            "large_list_col",
-            DataType::LargeList(Arc::new(Field::new("element", DataType::Utf8, false))),
-            true,
-        )]);
-
-        let result = assign_field_ids(&schema);
-
-        assert_eq!(get_field_id(&result.fields[0]), Some(0));
-        if let DataType::LargeList(element_field) = result.fields[0].data_type() {
-            assert_eq!(get_field_id(element_field), Some(1));
-        } else {
-            panic!("Expected large list type");
-        }
-
-        // Verify iceberg conversion succeeds
-        arrow_schema_to_schema(&result).expect("Should convert to iceberg schema");
-    }
-
-    #[test]
-    fn test_assign_field_ids_fixed_size_list() {
-        let schema = ArrowSchema::new(vec![Field::new(
-            "fixed_list_col",
-            DataType::FixedSizeList(
-                Arc::new(Field::new("element", DataType::Float32, false)),
-                10,
-            ),
-            true,
-        )]);
-
-        let result = assign_field_ids(&schema);
-
-        assert_eq!(get_field_id(&result.fields[0]), Some(0));
-        if let DataType::FixedSizeList(element_field, size) = result.fields[0].data_type() {
-            assert_eq!(get_field_id(element_field), Some(1));
-            assert_eq!(*size, 10);
-        } else {
-            panic!("Expected fixed size list type");
-        }
-
-        // Verify iceberg conversion succeeds
-        arrow_schema_to_schema(&result).expect("Should convert to iceberg schema");
-    }
-
-    #[test]
-    fn test_assign_field_ids_preserves_existing_metadata() {
-        let mut existing_metadata = HashMap::new();
-        existing_metadata.insert("custom_key".to_string(), "custom_value".to_string());
-        existing_metadata.insert("another_key".to_string(), "another_value".to_string());
-
-        let field_with_metadata =
-            Field::new("a", DataType::Int32, false).with_metadata(existing_metadata);
-        let schema = ArrowSchema::new(vec![field_with_metadata]);
-
-        let result = assign_field_ids(&schema);
-
-        let result_field = &result.fields[0];
-        let metadata = result_field.metadata();
-
-        // Verify field ID was added
-        assert_eq!(get_field_id(result_field), Some(0));
-
-        // Verify existing metadata was preserved
-        assert_eq!(
-            metadata.get("custom_key"),
-            Some(&"custom_value".to_string())
-        );
-        assert_eq!(
-            metadata.get("another_key"),
-            Some(&"another_value".to_string())
-        );
-
-        // Verify we have all three keys
-        assert_eq!(metadata.len(), 3);
-    }
-
-    #[test]
-    fn test_assign_field_ids_preserves_nested_metadata() {
-        let mut inner_metadata = HashMap::new();
-        inner_metadata.insert("inner_key".to_string(), "inner_value".to_string());
-
-        let inner_field = Field::new("inner", DataType::Utf8, false).with_metadata(inner_metadata);
-        let schema = ArrowSchema::new(vec![Field::new(
-            "outer",
-            DataType::Struct(Fields::from(vec![inner_field])),
-            false,
-        )]);
-
-        let result = assign_field_ids(&schema);
-
-        if let DataType::Struct(inner_fields) = result.fields[0].data_type() {
-            let inner_metadata = inner_fields[0].metadata();
-            assert_eq!(get_field_id(&inner_fields[0]), Some(1));
-            assert_eq!(
-                inner_metadata.get("inner_key"),
-                Some(&"inner_value".to_string())
-            );
-        } else {
-            panic!("Expected struct type");
-        }
-    }
-
-    #[test]
-    fn test_assign_field_ids_at_max_depth() {
-        // Depth of 10 should work (depth starts at 0, so levels 0-10 are allowed)
-        let schema = create_nested_schema(10);
-        let result = assign_field_ids(&schema);
-
-        // Should have field IDs assigned (not return original schema)
-        assert_eq!(get_field_id(&result.fields[0]), Some(0));
-
-        // Verify we can traverse and find field IDs at each level
-        let mut current_field = &result.fields[0];
-        for expected_id in 0..10 {
-            assert_eq!(
-                get_field_id(current_field),
-                Some(expected_id),
-                "Field at depth {expected_id} should have ID {expected_id}"
-            );
-            if let DataType::Struct(fields) = current_field.data_type() {
-                current_field = &fields[0];
-            }
-        }
-    }
-
-    #[test]
-    fn test_assign_field_ids_exceeds_max_depth() {
-        // Depth of 12 exceeds the limit of 10
-        let schema = create_nested_schema(12);
-        let result = assign_field_ids(&schema);
-
-        // Should return original schema (no field IDs assigned)
-        assert_eq!(
-            get_field_id(&result.fields[0]),
-            None,
-            "Original schema should be returned when depth limit exceeded"
-        );
-
-        // Verify the schema structure is preserved (root -> level_0 -> level_1 -> ... -> level_11)
-        assert_eq!(result.fields[0].name(), "root");
-        let mut current_field = &result.fields[0];
-        for i in 0..12 {
-            if let DataType::Struct(fields) = current_field.data_type() {
-                current_field = &fields[0];
-                assert_eq!(current_field.name(), format!("level_{i}").as_str());
-            }
-        }
-    }
-
-    #[test]
-    fn test_assign_field_ids_exactly_at_limit_boundary() {
-        // Test depth = 11 (just over the limit of 10)
-        let schema = create_nested_schema(11);
-        let result = assign_field_ids(&schema);
-
-        // Should return original schema
-        assert_eq!(
-            get_field_id(&result.fields[0]),
-            None,
-            "Original schema should be returned when depth is 11 (exceeds limit of 10)"
-        );
-    }
-
-    #[test]
-    fn test_assign_field_ids_nested_list_depth_limit() {
-        // Create deeply nested lists that exceed the depth limit
-        let mut current_type = DataType::Int32;
-        for _ in 0..12 {
-            current_type =
-                DataType::List(Arc::new(Field::new("element", current_type.clone(), false)));
-        }
-        let schema = ArrowSchema::new(vec![Field::new("nested_lists", current_type, false)]);
-
-        let result = assign_field_ids(&schema);
-
-        // Should return original schema (no field IDs assigned)
-        assert_eq!(
-            get_field_id(&result.fields[0]),
-            None,
-            "Original schema should be returned for deeply nested lists"
-        );
-    }
-
-    /// Helper: the schema conversion the HTTP handler serves.
-    fn coerce_and_convert(schema: &ArrowSchema) -> iceberg::spec::Schema {
-        iceberg_schema_for(schema).expect("Should convert to iceberg schema")
-    }
-
-    #[test]
-    fn test_coerce_timestamps_all_units_and_timezones() {
-        let schema = ArrowSchema::new(vec![
-            Field::new(
-                "ts_s",
-                DataType::Timestamp(arrow::datatypes::TimeUnit::Second, None),
-                true,
-            ),
-            Field::new(
-                "ts_ms",
-                DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, None),
-                true,
-            ),
-            Field::new(
-                "ts_ns",
-                DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, None),
-                true,
-            ),
-            Field::new(
-                "ts_us",
-                DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, None),
-                false,
-            ),
-            Field::new(
-                "ts_s_utc",
-                DataType::Timestamp(arrow::datatypes::TimeUnit::Second, Some("UTC".into())),
-                true,
-            ),
-            Field::new(
-                "ts_ms_utc",
-                DataType::Timestamp(arrow::datatypes::TimeUnit::Millisecond, Some("UTC".into())),
-                true,
-            ),
-            Field::new(
-                "ts_ns_utc",
-                DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, Some("UTC".into())),
-                true,
-            ),
-            Field::new(
-                "ts_us_utc",
-                DataType::Timestamp(arrow::datatypes::TimeUnit::Microsecond, Some("UTC".into())),
-                false,
-            ),
-        ]);
-        coerce_and_convert(&schema);
-    }
-
-    #[test]
-    fn test_coerce_date_and_time_types() {
-        let schema = ArrowSchema::new(vec![
-            Field::new("d32", DataType::Date32, false),
-            Field::new("d64", DataType::Date64, true),
-            Field::new(
-                "t32_s",
-                DataType::Time32(arrow::datatypes::TimeUnit::Second),
-                true,
-            ),
-            Field::new(
-                "t32_ms",
-                DataType::Time32(arrow::datatypes::TimeUnit::Millisecond),
-                true,
-            ),
-            Field::new(
-                "t64_us",
-                DataType::Time64(arrow::datatypes::TimeUnit::Microsecond),
-                false,
-            ),
-            Field::new(
-                "t64_ns",
-                DataType::Time64(arrow::datatypes::TimeUnit::Nanosecond),
-                true,
-            ),
-        ]);
-        coerce_and_convert(&schema);
-    }
-
-    #[test]
-    fn test_coerce_mixed_schema() {
-        // A realistic schema mixing types that need coercion with types that don't.
-        let schema = ArrowSchema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("name", DataType::Utf8, true),
-            Field::new(
-                "created_at",
-                DataType::Timestamp(arrow::datatypes::TimeUnit::Second, None),
-                true,
-            ),
-            Field::new(
-                "updated_at",
-                DataType::Timestamp(arrow::datatypes::TimeUnit::Nanosecond, Some("UTC".into())),
-                true,
-            ),
-            Field::new("event_date", DataType::Date64, true),
-            Field::new(
-                "event_time",
-                DataType::Time32(arrow::datatypes::TimeUnit::Millisecond),
-                true,
-            ),
-            Field::new("amount", DataType::Decimal128(10, 2), true),
-            Field::new("active", DataType::Boolean, false),
-            Field::new("data", DataType::Binary, true),
-        ]);
-        coerce_and_convert(&schema);
-    }
-
-    fn iceberg_type_of(schema: &iceberg::spec::Schema, name: &str) -> iceberg::spec::Type {
-        schema
-            .field_by_name(name)
-            .unwrap_or_else(|| panic!("Iceberg schema should have field {name}"))
-            .field_type
-            .as_ref()
-            .clone()
-    }
-
-    fn element(data_type: DataType) -> Arc<Field> {
-        Arc::new(Field::new("element", data_type, true))
-    }
-
-    #[test]
-    fn test_coerce_nested_temporal_types() {
-        let schema = ArrowSchema::new(vec![
-            Field::new("dates", DataType::List(element(DataType::Date64)), true),
-            Field::new(
-                "times",
-                DataType::List(element(DataType::Time32(TimeUnit::Millisecond))),
-                true,
-            ),
-            Field::new(
-                "event",
-                DataType::Struct(Fields::from(vec![Field::new(
-                    "at",
-                    DataType::Timestamp(TimeUnit::Millisecond, None),
-                    true,
-                )])),
-                true,
-            ),
-            // A nanosecond timestamp is a v3 type; the table is served as format v2.
-            Field::new(
-                "instants",
-                DataType::LargeList(element(DataType::Timestamp(TimeUnit::Nanosecond, None))),
-                true,
-            ),
-            Field::new(
-                "by_key",
-                DataType::Map(
-                    Arc::new(Field::new(
-                        "entries",
-                        DataType::Struct(Fields::from(vec![
-                            Field::new("key", DataType::Utf8, false),
-                            Field::new(
-                                "value",
-                                DataType::Timestamp(TimeUnit::Nanosecond, Some("UTC".into())),
-                                true,
-                            ),
-                        ])),
-                        false,
-                    )),
-                    false,
-                ),
-                true,
-            ),
-        ]);
-
-        let iceberg_schema = coerce_and_convert(&schema);
-
-        for (name, expected) in [
-            ("dates.element", PrimitiveType::Date),
-            ("times.element", PrimitiveType::Time),
-            ("event.at", PrimitiveType::Timestamp),
-            ("instants.element", PrimitiveType::Timestamp),
-            ("by_key.value", PrimitiveType::Timestamptz),
-        ] {
-            assert_eq!(
-                iceberg_type_of(&iceberg_schema, name),
-                Type::Primitive(expected),
-                "{name}"
-            );
-        }
-    }
-
-    #[test]
-    fn test_coerce_non_utc_timestamps_to_timestamptz() {
-        let schema = ArrowSchema::new(vec![
-            Field::new(
-                "ny",
-                DataType::Timestamp(TimeUnit::Microsecond, Some("America/New_York".into())),
-                true,
-            ),
-            Field::new(
-                "offset_ms",
-                DataType::Timestamp(TimeUnit::Millisecond, Some("+02:00".into())),
-                true,
-            ),
-            Field::new(
-                "utc_offset",
-                DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
-                true,
-            ),
-            Field::new(
-                "nested",
-                DataType::List(element(DataType::Timestamp(
-                    TimeUnit::Nanosecond,
-                    Some("Asia/Tokyo".into()),
-                ))),
-                true,
-            ),
-        ]);
-
-        let iceberg_schema = coerce_and_convert(&schema);
-
-        for name in ["ny", "offset_ms", "utc_offset", "nested.element"] {
-            assert_eq!(
-                iceberg_type_of(&iceberg_schema, name),
-                Type::Primitive(PrimitiveType::Timestamptz),
-                "{name} should be served as timestamptz"
-            );
-        }
-    }
-
-    #[test]
-    fn test_coerce_float16_and_dictionary_values() {
-        let schema = ArrowSchema::new(vec![
-            Field::new("half", DataType::Float16, true),
-            Field::new("halves", DataType::List(element(DataType::Float16)), true),
-            Field::new(
-                "dict_ts",
-                DataType::Dictionary(
-                    Box::new(DataType::Int32),
-                    Box::new(DataType::Timestamp(TimeUnit::Second, None)),
-                ),
-                true,
-            ),
-            Field::new(
-                "dict_str",
-                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
-                true,
-            ),
-        ]);
-
-        let iceberg_schema = coerce_and_convert(&schema);
-
-        for (name, expected) in [
-            ("half", PrimitiveType::Float),
-            ("halves.element", PrimitiveType::Float),
-            ("dict_ts", PrimitiveType::Timestamp),
-            ("dict_str", PrimitiveType::String),
-        ] {
-            assert_eq!(
-                iceberg_type_of(&iceberg_schema, name),
-                Type::Primitive(expected),
-                "{name}"
-            );
-        }
-    }
-
-    /// Types with no Iceberg v2 equivalent that holds every value stay a conversion error.
-    #[test]
-    fn test_types_without_an_iceberg_equivalent_are_rejected() {
-        for data_type in [
-            DataType::UInt64,
-            DataType::Duration(TimeUnit::Second),
-            DataType::Decimal256(40, 0),
-        ] {
-            let schema = ArrowSchema::new(vec![Field::new("c", data_type.clone(), true)]);
-            assert!(
-                iceberg_schema_for(&schema).is_err(),
-                "{data_type} should not convert"
-            );
-        }
-    }
-
-    /// `last-column-id` is the highest assigned field ID, which counts nested fields.
-    #[test]
-    fn test_highest_field_id_counts_nested_fields() {
-        let schema = ArrowSchema::new(vec![
-            Field::new("id", DataType::Int64, false),
-            Field::new("tags", DataType::List(element(DataType::Utf8)), true),
-            Field::new(
-                "s",
-                DataType::Struct(Fields::from(vec![Field::new("x", DataType::Int64, true)])),
-                true,
-            ),
-        ]);
-
-        // id=0, tags=1, tags.element=2, s=3, s.x=4
-        assert_eq!(coerce_and_convert(&schema).highest_field_id(), 4);
-    }
 }

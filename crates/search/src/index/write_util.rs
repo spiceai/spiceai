@@ -791,11 +791,36 @@ mod tests {
             Some(vec![0.7, 0.8, 0.9]),
         ];
 
-        let result = create_embedding_array(&embeddings, 3);
-        assert!(
-            result.is_ok(),
-            "Should succeed when all embedding dimensions match"
+        let array = create_embedding_array(&embeddings, 3)
+            .expect("Should succeed when all embedding dimensions match");
+        let list = array
+            .as_any()
+            .downcast_ref::<FixedSizeListArray>()
+            .expect("embeddings are a FixedSizeList");
+        assert_eq!(
+            list.data_type(),
+            &DataType::FixedSizeList(Arc::new(Field::new_list_field(DataType::Float32, false)), 3)
         );
+        assert_eq!(list.len(), 4);
+        // The missing embedding is a NULL row, not a zero vector a search would rank.
+        assert_eq!(list.null_count(), 1);
+        assert!(list.is_null(2), "row 2 has no embedding");
+        for (row, expected) in [
+            (0, [0.1_f32, 0.2, 0.3]),
+            (1, [0.4, 0.5, 0.6]),
+            (3, [0.7, 0.8, 0.9]),
+        ] {
+            let values = list.value(row);
+            let values = values
+                .as_any()
+                .downcast_ref::<Float32Array>()
+                .expect("Float32 components");
+            assert_eq!(
+                values.values().iter().copied().collect::<Vec<f32>>(),
+                expected.to_vec(),
+                "row {row}"
+            );
+        }
     }
 
     #[test]

@@ -185,9 +185,18 @@ mod tests {
 
     #[test]
     fn iam_role_source_rejects_values_outside_the_spec() {
-        for raw in ["", "role", "instance"] {
-            assert!(
-                raw.parse::<IamRoleSource>().is_err(),
+        // The message names the value as parsed: trimmed and lowercased.
+        for (raw, found) in [
+            ("", ""),
+            ("role", "role"),
+            ("instance", "instance"),
+            (" Role ", "role"),
+        ] {
+            assert_eq!(
+                raw.parse::<IamRoleSource>(),
+                Err(format!(
+                    "must be one of: auto, metadata, env. Found {found}"
+                )),
                 "{raw:?} should be rejected"
             );
         }
@@ -211,9 +220,18 @@ mod tests {
 
     #[test]
     fn guardrail_trace_mode_rejects_values_outside_the_spec() {
-        for raw in ["", "verbose", "true"] {
-            assert!(
-                raw.parse::<GuardrailTraceMode>().is_err(),
+        // The message names the value as parsed: trimmed and lowercased.
+        for (raw, found) in [
+            ("", ""),
+            ("verbose", "verbose"),
+            ("true", "true"),
+            (" Verbose ", "verbose"),
+        ] {
+            assert_eq!(
+                raw.parse::<GuardrailTraceMode>(),
+                Err(format!(
+                    "must be one of: enabled, disabled, enabled_full. Found {found}"
+                )),
                 "{raw:?} should be rejected"
             );
         }
