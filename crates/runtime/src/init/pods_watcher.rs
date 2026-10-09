@@ -55,6 +55,9 @@ fn start_time_only_changes(
         tracing: tracing_config,
         telemetry,
         params,
+        // Cayenne resolves the tuning mode when a dataset or catalog is loaded, so a change
+        // reaches only components that are recreated, exactly as a `params` change does.
+        adaptive_tuning,
         task_history,
         auth,
         cors,
@@ -102,6 +105,11 @@ fn start_time_only_changes(
             "runtime.params",
             ProcessAndRecreatedComponents,
             *params != current.params,
+        ),
+        (
+            "runtime.adaptive_tuning",
+            ProcessAndRecreatedComponents,
+            *adaptive_tuning != current.adaptive_tuning,
         ),
         (
             "runtime.task_history",
@@ -464,6 +472,12 @@ mod tests {
                 }),
             ),
             (
+                "runtime.adaptive_tuning",
+                Box::new(|rt: &mut SpicepodRuntime| {
+                    rt.adaptive_tuning = spicepod::component::runtime::AdaptiveTuning::Enabled;
+                }),
+            ),
+            (
                 "runtime.task_history",
                 Box::new(|rt: &mut SpicepodRuntime| rt.task_history.enabled = false),
             ),
@@ -757,6 +771,12 @@ mod tests {
                 Box::new(|rt: &mut SpicepodRuntime| {
                     rt.params
                         .insert("url_tables".to_string(), "enabled".to_string());
+                }),
+            ),
+            (
+                "runtime.adaptive_tuning",
+                Box::new(|rt: &mut SpicepodRuntime| {
+                    rt.adaptive_tuning = spicepod::component::runtime::AdaptiveTuning::Enabled;
                 }),
             ),
             (

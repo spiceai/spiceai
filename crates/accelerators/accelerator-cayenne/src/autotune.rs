@@ -535,46 +535,6 @@ impl WorkloadProfile {
     }
 }
 
-/// The runtime-wide `runtime.params.adaptive_tuning` mode: how the knobs this module derives get their values.
-///
-/// [`Self::Adaptive`] is selected only by an explicit `enabled`. Unset, `disabled`,
-/// and anything unrecognized are all [`Self::Auto`], so no other signal — and no
-/// typo — can land a table in the closed loop. Shared by the accelerator and the
-/// catalog connector, which read the same runtime parameter and must agree on it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-pub(crate) enum TuningMode {
-    /// Derive the knobs statically from the detected environment and, where
-    /// available, the inferred schema. No closed loop.
-    #[default]
-    Auto,
-    /// The static derivation as a warm start, plus the per-table closed-feedback
-    /// controller that moves the knobs within the derived bounds (preview).
-    Adaptive,
-}
-
-impl TuningMode {
-    /// Resolve a raw parameter value, ignoring case and surrounding whitespace.
-    ///
-    /// Returns the mode and whether the value was unrecognized. An unrecognized value
-    /// resolves to [`Self::Auto`], and the caller decides whether to reject it.
-    #[must_use]
-    pub(crate) fn parse(raw: Option<&str>) -> (Self, bool) {
-        let Some(mode) = raw.map(str::trim) else {
-            return (Self::Auto, false);
-        };
-        if mode.eq_ignore_ascii_case("enabled") {
-            (Self::Adaptive, false)
-        } else {
-            (Self::Auto, !mode.eq_ignore_ascii_case("disabled"))
-        }
-    }
-
-    #[must_use]
-    pub(crate) fn is_adaptive(self) -> bool {
-        matches!(self, Self::Adaptive)
-    }
-}
-
 /// A numeric `cayenne_*` knob's value as configured by the operator, after
 /// honoring the literal `auto`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -678,35 +638,6 @@ mod tests {
 
     fn profile(cores: usize, mem: u64, storage: ResolvedAccelerationStorage) -> HardwareProfile {
         HardwareProfile::new(cores, mem, storage, storage)
-    }
-
-    // ---- TuningMode -------------------------------------------------------
-
-    #[test]
-    fn only_an_explicit_enabled_value_enables_the_closed_loop() {
-        // Unset and `disabled` are the same answer, and neither is flagged invalid.
-        assert_eq!(TuningMode::parse(None), (TuningMode::Auto, false));
-        assert_eq!(
-            TuningMode::parse(Some("disabled")),
-            (TuningMode::Auto, false)
-        );
-        // `enabled` matches case-insensitively, ignoring surrounding whitespace.
-        assert_eq!(
-            TuningMode::parse(Some("  Enabled ")),
-            (TuningMode::Adaptive, false)
-        );
-        // An unrecognized value is reported, and can NEVER enable adaptive.
-        assert_eq!(
-            TuningMode::parse(Some("nonsense")),
-            (TuningMode::Auto, true)
-        );
-        // The retired `auto`/`adaptive` values are not recognized.
-        assert_eq!(
-            TuningMode::parse(Some("adaptive")),
-            (TuningMode::Auto, true)
-        );
-        assert_eq!(TuningMode::parse(Some("auto")), (TuningMode::Auto, true));
-        assert!(!TuningMode::default().is_adaptive());
     }
 
     // ---- read_knob / auto_or_* --------------------------------------------

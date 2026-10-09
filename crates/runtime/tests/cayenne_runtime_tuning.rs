@@ -14,12 +14,12 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! `runtime.params.adaptive_tuning` selects the Cayenne tuning mode for every Cayenne-accelerated
+//! `runtime.adaptive_tuning` selects the Cayenne tuning mode for every Cayenne-accelerated
 //! dataset. These tests load a real Spicepod from disk, through the runtime, and read the
 //! mode each resolved Cayenne table actually runs with.
 //!
 //! The old per-dataset `cayenne_tuning` is no longer read, so a dataset that still sets it
-//! stays `disabled` and is told once, and an invalid `runtime.params.adaptive_tuning` fails the load.
+//! stays `disabled` and is told once, and an invalid `runtime.adaptive_tuning` fails the load.
 
 #![cfg(not(windows))]
 #![recursion_limit = "256"]
@@ -88,13 +88,25 @@ fn spicepod(
     runtime_params: &str,
     dataset_params: &str,
 ) -> String {
+    spicepod_with_runtime_fields(dataset, dir, "", runtime_params, dataset_params)
+}
+
+/// Like [`spicepod`], with `runtime_fields` (each line indented two spaces) set directly
+/// under `runtime:`, beside `params:`.
+fn spicepod_with_runtime_fields(
+    dataset: &str,
+    dir: &std::path::Path,
+    runtime_fields: &str,
+    runtime_params: &str,
+    dataset_params: &str,
+) -> String {
     let csv = dir.join("rows.csv");
     std::fs::write(&csv, "id,name\n1,a\n2,b\n3,c\n").expect("the fixture CSV must be written");
     format!(
         "version: v1\n\
          kind: Spicepod\n\
          name: cayenne_runtime_tuning\n\
-         runtime:\n  params:\n{runtime_params}    cdc_prefetch_buffer: '16'\n\
+         runtime:\n{runtime_fields}  params:\n{runtime_params}    cdc_prefetch_buffer: '16'\n\
          datasets:\n\
          \x20 - from: file://{csv}\n\
          \x20   name: {dataset}\n\
@@ -159,15 +171,31 @@ async fn dynamic_tuning_of(dataset: &str, pod: &str, dir: &std::path::Path) -> b
 #[tokio::test(flavor = "multi_thread")]
 async fn runtime_tuning_adaptive_turns_adaptive_on_for_the_dataset() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let pod = spicepod(
+    let pod = spicepod_with_runtime_fields(
         "rt_adaptive",
+        dir.path(),
+        "  adaptive_tuning: enabled\n",
+        "",
+        "",
+    );
+    assert!(
+        dynamic_tuning_of("rt_adaptive", &pod, dir.path()).await,
+        "`runtime.adaptive_tuning: enabled` must run the closed-loop tuner"
+    );
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn runtime_params_adaptive_tuning_does_not_turn_adaptive_on() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let pod = spicepod(
+        "rt_params_switch",
         dir.path(),
         "    adaptive_tuning: enabled\n",
         "",
     );
     assert!(
-        dynamic_tuning_of("rt_adaptive", &pod, dir.path()).await,
-        "`runtime.params.adaptive_tuning: enabled` must run the closed-loop tuner"
+        !dynamic_tuning_of("rt_params_switch", &pod, dir.path()).await,
+        "`runtime.params.adaptive_tuning` is not the switch; only `runtime.adaptive_tuning` is"
     );
 }
 
@@ -177,7 +205,7 @@ async fn runtime_tuning_defaults_to_auto() {
     let pod = spicepod("rt_default", dir.path(), "", "");
     assert!(
         !dynamic_tuning_of("rt_default", &pod, dir.path()).await,
-        "without `runtime.params.adaptive_tuning` the dataset runs static tuning"
+        "without `runtime.adaptive_tuning` the dataset runs static tuning"
     );
 }
 
@@ -197,7 +225,7 @@ async fn unprefixed_retired_dataset_params_are_not_applied_and_warn_once() {
 
     let logs = logged();
     for warning in [
-        "Dataset 'rt_unprefixed' sets `tuning`, which is no longer a dataset parameter, so it has no effect. Set `runtime.params.adaptive_tuning` instead. See: https://spiceai.org/docs/reference/spicepod/runtime",
+        "Dataset 'rt_unprefixed' sets `tuning`, which is no longer a dataset parameter, so it has no effect. Set `runtime.adaptive_tuning` instead. See: https://spiceai.org/docs/reference/spicepod/runtime",
         "Dataset 'rt_unprefixed' sets `goal_freshness`, which is no longer a dataset parameter, so it has no effect. Set `runtime.params.target_freshness` instead. See: https://spiceai.org/docs/reference/spicepod/runtime",
         "Dataset 'rt_unprefixed' sets `cayenne_goal_qph`, which is no longer a dataset parameter, so it has no effect. Set `runtime.params.target_qph` instead. See: https://spiceai.org/docs/reference/spicepod/runtime",
         "Dataset 'rt_unprefixed' sets `goal_qph`, which is no longer a dataset parameter, so it has no effect. Set `runtime.params.target_qph` instead. See: https://spiceai.org/docs/reference/spicepod/runtime",
@@ -224,10 +252,11 @@ async fn unprefixed_retired_dataset_params_are_not_applied_and_warn_once() {
 #[tokio::test(flavor = "multi_thread")]
 async fn compaction_fallback_with_targets_is_one_warning_and_not_reported_as_disabled() {
     let dir = tempfile::tempdir().expect("temp dir");
-    let pod = spicepod(
+    let pod = spicepod_with_runtime_fields(
         "rt_fallback",
         dir.path(),
-        "    adaptive_tuning: enabled\n    target_freshness: 5s\n",
+        "  adaptive_tuning: enabled\n",
+        "    target_freshness: 5s\n",
         "        cayenne_compaction_background_interval_ms: '0'\n",
     );
     assert!(
@@ -237,7 +266,7 @@ async fn compaction_fallback_with_targets_is_one_warning_and_not_reported_as_dis
 
     let logs = logged();
     assert!(
-        !logs.contains("`runtime.params.adaptive_tuning` is `disabled`, so dataset 'rt_fallback'"),
+        !logs.contains("`runtime.adaptive_tuning` is `disabled`, so dataset 'rt_fallback'"),
         "targets set with `adaptive_tuning: enabled` must not be reported as ignored by `disabled`, logs: {logs}"
     );
     let fallback = "Dataset 'rt_fallback' cannot use adaptive tuning because";
@@ -267,7 +296,7 @@ async fn retired_dataset_tuning_param_is_not_applied_and_warns_once() {
     );
 
     let logs = logged();
-    let warning = "Dataset 'rt_retired' sets `cayenne_tuning`, which is no longer a dataset parameter, so it has no effect. Set `runtime.params.adaptive_tuning` instead. See: https://spiceai.org/docs/reference/spicepod/runtime";
+    let warning = "Dataset 'rt_retired' sets `cayenne_tuning`, which is no longer a dataset parameter, so it has no effect. Set `runtime.adaptive_tuning` instead. See: https://spiceai.org/docs/reference/spicepod/runtime";
     assert_eq!(
         logs.matches(warning).count(),
         1,
@@ -306,10 +335,11 @@ async fn invalid_runtime_tuning_fails_the_load() {
     let dir = tempfile::tempdir().expect("temp dir");
     std::fs::write(
         dir.path().join("spicepod.yaml"),
-        spicepod(
+        spicepod_with_runtime_fields(
             "rt_invalid",
             dir.path(),
-            "    adaptive_tuning: enablde\n",
+            "  adaptive_tuning: enablde\n",
+            "",
             "",
         ),
     )
@@ -317,10 +347,10 @@ async fn invalid_runtime_tuning_fails_the_load() {
 
     let error = AppBuilder::build_from_path(dir.path().to_path_buf())
         .await
-        .expect_err("an invalid `runtime.params.adaptive_tuning` must fail the load");
+        .expect_err("an invalid `runtime.adaptive_tuning` must fail the load");
     let message = format!("{error:?} {error}");
     assert!(
-        message.contains("Invalid `runtime.params.adaptive_tuning` value 'enablde': expected `enabled` or `disabled`. See: https://spiceai.org/docs/reference/spicepod/runtime"),
+        message.contains("Invalid `runtime.adaptive_tuning` value 'enablde': expected `enabled` or `disabled`. See: https://spiceai.org/docs/reference/spicepod/runtime"),
         "unexpected error: {message}"
     );
 }

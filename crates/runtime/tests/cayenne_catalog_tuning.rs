@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! `runtime.params.adaptive_tuning` reaches the tables of a Cayenne catalog.
+//! `runtime.adaptive_tuning` reaches the tables of a Cayenne catalog.
 //!
 //! A Cayenne catalog only runs in a cluster, so each test starts a real scheduler and
 //! executor, registers the catalog, creates a table through it, and reads whether that
@@ -41,6 +41,7 @@ use harness::ClusterHarness;
 use parking_lot::Mutex;
 use spicepod::component::access::AccessMode;
 use spicepod::component::catalog::Catalog;
+use spicepod::component::runtime::AdaptiveTuning;
 use spicepod::param::Params;
 use tracing_subscriber::fmt::MakeWriter;
 
@@ -119,6 +120,7 @@ struct Resolved {
 /// Starts a scheduler and executor sharing a Cayenne catalog called `tcat`, creates
 /// `tcat.s.t`, and returns whether that table runs the closed-loop tuner.
 async fn catalog_table_tuning(
+    adaptive_tuning: AdaptiveTuning,
     runtime_params: &[(&str, &str)],
     catalog_params: &[(&str, &str)],
 ) -> Resolved {
@@ -129,6 +131,7 @@ async fn catalog_table_tuning(
     let mut scheduler = AppBuilder::new("catalog_tuning_scheduler")
         .with_catalog(catalog.clone())
         .build();
+    scheduler.runtime.adaptive_tuning = adaptive_tuning;
     for (key, value) in runtime_params {
         scheduler
             .runtime
@@ -225,10 +228,10 @@ async fn catalog_table_tuning(
 )]
 async fn adaptive_tuning_enabled_turns_adaptive_on_for_catalog_tables() {
     assert!(
-        catalog_table_tuning(&[("adaptive_tuning", "enabled")], &[])
+        catalog_table_tuning(AdaptiveTuning::Enabled, &[], &[])
             .await
             .dynamic_tuning,
-        "`runtime.params.adaptive_tuning: enabled` must run the closed-loop tuner on catalog tables"
+        "`runtime.adaptive_tuning: enabled` must run the closed-loop tuner on catalog tables"
     );
 }
 
@@ -239,8 +242,10 @@ async fn adaptive_tuning_enabled_turns_adaptive_on_for_catalog_tables() {
 )]
 async fn catalog_tables_are_static_by_default() {
     assert!(
-        !catalog_table_tuning(&[], &[]).await.dynamic_tuning,
-        "without `runtime.params.adaptive_tuning` catalog tables run static tuning"
+        !catalog_table_tuning(AdaptiveTuning::Disabled, &[], &[])
+            .await
+            .dynamic_tuning,
+        "without `runtime.adaptive_tuning` catalog tables run static tuning"
     );
 }
 
@@ -251,6 +256,7 @@ async fn catalog_tables_are_static_by_default() {
 )]
 async fn retired_catalog_tuning_param_warns_once_per_node_and_is_not_applied() {
     let dynamic = catalog_table_tuning(
+        AdaptiveTuning::Disabled,
         &[],
         &[
             ("cayenne_tuning", "enabled"),
@@ -264,7 +270,7 @@ async fn retired_catalog_tuning_param_warns_once_per_node_and_is_not_applied() {
         !dynamic,
         "the retired catalog `cayenne_tuning` must not turn the closed-loop tuner on"
     );
-    let warning = "Catalog 'tcat' sets `cayenne_tuning`, which is no longer a catalog parameter, so it has no effect. Set `runtime.params.adaptive_tuning` instead. See: https://spiceai.org/docs/reference/spicepod/runtime";
+    let warning = "Catalog 'tcat' sets `cayenne_tuning`, which is no longer a catalog parameter, so it has no effect. Set `runtime.adaptive_tuning` instead. See: https://spiceai.org/docs/reference/spicepod/runtime";
     let logs = logged();
     // The scheduler and the executor each register the catalog, so each reports it once.
     assert_eq!(
@@ -301,8 +307,8 @@ async fn retired_catalog_tuning_param_warns_once_per_node_and_is_not_applied() {
 )]
 async fn runtime_targets_reach_catalog_tables() {
     let resolved = catalog_table_tuning(
+        AdaptiveTuning::Enabled,
         &[
-            ("adaptive_tuning", "enabled"),
             ("target_replication_lag", "10s"),
             ("target_freshness", "5s"),
             ("target_query_latency", "250ms"),
@@ -332,12 +338,13 @@ async fn runtime_targets_reach_catalog_tables() {
     ignore = "the Cayenne catalog connector requires the spicebench feature"
 )]
 async fn targets_without_adaptive_tuning_warn_once_and_leave_the_loop_off() {
-    let resolved = catalog_table_tuning(&[("target_freshness", "5s")], &[]).await;
+    let resolved =
+        catalog_table_tuning(AdaptiveTuning::Disabled, &[("target_freshness", "5s")], &[]).await;
     assert!(
         !resolved.dynamic_tuning,
         "a target must not turn the closed-loop tuner on"
     );
-    let warning = "`runtime.params.target_*` is set but `runtime.params.adaptive_tuning` is `disabled`, so catalog 'tcat' ignores the targets.";
+    let warning = "`runtime.params.target_*` is set but `runtime.adaptive_tuning` is `disabled`, so catalog 'tcat' ignores the targets.";
     let logs = logged();
     // The scheduler and the executor each register the catalog, so each reports it once.
     assert_eq!(

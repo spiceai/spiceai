@@ -1056,7 +1056,7 @@ pub struct VortexConfig {
     #[serde(default = "default_cdc_mem_tier_seal_age_ms")]
     pub cdc_mem_tier_seal_age_ms: u64,
     /// Enable the closed-loop dynamic auto-tuner (see `provider::tuning`). Set by
-    /// the runtime-wide `runtime.params.adaptive_tuning` mode: `disabled` (default) → `false` (static derivation
+    /// the runtime-wide `runtime.adaptive_tuning` mode: `disabled` (default) → `false` (static derivation
     /// only); `enabled` → `true` (static warm-start + the closed loop). When on,
     /// a per-table controller measures the CDC ingest rate *and the runtime's
     /// whole-system response* (apply latency vs offered load, read amplification

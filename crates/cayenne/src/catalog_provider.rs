@@ -82,7 +82,7 @@ pub struct CayenneCatalogProviderConfig {
     pub inline_flush_max_bytes: Option<i64>,
     /// Primary-key conflict detection behavior for inserts.
     pub pk_conflict_detection: Option<PkConflictDetection>,
-    /// Enable the closed-loop adaptive tuner (`runtime.params.adaptive_tuning: enabled`). When
+    /// Enable the closed-loop adaptive tuner (`runtime.adaptive_tuning: enabled`). When
     /// `true`, the per-table controller in `provider::context` adapts the
     /// inline-flush caps, compaction cadence/trigger, and write concurrency over
     /// time, anchored to the seeded knob values below.

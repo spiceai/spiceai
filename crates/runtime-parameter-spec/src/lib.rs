@@ -39,7 +39,7 @@ pub struct ParameterSpec {
     pub one_of: Option<&'static [&'static str]>,
     pub one_of_ignore_ascii_case: bool,
     pub deprecation_message: Option<&'static str>,
-    /// Where a parameter that is no longer read now lives (e.g. `runtime.params.adaptive_tuning`).
+    /// Where a parameter that is no longer read now lives (e.g. `runtime.adaptive_tuning`).
     /// Such a parameter is kept in the list only so that `Parameters` drops it without
     /// the generic "not supported" warning, because the owning component reports it with
     /// a message of its own. It is left out of the published schema and of "did you

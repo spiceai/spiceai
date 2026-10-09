@@ -111,10 +111,6 @@ const KNOWN_CAYENNE_RUNTIME_PARAMS: &[&str] = &[
     CAYENNE_METASTORE_INCREMENTAL_VACUUM_PAGES_PARAM,
 ];
 
-/// Runtime-wide tuning switch, which carries no `cayenne_` prefix. The `target_*` keys it steers
-/// toward are `spicepod::component::runtime::TUNING_TARGET_PARAMS`.
-const TUNING_RUNTIME_PARAMS: &[&str] = &[spicepod::component::runtime::ADAPTIVE_TUNING_PARAM];
-
 /// Recognized `runtime.params` keys that don't belong to a larger prefix
 /// family (the family lists live next to the code that consumes them:
 /// `KNOWN_CAYENNE_RUNTIME_PARAMS`, `changes::CDC_RUNTIME_PARAMS`,
@@ -144,12 +140,10 @@ fn known_runtime_params() -> Vec<&'static str> {
             + crate::accelerated::refresh_task::changes::CDC_RUNTIME_PARAMS.len()
             + dataconnector::http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS.len()
             + crate::cluster::CLUSTER_GRPC_RUNTIME_PARAMS.len()
-            + TUNING_RUNTIME_PARAMS.len()
             + spicepod::component::runtime::TUNING_TARGET_PARAMS.len()
             + MISC_RUNTIME_PARAMS.len(),
     );
     known.extend_from_slice(KNOWN_CAYENNE_RUNTIME_PARAMS);
-    known.extend_from_slice(TUNING_RUNTIME_PARAMS);
     known.extend_from_slice(spicepod::component::runtime::TUNING_TARGET_PARAMS);
     known.extend_from_slice(crate::accelerated::refresh_task::changes::CDC_RUNTIME_PARAMS);
     known.extend_from_slice(dataconnector::http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS);
@@ -3617,7 +3611,6 @@ mod test {
             .iter()
             .chain(crate::accelerated::refresh_task::changes::CDC_RUNTIME_PARAMS)
             .chain(dataconnector::http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS)
-            .chain(TUNING_RUNTIME_PARAMS)
             .chain(spicepod::component::runtime::TUNING_TARGET_PARAMS)
             .chain(MISC_RUNTIME_PARAMS);
         for key in family_keys {

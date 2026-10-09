@@ -680,14 +680,16 @@ pub trait DataAccelerator: Send + Sync {
     /// Seeds this engine's adaptive-tuning knobs for a catalog, whose tables are
     /// configured before any of them exists.
     ///
-    /// `runtime_params` is the runtime's `runtime.params`. The engine reads
-    /// `adaptive_tuning` and the `target_*` targets from it because it owns that
-    /// vocabulary; `data_path` and `metastore_path` are the directories to probe. A catalog has no schema inference, so the seed comes from
+    /// `adaptive_tuning` is the runtime's `runtime.adaptive_tuning` switch and
+    /// `runtime_params` its `runtime.params`, from which the engine reads the `target_*`
+    /// targets because it owns that vocabulary; `data_path` and `metastore_path` are the
+    /// directories to probe. A catalog has no schema inference, so the seed comes from
     /// the host alone — which is precisely why it must come from the engine, and why an
     /// engine with no adaptive controller returns the default outcome and keeps its
     /// static values.
     async fn adaptive_tuning_seeds(
         &self,
+        _adaptive_tuning: spicepod::component::runtime::AdaptiveTuning,
         _runtime_params: &std::collections::HashMap<String, String>,
         _data_path: &str,
         _metastore_path: &str,
@@ -1248,9 +1250,6 @@ pub struct AdaptiveTuningSeeds {
 /// The outcome of asking an engine to seed adaptive tuning.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AdaptiveTuningOutcome {
-    /// The operator's `adaptive_tuning` value was not one the engine recognizes. Reported rather
-    /// than corrected so the caller can warn once and carry on with the default.
-    pub tuning_value_invalid: bool,
     /// `None` when the operator did not ask for adaptive tuning, in which case the engine
     /// keeps its static defaults.
     pub seeds: Option<AdaptiveTuningSeeds>,

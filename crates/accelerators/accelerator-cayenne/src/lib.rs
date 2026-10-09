@@ -636,7 +636,7 @@ fn compaction_fallback_warning(table_name: &str, targets_set: bool) -> String {
         ""
     };
     format!(
-        "Dataset '{table_name}' cannot use adaptive tuning because `cayenne_compaction_background_interval_ms` is 0 and the tuner runs on the background compaction tick, so it uses static tuning even though `runtime.params.adaptive_tuning` is `enabled`.{targets} Set `cayenne_compaction_background_interval_ms` to a non-zero value to enable adaptive tuning for it."
+        "Dataset '{table_name}' cannot use adaptive tuning because `cayenne_compaction_background_interval_ms` is 0 and the tuner runs on the background compaction tick, so it uses static tuning even though `runtime.adaptive_tuning` is `enabled`.{targets} Set `cayenne_compaction_background_interval_ms` to a non-zero value to enable adaptive tuning for it."
     )
 }
 
@@ -2220,7 +2220,7 @@ impl CayenneAccelerator {
                 config.compaction_background_interval_ms,
             );
 
-            // Tuning mode (`runtime.params.adaptive_tuning`, runtime-wide): `disabled` derives the
+            // Tuning mode (`runtime.adaptive_tuning`, runtime-wide): `disabled` derives the
             // knobs statically from the detected environment + inferred schema;
             // `enabled` also runs the closed-feedback loop that moves them within
             // the environment-derived [floor, ceiling]. the closed loop is reached ONLY by
@@ -2230,20 +2230,7 @@ impl CayenneAccelerator {
             // it *pins* that knob so the loop leaves it alone.
             let app = source.app();
             let runtime_params = &app.runtime.params;
-            let raw_tuning = runtime_params.get("adaptive_tuning").map(String::as_str);
-            let (tuning_mode, tuning_was_invalid) = autotune::TuningMode::parse(raw_tuning);
-            // `runtime.params.adaptive_tuning` is validated when the Spicepod loads; a runtime
-            // built programmatically skips that, so refuse the value here as well
-            // rather than quietly running a different mode than the one requested.
-            ensure!(
-                !tuning_was_invalid,
-                InvalidConfigurationSnafu {
-                    detail: spicepod::component::runtime::invalid_tuning_message(
-                        raw_tuning.unwrap_or_default().trim()
-                    )
-                }
-            );
-            config.dynamic_tuning = tuning_mode.is_adaptive();
+            config.dynamic_tuning = app.runtime.adaptive_tuning.is_enabled();
             // Inferred schema metadata SHARPENS the adaptive warm start (row_count/
             // table_bytes refine the memory sizing; inferred PK/index/sort metadata
             // feeds the query-health surface), but it is not REQUIRED for
@@ -2256,7 +2243,7 @@ impl CayenneAccelerator {
                 tracing::info!(
                     target: "spiced::acceleration::cayenne",
                     table = %table_name,
-                    "`runtime.params.adaptive_tuning` is `enabled`: no inferred schema metadata available for this table (the source may not expose catalog metadata or the connection role lacks read access); starting from the hardware-derived config and adapting from observed ingest."
+                    "`runtime.adaptive_tuning` is `enabled`: no inferred schema metadata available for this table (the source may not expose catalog metadata or the connection role lacks read access); starting from the hardware-derived config and adapting from observed ingest."
                 );
             }
             // The targets are parsed first because the compaction fallback below mentions them.
@@ -2278,7 +2265,7 @@ impl CayenneAccelerator {
             // `runtime.params` (runtime-wide; there is no per-dataset override).
             // Times are duration strings (`5s`/`1m`/`250ms`); QPH is a number. The
             // targets steer the closed loop but never ENABLE it: `adaptive` is reached
-            // only by `runtime.params.adaptive_tuning: enabled`, so a target set without it is
+            // only by `runtime.adaptive_tuning: enabled`, so a target set without it is
             // inert and warns below. Query latency is stored in ms.
             config.goal_replication_lag_secs = targets.replication_lag_secs;
             config.goal_freshness_secs = targets.freshness_secs;
@@ -2296,7 +2283,7 @@ impl CayenneAccelerator {
                 tracing::warn!(
                     target: "spiced::acceleration::cayenne",
                     table = %table_name,
-                    "`runtime.params.adaptive_tuning: enabled` is in preview; verify query correctness and performance before using it for production workloads"
+                    "`runtime.adaptive_tuning: enabled` is in preview; verify query correctness and performance before using it for production workloads"
                 );
             }
             config.pinned_tuning_actuators = cayenne::metadata::PinnedTuningActuators {
@@ -2372,7 +2359,7 @@ impl CayenneAccelerator {
                     tracing::warn!(
                         target: "spiced::acceleration::cayenne",
                         table = %table_name,
-                        "`runtime.params.target_*` is set but `runtime.params.adaptive_tuning` is `disabled`, so dataset '{table_name}' ignores the targets. Set `runtime.params.adaptive_tuning` to `enabled` to enable target-seeking. See: https://spiceai.org/docs/reference/spicepod/runtime"
+                        "`runtime.params.target_*` is set but `runtime.adaptive_tuning` is `disabled`, so dataset '{table_name}' ignores the targets. Set `runtime.adaptive_tuning` to `enabled` to enable target-seeking. See: https://spiceai.org/docs/reference/spicepod/runtime"
                     );
                 }
 
@@ -3263,10 +3250,10 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .description("Periodic background mem-tier checkpoint interval in milliseconds, in cdc_durability: memory mode only. The accelerator spawns a per-table background task that checkpoints the RAM tier every interval (mirroring the background compactor); this advances the deferred source slot ack on an idle or pure-upsert stream that never trips a delete/truncate event trigger or a write-path cap. Default 1000 (1 s). Set 0 to disable the periodic task."),
         ParameterSpec::component("cdc_mem_tier_shards")
             .description("Number of PK-hash shards the in-RAM CDC tier is partitioned into, in cdc_durability: memory mode only (non-partitioned, key-based merge-on-read tables). Each shard is an independent serial validate->append domain keyed by the RowConverter OwnedRow bytes, so disjoint keys validate and append in parallel within one apply (intra-apply fan-out) while a key's whole version history — upserts AND delete tombstones — stays confined to its one owning shard (last-writer-wins preserved). Checkpoints are always all-shards-atomic on a single source-position axis. Default 1 (the byte-identical serial path). Raise (e.g. 4) on update/insert-heavy CDC tables to lift the per-apply serialization ceiling."),
-        // Retired: these moved to `runtime.params` (`adaptive_tuning`, `target_*`). They stay listed
+        // Retired: these moved to the runtime (`runtime.adaptive_tuning`, `runtime.params.target_*`). They stay listed
         // only so `Parameters` drops them without a second, generic warning, and are left
         // out of the published schema.
-        ParameterSpec::component("tuning").moved_to("runtime.params.adaptive_tuning"),
+        ParameterSpec::component("tuning").moved_to("runtime.adaptive_tuning"),
         ParameterSpec::component("goal_replication_lag").moved_to("runtime.params.target_replication_lag"),
         ParameterSpec::component("goal_freshness").moved_to("runtime.params.target_freshness"),
         ParameterSpec::component("goal_query_latency").moved_to("runtime.params.target_query_latency"),
@@ -3314,16 +3301,14 @@ impl DataAccelerator for CayenneAccelerator {
 
     async fn adaptive_tuning_seeds(
         &self,
+        adaptive_tuning: spicepod::component::runtime::AdaptiveTuning,
         runtime_params: &std::collections::HashMap<String, String>,
         data_path: &str,
         metastore_path: &str,
     ) -> data_accelerator_api::AdaptiveTuningOutcome {
-        let (tuning_mode, tuning_value_invalid) =
-            autotune::TuningMode::parse(runtime_params.get("adaptive_tuning").map(String::as_str));
         let targets = parse_tuning_targets(runtime_params);
-        if tuning_mode != autotune::TuningMode::Adaptive {
+        if !adaptive_tuning.is_enabled() {
             return data_accelerator_api::AdaptiveTuningOutcome {
-                tuning_value_invalid,
                 seeds: None,
                 targets,
             };
@@ -3340,7 +3325,6 @@ impl DataAccelerator for CayenneAccelerator {
         let caps = hardware.inline_flush_caps(&autotune::WorkloadProfile::default());
 
         data_accelerator_api::AdaptiveTuningOutcome {
-            tuning_value_invalid,
             targets,
             seeds: Some(data_accelerator_api::AdaptiveTuningSeeds {
                 // A small-write cadence, so the controller has a tick to ride.
@@ -4487,6 +4471,7 @@ data_accelerator_api::register_data_accelerator!(configured: Engine::Cayenne, Ca
 #[cfg(test)]
 mod tests {
     use super::*;
+    use spicepod::component::runtime::AdaptiveTuning;
     // Exercised only by the tests below; the delete-path guard reaches it through
     // `overlapping_metastore_dir` rather than calling it directly.
     use cayenne::metastore_layout::absolute_data_dir;
@@ -7441,20 +7426,20 @@ mod tests {
     /// and acceleration params.
     async fn tuning_config(
         name: &str,
+        adaptive_tuning: AdaptiveTuning,
         runtime_params: &[(&str, &str)],
         dataset_params: &[(&str, &str)],
     ) -> Result<cayenne::metadata::VortexConfig> {
-        let app = Arc::new(
-            AppBuilder::new("test")
-                .with_runtime_params(
-                    runtime_params
-                        .iter()
-                        .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
-                        .collect(),
-                )
-                .build(),
-        );
-        let mut dataset = TestAccelerationSource::new(name).with_app(app);
+        let mut app = AppBuilder::new("test")
+            .with_runtime_params(
+                runtime_params
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                    .collect(),
+            )
+            .build();
+        app.runtime.adaptive_tuning = adaptive_tuning;
+        let mut dataset = TestAccelerationSource::new(name).with_app(Arc::new(app));
         dataset.set_acceleration(Acceleration {
             engine: Engine::Cayenne,
             mode: Mode::File,
@@ -7468,9 +7453,6 @@ mod tests {
         CayenneAccelerator::get_vortex_config(name, &dataset).await
     }
 
-    /// Adaptive tuning stays `disabled` unless `runtime.params.adaptive_tuning` is `enabled`. A `target_*`
-    /// SLO expresses a target, not a choice of controller, so it must leave the closed
-    /// loop off.
     #[test]
     fn test_every_runtime_target_param_is_parsed() {
         for key in spicepod::component::runtime::TUNING_TARGET_PARAMS {
@@ -7487,7 +7469,7 @@ mod tests {
         let without = compaction_fallback_warning("orders", false);
         assert_eq!(
             without,
-            "Dataset 'orders' cannot use adaptive tuning because `cayenne_compaction_background_interval_ms` is 0 and the tuner runs on the background compaction tick, so it uses static tuning even though `runtime.params.adaptive_tuning` is `enabled`. Set `cayenne_compaction_background_interval_ms` to a non-zero value to enable adaptive tuning for it."
+            "Dataset 'orders' cannot use adaptive tuning because `cayenne_compaction_background_interval_ms` is 0 and the tuner runs on the background compaction tick, so it uses static tuning even though `runtime.adaptive_tuning` is `enabled`. Set `cayenne_compaction_background_interval_ms` to a non-zero value to enable adaptive tuning for it."
         );
         let with = compaction_fallback_warning("orders", true);
         assert!(
@@ -7499,11 +7481,19 @@ mod tests {
         assert!(!with.contains("is `disabled`"));
     }
 
+    /// Adaptive tuning stays `disabled` unless `runtime.adaptive_tuning` is `enabled`. A `target_*`
+    /// SLO expresses a target, not a choice of controller, so it must leave the closed
+    /// loop off.
     #[tokio::test]
     async fn test_targets_do_not_enable_adaptive_tuning() {
-        let config = tuning_config("global_target", &[("target_replication_lag", "5s")], &[])
-            .await
-            .expect("config should be valid");
+        let config = tuning_config(
+            "global_target",
+            AdaptiveTuning::Disabled,
+            &[("target_replication_lag", "5s")],
+            &[],
+        )
+        .await
+        .expect("config should be valid");
         assert!(
             !config.dynamic_tuning,
             "a runtime.params target_* must not turn on the closed loop"
@@ -7515,14 +7505,15 @@ mod tests {
 
         let config = tuning_config(
             "adaptive",
-            &[("adaptive_tuning", "enabled"), ("target_freshness", "30s")],
+            AdaptiveTuning::Enabled,
+            &[("target_freshness", "30s")],
             &[],
         )
         .await
         .expect("config should be valid");
         assert!(
             config.dynamic_tuning,
-            "`runtime.params.adaptive_tuning: enabled` enables the closed loop"
+            "`runtime.adaptive_tuning: enabled` enables the closed loop"
         );
         assert_eq!(config.goal_freshness_secs, Some(30.0));
     }
@@ -7532,6 +7523,7 @@ mod tests {
     async fn test_retired_dataset_tuning_params_are_not_applied() {
         let config = tuning_config(
             "retired",
+            AdaptiveTuning::Disabled,
             &[],
             &[
                 ("cayenne_tuning", "adaptive"),
@@ -7551,6 +7543,7 @@ mod tests {
     async fn test_renamed_runtime_target_params_are_not_applied() {
         let config = tuning_config(
             "renamed",
+            AdaptiveTuning::Disabled,
             &[
                 ("cayenne_goal_freshness", "30s"),
                 ("cayenne_goal_qph", "100"),
@@ -7567,8 +7560,8 @@ mod tests {
     async fn test_target_params_resolve_from_runtime_params() {
         let config = tuning_config(
             "targets",
+            AdaptiveTuning::Enabled,
             &[
-                ("adaptive_tuning", "enabled"),
                 ("target_replication_lag", "10s"),
                 ("target_freshness", "5s"),
                 ("target_query_latency", "250ms"),
@@ -7587,15 +7580,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_invalid_runtime_tuning_fails_the_dataset() {
-        let error = tuning_config("bad_tuning", &[("adaptive_tuning", "enablde")], &[])
-            .await
-            .expect_err("an invalid tuning value must not fall back to `auto`");
+    async fn test_runtime_params_adaptive_tuning_does_not_enable_the_closed_loop() {
+        let config = tuning_config(
+            "params_switch",
+            AdaptiveTuning::Disabled,
+            &[("adaptive_tuning", "enabled")],
+            &[],
+        )
+        .await
+        .expect("config should be valid");
         assert!(
-            error.to_string().contains(
-                "Invalid `runtime.params.adaptive_tuning` value 'enablde': expected `enabled` or `disabled`."
-            ),
-            "unexpected error: {error}"
+            !config.dynamic_tuning,
+            "only `runtime.adaptive_tuning` enables the closed loop"
         );
     }
 
