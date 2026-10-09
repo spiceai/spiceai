@@ -30,12 +30,18 @@ limitations under the License.
 //! - **Append / Replace** ([`append::CayennePartitionedAppendSink`]): every
 //!   participating partition stages its data into a prepared *target*
 //!   snapshot; then, holding one shared `listing_fence.write()` barrier
-//!   window, the staged files are made durable and every partition's
-//!   `current_snapshot_id` pointer is advanced atomically in a single
-//!   `MetastoreTransaction` (either every partition advances or none do),
-//!   anchored by a top-level [`cayenne::PartitionedWal`] for crash recovery
-//!   on local and object-store tables. See that type's docs for the full
-//!   coordination flow.
+//!   window, the staged files are made durable and every partition commits in
+//!   a single `MetastoreTransaction` (either every partition commits or none
+//!   does), anchored by a top-level [`cayenne::PartitionedWal`] for crash
+//!   recovery on local and object-store tables. A partition whose write
+//!   publishes on-conflict state (tombstones and re-insert records keyed by
+//!   primary key) stages into an *overlay* — a protected snapshot holding only
+//!   the write's rows, which the transaction commits by recording its
+//!   sequence, leaving the current snapshot and the copies the write supersedes
+//!   behind their tombstones. Any other partition's target is a clone of its
+//!   current snapshot plus the write's rows, which the transaction commits by
+//!   advancing the partition's `current_snapshot_id` pointer. See that type's
+//!   docs for the full coordination flow.
 //!
 //! This module holds the pieces shared by both sinks: the top-level
 //! [`CayennePartitionedInsertStrategy`] that dispatches to whichever sink an
@@ -52,7 +58,7 @@ use std::sync::Arc;
 
 use arrow::array::RecordBatch;
 use async_trait::async_trait;
-use cayenne::{CayenneCatalog, CayenneTableProvider, PartitionedWal};
+use cayenne::{CayenneCatalog, CayenneTableProvider, MetadataCatalog, PartitionedWal};
 use datafusion::common::{Column, DFSchema};
 use datafusion::error::DataFusionError;
 use datafusion::physical_expr::{PhysicalExpr, create_physical_expr};
@@ -342,10 +348,11 @@ impl CayennePartitionedInsertStrategy {
     /// Reconcile stale cross-partition WAL anchors after all partition
     /// providers have completed their per-partition staged-WAL recovery.
     ///
-    /// The catalog pointer transaction is the only commit decision. For each
-    /// set, every pointer must either equal its recorded target (committed) or
-    /// differ (not committed). A mixed set is impossible under an atomic
-    /// catalog transaction and is rejected rather than guessed at.
+    /// The shared catalog transaction is the only commit decision. For each
+    /// set, every partition must be committed — its pointer equal to its
+    /// recorded target, or, for an overlay, its target's sequence recorded — or
+    /// none. A mixed set is impossible under an atomic catalog transaction and is
+    /// rejected rather than guessed at.
     /// # Errors
     ///
     /// Returns an error when a partition's staging WAL cannot be read or replayed. A
@@ -409,12 +416,22 @@ impl CayennePartitionedInsertStrategy {
                         wal.commit_id, entry.table_id
                     ))
                 })?;
-                let current_snapshot_id = self
-                    .catalog
-                    .current_snapshot_id_for_table(&entry.table_id)
-                    .await
-                    .map_err(|error| DataFusionError::External(Box::new(error)))?;
-                if current_snapshot_id == target_snapshot_id {
+                // The transaction that commits an overlay records its target's
+                // sequence; one that commits any other target moves the pointer.
+                let is_committed = if entry.overlay {
+                    self.catalog
+                        .get_snapshot_sequence(&entry.table_id, target_snapshot_id)
+                        .await
+                        .map_err(|error| DataFusionError::External(Box::new(error)))?
+                        .is_some()
+                } else {
+                    self.catalog
+                        .current_snapshot_id_for_table(&entry.table_id)
+                        .await
+                        .map_err(|error| DataFusionError::External(Box::new(error)))?
+                        == target_snapshot_id
+                };
+                if is_committed {
                     committed += 1;
                 } else {
                     uncommitted += 1;
