@@ -19,9 +19,14 @@ limitations under the License.
 //!
 //! Regression test for <https://github.com/spiceai/spiceai/issues/14922>.
 
+use std::collections::HashMap;
+
 use arrow::array::RecordBatch;
 use arrow_flight::{FlightClient, Ticket, error::FlightError};
+use axum::{Router, http::StatusCode};
 use futures::TryStreamExt;
+use spicepod::{component::dataset::Dataset, param::Params as DatasetParams};
+use tokio::net::TcpListener;
 use tonic::Code;
 
 use crate::{
@@ -76,6 +81,49 @@ async fn query_and_data_failures_are_invalid_argument() -> Result<(), anyhow::Er
                     "{sql}"
                 );
             }
+
+            Ok(())
+        })
+        .await
+}
+
+/// An HTTP origin's 404 fails the query by default (`on_error_response: error`). The
+/// connector raises it as a planning error, and execution hands it on wrapped in
+/// `Shared`, so this covers the connector, the execution wrapping and the Flight status
+/// together.
+#[tokio::test]
+async fn an_http_origin_404_is_invalid_argument() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let addr = listener.local_addr()?;
+            let origin = Router::new().fallback(|| async { (StatusCode::NOT_FOUND, "{}") });
+            tokio::spawn(async move { axum::serve(listener, origin).await });
+
+            let mut dataset = Dataset::new(format!("http://{addr}"), "origin");
+            dataset.params = Some(DatasetParams::from_string_map(HashMap::from([
+                ("file_format".to_string(), "json".to_string()),
+                ("allowed_request_paths".to_string(), "/shows/**".to_string()),
+                ("max_retries".to_string(), "0".to_string()),
+            ])));
+
+            let (channel, _df) = start_spice_test_app(None, None, Some(dataset)).await?;
+            let mut client = create_flight_client(channel, None)?;
+
+            let sql = "SELECT * FROM origin WHERE request_path = '/shows/404'";
+            let status = failure_of(&mut client, sql).await;
+            let expected = format!(
+                "Failed to fetch http://{addr} for dataset 'origin': the origin answered 404, \
+                 so the request failed rather than becoming data."
+            );
+            assert_eq!(status.code(), Code::InvalidArgument, "{sql}: {status:?}");
+            assert!(
+                status.message().starts_with(&expected),
+                "{sql}: expected the message to start with {expected:?}, got {:?}",
+                status.message()
+            );
 
             Ok(())
         })
