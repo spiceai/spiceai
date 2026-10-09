@@ -66,6 +66,12 @@ enum Mode {
     ModeB,
 }
 
+/// Mode B's acceleration engine when `--acceleration-engine` is not given.
+const DEFAULT_ACCELERATION_ENGINE: &str = "cayenne";
+
+/// Mode B's wait for `spiced` to load the tables when `--ready-wait` is not given.
+const DEFAULT_READY_WAIT_SECS: u64 = 900;
+
 /// How Mode B's datasets are stored.
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum AccelerationMode {
@@ -127,11 +133,11 @@ struct Args {
     #[arg(long)]
     spiced_path: Option<PathBuf>,
 
-    /// Mode B: the acceleration engine of every TPC-H dataset (`cayenne`,
-    /// `duckdb`, `arrow`, `sqlite`, …), or `none` to serve the parquet files
-    /// federated.
-    #[arg(long, default_value = "cayenne")]
-    acceleration_engine: String,
+    /// Mode B: the acceleration engine of every TPC-H dataset (`cayenne`, the
+    /// default, `duckdb`, `arrow`, `sqlite`, …), or `none` to serve the parquet
+    /// files federated.
+    #[arg(long)]
+    acceleration_engine: Option<String>,
 
     /// Mode B: how the accelerated datasets are stored (default `file`).
     #[arg(long, value_enum)]
@@ -148,9 +154,9 @@ struct Args {
     #[arg(long)]
     data_dir: Option<PathBuf>,
 
-    /// Mode B: seconds to wait for `spiced` to load the tables.
-    #[arg(long, default_value_t = 900)]
-    ready_wait: u64,
+    /// Mode B: seconds to wait for `spiced` to load the tables (default 900).
+    #[arg(long)]
+    ready_wait: Option<u64>,
 
     /// Mode B: how many times to run each plan. Every execution is compared
     /// with the golden, so an answer that changes once a cache or an index is
@@ -313,7 +319,7 @@ async fn run() -> Result<ExitCode> {
             let options = mode_b::ServingOptions {
                 spiced_path,
                 acceleration: acceleration_options(&args)?,
-                ready_wait: Duration::from_secs(args.ready_wait),
+                ready_wait: Duration::from_secs(args.ready_wait.unwrap_or(DEFAULT_READY_WAIT_SECS)),
             };
             let started = Instant::now();
             let parts = SessionConfig::new().target_partitions();
@@ -434,7 +440,11 @@ fn spiced_program(spiced_path: &Path) -> Result<PathBuf> {
 /// A federated run has no acceleration to store or lay out, so it refuses a
 /// flag that configures one rather than run a weaker test than was asked for.
 fn acceleration_options(args: &Args) -> Result<Option<mode_b::AccelerationOptions>> {
-    if args.acceleration_engine == "none" {
+    let engine = args
+        .acceleration_engine
+        .as_deref()
+        .unwrap_or(DEFAULT_ACCELERATION_ENGINE);
+    if engine == "none" {
         let flag = if args.acceleration_mode.is_some() {
             Some("--acceleration-mode")
         } else if args.layout.is_some() {
@@ -448,7 +458,7 @@ fn acceleration_options(args: &Args) -> Result<Option<mode_b::AccelerationOption
         };
     }
     Ok(Some(mode_b::AccelerationOptions {
-        engine: args.acceleration_engine.clone(),
+        engine: engine.to_string(),
         mode: match args.acceleration_mode.unwrap_or(AccelerationMode::File) {
             AccelerationMode::File => Mode_::File,
             AccelerationMode::Memory => Mode_::Memory,
@@ -461,12 +471,16 @@ fn acceleration_options(args: &Args) -> Result<Option<mode_b::AccelerationOption
 fn reject_mode_b_flags(args: &Args) -> Result<()> {
     let flag = if args.spiced_path.is_some() {
         Some("--spiced-path")
+    } else if args.acceleration_engine.is_some() {
+        Some("--acceleration-engine")
     } else if args.acceleration_mode.is_some() {
         Some("--acceleration-mode")
     } else if args.layout.is_some() {
         Some("--layout")
     } else if args.data_dir.is_some() {
         Some("--data-dir")
+    } else if args.ready_wait.is_some() {
+        Some("--ready-wait")
     } else if args.iterations != NonZeroU32::MIN {
         Some("--iterations")
     } else {
@@ -695,21 +709,31 @@ mod tests {
         super::reject_mode_b_flags(&args).expect("one iteration is the Mode A default");
     }
 
+    /// Every flag that only Mode B reads is refused in Mode A, which would
+    /// otherwise run its ordinary in-process suite and ignore the flag.
     #[test]
-    fn mode_a_refuses_an_acceleration_mode_it_would_ignore() {
+    fn mode_a_refuses_every_mode_b_flag_it_would_ignore() {
         use clap::Parser as _;
-        let args = super::Args::try_parse_from([
-            "spice-substrait-compliance",
-            "--acceleration-mode",
-            "memory",
-        ])
-        .expect("clap accepts the mode");
-        let err = super::reject_mode_b_flags(&args).expect_err("--acceleration-mode with Mode A");
-        assert_eq!(
-            err.to_string(),
-            "`--acceleration-mode` applies to Mode B only, and Mode A would ignore it. Pass \
-             `--mode mode-b`, or drop `--acceleration-mode`"
-        );
+        for (flag, value) in [
+            ("--spiced-path", "spiced"),
+            ("--acceleration-engine", "none"),
+            ("--acceleration-mode", "memory"),
+            ("--layout", "primary_key"),
+            ("--data-dir", "data"),
+            ("--ready-wait", "5"),
+            ("--iterations", "3"),
+        ] {
+            let args = super::Args::try_parse_from(["spice-substrait-compliance", flag, value])
+                .unwrap_or_else(|error| panic!("clap accepts {flag} {value}: {error}"));
+            let err = super::reject_mode_b_flags(&args).expect_err(flag);
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "`{flag}` applies to Mode B only, and Mode A would ignore it. Pass \
+                     `--mode mode-b`, or drop `{flag}`"
+                )
+            );
+        }
     }
 
     /// A federated run has no acceleration, so a layout or a storage mode for
@@ -767,6 +791,15 @@ mod tests {
             .expect("an acceleration");
         assert!(matches!(defaulted.mode, super::Mode_::File));
         assert!(defaulted.layout.is_none());
+
+        let default_engine = super::acceleration_options(
+            &super::Args::try_parse_from(["spice-substrait-compliance", "--mode", "mode-b"])
+                .expect("clap accepts Mode B with no acceleration flags"),
+        )
+        .expect("an accelerated run")
+        .expect("an acceleration");
+        assert_eq!(default_engine.engine, "cayenne");
+        assert!(matches!(default_engine.mode, super::Mode_::File));
     }
 
     #[test]
