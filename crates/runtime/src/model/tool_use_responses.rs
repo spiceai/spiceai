@@ -19,9 +19,10 @@ use async_openai::{
     types::responses::{
         CodeInterpreterTool, CreateResponse, EasyInputContent, EasyInputMessage,
         FunctionCallOutput, FunctionCallOutputItemParam, FunctionTool, FunctionToolCall, InputItem,
-        InputParam, InputTokenDetails, Item, MessageType, OutputItem, OutputTokenDetails, Response,
-        ResponseStream, ResponseStreamEvent, ResponseUsage, Role, Tool as ToolDefinition,
-        ToolChoiceAllowedMode, ToolChoiceOptions, ToolChoiceParam, WebSearchTool,
+        InputParam, InputTokenDetails, Item, MessageItem, MessageType, OutputItem,
+        OutputTokenDetails, Response, ResponseStream, ResponseStreamEvent, ResponseUsage, Role,
+        Tool as ToolDefinition, ToolChoiceAllowedMode, ToolChoiceOptions, ToolChoiceParam,
+        WebSearchTool,
     },
 };
 use async_trait::async_trait;
@@ -31,9 +32,9 @@ use llms::responses::Error as ResponsesError;
 use llms::responses::Responses;
 use llms::{chat::Error as LlmError, progress::Progress};
 use serde_json::{Value, json};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use tokio::sync::mpsc;
 use tools::SpiceModelTool;
@@ -205,69 +206,104 @@ impl ToolUsingResponses {
         }
     }
 
-    async fn process_tool_calls_and_run_spice_tools(
+    /// Whether `item` is a call to one of Spice's tools.
+    fn is_spice_tool_call(&self, item: &OutputItem) -> bool {
+        matches!(item, OutputItem::FunctionCall(call) if self.as_spiced_tool(&call.name).is_some())
+    }
+
+    /// `item`, an item of one round's output, as input for the next round.
+    fn replay_item(&self, item: &OutputItem) -> Option<Item> {
+        match item {
+            OutputItem::Message(message) => {
+                Some(Item::Message(MessageItem::Output(message.clone())))
+            }
+            OutputItem::Reasoning(reasoning) => Some(Item::Reasoning(reasoning.clone())),
+            OutputItem::FunctionCall(call) => self
+                .as_spiced_tool(&call.name)
+                .is_some()
+                .then(|| Item::FunctionCall(call.clone())),
+            OutputItem::WebSearchCall(call) => Some(Item::WebSearchCall(call.clone())),
+            OutputItem::FileSearchCall(call) => Some(Item::FileSearchCall(call.clone())),
+            OutputItem::CodeInterpreterCall(call) => Some(Item::CodeInterpreterCall(call.clone())),
+            OutputItem::ImageGenerationCall(call) => Some(Item::ImageGenerationCall(call.clone())),
+            OutputItem::McpCall(call) => Some(Item::McpCall(call.clone())),
+            OutputItem::McpListTools(tools) => Some(Item::McpListTools(tools.clone())),
+            // Calls the client runs, which the next round has no result for, and items whose
+            // input form differs from their output form.
+            OutputItem::ComputerCall(_)
+            | OutputItem::LocalShellCall(_)
+            | OutputItem::ShellCall(_)
+            | OutputItem::ShellCallOutput(_)
+            | OutputItem::ApplyPatchCall(_)
+            | OutputItem::ApplyPatchCallOutput(_)
+            | OutputItem::McpApprovalRequest(_)
+            | OutputItem::CustomToolCall(_)
+            | OutputItem::Compaction(_) => None,
+        }
+    }
+
+    /// Runs the Spice tool calls in `output`, one round's output, and returns the input for the
+    /// next round: `input`, then `output`, then the calls' results, paired with the calls by
+    /// `call_id`. `None` when `output` calls no Spice tool.
+    ///
+    /// The round's output is replayed as is, item IDs included: a reasoning model pairs each tool
+    /// call with a reasoning item, and `OpenAI` rejects one replayed without the other. The next
+    /// round also gets the round's hosted tool results, such as a web search's.
+    async fn run_spice_tool_calls(
         &self,
-        original_messages: Vec<InputItem>,
-        requested_tools: Vec<FunctionToolCall>,
-    ) -> Result<Option<Vec<InputItem>>, OpenAIError> {
-        let spiced_tools = requested_tools
+        input: Vec<InputItem>,
+        output: &[OutputItem],
+    ) -> Option<Vec<InputItem>> {
+        let calls = output
             .iter()
-            .filter(|&t| self.as_spiced_tool(&t.name).is_some())
-            .cloned()
+            .filter_map(|item| match item {
+                OutputItem::FunctionCall(call) if self.as_spiced_tool(&call.name).is_some() => {
+                    Some(call)
+                }
+                _ => None,
+            })
             .collect_vec();
 
         // Return early if no spiced runtime tools used.
-        if spiced_tools.is_empty() {
+        if calls.is_empty() {
             tracing::debug!("No spiced tools used by chat model, returning early");
-            return Ok(None);
+            return None;
         }
 
-        let mut tool_and_response_content = vec![];
-        for t in spiced_tools.clone() {
+        let mut next_input = input;
+        next_input.extend(
+            output
+                .iter()
+                .filter_map(|item| self.replay_item(item))
+                .map(InputItem::Item),
+        );
+        for call in &calls {
             tracing::info!(
                 target: "task_history",
                 progress = Progress::log()
-                    .id(t.id.clone())
-                    .title(format!("Calling '{}' tool", t.name))
-                    .content(t.arguments.clone())
+                    .id(call.id.clone())
+                    .title(format!("Calling '{}' tool", call.name))
+                    .content(call.arguments.clone())
                     .to_jsonl(),
             );
-            let content = self.call_tool(&t).await;
-            tool_and_response_content.push((t, content));
-        }
-
-        // Tell model the assistant used these tools, and provided result.
-        let mut messages = original_messages.clone();
-        for (tool_call, response_content) in &tool_and_response_content {
-            messages.push(InputItem::Item(Item::FunctionCall(FunctionToolCall {
-                arguments: tool_call.arguments.clone(),
-                call_id: tool_call.id.clone().unwrap_or_default(),
-                name: tool_call.name.clone(),
-                id: Some(tool_call.name.clone()),
-                status: None,
-            })));
-            messages.push(InputItem::Item(Item::FunctionCallOutput(
+            let content = self.call_tool(call).await;
+            next_input.push(InputItem::Item(Item::FunctionCallOutput(
                 FunctionCallOutputItemParam {
-                    call_id: tool_call.id.clone().unwrap_or_default(),
+                    call_id: call.call_id.clone(),
                     output: FunctionCallOutput::Text(
-                        serde_json::to_string(&response_content)
+                        serde_json::to_string(&content)
                             .unwrap_or("Error calling tool.".to_string()),
                     ),
-                    id: Some(tool_call.name.clone()),
+                    id: None,
                     status: None,
                 },
             )));
         }
 
-        if !messages.is_empty() {
-            let used_tools = spiced_tools.len();
-            if used_tools > 0 {
-                let context = RequestContext::current(AsyncMarker::new().await);
-                crate::model::add_tools_used(&context, used_tools);
-            }
-        }
+        let context = RequestContext::current(AsyncMarker::new().await);
+        crate::model::add_tools_used(&context, calls.len());
 
-        Ok(Some(messages))
+        Some(next_input)
     }
 
     async fn responses_request_inner(
@@ -275,63 +311,53 @@ impl ToolUsingResponses {
         req: CreateResponse,
         recursion_limit: Option<usize>,
     ) -> Result<Response, OpenAIError> {
-        Box::pin(async move {
-            // Don't use spice runtime tools if users has explicitly chosen to not use any tools.
-            if req
-                .tool_choice
-                .as_ref()
-                .is_some_and(|t| matches!(t, ToolChoiceParam::Mode(ToolChoiceOptions::None)))
-            {
-                tracing::debug!("User asked for no tools, calling inner chat model");
-                return self.inner_responses.responses_request(req).await;
-            }
+        // Don't use spice runtime tools if users has explicitly chosen to not use any tools.
+        if req
+            .tool_choice
+            .as_ref()
+            .is_some_and(|t| matches!(t, ToolChoiceParam::Mode(ToolChoiceOptions::None)))
+        {
+            tracing::debug!("User asked for no tools, calling inner chat model");
+            return self.inner_responses.responses_request(req).await;
+        }
 
-            if recursion_limit.is_some_and(|f| f == 0) {
-                tracing::debug!(
-                    "Tool-use recursion limit reached. Will call model, but not process further"
+        if recursion_limit.is_some_and(|f| f == 0) {
+            tracing::debug!(
+                "Tool-use recursion limit reached. Will call model, but not process further"
+            );
+            return self.inner_responses.responses_request(req).await;
+        }
+
+        // Append spiced runtime tools to the request.
+        let mut req = self.add_runtime_tools(&req);
+        // The rounds that may still run Spice tools; `None` for no limit.
+        let mut tool_rounds_left = recursion_limit;
+        // The output of the rounds that ran Spice tools, less those calls, and their usage.
+        let mut earlier_output = Vec::new();
+        let mut earlier_usage = None;
+
+        loop {
+            let response = self.inner_responses.responses_request(req.clone()).await?;
+
+            if tool_rounds_left != Some(0)
+                && let Some(next_input) = self
+                    .run_spice_tool_calls(to_input_item(req.input.clone()), &response.output)
+                    .await
+            {
+                req = create_new_recursive_req(&req, next_input, response.usage.as_ref());
+                earlier_usage = combine_usage(earlier_usage, response.usage);
+                earlier_output.extend(
+                    response
+                        .output
+                        .into_iter()
+                        .filter(|item| !self.is_spice_tool_call(item)),
                 );
-                return self.inner_responses.responses_request(req).await;
+                tool_rounds_left = tool_rounds_left.map(|rounds| rounds - 1);
+                continue;
             }
 
-            // Append spiced runtime tools to the request.
-            let inner_req = self.add_runtime_tools(&req);
-
-            let resp = self
-                .inner_responses
-                .responses_request(inner_req.clone())
-                .await?;
-
-            let usage = resp.usage.clone();
-
-            let tools_used = resp
-                .output
-                .iter()
-                .cloned()
-                .filter_map(|c| match c {
-                    OutputItem::FunctionCall(t) => Some(t),
-                    _ => None,
-                })
-                .collect_vec();
-
-            match self
-                .process_tool_calls_and_run_spice_tools(to_input_item(req.input), tools_used)
-                .await?
-            {
-                // New messages means we have run spice tools locally, ready to recall model.
-                Some(messages) => {
-                    let mut resp = self
-                        .responses_request_inner(
-                            create_new_recursive_req(&inner_req, messages, resp.usage.as_ref()),
-                            recursion_limit.map(|r| r - 1),
-                        )
-                        .await?;
-                    resp.usage = combine_usage(usage, resp.usage);
-                    Ok(resp)
-                }
-                None => Ok(resp),
-            }
-        })
-        .await
+            return Ok(with_earlier_rounds(response, earlier_output, earlier_usage));
+        }
     }
 
     async fn responses_stream_inner(
@@ -339,46 +365,40 @@ impl ToolUsingResponses {
         req: CreateResponse,
         recursion_limit: Option<usize>,
     ) -> Result<ResponseStream, OpenAIError> {
-        Box::pin(async move {
-            // Don't use spice runtime tools if users has explicitly chosen to not use any tools.
-            if req
-                .tool_choice
-                .as_ref()
-                .is_some_and(|t| matches!(t, ToolChoiceParam::Mode(ToolChoiceOptions::None)))
-            {
-                tracing::debug!("User asked for no tools, calling inner responses model");
-                return self.inner_responses.responses_stream(req).await;
-            }
+        // Don't use spice runtime tools if users has explicitly chosen to not use any tools.
+        if req
+            .tool_choice
+            .as_ref()
+            .is_some_and(|t| matches!(t, ToolChoiceParam::Mode(ToolChoiceOptions::None)))
+        {
+            tracing::debug!("User asked for no tools, calling inner responses model");
+            return self.inner_responses.responses_stream(req).await;
+        }
 
-            if recursion_limit.is_some_and(|f| f == 0) {
-                tracing::debug!(
-                    "Tool-use recursion limit reached. Will call model, but not process further"
-                );
-                return self.inner_responses.responses_stream(req).await;
-            }
+        if recursion_limit.is_some_and(|f| f == 0) {
+            tracing::debug!(
+                "Tool-use recursion limit reached. Will call model, but not process further"
+            );
+            return self.inner_responses.responses_stream(req).await;
+        }
 
-            // Append spiced runtime tools to the request.
-            let inner_req = self.add_runtime_tools(&req);
+        // Append spiced runtime tools to the request.
+        let req = self.add_runtime_tools(&req);
 
-            let s = self
-                .inner_responses
-                .responses_stream(inner_req.clone())
-                .await?;
+        let s = self.inner_responses.responses_stream(req.clone()).await?;
 
-            Ok(make_responses_stream(
-                Span::current(),
-                RequestContext::current(AsyncMarker::new().await),
-                Self::new(
-                    Arc::clone(&self.inner_responses),
-                    self.openai_tools.clone(),
-                    self.tools.clone(),
-                    recursion_limit.map(|r| r - 1),
-                ),
-                req,
-                s,
-            ))
-        })
-        .await
+        Ok(make_responses_stream(
+            Span::current(),
+            RequestContext::current(AsyncMarker::new().await),
+            Self::new(
+                Arc::clone(&self.inner_responses),
+                self.openai_tools.clone(),
+                self.tools.clone(),
+                recursion_limit,
+            ),
+            req,
+            s,
+        ))
     }
 
     fn add_runtime_tools(&self, req: &CreateResponse) -> CreateResponse {
@@ -429,227 +449,200 @@ impl Stream for CustomResponseStream {
     }
 }
 
+/// The client's view of a streamed tool-use loop: one response, however many rounds it takes.
+///
+/// Each round is a response of its own from the provider, with its own lifecycle events, and its
+/// own `sequence_number`s and `output_index`es counting from 0. The client is sent the first
+/// round's `response.created` and `response.in_progress` only, one run of `sequence_number`s, and
+/// `output_index`es that count the items it was sent across rounds. The Spice tool calls it is not
+/// sent leave no gap.
+#[derive(Default)]
+struct ClientStream {
+    /// The rounds that ran Spice tools so far.
+    tool_rounds: usize,
+    /// The `sequence_number` of the next event sent to the client.
+    sequence_number: u64,
+    /// How many output items the client was sent.
+    items_sent: u64,
+    /// The client's `output_index` of each item of the current round that it was sent.
+    output_indexes: HashMap<u64, u64>,
+    /// The `output_index`es of the current round's Spice tool calls, which the client is not sent.
+    hidden_indexes: HashSet<u64>,
+    /// The output items of earlier rounds that the client was sent.
+    earlier_output: Vec<OutputItem>,
+    /// The usage of earlier rounds.
+    earlier_usage: Option<ResponseUsage>,
+}
+
+impl ClientStream {
+    /// `event` as the client is to receive it, or `None` when the client is not to receive it.
+    /// `hide` tells whether an output item is a Spice tool call to keep from the client.
+    fn event(
+        &mut self,
+        mut event: ResponseStreamEvent,
+        hide: impl Fn(&OutputItem) -> bool,
+    ) -> Option<ResponseStreamEvent> {
+        match &mut event {
+            // A later round continues the response the client already has.
+            ResponseStreamEvent::ResponseCreated(_)
+            | ResponseStreamEvent::ResponseInProgress(_)
+            | ResponseStreamEvent::ResponseQueued(_)
+                if self.tool_rounds > 0 =>
+            {
+                return None;
+            }
+            ResponseStreamEvent::ResponseOutputItemAdded(added) => {
+                let index = u64::from(added.output_index);
+                if hide(&added.item) {
+                    self.hidden_indexes.insert(index);
+                    return None;
+                }
+                self.output_indexes.insert(index, self.items_sent);
+                self.items_sent += 1;
+            }
+            ResponseStreamEvent::ResponseCompleted(completed) => {
+                self.finish(&mut completed.response);
+            }
+            ResponseStreamEvent::ResponseIncomplete(incomplete) => {
+                self.finish(&mut incomplete.response);
+            }
+            ResponseStreamEvent::ResponseFailed(failed) => self.finish(&mut failed.response),
+            _ => {}
+        }
+
+        // Every event has a `sequence_number`, and every event about one output item has an
+        // `output_index`. Renumbering them on the serialized event covers every event type.
+        let Ok(mut value) = serde_json::to_value(&event) else {
+            return Some(event);
+        };
+        if let Some(index) = value.get("output_index").and_then(Value::as_u64) {
+            if self.hidden_indexes.contains(&index) {
+                return None;
+            }
+            if let Some(client_index) = self.output_indexes.get(&index) {
+                value["output_index"] = json!(client_index);
+            }
+        }
+        value["sequence_number"] = json!(self.sequence_number);
+        self.sequence_number += 1;
+        Some(serde_json::from_value(value).unwrap_or(event))
+    }
+
+    /// Ends a round that ran Spice tools: the next round continues the client's response.
+    fn end_round(&mut self, response: Response) {
+        let hidden_indexes = std::mem::take(&mut self.hidden_indexes);
+        self.earlier_output.extend(
+            response
+                .output
+                .into_iter()
+                .zip(0_u64..)
+                .filter(|(_, index)| !hidden_indexes.contains(index))
+                .map(|(item, _)| item),
+        );
+        self.earlier_usage = combine_usage(self.earlier_usage.take(), response.usage);
+        self.output_indexes.clear();
+        self.tool_rounds += 1;
+    }
+
+    /// Makes `response`, the last round's, the response to the whole loop, as
+    /// [`with_earlier_rounds`] does, less the Spice tool calls the client was not sent.
+    fn finish(&mut self, response: &mut Response) {
+        let mut output = std::mem::take(&mut self.earlier_output);
+        output.extend(
+            std::mem::take(&mut response.output)
+                .into_iter()
+                .zip(0_u64..)
+                .filter(|(_, index)| !self.hidden_indexes.contains(index))
+                .map(|(item, _)| item),
+        );
+        response.output = output;
+        response.usage = combine_usage(self.earlier_usage.take(), response.usage.take());
+    }
+}
+
+/// The response a `response.completed` or `response.incomplete` event ends a round with.
+fn ended_response(event: &ResponseStreamEvent) -> Option<&Response> {
+    match event {
+        ResponseStreamEvent::ResponseCompleted(completed) => Some(&completed.response),
+        ResponseStreamEvent::ResponseIncomplete(incomplete) => Some(&incomplete.response),
+        _ => None,
+    }
+}
+
 fn make_responses_stream(
     span: Span,
     request_context: Arc<RequestContext>,
     model: ToolUsingResponses,
-    req: CreateResponse,
+    mut req: CreateResponse,
     mut s: ResponseStream,
 ) -> ResponseStream {
     let (sender, receiver) = mpsc::channel(100);
-    let sender_clone = sender;
 
     tokio::spawn(
         request_context
             .scope(async move {
-                let function_call_builders: Arc<Mutex<HashMap<String, FunctionToolCall>>> =
-                    Arc::new(Mutex::new(HashMap::new()));
-                let ready_to_call_functions: Arc<Mutex<Vec<FunctionToolCall>>> =
-                    Arc::new(Mutex::new(Vec::new()));
-
+                let mut client_stream = ClientStream::default();
+                // The rounds that may still run Spice tools; `None` for no limit.
+                let mut tool_rounds_left = model.recursion_limit;
                 let mut captured_output = String::new();
 
-                while let Some(result) = s.next().await {
-                    let response_event = match result {
-                        Ok(event) => event,
-                        Err(e) => {
-                            if let Err(e) = sender_clone.send(Err(e)).await
-                                && !sender_clone.is_closed()
-                            {
-                                tracing::error!("Unable to send error to response stream: {}", e);
+                loop {
+                    let runs_tools = tool_rounds_left != Some(0);
+                    let hide = |item: &OutputItem| runs_tools && model.is_spice_tool_call(item);
+                    // The round's last event, held back until it is known whether the round runs
+                    // Spice tools.
+                    let mut last_event = None;
+
+                    while let Some(result) = s.next().await {
+                        let event = match result {
+                            Ok(event) => event,
+                            Err(e) => {
+                                let _ = sender.send(Err(e)).await;
+                                return;
                             }
+                        };
+                        if let ResponseStreamEvent::ResponseOutputTextDelta(delta) = &event {
+                            captured_output.push_str(&delta.delta);
+                        }
+                        if runs_tools && ended_response(&event).is_some() {
+                            last_event = Some(event);
+                            break;
+                        }
+                        if let Some(event) = client_stream.event(event, hide)
+                            && sender.send(Ok(event)).await.is_err()
+                        {
+                            // The client went away.
+                            return;
+                        }
+                    }
+
+                    let Some(last_event) = last_event else {
+                        break;
+                    };
+                    let Some(response) = ended_response(&last_event) else {
+                        break;
+                    };
+                    let Some(next_input) = model
+                        .run_spice_tool_calls(to_input_item(req.input.clone()), &response.output)
+                        .await
+                    else {
+                        // The round called no Spice tool, so it is the last.
+                        if let Some(event) = client_stream.event(last_event, hide) {
+                            let _ = sender.send(Ok(event)).await;
+                        }
+                        break;
+                    };
+
+                    req = create_new_recursive_req(&req, next_input, response.usage.as_ref());
+                    client_stream.end_round(response.clone());
+                    tool_rounds_left = tool_rounds_left.map(|rounds| rounds - 1);
+                    s = match model.inner_responses.responses_stream(req.clone()).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            let _ = sender.send(Err(e)).await;
                             return;
                         }
                     };
-
-                    let mut should_forward = true;
-                    let mut should_process_tools = false;
-
-                    match &response_event {
-                        ResponseStreamEvent::ResponseOutputTextDelta(delta) => {
-                            captured_output.push_str(&delta.delta);
-                        }
-                        ResponseStreamEvent::ResponseOutputItemAdded(item_added) => {
-                            if let OutputItem::FunctionCall(function_call) = &item_added.item {
-                                let function_call_builders_clone =
-                                    Arc::clone(&function_call_builders);
-                                let Ok(mut builders_lock) = function_call_builders_clone.lock()
-                                else {
-                                    return;
-                                };
-
-                                builders_lock
-                                    .insert(function_call.call_id.clone(), function_call.clone());
-                                should_forward = false;
-                            }
-                        }
-                        ResponseStreamEvent::ResponseFunctionCallArgumentsDelta(delta) => {
-                            let function_call_builders_clone = Arc::clone(&function_call_builders);
-                            let Ok(mut builders_lock) = function_call_builders_clone.lock() else {
-                                return;
-                            };
-
-                            if let Some(state) = builders_lock.get_mut(&delta.item_id) {
-                                state.arguments.push_str(&delta.delta);
-                            }
-                        }
-                        ResponseStreamEvent::ResponseFunctionCallArgumentsDone(done) => {
-                            let function_call_builders_clone = Arc::clone(&function_call_builders);
-                            let Ok(builders_lock) = function_call_builders_clone.lock() else {
-                                return;
-                            };
-
-                            if let Some(function_call) = builders_lock.get(&done.item_id) {
-                                // Move function call to the ready to call list
-                                let ready_to_call = Arc::clone(&ready_to_call_functions);
-                                let Ok(mut ready_to_call_lock) = ready_to_call.lock() else {
-                                    return;
-                                };
-                                ready_to_call_lock.push(function_call.clone());
-                            }
-                        }
-                        ResponseStreamEvent::ResponseOutputItemDone(item_done) => {
-                            // When an output item (like a function call) is done, just note it but don't process tools yet
-                            // Tool processing will happen when the entire response is complete
-                            if let OutputItem::FunctionCall(function_call) = &item_done.item {
-                                // Don't forward individual function call completion events for Spice tools
-                                // We'll handle them when the entire response completes
-                                let ready_to_call_clone = Arc::clone(&ready_to_call_functions);
-                                let spice_tool_found = {
-                                    let Ok(ready_to_call_lock) = ready_to_call_clone.lock() else {
-                                        return;
-                                    };
-
-                                    ready_to_call_lock
-                                        .iter()
-                                        .find(|call| call.id == function_call.id)
-                                        .is_some_and(|call| {
-                                            model.as_spiced_tool(&call.name).is_some()
-                                        })
-                                };
-
-                                if spice_tool_found {
-                                    // This is a Spice tool - don't forward this event but don't process yet
-                                    should_forward = false;
-                                    // Don't set should_process_tools = true here - wait for response completion
-                                }
-                            }
-                        }
-                        ResponseStreamEvent::ResponseCompleted(_)
-                        | ResponseStreamEvent::ResponseIncomplete(_)
-                            // Only process tools if we haven't already done so and there are spice tools
-                            if !should_process_tools => {
-                                let ready_to_call_clone = Arc::clone(&ready_to_call_functions);
-                                let has_spice_tools = {
-                                    let Ok(ready_to_call_lock) = ready_to_call_clone.lock() else {
-                                        return;
-                                    };
-
-                                    ready_to_call_lock
-                                        .iter()
-                                        .any(|call| model.as_spiced_tool(&call.name).is_some())
-                                };
-
-                                if has_spice_tools {
-                                    should_forward = false;
-                                    should_process_tools = true;
-                                }
-                            }
-                        _ => {}
-                    }
-
-                    // Process completed spiced tool calls when response is complete
-                    if should_process_tools {
-                        let ready_to_call_clone = Arc::clone(&ready_to_call_functions);
-                        let spice_tools: Vec<FunctionToolCall> = {
-                            let Ok(ready_to_call_lock) = ready_to_call_clone.lock() else {
-                                return;
-                            };
-
-                            ready_to_call_lock
-                                .iter()
-                                .filter(|call| model.as_spiced_tool(&call.name).is_some())
-                                .cloned()
-                                .collect()
-                        }; // Lock is dropped here
-
-                        if spice_tools.is_empty() {
-                            // No spice tools, forward the completion event normally
-                            if let Err(e) = sender_clone.send(Ok(response_event)).await
-                                && !sender_clone.is_closed()
-                            {
-                                tracing::error!("Error sending event: {}", e);
-                            }
-                        } else {
-                            // Process spice tools - don't forward the completion event
-                            let new_messages = match model
-                                .process_tool_calls_and_run_spice_tools(
-                                    to_input_item(req.input.clone()),
-                                    spice_tools,
-                                )
-                                .await
-                            {
-                                Ok(Some(messages)) => messages,
-                                Ok(None) => {
-                                    // No spice tools within returned tools, forward the event
-                                    if let Err(e) = sender_clone.send(Ok(response_event)).await
-                                        && !sender_clone.is_closed()
-                                    {
-                                        tracing::error!("Error sending event: {}", e);
-                                    }
-                                    continue;
-                                }
-                                Err(e) => {
-                                    if let Err(e) = sender_clone.send(Err(e)).await
-                                        && !sender_clone.is_closed()
-                                    {
-                                        tracing::error!("Error sending error: {}", e);
-                                    }
-                                    return;
-                                }
-                            };
-
-                            // Make recursive call for tool results
-                            match model
-                                .responses_stream_inner(
-                                    create_new_recursive_req(&req, new_messages, None),
-                                    model.recursion_limit.map(|r| r - 1),
-                                )
-                                .await
-                            {
-                                Ok(mut recursive_stream) => {
-                                    while let Some(recursive_result) = recursive_stream.next().await
-                                    {
-                                        if let Err(e) = sender_clone.send(recursive_result).await {
-                                            if !sender_clone.is_closed() {
-                                                tracing::error!(
-                                                    "Error sending recursive event: {}",
-                                                    e
-                                                );
-                                            }
-                                            return;
-                                        }
-                                    }
-                                    // Continue processing the original stream after recursive stream completes
-                                }
-                                Err(e) => {
-                                    if let Err(e) = sender_clone.send(Err(e)).await
-                                        && !sender_clone.is_closed()
-                                    {
-                                        tracing::error!("Error sending recursive error: {}", e);
-                                    }
-                                    return;
-                                }
-                            }
-                        }
-                    } else if should_forward {
-                        // Forward the event normally
-                        if let Err(e) = sender_clone.send(Ok(response_event)).await
-                            && !sender_clone.is_closed()
-                        {
-                            tracing::error!("Error sending event: {}", e);
-                        }
-                    }
                 }
 
                 tracing::info!(target: "task_history", captured_output = %captured_output);
@@ -732,6 +725,21 @@ fn to_input_item(input: InputParam) -> Vec<InputItem> {
     }
 }
 
+/// `response`, the last round's, as the response to the whole tool-use loop: the output of the
+/// earlier rounds comes first, and the usage covers every round. It keeps the last round's ID,
+/// the response whose input holds the whole exchange, so that a client continuing with
+/// `previous_response_id` continues from all of it.
+fn with_earlier_rounds(
+    mut response: Response,
+    mut earlier_output: Vec<OutputItem>,
+    earlier_usage: Option<ResponseUsage>,
+) -> Response {
+    earlier_output.append(&mut response.output);
+    response.output = earlier_output;
+    response.usage = combine_usage(earlier_usage, response.usage);
+    response
+}
+
 pub fn combine_usage(
     u1: Option<ResponseUsage>,
     u2: Option<ResponseUsage>,
@@ -760,8 +768,443 @@ pub fn combine_usage(
 mod tests {
     use super::*;
     use async_openai::types::responses::{
-        ToolChoiceAllowed, ToolChoiceCustom, ToolChoiceFunction, ToolChoiceTypes,
+        CreateResponseArgs, ToolChoiceAllowed, ToolChoiceCustom, ToolChoiceFunction,
+        ToolChoiceTypes,
     };
+    use parking_lot::Mutex;
+    use std::borrow::Cow;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A `list_datasets` Spice tool that counts its calls.
+    struct ListDatasets(AtomicUsize);
+
+    #[async_trait]
+    impl SpiceModelTool for ListDatasets {
+        fn name(&self) -> Cow<'_, str> {
+            "list_datasets".into()
+        }
+
+        fn description(&self) -> Option<Cow<'_, str>> {
+            None
+        }
+
+        fn parameters(&self) -> Option<Value> {
+            None
+        }
+
+        async fn call(
+            &self,
+            _arg: &str,
+        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(json!(["taxi_trips"]))
+        }
+    }
+
+    /// A provider whose response in round `n` outputs the items in `rounds[n]`: a text message for
+    /// `"message"`, else a call to the function by that name. Once `rounds` runs out, it answers
+    /// with a message. It records every request.
+    struct ScriptedResponses {
+        rounds: Vec<Vec<&'static str>>,
+        requests: Mutex<Vec<CreateResponse>>,
+    }
+
+    impl ScriptedResponses {
+        fn new(rounds: Vec<Vec<&'static str>>) -> Arc<Self> {
+            Arc::new(Self {
+                rounds,
+                requests: Mutex::new(Vec::new()),
+            })
+        }
+
+        /// Records `req`, and returns its round and the items its response outputs.
+        fn next_round(&self, req: CreateResponse) -> (usize, Vec<&'static str>) {
+            let mut requests = self.requests.lock();
+            requests.push(req);
+            let round = requests.len() - 1;
+            let items = self
+                .rounds
+                .get(round)
+                .cloned()
+                .unwrap_or_else(|| vec!["message"]);
+            (round, items)
+        }
+
+        /// The input of request `round`.
+        fn input(&self, round: usize) -> Value {
+            serde_json::to_value(&self.requests.lock()[round].input).expect("a serializable input")
+        }
+    }
+
+    #[async_trait]
+    impl Responses for ScriptedResponses {
+        async fn health(&self) -> Result<(), ResponsesError> {
+            Ok(())
+        }
+
+        async fn responses_stream(
+            &self,
+            req: CreateResponse,
+        ) -> Result<ResponseStream, OpenAIError> {
+            let (round, items) = self.next_round(req);
+            Ok(Box::pin(futures::stream::iter(
+                round_events(round, &items).into_iter().map(Ok),
+            )))
+        }
+
+        async fn responses_request(&self, req: CreateResponse) -> Result<Response, OpenAIError> {
+            let (round, items) = self.next_round(req);
+            Ok(
+                serde_json::from_value(response(round, "completed", &output(round, &items)))
+                    .expect("a valid response"),
+            )
+        }
+    }
+
+    /// Output item `index` of round `round`: a text message for `"message"`, else a call to the
+    /// function by that name.
+    fn item(round: usize, index: usize, name: &str, status: &str) -> Value {
+        let done = status == "completed";
+        if name == "message" {
+            let text = json!([{
+                "type": "output_text", "text": "taxi_trips", "annotations": [], "logprobs": null,
+            }]);
+            json!({
+                "type": "message", "id": format!("msg_{round}_{index}"), "role": "assistant",
+                "status": status, "content": if done { text } else { json!([]) },
+            })
+        } else {
+            json!({
+                "type": "function_call", "id": format!("fc_{round}_{index}"),
+                "call_id": format!("call_{round}_{index}"), "name": name,
+                "arguments": if done { "{}" } else { "" }, "status": status,
+            })
+        }
+    }
+
+    fn output(round: usize, items: &[&str]) -> Vec<Value> {
+        items
+            .iter()
+            .enumerate()
+            .map(|(index, name)| item(round, index, name, "completed"))
+            .collect()
+    }
+
+    /// Round `round`'s response. A completed one reports 11 tokens of usage.
+    fn response(round: usize, status: &str, output: &[Value]) -> Value {
+        let mut response = json!({
+            "id": format!("resp_{round}"), "object": "response", "created_at": 0,
+            "model": "scripted", "status": status, "output": output,
+        });
+        if status == "completed" {
+            response["usage"] = json!({
+                "input_tokens": 10, "input_tokens_details": { "cached_tokens": 0 },
+                "output_tokens": 1, "output_tokens_details": { "reasoning_tokens": 0 },
+                "total_tokens": 11,
+            });
+        }
+        response
+    }
+
+    /// The events of round `round`'s response, in the order `OpenAI` streams them.
+    fn round_events(round: usize, items: &[&str]) -> Vec<ResponseStreamEvent> {
+        let mut events = vec![json!({
+            "type": "response.created", "response": response(round, "in_progress", &[]),
+        })];
+        for (index, name) in items.iter().enumerate() {
+            let item_id = item(round, index, name, "completed")["id"].clone();
+            events.push(json!({
+                "type": "response.output_item.added", "output_index": index,
+                "item": item(round, index, name, "in_progress"),
+            }));
+            if *name == "message" {
+                events.push(json!({
+                    "type": "response.output_text.delta", "item_id": item_id,
+                    "output_index": index, "content_index": 0, "delta": "taxi_trips",
+                }));
+            } else {
+                events.extend([
+                    json!({
+                        "type": "response.function_call_arguments.delta", "item_id": item_id,
+                        "output_index": index, "delta": "{}",
+                    }),
+                    json!({
+                        "type": "response.function_call_arguments.done", "item_id": item_id,
+                        "output_index": index, "arguments": "{}",
+                    }),
+                ]);
+            }
+            events.push(json!({
+                "type": "response.output_item.done", "output_index": index,
+                "item": item(round, index, name, "completed"),
+            }));
+        }
+        events.push(json!({
+            "type": "response.completed",
+            "response": response(round, "completed", &output(round, items)),
+        }));
+        events
+            .into_iter()
+            .enumerate()
+            .map(|(sequence_number, mut event)| {
+                event["sequence_number"] = json!(sequence_number);
+                serde_json::from_value(event).expect("a valid stream event")
+            })
+            .collect()
+    }
+
+    fn model(
+        provider: &Arc<ScriptedResponses>,
+        tool: &Arc<ListDatasets>,
+        recursion_limit: Option<usize>,
+    ) -> ToolUsingResponses {
+        ToolUsingResponses::new(
+            Arc::clone(provider) as Arc<dyn Responses>,
+            vec![],
+            vec![Arc::clone(tool) as Arc<dyn SpiceModelTool>],
+            recursion_limit,
+        )
+    }
+
+    fn request(stream: bool) -> CreateResponse {
+        CreateResponseArgs::default()
+            .model("scripted")
+            .input("What datasets do you have access to?")
+            .stream(stream)
+            .build()
+            .expect("a valid request")
+    }
+
+    /// The events the client receives for a streamed request.
+    async fn stream_through_spice(
+        provider: &Arc<ScriptedResponses>,
+        tool: &Arc<ListDatasets>,
+        recursion_limit: Option<usize>,
+    ) -> Vec<Value> {
+        model(provider, tool, recursion_limit)
+            .responses_stream(request(true))
+            .await
+            .expect("a response stream")
+            .map(|event| {
+                serde_json::to_value(event.expect("an event, not an error"))
+                    .expect("a serializable event")
+            })
+            .collect()
+            .await
+    }
+
+    /// Each event, as its type plus the item's name or type, or else the output index the event
+    /// belongs to.
+    fn summary(events: &[Value]) -> Vec<String> {
+        events
+            .iter()
+            .map(|event| {
+                let event_type = event["type"].as_str().unwrap_or_default();
+                match (
+                    event["item"]["name"].as_str(),
+                    event["item"]["type"].as_str(),
+                    event["output_index"].as_u64(),
+                ) {
+                    (Some(name), _, _) => format!("{event_type} {name}"),
+                    (None, Some(item_type), _) => format!("{event_type} {item_type}"),
+                    (None, None, Some(index)) => format!("{event_type} #{index}"),
+                    (None, None, None) => event_type.to_string(),
+                }
+            })
+            .collect()
+    }
+
+    fn user_message() -> Value {
+        json!({ "type": "message", "role": "user", "content": "What datasets do you have access to?" })
+    }
+
+    fn tool_result(round: usize, index: usize) -> Value {
+        json!({
+            "type": "function_call_output", "call_id": format!("call_{round}_{index}"),
+            "output": "[\"taxi_trips\"]",
+        })
+    }
+
+    // regression test for #14905
+    #[tokio::test]
+    async fn test_streamed_spice_tool_call_runs_unseen_by_the_client() {
+        let provider = ScriptedResponses::new(vec![vec!["list_datasets"]]);
+        let tool = Arc::new(ListDatasets(AtomicUsize::new(0)));
+
+        assert_eq!(
+            summary(&stream_through_spice(&provider, &tool, None).await),
+            [
+                "response.created",
+                "response.output_item.added message",
+                "response.output_text.delta #0",
+                "response.output_item.done message",
+                "response.completed",
+            ]
+        );
+        assert_eq!(tool.0.load(Ordering::SeqCst), 1);
+
+        // The follow-up request replays the round's output, and pairs the call with its result by
+        // `call_id`.
+        assert_eq!(provider.requests.lock().len(), 2);
+        assert_eq!(
+            provider.input(1),
+            json!([
+                user_message(),
+                item(0, 0, "list_datasets", "completed"),
+                tool_result(0, 0)
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_streamed_client_tool_call_reaches_the_client_whole() {
+        let provider = ScriptedResponses::new(vec![vec!["client_tool", "list_datasets"]]);
+        let tool = Arc::new(ListDatasets(AtomicUsize::new(0)));
+
+        let events = stream_through_spice(&provider, &tool, None).await;
+        assert_eq!(
+            summary(&events),
+            [
+                "response.created",
+                "response.output_item.added client_tool",
+                "response.function_call_arguments.delta #0",
+                "response.function_call_arguments.done #0",
+                "response.output_item.done client_tool",
+                "response.output_item.added message",
+                "response.output_text.delta #1",
+                "response.output_item.done message",
+                "response.completed",
+            ]
+        );
+        assert_eq!(tool.0.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            events
+                .last()
+                .map(|completed| completed["response"]["output"].clone()),
+            Some(json!([
+                item(0, 0, "client_tool", "completed"),
+                item(1, 0, "message", "completed")
+            ]))
+        );
+
+        // The next round has no result for the client's call, so it is not replayed.
+        assert_eq!(
+            provider.input(1),
+            json!([
+                user_message(),
+                item(0, 1, "list_datasets", "completed"),
+                tool_result(0, 1)
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_streamed_tool_rounds_reach_the_client_as_one_response() {
+        // Round 0 says something before it calls `list_datasets`; round 1 answers.
+        let provider = ScriptedResponses::new(vec![vec!["message", "list_datasets"]]);
+        let tool = Arc::new(ListDatasets(AtomicUsize::new(0)));
+
+        let events = stream_through_spice(&provider, &tool, None).await;
+        assert_eq!(
+            summary(&events),
+            [
+                "response.created",
+                "response.output_item.added message",
+                "response.output_text.delta #0",
+                "response.output_item.done message",
+                "response.output_item.added message",
+                "response.output_text.delta #1",
+                "response.output_item.done message",
+                "response.completed",
+            ]
+        );
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event["sequence_number"].as_u64())
+                .collect_vec(),
+            (0..8).map(Some).collect_vec()
+        );
+
+        // The response completes as the last round's, with every item the client was sent and
+        // every round's usage.
+        let completed = &events[7]["response"];
+        assert_eq!(completed["id"], "resp_1");
+        assert_eq!(
+            completed["output"],
+            json!([
+                item(0, 0, "message", "completed"),
+                item(1, 0, "message", "completed")
+            ])
+        );
+        assert_eq!(completed["usage"]["total_tokens"], 22);
+
+        assert_eq!(
+            provider.input(1),
+            json!([
+                user_message(),
+                item(0, 0, "message", "completed"),
+                item(0, 1, "list_datasets", "completed"),
+                tool_result(0, 1)
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_tool_rounds_return_one_response() {
+        let provider = ScriptedResponses::new(vec![vec!["message", "list_datasets"]]);
+        let tool = Arc::new(ListDatasets(AtomicUsize::new(0)));
+
+        let response = serde_json::to_value(
+            model(&provider, &tool, None)
+                .responses_request(request(false))
+                .await
+                .expect("a response"),
+        )
+        .expect("a serializable response");
+
+        assert_eq!(tool.0.load(Ordering::SeqCst), 1);
+        assert_eq!(response["id"], "resp_1");
+        assert_eq!(
+            response["output"],
+            json!([
+                item(0, 0, "message", "completed"),
+                item(1, 0, "message", "completed")
+            ])
+        );
+        assert_eq!(response["usage"]["total_tokens"], 22);
+        assert_eq!(
+            provider.input(1),
+            json!([
+                user_message(),
+                item(0, 0, "message", "completed"),
+                item(0, 1, "list_datasets", "completed"),
+                tool_result(0, 1)
+            ])
+        );
+    }
+
+    // regression test for #14631
+    #[tokio::test]
+    async fn test_streamed_tool_rounds_follow_the_recursion_limit() {
+        for limit in [1, 2, 3, 10] {
+            // The provider calls `list_datasets` in every round.
+            let provider = ScriptedResponses::new(vec![vec!["list_datasets"]; limit + 1]);
+            let tool = Arc::new(ListDatasets(AtomicUsize::new(0)));
+
+            let events = stream_through_spice(&provider, &tool, Some(limit)).await;
+
+            // As in `responses_request_inner`: `limit` rounds run Spice tools, and the round
+            // after them returns the model's response as is.
+            assert_eq!(tool.0.load(Ordering::SeqCst), limit, "limit {limit}");
+            assert_eq!(provider.requests.lock().len(), limit + 1, "limit {limit}");
+            assert_eq!(
+                events.last().map(|event| event["type"].clone()),
+                Some(json!("response.completed")),
+                "limit {limit}"
+            );
+        }
+    }
 
     fn allowed_tools(mode: ToolChoiceAllowedMode) -> ToolChoiceParam {
         ToolChoiceParam::AllowedTools(ToolChoiceAllowed {
