@@ -31,6 +31,7 @@ use llms::responses::Error as ResponsesError;
 use llms::responses::Responses;
 use llms::{chat::Error as LlmError, progress::Progress};
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -447,6 +448,10 @@ fn make_responses_stream(
             .scope(async move {
                 // The Spice tool calls in this response, run once the response completes.
                 let mut spice_tool_calls: Vec<FunctionToolCall> = Vec::new();
+                // The output indexes of those calls. None of a Spice tool call's events reach the
+                // client: an argument event for an item it never saw added breaks SDK stream
+                // accumulators.
+                let mut spice_tool_call_indexes: HashSet<u32> = HashSet::new();
 
                 let mut captured_output = String::new();
 
@@ -471,7 +476,20 @@ fn make_responses_stream(
                             captured_output.push_str(&delta.delta);
                         }
                         ResponseStreamEvent::ResponseOutputItemAdded(item_added) => {
-                            if matches!(item_added.item, OutputItem::FunctionCall(_)) {
+                            if let OutputItem::FunctionCall(function_call) = &item_added.item
+                                && model.as_spiced_tool(&function_call.name).is_some()
+                            {
+                                spice_tool_call_indexes.insert(item_added.output_index);
+                                should_forward = false;
+                            }
+                        }
+                        ResponseStreamEvent::ResponseFunctionCallArgumentsDelta(delta) => {
+                            if spice_tool_call_indexes.contains(&delta.output_index) {
+                                should_forward = false;
+                            }
+                        }
+                        ResponseStreamEvent::ResponseFunctionCallArgumentsDone(done) => {
+                            if spice_tool_call_indexes.contains(&done.output_index) {
                                 should_forward = false;
                             }
                         }
@@ -525,11 +543,12 @@ fn make_responses_stream(
                             }
                         };
 
-                        // Make recursive call for tool results
+                        // Make recursive call for tool results. `model` already carries the
+                        // limit decremented for this round.
                         match model
                             .responses_stream_inner(
                                 create_new_recursive_req(&req, new_messages, None),
-                                model.recursion_limit.map(|r| r - 1),
+                                model.recursion_limit,
                             )
                             .await
                         {
@@ -671,8 +690,295 @@ pub fn combine_usage(
 mod tests {
     use super::*;
     use async_openai::types::responses::{
-        ToolChoiceAllowed, ToolChoiceCustom, ToolChoiceFunction, ToolChoiceTypes,
+        CreateResponseArgs, ToolChoiceAllowed, ToolChoiceCustom, ToolChoiceFunction,
+        ToolChoiceTypes,
     };
+    use parking_lot::Mutex;
+    use std::borrow::Cow;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A `list_datasets` Spice tool that counts its calls.
+    struct ListDatasets(AtomicUsize);
+
+    #[async_trait]
+    impl SpiceModelTool for ListDatasets {
+        fn name(&self) -> Cow<'_, str> {
+            "list_datasets".into()
+        }
+
+        fn description(&self) -> Option<Cow<'_, str>> {
+            None
+        }
+
+        fn parameters(&self) -> Option<Value> {
+            None
+        }
+
+        async fn call(
+            &self,
+            _arg: &str,
+        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+            self.0.fetch_add(1, Ordering::SeqCst);
+            Ok(json!(["taxi_trips"]))
+        }
+    }
+
+    /// A provider whose streamed response in round `n` calls the functions in `calls[n]`, and
+    /// answers with text once `calls` runs out. It records every request.
+    struct ScriptedResponses {
+        calls: Vec<Vec<&'static str>>,
+        requests: Mutex<Vec<CreateResponse>>,
+    }
+
+    impl ScriptedResponses {
+        fn new(calls: Vec<Vec<&'static str>>) -> Arc<Self> {
+            Arc::new(Self {
+                calls,
+                requests: Mutex::new(Vec::new()),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl Responses for ScriptedResponses {
+        async fn health(&self) -> Result<(), ResponsesError> {
+            Ok(())
+        }
+
+        async fn responses_stream(
+            &self,
+            req: CreateResponse,
+        ) -> Result<ResponseStream, OpenAIError> {
+            let round = {
+                let mut requests = self.requests.lock();
+                requests.push(req);
+                requests.len() - 1
+            };
+            let events = match self.calls.get(round) {
+                Some(names) => function_call_events(round, names),
+                None => text_events(round),
+            };
+            Ok(Box::pin(futures::stream::iter(events.into_iter().map(Ok))))
+        }
+
+        async fn responses_request(&self, _req: CreateResponse) -> Result<Response, OpenAIError> {
+            Err(OpenAIError::InvalidArgument(
+                "only streamed responses are scripted".to_string(),
+            ))
+        }
+    }
+
+    fn response(round: usize, status: &str, output: &[Value]) -> Value {
+        json!({
+            "id": format!("resp_{round}"), "object": "response", "created_at": 0,
+            "model": "scripted", "status": status, "output": output,
+        })
+    }
+
+    fn numbered(events: Vec<Value>) -> Vec<ResponseStreamEvent> {
+        events
+            .into_iter()
+            .enumerate()
+            .map(|(sequence_number, mut event)| {
+                event["sequence_number"] = json!(sequence_number);
+                serde_json::from_value(event).expect("a valid stream event")
+            })
+            .collect()
+    }
+
+    /// The events of a response that calls `names`, in the order `OpenAI` streams them.
+    fn function_call_events(round: usize, names: &[&str]) -> Vec<ResponseStreamEvent> {
+        let call = |index: usize, name: &str, status: &str, arguments: &str| {
+            json!({
+                "type": "function_call", "id": format!("fc_{round}_{index}"),
+                "call_id": format!("call_{round}_{index}"), "name": name,
+                "arguments": arguments, "status": status,
+            })
+        };
+        let mut events = vec![json!({
+            "type": "response.created", "response": response(round, "in_progress", &[]),
+        })];
+        for (index, name) in names.iter().enumerate() {
+            let item_id = format!("fc_{round}_{index}");
+            events.extend([
+                json!({
+                    "type": "response.output_item.added", "output_index": index,
+                    "item": call(index, name, "in_progress", ""),
+                }),
+                json!({
+                    "type": "response.function_call_arguments.delta", "item_id": item_id,
+                    "output_index": index, "delta": "{}",
+                }),
+                json!({
+                    "type": "response.function_call_arguments.done", "item_id": item_id,
+                    "output_index": index, "arguments": "{}",
+                }),
+                json!({
+                    "type": "response.output_item.done", "output_index": index,
+                    "item": call(index, name, "completed", "{}"),
+                }),
+            ]);
+        }
+        let output = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| call(index, name, "completed", "{}"))
+            .collect_vec();
+        events.push(json!({
+            "type": "response.completed", "response": response(round, "completed", &output),
+        }));
+        numbered(events)
+    }
+
+    /// The events of a response that answers with text.
+    fn text_events(round: usize) -> Vec<ResponseStreamEvent> {
+        let message = |status: &str, content: Value| {
+            json!({
+                "type": "message", "id": format!("msg_{round}"), "role": "assistant",
+                "status": status, "content": content,
+            })
+        };
+        let text = json!([{ "type": "output_text", "text": "taxi_trips", "annotations": [] }]);
+        numbered(vec![
+            json!({ "type": "response.created", "response": response(round, "in_progress", &[]) }),
+            json!({
+                "type": "response.output_item.added", "output_index": 0,
+                "item": message("in_progress", json!([])),
+            }),
+            json!({
+                "type": "response.output_text.delta", "item_id": format!("msg_{round}"),
+                "output_index": 0, "content_index": 0, "delta": "taxi_trips",
+            }),
+            json!({
+                "type": "response.output_item.done", "output_index": 0,
+                "item": message("completed", text.clone()),
+            }),
+            json!({
+                "type": "response.completed",
+                "response": response(round, "completed", &[message("completed", text)]),
+            }),
+        ])
+    }
+
+    /// Each event the client receives, as its type plus the item's name or type, or else the
+    /// output index the event belongs to.
+    async fn stream_through_spice(
+        provider: &Arc<ScriptedResponses>,
+        tool: &Arc<ListDatasets>,
+        recursion_limit: Option<usize>,
+    ) -> Vec<String> {
+        let model = ToolUsingResponses::new(
+            Arc::clone(provider) as Arc<dyn Responses>,
+            vec![],
+            vec![Arc::clone(tool) as Arc<dyn SpiceModelTool>],
+            recursion_limit,
+        );
+        let req = CreateResponseArgs::default()
+            .model("scripted")
+            .input("What datasets do you have access to?")
+            .stream(true)
+            .build()
+            .expect("a valid request");
+        model
+            .responses_stream(req)
+            .await
+            .expect("a response stream")
+            .map(|event| {
+                let event = serde_json::to_value(event.expect("an event, not an error"))
+                    .expect("a serializable event");
+                let event_type = event["type"].as_str().unwrap_or_default();
+                match (
+                    event["item"]["name"].as_str(),
+                    event["item"]["type"].as_str(),
+                    event["output_index"].as_u64(),
+                ) {
+                    (Some(name), _, _) => format!("{event_type} {name}"),
+                    (None, Some(item_type), _) => format!("{event_type} {item_type}"),
+                    (None, None, Some(index)) => format!("{event_type} #{index}"),
+                    (None, None, None) => event_type.to_string(),
+                }
+            })
+            .collect()
+            .await
+    }
+
+    // regression test for #14905
+    #[tokio::test]
+    async fn test_streamed_spice_tool_call_runs_unseen_by_the_client() {
+        let provider = ScriptedResponses::new(vec![vec!["list_datasets"]]);
+        let tool = Arc::new(ListDatasets(AtomicUsize::new(0)));
+
+        assert_eq!(
+            stream_through_spice(&provider, &tool, None).await,
+            [
+                "response.created",
+                "response.created",
+                "response.output_item.added message",
+                "response.output_text.delta #0",
+                "response.output_item.done message",
+                "response.completed",
+            ]
+        );
+        assert_eq!(tool.0.load(Ordering::SeqCst), 1);
+
+        // The follow-up request pairs the call with its output by `call_id`, and leaves the item
+        // IDs to the provider.
+        let requests = provider.requests.lock();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            serde_json::to_value(&requests[1].input).expect("a serializable input"),
+            json!([
+                { "type": "message", "role": "user", "content": "What datasets do you have access to?" },
+                { "type": "function_call", "call_id": "call_0_0", "name": "list_datasets", "arguments": "{}" },
+                { "type": "function_call_output", "call_id": "call_0_0", "output": "[\"taxi_trips\"]" },
+            ])
+        );
+    }
+
+    #[tokio::test]
+    async fn test_streamed_client_tool_call_reaches_the_client_whole() {
+        let provider = ScriptedResponses::new(vec![vec!["client_tool", "list_datasets"]]);
+        let tool = Arc::new(ListDatasets(AtomicUsize::new(0)));
+
+        assert_eq!(
+            stream_through_spice(&provider, &tool, None).await,
+            [
+                "response.created",
+                "response.output_item.added client_tool",
+                "response.function_call_arguments.delta #0",
+                "response.function_call_arguments.done #0",
+                "response.output_item.done client_tool",
+                "response.created",
+                "response.output_item.added message",
+                "response.output_text.delta #0",
+                "response.output_item.done message",
+                "response.completed",
+            ]
+        );
+        assert_eq!(tool.0.load(Ordering::SeqCst), 1);
+    }
+
+    // regression test for #14631
+    #[tokio::test]
+    async fn test_streamed_tool_rounds_follow_the_recursion_limit() {
+        for limit in [1, 2, 3, 10] {
+            // The provider calls `list_datasets` in every round.
+            let provider = ScriptedResponses::new(vec![vec!["list_datasets"]; limit + 1]);
+            let tool = Arc::new(ListDatasets(AtomicUsize::new(0)));
+
+            let events = stream_through_spice(&provider, &tool, Some(limit)).await;
+
+            // As in `responses_request_inner`: `limit` rounds run Spice tools, and the round
+            // after them returns the model's response as is.
+            assert_eq!(tool.0.load(Ordering::SeqCst), limit, "limit {limit}");
+            assert_eq!(provider.requests.lock().len(), limit + 1, "limit {limit}");
+            assert_eq!(
+                events.last().map(String::as_str),
+                Some("response.completed"),
+                "limit {limit}"
+            );
+        }
+    }
 
     fn allowed_tools(mode: ToolChoiceAllowedMode) -> ToolChoiceParam {
         ToolChoiceParam::AllowedTools(ToolChoiceAllowed {
