@@ -410,9 +410,7 @@ impl ClusterService for ClusterServiceImpl {
         let allowed_keys = expandable_secret_keys(&app);
 
         let Some(allowed_stores) = allowed_keys.get(request.key.as_str()) else {
-            // Routine: executors ask for every optional autoloaded param
-            // (e.g. `s3_region`), whether or not the app sets it.
-            tracing::debug!(
+            tracing::warn!(
                 executor_id = %request.executor_id,
                 key = %request.key,
                 "Denied cluster secret expansion: key is not referenced by the app"
