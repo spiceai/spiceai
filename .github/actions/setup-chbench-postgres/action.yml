@@ -47,8 +47,12 @@ runs:
     - name: Wait for CH-benCH PostgreSQL
       shell: bash
       run: |
+        # Probe over TCP, as the CH-benCH clients connect. The image's entrypoint
+        # first runs a temporary server on the Unix socket only, then stops it and
+        # starts the real one, so a Unix-socket probe can pass before the server
+        # the clients reach is listening.
         for _ in {1..30}; do
-          if docker exec chbench-pg pg_isready -U bench > /dev/null 2>&1; then
+          if docker exec chbench-pg pg_isready -h 127.0.0.1 -U bench > /dev/null 2>&1; then
             echo "PostgreSQL is ready"
             exit 0
           fi

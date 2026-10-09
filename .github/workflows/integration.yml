@@ -101,6 +101,7 @@ jobs:
           filters: |
             code_changes:
               - 'test/source_versions.json'
+              - 'crates/test-framework/src/source_versions.rs'
               - '.github/workflows/integration.yml'
               - 'crates/data-connectors/connector-postgres/**'
               - 'crates/data-connectors/connector-postgres-common/**'
