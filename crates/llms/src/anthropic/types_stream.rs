@@ -637,6 +637,22 @@ mod tests {
     }
 
     #[test]
+    fn thinking_deltas_deserialize_and_yield_no_chunk() {
+        for payload in [
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}"#,
+            r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"abc"}}"#,
+        ] {
+            let MessageCreateStreamResponse::ContentBlockDelta { delta, .. } =
+                serde_json::from_str(payload).expect("thinking delta should deserialize")
+            else {
+                panic!("expected a content block delta");
+            };
+            let out = delta.into_completion(Some(&MessageRole::Assistant), None);
+            assert!(out.is_none(), "{payload} must yield no chunk: {out:?}");
+        }
+    }
+
+    #[test]
     fn usage_delta_accumulates_cache_tokens() {
         let mut usage = Usage {
             input_tokens: 10,
