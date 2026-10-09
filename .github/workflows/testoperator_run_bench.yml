@@ -107,7 +107,7 @@ on:
         type: boolean
         default: true
       postgres_version:
-        description: 'PostgreSQL release line of the local postgres_tpch source (TPC-H/TPC-DS SF1/SF10): one of its versions in test/source_versions.json'
+        description: 'PostgreSQL release line of the local source: postgres_tpch (TPC-H/TPC-DS SF1/SF10) or the CH-benCH source; one of its versions in test/source_versions.json'
         required: false
         type: string
         default: '16'
@@ -429,6 +429,8 @@ jobs:
       - name: Setup CH-benCH PostgreSQL
         if: ${{ github.event.inputs.query_set == 'chbench' }}
         uses: ./.github/actions/setup-chbench-postgres
+        with:
+          version: ${{ github.event.inputs.postgres_version || '16' }}
 
       - name: Start local MinIO for DuckLake
         if: ${{ contains(github.event.inputs.spicepod_path, 'ducklake') }}

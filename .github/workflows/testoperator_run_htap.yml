@@ -1,5 +1,5 @@
 name: htap benchmark tests
-run-name: CH-BenCHmark - ${{ github.event.inputs.spicepod_path }} - SF${{ github.event.inputs.scale_factor }} - ${{ github.event.inputs.duration }}s${{ github.event.inputs.layout != '' && format(' - layout {0}', github.event.inputs.layout) || '' }}
+run-name: CH-BenCHmark - ${{ github.event.inputs.spicepod_path }} - SF${{ github.event.inputs.scale_factor }} - ${{ github.event.inputs.duration }}s${{ github.event.inputs.source_version != '' && format(' - source {0}', github.event.inputs.source_version) || '' }}${{ github.event.inputs.layout != '' && format(' - layout {0}', github.event.inputs.layout) || '' }}
 
 on:
   workflow_dispatch:

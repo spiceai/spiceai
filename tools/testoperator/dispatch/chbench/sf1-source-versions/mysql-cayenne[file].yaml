@@ -1,0 +1,12 @@
+# chbench/sf1/mysql-cayenne[file].yaml on every MySQL release line in
+# test/source_versions.json, on a runner that starts the source in Docker.
+# The HTAP gates compare Spice with the source after the binlog stream drains.
+tests:
+  htap:
+    spicepod_path: accelerated/mysql-cayenne[file].yaml
+    runner_type: spiceai-dev-large-runners
+    scale_factor: 1
+    duration: 1800
+    ready_wait: 60
+    rate: 9250
+    source_version: all
