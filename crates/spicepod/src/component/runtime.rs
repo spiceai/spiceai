@@ -571,7 +571,20 @@ pub const RETIRED_DATASET_TUNING_PARAMS: &[&str] = &[
 ];
 
 /// Catalog parameters that moved to `runtime.params` and are no longer read.
-pub const RETIRED_CATALOG_TUNING_PARAMS: &[&str] = &["cayenne_tuning", "tuning"];
+pub const RETIRED_CATALOG_TUNING_PARAMS: &[&str] = &[
+    "cayenne_tuning",
+    "tuning",
+    "cayenne_goal_replication_lag",
+    "goal_replication_lag",
+    "cayenne_goal_freshness",
+    "goal_freshness",
+    "cayenne_goal_query_latency",
+    "goal_query_latency",
+    "cayenne_goal_convergence_window",
+    "goal_convergence_window",
+    "cayenne_goal_qph",
+    "goal_qph",
+];
 
 /// `runtime.params` keys renamed without the `cayenne_` prefix, as `(old, new)`. The old
 /// names are no longer read.
@@ -2764,6 +2777,17 @@ datasets:
         assert_eq!(
             retired_tuning_param_warnings("catalog", "lake", &params, RETIRED_CATALOG_TUNING_PARAMS),
             vec!["Catalog 'lake' sets `cayenne_tuning`, which is no longer a catalog parameter, so it has no effect. Set `runtime.params.adaptive_tuning` instead. See: https://spiceai.org/docs/reference/spicepod/runtime".to_string()]
+        );
+        let params = HashMap::from([
+            ("cayenne_goal_freshness".to_string(), "5s".to_string()),
+            ("goal_qph".to_string(), "100".to_string()),
+        ]);
+        assert_eq!(
+            retired_tuning_param_warnings("catalog", "lake", &params, RETIRED_CATALOG_TUNING_PARAMS),
+            vec![
+                "Catalog 'lake' sets `cayenne_goal_freshness`, which is no longer a catalog parameter, so it has no effect. Set `runtime.params.target_freshness` instead. See: https://spiceai.org/docs/reference/spicepod/runtime".to_string(),
+                "Catalog 'lake' sets `goal_qph`, which is no longer a catalog parameter, so it has no effect. Set `runtime.params.target_qph` instead. See: https://spiceai.org/docs/reference/spicepod/runtime".to_string(),
+            ]
         );
         assert!(
             retired_tuning_param_warnings(

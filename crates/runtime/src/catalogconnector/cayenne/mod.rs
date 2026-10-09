@@ -79,9 +79,17 @@ pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("inline_flush_max_bytes")
         .description("Maximum inline IPC bytes before checkpointing inline data to Vortex. Default: 8388608.")
         .default("8388608"),
-    // Retired: tuning moved to `runtime.params.adaptive_tuning`. Listed only so `Parameters` drops
+    // Retired: tuning and the goals moved to `runtime.params` (`adaptive_tuning`, `target_*`). Listed only so `Parameters` drops
     // it without a second, generic warning; left out of the published schema.
     ParameterSpec::component("tuning").moved_to("runtime.params.adaptive_tuning"),
+    ParameterSpec::component("goal_replication_lag")
+        .moved_to("runtime.params.target_replication_lag"),
+    ParameterSpec::component("goal_freshness").moved_to("runtime.params.target_freshness"),
+    ParameterSpec::component("goal_query_latency")
+        .moved_to("runtime.params.target_query_latency"),
+    ParameterSpec::component("goal_convergence_window")
+        .moved_to("runtime.params.target_convergence_window"),
+    ParameterSpec::component("goal_qph").moved_to("runtime.params.target_qph"),
 ];
 
 /// A catalog connector for Cayenne lakehouse catalogs.
@@ -540,5 +548,47 @@ mod tests {
             !params.to_secret_map().contains_key("tuning"),
             "`cayenne_tuning` must be dropped, not carried into the catalog config"
         );
+    }
+
+    #[test]
+    fn retired_catalog_params_are_listed_so_they_are_dropped_silently() {
+        for name in [
+            "tuning",
+            "goal_replication_lag",
+            "goal_freshness",
+            "goal_query_latency",
+            "goal_convergence_window",
+            "goal_qph",
+        ] {
+            let spec = PARAMETERS
+                .iter()
+                .find(|p| p.name == name)
+                .expect("a retired catalog parameter must stay listed so it is dropped silently");
+            assert!(spec.is_retired(), "`{name}` must be retired");
+        }
+    }
+
+    #[tokio::test]
+    async fn retired_catalog_goal_params_are_not_applied() {
+        let params = Parameters::try_new(
+            "connector cayenne",
+            vec![
+                (
+                    "cayenne_goal_freshness".to_string(),
+                    SecretString::new("5s".to_string().into()),
+                ),
+                (
+                    "goal_qph".to_string(),
+                    SecretString::new("100".to_string().into()),
+                ),
+            ],
+            PREFIX,
+            Arc::new(RwLock::new(Secrets::new())),
+            PARAMETERS,
+        )
+        .await
+        .expect("a retired parameter must not fail validation");
+        let map = params.to_secret_map();
+        assert!(!map.contains_key("goal_freshness") && !map.contains_key("goal_qph"));
     }
 }

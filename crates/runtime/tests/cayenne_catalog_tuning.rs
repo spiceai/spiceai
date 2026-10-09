@@ -250,9 +250,16 @@ async fn catalog_tables_are_static_by_default() {
     ignore = "the Cayenne catalog connector requires the spicebench feature"
 )]
 async fn retired_catalog_tuning_param_warns_once_per_node_and_is_not_applied() {
-    let dynamic = catalog_table_tuning(&[], &[("cayenne_tuning", "enabled")])
-        .await
-        .dynamic_tuning;
+    let dynamic = catalog_table_tuning(
+        &[],
+        &[
+            ("cayenne_tuning", "enabled"),
+            ("cayenne_goal_freshness", "5s"),
+            ("goal_qph", "100"),
+        ],
+    )
+    .await
+    .dynamic_tuning;
     assert!(
         !dynamic,
         "the retired catalog `cayenne_tuning` must not turn the closed-loop tuner on"
@@ -265,10 +272,26 @@ async fn retired_catalog_tuning_param_warns_once_per_node_and_is_not_applied() {
         2,
         "the retired catalog param must be reported once per registering node:\n{logs}"
     );
-    assert!(
-        !logs.contains("Ignoring parameter `cayenne_tuning`"),
-        "the generic unsupported-parameter warning must not repeat it"
-    );
+    for warning in [
+        "Catalog 'tcat' sets `cayenne_goal_freshness`, which is no longer a catalog parameter, so it has no effect. Set `runtime.params.target_freshness` instead. See: https://spiceai.org/docs/reference/spicepod/runtime",
+        "Catalog 'tcat' sets `goal_qph`, which is no longer a catalog parameter, so it has no effect. Set `runtime.params.target_qph` instead. See: https://spiceai.org/docs/reference/spicepod/runtime",
+    ] {
+        assert_eq!(
+            logs.matches(warning).count(),
+            2,
+            "the retired catalog goal param must be reported once per registering node:\n{logs}"
+        );
+    }
+    for generic in [
+        "Ignoring parameter `cayenne_tuning`",
+        "Ignoring parameter `cayenne_goal_freshness`",
+        "Ignoring parameter `goal_qph`",
+    ] {
+        assert!(
+            !logs.contains(generic),
+            "the generic unsupported-parameter warning must not repeat it"
+        );
+    }
 }
 
 #[tokio::test(flavor = "multi_thread")]
