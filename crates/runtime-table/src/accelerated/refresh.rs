@@ -1038,7 +1038,10 @@ impl Refresher {
         };
         let result = match &self.cpu_runtime {
             Some(cpu_runtime) => cpu_runtime
-                .spawn(rebuild)
+                .spawn(tracing::Instrument::instrument(
+                    rebuild,
+                    tracing::Span::current(),
+                ))
                 .await
                 .unwrap_or_else(|e| Err(datafusion::error::DataFusionError::External(Box::new(e)))),
             None => rebuild.await,
