@@ -265,9 +265,10 @@ pub fn expression_support_for_engine(engine: &str) -> Option<ExpressionSupport> 
 ///   fails with `no such function` or, for `date_trunc`, a cast of the
 ///   truncated `'2026-01'` text back into a timestamp.
 ///
-/// Aggregates ([`SQLITE_UNTRANSLATABLE_AGGREGATES`]) and `LIKE` / `ILIKE` are
-/// not names the scalar deny-list can see; they are refused by
-/// [`sqlite_can_translate_aggregate`] and [`sqlite_can_evaluate_expression`].
+/// Aggregates (only [`SQLITE_AGGREGATES`] federate), windows, `LIKE` / `ILIKE`
+/// and `ROLLUP` / `CUBE` / `GROUPING SETS` are not names the scalar deny-list
+/// can see; they are gated by [`sqlite_can_translate_aggregate`],
+/// [`sqlite_can_translate_window`] and [`sqlite_can_evaluate_expression`].
 pub const SQLITE_DENIED_BUILTINS: &[&str] = &[
     crate::dialect::BTRIM_NAME,
     "upper",
@@ -295,9 +296,10 @@ pub const SQLITE_DENIED_BUILTINS: &[&str] = &[
 /// federated scan instead. That costs the pushdown for those plans and returns
 /// the right rows, which is the trade the deny-list exists to make.
 ///
-/// Casts and `LIKE`/`ILIKE` are gated by [`sqlite_can_evaluate_expression`].
-/// Aggregates and windows `SQLite` cannot evaluate are gated by
-/// [`sqlite_can_translate_aggregate`] and [`sqlite_can_translate_window`].
+/// Casts, `LIKE`/`ILIKE` and grouping sets are gated by
+/// [`sqlite_can_evaluate_expression`]. Aggregates and windows `SQLite` cannot
+/// evaluate are gated by [`sqlite_can_translate_aggregate`] and
+/// [`sqlite_can_translate_window`].
 #[must_use]
 pub fn deny_spice_functions_for_sqlite_table_providers() -> FunctionSupport {
     FunctionSupportBuilder::new()
@@ -308,49 +310,75 @@ pub fn deny_spice_functions_for_sqlite_table_providers() -> FunctionSupport {
         .with_window_call_support(Arc::new(sqlite_can_translate_window))
 }
 
-/// Aggregates `SQLite` has no aggregate of. A federated call fails the query.
+/// The aggregates `SQLite` evaluates the way `DataFusion` does. It is an
+/// allow-list, so an aggregate nobody has checked against `SQLite` stays local.
 ///
-/// `median`, `approx_distinct`, `string_agg` and `array_agg` fail with
-/// `no such function` (`group_concat` is not a faithful stand-in for
-/// `string_agg`: it has no `DISTINCT`/`ORDER BY` contract matching
-/// `DataFusion`). `first_value`, `last_value` and `nth_value` are window
-/// functions only in `SQLite`, so as an aggregate they fail with
-/// `misuse of window function`.
-const SQLITE_UNTRANSLATABLE_AGGREGATES: &[&str] = &[
-    "median",
-    "approx_distinct",
-    "string_agg",
-    "array_agg",
+/// `SQLite` has no function for most of `DataFusion`'s aggregates — `stddev`,
+/// `var_pop`, `corr`, `bool_and`, `bit_and`, `median`, `approx_distinct`,
+/// `array_agg` and `grouping` among them — and the accelerator registers none,
+/// so a federated call fails with `no such function`. `first_value`,
+/// `last_value` and `nth_value` exist in `SQLite` only as window functions, so as
+/// an aggregate they fail with `misuse of window function`. `string_agg` exists,
+/// as an alias of `group_concat`, but stays local: it has no `DISTINCT`/`ORDER
+/// BY` contract matching `DataFusion`'s.
+///
+/// Each of the five takes at most one argument in `SQLite`.
+/// [`sqlite_can_translate_aggregate`] holds them to that, because `DataFusion`
+/// answers a two-argument `count(a, b)`, while `SQLite` fails it with
+/// `wrong number of arguments`.
+const SQLITE_AGGREGATES: &[&str] = &["count", "sum", "avg", "min", "max"];
+
+/// The window functions `SQLite` has, all of `DataFusion`'s built-in ones, which
+/// answer the way `DataFusion`'s do while nulls are respected (see
+/// [`sqlite_can_translate_window`]).
+const SQLITE_WINDOW_FUNCTIONS: &[&str] = &[
+    "row_number",
+    "rank",
+    "dense_rank",
+    "percent_rank",
+    "cume_dist",
+    "ntile",
+    "lag",
+    "lead",
     "first_value",
     "last_value",
     "nth_value",
 ];
 
-/// The same names written as a window, less `first_value`, `last_value` and
-/// `nth_value`, which `SQLite` runs as window functions.
-const SQLITE_UNTRANSLATABLE_WINDOWS: &[&str] =
-    &["median", "approx_distinct", "string_agg", "array_agg"];
-
-/// Whether this aggregate call can be handed to `SQLite`: not one of
-/// [`SQLITE_UNTRANSLATABLE_AGGREGATES`].
+/// Whether this aggregate call can be handed to `SQLite`: one of
+/// [`SQLITE_AGGREGATES`], with at most one argument.
 #[must_use]
 pub fn sqlite_can_translate_aggregate(
     call: &datafusion::logical_expr::expr::AggregateFunction,
 ) -> bool {
-    !names_one_of(call.func.name(), SQLITE_UNTRANSLATABLE_AGGREGATES)
+    call.params.args.len() <= 1 && names_one_of(call.func.name(), SQLITE_AGGREGATES)
 }
 
-/// Whether this window call can be handed to `SQLite`: not one of
-/// [`SQLITE_UNTRANSLATABLE_WINDOWS`].
+/// Whether this window call can be handed to `SQLite`: one of
+/// [`SQLITE_WINDOW_FUNCTIONS`], or an aggregate [`sqlite_can_translate_aggregate`]
+/// admits, which `SQLite` runs over a window too. `stddev(x) OVER (…)` fails
+/// remotely just as `stddev(x)` does.
+///
+/// Two shapes of those stay local as well. `SQLite` refuses `DISTINCT` in any
+/// window ("DISTINCT is not supported for window functions"). And the unparser
+/// never renders `IGNORE NULLS` on a window, so `lag`, `lead`, `first_value`,
+/// `last_value` and `nth_value` would reach `SQLite` respecting nulls and
+/// return different rows.
 #[must_use]
 pub fn sqlite_can_translate_window(call: &datafusion::logical_expr::expr::WindowFunction) -> bool {
-    !names_one_of(call.fun.name(), SQLITE_UNTRANSLATABLE_WINDOWS)
+    use datafusion::logical_expr::expr::NullTreatment;
+    if call.params.distinct
+        || matches!(call.params.null_treatment, Some(NullTreatment::IgnoreNulls))
+    {
+        return false;
+    }
+    let name = call.fun.name();
+    names_one_of(name, SQLITE_WINDOW_FUNCTIONS)
+        || (call.params.args.len() <= 1 && names_one_of(name, SQLITE_AGGREGATES))
 }
 
-fn names_one_of(name: &str, denied: &[&str]) -> bool {
-    denied
-        .iter()
-        .any(|denied| name.eq_ignore_ascii_case(denied))
+fn names_one_of(name: &str, names: &[&str]) -> bool {
+    names.iter().any(|listed| name.eq_ignore_ascii_case(listed))
 }
 
 /// Whether `SQLite` evaluates this non-function expression node the way
@@ -383,8 +411,9 @@ pub fn sqlite_can_evaluate_expression(expr: &Expr, schema: Option<&DFSchema>) ->
         // `TRY_CAST` is not SQLite SQL (issue #14398). `LIKE` folds ASCII
         // case (`'alice' LIKE '%ALICE%'` is true) and `ILIKE` does not exist,
         // so both Like forms stay local rather than matching the wrong rows
-        // or failing remotely.
-        Expr::TryCast(_) | Expr::Like(_) => false,
+        // or failing remotely. SQLite has no `ROLLUP`, `CUBE` or
+        // `GROUPING SETS` (`no such function: ROLLUP`).
+        Expr::TryCast(_) | Expr::Like(_) | Expr::GroupingSet(_) => false,
         Expr::Cast(cast) => {
             let to = cast.field.data_type();
             if let Expr::Literal(value, _) = cast.expr.as_ref() {
@@ -1101,6 +1130,11 @@ mod tests {
         .partition_by(vec![col("g")])
         .build()
         .expect("window expression");
+        plan_with_window(window)
+    }
+
+    /// `SELECT <window> FROM t`.
+    fn plan_with_window(window: Expr) -> LogicalPlan {
         numeric_scan()
             .window(vec![window])
             .expect("window")
@@ -1130,8 +1164,8 @@ mod tests {
     /// it: `string_agg`, `array_agg`, `first_value` and `last_value` take it inside
     /// the call, and `percentile_cont` as `WITHIN GROUP`. Any other ordered aggregate
     /// would lose its ordering in the unparser, and `IGNORE NULLS` is never rendered,
-    /// so both stay local on both `DuckDB` accessors. `approx_distinct` has no
-    /// `DuckDB` name and stays local.
+    /// on an aggregate or a window, so both stay local on both `DuckDB` accessors.
+    /// `approx_distinct` has no `DuckDB` name and stays local.
     #[test]
     fn duckdb_federates_the_ordered_aggregates_it_renders_and_keeps_the_rest_local() {
         use datafusion::functions_aggregate::approx_distinct::approx_distinct_udaf;
@@ -1186,6 +1220,22 @@ mod tests {
                 !pushes(&plan_windowing(approx_distinct_udaf(), "i"), &support),
                 "a windowed approx_distinct must stay local on {route}"
             );
+            for window in nullable_value_windows() {
+                let respecting = window
+                    .clone()
+                    .order_by(vec![col("g").sort(true, false)])
+                    .build()
+                    .expect("window respecting nulls");
+                assert!(
+                    pushes(&plan_with_window(respecting.clone()), &support),
+                    "{respecting} must keep its {route} pushdown"
+                );
+                let ignoring = ignoring_nulls(window);
+                assert!(
+                    !pushes(&plan_with_window(ignoring.clone()), &support),
+                    "{ignoring} would reach DuckDB respecting nulls and must stay local on {route}"
+                );
+            }
         }
     }
 
@@ -1214,11 +1264,14 @@ mod tests {
         };
         use datafusion::functions_aggregate::approx_distinct::approx_distinct_udaf;
         use datafusion::functions_aggregate::array_agg::array_agg_udaf;
+        use datafusion::functions_aggregate::count::count_udaf;
         use datafusion::functions_aggregate::expr_fn::{
-            approx_distinct, array_agg, first_value, last_value, median, nth_value,
+            approx_distinct, approx_median, array_agg, bit_and, bool_and, corr, first_value,
+            last_value, median, nth_value, stddev, var_pop,
         };
         use datafusion::functions_aggregate::first_last::{first_value_udaf, last_value_udaf};
         use datafusion::functions_aggregate::median::median_udaf;
+        use datafusion::logical_expr::expr::AggregateFunction;
         let support = deny_spice_functions_for_sqlite_table_providers();
         let month = Expr::Literal(ScalarValue::Utf8(Some("month".into())), None);
 
@@ -1258,7 +1311,16 @@ mod tests {
         }
 
         // `SQLite` has no aggregate of these names; `first_value`, `last_value`
-        // and `nth_value` exist only as window functions there.
+        // and `nth_value` exist only as window functions there. Its `count`
+        // takes one argument.
+        let two_argument_count = Expr::AggregateFunction(AggregateFunction::new_udf(
+            count_udaf(),
+            vec![col("i"), col("g")],
+            false,
+            None,
+            vec![],
+            None,
+        ));
         for refused in [
             median(col("i")),
             approx_distinct(col("i")),
@@ -1266,6 +1328,13 @@ mod tests {
             first_value(col("i"), vec![]),
             last_value(col("i"), vec![]),
             nth_value(col("i"), 2, vec![col("i").sort(true, false)]),
+            stddev(col("i")),
+            var_pop(col("i")),
+            corr(col("i"), col("g")),
+            bool_and(col("i").gt(lit(0))),
+            bit_and(col("i")),
+            approx_median(col("i")),
+            two_argument_count,
         ] {
             assert!(
                 !pushes(&plan_aggregating(refused.clone()), &support),
@@ -1296,6 +1365,148 @@ mod tests {
             pushes(&plan_projecting(col("s")), &support),
             "a plain column must still federate on SQLite"
         );
+    }
+
+    /// `SQLite` is handed only the aggregates and window functions it has. Of
+    /// every aggregate `DataFusion` registers, that is `count`, `sum`, `avg`,
+    /// `min` and `max` — one added later stays local until it is listed — and
+    /// over a window `first_value`, `last_value` and `nth_value` too. Every
+    /// `DataFusion` window function is one `SQLite` has, but not with
+    /// `IGNORE NULLS`, which the unparser drops, nor over a `DISTINCT` window,
+    /// which `SQLite` refuses. A grouping set stays local: `SQLite` has none.
+    #[test]
+    fn sqlite_federates_only_the_aggregates_and_windows_it_has() {
+        use datafusion::functions_aggregate::all_default_aggregate_functions;
+        use datafusion::functions_aggregate::count::count_udaf;
+        use datafusion::functions_aggregate::expr_fn::sum;
+        use datafusion::functions_window::all_default_window_functions;
+        use datafusion::logical_expr::expr::{AggregateFunction, WindowFunction};
+        use datafusion::logical_expr::{
+            AggregateUDF, ExprFunctionExt as _, GroupingSet, WindowFunctionDefinition,
+        };
+        let support = deny_spice_functions_for_sqlite_table_providers();
+
+        let federated = |definition: fn(Arc<AggregateUDF>) -> Expr| {
+            let mut names: Vec<String> = all_default_aggregate_functions()
+                .into_iter()
+                .filter(|udaf| support.supports(&definition(Arc::clone(udaf)), None))
+                .map(|udaf| udaf.name().to_string())
+                .collect();
+            names.sort();
+            names
+        };
+        assert_eq!(
+            federated(|udaf| Expr::AggregateFunction(AggregateFunction::new_udf(
+                udaf,
+                vec![col("i")],
+                false,
+                None,
+                vec![],
+                None,
+            ))),
+            ["avg", "count", "max", "min", "sum"],
+            "only SQLite's own aggregates may federate"
+        );
+        assert_eq!(
+            federated(|udaf| Expr::from(WindowFunction::new(
+                WindowFunctionDefinition::AggregateUDF(udaf),
+                vec![col("i")],
+            ))),
+            [
+                "avg",
+                "count",
+                "first_value",
+                "last_value",
+                "max",
+                "min",
+                "nth_value",
+                "sum"
+            ],
+            "only an aggregate SQLite runs over a window may federate as one"
+        );
+        for udwf in all_default_window_functions() {
+            let window = Expr::from(WindowFunction::new(
+                WindowFunctionDefinition::WindowUDF(Arc::clone(&udwf)),
+                vec![col("i")],
+            ));
+            assert!(
+                support.supports(&window, None),
+                "SQLite has the {} window function, so it must keep its pushdown",
+                udwf.name()
+            );
+        }
+
+        for window in nullable_value_windows() {
+            let respecting = window
+                .clone()
+                .order_by(vec![col("g").sort(true, false)])
+                .build()
+                .expect("window respecting nulls");
+            assert!(
+                pushes(&plan_with_window(respecting.clone()), &support),
+                "{respecting} must keep its SQLite pushdown"
+            );
+            let ignoring = ignoring_nulls(window);
+            assert!(
+                !pushes(&plan_with_window(ignoring.clone()), &support),
+                "{ignoring} would reach SQLite respecting nulls and must stay local"
+            );
+        }
+
+        let distinct_count = Expr::from(WindowFunction::new(
+            WindowFunctionDefinition::AggregateUDF(count_udaf()),
+            vec![col("i")],
+        ))
+        .partition_by(vec![col("g")])
+        .distinct()
+        .build()
+        .expect("count(DISTINCT i) OVER (PARTITION BY g)");
+        assert!(
+            !pushes(&plan_with_window(distinct_count), &support),
+            "SQLite refuses DISTINCT in a window, so it must stay local"
+        );
+
+        let rollup = numeric_scan()
+            .aggregate(
+                vec![Expr::GroupingSet(GroupingSet::Rollup(vec![col("g")]))],
+                vec![sum(col("i"))],
+            )
+            .expect("aggregate")
+            .build()
+            .expect("build plan");
+        assert!(
+            !pushes(&rollup, &support),
+            "SQLite has no ROLLUP, so the grouping must stay local"
+        );
+        assert!(
+            pushes(&plan_aggregating(sum(col("i"))), &support),
+            "a plain GROUP BY with sum must keep its SQLite pushdown"
+        );
+    }
+
+    /// The window functions whose answer depends on `IGNORE NULLS`, unordered.
+    fn nullable_value_windows() -> [Expr; 5] {
+        use datafusion::functions_window::expr_fn::{
+            first_value, lag, last_value, lead, nth_value,
+        };
+        [
+            lag(col("i"), None, None),
+            lead(col("i"), None, None),
+            first_value(col("i")),
+            last_value(col("i")),
+            nth_value(col("i"), 2),
+        ]
+    }
+
+    /// `window` ordered by `g` with `IGNORE NULLS`.
+    fn ignoring_nulls(window: Expr) -> Expr {
+        use datafusion::logical_expr::ExprFunctionExt as _;
+        use datafusion::logical_expr::expr::NullTreatment;
+        window
+            .order_by(vec![col("g").sort(true, false)])
+            .null_treatment(NullTreatment::IgnoreNulls)
+            .build()
+            .expect("window ignoring nulls")
     }
 
     /// A scan of `t(id, s, a)` with `s` text and `a` binary, filtered by

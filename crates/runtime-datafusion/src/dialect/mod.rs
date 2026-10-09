@@ -278,11 +278,15 @@ pub fn duckdb_can_translate_aggregate(call: &AggregateFunction) -> bool {
 
 /// Whether this window call can be handed to `DuckDB`.
 ///
-/// `approx_distinct` is refused for the same reason as
-/// [`duckdb_can_translate_aggregate`]: `DuckDB` has no function of that name.
+/// `approx_distinct` and `IGNORE NULLS` are refused for the same reasons as in
+/// [`duckdb_can_translate_aggregate`]: `DuckDB` has no function of that name, and
+/// the unparser does not render `IGNORE NULLS` on a window either, so `lag`,
+/// `lead`, `first_value`, `last_value` and `nth_value` would reach `DuckDB`
+/// respecting nulls and return different rows.
 #[must_use]
 pub fn duckdb_can_translate_window(call: &WindowFunction) -> bool {
     !call.fun.name().eq_ignore_ascii_case("approx_distinct")
+        && !matches!(call.params.null_treatment, Some(NullTreatment::IgnoreNulls))
 }
 
 /// Whether `DuckDB` evaluates this non-function expression node the way

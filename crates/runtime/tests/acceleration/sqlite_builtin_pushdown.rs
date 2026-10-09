@@ -248,6 +248,80 @@ async fn sqlite_accelerator_evaluates_unfaithful_builtins_locally() -> Result<()
                     "SELECT nth_value(customer, 2 ORDER BY id) AS n FROM {table}",
                     Some("nth_value("),
                 ),
+                // `SQLite` has only `count`, `sum`, `avg`, `min` and `max` of
+                // `DataFusion`'s aggregates, each over at most one argument. Every
+                // other aggregate failed with `no such function` (`count(a, b)`
+                // with `wrong number of arguments`), over a window too.
+                ("SELECT stddev(qty) AS s FROM {table}", Some("stddev(")),
+                ("SELECT var_pop(qty) AS v FROM {table}", Some("var_pop(")),
+                ("SELECT corr(qty, id) AS c FROM {table}", Some("corr(")),
+                (
+                    "SELECT bool_and(qty > 10) AS b FROM {table}",
+                    Some("bool_and("),
+                ),
+                ("SELECT bit_or(qty) AS b FROM {table}", Some("bit_or(")),
+                (
+                    "SELECT approx_median(qty) AS m FROM {table}",
+                    Some("approx_median("),
+                ),
+                (
+                    "SELECT count(region, customer) AS n FROM {table}",
+                    Some("count("),
+                ),
+                (
+                    "SELECT id, stddev(qty) OVER (PARTITION BY region) AS s \
+                     FROM {table} ORDER BY id",
+                    Some("stddev("),
+                ),
+                // `SQLite` refuses `DISTINCT` in any window.
+                (
+                    "SELECT id, count(DISTINCT qty) OVER (PARTITION BY region) AS n \
+                     FROM {table} ORDER BY id",
+                    Some("count("),
+                ),
+                // The unparser drops `IGNORE NULLS` from a window, so each of these
+                // reached `SQLite` respecting nulls and landed on the NULL region.
+                (
+                    "SELECT id, lag(region) IGNORE NULLS OVER (ORDER BY id) AS r \
+                     FROM {table} ORDER BY id",
+                    Some("lag("),
+                ),
+                (
+                    "SELECT id, lead(region) IGNORE NULLS OVER (ORDER BY id) AS r \
+                     FROM {table} ORDER BY id",
+                    Some("lead("),
+                ),
+                (
+                    "SELECT id, last_value(region) IGNORE NULLS OVER (ORDER BY id \
+                     ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS r \
+                     FROM {table} ORDER BY id",
+                    Some("last_value("),
+                ),
+                (
+                    "SELECT id, nth_value(region, 2) IGNORE NULLS OVER (ORDER BY id \
+                     ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS r \
+                     FROM {table} ORDER BY id",
+                    Some("nth_value("),
+                ),
+                // `SQLite` has no `ROLLUP`.
+                (
+                    "SELECT region, sum(qty) AS s FROM {table} GROUP BY ROLLUP(region) \
+                     ORDER BY region NULLS LAST, s",
+                    Some("ROLLUP"),
+                ),
+                // `SQLite`'s own aggregates and window functions, which still reach
+                // it (asserted below): its answers must agree too.
+                (
+                    "SELECT region, count(qty) AS n, sum(qty) AS s, avg(qty) AS a, \
+                     min(qty) AS lo, max(qty) AS hi FROM {table} \
+                     GROUP BY region ORDER BY region NULLS LAST",
+                    None,
+                ),
+                (
+                    "SELECT id, row_number() OVER (ORDER BY id) AS n, \
+                     lag(region) OVER (ORDER BY id) AS r FROM {table} ORDER BY id",
+                    None,
+                ),
             ];
 
             for (sql, forbidden) in cases {
@@ -273,6 +347,30 @@ async fn sqlite_accelerator_evaluates_unfaithful_builtins_locally() -> Result<()
                     assert!(
                         !remote_sql.contains(name),
                         "{name} must not reach SQLite; the SQL sent was:\n{remote_sql}\nplan:\n{plan}"
+                    );
+                }
+            }
+
+            // The aggregates and window functions `SQLite` has still reach it,
+            // so the refusals above are not every aggregate falling back.
+            for (sql, renderings) in [
+                (
+                    "EXPLAIN SELECT region, count(qty) AS n, sum(qty) AS s, avg(qty) AS a, \
+                     min(qty) AS lo, max(qty) AS hi FROM accelerated GROUP BY region",
+                    &["count(", "sum(", "avg(", "min(", "max("][..],
+                ),
+                (
+                    "EXPLAIN SELECT id, row_number() OVER (ORDER BY id) AS n, \
+                     lag(region) OVER (ORDER BY id) AS r FROM accelerated",
+                    &["row_number(", "lag("][..],
+                ),
+            ] {
+                let plan = to_pretty_display(&run_query(&rt, sql).await?)?.to_string();
+                let remote_sql = pushed_down_sql(&plan);
+                for rendering in renderings {
+                    assert!(
+                        remote_sql.contains(rendering),
+                        "{rendering} is SQLite's own and must reach it; the SQL sent was:\n{remote_sql}"
                     );
                 }
             }
@@ -352,6 +450,31 @@ async fn sqlite_accelerator_evaluates_unfaithful_builtins_locally() -> Result<()
                 &run_query(
                     &rt,
                     "SELECT concat(customer, '') AS c FROM accelerated WHERE id = 1"
+                )
+                .await?
+            );
+            // 10 | 20 | 15 | 10. SQLite failed with `no such function: bit_or`.
+            assert_batches_eq!(
+                ["+----+", "| b  |", "+----+", "| 31 |", "+----+"],
+                &run_query(&rt, "SELECT bit_or(qty) AS b FROM accelerated").await?
+            );
+            // Row 3 skips the NULL region of row 2. Federated, it respected that
+            // NULL and answered it.
+            assert_batches_eq!(
+                [
+                    "+----+----+",
+                    "| id | r  |",
+                    "+----+----+",
+                    "| 1  |    |",
+                    "| 2  | eu |",
+                    "| 3  | eu |",
+                    "| 4  | eu |",
+                    "+----+----+",
+                ],
+                &run_query(
+                    &rt,
+                    "SELECT id, lag(region) IGNORE NULLS OVER (ORDER BY id) AS r \
+                     FROM accelerated ORDER BY id"
                 )
                 .await?
             );

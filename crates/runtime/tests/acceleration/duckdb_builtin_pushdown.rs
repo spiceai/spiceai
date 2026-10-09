@@ -1551,42 +1551,183 @@ async fn duckdb_accelerated_ordered_aggregates_push_down_and_agree() -> Result<(
                 ),
             ];
 
-            for (query, pushed, kept_local, expected) in cases {
-                let plan = to_pretty_display(
-                    &run_query(
-                        &rt,
-                        &format!("EXPLAIN {}", query.replace("{table}", "accelerated")),
-                    )
-                    .await?,
-                )?
-                .to_string();
-                let remote_sql = pushed_down_sql(&plan);
-                assert!(
-                    !remote_sql.is_empty(),
-                    "the scan under `{query}` must still be federated to DuckDB; plan was:\n{plan}"
-                );
-                for rendering in pushed {
-                    assert!(
-                        remote_sql.contains(rendering),
-                        "`{query}` must reach DuckDB as {rendering}; the SQL sent was:\n{remote_sql}"
-                    );
-                }
-                for function in kept_local {
-                    assert!(
-                        !remote_sql.contains(function),
-                        "{function} must not be sent to DuckDB; the SQL sent was:\n{remote_sql}"
-                    );
-                }
+            assert_pushdown_cases(&rt, &cases).await?;
 
-                let accelerated = run_query(&rt, &query.replace("{table}", "accelerated")).await?;
-                let local = run_query(&rt, &query.replace("{table}", "local")).await?;
-                assert_batches_eq!(expected, &accelerated);
-                assert_eq!(
-                    to_pretty_display(&accelerated)?.to_string(),
-                    to_pretty_display(&local)?.to_string(),
-                    "DuckDB-accelerated `{query}` must agree with local evaluation"
-                );
-            }
+            rt.shutdown().await;
+            Ok(())
+        })
+        .await
+}
+
+/// For each case: the scan under the query still federates to `DuckDB`, the SQL
+/// sent contains every rendering that must be pushed and none that must stay
+/// local, and the accelerated answer is the expected rows and agrees with the
+/// unaccelerated `local` table.
+async fn assert_pushdown_cases(
+    rt: &Arc<Runtime>,
+    cases: &[PushdownCase<'_>],
+) -> Result<(), anyhow::Error> {
+    for (query, pushed, kept_local, expected) in cases {
+        let plan = to_pretty_display(
+            &run_query(
+                rt,
+                &format!("EXPLAIN {}", query.replace("{table}", "accelerated")),
+            )
+            .await?,
+        )?
+        .to_string();
+        let remote_sql = pushed_down_sql(&plan);
+        assert!(
+            !remote_sql.is_empty(),
+            "the scan under `{query}` must still be federated to DuckDB; plan was:\n{plan}"
+        );
+        for rendering in *pushed {
+            assert!(
+                remote_sql.contains(rendering),
+                "`{query}` must reach DuckDB as {rendering}; the SQL sent was:\n{remote_sql}"
+            );
+        }
+        for function in *kept_local {
+            assert!(
+                !remote_sql.contains(function),
+                "{function} must not be sent to DuckDB; the SQL sent was:\n{remote_sql}"
+            );
+        }
+
+        let accelerated = run_query(rt, &query.replace("{table}", "accelerated")).await?;
+        let local = run_query(rt, &query.replace("{table}", "local")).await?;
+        assert_batches_eq!(*expected, &accelerated);
+        assert_eq!(
+            to_pretty_display(&accelerated)?.to_string(),
+            to_pretty_display(&local)?.to_string(),
+            "DuckDB-accelerated `{query}` must agree with local evaluation"
+        );
+    }
+    Ok(())
+}
+
+/// Values with a NULL between non-NULL ones, so a window ignoring nulls answers
+/// differently from the same window respecting them.
+fn write_nullable_values_source(path: &Path) -> Result<(), anyhow::Error> {
+    std::fs::write(path, "id,v\n1,10\n2,\n3,30\n4,\n5,50\n")?;
+    Ok(())
+}
+
+/// The unparser drops `IGNORE NULLS` from a window, so `lag(v) IGNORE NULLS` and
+/// the rest reached `DuckDB` respecting nulls, and answered NULL wherever the
+/// row they landed on was NULL. Each now stays local and agrees with the
+/// unaccelerated engine. The same window respecting nulls still federates.
+#[tokio::test]
+async fn duckdb_accelerated_windows_ignoring_nulls_stay_local_and_agree()
+-> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+
+    test_request_context()
+        .scope(async {
+            let dir = tempfile::tempdir()?;
+            let csv = dir.path().join("nullable_values.csv");
+            write_nullable_values_source(&csv)?;
+            let from = format!("file://{}", csv.display());
+
+            let app = AppBuilder::new("duckdb_builtin_pushdown_ignore_nulls")
+                .with_dataset(duckdb_accelerated(&from, "accelerated"))
+                .with_dataset(unaccelerated(&from, "local"))
+                .build();
+
+            configure_test_datafusion();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            load_runtime_datasets(&rt, LOAD_TIMEOUT).await?;
+
+            let cases: [PushdownCase; 5] = [
+                (
+                    "SELECT id, lag(v) IGNORE NULLS OVER (ORDER BY id) AS w \
+                     FROM {table} ORDER BY id",
+                    &[],
+                    &["lag("],
+                    &[
+                        "+----+----+",
+                        "| id | w  |",
+                        "+----+----+",
+                        "| 1  |    |",
+                        "| 2  | 10 |",
+                        "| 3  | 10 |",
+                        "| 4  | 30 |",
+                        "| 5  | 30 |",
+                        "+----+----+",
+                    ],
+                ),
+                (
+                    "SELECT id, lead(v) IGNORE NULLS OVER (ORDER BY id) AS w \
+                     FROM {table} ORDER BY id",
+                    &[],
+                    &["lead("],
+                    &[
+                        "+----+----+",
+                        "| id | w  |",
+                        "+----+----+",
+                        "| 1  | 30 |",
+                        "| 2  | 30 |",
+                        "| 3  | 50 |",
+                        "| 4  | 50 |",
+                        "| 5  |    |",
+                        "+----+----+",
+                    ],
+                ),
+                (
+                    "SELECT id, last_value(v) IGNORE NULLS OVER (ORDER BY id \
+                     ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS w \
+                     FROM {table} ORDER BY id",
+                    &[],
+                    &["last_value("],
+                    &[
+                        "+----+----+",
+                        "| id | w  |",
+                        "+----+----+",
+                        "| 1  | 10 |",
+                        "| 2  | 10 |",
+                        "| 3  | 30 |",
+                        "| 4  | 30 |",
+                        "| 5  | 50 |",
+                        "+----+----+",
+                    ],
+                ),
+                (
+                    "SELECT id, nth_value(v, 2) IGNORE NULLS OVER (ORDER BY id \
+                     ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) AS w \
+                     FROM {table} ORDER BY id",
+                    &[],
+                    &["nth_value("],
+                    &[
+                        "+----+----+",
+                        "| id | w  |",
+                        "+----+----+",
+                        "| 1  | 30 |",
+                        "| 2  | 30 |",
+                        "| 3  | 30 |",
+                        "| 4  | 30 |",
+                        "| 5  | 30 |",
+                        "+----+----+",
+                    ],
+                ),
+                (
+                    "SELECT id, lag(v) OVER (ORDER BY id) AS w FROM {table} ORDER BY id",
+                    &[r#"lag("accelerated"."v")"#],
+                    &[],
+                    &[
+                        "+----+----+",
+                        "| id | w  |",
+                        "+----+----+",
+                        "| 1  |    |",
+                        "| 2  | 10 |",
+                        "| 3  |    |",
+                        "| 4  | 30 |",
+                        "| 5  |    |",
+                        "+----+----+",
+                    ],
+                ),
+            ];
+            assert_pushdown_cases(&rt, &cases).await?;
 
             rt.shutdown().await;
             Ok(())
