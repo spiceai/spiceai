@@ -904,6 +904,61 @@ async fn assert_list_datasets_called(
     );
 }
 
+/// Asserts that `events`, the stream a client received, reads as one response, however many
+/// rounds Spice ran: one `response.created`, one run of `sequence_number`s from 0, `output_index`es
+/// that count the items added so far, and a `response.completed` whose output is the items
+/// streamed.
+fn assert_one_response(model: &str, events: &[Value]) {
+    let types = events
+        .iter()
+        .map(|event| event["type"].as_str().unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        types.iter().filter(|t| **t == "response.created").count(),
+        1,
+        "{model}: {types:?}"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event["sequence_number"].as_u64())
+            .collect::<Vec<_>>(),
+        (0_u64..).take(events.len()).map(Some).collect::<Vec<_>>(),
+        "{model}: {types:?}"
+    );
+
+    let mut items_added = 0;
+    for event in events {
+        let Some(index) = event["output_index"].as_u64() else {
+            continue;
+        };
+        if event["type"] == "response.output_item.added" {
+            assert_eq!(index, items_added, "{model}: {event}");
+            items_added += 1;
+        } else {
+            assert!(index < items_added, "{model}: {event}");
+        }
+    }
+
+    let streamed_items = events
+        .iter()
+        .filter(|event| event["type"] == "response.output_item.done")
+        .map(|event| event["item"]["id"].clone())
+        .collect::<Vec<_>>();
+    let completed = events.last().expect("the stream's events");
+    assert_eq!(completed["type"], "response.completed", "{model}");
+    assert_eq!(
+        completed["response"]["output"]
+            .as_array()
+            .map(|output| output
+                .iter()
+                .map(|item| item["id"].clone())
+                .collect::<Vec<_>>()),
+        Some(streamed_items),
+        "{model}"
+    );
+}
+
 // regression test for #14905
 #[tokio::test]
 async fn openai_test_responses_api_with_tools_streaming() -> Result<(), anyhow::Error> {
@@ -956,28 +1011,31 @@ async fn openai_test_responses_api_with_tools_streaming() -> Result<(), anyhow::
                 let mut text = String::new();
                 let mut delta_count = 0;
                 let mut completed = None;
+                let mut events = Vec::new();
 
                 while let Some(result) = stream.next().await {
-                    match result {
-                        Ok(ResponseStreamEvent::ResponseOutputTextDelta(delta)) => {
-                            text += &delta.delta;
-                            delta_count += 1;
-                        }
-                        Ok(ResponseStreamEvent::ResponseCompleted(event)) => {
-                            completed = Some(event.response);
-                            break;
-                        }
-                        Ok(
-                            ResponseStreamEvent::ResponseIncomplete(_)
-                            | ResponseStreamEvent::ResponseFailed(_),
-                        ) => break,
-                        Ok(_) => {}
+                    let event = match result {
+                        Ok(event) => event,
                         Err(e) => {
                             eprintln!("{e:#?}");
                             // When a stream ends, it returns Err(OpenAIError::StreamError("Stream ended"))
                             // Without this, the stream will never end
                             break;
                         }
+                    };
+                    events.push(serde_json::to_value(&event)?);
+                    match event {
+                        ResponseStreamEvent::ResponseOutputTextDelta(delta) => {
+                            text += &delta.delta;
+                            delta_count += 1;
+                        }
+                        ResponseStreamEvent::ResponseCompleted(event) => {
+                            completed = Some(event.response);
+                            break;
+                        }
+                        ResponseStreamEvent::ResponseIncomplete(_)
+                        | ResponseStreamEvent::ResponseFailed(_) => break,
+                        _ => {}
                     }
                 }
 
@@ -997,6 +1055,7 @@ async fn openai_test_responses_api_with_tools_streaming() -> Result<(), anyhow::
                 assert!(mentions_taxi_trips(&text), "{model}: {text}");
                 // More than one delta: the answer was streamed.
                 assert!(delta_count > 1, "{model}: {delta_count} deltas");
+                assert_one_response(model, &events);
                 assert_list_datasets_called(&rt, &trace_provider, start, model).await;
             }
 
