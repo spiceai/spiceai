@@ -646,3 +646,79 @@ async fn transient_build_failure_loads_on_retry() {
     .await
     .expect("the retry must finish");
 }
+
+/// A build that fails after it may have started work, here a caching child whose
+/// parent stops taking children, keeps the dataset's generation fenced, because
+/// nothing proves that work stopped.
+#[tokio::test]
+async fn build_failure_after_ingestion_starts_keeps_the_generation_fenced() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let runtime = Arc::new(Runtime::builder().build().await);
+        let df = runtime.datafusion();
+        let app = Arc::new(app::AppBuilder::new("fenced-build-test").build());
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let provider: Arc<dyn TableProvider> = Arc::new(
+            data_components::arrow::write::MemTable::try_new(schema, vec![vec![]])
+                .expect("Arrow source"),
+        );
+        let source = Arc::new(FlakySetup {
+            provider: Arc::clone(&provider),
+            failures: AtomicUsize::new(0),
+        });
+        let caching = |from: &str, name: &str| {
+            let mut builder = DatasetBuilder::try_new(from.into(), name)
+                .expect("dataset")
+                .with_app(Arc::clone(&app))
+                .with_runtime(Arc::clone(&runtime));
+            builder.acceleration = Some(Acceleration {
+                refresh_mode: Some(RefreshMode::Caching),
+                ..Acceleration::default()
+            });
+            Arc::new(builder.build().expect("dataset configuration"))
+        };
+        let register = |dataset| {
+            df.register_table(
+                dataset,
+                Table::Accelerated {
+                    source: Arc::clone(&source) as Arc<dyn DataConnector>,
+                    federated_read_table: FederatedTable::new_unchecked(Arc::clone(&provider)),
+                    accelerated_table: None,
+                    secrets: runtime.secrets(),
+                    bootstrap_status: runtime_acceleration::BootstrapStatus::none().into(),
+                    initial_partition_filters: None,
+                },
+            )
+        };
+
+        let parent = caching("https://example.com/parent", "fenced_parent");
+        register(Arc::clone(&parent))
+            .await
+            .expect("register the parent");
+        let installed = df.get_table(&parent.name).await.expect("parent table");
+        let parent_table = spice_table::find_layer::<crate::accelerated::AcceleratedTable>(
+            installed.as_ref(),
+            spice_table::LayerWalk::Read,
+        )
+        .expect("accelerated layer");
+        // A draining parent refuses new cache children.
+        let _drain = parent_table.begin_changes_drain();
+
+        let child = caching("localpod:fenced_parent", "fenced_child");
+        let error = register(Arc::clone(&child))
+            .await
+            .expect_err("the parent refuses the child");
+        assert!(error.to_string().contains("is stopping"), "{error}");
+        let error = df
+            .remove_table(&child.name)
+            .await
+            .expect_err("the child's generation is not released");
+        assert!(error.to_string().contains("nothing stopped"), "{error}");
+        let error = df
+            .remove_table(&child.name)
+            .await
+            .expect_err("the child's generation stays fenced");
+        assert!(error.to_string().contains("remains fenced"), "{error}");
+    })
+    .await
+    .expect("the fenced build must finish");
+}

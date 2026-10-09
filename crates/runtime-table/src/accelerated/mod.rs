@@ -270,6 +270,10 @@ pub enum AcceleratedTableBuilderError {
     #[snafu(transparent)]
     AcceleratedTableError { source: Error },
 
+    /// Raised after the builder started producers or accepted writes.
+    #[snafu(display("{source}"))]
+    FailedAfterStart { source: Error },
+
     #[snafu(display(
         "Failed to accelerate dataset {dataset_name}: durable write-back delivers each committed row to the source keyed on the primary key, and only a single-column key can be delivered on, but this dataset's accelerator resolved a {pk_columns}-column key. Declare a single-column 'acceleration.primary_key', or use a different 'acceleration.write_mode'. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
     ))]
@@ -295,7 +299,7 @@ impl AcceleratedTableBuilderError {
     /// before failing. A rejected setting fails before anything starts.
     #[must_use]
     pub fn may_have_started_ingestion(&self) -> bool {
-        matches!(self, Self::AcceleratedTableError { .. })
+        matches!(self, Self::FailedAfterStart { .. })
     }
 }
 
@@ -1206,7 +1210,9 @@ impl Builder {
                 synchronize_with
                     .prepare_cache_child(child)
                     .await
-                    .map_err(|source| Error::FailedToWriteData { source })?,
+                    .map_err(|source| AcceleratedTableBuilderError::FailedAfterStart {
+                        source: Error::FailedToWriteData { source },
+                    })?,
             )
         } else {
             None
@@ -1238,7 +1244,12 @@ impl Builder {
                 (None, None)
             } else {
                 (
-                    refresher.start(acceleration_refresh_mode).await?,
+                    refresher
+                        .start(acceleration_refresh_mode)
+                        .await
+                        .map_err(|source| AcceleratedTableBuilderError::FailedAfterStart {
+                            source,
+                        })?,
                     refresh_trigger,
                 )
             };
@@ -1422,9 +1433,11 @@ impl Builder {
             user_facing_schema: self.user_facing_schema,
         };
         if let Some(prepared_child) = prepared_child {
-            let rows = prepared_child
-                .publish()
-                .map_err(|source| Error::FailedToWriteData { source })?;
+            let rows = prepared_child.publish().map_err(|source| {
+                AcceleratedTableBuilderError::FailedAfterStart {
+                    source: Error::FailedToWriteData { source },
+                }
+            })?;
             if let Some(synchronize_with) = &table.synchronized_with {
                 if rows > 0 {
                     tracing::info!(
