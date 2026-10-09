@@ -666,6 +666,11 @@ impl<V: Clone> Shard<V> {
     /// [`Self::expire_older_than`], stopping after `limit` removals so a
     /// caller can release the shard lock between batches. The final `bool`
     /// is `true` when the limit was reached and expired residents may remain.
+    ///
+    /// Entries stamped after `now` are never removed, even under a zero TTL
+    /// that counts them as expired: a caller that holds `now` fixed across
+    /// batches then reclaims only what the shard held when it started, however
+    /// fast the shard is refilled between batches.
     pub(crate) fn expire_older_than_at_most(
         &mut self,
         now: Instant,
@@ -680,7 +685,11 @@ impl<V: Clone> Shard<V> {
                 return (values, weight, false);
             };
             let key = match self.slots.get(idx as usize) {
-                Some(Slot::Occupied(node)) if ttl_elapsed(now, node.inserted_at, ttl) => node.key,
+                Some(Slot::Occupied(node))
+                    if node.inserted_at <= now && ttl_elapsed(now, node.inserted_at, ttl) =>
+                {
+                    node.key
+                }
                 _ => return (values, weight, false),
             };
             self.map.remove(&key);

@@ -2880,6 +2880,55 @@ mod tests {
         assert_eq!(left, (stale..stale + 5).map(shard_key).collect::<Vec<_>>());
     }
 
+    /// Refills shard 0 of [`REFILLED`] with one new entry per expiry it hears
+    /// about, so the shard being swept never runs out of expired entries.
+    struct RefillingListener;
+    static REFILLED: std::sync::OnceLock<ShardedCache<TestValue, RefillingListener>> =
+        std::sync::OnceLock::new();
+    static REFILL_EXPIRED: AtomicU64 = AtomicU64::new(0);
+    static REFILL_NEXT_KEY: AtomicU64 = AtomicU64::new(1 << 32);
+    /// Bounds the refills so a pass that never stops still ends the test.
+    const REFILL_CAP: u64 = 100_000;
+
+    impl EvictionListener for RefillingListener {
+        fn on_evict(reason: EvictionReason) {
+            if reason != EvictionReason::Expired {
+                return;
+            }
+            if REFILL_EXPIRED.fetch_add(1, Ordering::Relaxed) >= REFILL_CAP {
+                return;
+            }
+            let key = REFILL_NEXT_KEY.fetch_add(NUM_SHARDS as u64, Ordering::Relaxed);
+            if let Some(cache) = REFILLED.get() {
+                cache.insert(key, TestValue::with_size("refill", 1), 1);
+            }
+        }
+    }
+
+    /// A pass reclaims what had expired when it reached the shard, not what
+    /// was inserted while it ran. Under a zero TTL every entry is expired on
+    /// insert, so without that cutoff a shard refilled between batches would
+    /// keep one `run_pending_tasks` call going for as long as the refills do.
+    #[test]
+    fn run_pending_tasks_stops_at_entries_inserted_during_the_pass() {
+        let cache = REFILLED
+            .get_or_init(|| ShardedCache::new(1 << 40, Duration::ZERO, EvictionPolicy::Lru));
+        let initial = u64::try_from(2 * EXPIRE_BATCH + 7).expect("fits u64");
+        // Multiples of NUM_SHARDS all land on shard 0.
+        for i in 0..initial {
+            cache.insert(i * NUM_SHARDS as u64, TestValue::with_size("old", 1), 1);
+        }
+
+        cache.run_pending_tasks();
+
+        assert_eq!(
+            REFILL_EXPIRED.load(Ordering::Relaxed),
+            initial,
+            "one pass must reclaim exactly the entries present when it started"
+        );
+        assert_eq!(cache.len(), usize::try_from(initial).expect("fits usize"));
+    }
+
     #[test]
     fn lfu_evicts_global_lowest_freq_including_cold_mru() {
         // Keys on distinct shards (0, 1, 2). Full-scan LFU must prefer the
