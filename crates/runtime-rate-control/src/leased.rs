@@ -127,7 +127,8 @@ limitations under the License.
 //! replica that stops stops holding the cluster to its limit three windows
 //! after its last refresh. Grants already written stand, so a replica that
 //! starts with a lower limit holds the cluster to it from the second window
-//! after it first leases.
+//! after it first leases. Each replica logs a warning naming the origin and
+//! the limits when they start to differ, and a note when they agree again.
 //!
 //! Window ids come from each replica's own clock, so the budget of a window
 //! holds in real time only while the replicas' clocks agree to well within a
@@ -140,7 +141,7 @@ limitations under the License.
 //! grants and give way to them.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
@@ -306,28 +307,51 @@ impl PersistedRateControlState {
         limiter
     }
 
-    /// The other limiters of `own_key`'s quota, with their keys: the same
-    /// quota name, written by replicas that configure a different limit for it.
+    /// The other limiters of `own_key`'s quota: the same quota name, written
+    /// by replicas that configure a different limit for it.
     fn siblings<'a>(
         &'a self,
         own_key: &'a str,
-    ) -> impl Iterator<Item = (&'a str, &'a PersistedLimiter)> + 'a {
-        let own_name = quota_name(own_key);
+    ) -> impl Iterator<Item = (LimiterKey<'a>, &'a PersistedLimiter)> + 'a {
+        let own_name = LimiterKey::parse(own_key).map(|key| key.name);
         self.limiters.iter().filter_map(move |(key, limiter)| {
-            (key != own_key && own_name.is_some() && quota_name(key) == own_name)
-                .then_some((key.as_str(), limiter))
+            if key == own_key {
+                return None;
+            }
+            let parsed = LimiterKey::parse(key)?;
+            (Some(parsed.name) == own_name).then_some((parsed, limiter))
         })
     }
 }
 
-/// The quota name of a persisted limiter key,
-/// `{name}:burst={limit}:replenish_ns={interval}`.
+/// A persisted limiter key, `{name}:burst={limit}:replenish_ns={interval}`,
+/// taken apart.
 ///
 /// The key carries the configured limit, so replicas that set different limits
 /// for one quota write different keys into one file. The name is what ties them
 /// back together.
-fn quota_name(key: &str) -> Option<&str> {
-    key.split_once(":burst=").map(|(name, _)| name)
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct LimiterKey<'a> {
+    /// The quota, e.g. `requests_per_second`.
+    name: &'a str,
+    /// The configured limit: the quota's burst size, which is the value the
+    /// user set (`requests_per_second_limit: 10` is a burst of 10).
+    limit: u64,
+}
+
+impl<'a> LimiterKey<'a> {
+    fn parse(key: &'a str) -> Option<Self> {
+        let (name, rest) = key.split_once(":burst=")?;
+        let limit = rest.split(':').next()?.parse().ok()?;
+        Some(Self { name, limit })
+    }
+
+    /// The setting the user configures this quota with. The quota names come
+    /// from HTTP rate control, the only caller that leases quotas: the quota
+    /// `requests_per_second` is set by `requests_per_second_limit`.
+    fn setting(self) -> String {
+        format!("{}_limit", self.name)
+    }
 }
 
 /// What the sibling limiters of a quota hold for one window: the replicas that
@@ -337,6 +361,8 @@ struct SiblingReading {
     /// The per-window burst the cluster is held to: the lowest of this
     /// replica's and every live sibling's.
     burst: u64,
+    /// The distinct limits live siblings configure, for the log line.
+    limits: BTreeSet<u64>,
     /// Tokens live siblings granted in the window.
     granted: u64,
     /// Live siblings' demand over the lookback. `mine` is zero: this replica
@@ -395,6 +421,7 @@ impl SiblingReading {
 
         Self {
             burst,
+            limits: live.iter().map(|(key, _)| key.limit).collect(),
             granted: live
                 .iter()
                 .map(|(_, limiter)| limiter.granted_in(window_id))
@@ -1272,6 +1299,9 @@ pub(crate) struct LeasedBucket {
     /// The fraction of the cluster budget this replica carries between windows.
     /// Local to this replica, and never written to the shared file.
     remainder_bank: SyncMutex<RemainderBank>,
+    /// The limits other replicas configure for this quota, as last logged.
+    /// Empty while every replica agrees. Touched once per refresh tick.
+    reported_sibling_limits: SyncMutex<BTreeSet<u64>>,
 }
 
 /// The cluster budget for one window after the adaptive coefficient, split into
@@ -1472,6 +1502,7 @@ impl LeasedBucket {
             throttle_log: SyncMutex::new(PhaseChangeLog::new(ThrottleState::Healthy, hold)),
             budget_memo: SyncMutex::new(BudgetMemo::default()),
             remainder_bank: SyncMutex::new(RemainderBank::default()),
+            reported_sibling_limits: SyncMutex::new(BTreeSet::new()),
             config,
         })
     }
@@ -1703,6 +1734,7 @@ impl LeasedBucket {
                 started.elapsed(),
             );
             self.report_throttle(current.throttle);
+            self.report_sibling_limits(&current.sibling_limits);
             if dirty {
                 // Only a write can have changed what waiters are owed.
                 self.notify.notify_waiters();
@@ -1872,6 +1904,7 @@ impl LeasedBucket {
                 near_boundary: outcomes
                     .is_near_boundary(adaptive.k, ratio < FULL_ADMISSION_COEFFICIENT),
             }),
+            sibling_limits: siblings.limits,
             dirty: published,
         }
     }
@@ -1901,6 +1934,41 @@ impl LeasedBucket {
                     .map_or(0.0, |adaptive| adaptive.failure_threshold),
             );
         }
+    }
+
+    /// Log a change in the limits other replicas configure for this quota.
+    fn report_sibling_limits(&self, sibling_limits: &BTreeSet<u64>) {
+        match self.sibling_limits_change(sibling_limits) {
+            Some(SiblingLimitsChange::Differ(warning)) => tracing::warn!("{warning}"),
+            Some(SiblingLimitsChange::Agree(notice)) => tracing::info!("{notice}"),
+            None => {}
+        }
+    }
+
+    /// What to log about the limits other replicas configure for this quota,
+    /// or `None` when they have not changed since the last report.
+    ///
+    /// Warns when they start to differ from this replica's, or change while
+    /// they do, naming every value, and notes once they agree again. Reported
+    /// on a change only, not on every tick.
+    fn sibling_limits_change(&self, sibling_limits: &BTreeSet<u64>) -> Option<SiblingLimitsChange> {
+        {
+            let mut reported = self.reported_sibling_limits.lock();
+            if *reported == *sibling_limits {
+                return None;
+            }
+            reported.clone_from(sibling_limits);
+        }
+        let key = LimiterKey::parse(&self.config.limiter_key)?;
+        Some(if sibling_limits.is_empty() {
+            SiblingLimitsChange::Agree(limits_agree_notice(&self.config.origin, key))
+        } else {
+            SiblingLimitsChange::Differ(limits_differ_warning(
+                &self.config.origin,
+                key,
+                sibling_limits,
+            ))
+        })
     }
 
     fn note_failure(&self) {
@@ -1967,6 +2035,9 @@ struct WindowOutcome {
     /// The adaptive state of the window that was just leased, or `None`
     /// without adaptive settings.
     throttle: Option<ClusterThrottle>,
+    /// The limits replicas leasing under sibling limiters configure for the
+    /// window. Empty while every replica configures this one's.
+    sibling_limits: BTreeSet<u64>,
     /// Whether the persisted state was modified and must therefore be written
     /// back. Two reasons we'd skip a write: (a) we already had a lease at the
     /// desired size in this window from a previous tick, or (b) demand is
@@ -2005,6 +2076,48 @@ impl ClusterThrottle {
         } else {
             Damping::Immediate
         }
+    }
+}
+
+/// A change in the limits other replicas configure for a quota, with the line
+/// that reports it.
+#[derive(Debug, PartialEq, Eq)]
+enum SiblingLimitsChange {
+    /// They differ from this replica's limit: a warning.
+    Differ(String),
+    /// They agree with it again: a note.
+    Agree(String),
+}
+
+/// The warning a replica logs while other replicas sharing the state location
+/// configure a different limit for one of its quotas.
+fn limits_differ_warning(origin: &str, key: LimiterKey<'_>, others: &BTreeSet<u64>) -> String {
+    let setting = key.setting();
+    let own = key.limit;
+    let lowest = others.iter().copied().fold(own, u64::min);
+    let others = list_values(others);
+    format!(
+        "Instances sharing cluster rate control for origin '{origin}' set `{setting}` to different values (this instance: {own}; other instances: {others}), so the cluster is held to the lowest value, {lowest}, until every instance sets the same one. Set the same `{setting}` on every instance that shares `runtime.state.location`. See: https://spiceai.org/docs/reference/spicepod/runtime#runtimesource_rate_control"
+    )
+}
+
+/// The note a replica logs once every replica it shares a quota with agrees on
+/// the limit again, closing the warning [`limits_differ_warning`] opened.
+fn limits_agree_notice(origin: &str, key: LimiterKey<'_>) -> String {
+    let setting = key.setting();
+    let limit = key.limit;
+    format!(
+        "Instances sharing cluster rate control for origin '{origin}' now all set `{setting}` to {limit}, so the cluster is held to {limit}."
+    )
+}
+
+/// `10`, `10 and 15`, `5, 10 and 15`.
+fn list_values(values: &BTreeSet<u64>) -> String {
+    let values: Vec<String> = values.iter().map(u64::to_string).collect();
+    match values.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+        Some((last, _)) => last.clone(),
+        None => String::new(),
     }
 }
 
@@ -3637,26 +3750,36 @@ mod tests {
         assert!(granted_a + granted_b <= 10, "{granted_a}+{granted_b} > 10");
     }
 
-    /// The key a quota is persisted under parses back to the quota's name: the
-    /// name is what ties replicas that configure different limits back to one
-    /// budget.
+    /// The key a quota is persisted under parses back to the quota's name and
+    /// the configured limit: the name is what ties replicas that configure
+    /// different limits back to one budget.
     #[test]
-    fn limiter_keys_parse_back_to_the_quota_name() {
-        for (name, quota) in [
+    fn limiter_keys_parse_back_to_the_quota_and_the_configured_limit() {
+        for (name, quota, limit) in [
             (
                 "requests_per_second",
                 governor::Quota::per_second(NonZeroU32::new(10).expect("non-zero")),
+                10,
             ),
             (
                 "requests_per_minute",
                 governor::Quota::per_minute(NonZeroU32::new(600).expect("non-zero")),
+                600,
             ),
         ] {
             let key = crate::QuotaDefinition::new(Some(name.to_string()), quota)
                 .persistence_key("unused");
-            assert_eq!(quota_name(&key), Some(name), "{key}");
+            assert_eq!(
+                LimiterKey::parse(&key),
+                Some(LimiterKey { name, limit }),
+                "{key}"
+            );
         }
-        assert_eq!(quota_name("requests_per_second"), None);
+        assert_eq!(LimiterKey::parse("requests_per_second"), None);
+        assert_eq!(
+            LimiterKey::parse("requests_per_second:burst=ten:replenish_ns=1"),
+            None
+        );
     }
 
     /// Only limiters of the same quota are siblings: a per-minute limiter in
@@ -3678,7 +3801,77 @@ mod tests {
             .collect();
         assert_eq!(
             siblings,
-            vec![("requests_per_second:burst=10:replenish_ns=100000000", 10)]
+            vec![(
+                LimiterKey {
+                    name: "requests_per_second",
+                    limit: 10
+                },
+                10
+            )]
+        );
+    }
+
+    /// The warning names the origin, the setting, this replica's value and every
+    /// other one, and the value the cluster is held to; the notice that closes
+    /// it names the value the replicas agree on.
+    #[test]
+    fn limit_log_lines_name_the_origin_the_setting_and_every_value() {
+        let origin = "http://127.0.0.1:37081";
+        let key = LimiterKey {
+            name: "requests_per_second",
+            limit: 20,
+        };
+        assert_eq!(
+            limits_differ_warning(origin, key, &BTreeSet::from([10])),
+            "Instances sharing cluster rate control for origin 'http://127.0.0.1:37081' set `requests_per_second_limit` to different values (this instance: 20; other instances: 10), so the cluster is held to the lowest value, 10, until every instance sets the same one. Set the same `requests_per_second_limit` on every instance that shares `runtime.state.location`. See: https://spiceai.org/docs/reference/spicepod/runtime#runtimesource_rate_control"
+        );
+        assert_eq!(
+            limits_differ_warning(origin, key, &BTreeSet::from([30, 25, 40])),
+            "Instances sharing cluster rate control for origin 'http://127.0.0.1:37081' set `requests_per_second_limit` to different values (this instance: 20; other instances: 25, 30 and 40), so the cluster is held to the lowest value, 20, until every instance sets the same one. Set the same `requests_per_second_limit` on every instance that shares `runtime.state.location`. See: https://spiceai.org/docs/reference/spicepod/runtime#runtimesource_rate_control"
+        );
+        assert_eq!(
+            limits_agree_notice(origin, key),
+            "Instances sharing cluster rate control for origin 'http://127.0.0.1:37081' now all set `requests_per_second_limit` to 20, so the cluster is held to 20."
+        );
+    }
+
+    /// A change in the other replicas' limits is reported once: a warning
+    /// naming them when they start to differ or change, a note when they agree
+    /// again, and nothing on the ticks in between.
+    #[tokio::test]
+    async fn limit_changes_are_reported_once() {
+        let bucket = per_second_bucket(&Arc::new(InMemory::new()), "a", 20, Duration::from_secs(1));
+        let key = LimiterKey {
+            name: "requests_per_second",
+            limit: 20,
+        };
+        let differ = |others: &[u64]| {
+            Some(SiblingLimitsChange::Differ(limits_differ_warning(
+                "https://example.com",
+                key,
+                &others.iter().copied().collect(),
+            )))
+        };
+        let agree = Some(SiblingLimitsChange::Agree(limits_agree_notice(
+            "https://example.com",
+            key,
+        )));
+
+        let reports: Vec<_> = [&[][..], &[10], &[10], &[10, 15], &[10, 15], &[], &[]]
+            .into_iter()
+            .map(|others| bucket.sibling_limits_change(&others.iter().copied().collect()))
+            .collect();
+        assert_eq!(
+            reports,
+            vec![
+                None,
+                differ(&[10]),
+                None,
+                differ(&[10, 15]),
+                None,
+                agree,
+                None
+            ]
         );
     }
 
@@ -3800,6 +3993,10 @@ mod tests {
             }
         }
 
+        // Each replica has reported the other's limit.
+        assert_eq!(*high.reported_sibling_limits.lock(), BTreeSet::from([10]));
+        assert_eq!(*low.reported_sibling_limits.lock(), BTreeSet::from([20]));
+
         // Both have asked for the same since the replica at 10 joined, so
         // neither is left with the scraps of the other's grant.
         let low_stopped = joined + 5;
@@ -3819,6 +4016,10 @@ mod tests {
             refresh_with_demand(&high).await;
         }
         assert_eq!(high.metrics.lease_granted(), max_lease_per_replica(20));
+
+        // The replica left reports that every replica it shares the quota with
+        // agrees with it again; see `limit_changes_are_reported_once`.
+        assert_eq!(*high.reported_sibling_limits.lock(), BTreeSet::new());
     }
 
     /// Replicas that start together, with requests waiting and no history,
