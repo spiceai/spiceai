@@ -222,11 +222,41 @@ impl AdaptiveTuning {
 }
 
 // Not derived, so an invalid value reports the documented message rather than serde's
-// generic unknown-variant text.
+// generic unknown-variant or type text. A scalar that is not a string (`true`, `1`) is
+// reported as written; `true`/`false` are deliberately not accepted as aliases.
 impl<'de> Deserialize<'de> for AdaptiveTuning {
     fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
-        let raw = String::deserialize(deserializer)?;
-        Self::parse(&raw).map_err(serde::de::Error::custom)
+        struct AdaptiveTuningVisitor;
+
+        impl serde::de::Visitor<'_> for AdaptiveTuningVisitor {
+            type Value = AdaptiveTuning;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("`enabled` or `disabled`")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                AdaptiveTuning::parse(value).map_err(E::custom)
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Self::Value, E> {
+                self.visit_str(&value.to_string())
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Self::Value, E> {
+                self.visit_str(&value.to_string())
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
+                self.visit_str(&value.to_string())
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Self::Value, E> {
+                self.visit_str(&value.to_string())
+            }
+        }
+
+        deserializer.deserialize_any(AdaptiveTuningVisitor)
     }
 }
 
@@ -2796,6 +2826,40 @@ datasets:
             invalid_tuning_message("enablde"),
             "Invalid `runtime.adaptive_tuning` value 'enablde': expected `enabled` or `disabled`. See: https://spiceai.org/docs/reference/spicepod/runtime"
         );
+    }
+
+    #[test]
+    fn test_adaptive_tuning_rejects_non_string_scalars_with_the_documented_message() {
+        for (yaml_value, rendered) in [("true", "true"), ("false", "false"), ("1", "1")] {
+            let error = yaml::from_str::<Runtime>(&format!("adaptive_tuning: {yaml_value}\n"))
+                .expect_err("a non-string value must fail the load");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&invalid_tuning_message(rendered)),
+                "unexpected error for {yaml_value}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_adaptive_tuning_rejects_non_string_json_scalars_with_the_documented_message() {
+        for (json_value, rendered) in [
+            ("true", "true"),
+            ("false", "false"),
+            ("1", "1"),
+            ("1.5", "1.5"),
+        ] {
+            let error =
+                serde_json::from_str::<Runtime>(&format!(r#"{{"adaptive_tuning": {json_value}}}"#))
+                    .expect_err("a non-string value must fail the load");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&invalid_tuning_message(rendered)),
+                "unexpected error for {json_value}: {error}"
+            );
+        }
     }
 
     #[test]
