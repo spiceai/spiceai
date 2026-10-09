@@ -95,6 +95,36 @@ impl SecondaryIndex {
     }
 }
 
+const HASH_INDEX_DOCS: &str = "https://spiceai.org/docs/features/data-acceleration/hash-index";
+
+/// The warning a dataset gets when a rebuild cannot use one of its secondary indexes.
+fn index_unusable_warning(dataset: &str, columns: &[String], cause: &dyn fmt::Display) -> String {
+    format!(
+        "Dataset '{dataset}' (arrow): the index on ({}) cannot be used, so lookups on that column read the whole table until a refresh changes the data. Cause: {cause}. See: {HASH_INDEX_DOCS}",
+        columns.join(", ")
+    )
+}
+
+/// The warning an Arrow acceleration gets when it declares a `unique` index.
+///
+/// Arrow treats a `unique` index like `enabled`: it does not reject a repeated row on
+/// write, and an index over repeated values stops serving lookups. Said at registration,
+/// as Cayenne does, rather than left for a slow lookup to say.
+#[must_use]
+pub fn unique_index_warning(dataset: &str) -> String {
+    format!(
+        "Dataset '{dataset}' (arrow): a `unique` entry in `indexes` speeds up lookups but does not constrain writes, so duplicate rows are not rejected; while a value repeats, lookups on that column read the whole table. Set `primary_key` with `on_conflict` to deduplicate on a column set. See: {HASH_INDEX_DOCS}"
+    )
+}
+
+/// The notice a dataset gets when a rebuild makes a disabled secondary index usable again.
+fn index_usable_again_notice(dataset: &str, columns: &[String]) -> String {
+    format!(
+        "Dataset '{dataset}' (arrow): the index on ({}) serves lookups again",
+        columns.join(", ")
+    )
+}
+
 /// A `MemTable` enhanced with a SIMD-optimized hash index for fast point lookups.
 ///
 /// When a primary key is defined, this table maintains a hash index that enables
@@ -394,7 +424,7 @@ impl IndexedMemTable {
         // with a repeated key leaves it unusable, and lookups on it scan the table
         // until a rebuild finds the keys distinct again. Logged on each change of
         // state only, since the rebuild runs after every refresh.
-        let table = self.table_name.as_deref().unwrap_or("<unnamed>");
+        let dataset = self.table_name.as_deref().unwrap_or("<unnamed>");
         for secondary in &self.secondary_indexes {
             let was_usable = secondary.is_usable();
             match secondary.index.rebuild_strict(&partitions) {
@@ -402,20 +432,20 @@ impl IndexedMemTable {
                     secondary.usable.store(true, Ordering::Release);
                     if !was_usable {
                         tracing::info!(
-                            "Table '{table}': the Arrow index on ({}) serves lookups again; its values are distinct",
-                            secondary.columns.join(", ")
+                            "{}",
+                            index_usable_again_notice(dataset, &secondary.columns)
                         );
                     }
                 }
                 Err(
-                    reason @ (hash_index::Error::DuplicateKey
+                    cause @ (hash_index::Error::DuplicateKey
                     | hash_index::Error::HashCollision { .. }),
                 ) => {
                     secondary.usable.store(false, Ordering::Release);
                     if was_usable {
                         tracing::warn!(
-                            "Table '{table}': the Arrow index on ({}) is not used for lookups, which read the whole table until a refresh removes the repeated values. Reason: {reason}",
-                            secondary.columns.join(", ")
+                            "{}",
+                            index_unusable_warning(dataset, &secondary.columns, &cause)
                         );
                     }
                 }
@@ -3847,5 +3877,29 @@ mod tests {
             .await
             .expect("maintenance failed");
         assert!(!table.is_dirty());
+    }
+
+    /// A log line a user acts on names the dataset, links the docs, and stays on one line.
+    #[test]
+    fn index_messages_name_the_dataset_and_link_the_docs() {
+        let columns = vec!["sender_id".to_string()];
+        let warning = index_unusable_warning("senders", &columns, &hash_index::Error::DuplicateKey);
+        assert!(warning.contains("'senders'"), "{warning}");
+        assert!(warning.contains("(sender_id)"), "{warning}");
+        assert!(warning.contains("Duplicate key"), "{warning}");
+        assert!(warning.contains("https://spiceai.org/docs"), "{warning}");
+        assert!(!warning.contains('\n'), "{warning}");
+
+        let notice = index_usable_again_notice("senders", &columns);
+        assert!(
+            notice.contains("'senders'") && notice.contains("(sender_id)"),
+            "{notice}"
+        );
+        assert!(!notice.contains('\n'), "{notice}");
+
+        let warning = unique_index_warning("senders");
+        assert!(warning.contains("'senders'"), "{warning}");
+        assert!(warning.contains("https://spiceai.org/docs"), "{warning}");
+        assert!(!warning.contains('\n'), "{warning}");
     }
 }

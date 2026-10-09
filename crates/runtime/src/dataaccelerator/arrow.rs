@@ -124,9 +124,6 @@ impl DataAccelerator for ArrowAccelerator {
                 .insert("sort_columns".to_string(), sort_cols_str.clone());
         }
 
-        // Arrow treats a `unique` index like `enabled`: it does not reject a repeated
-        // row on write, and an index over repeated values stops serving lookups. Say
-        // so at registration, as Cayenne does, rather than let a slow lookup say it.
         if let Some(source) = source
             && let Some(acceleration) = source.acceleration()
             && acceleration
@@ -134,9 +131,11 @@ impl DataAccelerator for ArrowAccelerator {
                 .values()
                 .any(|index_type| matches!(index_type, IndexType::Unique))
         {
+            // Arrow treats a `unique` index like `enabled`; say so at registration, as
+            // Cayenne does, rather than let a slow lookup say it.
             tracing::warn!(
-                "Dataset '{}' (arrow): a `unique` entry in `indexes` speeds up lookups but does not constrain writes, so duplicate rows are not rejected; while a value repeats, lookups on that column read the whole table. Set `primary_key` with `on_conflict` to deduplicate on a column set.",
-                source.name()
+                "{}",
+                data_components::arrow::unique_index_warning(&source.name().to_string())
             );
         }
 
@@ -176,12 +175,6 @@ data_accelerator_api::register_data_accelerator!(Engine::Arrow, ArrowAccelerator
 mod tests {
     use super::*;
     use crate::component::dataset::acceleration::Acceleration;
-    use crate::component::dataset::schema_inference::apply_inferred_schema;
-    use crate::parameters::Parameters;
-    use arrow::datatypes::{DataType, Field, Schema};
-    use data_components::inferred_schema::{InferredSchema, InferredSortColumn};
-    use runtime_secrets::{Secrets, get_params_with_secrets};
-    use tokio::sync::RwLock;
 
     /// Regression test for #14023: the sort order schema inference writes into
     /// the acceleration params must be spelled the way this accelerator's

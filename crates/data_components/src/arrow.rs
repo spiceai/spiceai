@@ -34,7 +34,7 @@ pub mod indexed;
 pub mod struct_builder;
 pub mod write;
 
-pub use indexed::IndexedMemTable;
+pub use indexed::{IndexedMemTable, unique_index_warning};
 
 #[derive(Debug)]
 pub struct ArrowFactory {}
