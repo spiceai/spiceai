@@ -345,6 +345,8 @@ mod tests {
     /// The adapter does not trust every evaluation model to range-check its nouls.
     #[tokio::test]
     async fn a_noul_outside_zero_to_one_fails() {
+        // `MockEvaluate` takes a fn returning `Option`, so the wrap is required.
+        #[expect(clippy::unnecessary_wraps)]
         fn out_of_range(_state: &EvaluateState, _id: &str) -> Option<f64> {
             Some(1.7)
         }
