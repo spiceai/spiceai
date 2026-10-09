@@ -35,7 +35,7 @@ limitations under the License.
 //! Its own test binary with a single test: the budget is process-global, so
 //! the cases run in sequence rather than on parallel test threads.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 

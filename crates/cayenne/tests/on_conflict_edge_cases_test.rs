@@ -27,7 +27,7 @@ limitations under the License.
 //! - String primary key upserts
 //! - Empty batch handling
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 

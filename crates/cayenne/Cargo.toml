@@ -6,6 +6,7 @@ license = "Apache-2.0"
 name = "cayenne"
 repository = "https://github.com/spiceai/spiceai"
 version.workspace = true
+autotests = false
 
 [dependencies]
 cpu-budget = { path = "../cpu-budget" }
@@ -524,51 +525,33 @@ name = "pk_keyset_present_path"
 harness = false
 name = "scan_view_reuse_qps"
 
-# Turso 0.7.2 → 0.8.1 on-disk open. The fixtures were written by
-# `tools/turso-072-fixture-gen` (excluded from the workspace so cargo does not
-# unify `turso` to 0.8.1). Required feature: the test talks to the Turso crate.
-[[test]]
-name = "turso_0_7_2_open_compat_test"
-path = "tests/turso_0_7_2_open_compat_test.rs"
-required-features = ["turso"]
+[lints]
+workspace = true
 
-# Result *correctness* (not perf): inventory completeness + pure compare path.
 [[test]]
-name = "result_correctness_inventory_test"
-path = "tests/result_correctness_inventory_test.rs"
+name = "integration"
+path = "tests/integration.rs"
 
-# Static comparison-cell census over the inventory. Links no engines; prints the
-# planned-coverage ceiling as markdown. Not a gate — it asserts nothing.
 [[test]]
-name = "result_correctness_census_test"
-path = "tests/result_correctness_census_test.rs"
+name = "footer_cache_hit_counter_test"
+path = "tests/footer_cache_hit_counter_test.rs"
 
-# Result correctness vs DuckDB on SF1 suites + SQLLancer. Not a Criterion bench.
 [[test]]
-name = "result_correctness_vs_duckdb_test"
-path = "tests/result_correctness_vs_duckdb_test.rs"
-required-features = ["result-correctness-duckdb"]
+name = "inline_cache_gauge_test"
+path = "tests/inline_cache_gauge_test.rs"
 
-# Result correctness vs chDB (SQLLancer + micro). Separate process from DuckDB
-# — the engines cannot co-link. Not a Criterion bench.
+[[test]]
+name = "lookup_index_memory_test"
+path = "tests/lookup_index_memory_test.rs"
+
+[[test]]
+name = "mem_tier_limit_accounting_test"
+path = "tests/mem_tier_limit_accounting_test.rs"
+
+# Result correctness vs chDB (SQLLancer + micro). Its own binary because chDB and
+# DuckDB cannot be linked into one process, and the DuckDB lanes are modules of
+# `integration`.
 [[test]]
 name = "result_correctness_vs_chdb_test"
 path = "tests/result_correctness_vs_chdb_test.rs"
 required-features = ["result-correctness-chdb"]
-
-# Result correctness vs SQLite (SSB + SQLLancer + micro). Always linked
-# (rusqlite is a cayenne dependency). Not a Criterion bench.
-[[test]]
-name = "result_correctness_vs_sqlite_test"
-path = "tests/result_correctness_vs_sqlite_test.rs"
-
-# Out-of-Spice oracle baseline: standalone DuckDB ↔ standalone SQLite (no
-# Cayenne / no Spice accelerators). Validates external engines agree before
-# accelerator-vs-oracle gates. Requires DuckDB feature for one side.
-[[test]]
-name = "result_correctness_standalone_engines_test"
-path = "tests/result_correctness_standalone_engines_test.rs"
-required-features = ["result-correctness-duckdb"]
-
-[lints]
-workspace = true

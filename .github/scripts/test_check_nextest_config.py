@@ -20,7 +20,7 @@ slow-timeout = { period = "120s", terminate-after = 3 }
 cayenne-property-tests = { max-threads = 2 }
 
 [[profile.default.overrides]]
-filter = 'binary(=mutation_property_test) | binary(=cdc_compaction_delete_race_test) | binary(=maintained_aggregate_filter_test)'
+filter = '(binary_id(=cayenne::integration) & test(/^mutation_property_test::/)) | (binary_id(=cayenne::integration) & test(/^cdc_compaction_delete_race_test::/)) | (binary_id(=cayenne::integration) & test(/^maintained_aggregate_filter_test::/))'
 test-group = 'cayenne-property-tests'
 retries = 0
 """
@@ -33,15 +33,15 @@ FIXED_CONFIG = PRE_FIX_CONFIG + """\
 slow-timeout = { period = "120s", terminate-after = 12 }
 
 [[profile.default.overrides]]
-filter = 'binary(=partition_chunking_test) | binary(=layout_pruning_ab_test)'
+filter = '(binary_id(=cayenne::integration) & test(/^partition_chunking_test::/)) | (binary_id(=cayenne::integration) & test(/^layout_pruning_ab_test::/))'
 slow-timeout = { period = "120s", terminate-after = 12 }
 
 [[profile.default.overrides]]
-filter = 'binary(=mutation_model_test)'
+filter = '(binary_id(=cayenne::integration) & test(/^mutation_model_test::/))'
 slow-timeout = { period = "120s", terminate-after = 8 }
 
 [[profile.default.overrides]]
-filter = 'binary(=result_correctness_vs_duckdb_test) | binary(=result_correctness_vs_sqlite_test)'
+filter = '(binary_id(=cayenne::integration) & test(/^result_correctness_vs_duckdb_test::/)) | (binary_id(=cayenne::integration) & test(/^result_correctness_vs_sqlite_test::/))'
 retries = 0
 slow-timeout = { period = "120s", terminate-after = 12 }
 """
@@ -155,20 +155,52 @@ class CeilingTest(unittest.TestCase):
 class BinaryFilterTest(unittest.TestCase):
     def test_matches_each_disjunct(self):
         self.assertEqual(
-            check_nextest_config.binaries_matched("binary(=a_test) | binary(=b_test)"),
+            check_nextest_config.selectors_matched("binary(=a_test) | binary(=b_test)"),
             {"a_test", "b_test"},
         )
 
     def test_a_test_name_filter_matches_no_binary(self):
         """A `test(=…)` filter cannot be resolved to a binary, and must not be guessed at."""
         self.assertEqual(
-            check_nextest_config.binaries_matched("test(=mysql::replication_e2e::foo)"), set()
+            check_nextest_config.selectors_matched("test(=mysql::replication_e2e::foo)"), set()
         )
 
     def test_rejects_binary_filter_spellings_it_cannot_resolve(self):
-        for expr in ("binary(~mutation)", "binary(/mutation.*/)", "binary-id(cayenne::foo)"):
-            with self.assertRaises(ValueError):
-                check_nextest_config.binaries_matched(expr)
+        for expr in (
+            "binary(~mutation)",
+            "binary(/mutation.*/)",
+            "binary-id(cayenne::foo)",
+            # A module of a binary named without its package: cayenne and
+            # runtime both have an `integration` binary, so this cannot be
+            # resolved.
+            "binary(=integration) & test(/^mutation_property_test::/)",
+            "(binary_id(=cayenne::integration) & test(/mutation/))",
+            "binary_id(=cayenne::integration)",
+        ):
+            with self.assertRaises(ValueError, msg=expr):
+                check_nextest_config.selectors_matched(expr)
+
+    def test_matches_a_module_of_a_binary(self):
+        self.assertEqual(
+            check_nextest_config.selectors_matched(
+                "(binary_id(=cayenne::integration) & test(/^a_test::/))"
+                " | (binary_id(=cayenne::integration) & test(/^b_test::/))"
+                " | binary(=retention_oom)"
+            ),
+            {
+                "cayenne::integration::a_test",
+                "cayenne::integration::b_test",
+                "retention_oom",
+            },
+        )
+
+    def test_a_module_selector_does_not_match_the_whole_binary(self):
+        """Selecting one module must not stand in for the binary, or its siblings."""
+        matched = check_nextest_config.selectors_matched(
+            "(binary_id(=cayenne::integration) & test(/^a_test::/))"
+        )
+        self.assertNotIn("integration", matched)
+        self.assertNotIn("cayenne::integration::b_test", matched)
 
 
 class ResolveTest(unittest.TestCase):
@@ -242,11 +274,11 @@ class CheckConfigTest(unittest.TestCase):
         which is what makes the earlier block win otherwise.
         """
         config = FIXED_CONFIG.replace(
-            "filter = 'binary(=partition_chunking_test) | binary(=layout_pruning_ab_test)'",
-            "filter = 'binary(=partition_chunking_test)'",
+            "filter = '(binary_id(=cayenne::integration) & test(/^partition_chunking_test::/)) | (binary_id(=cayenne::integration) & test(/^layout_pruning_ab_test::/))'",
+            "filter = '(binary_id(=cayenne::integration) & test(/^partition_chunking_test::/))'",
         ).replace(
-            "filter = 'binary(=mutation_model_test)'",
-            "filter = 'binary(=mutation_model_test) | binary(=layout_pruning_ab_test)'",
+            "filter = '(binary_id(=cayenne::integration) & test(/^mutation_model_test::/))'",
+            "filter = '(binary_id(=cayenne::integration) & test(/^mutation_model_test::/)) | (binary_id(=cayenne::integration) & test(/^layout_pruning_ab_test::/))'",
         )
         with tempfile.TemporaryDirectory() as tmp:
             problems = check_nextest_config.check_config(write(tmp, config))

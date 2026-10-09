@@ -25,7 +25,7 @@ limitations under the License.
 //! 4. Atomically swap the catalog to the new snapshot
 //! 5. Verify data correctness and ordering after the rewrite
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 

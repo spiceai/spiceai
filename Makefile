@@ -112,8 +112,7 @@ endif
 # the `metrics` binary into that one selection. It builds every test target
 # in the workspace, including ones the filterset never runs. Naming just the
 # wanted targets with `--test <glob>` would build fewer, but a new test file that
-# didn't match the glob would silently stop being covered — cayenne already has
-# a test target that doesn't follow the `*_test` convention its other 55 do.
+# didn't match the glob would silently stop being covered.
 #
 # `metrics` is a `tests/` binary rather than a `--lib` test because it needs its
 # own process to control the OTel meter-provider install order. Every metrics

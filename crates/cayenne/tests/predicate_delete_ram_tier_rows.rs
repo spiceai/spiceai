@@ -32,7 +32,7 @@ limitations under the License.
 //! Every observed row set is printed (`--nocapture`) so a run documents what
 //! the table actually served, whichever way the assertions go.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 

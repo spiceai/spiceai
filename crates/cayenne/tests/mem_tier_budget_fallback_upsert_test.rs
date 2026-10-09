@@ -31,7 +31,7 @@ limitations under the License.
 //! every backend and case runs in sequence rather than on parallel test
 //! threads.
 
-mod common;
+use crate::common;
 
 use std::ops::RangeInclusive;
 use std::sync::Arc;

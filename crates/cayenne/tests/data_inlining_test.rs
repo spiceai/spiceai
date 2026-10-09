@@ -18,7 +18,7 @@ limitations under the License.
 
 //! Tests for data inlining: small batches stored in the metastore as Arrow IPC blobs.
 
-mod common;
+use crate::common;
 
 use arrow::array::{
     Array, BooleanArray, Date32Array, Float64Array, Int32Array, Int64Array, StringArray,

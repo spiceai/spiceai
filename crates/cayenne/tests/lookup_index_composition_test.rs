@@ -22,7 +22,7 @@ limitations under the License.
 
 #![allow(clippy::expect_used, clippy::unwrap_used)]
 
-mod common;
+use crate::common;
 
 use common::lookup_index::{
     TableSpec, counters, file_mode_config, memory_mode_config, open_table, overwrite, poll_until,

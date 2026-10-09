@@ -25,7 +25,7 @@ limitations under the License.
 //! `compaction_trigger_files`, even tiny tests can exercise the picker +
 //! rewrite + snapshot-swap path end-to-end.
 
-mod common;
+use crate::common;
 
 use std::path::Path;
 use std::sync::Arc;

@@ -23,8 +23,8 @@ They measure correctness only. Numeric compare uses existing float tolerance.
 | `spice-duckdb-accel` | Spice DuckDB accelerator | `accelerator_duckdb` |
 | `spice-sqlite-accel` | Spice SQLite accelerator | `accelerator_sqlite` |
 
-**DuckDB and chDB cannot co-link** in one process; multi-engine coverage is
-pairwise across separate test binaries.
+**DuckDB and chDB cannot both run** in one process; the chDB lane is a separate
+test binary from the `integration` binary that holds the DuckDB lanes.
 
 ## Correctness matrix
 
@@ -150,18 +150,18 @@ Classic Q1.1–Q4.3; pure-Rust deterministic star schema. Scale:
 
 ```bash
 # Inventory
-cargo test -p cayenne --test result_correctness_inventory_test
+cargo test -p cayenne --test integration result_correctness_inventory_test::
 
 # Standalone oracles only (DuckDB ↔ SQLite, no Spice)
 cargo test -p cayenne --features result-correctness-duckdb \
-  --test result_correctness_standalone_engines_test
+  --test integration result_correctness_standalone_engines_test::
 
 # Cayenne ↔ standalone DuckDB. `--test-threads=1` is required, not stylistic:
 # parallel runs have hit allocator aborts in the bundled DuckDB crate, which fail
 # in a way that reads like a correctness mismatch.
 CAYENNE_PARITY_TPCH_SF=1 CAYENNE_PARITY_TPCDS_SF=1 CAYENNE_PARITY_CHBENCH_SF=1 \
   cargo test -p cayenne --features result-correctness-duckdb \
-  --test result_correctness_vs_duckdb_test -- --test-threads=1
+  --test integration result_correctness_vs_duckdb_test:: -- --test-threads=1
 
 # Cayenne ↔ standalone chDB
 cargo test -p cayenne --features result-correctness-chdb \
@@ -169,9 +169,9 @@ cargo test -p cayenne --features result-correctness-chdb \
 
 # Cayenne ↔ standalone SQLite. TPC-H and TPC-DS run at SF 0.1 unless
 # CAYENNE_PARITY_SQLITE_TPCH_SF / CAYENNE_PARITY_SQLITE_TPCDS_SF say otherwise,
-# which keeps this binary, gated by `make nextest`, inside the gate's per-test
+# which keeps this lane, gated by `make nextest`, inside the gate's per-test
 # ceiling; the DuckDB and chDB lanes compare SF1.
-cargo test -p cayenne --test result_correctness_vs_sqlite_test -- --test-threads=1
+cargo test -p cayenne --test integration result_correctness_vs_sqlite_test:: -- --test-threads=1
 
 # Spice DuckDB / SQLite accelerators ↔ standalone oracles
 cargo test -p runtime --features duckdb,sqlite --test result_correctness -- --nocapture
@@ -180,18 +180,19 @@ cargo test -p runtime --features duckdb,sqlite --test result_correctness -- --no
 ## What the gate runs
 
 `make nextest` builds with `--features cayenne/result-correctness-duckdb`, which
-is what makes the DuckDB and oracle-baseline binaries exist at all: cargo skips a
-test target whose `required-features` are unmet without reporting it, so before
-that flag the filterset selected them and they silently never ran.
+is what compiles the DuckDB and oracle-baseline lanes at all: they are
+`#[cfg(feature = "result-correctness-duckdb")]` modules of the `integration` test
+binary, which drops them without reporting it when the feature is off, so without
+that flag the filterset selects them and they silently never run.
 
-| Binary | In `make nextest` |
+| Lane (`integration` module unless noted) | In `make nextest` |
 |--------|-------------------|
 | `result_correctness_inventory_test` | yes |
 | `result_correctness_census_test` | yes |
 | `result_correctness_vs_sqlite_test` | yes |
 | `result_correctness_standalone_engines_test` | yes |
 | `result_correctness_vs_duckdb_test` | yes |
-| `result_correctness_vs_chdb_test` | no — runs in `.github/workflows/correctness_chdb.yml` |
+| `result_correctness_vs_chdb_test` (its own binary) | no — runs in `.github/workflows/correctness_chdb.yml` |
 | runtime `result_correctness` | no — see below |
 
 The chDB lane has a job of its own for two reasons. `chdb-rust` fetches libchdb
@@ -199,9 +200,10 @@ at build time, so folding it into the gate would make every sign-off depend on
 that fetch and on a machine that can link it; and the two embedded engines must
 not both be *called* in one process — linking them together is fine, but driving
 DuckDB and chDB from the same binary aborts it at startup on a static-init
-conflict. `make nextest` says out loud that this lane is not in its run, because
-a target whose `required-features` are unmet is dropped by cargo silently, which
-is how the lanes above once went unbuilt.
+conflict, which is also why it is a test binary of its own rather than a module of
+`integration` beside the DuckDB lanes. `make nextest` says out loud that this lane
+is not in its run, because a target whose `required-features` are unmet is dropped
+by cargo silently, which is how the lanes above once went unbuilt.
 
 The runtime accelerator lane stays out of the fast gate on purpose.
 `runtime/duckdb,runtime/sqlite` flow through the whole `--all --tests` build, so

@@ -16,11 +16,6 @@ limitations under the License.
 
 //! Common test utilities for Cayenne with multiple metastore backends
 
-#![expect(
-    dead_code,
-    reason = "Shared test helper module compiled into multiple test crates; not every item is used by every crate"
-)]
-
 pub mod lookup_index;
 
 use std::sync::Arc;

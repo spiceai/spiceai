@@ -22,7 +22,7 @@ limitations under the License.
 //! clauses work correctly with Cayenne, even though these functions cannot be pushed down
 //! to Vortex.
 
-mod common;
+use crate::common;
 
 use arrow::array::TimestampSecondArray;
 

@@ -27,7 +27,7 @@ limitations under the License.
 //!    carries on, so this pins what inert means: no object written, data still
 //!    served from warm.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 
