@@ -43,13 +43,22 @@ limitations under the License.
 //! [`SPICE_FUNCTION_REGISTRATIONS`] at link time. That is what keeps the
 //! deny-list from drifting as UDFs are added — there is no separate list to
 //! maintain, and no window during startup where the set is incomplete.
+//!
+//! Besides names, every policy refuses a call whose *clauses* the unparser
+//! cannot carry to the backend: `IGNORE NULLS`, and an aggregate `ORDER BY` the
+//! answer depends on. See [`aggregate_clauses_survive_unparsing`] and
+//! [`window_clauses_survive_unparsing`].
 
 use std::collections::HashSet;
 use std::sync::LazyLock;
 
-use datafusion::logical_expr::expr::ScalarFunction;
+use datafusion::logical_expr::expr::{
+    AggregateFunction, NullTreatment, ScalarFunction, WindowFunction,
+};
+use datafusion::logical_expr::utils::AggregateOrderSensitivity;
 use datafusion_table_providers::util::supported_functions::{
-    FunctionRestriction, FunctionSupport, ScalarCallSupport,
+    AggregateCallSupport, FunctionRestriction, FunctionSupport, ScalarCallSupport,
+    WindowCallSupport,
 };
 use linkme::distributed_slice;
 
@@ -273,13 +282,18 @@ fn excluding_native(names: impl IntoIterator<Item = String>, native: &[&str]) ->
 ///
 /// Defaults to denying every Spice function (link-time set plus user-registered)
 /// the [`DATAFUSION_CAST_BUILTINS`] and the [`PLAN_INTROSPECTION_BUILTINS`], and
-/// nothing else — correct for a source whose dialect rewrites none of the Spice
-/// functions.
+/// to refusing the aggregate and window calls whose clauses the unparser drops
+/// ([`aggregate_clauses_survive_unparsing`], [`window_clauses_survive_unparsing`]),
+/// and nothing else — correct for a source whose dialect rewrites none of the
+/// Spice functions.
 #[derive(Default)]
 pub struct FunctionSupportBuilder<'a> {
     native: &'a [&'a str],
     deny_also: Vec<String>,
     scalar_call: Option<ScalarCallSupport>,
+    aggregate_call: Option<AggregateCallSupport>,
+    window_call: Option<WindowCallSupport>,
+    renders_aggregate_order_by: Option<fn(&str) -> bool>,
 }
 
 impl<'a> FunctionSupportBuilder<'a> {
@@ -319,6 +333,38 @@ impl<'a> FunctionSupportBuilder<'a> {
     #[must_use]
     pub fn scalar_call(mut self, scalar_call: ScalarCallSupport) -> Self {
         self.scalar_call = Some(scalar_call);
+        self
+    }
+
+    /// A per-call check refusing the aggregate *call shapes* this backend cannot
+    /// evaluate.
+    ///
+    /// Supply it here rather than through
+    /// `FunctionSupport::with_aggregate_call_support` after [`Self::build`], for the
+    /// reason [`Self::scalar_call`] gives: that setter *replaces* the check, and
+    /// [`Self::build`] installs [`aggregate_clauses_survive_unparsing`] for every
+    /// backend. Both are consulted, and a call has to satisfy both to federate.
+    #[must_use]
+    pub fn aggregate_call(mut self, aggregate_call: AggregateCallSupport) -> Self {
+        self.aggregate_call = Some(aggregate_call);
+        self
+    }
+
+    /// The window counterpart of [`Self::aggregate_call`], consulted together
+    /// with [`window_clauses_survive_unparsing`].
+    #[must_use]
+    pub fn window_call(mut self, window_call: WindowCallSupport) -> Self {
+        self.window_call = Some(window_call);
+        self
+    }
+
+    /// Whether this backend's unparser dialect renders the argument-list
+    /// `ORDER BY` of the aggregate of this name itself, so
+    /// [`aggregate_clauses_survive_unparsing`] lets it federate with its ordering.
+    /// The `DuckDB` dialect does, for `array_agg(x ORDER BY y)` among others.
+    #[must_use]
+    pub fn renders_aggregate_order_by(mut self, renders: fn(&str) -> bool) -> Self {
+        self.renders_aggregate_order_by = Some(renders);
         self
     }
 
@@ -363,9 +409,18 @@ impl<'a> FunctionSupportBuilder<'a> {
     /// the name list allows, which is why the snapshot is left as it is rather
     /// than removed: it already denies everything registered before this call,
     /// and this closes the rest.
+    ///
+    /// The aggregate and window checks are installed here for the same reason:
+    /// [`aggregate_clauses_survive_unparsing`] and
+    /// [`window_clauses_survive_unparsing`] hold for every backend, so they are
+    /// composed with the backend's own checks rather than left for each caller
+    /// to remember.
     #[must_use]
     pub fn build(mut self) -> FunctionSupport {
         let backend_call = self.scalar_call.take();
+        let backend_aggregate = self.aggregate_call.take();
+        let backend_window = self.window_call.take();
+        let renders_order_by = self.renders_aggregate_order_by;
         FunctionSupport::new(
             Some(FunctionRestriction::Deny(self.denied_names())),
             None,
@@ -383,7 +438,77 @@ impl<'a> FunctionSupportBuilder<'a> {
                         .is_none_or(|supports| supports(call, scope))
             },
         ))
+        .with_aggregate_call_support(std::sync::Arc::new(move |call: &AggregateFunction| {
+            aggregate_clauses_survive_unparsing(call, |name| {
+                renders_order_by.is_some_and(|renders| renders(name))
+            }) && backend_aggregate
+                .as_ref()
+                .is_none_or(|supports| supports(call))
+        }))
+        .with_window_call_support(std::sync::Arc::new(move |call: &WindowFunction| {
+            window_clauses_survive_unparsing(call)
+                && backend_window
+                    .as_ref()
+                    .is_none_or(|supports| supports(call))
+        }))
     }
+}
+
+/// Aggregates whose answer does not depend on the order of their input, though
+/// `DataFusion` does not declare them order-insensitive the way it does `count`,
+/// `sum`, `min` and `max`: they keep `AggregateUDFImpl::order_sensitivity`'s
+/// conservative default. `median` is a function of the values alone. `avg` was
+/// measured for the `BigQuery` dialect's filter rewriting, which relies on the
+/// same reading: `1e16, 1.0, -1e16, 2.0, -1.0` averages to `0.4` under `ASC`,
+/// under `DESC` and unordered.
+const ORDER_INDEPENDENT_AGGREGATES: &[&str] = &["avg", "median"];
+
+/// Whether the SQL the unparser writes for this aggregate call asks the backend
+/// for the answer `DataFusion` would compute, so the call can federate.
+///
+/// The unparser drops two clauses. It never renders `IGNORE NULLS` — a dialect's
+/// aggregate override is not even handed it — so `first_value(x) IGNORE NULLS`
+/// would reach the backend respecting nulls. And it renders an argument-list
+/// `ORDER BY` only as `WITHIN GROUP`, for the aggregates that take that form, so
+/// `array_agg(x ORDER BY y)` reaches `PostgreSQL` as `array_agg(x)` and comes back
+/// in whatever order the backend produced: `[1, 2, 3, 4, 5]` where `DataFusion`
+/// answers `[5, 4, 3, 2, 1]` for `ORDER BY x DESC`. A call that would lose either
+/// stays local — unless the dropped `ORDER BY` cannot change the answer, because
+/// `DataFusion` declares the aggregate order-insensitive or it is one of the
+/// `ORDER_INDEPENDENT_AGGREGATES`, or `renders_order_by` says the backend's
+/// dialect renders it itself.
+#[must_use]
+pub fn aggregate_clauses_survive_unparsing(
+    call: &AggregateFunction,
+    renders_order_by: impl Fn(&str) -> bool,
+) -> bool {
+    if matches!(call.params.null_treatment, Some(NullTreatment::IgnoreNulls)) {
+        return false;
+    }
+    let name = call.func.name();
+    call.params.order_by.is_empty()
+        || call.func.supports_within_group_clause()
+        || matches!(
+            call.func.order_sensitivity(),
+            AggregateOrderSensitivity::Insensitive
+        )
+        || ORDER_INDEPENDENT_AGGREGATES
+            .iter()
+            .any(|independent| name.eq_ignore_ascii_case(independent))
+        || renders_order_by(name)
+}
+
+/// Whether the SQL the unparser writes for this window call asks the backend for
+/// the answer `DataFusion` would compute, so the call can federate.
+///
+/// The unparser never renders `IGNORE NULLS` on a window, so `lag`, `lead`,
+/// `first_value`, `last_value` and `nth_value` would reach the backend respecting
+/// nulls: `lag(v) IGNORE NULLS OVER (ORDER BY id)` came back from `PostgreSQL` as
+/// `[NULL, 10, NULL, 30, NULL]` where `DataFusion` answers `[NULL, 10, 10, 30, 30]`.
+/// Such a window stays local.
+#[must_use]
+pub fn window_clauses_survive_unparsing(call: &WindowFunction) -> bool {
+    !matches!(call.params.null_treatment, Some(NullTreatment::IgnoreNulls))
 }
 
 /// The [`FunctionSupport`] for a backend that evaluates no Spice function and
@@ -611,5 +736,150 @@ mod tests {
         assert!(is_user_function("probe_user_fn_udfs_api"));
         drop(registered);
         assert!(!is_user_function("probe_user_fn_udfs_api"));
+    }
+
+    /// `udaf` over `i`, ordered by `j` when `ordered`, ignoring nulls when
+    /// `ignore_nulls`.
+    fn aggregate(
+        udaf: Arc<datafusion::logical_expr::AggregateUDF>,
+        ordered: bool,
+        ignore_nulls: bool,
+    ) -> Expr {
+        use datafusion::prelude::col;
+        Expr::AggregateFunction(AggregateFunction::new_udf(
+            udaf,
+            vec![col("i")],
+            false,
+            None,
+            if ordered {
+                vec![col("j").sort(false, false)]
+            } else {
+                vec![]
+            },
+            ignore_nulls.then_some(NullTreatment::IgnoreNulls),
+        ))
+    }
+
+    /// `udwf` over `i`, ordered by `j`, ignoring nulls when `ignore_nulls`.
+    fn window(udwf: Arc<datafusion::logical_expr::WindowUDF>, ignore_nulls: bool) -> Expr {
+        use datafusion::logical_expr::{ExprFunctionExt as _, WindowFunctionDefinition};
+        use datafusion::prelude::col;
+        let window = Expr::from(WindowFunction::new(
+            WindowFunctionDefinition::WindowUDF(udwf),
+            vec![col("i")],
+        ))
+        .order_by(vec![col("j").sort(true, false)]);
+        if ignore_nulls {
+            window.null_treatment(NullTreatment::IgnoreNulls)
+        } else {
+            window
+        }
+        .build()
+        .expect("window expression")
+    }
+
+    /// The unparser drops `IGNORE NULLS` from every aggregate and window it
+    /// writes, so no policy may federate one — not even with a backend check
+    /// that admits everything, which composes with the rule rather than
+    /// replacing it.
+    #[test]
+    fn no_policy_federates_ignore_nulls() {
+        use datafusion::functions_aggregate::first_last::first_value_udaf;
+        use datafusion::functions_window::lead_lag::lag_udwf;
+        let admits_everything = FunctionSupportBuilder::new()
+            .aggregate_call(Arc::new(|_: &AggregateFunction| true))
+            .window_call(Arc::new(|_: &WindowFunction| true))
+            .build();
+        for support in [FunctionSupportBuilder::new().build(), admits_everything] {
+            assert!(
+                !support.supports(&window(lag_udwf(), true), None),
+                "lag(i) IGNORE NULLS would reach the backend respecting nulls"
+            );
+            assert!(
+                support.supports(&window(lag_udwf(), false), None),
+                "lag(i) respecting nulls must keep its pushdown"
+            );
+            assert!(
+                !support.supports(&aggregate(first_value_udaf(), false, true), None),
+                "first_value(i) IGNORE NULLS would reach the backend respecting nulls"
+            );
+            assert!(
+                support.supports(&aggregate(first_value_udaf(), false, false), None),
+                "first_value(i) respecting nulls must keep its pushdown"
+            );
+        }
+    }
+
+    /// Of every aggregate `DataFusion` registers, called with an `ORDER BY` the
+    /// unparser drops, only those whose answer the ordering cannot change
+    /// federate — order-insensitive ones, `avg` and `median` — plus those it
+    /// writes as `WITHIN GROUP`. `array_agg`, `string_agg`, `first_value`,
+    /// `last_value` and `nth_value` would come back in the backend's order.
+    #[test]
+    fn an_ordered_aggregate_federates_only_where_the_ordering_cannot_be_lost() {
+        let support = FunctionSupportBuilder::new().build();
+        let mut federated: Vec<String> =
+            datafusion::functions_aggregate::all_default_aggregate_functions()
+                .into_iter()
+                .filter(|udaf| support.supports(&aggregate(Arc::clone(udaf), true, false), None))
+                .map(|udaf| udaf.name().to_string())
+                .collect();
+        federated.sort();
+        assert_eq!(
+            federated,
+            [
+                "any_value",
+                "approx_percentile_cont",
+                "approx_percentile_cont_with_weight",
+                "avg",
+                "bool_and",
+                "bool_or",
+                "count",
+                "max",
+                "median",
+                "min",
+                "percentile_cont",
+                "sum",
+            ],
+        );
+        for udaf in datafusion::functions_aggregate::all_default_aggregate_functions() {
+            assert!(
+                support.supports(&aggregate(Arc::clone(&udaf), false, false), None),
+                "{} without an ORDER BY must keep its pushdown",
+                udaf.name()
+            );
+        }
+    }
+
+    /// A backend whose dialect renders an aggregate's `ORDER BY` itself keeps
+    /// that aggregate's pushdown, and only that one's; a backend's own check
+    /// narrows what federates and cannot widen it.
+    #[test]
+    fn a_backend_renders_its_own_orderings_and_its_check_only_narrows() {
+        use datafusion::functions_aggregate::array_agg::array_agg_udaf;
+        use datafusion::functions_aggregate::string_agg::string_agg_udaf;
+        use datafusion::functions_aggregate::sum::sum_udaf;
+        let support = FunctionSupportBuilder::new()
+            .renders_aggregate_order_by(|name| name == "array_agg")
+            .aggregate_call(Arc::new(|call: &AggregateFunction| {
+                call.func.name() != "sum"
+            }))
+            .build();
+        assert!(
+            support.supports(&aggregate(array_agg_udaf(), true, false), None),
+            "the dialect renders array_agg's ORDER BY, so it must federate"
+        );
+        assert!(
+            !support.supports(&aggregate(string_agg_udaf(), true, false), None),
+            "the dialect renders no string_agg ORDER BY, so it must stay local"
+        );
+        assert!(
+            !support.supports(&aggregate(array_agg_udaf(), true, true), None),
+            "rendering the ORDER BY does not render IGNORE NULLS"
+        );
+        assert!(
+            !support.supports(&aggregate(sum_udaf(), false, false), None),
+            "the backend's own check must survive the one `build` installs"
+        );
     }
 }

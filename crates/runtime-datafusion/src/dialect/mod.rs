@@ -19,9 +19,7 @@ use std::sync::{Arc, LazyLock};
 use arrow_schema::DataType;
 use datafusion::common::DFSchema;
 use datafusion::logical_expr::ExprSchemable as _;
-use datafusion::logical_expr::expr::{
-    AggregateFunction, NullTreatment, ScalarFunction, WindowFunction,
-};
+use datafusion::logical_expr::expr::{AggregateFunction, ScalarFunction, WindowFunction};
 use datafusion::logical_expr::{Cast, Expr, TryCast};
 use datafusion::sql::unparser::Unparser;
 use datafusion::sql::unparser::dialect::{Dialect, DuckDBDialect, ScalarFnToSqlHandler};
@@ -249,44 +247,39 @@ pub fn duckdb_can_translate(call: &ScalarFunction, scope: Option<&DFSchema>) -> 
 
 /// Whether this aggregate call can be handed to `DuckDB`.
 ///
-/// An aggregate `ORDER BY` federates only where it reaches `DuckDB`: as
-/// `WITHIN GROUP`, which the unparser renders, or inside the call for the
-/// aggregates [`duckdb::ordered_aggregate_to_sql`] renders (`string_agg`,
-/// `array_agg`, `first_value`, `last_value`). The unparser drops every other
-/// aggregate `ORDER BY`, so the call would come back in whatever order `DuckDB`
-/// produced, and a memory accelerator and a file accelerator could disagree with
-/// each other. An aggregate without an `ORDER BY` is unaffected.
-///
-/// `IGNORE NULLS` is refused because the unparser never renders it, so the call
-/// would reach `DuckDB` respecting nulls.
-///
 /// `approx_distinct` is refused because `DuckDB` has no function of that name
 /// (`approx_count_distinct` is a different `HyperLogLog`). Mapping the two would
 /// change the number; evaluating locally matches the unaccelerated engine.
+///
+/// The clauses the unparser cannot carry are refused for every backend, by
+/// `runtime_udfs_api::aggregate_clauses_survive_unparsing`: `IGNORE NULLS`, and an
+/// `ORDER BY` the answer depends on. For `DuckDB` that `ORDER BY` still federates
+/// where [`duckdb_renders_aggregate_order_by`] says the dialect renders it.
 #[must_use]
 pub fn duckdb_can_translate_aggregate(call: &AggregateFunction) -> bool {
-    let name = call.func.name();
-    if name.eq_ignore_ascii_case("approx_distinct")
-        || matches!(call.params.null_treatment, Some(NullTreatment::IgnoreNulls))
-    {
-        return false;
-    }
-    call.params.order_by.is_empty()
-        || call.func.supports_within_group_clause()
-        || duckdb::renders_aggregate_order_by(name)
+    !call.func.name().eq_ignore_ascii_case("approx_distinct")
+}
+
+/// Whether the `DuckDB` dialect renders the argument-list `ORDER BY` of the
+/// aggregate of this name: inside the call, for the aggregates
+/// [`duckdb::ordered_aggregate_to_sql`] renders (`string_agg`, `array_agg`,
+/// `first_value`, `last_value`). The unparser drops every other one, so such an
+/// ordered aggregate would come back in whatever order `DuckDB` produced, and a
+/// memory accelerator and a file accelerator could disagree with each other.
+#[must_use]
+pub fn duckdb_renders_aggregate_order_by(name: &str) -> bool {
+    duckdb::renders_aggregate_order_by(name)
 }
 
 /// Whether this window call can be handed to `DuckDB`.
 ///
-/// `approx_distinct` and `IGNORE NULLS` are refused for the same reasons as in
-/// [`duckdb_can_translate_aggregate`]: `DuckDB` has no function of that name, and
-/// the unparser does not render `IGNORE NULLS` on a window either, so `lag`,
-/// `lead`, `first_value`, `last_value` and `nth_value` would reach `DuckDB`
-/// respecting nulls and return different rows.
+/// `approx_distinct` is refused for the same reason as in
+/// [`duckdb_can_translate_aggregate`]: `DuckDB` has no function of that name.
+/// `IGNORE NULLS`, which the unparser does not render on a window, is refused for
+/// every backend by `runtime_udfs_api::window_clauses_survive_unparsing`.
 #[must_use]
 pub fn duckdb_can_translate_window(call: &WindowFunction) -> bool {
     !call.fun.name().eq_ignore_ascii_case("approx_distinct")
-        && !matches!(call.params.null_treatment, Some(NullTreatment::IgnoreNulls))
 }
 
 /// Whether `DuckDB` evaluates this non-function expression node the way

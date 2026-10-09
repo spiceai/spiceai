@@ -52,6 +52,16 @@ de-federating further, or restoring the pushdown, fails and asks for the entry
 to be re-decided. Issue #14607 tracks restoring full federation by rendering the
 cast as a truncating one instead of declining it.
 
+Queries 085, 086, 087 and 226 are the ordered-aggregate partial cases. Each
+calls `ARRAY_AGG` or `STRING_AGG` with an `ORDER BY` inside the call, which the
+unparser drops and the BigQuery dialect does not render, so a federated call
+came back in BigQuery's order. Every connector policy keeps such an aggregate
+local, and the plans split into 3, 6, 3 and 1 remote subtrees respectively.
+Against the gate's empty fixtures each runs one of them: an empty join build side
+never polls the rest. Both gates pin those counts and require the local ordered
+aggregate to still be there. Rendering the ordering inside the call, as the
+DuckDB dialect does, would restore full federation.
+
 Table-free statements are individually identified in the test and must contain
 no table scan or remote node. Final SQL rendering errors also fail the test.
 

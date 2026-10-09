@@ -132,10 +132,11 @@ pub fn deny_spice_functions_for_duckdb_dialect_without_carve_out() -> FunctionSu
     FunctionSupportBuilder::new()
         .deny_also(DUCKDB_DENIED_BUILTINS.iter().map(|n| (*n).to_string()))
         .scalar_call(Arc::new(crate::dialect::duckdb_can_translate))
+        .aggregate_call(Arc::new(crate::dialect::duckdb_can_translate_aggregate))
+        .window_call(Arc::new(crate::dialect::duckdb_can_translate_window))
+        .renders_aggregate_order_by(crate::dialect::duckdb_renders_aggregate_order_by)
         .build()
         .with_expression_support(Arc::new(crate::dialect::duckdb_can_evaluate_expression))
-        .with_aggregate_call_support(Arc::new(crate::dialect::duckdb_can_translate_aggregate))
-        .with_window_call_support(Arc::new(crate::dialect::duckdb_can_translate_window))
 }
 
 /// The one `DuckDB` policy both public accessors return, so the connector and
@@ -145,10 +146,11 @@ fn duckdb_function_support() -> FunctionSupport {
         .native(&crate::dialect::duckdb_native_function_names())
         .deny_also(DUCKDB_DENIED_BUILTINS.iter().map(|n| (*n).to_string()))
         .scalar_call(Arc::new(crate::dialect::duckdb_can_translate))
+        .aggregate_call(Arc::new(crate::dialect::duckdb_can_translate_aggregate))
+        .window_call(Arc::new(crate::dialect::duckdb_can_translate_window))
+        .renders_aggregate_order_by(crate::dialect::duckdb_renders_aggregate_order_by)
         .build()
         .with_expression_support(Arc::new(crate::dialect::duckdb_can_evaluate_expression))
-        .with_aggregate_call_support(Arc::new(crate::dialect::duckdb_can_translate_aggregate))
-        .with_window_call_support(Arc::new(crate::dialect::duckdb_can_translate_window))
 }
 
 /// The [`FunctionSupport`] for `BigQuery` over ADBC, as a value for
@@ -190,12 +192,10 @@ pub fn deny_spice_functions_for_bigquery_table_providers() -> FunctionSupport {
         .native(&crate::dialect::bigquery_native_function_names())
         .deny_also([crate::dialect::REGEXP_MATCH_NAME.to_string()])
         .scalar_call(Arc::new(crate::dialect::bigquery_can_translate))
+        .aggregate_call(Arc::new(crate::dialect::bigquery_can_translate_aggregate))
+        .window_call(Arc::new(crate::dialect::bigquery_can_translate_window))
         .build()
         .with_expression_support(Arc::new(bigquery_can_evaluate_expression))
-        // The builder carries the scalar hook; the aggregate and window hooks
-        // have no builder method yet, so they are installed on the built value.
-        .with_aggregate_call_support(Arc::new(crate::dialect::bigquery_can_translate_aggregate))
-        .with_window_call_support(Arc::new(crate::dialect::bigquery_can_translate_window))
 }
 
 /// Whether `BigQuery` can evaluate this non-function expression shape without
@@ -304,10 +304,10 @@ pub const SQLITE_DENIED_BUILTINS: &[&str] = &[
 pub fn deny_spice_functions_for_sqlite_table_providers() -> FunctionSupport {
     FunctionSupportBuilder::new()
         .deny_also(SQLITE_DENIED_BUILTINS.iter().map(|n| (*n).to_string()))
+        .aggregate_call(Arc::new(sqlite_can_translate_aggregate))
+        .window_call(Arc::new(sqlite_can_translate_window))
         .build()
         .with_expression_support(Arc::new(sqlite_can_evaluate_expression))
-        .with_aggregate_call_support(Arc::new(sqlite_can_translate_aggregate))
-        .with_window_call_support(Arc::new(sqlite_can_translate_window))
 }
 
 /// The aggregates `SQLite` evaluates the way `DataFusion` does. It is an
@@ -359,17 +359,13 @@ pub fn sqlite_can_translate_aggregate(
 /// admits, which `SQLite` runs over a window too. `stddev(x) OVER (…)` fails
 /// remotely just as `stddev(x)` does.
 ///
-/// Two shapes of those stay local as well. `SQLite` refuses `DISTINCT` in any
-/// window ("DISTINCT is not supported for window functions"). And the unparser
-/// never renders `IGNORE NULLS` on a window, so `lag`, `lead`, `first_value`,
-/// `last_value` and `nth_value` would reach `SQLite` respecting nulls and
-/// return different rows.
+/// A `DISTINCT` window stays local as well: `SQLite` refuses one ("DISTINCT is
+/// not supported for window functions"). A window with `IGNORE NULLS`, which the
+/// unparser does not render, is refused for every backend by
+/// `runtime_udfs_api::window_clauses_survive_unparsing`.
 #[must_use]
 pub fn sqlite_can_translate_window(call: &datafusion::logical_expr::expr::WindowFunction) -> bool {
-    use datafusion::logical_expr::expr::NullTreatment;
-    if call.params.distinct
-        || matches!(call.params.null_treatment, Some(NullTreatment::IgnoreNulls))
-    {
+    if call.params.distinct {
         return false;
     }
     let name = call.fun.name();
@@ -1160,17 +1156,18 @@ mod tests {
         datafusion::functions_aggregate::string_agg::string_agg(col("s"), lit("|"))
     }
 
-    /// An aggregate `ORDER BY` federates to `DuckDB` only where the dialect renders
-    /// it: `string_agg`, `array_agg`, `first_value` and `last_value` take it inside
-    /// the call, and `percentile_cont` as `WITHIN GROUP`. Any other ordered aggregate
-    /// would lose its ordering in the unparser, and `IGNORE NULLS` is never rendered,
-    /// on an aggregate or a window, so both stay local on both `DuckDB` accessors.
+    /// An aggregate `ORDER BY` federates to `DuckDB` where the dialect renders it:
+    /// `string_agg`, `array_agg`, `first_value` and `last_value` take it inside the
+    /// call, and `percentile_cont` as `WITHIN GROUP`. An ordering that cannot change
+    /// the answer, as on a `sum`, federates too. Any other ordered aggregate would
+    /// lose its ordering in the unparser, and `IGNORE NULLS` is never rendered, on an
+    /// aggregate or a window, so both stay local on both `DuckDB` accessors.
     /// `approx_distinct` has no `DuckDB` name and stays local.
     #[test]
     fn duckdb_federates_the_ordered_aggregates_it_renders_and_keeps_the_rest_local() {
         use datafusion::functions_aggregate::approx_distinct::approx_distinct_udaf;
         use datafusion::functions_aggregate::expr_fn::{
-            approx_distinct, array_agg, first_value, last_value, percentile_cont, sum,
+            approx_distinct, array_agg, first_value, last_value, nth_value, percentile_cont, sum,
         };
         use datafusion::logical_expr::ExprFunctionExt as _;
         use datafusion::logical_expr::expr::NullTreatment;
@@ -1200,13 +1197,18 @@ mod tests {
                 last_value(col("s"), vec![col("i").sort(false, true)]),
                 percentile_cont(col("i").sort(true, false), lit(0.5)),
                 unordered_string_agg(),
+                ordered_sum.clone(),
             ] {
                 assert!(
                     pushes(&plan_text_aggregating(rendered.clone()), &support),
-                    "{rendered} renders its ordering for DuckDB and must keep its {route} pushdown"
+                    "{rendered} renders its ordering for DuckDB, or does not depend on it, \
+                     and must keep its {route} pushdown"
                 );
             }
-            for dropped in [ordered_sum.clone(), first_value_ignoring_nulls.clone()] {
+            for dropped in [
+                nth_value(col("s"), 2, vec![col("i").sort(true, true)]),
+                first_value_ignoring_nulls.clone(),
+            ] {
                 assert!(
                     !pushes(&plan_text_aggregating(dropped.clone()), &support),
                     "{dropped} would lose its ordering or IGNORE NULLS and must stay local on {route}"
@@ -1482,6 +1484,102 @@ mod tests {
             pushes(&plan_aggregating(sum(col("i"))), &support),
             "a plain GROUP BY with sum must keep its SQLite pushdown"
         );
+    }
+
+    /// Every policy keeps `IGNORE NULLS`, and an aggregate `ORDER BY` the answer
+    /// depends on, above the federated scan, whatever the backend: `PostgreSQL`
+    /// and `MySQL`, whose policies add no aggregate or window check of their own,
+    /// included. The unparser drops both clauses, so `PostgreSQL` answered
+    /// `lag(v) IGNORE NULLS` respecting nulls and `array_agg(x ORDER BY y)` in its
+    /// own order. The same window respecting nulls, and an ordering that cannot
+    /// change a `sum`, keep their pushdown everywhere, and `DuckDB`, whose dialect
+    /// renders an `array_agg` ordering, keeps that one too.
+    #[test]
+    fn every_backend_keeps_calls_with_unrendered_clauses_local() {
+        use datafusion::functions_aggregate::expr_fn::{array_agg, sum};
+        use datafusion::functions_window::expr_fn::lag;
+        use datafusion::logical_expr::ExprFunctionExt as _;
+        let ordered_array_agg = array_agg(col("s"))
+            .order_by(vec![col("i").sort(false, true)])
+            .build()
+            .expect("ordered array_agg");
+        let ordered_sum = sum(col("i"))
+            .order_by(vec![col("i").sort(false, true)])
+            .build()
+            .expect("ordered sum");
+        let lag_respecting_nulls = lag(col("i"), None, None)
+            .order_by(vec![col("g").sort(true, false)])
+            .build()
+            .expect("lag respecting nulls");
+        let mut wrong = Vec::new();
+        for (backend, support, renders_array_agg_ordering) in [
+            (
+                "duckdb",
+                deny_spice_functions_for_duckdb_table_providers(),
+                true,
+            ),
+            (
+                "ducklake",
+                deny_spice_functions_for_duckdb_dialect_without_carve_out(),
+                true,
+            ),
+            (
+                "sqlite",
+                deny_spice_functions_for_sqlite_table_providers(),
+                false,
+            ),
+            (
+                "mysql",
+                deny_spice_functions_for_mysql_table_providers(),
+                false,
+            ),
+            (
+                "postgres",
+                deny_spice_functions_for_postgres_table_providers(),
+                false,
+            ),
+            (
+                "bigquery",
+                deny_spice_functions_for_bigquery_table_providers(),
+                false,
+            ),
+            (
+                "any other source",
+                runtime_udfs_api::deny_spice_functions_for_table_providers(),
+                false,
+            ),
+        ] {
+            for window in nullable_value_windows() {
+                let ignoring = ignoring_nulls(window);
+                if pushes(&plan_with_window(ignoring.clone()), &support) {
+                    wrong.push(format!(
+                        "{backend}: {ignoring} federates, and would come back respecting nulls"
+                    ));
+                }
+            }
+            if !pushes(&plan_with_window(lag_respecting_nulls.clone()), &support) {
+                wrong.push(format!("{backend}: lag respecting nulls lost its pushdown"));
+            }
+            if pushes(&plan_text_aggregating(ordered_array_agg.clone()), &support)
+                != renders_array_agg_ordering
+            {
+                wrong.push(format!(
+                    "{backend}: array_agg(s ORDER BY i DESC) {}",
+                    if renders_array_agg_ordering {
+                        "lost the pushdown its dialect renders"
+                    } else {
+                        "federates without its ordering"
+                    }
+                ));
+            }
+            if !pushes(&plan_text_aggregating(ordered_sum.clone()), &support) {
+                wrong.push(format!(
+                    "{backend}: sum(i ORDER BY i DESC) lost its pushdown, though an ORDER BY \
+                     cannot change a sum"
+                ));
+            }
+        }
+        assert!(wrong.is_empty(), "{}", wrong.join("\n"));
     }
 
     /// The window functions whose answer depends on `IGNORE NULLS`, unordered.
