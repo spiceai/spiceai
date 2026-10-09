@@ -228,6 +228,19 @@ impl LookupIndexReservation {
         self.bytes
     }
 
+    /// Transfers already admitted bytes without returning them to the pool.
+    pub(crate) fn absorb(&mut self, mut other: Self) -> Result<(), Self> {
+        if !Arc::ptr_eq(&self.account, &other.account) {
+            return Err(other);
+        }
+        let Some(bytes) = self.bytes.checked_add(other.bytes) else {
+            return Err(other);
+        };
+        self.bytes = bytes;
+        other.bytes = 0;
+        Ok(())
+    }
+
     /// Changes the reservation to `bytes`. Returns `false`, keeping what it
     /// held, when the pool cannot fit the growth; shrinking always succeeds.
     pub(crate) fn try_resize(&mut self, bytes: usize) -> bool {

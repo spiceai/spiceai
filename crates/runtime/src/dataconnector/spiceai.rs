@@ -903,11 +903,17 @@ mod tests {
         crate::dataconnector::register_connector_factory("spiceai", SpiceAIFactory::new_arc())
             .await;
 
-        for input in [
-            "spiceai:http://localhost:50051",
-            "spice.ai:http://localhost:50051",
-            "spice.ai:spiceai/quickstart/datasets/taxi_trips",
-            "spice.ai/spiceai/quickstart/datasets/taxi_trips",
+        for (input, expected_source) in [
+            ("spiceai:http://localhost:50051", "spiceai"),
+            ("spice.ai:http://localhost:50051", "spice.ai"),
+            (
+                "spice.ai:spiceai/quickstart/datasets/taxi_trips",
+                "spice.ai",
+            ),
+            (
+                "spice.ai/spiceai/quickstart/datasets/taxi_trips",
+                "spice.ai",
+            ),
         ] {
             let app = app::AppBuilder::new("test").build();
             let runtime = crate::Runtime::builder().build().await;
@@ -917,14 +923,24 @@ mod tests {
                 .with_runtime(Arc::new(runtime))
                 .build()
                 .expect("failed to build dataset");
+            assert_eq!(dataset.source(), expected_source, "{input}");
 
-            crate::dataconnector::parameters::ConnectorParamsBuilder::for_dataset(
+            let params = crate::dataconnector::parameters::ConnectorParamsBuilder::for_dataset(
                 dataset.source().into(),
                 &dataset,
             )
             .build(Arc::new(RwLock::new(Secrets::new())), Handle::current())
             .await
             .expect("spice.ai connector variant should resolve");
+
+            // Every spelling resolves to the spice.ai factory: its prefix and its
+            // parameter specs, so `api_key` is configured as `spiceai_api_key`.
+            assert_eq!(params.parameters.prefix(), "spiceai", "{input}");
+            assert_eq!(
+                params.parameters.user_param("api_key").0,
+                "spiceai_api_key",
+                "{input}"
+            );
         }
     }
 

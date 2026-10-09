@@ -1440,9 +1440,14 @@ mod tests {
 
     #[test]
     fn test_json_array_to_jsonl_not_an_array() {
+        // A JSON object (e.g. an error body) is reported as an invalid array,
+        // never shown as a one-row result.
         let input = r#"{"key": "value"}"#;
-        let result = json_array_to_jsonl(input);
-        let _ = result.expect_err("non-array JSON should fail");
+        let err = json_array_to_jsonl(input).expect_err("non-array JSON should fail");
+        assert_eq!(
+            err.to_string(),
+            "Invalid JSON array in response: invalid type: map, expected a sequence at line 1 column 0"
+        );
     }
 
     #[test]

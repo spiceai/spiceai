@@ -56,7 +56,7 @@ telemetry = { path = "../telemetry" }
 twox-hash.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
-tokio-util.workspace = true
+tokio-util = { workspace = true, features = ["rt"] }
 tracing.workspace = true
 util = { path = "../util", features = ["datafusion"] }
 utoipa = { workspace = true, optional = true }

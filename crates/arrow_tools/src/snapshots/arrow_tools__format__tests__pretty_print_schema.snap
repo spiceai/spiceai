@@ -1,0 +1,8 @@
+---
+source: crates/arrow_tools/src/format.rs
+expression: pretty_output
+---
+ id: int64
+ name: utf8 (nullable)
+ scores: list<item: float32> (nullable)
+ metadata: struct<key utf8, value utf8> (nullable)

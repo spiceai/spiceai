@@ -97,7 +97,7 @@ ZERO_RETRY_BINARIES = frozenset(
         "cdc_compaction_delete_race_test",
         "maintained_aggregate_filter_test",
         # Engine-vs-engine parity: a mismatch is deterministic, so a retry buys
-        # nothing but five more runs of a ~250s binary before the same failure.
+        # nothing but repeated runs of a ~250s binary before the same failure.
         "result_correctness_vs_duckdb_test",
         "result_correctness_vs_sqlite_test",
     }

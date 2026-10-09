@@ -725,10 +725,14 @@ mod tests {
     /// `TypeSafe` documents score criteria as two to ten levels.
     #[test]
     fn score_criteria_requires_two_levels() {
+        const LEVELS_ERROR: &str =
+            "score criteria must contain between two and ten non-null levels";
+
         let one = serde_json::from_value::<Question>(
             json!({"type": "score", "instructions": "how bad?", "criteria": ["only"]}),
-        );
-        assert!(one.is_err(), "one level must be rejected: {one:?}");
+        )
+        .expect_err("one level must be rejected");
+        assert_eq!(one.to_string(), LEVELS_ERROR);
 
         serde_json::from_value::<Question>(
             json!({"type": "score", "instructions": "how bad?", "criteria": ["calm", "angry"]}),
@@ -744,8 +748,9 @@ mod tests {
         let eleven: Vec<String> = (0..11).map(|i| format!("level {i}")).collect();
         let over = serde_json::from_value::<Question>(
             json!({"type": "score", "instructions": "how bad?", "criteria": eleven}),
-        );
-        assert!(over.is_err(), "eleven levels must be rejected: {over:?}");
+        )
+        .expect_err("eleven levels must be rejected");
+        assert_eq!(over.to_string(), LEVELS_ERROR);
     }
 
     /// A provider reply with no answers is malformed, not a successful evaluation.
@@ -753,8 +758,12 @@ mod tests {
     fn response_requires_at_least_one_answer() {
         let empty = serde_json::from_value::<EvaluateResponse>(
             json!({"model": "jev-latest", "answers": {}}),
+        )
+        .expect_err("empty answers must be rejected");
+        assert_eq!(
+            empty.to_string(),
+            "answers must contain at least one answer"
         );
-        assert!(empty.is_err(), "empty answers must be rejected: {empty:?}");
     }
 
     /// A partial `usage` block must not turn a successful evaluation into an error.

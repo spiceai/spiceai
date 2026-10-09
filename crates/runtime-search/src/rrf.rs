@@ -1513,7 +1513,8 @@ mod tests {
             spice_named_lit!("join_key", "id"),
         ]);
         let parsed = result.expect("Expected success");
-        assert!(parsed.join_key.is_some());
+        // The argument's value names the column the fused results are joined on.
+        assert_eq!(parsed.join_key, Some(col_expr("id")));
     }
 
     #[test]
@@ -1525,7 +1526,8 @@ mod tests {
         ]);
 
         let parsed = result.expect("Expected success");
-        assert!(parsed.time_column.is_some());
+        // The argument's value names the column recency decay reads.
+        assert_eq!(parsed.time_column, Some(col_expr("created_at")));
     }
 
     #[test]

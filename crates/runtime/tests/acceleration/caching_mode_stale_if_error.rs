@@ -84,14 +84,15 @@ const PAST_WINDOW: Duration = Duration::from_secs(10);
 /// over an entry rather than a single row.
 const ROWS: usize = 3;
 
-/// A mock origin serving `/items` as a JSON array of [`ROWS`] objects, counting
-/// the requests that reach it, until it is taken down or switched to answer
-/// with a fixed HTTP status (see [`Origin::set_status`]) — the shape a
-/// connector-exhausted-retries failure actually takes, as distinct from a
-/// send error from [`Origin::take_down`].
+/// A mock origin serving `/items` as a JSON array of [`ROWS`] objects (see
+/// [`Origin::set_rows`]), counting the requests that reach it, until it is
+/// taken down or switched to answer with a fixed HTTP status (see
+/// [`Origin::set_status`]) — the shape a connector-exhausted-retries failure
+/// actually takes, as distinct from a send error from [`Origin::take_down`].
 struct Origin {
     addr: SocketAddr,
     fetches: Arc<AtomicUsize>,
+    rows: Arc<AtomicUsize>,
     status: Arc<AtomicU16>,
     empty_fault_body: Arc<std::sync::atomic::AtomicBool>,
     delay_ms: Arc<AtomicUsize>,
@@ -102,6 +103,8 @@ impl Origin {
     async fn start() -> Self {
         let fetches = Arc::new(AtomicUsize::new(0));
         let counter = Arc::clone(&fetches);
+        let rows = Arc::new(AtomicUsize::new(ROWS));
+        let rows_for_handler = Arc::clone(&rows);
         let status = Arc::new(AtomicU16::new(200));
         let status_for_handler = Arc::clone(&status);
         let empty_fault_body = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -114,6 +117,7 @@ impl Origin {
             "/items",
             get(move |uri: axum::http::Uri| {
                 let counter = Arc::clone(&counter);
+                let rows = Arc::clone(&rows_for_handler);
                 let status = Arc::clone(&status_for_handler);
                 let empty_fault_body = Arc::clone(&empty_fault_body_for_handler);
                 let delay_ms = Arc::clone(&delay_for_handler);
@@ -135,7 +139,7 @@ impl Origin {
                         return (code, [("content-type", "text/plain")], body);
                     }
                     let query = uri.query().unwrap_or_default().to_string();
-                    let body = (1..=ROWS)
+                    let body = (1..=rows.load(Ordering::SeqCst))
                         .map(|rank| format!(r#"{{"rank":{rank},"query":"{query}"}}"#))
                         .collect::<Vec<_>>()
                         .join(",");
@@ -164,6 +168,7 @@ impl Origin {
         Self {
             addr,
             fetches,
+            rows,
             status,
             empty_fault_body,
             delay_ms,
@@ -173,6 +178,11 @@ impl Origin {
 
     fn fetches(&self) -> usize {
         self.fetches.load(Ordering::SeqCst)
+    }
+
+    /// Answers later requests with ranks `1..=rows`.
+    fn set_rows(&self, rows: usize) {
+        self.rows.store(rows, Ordering::SeqCst);
     }
 
     /// Switches the origin to answer every request with `status` instead of
@@ -402,6 +412,38 @@ async fn fetch_decomposed_rank(rt: &Runtime, rank: usize) -> Result<Vec<String>,
                 .collect::<Vec<_>>()
         })
         .collect())
+}
+
+/// The sorted `rank` of every row the accelerator holds for a
+/// [`decompose_into_named_columns`] dataset. Unfiltered, like [`cached_rows`].
+async fn cached_ranks(rt: &Runtime) -> Vec<String> {
+    let batches = rt
+        .datafusion()
+        .ctx
+        .table("http_data")
+        .await
+        .expect("table")
+        .select(vec![col("rank")])
+        .expect("rank column")
+        .collect()
+        .await
+        .expect("collect");
+    let mut ranks: Vec<String> = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("rank is Utf8")
+                .iter()
+                .flatten()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        })
+        .collect();
+    ranks.sort_unstable();
+    ranks
 }
 
 /// Rows the accelerator currently holds. Unfiltered on purpose: a query carrying
@@ -851,6 +893,56 @@ async fn a_5xx_response_is_recognized_on_a_json_decomposed_dataset() -> Result<(
         failure the fingerprint cannot see is silently indistinguishable from real data \
         decomposing to NULL, which is what #14157 observed as HTTP 200 with an empty body"
     );
+    Ok(())
+}
+
+/// Regression test for #14865: a read that filters a decomposed response column
+/// caches the whole response of its request, and reads of that request that
+/// differ only in response predicates share the one cached response. A later
+/// read for a rank the cached response lacks misses, and its fill replaces the
+/// request's rows instead of appending a second copy beside them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn response_column_predicates_share_one_cached_response_per_request()
+-> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(None);
+    register_test_connectors().await;
+
+    let origin = Origin::start().await;
+    origin.set_rows(ROWS - 1);
+    // A TTL longer than the test, so every cached read below is fresh.
+    let dataset = decompose_into_named_columns(caching_dataset(
+        &origin,
+        "enabled",
+        None,
+        Mode::Memory,
+        vec![("caching_ttl".to_string(), "10m".to_string())],
+    ));
+    let rt = build_runtime(dataset, "caching_decomposed_response_predicates").await;
+
+    assert_eq!(fetch_decomposed_rank(&rt, 1).await?, vec!["1"]);
+    wait_for_cached_rows(&rt, ROWS - 1, Duration::from_secs(30))
+        .await
+        .map_err(|e| anyhow::anyhow!("a response-filtered read must cache its response: {e}"))?;
+    let fetches_after_fill = origin.fetches();
+    assert_eq!(fetch_decomposed_rank(&rt, 1).await?, vec!["1"]);
+    assert_eq!(fetch_decomposed_rank(&rt, 2).await?, vec!["2"]);
+    assert_eq!(
+        origin.fetches(),
+        fetches_after_fill,
+        "reads of the cached request are served without a fetch"
+    );
+
+    origin.set_rows(ROWS);
+    assert_eq!(fetch_decomposed_rank(&rt, 3).await?, vec!["3"]);
+    assert_eq!(
+        origin.fetches(),
+        fetches_after_fill + 1,
+        "a rank the cached response lacks is fetched"
+    );
+    wait_for_cached_rows(&rt, ROWS, Duration::from_secs(30))
+        .await
+        .map_err(|e| anyhow::anyhow!("the refill must replace the request's rows: {e}"))?;
+    assert_eq!(cached_ranks(&rt).await, vec!["1", "2", "3"]);
     Ok(())
 }
 

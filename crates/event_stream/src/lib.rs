@@ -247,72 +247,62 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_event_stream_receives_event() {
-        with_default(
+        // The span is dropped with the closure, which closes its channel, so
+        // the stream below ends on the events already buffered.
+        let events = with_default(
             Registry::default().with(EventStreamLayer::new("message")),
             || {
                 let span = span!(Level::INFO, "test_span");
-                let _enter = span.enter();
-
-                let mut stream = get_event_stream().expect("Failed to obtain event stream");
-
-                info!(message = "hello world", "Emitting an event");
-
-                // `with_default` does not support async, spawn an async task instead.
-                tokio::spawn(async move {
-                    let received = timeout(Duration::from_millis(100), stream.next())
-                        .await
-                        .expect("Timed out waiting for an event")
-                        .expect("Expected an event on the stream");
-                    assert_eq!(received, "hello world".to_string());
-                });
+                span.in_scope(|| {
+                    let events = get_event_stream().expect("Failed to obtain event stream");
+                    // Only the configured `message` field is published.
+                    info!(message = "hello world", unrelated = "not published");
+                    events
+                })
             },
         );
 
-        // Wait briefly to allow the background task to complete.
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        // A deadlock guard, not a wait: the channel is already closed. Keep it
+        // short so a regression that leaves the stream open fails fast.
+        let received: Vec<String> = timeout(Duration::from_secs(1), events.collect())
+            .await
+            .expect("the event stream must end when its span closes");
+        assert_eq!(received, vec!["hello world".to_string()]);
     }
 
     #[tokio::test]
     async fn test_get_event_stream_descendant_event() {
         let subscriber = Registry::default().with(EventStreamLayer::new("message"));
 
-        with_default(subscriber, || {
+        // Both spans are dropped with the closure, which closes the parent's
+        // channel, so the stream below ends on the events already buffered.
+        let events = with_default(subscriber, || {
             let parent_span = span!(Level::INFO, "parent_span");
-            let _enter_parent = parent_span.enter();
-            info!(message = "parent event", "Emitting an event");
+            parent_span.in_scope(|| {
+                // Emitted before anyone subscribed: the stream does not replay it.
+                info!(message = "before subscribing");
 
-            // Get the event stream from the parent span.
-            let mut stream = get_event_stream().expect("Failed to obtain event stream");
+                // Get the event stream from the parent span.
+                let events = get_event_stream().expect("Failed to obtain event stream");
+                info!(message = "parent event");
 
-            // Child scope
-            {
-                let child_span = span!(Level::INFO, "child_span");
-                let _enter_child = child_span.enter();
-
-                // Emit an event in the child span.
-                info!(message = "child event", "Emitting a child event");
-            }
-
-            // Spawn an async task to wait for the two events.
-            tokio::spawn(async move {
-                assert_eq!(
-                    timeout(Duration::from_millis(100), stream.next())
-                        .await
-                        .expect("Timed out waiting for an event")
-                        .expect("Expected an event on the stream"),
-                    "child event".to_string()
-                );
-
-                assert_eq!(
-                    timeout(Duration::from_millis(100), stream.next())
-                        .await
-                        .expect("Timed out waiting for an event")
-                        .expect("Expected an event on the stream"),
-                    "parent event".to_string()
-                );
-            });
+                // An event emitted in a child span reaches the parent's stream.
+                {
+                    let child_span = span!(Level::INFO, "child_span");
+                    let _enter_child = child_span.enter();
+                    info!(message = "child event");
+                }
+                events
+            })
         });
 
-        tokio::time::sleep(Duration::from_millis(150)).await;
+        // A deadlock guard, not a wait: the channel is already closed.
+        let received: Vec<String> = timeout(Duration::from_secs(1), events.collect())
+            .await
+            .expect("the event stream must end when its span closes");
+        assert_eq!(
+            received,
+            vec!["parent event".to_string(), "child event".to_string()]
+        );
     }
 }

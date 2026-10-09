@@ -1788,31 +1788,19 @@ mod tests {
         let format_opts = FormatOptions::new().with_types_info(true);
 
         let data = stream.try_collect::<Vec<_>>().await?;
-        assert_snapshot!(pretty_format_batches_with_options(&data, &format_opts)?.to_string(), @r"
-        +-------+
-        | a     |
-        | Int32 |
-        +-------+
-        | 1     |
-        | 2     |
-        | 3     |
-        +-------+
-        ");
+        assert_snapshot!(
+            "open_files_different_table_schema_int32_file",
+            pretty_format_batches_with_options(&data, &format_opts)?.to_string()
+        );
 
         let opener2 = make_opener(filter.clone());
         let stream = opener2.open(file2)?.await?;
 
         let data = stream.try_collect::<Vec<_>>().await?;
-        assert_snapshot!(pretty_format_batches_with_options(&data, &format_opts)?.to_string(), @r"
-        +-------+
-        | a     |
-        | Int32 |
-        +-------+
-        | -1    |
-        | -2    |
-        | -3    |
-        +-------+
-        ");
+        assert_snapshot!(
+            "open_files_different_table_schema_int16_file_widened",
+            pretty_format_batches_with_options(&data, &format_opts)?.to_string()
+        );
 
         Ok(())
     }
@@ -1877,16 +1865,10 @@ mod tests {
 
         // Verify the output has columns in table schema order (a, b, c)
         // not file order (c, b, a)
-        assert_snapshot!(pretty_format_batches_with_options(&data, &format_opts)?.to_string(), @r"
-        +-------+-------+-------+
-        | a     | b     | c     |
-        | Int32 | Int32 | Int32 |
-        +-------+-------+-------+
-        | 100   | 200   | 300   |
-        | 101   | 201   | 301   |
-        | 102   | 202   | 302   |
-        +-------+-------+-------+
-        ");
+        assert_snapshot!(
+            "schema_different_column_order_table_order",
+            pretty_format_batches_with_options(&data, &format_opts)?.to_string()
+        );
 
         Ok(())
     }
@@ -2036,14 +2018,10 @@ mod tests {
         // Verify the columns are in the right order and have the right values
         use datafusion::arrow::util::pretty::pretty_format_batches_with_options;
         let format_opts = FormatOptions::new().with_types_info(true);
-        assert_snapshot!(pretty_format_batches_with_options(&data, &format_opts)?.to_string(), @r"
-        +-------+--------------------------+
-        | c     | b                        |
-        | Int32 | Dictionary(UInt32, Utf8) |
-        +-------+--------------------------+
-        | 2     | test                     |
-        +-------+--------------------------+
-        ");
+        assert_snapshot!(
+            "projection_bug_minimal_repro_projected_and_cast",
+            pretty_format_batches_with_options(&data, &format_opts)?.to_string()
+        );
 
         Ok(())
     }
@@ -2158,17 +2136,10 @@ mod tests {
         let data = stream.try_collect::<Vec<_>>().await?;
         let format_opts = FormatOptions::new().with_types_info(true);
 
-        assert_snapshot!(pretty_format_batches_with_options(&data, &format_opts)?.to_string(), @r"
-        +-------+------+
-        | a     | b    |
-        | Int32 | Utf8 |
-        +-------+------+
-        | 1     | r1   |
-        | 3     | r3   |
-        | 5     | r5   |
-        | 7     | r7   |
-        +-------+------+
-        ");
+        assert_snapshot!(
+            "selection_include_by_index_rows",
+            pretty_format_batches_with_options(&data, &format_opts)?.to_string()
+        );
 
         Ok(())
     }
@@ -2202,18 +2173,10 @@ mod tests {
         let data = stream.try_collect::<Vec<_>>().await?;
         let format_opts = FormatOptions::new().with_types_info(true);
 
-        assert_snapshot!(pretty_format_batches_with_options(&data, &format_opts)?.to_string(), @r"
-        +-------+------+
-        | a     | b    |
-        | Int32 | Utf8 |
-        +-------+------+
-        | 1     | r1   |
-        | 3     | r3   |
-        | 5     | r5   |
-        | 7     | r7   |
-        | 9     | r9   |
-        +-------+------+
-        ");
+        assert_snapshot!(
+            "selection_exclude_by_index_rows",
+            pretty_format_batches_with_options(&data, &format_opts)?.to_string()
+        );
 
         Ok(())
     }
@@ -2343,16 +2306,11 @@ mod tests {
         // row 0: 1 + 10 * 2 = 21
         // row 1: 2 + 20 * 2 = 42
         // row 2: 3 + 30 * 2 = 63
-        assert_snapshot!(pretty_format_batches_with_options(&data, &FormatOptions::new().with_types_info(true))?.to_string(), @r"
-        +--------+
-        | result |
-        | Int32  |
-        +--------+
-        | 21     |
-        | 42     |
-        | 63     |
-        +--------+
-        ");
+        assert_snapshot!(
+            "projection_expr_pushdown_result",
+            pretty_format_batches_with_options(&data, &FormatOptions::new().with_types_info(true))?
+                .to_string()
+        );
 
         Ok(())
     }

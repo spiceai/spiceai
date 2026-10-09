@@ -161,6 +161,9 @@ impl ListModels for AzureModelLister {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
+    use wiremock::matchers::{header, method, path, query_param};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
 
     #[test]
     fn test_from_params_missing_endpoint() {
@@ -186,20 +189,62 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn test_from_params_with_api_key() {
+    #[tokio::test]
+    async fn test_from_params_with_api_key() {
         let mut params = HashMap::new();
         params.insert(
             "azure_endpoint".to_string(),
             SecretString::from("https://test.openai.azure.com"),
         );
         params.insert("azure_api_key".to_string(), SecretString::from("test-key"));
-        let result = AzureModelLister::from_params(&params);
-        result.expect("should succeed with api_key");
+        let lister = AzureModelLister::from_params(&params).expect("should succeed with api_key");
+        assert_eq!(lister.endpoint, "https://test.openai.azure.com");
+        assert_eq!(
+            lister.api_key.as_ref().map(ExposeSecret::expose_secret),
+            Some("test-key")
+        );
+        assert!(
+            lister.entra_token.is_none(),
+            "no entra token was configured"
+        );
+        assert_eq!(lister.api_version, "2024-10-21");
+
+        // The key is sent in the `api-key` header, and not as a bearer token.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/openai/models"))
+            .and(query_param("api-version", "2024-10-21"))
+            .and(header("api-key", "test-key"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"data": [{"id": "gpt-4o"}]})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        params.insert(
+            "azure_endpoint".to_string(),
+            SecretString::from(server.uri()),
+        );
+        let models = AzureModelLister::from_params(&params)
+            .expect("should succeed with api_key")
+            .list_models()
+            .await
+            .expect("the mock serves the model list");
+        assert_eq!(models, vec!["gpt-4o".to_string()]);
+        let requests = server
+            .received_requests()
+            .await
+            .expect("request recording is enabled");
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.headers.contains_key("authorization")),
+            "an api key must not also be sent as a bearer token"
+        );
     }
 
-    #[test]
-    fn test_from_params_with_entra_token() {
+    #[tokio::test]
+    async fn test_from_params_with_entra_token() {
         let mut params = HashMap::new();
         params.insert(
             "azure_endpoint".to_string(),
@@ -209,7 +254,47 @@ mod tests {
             "azure_entra_token".to_string(),
             SecretString::from("test-token"),
         );
-        let result = AzureModelLister::from_params(&params);
-        result.expect("should succeed with entra_token");
+        let lister =
+            AzureModelLister::from_params(&params).expect("should succeed with entra_token");
+        assert_eq!(lister.endpoint, "https://test.openai.azure.com");
+        assert!(lister.api_key.is_none(), "no api key was configured");
+        assert_eq!(
+            lister.entra_token.as_ref().map(ExposeSecret::expose_secret),
+            Some("test-token")
+        );
+        assert_eq!(lister.api_version, "2024-10-21");
+
+        // The token is sent as a bearer token, and not in the `api-key` header.
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/openai/models"))
+            .and(query_param("api-version", "2024-10-21"))
+            .and(header("authorization", "Bearer test-token"))
+            .respond_with(
+                ResponseTemplate::new(200).set_body_json(json!({"data": [{"id": "gpt-4o"}]})),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        params.insert(
+            "azure_endpoint".to_string(),
+            SecretString::from(server.uri()),
+        );
+        let models = AzureModelLister::from_params(&params)
+            .expect("should succeed with entra_token")
+            .list_models()
+            .await
+            .expect("the mock serves the model list");
+        assert_eq!(models, vec!["gpt-4o".to_string()]);
+        let requests = server
+            .received_requests()
+            .await
+            .expect("request recording is enabled");
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.headers.contains_key("api-key")),
+            "an entra token must not also be sent as an api key"
+        );
     }
 }

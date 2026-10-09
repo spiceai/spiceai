@@ -1061,7 +1061,14 @@ mod tests {
             .await
             .expect("stage a");
 
-        // The dual write reaches `b` first, then `a`.
+        // Every clone of the coordinator is a holder or a waiter. With the lock
+        // held here, a dual write that adds one is parked on it: a positive,
+        // deterministic signal that it serializes with this writer, rather than a
+        // window in which a writer ignoring the coordinator might take `b`.
+        let coordinator_handle = partitioned.write_coordinator();
+        let idle_holders = Arc::strong_count(&coordinator_handle);
+
+        // The dual write would reach `b` first, then `a`.
         let (input, input_rx) = mpsc::channel(4);
         let dual_write = tokio::spawn(super::write_all_with_partitioned_cayenne(
             refresher,
@@ -1073,34 +1080,33 @@ mod tests {
             )),
             1,
         ));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while Arc::strong_count(&coordinator_handle) == idle_holders {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the dual write never queued on the table's write coordinator \
+                 ({idle_holders} holder(s) throughout)"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        // Parked on the coordinator it reads none of its input, so it cannot take
+        // `b` whatever order the input reaches the partitions in.
         input
             .send(Ok(rows(vec![1, 2], "b")))
             .await
             .expect("the dual write accepts input");
-        // Give a dual write that ignores the coordinator every chance to take `b`
-        // before it sees `a`: poll until something holds `b`, briefly releasing
-        // each probe that gets it.
-        let b = partition("b").await;
-        for _ in 0..40 {
-            match tokio::time::timeout(Duration::from_millis(50), b.begin_overwrite(nothing(), 1))
-                .await
-            {
-                Ok(probe) => {
-                    probe
-                        .expect("probe b")
-                        .rollback()
-                        .await
-                        .expect("release the probe");
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                }
-                Err(_) => break,
-            }
-        }
         input
             .send(Ok(rows(vec![3], "a")))
             .await
             .expect("the dual write accepts input");
+        assert_eq!(
+            input.capacity(),
+            2,
+            "a dual write parked on the coordinator must not have read its input"
+        );
 
+        let b = partition("b").await;
         let staged_b =
             tokio::time::timeout(Duration::from_secs(10), b.begin_overwrite(nothing(), 1))
                 .await

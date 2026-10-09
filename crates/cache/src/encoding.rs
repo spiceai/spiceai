@@ -253,15 +253,12 @@ mod tests {
             .decode(&payload.bytes)
             .await
             .expect("decode should succeed");
-        (decoded.len() == original.len())
-            .then_some(())
-            .expect("decoded and original should have same length");
-        (decoded[0].num_rows() == original[0].num_rows())
-            .then_some(())
-            .expect("decoded and original should have same num_rows");
-        (decoded[0].num_columns() == original[0].num_columns())
-            .then_some(())
-            .expect("decoded and original should have same num_columns");
+        // `RecordBatch` equality compares the schema and every value, so a decode that
+        // reorders columns, changes a type, or alters a row fails here.
+        assert_eq!(
+            decoded, original,
+            "decoding must return exactly the batches that were encoded"
+        );
     }
 
     #[tokio::test]

@@ -306,6 +306,28 @@ mod tests {
         }
     }
 
+    /// The pool options every metadata pool is built with: no idle connection
+    /// kept, and at most one open.
+    fn metadata_pool_opts() -> mysql_async::PoolOpts {
+        mysql_async::PoolOpts::default().with_constraints(
+            mysql_async::PoolConstraints::new(0, 1).expect("0..=1 is a valid pool constraint"),
+        )
+    }
+
+    /// The `Debug` rendering of the options a metadata pool was built with.
+    /// `mysql_async::Pool` has no accessor for its `Opts`, and creating the
+    /// pool never connects, so this is how a test reads them back.
+    fn pool_opts_debug(pool: &mysql_async::Pool) -> String {
+        let debug = format!("{pool:?}");
+        debug
+            .strip_prefix("Pool { opts: ")
+            .and_then(|rest| rest.split_once(", inner: Inner {"))
+            .map_or_else(
+                || panic!("unexpected mysql_async::Pool Debug rendering: {debug}"),
+                |(opts, _)| opts.to_string(),
+            )
+    }
+
     #[tokio::test]
     async fn test_create_metadata_pool_from_connection_string() {
         let mut params = HashMap::new();
@@ -327,17 +349,37 @@ mod tests {
         params.insert("tcp_port".to_string(), "3306".to_string());
         params.insert("db".to_string(), "mydb".to_string());
         let connector_params = make_connector_params(params).await;
-        MySQLCatalog::create_metadata_pool(&connector_params)
+        let pool = MySQLCatalog::create_metadata_pool(&connector_params)
             .expect("should create pool from individual params");
+        let expected = mysql_async::Opts::from(
+            mysql_async::OptsBuilder::default()
+                .user(Some("root"))
+                .pass(Some("password"))
+                .ip_or_hostname("127.0.0.1")
+                .tcp_port(3306)
+                .db_name(Some("mydb"))
+                .ssl_opts(Some(mysql_async::SslOpts::default()))
+                .pool_opts(metadata_pool_opts()),
+        );
+        assert_eq!(pool_opts_debug(&pool), format!("{expected:?}"));
     }
 
     #[tokio::test]
     async fn test_create_metadata_pool_defaults_host_and_port() {
-        // With no host/port, should default to localhost:3306
+        // With no params: localhost:3306, no credentials or database, and TLS
+        // required (the `sslmode` default).
         let params = HashMap::new();
         let connector_params = make_connector_params(params).await;
-        MySQLCatalog::create_metadata_pool(&connector_params)
+        let pool = MySQLCatalog::create_metadata_pool(&connector_params)
             .expect("should succeed with default host and port");
+        let expected = mysql_async::Opts::from(
+            mysql_async::OptsBuilder::default()
+                .ip_or_hostname("localhost")
+                .tcp_port(3306)
+                .ssl_opts(Some(mysql_async::SslOpts::default()))
+                .pool_opts(metadata_pool_opts()),
+        );
+        assert_eq!(pool_opts_debug(&pool), format!("{expected:?}"));
     }
 
     #[tokio::test]
@@ -348,9 +390,18 @@ mod tests {
             "not-a-valid-url".to_string(),
         );
         let connector_params = make_connector_params(params).await;
-        assert!(
-            MySQLCatalog::create_metadata_pool(&connector_params).is_err(),
-            "should fail with invalid connection string"
+        let err = MySQLCatalog::create_metadata_pool(&connector_params)
+            .expect_err("should fail with invalid connection string");
+        assert_eq!(
+            err.downcast_ref::<mysql_async::UrlError>(),
+            Some(&mysql_async::UrlError::Parse(
+                mysql_async::ParseError::RelativeUrlWithoutBase
+            )),
+            "expected a URL parse error, got {err}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "URL parse error: relative URL without a base"
         );
     }
 
@@ -366,8 +417,21 @@ mod tests {
         params.insert("user".to_string(), "individual_user".to_string());
         params.insert("host".to_string(), "individual_host".to_string());
         let connector_params = make_connector_params(params).await;
-        // Should succeed using connection_string, not individual params
-        MySQLCatalog::create_metadata_pool(&connector_params)
+        let pool = MySQLCatalog::create_metadata_pool(&connector_params)
             .expect("should create pool from connection_string when both are present");
+        let opts = pool_opts_debug(&pool);
+        assert!(
+            opts.starts_with(
+                "Opts { inner: InnerOpts { mysql_opts: MysqlOpts { user: Some(\"conn_user\"), \
+                 pass: Some(\"conn_pass\"), db_name: Some(\"conndb\"), "
+            ),
+            "the connection string's credentials and database must win, got {opts}"
+        );
+        assert!(
+            opts.ends_with(
+                "address: HostPort { host: \"connhost\", port: 3307, resolved_ips: None } } }"
+            ),
+            "the connection string's host and port must win, got {opts}"
+        );
     }
 }

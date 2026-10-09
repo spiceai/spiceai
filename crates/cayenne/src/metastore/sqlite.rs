@@ -1519,6 +1519,22 @@ impl SqliteMetastore {
         )
     ";
 
+    /// Schema for the `cayenne_index_run` table: one row per persisted
+    /// secondary index run (see `metadata::IndexRunRecord`). The run's bytes
+    /// live in the table's object store; captured in metastore snapshots via
+    /// `EXPECTED_TABLES`.
+    const INDEX_RUN_TABLE_DDL: &'static str = r"
+        CREATE TABLE IF NOT EXISTS cayenne_index_run (
+            table_id TEXT NOT NULL,
+            index_key TEXT NOT NULL,
+            run_name TEXT NOT NULL,
+            row_count BIGINT NOT NULL,
+            size_bytes BIGINT NOT NULL,
+            FOREIGN KEY (table_id) REFERENCES cayenne_table(table_id) ON DELETE CASCADE,
+            PRIMARY KEY (table_id, index_key, run_name)
+        )
+    ";
+
     /// Schema for the `cayenne_inlined_data` table.
     ///
     /// Stores small batches of insert data as Arrow IPC blobs directly in the
@@ -1725,7 +1741,7 @@ impl MetastoreBackend for SqliteMetastore {
             .call(|conn| {
                 // Create tables in a transaction
                 conn.execute_batch(&format!(
-                    "{}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {};",
+                    "{}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {}; {};",
                     Self::TABLE_TABLE_DDL,
                     Self::TABLE_NAME_UNIQUE_INDEX_DDL,
                     Self::DELETE_FILE_TABLE_DDL,
@@ -1739,7 +1755,8 @@ impl MetastoreBackend for SqliteMetastore {
                     Self::COLD_TIER_FILE_TABLE_DDL,
                     Self::INLINED_DATA_TABLE_DDL,
                     Self::INLINED_DELETE_TABLE_DDL,
-                    Self::PK_INDEX_TABLE_DDL
+                    Self::PK_INDEX_TABLE_DDL,
+            Self::INDEX_RUN_TABLE_DDL
                 ))?;
 
                 // Backfill new columns for existing deployments (SQLite doesn't support IF NOT EXISTS for ALTER TABLE until v3.35)
@@ -2708,6 +2725,52 @@ mod tests {
         count
     }
 
+    /// Records whether the waker it backs has been woken.
+    #[derive(Default)]
+    struct WokenFlag(std::sync::atomic::AtomicBool);
+
+    impl std::task::Wake for WokenFlag {
+        fn wake(self: Arc<Self>) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// Drives `write` until it is queued on the [`Writer`], without awaiting it, so the
+    /// order of these calls is exactly the order the writes arrive in the writer's queue.
+    ///
+    /// The poll that reaches [`Writer::run`] hands the write to the writer's thread before
+    /// it parks, so a write is queued by its first poll unless it parks on other work
+    /// first: one that only `SQLite` recognizes as a write first parks on the read
+    /// connection preparing it. `parks_before_writer` is how many such parks to see
+    /// through, each waited out, bounded, until the work it parked on wakes it.
+    async fn queue_on_writer<F>(write: &mut F, parks_before_writer: usize)
+    where
+        F: std::future::Future + Unpin,
+        F::Output: std::fmt::Debug,
+    {
+        for park in 0..=parks_before_writer {
+            let woken = Arc::new(WokenFlag::default());
+            let waker = std::task::Waker::from(Arc::clone(&woken));
+            let polled =
+                std::pin::Pin::new(&mut *write).poll(&mut std::task::Context::from_waker(&waker));
+            assert!(
+                polled.is_pending(),
+                "the write finished at park {park} instead of waiting for its turn: {polled:?}"
+            );
+            if park == parks_before_writer {
+                break;
+            }
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !woken.0.load(Ordering::SeqCst) {
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "the work the write parked on at park {park} never finished"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+            }
+        }
+    }
+
     /// `execute_many` runs its statement once per entry, in order, across chunk
     /// boundaries, and the first entry that fails stops the batch with that
     /// entry's error — what a loop of `execute` calls does, so the caller's
@@ -2796,24 +2859,23 @@ mod tests {
         let mut writers = Vec::new();
         for writer in 0..WRITERS {
             let metastore = Arc::clone(&metastore);
-            writers.push(tokio::spawn(async move {
+            let mut write = Box::pin(async move {
                 metastore
                     .execute(ExecuteParams {
                         sql: "INSERT INTO t (writer) VALUES (?1)",
                         params: vec![MetastoreValue::Integer(writer)],
                     })
                     .await
-            }));
-            // Arrival order is what is under test: each writer must be queued
-            // before the next one starts, and reaching the queue takes
-            // microseconds.
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            });
+            // Arrival order is what is under test: each writer is queued
+            // before the next one is created.
+            queue_on_writer(&mut write, 0).await;
+            writers.push(write);
         }
         holder.commit().await.expect("commit the holder");
         for writer in writers {
             writer
                 .await
-                .expect("writer task")
                 .expect("a queued writer must get the lock, not time out");
         }
 
@@ -3079,43 +3141,28 @@ mod tests {
             .expect("seed row");
 
         let holder = metastore.begin_transaction().await.expect("begin");
-        let multiply = {
-            let metastore = Arc::clone(&metastore);
-            tokio::spawn(async move {
-                metastore
-                    .query_row(
-                        QueryRowParams {
-                            sql: "WITH factor(v) AS (VALUES (10)) UPDATE t SET n = n * (SELECT v FROM factor) WHERE id = 1 RETURNING n",
-                            params: vec![],
-                        },
-                        |row| row.get_i64(0),
-                    )
-                    .await
-            })
-        };
-        // Arrival order is what is under test: the CTE write must be queued
-        // before the next write, and reaching the queue takes microseconds.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let add = {
-            let metastore = Arc::clone(&metastore);
-            tokio::spawn(async move {
-                metastore
-                    .execute(ExecuteParams {
-                        sql: "UPDATE t SET n = n + 1 WHERE id = 1",
-                        params: vec![],
-                    })
-                    .await
-            })
-        };
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Arrival order is what is under test: the CTE write is queued on the
+        // writer, behind the holder, before the next write is created.
+        let mut multiply = Box::pin(metastore.query_row(
+            QueryRowParams {
+                sql: "WITH factor(v) AS (VALUES (10)) UPDATE t SET n = n * (SELECT v FROM factor) WHERE id = 1 RETURNING n",
+                params: vec![],
+            },
+            |row| row.get_i64(0),
+        ));
+        queue_on_writer(&mut multiply, 0).await;
+        let mut add = Box::pin(metastore.execute(ExecuteParams {
+            sql: "UPDATE t SET n = n + 1 WHERE id = 1",
+            params: vec![],
+        }));
+        queue_on_writer(&mut add, 0).await;
         holder.commit().await.expect("commit the holder");
-        multiply
-            .await
-            .expect("CTE write task")
-            .expect("the CTE write");
-        add.await
-            .expect("write task")
-            .expect("the write queued after it");
+        assert_eq!(
+            multiply.await.expect("the CTE write"),
+            10,
+            "the CTE write runs first, on the seeded value (1 × 10)"
+        );
+        add.await.expect("the write queued after it");
 
         let n = metastore
             .query_row(
@@ -3182,8 +3229,8 @@ mod tests {
 
     /// A CTE-prefixed write issued through a query method is recognized by the
     /// statement its `WITH` clause leads into, so it queues on the writer
-    /// connection the moment it arrives: it waits for no read connection, and a
-    /// write that arrives after it cannot run first.
+    /// connection the moment it arrives: it completes while every read
+    /// connection is taken, before the write issued after it.
     #[tokio::test]
     async fn test_a_cte_write_through_a_query_does_not_wait_for_a_read_connection() {
         let _guard = CONFIG_LOCK.lock().await;
@@ -3208,22 +3255,22 @@ mod tests {
         for conn in &pool.conns {
             reads.push(Arc::clone(conn).lock_owned().await);
         }
-        let multiply = {
-            let metastore = Arc::clone(&metastore);
-            tokio::spawn(async move {
-                metastore
-                    .query_row(
-                        QueryRowParams {
-                            sql: "WITH factor(v) AS (VALUES (10)) UPDATE t SET n = n * (SELECT v FROM factor) WHERE id = 1 RETURNING n",
-                            params: vec![],
-                        },
-                        |row| row.get_i64(0),
-                    )
-                    .await
-            })
-        };
-        // Arrival order is what is under test: the CTE write arrives first.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Nothing holds the writer, so the only thing the CTE write could wait
+        // for is a read connection: it must finish while every one is taken.
+        let multiplied = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            metastore.query_row(
+                QueryRowParams {
+                    sql: "WITH factor(v) AS (VALUES (10)) UPDATE t SET n = n * (SELECT v FROM factor) WHERE id = 1 RETURNING n",
+                    params: vec![],
+                },
+                |row| row.get_i64(0),
+            ),
+        )
+        .await
+        .expect("the CTE write must not wait for a read connection")
+        .expect("the CTE write");
+        assert_eq!(multiplied, 10, "1 × 10");
         metastore
             .execute(ExecuteParams {
                 sql: "UPDATE t SET n = n + 1 WHERE id = 1",
@@ -3232,10 +3279,6 @@ mod tests {
             .await
             .expect("the write that arrived after the CTE write");
         drop(reads);
-        multiply
-            .await
-            .expect("CTE write task")
-            .expect("the CTE write");
 
         let n = metastore
             .query_row(
@@ -3264,44 +3307,43 @@ mod tests {
         let metastore = Arc::new(metastore);
 
         let holder = metastore.begin_transaction().await.expect("begin");
-        let create = {
-            let metastore = Arc::clone(&metastore);
-            tokio::spawn(async move {
-                metastore
-                    .query(
-                        QueryParams {
-                            sql: "CREATE TABLE later (id INTEGER PRIMARY KEY)",
-                            params: vec![],
-                        },
-                        |_| Ok(()),
-                    )
-                    .await
-            })
-        };
-        // Arrival order is what is under test: the CREATE TABLE must be queued
-        // before the INSERT, and reaching the queue takes well under this.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        let insert = {
-            let metastore = Arc::clone(&metastore);
-            tokio::spawn(async move {
-                metastore
-                    .execute(ExecuteParams {
-                        sql: "INSERT INTO later (id) VALUES (1)",
-                        params: vec![],
-                    })
-                    .await
-            })
-        };
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        // Arrival order is what is under test: the CREATE TABLE parks once on
+        // the read connection preparing it, then is queued on the writer,
+        // behind the holder, before the INSERT is created.
+        let mut create = Box::pin(metastore.query(
+            QueryParams {
+                sql: "CREATE TABLE later (id INTEGER PRIMARY KEY)",
+                params: vec![],
+            },
+            |_| Ok(()),
+        ));
+        queue_on_writer(&mut create, 1).await;
+        let mut insert = Box::pin(metastore.execute(ExecuteParams {
+            sql: "INSERT INTO later (id) VALUES (1)",
+            params: vec![],
+        }));
+        queue_on_writer(&mut insert, 0).await;
         holder.commit().await.expect("commit the holder");
-        create
-            .await
-            .expect("CREATE TABLE task")
-            .expect("the CREATE TABLE");
+        assert_eq!(
+            create.await.expect("the CREATE TABLE"),
+            Vec::<()>::new(),
+            "a CREATE TABLE returns no rows"
+        );
         insert
             .await
-            .expect("INSERT task")
             .expect("the INSERT queued after the CREATE TABLE must find its table");
+
+        let ids = metastore
+            .query(
+                QueryParams {
+                    sql: "SELECT id FROM later",
+                    params: vec![],
+                },
+                |row| row.get_i64(0),
+            )
+            .await
+            .expect("read the table the CREATE TABLE made");
+        assert_eq!(ids, vec![1], "the INSERT ran after the CREATE TABLE");
     }
 
     /// A transaction keeps its writer connection registered after the metastore
@@ -3675,7 +3717,27 @@ mod tests {
         let key = writer_key(stuck.to_str().expect("utf-8 path")).await;
         // Hold the stuck file's slot, as an open waiting out a lock would.
         let slot = Arc::clone(WRITERS.lock().entry(key).or_default());
-        let _opening = slot.lock().await;
+        let opening = slot.lock().await;
+
+        // A metastore on the stuck file opens its read connections, then takes
+        // its claim on the slot (the map's and this test's are the other two)
+        // and waits on the held lock.
+        let stuck_metastore = SqliteMetastore::new(format!("sqlite://{}", stuck.display()));
+        let stuck_open = tokio::spawn(async move {
+            stuck_metastore
+                .pool()
+                .await
+                .map(|pool| Arc::clone(&pool.writer))
+        });
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+        while Arc::strong_count(&slot) < 3 {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the stuck file's metastore never reached its writer slot (claims: {})",
+                Arc::strong_count(&slot)
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
 
         let other = SqliteMetastore::new(format!(
             "sqlite://{}",
@@ -3685,6 +3747,26 @@ mod tests {
             .await
             .expect("another file's writer connection must not wait for a stuck open")
             .expect("pool");
+        assert!(
+            !stuck_open.is_finished(),
+            "a metastore on the stuck file must wait for its held slot"
+        );
+
+        drop(opening);
+        let stuck_writer = tokio::time::timeout(std::time::Duration::from_secs(10), stuck_open)
+            .await
+            .expect("the stuck file's metastore must get its pool once its slot is free")
+            .expect("stuck open task")
+            .expect("pool");
+        let registered = slot
+            .lock()
+            .await
+            .upgrade()
+            .expect("the slot names the writer connection the stuck open made");
+        assert!(
+            Arc::ptr_eq(&registered, &stuck_writer),
+            "the stuck open must have opened its writer through its own file's slot"
+        );
     }
 
     /// A TRUNCATE checkpoint waits only briefly for a reader still on an older

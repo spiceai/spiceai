@@ -38,7 +38,8 @@ use tokio::runtime::Handle;
 use tokio::sync::{Notify, Semaphore, oneshot};
 
 use super::batching::{
-    AppendBurst, AppendIngress, CdcBurst, CdcIngress, CoalescingBurst, CoalescingLimits,
+    AppendBurst, AppendIngress, ApplyingGuard, CdcBurst, CdcIngress, CoalescingBurst,
+    CoalescingLimits,
 };
 use super::provider::{ProviderChangeSinkBackend, refusal::is_before_mutation};
 use super::source_policy::{CdcPolicy, SchemaDecision};
@@ -193,6 +194,26 @@ impl CdcPolicy for UnchangedSchema {
 }
 
 #[test]
+fn applying_guard_clears_the_flag_when_dropped() {
+    let ingress = Arc::new(CdcIngress::new(
+        &TableReference::bare("cdc"),
+        Arc::new(UnchangedSchema),
+        two_input_limits(),
+    ));
+    {
+        let _guard = ApplyingGuard::enter(&ingress);
+        assert!(
+            ingress.is_applying(),
+            "enter must mark the apply as in flight"
+        );
+    }
+    assert!(
+        !ingress.is_applying(),
+        "drop must clear the flag so a cancelled apply cannot leave the producer building ahead"
+    );
+}
+
+#[test]
 fn cdc_burst_returns_unconsumed_input_at_capacity() {
     let ingress = Arc::new(CdcIngress::new(
         &TableReference::bare("cdc"),
@@ -241,6 +262,10 @@ async fn overlapping_scope_shapes_reject_equal_full_keys() {
     .await;
     let error = result.expect_err("different overlapping scopes must not share a physical key");
     assert!(is_before_mutation(&error));
+    assert_eq!(
+        error.to_string(),
+        "External error: Error during planning: Unique key conflicts between scoped appends for dataset 'scoped'"
+    );
 }
 
 #[tokio::test]
@@ -256,6 +281,10 @@ async fn overlapping_scope_shapes_reject_equal_partial_keys() {
     .await;
     let error = result.expect_err("membership in both scopes must not authorize a key collision");
     assert!(is_before_mutation(&error));
+    assert_eq!(
+        error.to_string(),
+        "External error: Error during planning: Unique key conflicts between scoped appends for dataset 'scoped'"
+    );
 }
 
 #[tokio::test]

@@ -54,6 +54,7 @@ use connector_gcs as _;
 use connector_git as _;
 use connector_github as _;
 use connector_glue as _;
+use connector_huggingface as _;
 use connector_postgres as _;
 use connector_scylladb as _;
 use connector_sftp as _;
@@ -286,7 +287,14 @@ mod tests {
             .map(|c| c.name)
             .collect();
         assert!(!names.is_empty(), "no data connectors were collected");
-        for expected in ["dynamodb", "postgres", "clickhouse", "mysql", "graphql"] {
+        for expected in [
+            "dynamodb",
+            "postgres",
+            "clickhouse",
+            "mysql",
+            "graphql",
+            "hf",
+        ] {
             assert!(
                 names.iter().any(|n| n == expected),
                 "connector '{expected}' missing from the generated schema; collected: {names:?}"

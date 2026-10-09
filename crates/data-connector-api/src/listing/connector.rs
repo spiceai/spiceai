@@ -95,6 +95,92 @@ const SCHEMA_SOURCE_PATH_FILE_SCAN_LIMIT: usize = 10_000;
 /// publish an incomplete schema for that full scan.
 const ORC_COLLECTION_SCHEMA_INFER_FILE_LIMIT: usize = 10_000;
 
+/// The listing options and file schema a dataset's listing table is built from, as
+/// [`ListingTableConnector::listing_table_template`] resolves them.
+///
+/// [`Self::build`] builds the table over any path from them, so a connector that reads a
+/// dataset from more than one location over its lifetime exposes the same schema at each.
+#[derive(Clone, Debug)]
+pub struct ListingTableTemplate {
+    options: ListingOptions,
+    /// The columns physically stored in the data files, without partition or metadata
+    /// columns.
+    schema: SchemaRef,
+    object_store: Arc<dyn ObjectStore>,
+    /// Listing extension from [`ListingTableConnector::get_file_format_and_extension`].
+    extension: String,
+}
+
+impl ListingTableTemplate {
+    /// The columns physically stored in the data files, without partition or metadata
+    /// columns.
+    #[must_use]
+    pub fn file_schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    /// Builds the dataset's table over `table_path`: a [`ListingTable`] with a
+    /// file-statistics cache, wrapped for `location` pruning and format-selected listing when
+    /// the dataset uses either.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the listing options do not fit the file schema, such as a metadata
+    /// column whose name a file column already uses.
+    pub fn build(&self, table_path: ListingTableUrl) -> DFResult<Arc<dyn TableProvider>> {
+        let table = Arc::new(self.listing_table(table_path.clone())?);
+        Ok(self.wrap(table, table_path))
+    }
+
+    fn listing_table(&self, table_path: ListingTableUrl) -> DFResult<ListingTable> {
+        let config = ListingTableConfig::new(table_path)
+            .with_listing_options(self.options.clone())
+            .with_schema(Arc::clone(&self.schema));
+
+        // Attach a file-statistics cache. With `collect_stat = true` (the
+        // DataFusion default), resolving a scan's statistics parses every
+        // file's Parquet footer; without a cache, `ListingTable` re-parses all
+        // footers on every plan. That makes stat-only queries (e.g. an
+        // unfiltered `COUNT(*)`, which the `AggregateStatistics` rule answers
+        // purely from statistics) scale linearly with file count on each query.
+        // The stock DataFusion `CREATE EXTERNAL TABLE` path wires this same
+        // cache; we mirror it so per-file footer stats are reused across
+        // queries. The cache invalidates per file on `ObjectMeta` change, so
+        // refreshing datasets still pick up new data.
+        Ok(ListingTable::try_new(config)?.with_cache(Some(Arc::new(
+            DefaultCache::<TableScopedPath, CachedFileMetadata>::new(
+                DEFAULT_FILE_STATISTICS_MEMORY_LIMIT,
+            )
+            .with_name("DefaultFileStatisticsCache"),
+        ))))
+    }
+
+    fn wrap(
+        &self,
+        table: Arc<ListingTable>,
+        table_path: ListingTableUrl,
+    ) -> Arc<dyn TableProvider> {
+        let has_location_metadata = table.options().metadata_cols.iter().any(|c| {
+            matches!(
+                c,
+                datafusion_datasource::metadata::MetadataColumn::Location(_)
+            )
+        });
+
+        if has_location_metadata || format_selected_data_suffix(&self.extension).is_some() {
+            Arc::new(LocationPruningListingTable::new(
+                table,
+                Arc::clone(&self.object_store),
+                table_path,
+                Arc::clone(&self.schema),
+                self.extension.as_str(),
+            ))
+        } else {
+            table
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 /// Wraps a `ListingTable` to short-circuit broad object-store listings when
 /// queries include `location` predicates, and to apply format-selected Hive
@@ -1492,6 +1578,69 @@ pub trait ListingTableConnector: DataConnector {
     where
         Self: Display,
     {
+        let template = self
+            .listing_table_template(dataset, url, extension, file_format)
+            .await?;
+
+        // This shouldn't error because `listing_table_template` already parsed the same URL.
+        let table_path =
+            ListingTableUrl::parse(url.clone())
+                .boxed()
+                .context(crate::InternalSnafu {
+                    dataconnector: format!("{self}"),
+                    connector_component: ConnectorComponent::from(dataset),
+                    code: "LTC-RP-LTUP".to_string(), // ListingTableConnector-ReadProvider-ListingTableUrlParse
+                })?;
+
+        // This shouldn't error because we're passing the schema and options correctly.
+        let table_arc = Arc::new(template.listing_table(table_path.clone()).boxed().context(
+            crate::InternalSnafu {
+                dataconnector: format!("{self}"),
+                connector_component: ConnectorComponent::from(dataset),
+                code: "LTC-RP-LTTN".to_string(), // ListingTableConnector-ReadProvider-ListingTableTryNew
+            },
+        )?);
+
+        // For S3 single-file datasets with acceleration enabled, wrap with a caching layer
+        // that checks ETag/Version ID to skip unnecessary re-fetches when file hasn't changed.
+        if self.supports_single_file_version_cache()
+            && refresh_skip_enabled(dataset)
+            && !table_path.is_collection()
+            && dataset.acceleration.is_some()
+            && let Some(cached_table) =
+                data_components::s3_single_file_cached::S3SingleFileCached::try_new(
+                    Arc::clone(&table_arc),
+                    Arc::clone(&template.object_store),
+                    dataset.name.to_string(),
+                )
+        {
+            tracing::debug!(
+                "Enabled single-file ETag/Version caching for {}",
+                dataset.name
+            );
+            return Ok(Arc::new(cached_table));
+        }
+
+        Ok(template.wrap(table_arc, table_path))
+    }
+
+    /// Resolves the listing options and schema [`Self::create_listing_table`] builds the
+    /// dataset's table from, without building it.
+    ///
+    /// A connector whose files are read from a location that changes over the dataset's
+    /// lifetime — a path pinned to a source revision — resolves this once and builds the table
+    /// at each location with [`ListingTableTemplate::build`], so the dataset keeps the schema
+    /// it registered with.
+    async fn listing_table_template(
+        &self,
+        dataset: &DatasetSpec,
+        url: &Url,
+        extension: &str,
+        file_format: Arc<dyn FileFormat>,
+    ) -> DataConnectorResult<ListingTableTemplate>
+    where
+        Self: Display,
+    {
         // This shouldn't error because we've already validated the URL in `get_object_store_url`.
         let table_path =
             ListingTableUrl::parse(url.clone())
@@ -1680,79 +1829,12 @@ pub trait ListingTableConnector: DataConnector {
             expanded_schema
         };
 
-        // Keep a reference to the file schema for LocationPruningListingTable
-        let file_schema = Arc::clone(&final_schema);
-
-        let config = ListingTableConfig::new(table_path.clone())
-            .with_listing_options(options)
-            .with_schema(final_schema);
-
-        // This shouldn't error because we're passing the schema and options correctly.
-        //
-        // Attach a file-statistics cache. With `collect_stat = true` (the
-        // DataFusion default), resolving a scan's statistics parses every
-        // file's Parquet footer; without a cache, `ListingTable` re-parses all
-        // footers on every plan. That makes stat-only queries (e.g. an
-        // unfiltered `COUNT(*)`, which the `AggregateStatistics` rule answers
-        // purely from statistics) scale linearly with file count on each query.
-        // The stock DataFusion `CREATE EXTERNAL TABLE` path wires this same
-        // cache; we mirror it so per-file footer stats are reused across
-        // queries. The cache invalidates per file on `ObjectMeta` change, so
-        // refreshing datasets still pick up new data.
-        let table = ListingTable::try_new(config)
-            .boxed()
-            .context(crate::InternalSnafu {
-                dataconnector: format!("{self}"),
-                connector_component: ConnectorComponent::from(dataset),
-                code: "LTC-RP-LTTN".to_string(), // ListingTableConnector-ReadProvider-ListingTableTryNew
-            })?
-            .with_cache(Some(Arc::new(
-                DefaultCache::<TableScopedPath, CachedFileMetadata>::new(
-                    DEFAULT_FILE_STATISTICS_MEMORY_LIMIT,
-                )
-                .with_name("DefaultFileStatisticsCache"),
-            )));
-
-        // For S3 single-file datasets with acceleration enabled, wrap with a caching layer
-        // that checks ETag/Version ID to skip unnecessary re-fetches when file hasn't changed.
-        let table_arc = Arc::new(table);
-        if self.supports_single_file_version_cache()
-            && refresh_skip_enabled(dataset)
-            && !table_path.is_collection()
-            && dataset.acceleration.is_some()
-            && let Some(cached_table) =
-                data_components::s3_single_file_cached::S3SingleFileCached::try_new(
-                    Arc::clone(&table_arc),
-                    Arc::clone(&object_store),
-                    dataset.name.to_string(),
-                )
-        {
-            tracing::debug!(
-                "Enabled single-file ETag/Version caching for {}",
-                dataset.name
-            );
-            return Ok(Arc::new(cached_table));
-        }
-
-        let has_location_metadata = table_arc.options().metadata_cols.iter().any(|c| {
-            matches!(
-                c,
-                datafusion_datasource::metadata::MetadataColumn::Location(_)
-            )
-        });
-
-        if has_location_metadata || format_selected_data_suffix(extension).is_some() {
-            let wrapped = LocationPruningListingTable::new(
-                table_arc,
-                Arc::clone(&object_store),
-                table_path,
-                file_schema,
-                extension,
-            );
-            Ok(Arc::new(wrapped))
-        } else {
-            Ok(table_arc)
-        }
+        Ok(ListingTableTemplate {
+            options,
+            schema: final_schema,
+            object_store,
+            extension: extension.to_string(),
+        })
     }
 
     /// Drops partition columns from `schema` that the files already carry, so a
@@ -4733,30 +4815,59 @@ mod tests {
 
     #[tokio::test]
     async fn test_listing_table_metadata_columns_are_applied() {
-        let mut dataset = DatasetSpec::new("s3://bucket/prefix/", TableReference::bare("test"));
-        dataset.metadata = HashMap::from([(
-            MetadataColumn::Location(None).name().to_string(),
-            "enabled".to_string(),
-        )]);
+        use datafusion_datasource::metadata::MetadataColumn as ListingMetadataColumn;
 
-        let options =
-            ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension(".parquet");
+        let table_url = Url::parse("s3://bucket/prefix/").expect("parse table url");
         let schema = Schema::new(vec![Field::new(
             "compression",
             arrow_schema::DataType::Utf8,
             true,
         )]);
+        let listing_options = || {
+            ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension(".parquet")
+        };
 
-        let result = add_metadata_columns_if_required(
-            options,
-            &Url::parse("s3://bucket/prefix/").expect("parse table url"),
-            &schema,
-            &dataset,
+        let mut dataset = DatasetSpec::new("s3://bucket/prefix/", TableReference::bare("test"));
+        dataset.metadata = HashMap::from([(
+            MetadataColumn::Location(None).name().to_string(),
+            "enabled".to_string(),
+        )]);
+        let result =
+            add_metadata_columns_if_required(listing_options(), &table_url, &schema, &dataset);
+        // `_location` values are built from the bucket-level prefix, not the
+        // table path.
+        assert_eq!(
+            result.metadata_cols,
+            vec![ListingMetadataColumn::Location(Some(Arc::from(
+                "s3://bucket/"
+            )))]
         );
 
-        assert!(
-            !result.metadata_cols.is_empty(),
-            "metadata columns should be set on listing options"
+        // Every enabled column is forwarded as its DataFusion counterpart, in
+        // a fixed order.
+        dataset.metadata = HashMap::from([
+            (
+                MetadataColumn::LastModified.name().to_string(),
+                "enabled".to_string(),
+            ),
+            (
+                MetadataColumn::Location(None).name().to_string(),
+                "enabled".to_string(),
+            ),
+            (
+                MetadataColumn::Size.name().to_string(),
+                "enabled".to_string(),
+            ),
+        ]);
+        let result =
+            add_metadata_columns_if_required(listing_options(), &table_url, &schema, &dataset);
+        assert_eq!(
+            result.metadata_cols,
+            vec![
+                ListingMetadataColumn::LastModified,
+                ListingMetadataColumn::Location(Some(Arc::from("s3://bucket/"))),
+                ListingMetadataColumn::Size,
+            ]
         );
     }
 
@@ -4784,7 +4895,24 @@ mod tests {
         )
         .await;
 
-        result.expect_err("should error on no matching extension");
+        let err = result.expect_err("should error on no matching extension");
+        let DataConnectorError::InvalidConfigurationNoSource {
+            dataconnector,
+            message,
+            ..
+        } = &err
+        else {
+            panic!("an extension mismatch must be a configuration error, got: {err:?}");
+        };
+        assert_eq!(dataconnector, "TestListingConnector");
+        assert_eq!(
+            message,
+            "Failed to find any files matching the extension '.csv'. Is your `file_format` parameter correct? Spice found the following file extensions: '.parquet'. For details, visit: https://spiceai.org/docs/components/data-connectors#object-store-file-formats"
+        );
+        assert!(
+            !err.is_retriable(),
+            "files that are present but none match `file_format` is a permanent configuration error, not a wait-for-data retry"
+        );
     }
 
     #[tokio::test]
