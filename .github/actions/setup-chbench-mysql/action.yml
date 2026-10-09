@@ -78,8 +78,11 @@ runs:
         # snapshots the seeded tables on startup, so seed rows need not be in the
         # binlog). The loader falls back gracefully if this privilege is absent
         # (e.g. on the in-cluster pod, which should grant it too for the speedup).
+        # Over TCP, as the CH-benCH clients connect: the image's entrypoint first
+        # runs a temporary server on the Unix socket only, and stops it before
+        # starting the real one.
         for _ in {1..60}; do
-          if docker exec chbench-mysql mysql -uroot -prootpw -e 'SELECT 1' > /dev/null 2>&1; then
+          if docker exec chbench-mysql mysql -h 127.0.0.1 -P 3306 -uroot -prootpw -e 'SELECT 1' > /dev/null 2>&1; then
             echo "MySQL is ready"
             docker exec chbench-mysql mysql -uroot -prootpw -e \
               "GRANT REPLICATION SLAVE, REPLICATION CLIENT, SESSION_VARIABLES_ADMIN ON *.* TO 'bench'@'%'; FLUSH PRIVILEGES;"
