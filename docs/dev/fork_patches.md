@@ -107,7 +107,7 @@ own section below — a count here would be one more thing to keep true by hand.
 |---|---|---|
 | [arrow-adbc](#arrow-adbc) | `6e4119ac2007c6647702a1817505d6849b07e0e0` | `spiceai-24` |
 | [arrow-rs](#arrow-rs) | `2e2cc330c64ac8a9e44d2a5f2da171b391f775b8` | `spiceai-59` |
-| [async-openai](#async-openai) | `3a2d5673b037c18b4a3b2b5526ce2219a82027e6` | `viktor/open-service-tier` (TEMPORARY: spiceai/async-openai#42) |
+| [async-openai](#async-openai) | `2c102dc47efccacaa628e7e5b3a1725168181914` | `spiceai` |
 | [candle](#candle-and-its-kernel-crates) | `efbb9a72e92789eafed0806c3e16f14640c504f6` | `lukim/spiceai-0.11.0` |
 | [candle-cublaslt](#candle-and-its-kernel-crates) | `c41bf9c6e87195749c2262d16ca320af2bbebbfe` | `main` |
 | [candle-index-select-cu](#candle-and-its-kernel-crates) | `75fc0b689b33a327907d36dd479f7d242640ca71` | `master` |

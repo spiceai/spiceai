@@ -204,13 +204,13 @@ arrow-json = "59.3.0"
 arrow-odbc = "25.3" # 25.2+ accepts arrow ">=29, <60", so it resolves to the workspace Arrow 59
 arrow-row = "59.3.0"
 arrow-schema = "59.3.0"
-async-openai = { git = "https://github.com/spiceai/async-openai", rev = "3a2d5673b037c18b4a3b2b5526ce2219a82027e6", features = [
+async-openai = { git = "https://github.com/spiceai/async-openai", rev = "2c102dc47efccacaa628e7e5b3a1725168181914", features = [
     "byot",
     "embedding",
     "chat-completion",
     "responses",
     "model",
-] } # branch: viktor/open-service-tier (spiceai/async-openai#42)
+] } # branch: spiceai
 async-stream = "0.3.5"
 async-trait = "0.1.89"
 aws-config = "1.8.17"
