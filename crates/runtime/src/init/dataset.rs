@@ -4171,6 +4171,26 @@ mod tests {
         );
     }
 
+    /// The way out must be a configuration that loads: write-back requires
+    /// `refresh_mode: changes`, and `write_mode: acceleration` is refused with it.
+    #[test]
+    fn the_unsupported_source_rejection_offers_a_write_mode_that_loads() {
+        let message = DurableWriteBackUnsupportedBySourceSnafu {
+            dataset_name: "orders".to_string(),
+            connector: "mysql".to_string(),
+        }
+        .build()
+        .to_string();
+        assert!(
+            message.contains("'acceleration.write_mode: write_through'"),
+            "the rejection must offer write-through: {message}"
+        );
+        assert!(
+            !message.contains("write_mode: acceleration") && !message.contains("on_conflict"),
+            "the rejection must not offer a setting that cannot load: {message}"
+        );
+    }
+
     /// The rejection is the only account a user gets of why the dataset will not
     /// load, so it names the dataset, the setting to remove, what would go wrong,
     /// and a way out.

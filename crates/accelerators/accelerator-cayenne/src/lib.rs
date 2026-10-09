@@ -3068,7 +3068,7 @@ fn declares_unique_index(source: &dyn AccelerationSource) -> bool {
 /// duplicate rows.
 fn unique_index_warning(table_name: &str) -> String {
     format!(
-        "Dataset '{table_name}' (cayenne): a `unique` entry in `indexes` speeds up lookups but does not constrain writes, so duplicate rows are not rejected. Set `primary_key` to keep one row per value of a column set. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+        "Dataset '{table_name}' (cayenne): a `unique` entry in `indexes` speeds up lookups but does not constrain writes, so duplicate rows are not rejected. Set `primary_key`, with `cayenne_pk_conflict_detection` left at its default `auto`, to keep one row per value of a column set. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
     )
 }
 
@@ -5097,7 +5097,9 @@ mod tests {
             "the warning must say what a `unique` entry will not do: {warning}"
         );
         assert!(
-            warning.contains("primary_key") && !warning.contains("on_conflict"),
+            warning.contains("primary_key")
+                && warning.contains("cayenne_pk_conflict_detection")
+                && !warning.contains("on_conflict"),
             "the warning must give the actionable alternative: {warning}"
         );
     }
