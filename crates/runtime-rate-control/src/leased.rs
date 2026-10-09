@@ -130,7 +130,7 @@ limitations under the License.
 //! after it first leases. Each replica logs a warning naming the origin and
 //! the limits when they start to differ, and a note once every running
 //! replica sets its limit, whether the others changed theirs or stopped.
-//! A limiter no replica has written for as many windows as the file retains
+//! A limiter whose leases all expired as many windows ago as the file retains
 //! is dropped, so limit changes leave no trail in the file.
 //!
 //! Window ids come from each replica's own clock, so the budget of a window
@@ -310,18 +310,22 @@ impl PersistedRateControlState {
         limiter
     }
 
-    /// Drop every limiter but `keep` that no replica has written a lease
-    /// under since `cutoff_unix_ms`.
+    /// Drop every limiter but `keep` whose leases all expired before
+    /// `cutoff_unix_ms`.
     ///
     /// A replica prunes the windows of its own limiter only, so a limiter whose
     /// replicas have all stopped or changed their limit would otherwise stay in
     /// the file for good, and every replica would read it on every refresh.
-    /// Judged by the leases' write times rather than by window ids, so a
-    /// limiter written under a different window length is judged the same way.
-    /// A running replica writes a lease at least once per window.
+    ///
+    /// Judged by lease expiry, which the owning replica sets from its own
+    /// window length, rather than by window ids or write times. A running
+    /// replica always holds the pre-lease of its next window, which has not
+    /// expired, so its limiter is kept whatever its refresh interval — even
+    /// one far longer than this replica's, which may go most of a window
+    /// without writing.
     fn drop_retired_limiters(&mut self, keep: &str, cutoff_unix_ms: u64) {
         self.limiters
-            .retain(|key, limiter| key == keep || limiter.last_written_unix_ms() >= cutoff_unix_ms);
+            .retain(|key, limiter| key == keep || limiter.last_expiry_unix_ms() >= cutoff_unix_ms);
     }
 
     /// The other limiters of `own_key`'s quota: the same quota name, written
@@ -476,13 +480,13 @@ impl PersistedLimiter {
             .or_insert_with(|| PersistedWindow::new(burst_if_absent))
     }
 
-    /// When a replica last wrote a lease under this limiter, by that replica's
-    /// clock; `0` when none has.
-    fn last_written_unix_ms(&self) -> u64 {
+    /// When the last lease held under this limiter expires, by the clock of
+    /// the replica that wrote it; `0` when there is none.
+    fn last_expiry_unix_ms(&self) -> u64 {
         self.windows
             .values()
             .flat_map(|window| window.leases.values())
-            .map(|lease| lease.updated_at_unix_ms)
+            .map(|lease| lease.expires_at_unix_ms)
             .max()
             .unwrap_or(0)
     }
@@ -1687,7 +1691,7 @@ impl LeasedBucket {
             // flag would drop a whole window of upstream outcomes whenever
             // neither the current nor the pre-leased window changed.
             let mut tail_published = false;
-            // Limiters no replica writes any more go after the same horizon as
+            // Limiters whose leases all expired go after the same horizon as
             // the windows of a live one.
             state.drop_retired_limiters(
                 &self.config.limiter_key,
@@ -4199,40 +4203,55 @@ mod tests {
         assert_eq!(leasing, vec![98, 99, 100, 101, 102]);
     }
 
-    /// A limiter no replica has written for the retention horizon is dropped,
-    /// whatever its window ids; the replica's own limiter and every limiter
-    /// written since are kept.
+    /// A limiter whose leases all expired before the cutoff is dropped,
+    /// whatever its window ids or when they were written; the replica's own
+    /// limiter and every limiter holding a later lease are kept.
     #[test]
     fn retired_limiters_are_dropped_after_the_retention_horizon() {
-        let lease_written_at = |updated_at_unix_ms| PersistedLease {
+        let lease = |updated_at_unix_ms, expires_at_unix_ms| PersistedLease {
             granted: 1,
             consumed: 0,
             attempted: 0,
             ok: None,
             failed: None,
-            expires_at_unix_ms: updated_at_unix_ms,
+            expires_at_unix_ms,
             updated_at_unix_ms,
         };
         let mut state = PersistedRateControlState::fresh(Duration::from_secs(1));
-        for (key, window_id, written_at) in [
+        for (key, window_id, written_at, expires_at) in [
+            // Expires exactly at the cutoff.
             (
                 "requests_per_second:burst=10:replenish_ns=100000000",
                 100,
+                99_000,
                 100_000,
             ),
             (
                 "requests_per_second:burst=20:replenish_ns=50000000",
                 159,
+                158_000,
                 159_000,
             ),
+            // A window id far from this replica's: judged by time alone.
             (
                 "requests_per_second:burst=30:replenish_ns=33333333",
                 7,
+                159_500,
                 160_000,
             ),
+            // A slow replica written long before the cutoff, whose pre-lease
+            // runs well past it.
+            (
+                "requests_per_second:burst=50:replenish_ns=20000000",
+                2,
+                10_000,
+                240_000,
+            ),
+            // Expired a millisecond before the cutoff.
             (
                 "requests_per_minute:burst=60:replenish_ns=1000000000",
                 99,
+                99_999,
                 99_999,
             ),
         ] {
@@ -4240,7 +4259,7 @@ mod tests {
                 .limiter_entry(key, 1)
                 .window_entry(window_id, 1)
                 .leases
-                .insert("replica".to_string(), lease_written_at(written_at));
+                .insert("replica".to_string(), lease(written_at, expires_at));
         }
         state.limiter_entry("requests_per_second:burst=40:replenish_ns=25000000", 1);
 
@@ -4258,6 +4277,42 @@ mod tests {
                 "requests_per_second:burst=20:replenish_ns=50000000",
                 "requests_per_second:burst=30:replenish_ns=33333333",
                 "requests_per_second:burst=40:replenish_ns=25000000",
+                "requests_per_second:burst=50:replenish_ns=20000000",
+            ]
+        );
+    }
+
+    /// A replica with a far longer refresh interval than this one's may go
+    /// past this one's retention horizon without writing, but still holds an
+    /// unexpired pre-lease, so its limiter stays in the file.
+    #[tokio::test]
+    async fn a_slower_replicas_limiter_outlives_a_faster_ones_horizon() {
+        let fast_window = Duration::from_millis(20);
+        let horizon =
+            fast_window * u32::try_from(STALE_WINDOW_RETENTION).expect("retention fits in u32");
+        let store = Arc::new(InMemory::new());
+        let fast = per_second_bucket(&store, "fast", 10, fast_window);
+        let slow = per_second_bucket(&store, "slow", 20, Duration::from_secs(60));
+
+        refresh_with_demand(&slow).await;
+        let deadline = tokio::time::Instant::now() + horizon + fast_window * 10;
+        while tokio::time::Instant::now() < deadline {
+            refresh_with_demand(&fast).await;
+            tokio::time::sleep(fast_window).await;
+        }
+
+        let state = fast
+            .read_state()
+            .await
+            .expect("read the shared state")
+            .expect("the shared state exists");
+        let mut keys: Vec<String> = state.limiters.into_keys().collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "requests_per_second:burst=10:replenish_ns=100000000".to_string(),
+                "requests_per_second:burst=20:replenish_ns=50000000".to_string(),
             ]
         );
     }
