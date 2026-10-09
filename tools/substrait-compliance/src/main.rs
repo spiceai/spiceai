@@ -33,7 +33,7 @@ mod schema;
 mod suite;
 
 use std::num::NonZeroU32;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::ExitCode;
 use std::time::{Duration, Instant};
 
@@ -122,7 +122,8 @@ struct Args {
     #[arg(long)]
     out_csv: Option<PathBuf>,
 
-    /// Mode B: the `spiced` binary that serves the generated tables.
+    /// Mode B: the `spiced` binary that serves the generated tables: a path,
+    /// or a bare name such as `spiced` to find on `PATH`.
     #[arg(long)]
     spiced_path: Option<PathBuf>,
 
@@ -305,11 +306,10 @@ async fn run() -> Result<ExitCode> {
             else {
                 return error::ModeBNeedsGeneratedDataSnafu.fail();
             };
-            // `spiced` runs in a temporary directory of its own, so neither its
-            // binary nor the data directory its datasets read may be relative to
-            // this process's working directory.
-            let spiced_path = std::path::absolute(spiced_path)
-                .context(error::AbsolutePathSnafu { path: spiced_path })?;
+            // `spiced` runs in a temporary directory of its own, so neither a path
+            // to its binary nor the data directory its datasets read may be
+            // relative to this process's working directory.
+            let spiced_path = spiced_program(spiced_path)?;
             let options = mode_b::ServingOptions {
                 spiced_path,
                 acceleration: (args.acceleration_engine != "none").then(|| {
@@ -425,6 +425,18 @@ async fn run() -> Result<ExitCode> {
         println!("No case that passed in {} fails here", baseline.display());
     }
     Ok(ExitCode::SUCCESS)
+}
+
+/// The program Mode B starts `spiced` from. A bare name such as `spiced` is
+/// left for the `PATH` lookup a shell would do; any other path is made
+/// absolute, so the temporary directory `spiced` runs in cannot change which
+/// file it names.
+fn spiced_program(spiced_path: &Path) -> Result<PathBuf> {
+    let mut components = spiced_path.components();
+    if let (Some(Component::Normal(_)), None) = (components.next(), components.next()) {
+        return Ok(spiced_path.to_path_buf());
+    }
+    std::path::absolute(spiced_path).context(error::AbsolutePathSnafu { path: spiced_path })
 }
 
 /// Refuse a Mode A run that names a Mode B-only flag, which it would ignore.
@@ -550,6 +562,30 @@ mod tests {
                 !dir.is_dir(),
                 "{scale_factor}: {} must not exist; a directory check here would hide InvalidScaleFactor",
                 dir.display()
+            );
+        }
+    }
+
+    /// `--spiced-path spiced` names a program the OS finds on `PATH`, as a
+    /// shell would; a path with a directory in it is made absolute, since
+    /// `spiced` runs in a temporary directory of its own.
+    #[test]
+    fn a_bare_spiced_name_is_left_for_the_path_lookup() {
+        use std::path::{Path, PathBuf};
+        let cwd = std::env::current_dir().expect("working directory");
+        for (given, expected) in [
+            ("spiced", PathBuf::from("spiced")),
+            ("bin/spiced", cwd.join("bin/spiced")),
+            ("../spiced", cwd.join("../spiced")),
+            (
+                "/usr/local/bin/spiced",
+                PathBuf::from("/usr/local/bin/spiced"),
+            ),
+        ] {
+            assert_eq!(
+                super::spiced_program(Path::new(given)).expect(given),
+                expected,
+                "{given}"
             );
         }
     }
