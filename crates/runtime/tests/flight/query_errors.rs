@@ -24,6 +24,7 @@ use std::collections::HashMap;
 use arrow::array::RecordBatch;
 use arrow_flight::{FlightClient, Ticket, error::FlightError};
 use axum::{Router, http::StatusCode};
+use data_components::http::provider::Error::ErrorResponse;
 use futures::TryStreamExt;
 use spicepod::{component::dataset::Dataset, param::Params as DatasetParams};
 use tokio::net::TcpListener;
@@ -114,15 +115,16 @@ async fn an_http_origin_404_is_invalid_argument() -> Result<(), anyhow::Error> {
 
             let sql = "SELECT * FROM origin WHERE request_path = '/shows/404'";
             let status = failure_of(&mut client, sql).await;
-            let expected = format!(
-                "Failed to fetch http://{addr} for dataset 'origin': the origin answered 404, \
-                 so the request failed rather than becoming data."
-            );
-            assert_eq!(status.code(), Code::InvalidArgument, "{sql}: {status:?}");
-            assert!(
-                status.message().starts_with(&expected),
-                "{sql}: expected the message to start with {expected:?}, got {:?}",
-                status.message()
+            let expected = ErrorResponse {
+                status: 404,
+                endpoint: format!("http://{addr}"),
+                dataset: "dataset 'origin'".to_string(),
+            }
+            .to_string();
+            assert_eq!(
+                (status.code(), status.message()),
+                (Code::InvalidArgument, expected.as_str()),
+                "{sql}"
             );
 
             Ok(())
