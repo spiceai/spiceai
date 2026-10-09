@@ -6539,9 +6539,23 @@
             "type": "string",
             "description": "The source where the dataset is located (e.g., `postgres:syncs`)"
           },
+          "last_refresh": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "When the dataset's last successful refresh completed (RFC 3339), read from its\nacceleration's checkpoint at startup unless the dataset creates snapshots or\nwas restored from one. Those datasets report it once a refresh completes.\nOnly included when `status=true`, for an accelerated dataset with a known\nrefresh completion time."
+          },
           "name": {
             "type": "string",
             "description": "The name of the dataset"
+          },
+          "next_refresh": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "When the dataset's next scheduled refresh is due (RFC 3339). Interval schedules\ninclude jitter. Cron schedules initially report the next cron time, then the\njittered start time once the event fires, if jitter applies. A pending or\nunsuccessful refresh retains its due time even after that time passes.\nOnly included when `status=true`, for an accelerated dataset with a refresh\nschedule."
           },
           "properties": {
             "type": "object",

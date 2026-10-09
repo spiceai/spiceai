@@ -106,6 +106,7 @@ use util::timestamp_filter::is_day_granular;
 use util::{RetryError, retry};
 
 pub mod changes;
+#[cfg(test)]
 mod deletion;
 mod latest_by_time;
 
@@ -236,6 +237,8 @@ pub struct RefreshTaskBuilder {
     federated: Arc<FederatedTable>,
     federated_source: Option<String>,
     accelerator: Arc<dyn TableProvider>,
+    change_sink: Option<runtime_acceleration::change_sink::ChangeSink>,
+    cache_write_sender: Option<super::caching::CacheWriteSender>,
     disable_federation: bool,
     // Used to control how many parallel refreshes the runtime performs.
     semaphore: Option<Arc<Semaphore>>,
@@ -291,6 +294,8 @@ impl RefreshTaskBuilder {
             federated,
             federated_source,
             accelerator,
+            change_sink: None,
+            cache_write_sender: None,
             disable_federation: false,
             semaphore: None,
             metrics: None,
@@ -310,6 +315,24 @@ impl RefreshTaskBuilder {
                 std::collections::HashMap::new(),
             )),
         }
+    }
+
+    #[must_use]
+    pub fn with_change_sink(
+        mut self,
+        sink: Option<runtime_acceleration::change_sink::ChangeSink>,
+    ) -> Self {
+        self.change_sink = sink;
+        self
+    }
+
+    #[must_use]
+    pub fn with_cache_write_sender(
+        mut self,
+        sender: Option<super::caching::CacheWriteSender>,
+    ) -> Self {
+        self.cache_write_sender = sender;
+        self
     }
 
     /// Sets the `disable_federation` flag
@@ -493,7 +516,8 @@ impl RefreshTaskBuilder {
             is_s3_express_acceleration: self.is_s3_express_acceleration,
             engine_type_rewrites: self.engine_type_rewrites,
             snapshot_refresh_state: self.snapshot_refresh_state,
-            cdc_insert_plan_cache: Arc::new(Mutex::new(None)),
+            change_sink: tokio::sync::OnceCell::new_with(self.change_sink),
+            cache_write_sender: self.cache_write_sender,
             cdc_param_overrides: self.cdc_param_overrides,
             in_flight_revalidations: self.in_flight_revalidations,
             session_state,
@@ -578,8 +602,8 @@ pub struct RefreshTask {
     /// Per-dataset state required for `RefreshMode::Snapshot`. `None` for all
     /// other refresh modes.
     snapshot_refresh_state: Option<crate::accelerated::snapshots::SnapshotRefreshState>,
-    /// Cached generic CDC append plan. Cayenne's native CDC path bypasses this.
-    cdc_insert_plan_cache: Arc<Mutex<Option<changes::CdcInsertPlanCache>>>,
+    change_sink: tokio::sync::OnceCell<runtime_acceleration::change_sink::ChangeSink>,
+    cache_write_sender: Option<super::caching::CacheWriteSender>,
     /// Per-dataset `cdc_*` parameter overrides drawn from `dataset.acceleration.params`.
     pub(crate) cdc_param_overrides: Option<Arc<HashMap<String, String>>>,
     in_flight_revalidations: super::caching::InFlightRevalidations,
@@ -607,6 +631,29 @@ impl std::fmt::Debug for RefreshTask {
 }
 
 impl RefreshTask {
+    async fn change_sink(&self) -> &runtime_acceleration::change_sink::ChangeSink {
+        self.change_sink
+            .get_or_init(|| async {
+                use runtime_acceleration::change_sink::provider::ProviderChangeSinkBackend;
+                use runtime_acceleration::change_sink::{ChangeSink, ChangeSinkContext};
+
+                let mut context = ChangeSinkContext::new(
+                    self.dataset_name.clone(),
+                    Arc::clone(&self.accelerator),
+                );
+                context.write_lock = Arc::clone(&self.accelerator_write_mutex);
+                let federated = Arc::clone(&self.federated);
+                context.external_indexes = Arc::new(move || indexes_from_federated(&federated));
+                ChangeSink::new(
+                    Arc::new(ProviderChangeSinkBackend::new(context)),
+                    util::session_state::session_context(),
+                    &Handle::current(),
+                    changes::cdc_config().prefetch_buffer,
+                )
+            })
+            .await
+    }
+
     #[must_use]
     pub fn builder(
         runtime_status: Arc<status::RuntimeStatus>,
@@ -711,6 +758,12 @@ impl RefreshTask {
         &self,
         refresh: &Refresh,
     ) -> Result<RefreshOutcome, RetryError<super::Error>> {
+        // A refresh whose source has not been reached yet waits for it before it runs,
+        // and reports `Refreshing` only then: while the source cannot be reached, the
+        // dataset is served from its acceleration and reports `Error` with the cause.
+        // Immediate for a source already reached.
+        let _ = self.federated.try_wait_table_provider().await;
+
         self.set_refresh_status(
             refresh.display_sql().as_deref(),
             status::ComponentStatus::Refreshing,
@@ -1286,9 +1339,7 @@ impl RefreshTask {
                     // every append re-adds its whole overlap window.
                     Ok(data)
                         if refresh.versions_by_time.is_some()
-                            && self
-                                .version_ordering(refresh, &data.data.schema())
-                                .is_some() =>
+                            && self.version_ordering(refresh).is_some() =>
                     {
                         self.select_latest_by_time(refresh, data, timestamp).await
                     }
@@ -1313,18 +1364,12 @@ impl RefreshTask {
         }
     }
 
-    /// The primary key and time column a refresh reading `incoming` orders versions by,
-    /// or `None` when it keeps the last arrival instead.
-    fn version_ordering(
-        &self,
-        refresh: &Refresh,
-        incoming: &SchemaRef,
-    ) -> Option<(Vec<String>, String)> {
-        // Without a time column to read, versions keep the order they arrive in.
-        let time_column = refresh
-            .time_column
-            .clone()
-            .filter(|column| incoming.field_with_name(column).is_ok())?;
+    /// The primary key and time column a refresh orders versions by, or `None` when it
+    /// keeps the last arrival instead. Rows that lack the time column fail the refresh
+    /// where the versions are read (`latest_by_time`), naming the column, rather than
+    /// switching the dataset to the last arrival.
+    fn version_ordering(&self, refresh: &Refresh) -> Option<(Vec<String>, String)> {
+        let time_column = refresh.time_column.clone()?;
         let accelerator_schema = self.accelerator.schema();
         let key_columns = self
             .accelerator
@@ -1362,9 +1407,7 @@ impl RefreshTask {
                     .unwrap_or_else(|| error.to_string()),
             })
         };
-        let Some((key_columns, time_column)) =
-            self.version_ordering(refresh, &update.data.schema())
-        else {
+        let Some((key_columns, time_column)) = self.version_ordering(refresh) else {
             return Ok(update);
         };
         let accelerator_schema = self.accelerator.schema();
@@ -1375,16 +1418,14 @@ impl RefreshTask {
         // write holds: a write that replaces the table, or an append it loads into an
         // empty table (which it confirms itself, refusing the append otherwise). An
         // append with no high-water mark reads the whole source, so into an empty
-        // acceleration it is such a load; a retention filter keeps it off that path.
+        // acceleration it is such a load.
         if dedup.versions_resolved_after_write
             && window_start.is_none()
             && self.sink.read().await.synchronized_tables().is_empty()
             && match update.update_type {
                 UpdateType::Overwrite => true,
                 UpdateType::Append => {
-                    dedup.appends_resolved_after_write
-                        && refresh.write_retention_sql_delete_expr.is_none()
-                        && self.acceleration_is_empty().await?
+                    dedup.appends_resolved_after_write && self.acceleration_is_empty().await?
                 }
                 UpdateType::Changes => false,
             }
@@ -1511,6 +1552,13 @@ impl RefreshTask {
 
         // Use the CacheRefreshHelper to identify and refresh all stale rows
         let federated_provider = self.federated.table_provider().await;
+        let cache_write_sender = self.cache_write_sender.clone().ok_or_else(|| {
+            RetryError::permanent(super::Error::FailedToRefreshDataset {
+                source: datafusion::error::DataFusionError::Internal(
+                    "Caching refresh requires a bound table-generation writer".into(),
+                ),
+            })
+        })?;
         let refreshed_count = CacheRefreshHelper::refresh_all_stale_rows(
             federated_provider,
             Arc::clone(&self.accelerator),
@@ -1519,6 +1567,7 @@ impl RefreshTask {
             ttl,
             Arc::clone(&self.accelerator_write_mutex),
             Arc::clone(&self.in_flight_revalidations),
+            cache_write_sender,
         )
         .await
         .map_err(|e| RetryError::permanent(super::Error::FailedToRefreshDataset { source: e }))?;

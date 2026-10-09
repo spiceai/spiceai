@@ -593,10 +593,14 @@ fn resolve_primary_keys(
         )));
     }
 
-    if !matches!(
-        acceleration.on_conflict.get(primary_key),
-        Some(OnConflictBehavior::Upsert(_))
-    ) {
+    // Cayenne keeps one row per primary key on its own; the other upsert
+    // engines replace a row only through an `on_conflict` upsert keyed on it.
+    if !matches!(engine, Engine::Cayenne)
+        && !matches!(
+            acceleration.on_conflict.get(primary_key),
+            Some(OnConflictBehavior::Upsert(_))
+        )
+    {
         return Err(data_components::cdc::StreamError::External(format!(
             "mongodb change streams for dataset `{dataset_name}` require `acceleration.on_conflict` keyed on `primary_key` with `upsert` behavior so UPDATE events replace existing rows. Add: `on_conflict: {{ _id: upsert }}`."
         )));
@@ -878,6 +882,22 @@ mod tests {
         let error = resolve_primary_keys(&dataset_name, Some(&acceleration), &schema())
             .expect_err("missing upsert should fail");
         assert!(error.to_string().contains("on_conflict"));
+    }
+
+    #[test]
+    fn accepts_cayenne_primary_key_without_upsert() {
+        let acceleration = Acceleration {
+            enabled: true,
+            engine: Engine::Cayenne,
+            refresh_mode: Some(RefreshMode::Changes),
+            primary_key: Some(ColumnReference::new(vec!["_id".to_string()])),
+            ..Default::default()
+        };
+
+        let dataset_name = datafusion::common::TableReference::bare("users");
+        let keys = resolve_primary_keys(&dataset_name, Some(&acceleration), &schema())
+            .expect("Cayenne keeps one row per primary key without on_conflict");
+        assert_eq!(keys, vec!["_id".to_string()]);
     }
 
     #[test]

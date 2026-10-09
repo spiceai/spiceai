@@ -3353,15 +3353,11 @@ impl DataAccelerator for CayenneAccelerator {
         acceleration: &spicepod::acceleration::Acceleration,
         unset_refresh_mode: runtime_acceleration::acceleration::RefreshMode,
     ) -> Option<data_accelerator_api::SpicepodWriteProfile> {
-        // The contract is `None` unless the acceleration names this engine. The runtime
+        // The contract is `None` unless the acceleration uses this engine. The runtime
         // enumerates Cayenne accelerations before asking, so this is the implementation
         // holding up its own end: another consumer would otherwise get a confident
         // Cayenne classification for a DuckDB or Arrow acceleration.
-        if !acceleration
-            .engine
-            .as_deref()
-            .is_some_and(|engine| engine.eq_ignore_ascii_case("cayenne"))
-        {
+        if !acceleration.engine_name().eq_ignore_ascii_case("cayenne") {
             return None;
         }
 
@@ -3524,15 +3520,12 @@ impl DataAccelerator for CayenneAccelerator {
         }
     }
 
-    async fn init(
+    async fn validate_init(
         &self,
         source: &dyn AccelerationSource,
-    ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if !source.is_file_accelerated() {
-            // Memory mode (`mode: memory`) is fully in-RAM and ephemeral — there is
-            // nothing to bootstrap on disk; the dataset reloads from its federated
-            // source on startup, like the in-memory Arrow accelerator.
-            return Ok(BootstrapStatus::none());
+            return Ok(());
         }
 
         if let Some(acceleration) = source.acceleration() {
@@ -3573,7 +3566,18 @@ impl DataAccelerator for CayenneAccelerator {
         {
             Self::ensure_no_catalog_under_data_dir(source, &dir_path).await?;
         }
+        Ok(())
+    }
 
+    async fn init(
+        &self,
+        source: &dyn AccelerationSource,
+    ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
+        self.validate_init(source).await?;
+        if !source.is_file_accelerated() {
+            return Ok(BootstrapStatus::none());
+        }
+        let dir_path = self.file_path(source)?;
         let is_s3_express = s3::is_s3_express_data_path(source);
 
         // Handle S3 Express One Zone configuration
@@ -5331,9 +5335,14 @@ mod tests {
                 .is_some(),
             "the engine name is matched the way the runtime matches it: case-insensitively"
         );
+        assert!(
+            accelerator
+                .spicepod_write_profile(&named(None), RefreshMode::Full)
+                .is_some(),
+            "an acceleration that names no engine uses Cayenne, the default engine"
+        );
 
-        // `None` is the default Arrow engine, not an unspecified Cayenne one.
-        for other in [Some("duckdb"), Some("arrow"), Some("sqlite"), None] {
+        for other in [Some("duckdb"), Some("arrow"), Some("sqlite")] {
             assert!(
                 accelerator
                     .spicepod_write_profile(&named(other), RefreshMode::Full)
