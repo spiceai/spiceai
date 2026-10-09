@@ -2,8 +2,9 @@
 
 source [file join [file dirname [info script]] repl_helpers.exp]
 
-# Runtime response timeout
-set timeout 30
+# How long the runtime may go silent before the script calls it stalled. This is
+# not a bound on how long a response may take — see repl_idle_timeout.
+set timeout [repl_idle_timeout]
 
 spawn spice chat {*}[repl_endpoint_args]
 
@@ -38,12 +39,18 @@ proc verify_datasets_access {} {
         "chat> " {
             # end of model response
         }
+        -re {[^\n]*\n} {
+            # Still streaming — restart the wait. Whole lines only, for the
+            # reason given in repl_helpers.exp. The dataset patterns above are
+            # tried first, so a name anywhere in the buffer still wins over
+            # this branch.
+            exp_continue
+        }
         eof {
             repl_died "Waiting for the list of datasets"
         }
         timeout {
-            send_user "Timeout waiting for expected response\n"
-            exit 1
+            repl_stalled "Waiting for the list of datasets"
         }
     }
 
@@ -70,12 +77,15 @@ proc verify_num_issues {} {
         "chat> " {
             # end of model response
         }
+        -re {[^\n]*\n} {
+            # Still streaming — restart the wait. See verify_datasets_access.
+            exp_continue
+        }
         eof {
             repl_died "Waiting for the issue count"
         }
         timeout {
-            send_user "Timeout waiting for expected response\n"
-            exit 1
+            repl_stalled "Waiting for the issue count"
         }
     }
 
@@ -83,11 +93,6 @@ proc verify_num_issues {} {
 }
 
 proc verify_catalog_page {} {
-    global timeout
-
-    set original_timeout $timeout
-    set timeout 60
-
     repl_send "find top 3 exclusive deals in catalog pages. Respond with a short bullet list.\r"
 
     expect {
@@ -100,16 +105,17 @@ proc verify_catalog_page {} {
         "chat> " {
             # end of model response
         }
+        -re {[^\n]*\n} {
+            # Still streaming — restart the wait. See verify_datasets_access.
+            exp_continue
+        }
         eof {
             repl_died "Waiting for the catalog page deals"
         }
         timeout {
-            send_user "Timeout waiting for expected response\n"
-            exit 1
+            repl_stalled "Waiting for the catalog page deals"
         }
     }
-
-    set timeout $original_timeout
 
     send_user "Model returned expected response\n"
 }
@@ -118,12 +124,15 @@ expect {
     "chat>" {
         # runtime is ready for input
     }
+    -re {[^\n]*\n} {
+        # Banner and connection lines the CLI prints on its way to the prompt.
+        exp_continue
+    }
     eof {
         repl_died "Waiting for the initial chat prompt"
     }
     timeout {
-        send_user "Timeout waiting for initial chat prompt\n"
-        exit 1
+        repl_stalled "Waiting for the initial chat prompt"
     }
 }
 

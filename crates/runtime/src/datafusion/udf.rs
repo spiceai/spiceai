@@ -1164,8 +1164,10 @@ mod tests {
                 !support.supports(&make_named_expr(json_name.as_str()), None),
                 "{json_name} must stay denied for {backend}"
             );
+            // `upper` is a SQLite extra (ASCII-only case folding). `abs` is
+            // still a function both backends evaluate the same way.
             assert!(
-                support.supports(&make_named_expr("upper"), None),
+                support.supports(&make_named_expr("abs"), None),
                 "an ordinary function must still federate to {backend}"
             );
         }

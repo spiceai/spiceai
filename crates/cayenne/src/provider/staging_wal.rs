@@ -399,6 +399,7 @@ impl CayenneStagedAppend {
             deferred_manifest: None,
             validated_file_keys: None,
             append_sequence: None,
+            overlay: false,
         })
     }
 
@@ -452,6 +453,10 @@ pub struct PreparedStagedAppend {
     deferred_manifest: Option<Vec<SnapshotFile>>,
     validated_file_keys: Option<super::pk_index::PkDigestSet>,
     append_sequence: Option<i64>,
+    /// The target holds only this append's rows and publishes as a protected
+    /// snapshot over the unchanged current snapshot, rather than replacing the
+    /// current snapshot. See [`CayenneTableProvider::begin_deferred_snapshot_append`].
+    overlay: bool,
 }
 
 /// Object-store handle, table-level WAL prefix, and canonical backend identity.
@@ -475,6 +480,7 @@ impl std::fmt::Debug for PreparedStagedAppend {
                 &self.validated_file_keys.is_some(),
             )
             .field("append_sequence", &self.append_sequence)
+            .field("overlay", &self.overlay)
             .finish()
     }
 }
@@ -612,6 +618,14 @@ impl PreparedStagedAppend {
         self.deferred_manifest.as_deref()
     }
 
+    /// Whether this deferred append publishes its target as a protected snapshot
+    /// over the partition's unchanged current snapshot. Its commit is the
+    /// target's snapshot-sequence record, not a current-snapshot pointer.
+    #[must_use]
+    pub fn publishes_overlay(&self) -> bool {
+        self.overlay
+    }
+
     /// Build and validate the target snapshot's exact durable manifest.
     ///
     /// # Errors
@@ -619,6 +633,12 @@ impl PreparedStagedAppend {
     /// Returns an error if source or target files cannot be listed, metadata
     /// cannot be loaded, or the target manifest is inconsistent.
     pub async fn prepare_deferred_manifest(&mut self) -> Result<()> {
+        if self.overlay {
+            // A protected snapshot records no manifest, as the single-table write's
+            // does not: its files are listed from its own directory.
+            self.deferred_manifest = None;
+            return Ok(());
+        }
         let source_snapshot_id =
             self.source_snapshot_id
                 .as_ref()
@@ -727,11 +747,15 @@ impl PreparedStagedAppend {
     }
 
     /// Publish prepared on-conflict state while the caller holds the listing fence.
+    /// For an overlay this is what makes its rows visible.
     pub fn publish_on_conflict_under_held_fence(
         &self,
         prepared: PreparedOnConflictDeletionPublish,
     ) {
         self.table.publish_prepared_on_conflict_deletions(prepared);
+        if self.overlay {
+            self.table.invalidate_statistics_after_overlay_publish();
+        }
     }
 
     async fn lock_current_snapshot_for_apply(&self) -> Option<OwnedMutexGuard<()>> {
@@ -913,6 +937,12 @@ impl PreparedStagedAppend {
                     .to_string(),
             });
         }
+        if self.overlay {
+            return Err(Error::Internal {
+                table: self.table.table_name().to_string(),
+                message: "An overlay append never replaces the current snapshot".to_string(),
+            });
+        }
         self.table
             .prepare_append_snapshot_publish(&self.target_snapshot_id)
     }
@@ -953,10 +983,27 @@ impl PreparedStagedAppend {
     /// Run best-effort maintenance after the deferred snapshot is visible.
     pub fn finish_deferred_snapshot_maintenance(&self) {
         self.table.finish_deferred_append_snapshot();
-        if let Some(source_snapshot_id) = &self.source_snapshot_id {
+        // An overlay leaves the current snapshot in place, so its source is still
+        // the snapshot every read starts from.
+        if !self.overlay
+            && let Some(source_snapshot_id) = &self.source_snapshot_id
+        {
             self.table
                 .retire_snapshot_dirs(std::iter::once(source_snapshot_id.as_str()));
         }
+    }
+
+    /// Make a committed overlay visible after the shared catalog transaction
+    /// reported an ambiguous outcome: reload the partition's deletions and
+    /// protected snapshots from the catalog, leaving its current snapshot as it
+    /// is. Call after [`Self::recover_committed_snapshot`] has moved the staged
+    /// files into the target.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the catalog state cannot be loaded.
+    pub async fn publish_recovered_overlay(&self) -> Result<()> {
+        self.table.publish_recovered_protected_snapshots().await
     }
 
     /// Returns this partition's absolute staging-WAL path, used by the
@@ -1236,9 +1283,21 @@ impl CayenneTableProvider {
         ))
     }
 
-    /// Begin a staged append into a fresh snapshot cloned from the current
-    /// snapshot. The new snapshot remains invisible until its catalog pointer is
-    /// committed and [`PreparedStagedAppend::publish_deferred_snapshot`] runs.
+    /// Begin a staged append whose visibility a cross-partition commit decides.
+    ///
+    /// A table with a primary key supersedes a stored key by tombstoning it, so
+    /// an append that supersedes keys, or lands among tombstones, is staged into
+    /// a protected snapshot holding only its rows, the layout the single-table
+    /// write gives an upsert: the stored copies it supersedes stay in the current
+    /// snapshot behind their tombstones, and the shared catalog transaction
+    /// commits the snapshot by recording its sequence. A key-level tombstone could
+    /// not tell a stored copy from its replacement if both sat in one snapshot.
+    ///
+    /// Any other append stages into a fresh snapshot cloned from the current one,
+    /// which the shared transaction commits by pointing the table at it.
+    ///
+    /// Either target stays invisible until the transaction commits and the
+    /// coordinator publishes it.
     ///
     /// # Errors
     ///
@@ -1297,11 +1356,6 @@ impl CayenneTableProvider {
         let write_guard = self.write_lock_arc().lock_owned().await;
         self.ensure_no_incomplete_write().await?;
 
-        // The private target currently clones only immutable snapshot data.
-        // Pending deletion vectors, inline rows/deletes, and protected snapshot
-        // state are separate visibility inputs and cannot be dropped from a
-        // cross-partition append. Refuse before cloning or consuming input until
-        // those states are included in the coordinated transaction.
         let current_snapshot_id = self.get_current_snapshot_id();
         let (_, target_snapshot_id) = Self::new_staging_snapshot_id_pair();
         let mut setup_cleanup = DeferredSetupCleanup {
@@ -1309,8 +1363,6 @@ impl CayenneTableProvider {
             snapshots: vec![target_snapshot_id.clone()],
             armed: true,
         };
-        self.clone_snapshot_files(&current_snapshot_id, &target_snapshot_id)
-            .await?;
 
         let staging_snapshot_id = Self::new_staging_snapshot_id();
         setup_cleanup.snapshots.push(staging_snapshot_id.clone());
@@ -1341,6 +1393,24 @@ impl CayenneTableProvider {
             }
         };
         let may_have_on_conflict_deletions = prepared_insert.may_have_on_conflict_deletions();
+        // An append that supersedes stored keys, or lands on a table already
+        // holding tombstones, publishes on-conflict state: tombstones and
+        // re-insert records keyed by primary key, plus the target's sequence.
+        // With a primary key, that state separates the two copies of a key only
+        // across snapshots, so the target is an overlay. A table without one
+        // hides a deleted row by its position in a file (`is_position_based`),
+        // which the clone keeps.
+        let publishes_on_conflict = may_have_on_conflict_deletions || self.has_pending_deletions();
+        let overlay = publishes_on_conflict && !self.is_position_based();
+        if !overlay
+            && let Err(error) = self
+                .clone_snapshot_files(&current_snapshot_id, &target_snapshot_id)
+                .await
+        {
+            self.clear_staging_snapshot_dir(&staging_snapshot_id)
+                .await?;
+            return Err(error);
+        }
         let post_validation = prepared_insert.post_validation();
         let staged = match &resolution {
             None => {
@@ -1375,8 +1445,7 @@ impl CayenneTableProvider {
             on_conflict_deletions,
             validated_keys,
         } = post_validation.lock().take().unwrap_or_default();
-        let prepared_on_conflict = if may_have_on_conflict_deletions || self.has_pending_deletions()
-        {
+        let prepared_on_conflict = if publishes_on_conflict {
             match self
                 .prepare_on_conflict_deletions_for_staged_snapshot(
                     on_conflict_deletions,
@@ -1385,7 +1454,12 @@ impl CayenneTableProvider {
                 )
                 .await
             {
-                Ok(prepared) => Some(prepared),
+                Ok(mut prepared) => {
+                    // Deferring the catalog commit also suppresses the in-memory
+                    // protected-snapshot promotion, which an overlay needs.
+                    prepared.publish_as_protected_snapshot = overlay;
+                    Some(prepared)
+                }
                 Err(error) => {
                     let _ = self.clear_staging_snapshot_dir(&staging_snapshot_id).await;
                     let _ = self.clear_snapshot_dir(&target_snapshot_id).await;
@@ -1415,6 +1489,7 @@ impl CayenneTableProvider {
         }
         prepared.set_validated_file_keys(validated_keys);
         prepared.append_sequence = append_sequence;
+        prepared.overlay = overlay;
         setup_cleanup.armed = false;
         Ok(prepared)
     }
@@ -1938,10 +2013,14 @@ impl CayenneTableProvider {
                 //     protected-snapshot WAL). Rolling it back deletes durably
                 //     committed rows — including rows the upsert did NOT supersede.
                 //   * A cross-partition deferred append DEFERS its sequence write
-                //     into the coordinator transaction that also flips every
-                //     partition's pointer, so a crash before that COMMIT leaves no
-                //     durable sequence and the pointer unmoved — genuinely
-                //     uncommitted, and correctly rolled back.
+                //     into the coordinator transaction that commits every
+                //     participating partition — flipping the pointer of a partition
+                //     whose target replaces its current snapshot, and recording
+                //     the sequence that publishes an overlay — so a crash before
+                //     that COMMIT leaves no durable sequence and the pointer
+                //     unmoved: genuinely uncommitted, and correctly rolled back. A
+                //     committed overlay is rolled forward like the single-table
+                //     upsert above, which it shares its layout with.
                 //
                 // Durable sequence present => roll FORWARD by falling through to the
                 // move + WAL-removal below. The pointer is deliberately NOT advanced:
