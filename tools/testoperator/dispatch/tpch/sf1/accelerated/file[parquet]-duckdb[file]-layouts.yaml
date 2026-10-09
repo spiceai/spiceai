@@ -1,0 +1,19 @@
+# file[parquet]-duckdb[file].yaml under acceleration layouts (see
+# file[parquet]-cayenne[file]-layouts.yaml). DuckDB has no clustering or
+# partitioning; `primary_key,sort` is kept because DuckDB's on-refresh sort
+# rewrites the table, constraints included.
+schedule: weekly
+tests:
+  bench:
+    spicepod_path: accelerated/file[parquet]-duckdb[file].yaml
+    ready_wait: 300
+    query_set: tpch
+    runner_type: spiceai-dev-runners
+    validate_results: true
+    layouts:
+      - primary_key
+      - indexes
+      - sort
+      - primary_key,indexes
+      - primary_key,sort
+      - primary_key,indexes,sort,time_column

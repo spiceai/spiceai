@@ -1,5 +1,5 @@
 name: htap benchmark tests
-run-name: CH-BenCHmark - ${{ github.event.inputs.spicepod_path }} - SF${{ github.event.inputs.scale_factor }} - ${{ github.event.inputs.duration }}s${{ github.event.inputs.source_version != '' && format(' - source {0}', github.event.inputs.source_version) || '' }}
+run-name: CH-BenCHmark - ${{ github.event.inputs.spicepod_path }} - SF${{ github.event.inputs.scale_factor }} - ${{ github.event.inputs.duration }}s${{ github.event.inputs.source_version != '' && format(' - source {0}', github.event.inputs.source_version) || '' }}${{ github.event.inputs.layout != '' && format(' - layout {0}', github.event.inputs.layout) || '' }}
 
 on:
   workflow_dispatch:
@@ -74,6 +74,11 @@ on:
         type: string
       source_version:
         description: 'Source database release line, one of its versions in test/source_versions.json; empty = PostgreSQL 16 or MySQL 8.4. Only for runners that start the source in Docker: the in-cluster sources on spiceai-dev-xlarge-runners have fixed versions.'
+        required: false
+        default: ''
+        type: string
+      layout:
+        description: 'Acceleration layout to configure on every accelerated dataset (testoperator --layout): features from indexes, sort, cluster, time_column, partition, joined by commas; empty = the spicepod as written'
         required: false
         default: ''
         type: string
@@ -397,6 +402,7 @@ jobs:
             ${{ steps.set_spicepod_path.outputs.SOURCE_TYPE == 'mysql' && '--analytic-gate-concurrency 16' || '' }} \
             --disable-progress-bars \
             --metrics \
+            ${LAYOUT:+--layout "$LAYOUT"} \
             --metrics-dump "${GITHUB_WORKSPACE}/htap-metrics.json" \
             --summary-out "${GITHUB_WORKSPACE}/htap-summary.md" 2>&1 | tee "${GITHUB_WORKSPACE}/htap-run.log"
           # ${PIPESTATUS[0]} is testoperator's real exit (not tee's), so a failed
@@ -411,6 +417,7 @@ jobs:
           [ -n "$DIAG_PIDS" ] && kill $DIAG_PIDS 2>/dev/null || true
           exit $testop_exit
         env:
+          LAYOUT: ${{ github.event.inputs.layout }}
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           # Dedicated in-cluster PG pod on xlarge; per-run docker container (loopback) elsewhere.

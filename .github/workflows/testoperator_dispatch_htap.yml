@@ -19,6 +19,9 @@ on:
     # configs on every source release line in test/source_versions.json (7 runs), on the
     # same large runners as htap-sf1, which start the source in Docker at a chosen version.
     - cron: '0 2 * * 0'
+    # htap-sf1-layouts, weekly (Sunday 0300) — the SF1 configs under acceleration layouts
+    # (dispatch/chbench/sf1-layouts, 10 runs), on the same large runners as htap-sf1.
+    - cron: '0 3 * * 0'
 
   workflow_dispatch:
     inputs:
@@ -37,6 +40,7 @@ on:
           - 'sf1000'
           - 'sf1000-adaptive'
           - 'sf1-source-versions'
+          - 'sf1-layouts'
 
 jobs:
   dispatch-htap:
@@ -115,6 +119,7 @@ jobs:
               '0 4 * * *')                    SF=sf1000 ;;
               '0 6,18 * * *')                 SF=sf1 ;;
               '0 2 * * 0')                    SF=sf1-source-versions ;;
+              '0 3 * * 0')                    SF=sf1-layouts ;;
               *)                              SF= ;;   # unrecognized cron — dispatch nothing
             esac
           fi

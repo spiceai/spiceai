@@ -24,6 +24,7 @@ use crate::args::{CommonArgs, DatasetTestArgs};
 use test_framework::{
     anyhow,
     app::{App, AppBuilder},
+    layout::{Layout, apply_layout, benchmark_tables},
     opentelemetry_sdk::Resource,
     queries::{Query, QuerySet},
     spiced::{SpicedInstance, StartRequest},
@@ -460,11 +461,60 @@ pub(crate) async fn get_app_and_start_request(
 pub(crate) async fn get_dataset_app_and_start_request(
     args: &DatasetTestArgs,
 ) -> anyhow::Result<(App, StartRequest)> {
-    let mut app = load_app(&args.common).await?;
-    add_automatic_reference_datasets(args, &mut app).await?;
+    let app = prepare_dataset_app(args).await?;
     let start_request = start_request_from_app(&args.common, app.clone())?;
 
     Ok((app, start_request))
+}
+
+/// The app and start request an HTAP run starts `spiced` with: the spicepod
+/// under its `--layout`. HTAP checks Spice's answers against the source
+/// database itself, so it adds no reference datasets.
+pub(crate) async fn get_htap_app_and_start_request(
+    args: &DatasetTestArgs,
+) -> anyhow::Result<(App, StartRequest)> {
+    ensure_layout_applies(args)?;
+    let mut app = load_app(&args.common).await?;
+    apply_layout_option(args, &mut app)?;
+    let start_request = start_request_from_app(&args.common, app.clone())?;
+    Ok((app, start_request))
+}
+
+/// The app a dataset test starts `spiced` with: the spicepod, the
+/// `__test_reference.*` clones `--validate` needs, and the `--layout`.
+pub(crate) async fn prepare_dataset_app(args: &DatasetTestArgs) -> anyhow::Result<App> {
+    let mut app = load_app(&args.common).await?;
+    add_automatic_reference_datasets(args, &mut app).await?;
+    apply_layout_option(args, &mut app)?;
+    Ok(app)
+}
+
+/// Configure `--layout` on the app's accelerated datasets. The reference clones
+/// added before it carry no acceleration, so the layout never reaches them.
+fn apply_layout_option(args: &DatasetTestArgs, app: &mut App) -> anyhow::Result<()> {
+    let Some(layout) = &args.layout else {
+        return Ok(());
+    };
+    let query_set = args.load_query_set()?;
+    let tables = benchmark_tables(&query_set).ok_or_else(|| {
+        anyhow::anyhow!(
+            "--layout needs a benchmark query set with layout keys (tpch, tpch[parameterized], tpcds, clickbench or chbench), not {query_set:?}"
+        )
+    })?;
+    let applied = apply_layout(&mut app.datasets, tables, layout)?;
+    // A layout run is a different test of the same spicepod: its own name keeps
+    // its timings and plans out of the default layout's metric series and
+    // snapshots.
+    app.name = layout_test_name(&app.name, layout);
+    println!(
+        "Configured layout '{layout}' on {} accelerated datasets of '{}':",
+        applied.len(),
+        app.name
+    );
+    for dataset in &applied {
+        println!("  {dataset}");
+    }
+    Ok(())
 }
 
 fn start_request_from_app(args: &CommonArgs, app: App) -> anyhow::Result<StartRequest> {
@@ -622,6 +672,24 @@ pub(crate) fn ensure_shared_client_connections(
         "'{command}' does not support connection-topology flags \
          (--client-connections per-client, or --clients/--connections-per-client/\
          --queries-per-client); they apply to 'run throughput' and 'run load'"
+    );
+    Ok(())
+}
+
+/// The test name of `name`'s spicepod run under `layout`, following the spicepod
+/// naming convention's test-variant suffix.
+fn layout_test_name(name: &str, layout: &Layout) -> String {
+    format!("{name}-layout[{layout}]")
+}
+
+/// `--layout` rewrites the spicepod testoperator starts `spiced` with, so it
+/// cannot reach an instance testoperator does not start; refuse it there rather
+/// than report results for a layout that was never configured.
+pub(crate) fn ensure_layout_applies(args: &DatasetTestArgs) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        args.layout.is_none()
+            || !(args.common.is_system_adapter() || args.common.is_external_instance()),
+        "--layout configures the spicepod testoperator starts spiced with, so it cannot apply to an external spiced instance or a system adapter; drop --layout, or let testoperator start spiced"
     );
     Ok(())
 }
@@ -1056,15 +1124,18 @@ mod tests {
         assert!(runs > 0, "should find CH-benCH HTAP dispatches");
     }
 
-    /// Every scale factor 1 TPC-H, TPC-DS and `ClickBench` benchmark dispatch
-    /// validates its results against an oracle it can actually resolve, except
-    /// those in `BENCH_DISPATCHES_THAT_SKIP_RESULT_VALIDATION`. Benchmarks at
-    /// larger scale factors measure performance and leave `validate_results` unset.
+    /// Every scale factor 1 TPC-H, TPC-DS, `ClickBench` and CH-benCH benchmark
+    /// dispatch validates its results against an oracle it can actually resolve,
+    /// except those in `BENCH_DISPATCHES_THAT_SKIP_RESULT_VALIDATION`. Benchmarks
+    /// at larger scale factors measure performance and leave `validate_results`
+    /// unset.
     ///
     /// Each `bench` entry is resolved the way `testoperator_run_bench.yml` runs
-    /// it — the inputs `testoperator dispatch` sends, the spicepod under
-    /// `test/spicepods/<query set>/sf<scale factor>/`, `spiced` started by
-    /// testoperator — through the same calls a run makes before its first query.
+    /// it — the inputs `testoperator dispatch` sends (one run per layout and
+    /// `PostgreSQL` line it expands to), the spicepod under
+    /// `test/spicepods/<query set>/sf<scale factor>/` (`test/spicepods/chbench/`
+    /// for CH-benCH), `spiced` started by testoperator — through the same calls a
+    /// run makes before its first query, layout included.
     /// `--validate` stops a run that has no oracle, so a dispatch that could not
     /// be validated fails here instead of in the scheduled run.
     #[tokio::test]
@@ -1074,7 +1145,7 @@ mod tests {
         let dispatch_root = repo_root.join("tools/testoperator/dispatch");
         let mut checked = 0;
         let mut seen_opt_outs = BTreeSet::new();
-        for query_set_directory in ["tpch", "tpcds", "clickbench"] {
+        for query_set_directory in ["tpch", "tpcds", "clickbench", "chbench"] {
             let dispatch_directory = dispatch_root.join(query_set_directory);
             for dispatch_path in scan_directory_for_yamls(&dispatch_directory)
                 .expect("should scan the dispatch directory")
@@ -1102,12 +1173,14 @@ mod tests {
                     continue;
                 }
                 for throughput in &dispatch.tests.throughput {
-                    assert_eq!(
-                        throughput.postgres_version,
-                        None,
-                        "{} sets `postgres_version` on a throughput test; only the bench workflow takes it",
-                        dispatch_path.display()
-                    );
+                    throughput
+                        .ensure_only_bench_settings_unset("throughput")
+                        .unwrap_or_else(|e| panic!("{}: {e}", dispatch_path.display()));
+                }
+                for load in &dispatch.tests.load {
+                    load.bench_args
+                        .ensure_only_bench_settings_unset("load")
+                        .unwrap_or_else(|e| panic!("{}: {e}", dispatch_path.display()));
                 }
                 let runs = dispatch
                     .tests
@@ -1115,7 +1188,7 @@ mod tests {
                     .iter()
                     .flat_map(|bench| {
                         bench
-                            .expand_source_versions()
+                            .expand_runs()
                             .unwrap_or_else(|e| panic!("{}: {e}", dispatch_path.display()))
                     })
                     .collect::<Vec<_>>();
@@ -1153,11 +1226,19 @@ mod tests {
                             "{dispatch_name} sets `postgres_version`, but testoperator_run_bench.yml starts its local postgres_tpch service only for a `postgres` spicepod (not DuckLake) on TPC-H or TPC-DS at scale factor 1 or 10, or for ClickBench's s3[parquet]-postgres, so the version would not apply"
                         );
                     }
-                    let spicepod_path = repo_root
-                        .join("test/spicepods")
-                        .join(query_set.split('[').next().unwrap_or(query_set))
-                        .join(format!("sf{scale_factor}"))
-                        .join(&bench.spicepod_path);
+                    // testoperator_run_bench.yml's path: CH-benCH spicepods carry no
+                    // scale-factor directory, since the scale factor sets the source.
+                    let spicepod_path = if query_set == "chbench" {
+                        repo_root
+                            .join("test/spicepods/chbench")
+                            .join(&bench.spicepod_path)
+                    } else {
+                        repo_root
+                            .join("test/spicepods")
+                            .join(query_set.split('[').next().unwrap_or(query_set))
+                            .join(format!("sf{scale_factor}"))
+                            .join(&bench.spicepod_path)
+                    };
                     let spicepod_path = spicepod_path.to_string_lossy();
 
                     let mut command_line = vec![
@@ -1173,18 +1254,16 @@ mod tests {
                     if let Some(query_overrides) = inputs["query_overrides"].as_str() {
                         command_line.extend(["--query-overrides", query_overrides]);
                     }
+                    if let Some(layout) = inputs["layout"].as_str() {
+                        command_line.extend(["--layout", layout]);
+                    }
                     let args = DatasetTestArgs::try_parse_from(command_line).unwrap_or_else(|e| {
                         panic!("{dispatch_name} should translate to testoperator arguments: {e}")
                     });
 
-                    let mut app = load_app(&args.common).await.unwrap_or_else(|e| {
-                        panic!("{dispatch_name} should load its spicepod: {e}")
+                    let app = prepare_dataset_app(&args).await.unwrap_or_else(|e| {
+                        panic!("{dispatch_name} should load its spicepod, add its reference datasets and configure its layout: {e:#}")
                     });
-                    add_automatic_reference_datasets(&args, &mut app)
-                        .await
-                        .unwrap_or_else(|e| {
-                            panic!("{dispatch_name} should add its reference datasets: {e}")
-                        });
                     if let Err(e) = build_test_with_validation(&args, &app, NotStarted::new()).await
                     {
                         panic!("{dispatch_name} cannot validate its results: {e}");

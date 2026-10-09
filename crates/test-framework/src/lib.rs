@@ -25,6 +25,7 @@ pub mod execution;
 pub mod flight;
 pub mod gh_utils;
 pub mod git;
+pub mod layout;
 pub mod metrics;
 pub mod object_store;
 pub mod pki;

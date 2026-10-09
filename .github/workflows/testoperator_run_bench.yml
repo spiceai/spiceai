@@ -1,5 +1,5 @@
 name: benchmark e2e tests
-run-name: bench - ${{ github.event.inputs.query_set }} - ${{ github.event.inputs.spicepod_path }}${{ contains(github.event.inputs.spicepod_path, 'postgres') && format(' - PostgreSQL {0}', github.event.inputs.postgres_version || '16') || '' }}
+run-name: bench - ${{ github.event.inputs.query_set }} - ${{ github.event.inputs.spicepod_path }}${{ contains(github.event.inputs.spicepod_path, 'postgres') && format(' - PostgreSQL {0}', github.event.inputs.postgres_version || '16') || '' }}${{ github.event.inputs.layout != '' && format(' - layout {0}', github.event.inputs.layout) || '' }}
 
 on:
   workflow_dispatch:
@@ -111,6 +111,11 @@ on:
         required: false
         type: string
         default: '16'
+      layout:
+        description: 'Acceleration layout to configure on every accelerated dataset (testoperator --layout): features from primary_key, indexes, sort, cluster, time_column, partition, joined by commas; empty = the spicepod as written'
+        required: false
+        type: string
+        default: ''
 
 jobs:
   run-bench:
@@ -590,9 +595,11 @@ jobs:
             --disable-progress-bars \
             --disable-caching=${{ github.event.inputs.disable_caching }} \
             --validate=${{ github.event.inputs.validate_results }} \
+            ${LAYOUT:+--layout "$LAYOUT"} \
             --metrics \
             --scale-factor ${{ github.event.inputs.scale_factor }}
         env:
+          LAYOUT: ${{ github.event.inputs.layout }}
           S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
           S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}
