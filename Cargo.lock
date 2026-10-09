@@ -4201,7 +4201,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 [[package]]
 name = "clickhouse-rs"
 version = "1.1.0-alpha.1"
-source = "git+https://github.com/spiceai/clickhouse-rs.git?tag=0.2.2#7e98394f44cfa33919ebc5a92c06d5bddba708bf"
+source = "git+https://github.com/spiceai/clickhouse-rs.git?rev=20153c9c8eea6f1939dd03fc95e50198854f7fbf#20153c9c8eea6f1939dd03fc95e50198854f7fbf"
 dependencies = [
  "byteorder",
  "cfg-if",
@@ -4231,7 +4231,7 @@ dependencies = [
 [[package]]
 name = "clickhouse-rs-cityhash-sys"
 version = "0.1.2"
-source = "git+https://github.com/spiceai/clickhouse-rs.git?tag=0.2.2#7e98394f44cfa33919ebc5a92c06d5bddba708bf"
+source = "git+https://github.com/spiceai/clickhouse-rs.git?rev=20153c9c8eea6f1939dd03fc95e50198854f7fbf#20153c9c8eea6f1939dd03fc95e50198854f7fbf"
 dependencies = [
  "cc",
 ]
@@ -4473,6 +4473,7 @@ dependencies = [
  "datafusion",
  "datafusion-table-providers",
  "futures",
+ "insta",
  "linkme",
  "ns_lookup",
  "paste",

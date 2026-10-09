@@ -113,7 +113,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [candle-index-select-cu](#candle-and-its-kernel-crates) | `75fc0b689b33a327907d36dd479f7d242640ca71` | `master` |
 | [candle-layer-norm](#candle-and-its-kernel-crates) | `dfdbfbb953ceeb0366e5e3b69f2933204309d3dd` | `main` |
 | [candle-rotary](#candle-and-its-kernel-crates) | `e12f91a6c8beec5373ccec91a5ccad80619cf065` | `main` |
-| [clickhouse-rs](#clickhouse-rs) | `7e98394f44cfa33919ebc5a92c06d5bddba708bf` | tag `0.2.2` |
+| [clickhouse-rs](#clickhouse-rs) | `20153c9c8eea6f1939dd03fc95e50198854f7fbf` | `14921-clickhouse-types` (TEMPORARY: spiceai/clickhouse-rs#2) |
 | [datafusion](#datafusion) | `eea120e236447a70d7c8802401b3ed3ee24f0980` | `spiceai-55` |
 | [datafusion-ballista](#datafusion-ballista) | `a7c4c58502a16e2181a26fdb8e937ee005807e5e` | `spiceai-55` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `750561d79e88fd48afd06b6a136e3bc1dc2b8a12` | `spiceai-55` |
@@ -496,12 +496,15 @@ Upstream [64bit/async-openai](https://github.com/64bit/async-openai).
 ## clickhouse-rs
 
 Upstream [gengteng/clickhouse-rs](https://github.com/gengteng/clickhouse-rs), pinned
-by tag `0.2.2`.
+by revision on branch `async-await`.
 
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|
 | `Date32` support — `DateConverter for i32`, `Value`/`ValueRef::Date32`, `FromSql for NaiveDate` (fork commit `7e98394f`, which is the pinned revision itself) | ClickHouse `Date32` columns (dates outside 1970–2149) fail to decode | build (variant) + silent (range) | `crates/data-connectors/connector-clickhouse/src/block_to_arrow.rs::a_date32_value_decodes_the_dates_a_date_column_cannot_hold` for the decode `block_to_arrow` calls and for `Date32` still reporting `SqlType::Date`, which is what selects that arm. The wire half is only reachable against a server — `column::factory`'s `"Date32"` arm is fed from the `pub(crate)` `Block::load`, and `Block::add_column` over `NaiveDate` builds the 16-bit column — so the `Date32` column in `test/scripts/setup-data-clickhouse.sql` guards it end-to-end in the ClickHouse quickstart job |
 | `ConnectionError::NoPacketReceived` | A dropped connection surfaces as a less specific error | build | compile-guarded |
+| `LowCardinality(Nullable(T))` decoding — the dictionary is read as plain `T`, with key 0 as NULL | Reading the column misreads the stream: the query fails with a garbage compression method or the process aborts on a huge allocation | silent (crash) | The `lc_nullable_string_column` column in `test/scripts/setup-data-clickhouse.sql`, read end-to-end by the ClickHouse quickstart job; only a server produces this wire layout |
+| `Tuple` columns — `SqlType`/`Value`/`ValueRef::Tuple` and `TupleColumnData` | ClickHouse `Tuple` columns fail to decode (`Unsupported column type`) | build (variant) | compile-guarded by `crates/data-connectors/connector-clickhouse/src/block_to_arrow.rs`, and end-to-end by `tuple_column` in `test/scripts/setup-data-clickhouse.sql` |
+| `ValueRef::Map` holds its entries as a `Vec` in server order | Map entries lose their order and duplicate keys, and a key type the driver cannot hash (`Date`, `UUID`, `Enum`) panics while decoding | build (type) | compile-guarded: `block_to_arrow.rs` iterates the entries as pairs |
 
 ## rusqlite and tokio-rusqlite
 
