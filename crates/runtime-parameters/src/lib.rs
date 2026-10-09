@@ -89,11 +89,12 @@ impl Parameters {
             key_to_use = &key[full_prefix.len()..];
         }
 
-        // A retired key is dropped here and reported by the component that owns it,
-        // so the generic "not supported" warning does not repeat it.
+        // A retired key is dropped here, in its prefixed and unprefixed spelling, and
+        // reported by the component that owns it, so the generic "not supported"
+        // warning does not repeat it.
         if all_params
             .iter()
-            .any(|p| p.is_retired() && p.display_name(prefix) == key)
+            .any(|p| p.is_retired() && (p.display_name(prefix) == key || p.name == key))
         {
             return None;
         }
@@ -668,6 +669,11 @@ mod test {
             format("pg_tuning"),
             None,
             "a retired key must not be applied"
+        );
+        assert_eq!(
+            format("tuning"),
+            None,
+            "the unprefixed spelling of a retired key must not be applied either"
         );
         assert_eq!(format("pg_host"), Some("host".to_string()));
         assert_ne!(

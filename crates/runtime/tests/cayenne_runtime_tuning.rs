@@ -177,6 +177,42 @@ async fn runtime_tuning_defaults_to_auto() {
 }
 
 #[tokio::test(flavor = "multi_thread")]
+async fn unprefixed_retired_dataset_params_are_not_applied_and_warn_once() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let pod = spicepod(
+        "rt_unprefixed",
+        dir.path(),
+        "",
+        "        tuning: enabled\n        goal_freshness: 5s\n",
+    );
+    assert!(
+        !dynamic_tuning_of("rt_unprefixed", &pod, dir.path()).await,
+        "the retired unprefixed dataset `tuning` must not turn the closed-loop tuner on"
+    );
+
+    let logs = logged();
+    for warning in [
+        "Dataset 'rt_unprefixed' sets `tuning`, which is no longer a dataset parameter, so it has no effect. Set `runtime.params.adaptive_tuning` instead. See: https://spiceai.org/docs/reference/spicepod/runtime",
+        "Dataset 'rt_unprefixed' sets `goal_freshness`, which is no longer a dataset parameter, so it has no effect. Set `runtime.params.target_freshness` instead. See: https://spiceai.org/docs/reference/spicepod/runtime",
+    ] {
+        assert_eq!(
+            logs.matches(warning).count(),
+            1,
+            "expected exactly one retired-parameter warning, logs: {logs}"
+        );
+    }
+    for generic in [
+        "Ignoring parameter `tuning`",
+        "Ignoring parameter `goal_freshness`",
+    ] {
+        assert!(
+            !logs.contains(generic),
+            "the generic unsupported-parameter warning must not repeat it, logs: {logs}"
+        );
+    }
+}
+
+#[tokio::test(flavor = "multi_thread")]
 async fn retired_dataset_tuning_param_is_not_applied_and_warns_once() {
     let dir = tempfile::tempdir().expect("temp dir");
     let pod = spicepod(
