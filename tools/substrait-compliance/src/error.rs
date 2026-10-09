@@ -200,6 +200,12 @@ pub enum Error {
     ModeBOnlyFlag { flag: &'static str },
 
     #[snafu(display(
+        "`{flag}` configures an acceleration, and `--acceleration-engine none` serves the tables \
+         federated, without one. Pass an acceleration engine, or drop `{flag}`"
+    ))]
+    AccelerationOnlyFlag { flag: &'static str },
+
+    #[snafu(display(
         "The baseline report '{}' passed none of the cases this run selected, so comparing \
          against it would check nothing. Pass a baseline that passed them",
         path.display()

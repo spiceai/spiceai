@@ -78,7 +78,12 @@ if ! run mode-a --mode mode-a; then
 fi
 
 serve=(--mode mode-b --spiced-path "$spiced" --acceleration-engine "$engine"
-  --acceleration-mode "$mode" --iterations "$iterations")
+  --iterations "$iterations")
+# A federated run (`none`) has no acceleration to store, so the harness refuses
+# a mode for it; `$mode` still names its reports.
+if [[ $engine != none ]]; then
+  serve+=(--acceleration-mode "$mode")
+fi
 
 run "mode-b-${engine}-${mode}" "${serve[@]}" --baseline "$out/mode-a.json"
 if [[ ! -f "$out/mode-b-${engine}-${mode}.json" ]]; then

@@ -164,7 +164,9 @@ Spicepod that serves each one as a dataset: accelerated with
 with `--acceleration-engine none`. `--layout` applies an acceleration layout to
 every dataset, the same as `testoperator --layout`: features from
 `primary_key`, `indexes`, `sort`, `cluster`, `time_column` and `partition`,
-joined by commas, keyed from `crates/test-framework/src/layout/tpch.rs`.
+joined by commas, keyed from `crates/test-framework/src/layout/tpch.rs`. A
+federated run refuses `--acceleration-mode` and `--layout`, which it could not
+apply.
 
 Each plan goes to `spiced` as a FlightSQL `CommandStatementSubstraitPlan`
 (`GetFlightInfo`, then `DoGet` for each endpoint;

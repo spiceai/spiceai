@@ -133,9 +133,9 @@ struct Args {
     #[arg(long, default_value = "cayenne")]
     acceleration_engine: String,
 
-    /// Mode B: how the accelerated datasets are stored.
-    #[arg(long, value_enum, default_value_t = AccelerationMode::File)]
-    acceleration_mode: AccelerationMode,
+    /// Mode B: how the accelerated datasets are stored (default `file`).
+    #[arg(long, value_enum)]
+    acceleration_mode: Option<AccelerationMode>,
 
     /// Mode B: an acceleration layout for every dataset (`testoperator
     /// --layout`): features from `primary_key`, `indexes`, `sort`, `cluster`,
@@ -312,16 +312,7 @@ async fn run() -> Result<ExitCode> {
             let spiced_path = spiced_program(spiced_path)?;
             let options = mode_b::ServingOptions {
                 spiced_path,
-                acceleration: (args.acceleration_engine != "none").then(|| {
-                    mode_b::AccelerationOptions {
-                        engine: args.acceleration_engine.clone(),
-                        mode: match args.acceleration_mode {
-                            AccelerationMode::File => Mode_::File,
-                            AccelerationMode::Memory => Mode_::Memory,
-                        },
-                        layout: args.layout.clone(),
-                    }
-                }),
+                acceleration: acceleration_options(&args)?,
                 ready_wait: Duration::from_secs(args.ready_wait),
             };
             let started = Instant::now();
@@ -439,10 +430,39 @@ fn spiced_program(spiced_path: &Path) -> Result<PathBuf> {
     std::path::absolute(spiced_path).context(error::AbsolutePathSnafu { path: spiced_path })
 }
 
+/// Mode B's acceleration of every dataset, or `None` to serve them federated.
+/// A federated run has no acceleration to store or lay out, so it refuses a
+/// flag that configures one rather than run a weaker test than was asked for.
+fn acceleration_options(args: &Args) -> Result<Option<mode_b::AccelerationOptions>> {
+    if args.acceleration_engine == "none" {
+        let flag = if args.acceleration_mode.is_some() {
+            Some("--acceleration-mode")
+        } else if args.layout.is_some() {
+            Some("--layout")
+        } else {
+            None
+        };
+        return match flag {
+            Some(flag) => error::AccelerationOnlyFlagSnafu { flag }.fail(),
+            None => Ok(None),
+        };
+    }
+    Ok(Some(mode_b::AccelerationOptions {
+        engine: args.acceleration_engine.clone(),
+        mode: match args.acceleration_mode.unwrap_or(AccelerationMode::File) {
+            AccelerationMode::File => Mode_::File,
+            AccelerationMode::Memory => Mode_::Memory,
+        },
+        layout: args.layout.clone(),
+    }))
+}
+
 /// Refuse a Mode A run that names a Mode B-only flag, which it would ignore.
 fn reject_mode_b_flags(args: &Args) -> Result<()> {
     let flag = if args.spiced_path.is_some() {
         Some("--spiced-path")
+    } else if args.acceleration_mode.is_some() {
+        Some("--acceleration-mode")
     } else if args.layout.is_some() {
         Some("--layout")
     } else if args.data_dir.is_some() {
@@ -673,6 +693,80 @@ mod tests {
         let args = super::Args::try_parse_from(["spice-substrait-compliance", "--iterations", "1"])
             .expect("clap accepts one iteration");
         super::reject_mode_b_flags(&args).expect("one iteration is the Mode A default");
+    }
+
+    #[test]
+    fn mode_a_refuses_an_acceleration_mode_it_would_ignore() {
+        use clap::Parser as _;
+        let args = super::Args::try_parse_from([
+            "spice-substrait-compliance",
+            "--acceleration-mode",
+            "memory",
+        ])
+        .expect("clap accepts the mode");
+        let err = super::reject_mode_b_flags(&args).expect_err("--acceleration-mode with Mode A");
+        assert_eq!(
+            err.to_string(),
+            "`--acceleration-mode` applies to Mode B only, and Mode A would ignore it. Pass \
+             `--mode mode-b`, or drop `--acceleration-mode`"
+        );
+    }
+
+    /// A federated run has no acceleration, so a layout or a storage mode for
+    /// one would be dropped and the run would test less than it was asked to.
+    #[test]
+    fn a_federated_run_refuses_a_flag_that_configures_an_acceleration() {
+        use clap::Parser as _;
+        let mode_b = |extra: &[&str]| {
+            let mut argv = vec![
+                "spice-substrait-compliance",
+                "--mode",
+                "mode-b",
+                "--acceleration-engine",
+            ];
+            argv.extend_from_slice(extra);
+            super::Args::try_parse_from(argv).expect("clap accepts the flags")
+        };
+        for (flag, value) in [("--layout", "primary_key"), ("--acceleration-mode", "file")] {
+            let err = super::acceleration_options(&mode_b(&["none", flag, value]))
+                .err()
+                .unwrap_or_else(|| panic!("{flag} with --acceleration-engine none"));
+            assert_eq!(
+                err.to_string(),
+                format!(
+                    "`{flag}` configures an acceleration, and `--acceleration-engine none` \
+                     serves the tables federated, without one. Pass an acceleration engine, or \
+                     drop `{flag}`"
+                )
+            );
+        }
+        let federated =
+            super::acceleration_options(&mode_b(&["none"])).expect("a plain federated run");
+        assert!(federated.is_none(), "`none` serves the tables federated");
+
+        let accelerated = super::acceleration_options(&mode_b(&[
+            "cayenne",
+            "--acceleration-mode",
+            "memory",
+            "--layout",
+            "primary_key",
+        ]))
+        .expect("an accelerated run")
+        .expect("an acceleration");
+        assert_eq!(accelerated.engine, "cayenne");
+        assert!(matches!(accelerated.mode, super::Mode_::Memory));
+        assert_eq!(
+            accelerated
+                .layout
+                .map(|layout| layout.to_string())
+                .as_deref(),
+            Some("primary_key")
+        );
+        let defaulted = super::acceleration_options(&mode_b(&["duckdb"]))
+            .expect("an accelerated run")
+            .expect("an acceleration");
+        assert!(matches!(defaulted.mode, super::Mode_::File));
+        assert!(defaulted.layout.is_none());
     }
 
     #[test]
