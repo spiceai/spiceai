@@ -208,22 +208,17 @@ impl MemTable {
         Ok(())
     }
 
-    /// Attempt to retrieve the primary key from the constraints, and ensure that there are no unsupported [`Constraint::Unique`].
-    fn get_and_ensure_only_primary_keys(&self) -> Result<Option<Vec<usize>>> {
-        if let Some(constraints) = self.constraints() {
-            match constraints.iter().next() {
-                Some(Constraint::PrimaryKey(pk)) => {
-                    return Ok(Some(pk.clone()));
-                }
-                Some(Constraint::Unique(_)) => {
-                    return Err(DataFusionError::Execution(
-                        "Unique constraints are not supported for in-memory tables. If possible, consider using a primary key.".to_string(),
-                    ));
-                }
-                _ => return Ok(None),
+    /// Returns the primary key and the unique column sets declared by the constraints.
+    fn key_constraints(&self) -> (Option<Vec<usize>>, Vec<Vec<usize>>) {
+        let mut primary_key = None;
+        let mut unique_keys = Vec::new();
+        for constraint in self.constraints.iter() {
+            match constraint {
+                Constraint::PrimaryKey(pk) => primary_key = Some(pk.clone()),
+                Constraint::Unique(columns) => unique_keys.push(columns.clone()),
             }
         }
-        Ok(None)
+        (primary_key, unique_keys)
     }
 
     fn verify_on_conflict_matches_primary_key(
@@ -316,10 +311,10 @@ impl TableProvider for MemTable {
             )));
         }
 
-        let primary_key = self.get_and_ensure_only_primary_keys()?;
+        let (primary_key, unique_keys) = self.key_constraints();
 
-        // In-memory tables only support primary keys constraints. Support for `OnConflict` is limited to `Upsert` matching the primary key.
-        // So we verify that the `on_conflict` and  the primary key matches
+        // Support for `OnConflict` is limited to `Upsert` matching the primary key,
+        // so we verify that the `on_conflict` and the primary key match
         if let (Some(OnConflict::Upsert(on_conflict)), Some(pk)) = (&self.on_conflict, &primary_key)
         {
             self.verify_on_conflict_matches_primary_key(pk, on_conflict)?;
@@ -329,6 +324,7 @@ impl TableProvider for MemTable {
             self.batches.clone(),
             overwrite,
             primary_key,
+            unique_keys,
             self.schema(),
             self.on_conflict.clone(),
             self.sort_columns.clone(),
@@ -603,6 +599,8 @@ struct MemSink {
 
     /// Optional primary key columns. If present, primary key values must be unique, ordered ascendingly.
     primary_key: Option<Vec<usize>>,
+    /// Unique column sets, each ordered ascendingly. Null keys are allowed; repeated non-null keys are rejected.
+    unique_keys: Vec<Vec<usize>>,
     schema: SchemaRef,
     on_conflict: Option<OnConflict>,
 
@@ -636,6 +634,7 @@ impl MemSink {
         batches: Vec<PartitionData>,
         overwrite: InsertOp,
         primary_key: Option<Vec<usize>>,
+        unique_keys: Vec<Vec<usize>>,
         schema: SchemaRef,
         on_conflict: Option<OnConflict>,
         sort_columns: Vec<String>,
@@ -648,6 +647,13 @@ impl MemSink {
                 z.sort_unstable();
                 z
             }),
+            unique_keys: unique_keys
+                .into_iter()
+                .map(|mut columns| {
+                    columns.sort_unstable();
+                    columns
+                })
+                .collect(),
             schema,
             on_conflict,
             sort_columns,
@@ -1223,19 +1229,29 @@ fn rows_to_keep(
     Ok(keep.map(|mut builder| builder.finish()))
 }
 
-/// Fails if a row of `batch` has a primary key in `new_keys`, which appending the rows
-/// `new_keys` belongs to would duplicate.
-fn ensure_primary_keys_absent<S: std::hash::BuildHasher>(
+/// Fails with `duplicate(key)` if a row of `batch` has a key in `new_keys`, which appending
+/// the rows `new_keys` belongs to would duplicate.
+fn ensure_keys_absent<S: std::hash::BuildHasher>(
     batch: &RecordBatch,
-    pk_indices_ordered: &[usize],
+    key_indices_ordered: &[usize],
     new_keys: &HashSet<String, S>,
+    duplicate: impl Fn(&str) -> DataFusionError,
 ) -> Result<()> {
-    for_each_primary_key(batch, pk_indices_ordered, |_, key| match key {
-        Some(key) if new_keys.contains(key) => Err(DataFusionError::Execution(format!(
-            "Primary key ({key}) already exists and is not unique"
-        ))),
+    for_each_primary_key(batch, key_indices_ordered, |_, key| match key {
+        Some(key) if new_keys.contains(key) => Err(duplicate(key)),
         _ => Ok(()),
     })
+}
+
+fn duplicate_unique_key(schema: &SchemaRef, columns: &[usize], key: &str) -> DataFusionError {
+    let columns: Vec<&str> = columns
+        .iter()
+        .map(|&idx| schema.field(idx).name().as_str())
+        .collect();
+    DataFusionError::Execution(format!(
+        "Duplicate value ({key}) for unique index on ({}); the write was not applied",
+        columns.join(", ")
+    ))
 }
 
 // Public wrappers for benchmarking with standard hasher
@@ -1350,8 +1366,8 @@ impl DataSink for MemSink {
         // This is essential for caching scenarios where multiple result rows share the same request metadata.
         let mut new_key_set: HashSet<String, std::hash::BuildHasherDefault<PrimaryKeyHasher>> =
             HashSet::default();
+        let batch_flat: Vec<_> = new_batches.iter().flatten().collect();
         if let Some(ref pks) = self.primary_key {
-            let batch_flat: Vec<_> = new_batches.iter().flatten().collect();
             let new_primary_key_ids = primary_key_identifier(&batch_flat, pks)?;
 
             // For InsertOp::Replace, we don't require unique primary keys in new data
@@ -1375,8 +1391,41 @@ impl DataSink for MemSink {
             }
         }
 
+        // Unique keys are checked before any partition changes, so a rejected write leaves the
+        // table as it was. An upsert (`Replace`, or `Append` with `on_conflict`) replaces rows by
+        // primary key and is not checked against existing rows.
+        let new_unique_keys = if matches!(self.overwrite, InsertOp::Replace) {
+            Vec::new()
+        } else {
+            self.unique_keys
+                .iter()
+                .map(|columns| {
+                    let mut keys = HashSet::new();
+                    for key in primary_key_identifier(&batch_flat, columns)?
+                        .into_iter()
+                        .flatten()
+                    {
+                        if let Some(key) = keys.replace(key) {
+                            return Err(duplicate_unique_key(&self.schema, columns, &key));
+                        }
+                    }
+                    Ok(keys)
+                })
+                .collect::<Result<Vec<_>>>()?
+        };
+
         let mut writable_targets: Vec<_> =
             futures::future::join_all(self.batches.iter().map(|target| target.write())).await;
+
+        if matches!(self.overwrite, InsertOp::Append) && self.on_conflict.is_none() {
+            for (columns, keys) in self.unique_keys.iter().zip(&new_unique_keys) {
+                for rb in writable_targets.iter().flat_map(|target| target.iter()) {
+                    ensure_keys_absent(rb, columns, keys, |key| {
+                        duplicate_unique_key(&self.schema, columns, key)
+                    })?;
+                }
+            }
+        }
 
         for (target, mut batches) in writable_targets.iter_mut().zip(new_batches) {
             // Depending on [`InsertOp`], we may need to mutate the existing `target` before adding new data.
@@ -1393,7 +1442,11 @@ impl DataSink for MemSink {
                             filter_existing(&mut *target, &new_key_set, pks)?;
                         } else {
                             for rb in &**target {
-                                ensure_primary_keys_absent(rb, pks, &new_key_set)?;
+                                ensure_keys_absent(rb, pks, &new_key_set, |key| {
+                                    DataFusionError::Execution(format!(
+                                        "Primary key ({key}) already exists and is not unique"
+                                    ))
+                                })?;
                             }
                         }
                     }

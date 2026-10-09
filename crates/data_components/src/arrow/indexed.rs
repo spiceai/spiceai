@@ -24,7 +24,8 @@ limitations under the License.
 //! SIMD-optimized hash index for `MemTable`.
 //!
 //! This module provides a hash index wrapper that accelerates point lookups
-//! on `MemTable` when a primary key is specified.
+//! on `MemTable` by primary key, and on single-column secondary indexes, which
+//! return every row of a key.
 
 use std::collections::HashMap;
 use std::fmt::{self, Debug};
@@ -35,7 +36,7 @@ use arrow::array::{Array, RecordBatch};
 use arrow::datatypes::SchemaRef;
 use async_trait::async_trait;
 use datafusion::catalog::Session;
-use datafusion::common::{Constraint, Constraints, Result};
+use datafusion::common::{Constraints, Result};
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::error::DataFusionError;
 use datafusion::execution::SendableRecordBatchStream;
@@ -44,7 +45,7 @@ use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
 use datafusion_table_providers::util::on_conflict::OnConflict;
-use hash_index::{HashIndex, HashIndexBuilder, RowLocation};
+use hash_index::{HashIndex, HashIndexBuilder, MultiHashIndex, RowLocation};
 
 use super::write::MemTable;
 use crate::index_maintenance::IndexMaintenanceProvider;
@@ -56,20 +57,19 @@ pub struct SecondaryIndex {
     pub name: String,
     /// Column names that form the index key.
     pub columns: Vec<String>,
-    /// Whether this index enforces uniqueness.
-    pub unique: bool,
-    /// The hash index itself.
-    pub index: Arc<HashIndex>,
+    /// Every row of each key; empty until the table rebuilds its indexes.
+    pub index: Arc<MultiHashIndex>,
 }
 
 impl SecondaryIndex {
-    /// Creates a new secondary index.
+    /// Creates a new, empty secondary index. A `unique` index is enforced on write by
+    /// the table's `Unique` constraint, not by the index.
     #[must_use]
-    pub fn new(name: String, columns: Vec<String>, unique: bool, index: Arc<HashIndex>) -> Self {
+    pub fn new(name: String, columns: Vec<String>) -> Self {
+        let index = Arc::new(MultiHashIndex::new(columns.clone()));
         Self {
             name,
             columns,
-            unique,
             index,
         }
     }
@@ -480,27 +480,9 @@ impl IndexedMemTable {
         self
     }
 
-    /// Adds constraints to the table.
-    ///
-    /// Note: `Unique` constraints are filtered out because `IndexedMemTable` handles
-    /// uniqueness through secondary indexes. The underlying `MemTable` doesn't support
-    /// `Unique` constraints, so we only pass through `PrimaryKey` constraints.
+    /// Adds constraints to the table. `Unique` constraints reject duplicate keys on write.
     pub async fn try_with_constraints(mut self, constraints: Constraints) -> Result<Self> {
-        // Filter out Unique constraints - IndexedMemTable handles uniqueness via secondary indexes.
-        // The underlying MemTable doesn't support Unique constraints.
-        let filtered_constraints: Vec<Constraint> = constraints
-            .iter()
-            .filter(|c| matches!(c, Constraint::PrimaryKey(_)))
-            .cloned()
-            .collect();
-
-        if filtered_constraints.is_empty() {
-            // No primary key constraints to apply
-            return Ok(self);
-        }
-
-        let new_constraints = Constraints::new_unverified(filtered_constraints);
-        self.inner = self.inner.try_with_constraints(new_constraints).await?;
+        self.inner = self.inner.try_with_constraints(constraints).await?;
         Ok(self)
     }
 
@@ -714,7 +696,7 @@ impl TableProvider for IndexedMemTable {
                             schema,
                             Box::pin(stream),
                             pk_columns,
-                            true, // found result
+                            1,
                         )));
                     }
                     // Hash collision: the hash matched but actual key doesn't.
@@ -739,78 +721,40 @@ impl TableProvider for IndexedMemTable {
                 schema,
                 Box::pin(stream),
                 pk_columns,
-                false, // not found
+                0,
             )));
         }
 
-        // Check if we can use a secondary index for lookup
-        // Note: Secondary indexes with unique=true work like primary key lookups (single result)
-        // Non-unique secondary indexes still provide fast lookup but may have collisions
+        // A secondary key may repeat, so the lookup returns every row holding it.
         if let (true, Some((secondary, key_value))) =
             (index_usable, self.find_secondary_index_match(filters))
         {
-            tracing::debug!(
-                secondary_index_name = %secondary.name,
-                secondary_columns = ?secondary.columns,
-                secondary_unique = secondary.unique,
-                "Found secondary index match"
-            );
-            // Only use indexed lookup for unique secondary indexes
-            // Non-unique indexes would need multi-value support which hash-index doesn't provide yet
-            // Also verify this is a single-column index since verification below only checks first column
-            if secondary.unique && secondary.columns.len() == 1 {
-                let hash = key_value.hash();
-                let index_columns = secondary.columns.clone();
-
-                if let Some(location) = secondary.index.get_by_hash(hash) {
-                    if let Some(batch) = self.get_row_at_location(location).await? {
-                        // Verify the actual key matches (handle hash collisions)
-                        // SAFETY: We already verified secondary.columns.len() == 1 above
-                        let index_column = &secondary.columns[0];
-                        if key_value.matches_batch(&batch, index_column) {
-                            let result_batch = if let Some(proj) = projection {
-                                batch.project(proj)?
-                            } else {
-                                batch
-                            };
-
-                            let schema = result_batch.schema();
-                            let stream = futures::stream::once(async move { Ok(result_batch) });
-                            let stream = RecordBatchStreamAdapter::new(Arc::clone(&schema), stream);
-
-                            return Ok(Arc::new(IndexedLookupExec::new(
-                                schema,
-                                Box::pin(stream),
-                                index_columns,
-                                true,
-                            )));
-                        }
-                        // Hash collision - fall through to return empty
-                        tracing::debug!(
-                            hash = hash,
-                            index_name = %secondary.name,
-                            "Hash collision detected during secondary index lookup"
-                        );
-                    }
+            let index_column = &secondary.columns[0];
+            let mut rows = Vec::new();
+            for location in secondary.index.get_by_hash(key_value.hash()) {
+                // Verify the key: a different key can share the hash.
+                if let Some(row) = self.get_row_at_location(location).await?
+                    && key_value.matches_batch(&row, index_column)
+                {
+                    rows.push(row);
                 }
-
-                // Key not found - return empty result
-                let schema = if let Some(proj) = projection {
-                    Arc::new(self.schema().project(proj)?)
-                } else {
-                    self.schema()
-                };
-                let stream = futures::stream::empty();
-                let stream = RecordBatchStreamAdapter::new(Arc::clone(&schema), stream);
-
-                return Ok(Arc::new(IndexedLookupExec::new(
-                    schema,
-                    Box::pin(stream),
-                    index_columns,
-                    false,
-                )));
             }
-            // Non-unique secondary indexes fall through to full table scan
+            let batch = arrow::compute::concat_batches(&self.schema(), &rows)?;
+            let batch = match projection {
+                Some(proj) => batch.project(proj)?,
+                None => batch,
+            };
+            let num_rows = batch.num_rows();
+            let schema = batch.schema();
+            let stream = futures::stream::once(async move { Ok(batch) });
+            let stream = RecordBatchStreamAdapter::new(Arc::clone(&schema), stream);
+
+            return Ok(Arc::new(IndexedLookupExec::new(
+                schema,
+                Box::pin(stream),
+                secondary.columns.clone(),
+                num_rows,
+            )));
         }
 
         // Fall back to regular MemTable scan
@@ -936,11 +880,9 @@ pub struct IndexedLookupExec {
     properties: Arc<datafusion::physical_plan::PlanProperties>,
     /// Primary key columns used for the indexed lookup.
     pk_columns: Vec<String>,
-    /// Whether the lookup found a result.
-    found_result: bool,
     /// Metrics for this execution plan.
     metrics: datafusion::physical_plan::metrics::ExecutionPlanMetricsSet,
-    /// Number of rows that will be output (0 or 1 for point lookups).
+    /// Number of rows the lookup returns.
     output_rows: usize,
 }
 
@@ -949,7 +891,7 @@ impl IndexedLookupExec {
         schema: SchemaRef,
         stream: SendableRecordBatchStream,
         pk_columns: Vec<String>,
-        found_result: bool,
+        output_rows: usize,
     ) -> Self {
         use datafusion::physical_expr::EquivalenceProperties;
         use datafusion::physical_plan::Partitioning;
@@ -962,15 +904,11 @@ impl IndexedLookupExec {
             Boundedness::Bounded,
         ));
 
-        // For indexed point lookups, output_rows is 0 or 1
-        let output_rows = usize::from(found_result);
-
         Self {
             schema,
             result: std::sync::Mutex::new(Some(stream)),
             properties,
             pk_columns,
-            found_result,
             metrics: datafusion::physical_plan::metrics::ExecutionPlanMetricsSet::new(),
             output_rows,
         }
@@ -981,12 +919,6 @@ impl IndexedLookupExec {
     pub fn pk_columns(&self) -> &[String] {
         &self.pk_columns
     }
-
-    /// Returns whether the indexed lookup found a result.
-    #[must_use]
-    pub fn found_result(&self) -> bool {
-        self.found_result
-    }
 }
 
 #[expect(clippy::missing_fields_in_debug)]
@@ -995,7 +927,7 @@ impl Debug for IndexedLookupExec {
         f.debug_struct("IndexedLookupExec")
             .field("schema", &self.schema)
             .field("pk_columns", &self.pk_columns)
-            .field("found_result", &self.found_result)
+            .field("output_rows", &self.output_rows)
             .finish()
     }
 }
@@ -1089,10 +1021,9 @@ impl ExecutionPlan for IndexedLookupExec {
         Some(self.metrics.clone_inner())
     }
 
-    /// An exact row count: a primary-key probe returns the one row it matched or
-    /// nothing at all, and `output_rows` is set from that outcome at
-    /// construction, so `Precision::Exact` is provable here rather than an
-    /// estimate.
+    /// An exact row count: the lookup has already run, and `output_rows` is the
+    /// number of rows it returned (at most one for a primary-key probe), so
+    /// `Precision::Exact` is provable here rather than an estimate.
     ///
     /// It has to be reported for the optimizer to act on it. `EnforceDistribution`
     /// decides whether round-robin repartitioning is worthwhile from
@@ -1509,11 +1440,9 @@ mod tests {
         );
     }
 
-    /// Test that `Unique` constraints are filtered out and don't cause errors.
-    /// `IndexedMemTable` handles uniqueness via secondary indexes, so the underlying
-    /// `MemTable` shouldn't receive `Unique` constraints (which it doesn't support).
+    /// Test that a `Unique` constraint over distinct existing values is accepted.
     #[tokio::test]
-    async fn test_unique_constraints_are_filtered() {
+    async fn test_unique_constraint_is_accepted() {
         use datafusion::common::{Constraint, Constraints};
 
         let batch = create_large_test_batch(300);
@@ -1531,18 +1460,14 @@ mod tests {
         let table = table
             .try_with_constraints(constraints)
             .await
-            .expect("IndexedMemTable should filter out Unique constraints");
+            .expect("a unique constraint over distinct values must be accepted");
 
-        // The inner MemTable should have no constraints since Unique was filtered out
-        // and no PrimaryKey was provided
-        // The table should still work correctly
         assert!(table.has_index());
     }
 
-    /// Test that mixed constraints (`PrimaryKey` + `Unique`) work correctly.
-    /// Only `PrimaryKey` should be passed to the underlying `MemTable`.
+    /// Test that mixed constraints (`PrimaryKey` + `Unique`) both reach the underlying `MemTable`.
     #[tokio::test]
-    async fn test_mixed_constraints_primary_key_preserved() {
+    async fn test_mixed_constraints_preserved() {
         use datafusion::common::{Constraint, Constraints};
 
         let batch = create_large_test_batch(300);
@@ -1565,13 +1490,13 @@ mod tests {
             .await
             .expect("failed to add constraints");
 
-        // Exactly the PrimaryKey reaches the table: it is preserved and the Unique is dropped.
         assert_eq!(
             table.constraints(),
-            Some(&Constraints::new_unverified(vec![Constraint::PrimaryKey(
-                vec![0]
-            )])),
-            "only the primary key constraint may be applied; the unique constraint must be filtered out"
+            Some(&Constraints::new_unverified(vec![
+                Constraint::PrimaryKey(vec![0]),
+                Constraint::Unique(vec![1]),
+            ])),
+            "both constraints must be applied; the unique one is enforced on write"
         );
     }
 
@@ -2038,7 +1963,7 @@ mod tests {
         let stream = futures::stream::empty();
         let stream = RecordBatchStreamAdapter::new(Arc::clone(&schema), stream);
 
-        let exec = IndexedLookupExec::new(schema, Box::pin(stream), vec!["id".to_string()], true);
+        let exec = IndexedLookupExec::new(schema, Box::pin(stream), vec!["id".to_string()], 1);
 
         // Test Default format via fmt_as
         let mut output = String::new();
@@ -2063,7 +1988,7 @@ mod tests {
             schema2,
             Box::pin(stream2),
             vec!["tenant_id".to_string(), "user_id".to_string()],
-            false,
+            0,
         );
 
         let mut output2 = String::new();
@@ -2768,17 +2693,11 @@ mod tests {
         .expect("failed to create table");
 
         // Build secondary index on 'email'
-        let email_index = hash_index::HashIndexBuilder::new(vec!["email".to_string()])
-            .allow_duplicates(false)
-            .build(&partitions)
+        let secondary = SecondaryIndex::new("email".to_string(), vec!["email".to_string()]);
+        secondary
+            .index
+            .rebuild(&partitions)
             .expect("failed to build email index");
-
-        let secondary = SecondaryIndex::new(
-            "email".to_string(),
-            vec!["email".to_string()],
-            true, // unique
-            Arc::new(email_index),
-        );
 
         let table_with_secondary = table.with_secondary_index(secondary);
 
@@ -2835,17 +2754,11 @@ mod tests {
         .expect("failed to create table");
 
         // Build secondary index on 'email'
-        let email_index = hash_index::HashIndexBuilder::new(vec!["email".to_string()])
-            .allow_duplicates(false)
-            .build(&partitions)
+        let secondary = SecondaryIndex::new("email".to_string(), vec!["email".to_string()]);
+        secondary
+            .index
+            .rebuild(&partitions)
             .expect("failed to build email index");
-
-        let secondary = SecondaryIndex::new(
-            "email".to_string(),
-            vec!["email".to_string()],
-            true, // unique
-            Arc::new(email_index),
-        );
 
         let table_with_secondary = table.with_secondary_index(secondary);
 
@@ -2910,17 +2823,8 @@ mod tests {
         // Verify primary index was built
         assert!(table.has_index(), "primary index should be built");
 
-        let email_index = hash_index::HashIndexBuilder::new(vec!["email".to_string()])
-            .allow_duplicates(false)
-            .build(&partitions)
-            .expect("index");
-
-        let secondary = SecondaryIndex::new(
-            "email".to_string(),
-            vec!["email".to_string()],
-            true,
-            Arc::new(email_index),
-        );
+        let secondary = SecondaryIndex::new("email".to_string(), vec!["email".to_string()]);
+        secondary.index.rebuild(&partitions).expect("index");
 
         let table_with_secondary = table.with_secondary_index(secondary);
 
@@ -3357,17 +3261,8 @@ mod tests {
         .expect("table");
 
         // Add secondary index on email
-        let email_index = hash_index::HashIndexBuilder::new(vec!["email".to_string()])
-            .allow_duplicates(false)
-            .build(&partitions)
-            .expect("email index");
-
-        let secondary = SecondaryIndex::new(
-            "email".to_string(),
-            vec!["email".to_string()],
-            true,
-            Arc::new(email_index),
-        );
+        let secondary = SecondaryIndex::new("email".to_string(), vec!["email".to_string()]);
+        secondary.index.rebuild(&partitions).expect("email index");
 
         let table = table.with_secondary_index(secondary);
 
