@@ -566,6 +566,8 @@ pub const RETIRED_DATASET_TUNING_PARAMS: &[&str] = &[
     "goal_query_latency",
     "cayenne_goal_convergence_window",
     "goal_convergence_window",
+    "cayenne_goal_qph",
+    "goal_qph",
 ];
 
 /// Catalog parameters that moved to `runtime.params` and are no longer read.
@@ -2741,6 +2743,8 @@ datasets:
         let params = HashMap::from([
             ("tuning".to_string(), "enabled".to_string()),
             ("goal_freshness".to_string(), "5s".to_string()),
+            ("cayenne_goal_qph".to_string(), "100".to_string()),
+            ("goal_qph".to_string(), "100".to_string()),
         ]);
         assert_eq!(
             retired_tuning_param_warnings(
@@ -2752,6 +2756,8 @@ datasets:
             vec![
                 "Dataset 'orders' sets `tuning`, which is no longer a dataset parameter, so it has no effect. Set `runtime.params.adaptive_tuning` instead. See: https://spiceai.org/docs/reference/spicepod/runtime".to_string(),
                 "Dataset 'orders' sets `goal_freshness`, which is no longer a dataset parameter, so it has no effect. Set `runtime.params.target_freshness` instead. See: https://spiceai.org/docs/reference/spicepod/runtime".to_string(),
+                "Dataset 'orders' sets `cayenne_goal_qph`, which is no longer a dataset parameter, so it has no effect. Set `runtime.params.target_qph` instead. See: https://spiceai.org/docs/reference/spicepod/runtime".to_string(),
+                "Dataset 'orders' sets `goal_qph`, which is no longer a dataset parameter, so it has no effect. Set `runtime.params.target_qph` instead. See: https://spiceai.org/docs/reference/spicepod/runtime".to_string(),
             ]
         );
         let params = HashMap::from([("cayenne_tuning".to_string(), "disabled".to_string())]);

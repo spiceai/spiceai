@@ -3103,8 +3103,8 @@ fn retention_period_never_reclaimed_warning(table_name: &str) -> String {
 const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
     ParameterSpec,
     S3_PARAMS_LEN,
-    64,
-    { S3_PARAMS_LEN + 64 },
+    65,
+    { S3_PARAMS_LEN + 65 },
 >(
     S3_PARAMETERS,
     [
@@ -3252,6 +3252,7 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
         ParameterSpec::component("goal_freshness").moved_to("runtime.params.target_freshness"),
         ParameterSpec::component("goal_query_latency").moved_to("runtime.params.target_query_latency"),
         ParameterSpec::component("goal_convergence_window").moved_to("runtime.params.target_convergence_window"),
+        ParameterSpec::component("goal_qph").moved_to("runtime.params.target_qph"),
         ParameterSpec::runtime("cdc_prefetch_buffer")
             .description("Per-dataset override for the CDC source-reader prefetch channel depth (envelopes)."),
         ParameterSpec::runtime("cdc_max_coalesced_envelopes")
@@ -7559,6 +7560,7 @@ mod tests {
             "goal_freshness",
             "goal_query_latency",
             "goal_convergence_window",
+            "goal_qph",
         ] {
             let spec = PARAMETERS
                 .iter()

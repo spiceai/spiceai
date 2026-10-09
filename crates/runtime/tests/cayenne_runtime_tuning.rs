@@ -183,7 +183,7 @@ async fn unprefixed_retired_dataset_params_are_not_applied_and_warn_once() {
         "rt_unprefixed",
         dir.path(),
         "",
-        "        tuning: enabled\n        goal_freshness: 5s\n",
+        "        tuning: enabled\n        goal_freshness: 5s\n        cayenne_goal_qph: \'100\'\n        goal_qph: \'100\'\n",
     );
     assert!(
         !dynamic_tuning_of("rt_unprefixed", &pod, dir.path()).await,
@@ -194,6 +194,8 @@ async fn unprefixed_retired_dataset_params_are_not_applied_and_warn_once() {
     for warning in [
         "Dataset 'rt_unprefixed' sets `tuning`, which is no longer a dataset parameter, so it has no effect. Set `runtime.params.adaptive_tuning` instead. See: https://spiceai.org/docs/reference/spicepod/runtime",
         "Dataset 'rt_unprefixed' sets `goal_freshness`, which is no longer a dataset parameter, so it has no effect. Set `runtime.params.target_freshness` instead. See: https://spiceai.org/docs/reference/spicepod/runtime",
+        "Dataset 'rt_unprefixed' sets `cayenne_goal_qph`, which is no longer a dataset parameter, so it has no effect. Set `runtime.params.target_qph` instead. See: https://spiceai.org/docs/reference/spicepod/runtime",
+        "Dataset 'rt_unprefixed' sets `goal_qph`, which is no longer a dataset parameter, so it has no effect. Set `runtime.params.target_qph` instead. See: https://spiceai.org/docs/reference/spicepod/runtime",
     ] {
         assert_eq!(
             logs.matches(warning).count(),
@@ -204,6 +206,8 @@ async fn unprefixed_retired_dataset_params_are_not_applied_and_warn_once() {
     for generic in [
         "Ignoring parameter `tuning`",
         "Ignoring parameter `goal_freshness`",
+        "Ignoring parameter `cayenne_goal_qph`",
+        "Ignoring parameter `goal_qph`",
     ] {
         assert!(
             !logs.contains(generic),
