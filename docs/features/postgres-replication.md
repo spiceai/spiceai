@@ -60,7 +60,7 @@ On managed Postgres services:
 Spice applies each `UPDATE` and `DELETE` to the row with the same primary key, so the key columns must be in every event:
 
 - The table has a **primary key** (default — nothing to do).
-- Or the table has no primary key: set `acceleration.primary_key` to columns that identify a row, and set `REPLICA IDENTITY FULL` so Postgres sends those columns:
+- Or the table has no primary key: set `acceleration.primary_key` to columns that identify a row, and make Postgres send those columns with every event — `REPLICA IDENTITY USING INDEX` on a unique index over them, or `REPLICA IDENTITY FULL`:
 
   ```sql
   ALTER TABLE public.users REPLICA IDENTITY FULL;
@@ -468,7 +468,7 @@ Dropping or renaming columns in use by Spice will require rebuilding the acceler
 | -------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | Error: *`Table public.X has REPLICA IDENTITY NOTHING`*                     | Run `ALTER TABLE public.X REPLICA IDENTITY DEFAULT;` if the table has a primary key. Otherwise run `ALTER TABLE public.X REPLICA IDENTITY FULL;` and set `acceleration.primary_key`. |
 | Error: *`Table public.X has no primary key and REPLICA IDENTITY DEFAULT`*  | Add a primary key, or run `ALTER TABLE public.X REPLICA IDENTITY FULL;` and set `acceleration.primary_key`.                                                               |
-| Error: *`Table public.X has no primary key, and refresh_mode: changes needs one`* | Set `acceleration.primary_key` to columns that identify a row, and run `ALTER TABLE public.X REPLICA IDENTITY FULL;`.                                             |
+| Error: *`Table public.X has no primary key, and refresh_mode: changes needs one`* | Set `acceleration.primary_key` to columns that identify a row. Postgres must send them with every change: run `ALTER TABLE public.X REPLICA IDENTITY FULL;`, or use `REPLICA IDENTITY USING INDEX` on a unique index over them. |
 | Error: *`Source table public.X does not exist`*                            | The fully qualified table in `from: postgres:<schema>.<table>` is wrong or the role lacks SELECT.                                                                       |
 | Error: *`replication slot "..." already exists`* on startup                | Another Spice replica is using the same slot name. Set `pg_replication_slot` uniquely, or ensure `SPICE_INSTANCE_ID` differs between replicas.                          |
 | Error mentioning *permission denied for database* during setup             | The role needs `CREATE` on the database, or you need to pre-create the publication/slot yourself.                                                                       |

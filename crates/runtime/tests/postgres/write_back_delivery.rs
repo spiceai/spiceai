@@ -56,8 +56,7 @@ use tokio_postgres::Client;
 use crate::cayenne::transaction::{describe, run_txn};
 use crate::postgres::common;
 use crate::utils::{
-    register_test_connectors, run_query, runtime_ready_check, test_request_context,
-    wait_until_true,
+    register_test_connectors, run_query, runtime_ready_check, test_request_context, wait_until_true,
 };
 use crate::{configure_test_datafusion, init_tracing};
 
@@ -586,9 +585,10 @@ async fn a_changes_dataset_loads_only_with_a_primary_key() -> Result<(), anyhow:
                  Cause: Cannot setup the dataset cdc_keyless (postgres) with an invalid configuration. \
                  Table `public.cdc_keyless` has no primary key, and `refresh_mode: changes` needs \
                  one to apply UPDATE and DELETE events. Set `acceleration.primary_key` to the \
-                 columns that identify a row, and run \
-                 `ALTER TABLE public.cdc_keyless REPLICA IDENTITY FULL;` so Postgres sends those \
-                 columns with every change."
+                 columns that identify a row. Postgres sends those columns with every change \
+                 only under `REPLICA IDENTITY FULL` (run \
+                 `ALTER TABLE public.cdc_keyless REPLICA IDENTITY FULL;`) or \
+                 `REPLICA IDENTITY USING INDEX` on a unique index over them."
             );
 
             for table in ["cdc_keyed", "cdc_source_key"] {

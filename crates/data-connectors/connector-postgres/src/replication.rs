@@ -39,6 +39,7 @@ use data_connector_api::federated::FederatedTableProvider;
 use data_connector_api::parameters::ConnectorContext;
 use datafusion::common::TableReference;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
+use datafusion_table_providers::util::column_reference::ColumnReference;
 use futures::StreamExt;
 use opentelemetry::KeyValue;
 use runtime_api_types::v1::ComponentType;
@@ -1416,14 +1417,14 @@ pub(crate) fn changes_dataset_lacks_primary_key(
         && acceleration
             .primary_key
             .as_ref()
-            .is_none_or(|pk| pk.is_empty())
+            .is_none_or(ColumnReference::is_empty)
         && data_components::inferred_schema::InferredSchema::from_metadata(schema.metadata())
             .primary_key
             .is_empty()
         && extract_primary_keys(provider).is_empty()
 }
 
-/// The fix for [`changes_dataset_lacks_primary_key`]: a declared key, plus the
+/// The fix for [`changes_dataset_lacks_primary_key`]: a declared key, plus a
 /// replica identity that makes Postgres send that key's columns with every
 /// UPDATE and DELETE.
 pub(crate) fn missing_primary_key_message(dataset: &DatasetSpec) -> String {
@@ -1441,9 +1442,10 @@ pub(crate) fn missing_primary_key_message(dataset: &DatasetSpec) -> String {
     format!(
         "Table `{schema_name}.{table_name}` has no primary key, and `refresh_mode: changes` needs \
          one to apply UPDATE and DELETE events. Set `acceleration.primary_key` to the columns \
-         that identify a row{on_conflict_note}, and run \
-         `ALTER TABLE {schema_name}.{table_name} REPLICA IDENTITY FULL;` so Postgres sends \
-         those columns with every change."
+         that identify a row{on_conflict_note}. Postgres sends those columns with every \
+         change only under `REPLICA IDENTITY FULL` (run \
+         `ALTER TABLE {schema_name}.{table_name} REPLICA IDENTITY FULL;`) or \
+         `REPLICA IDENTITY USING INDEX` on a unique index over them."
     )
 }
 
