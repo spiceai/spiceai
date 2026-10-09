@@ -3275,9 +3275,9 @@ fn cayenne_on_conflict_warning(
 
 /// The warning for a dataset on another accelerator that sets `on_conflict`.
 fn deprecated_on_conflict_warning(dataset_name: &str, acceleration: &Acceleration) -> String {
+    // File mode keeps CDC acceleration durable across restarts.
     let mode = if acceleration.mode != Mode::File
-        && (acceleration.mode == Mode::Memory
-            || acceleration.refresh_mode == Some(RefreshMode::Changes))
+        && acceleration.refresh_mode == Some(RefreshMode::Changes)
     {
         " with `mode: file`"
     } else {
@@ -3874,23 +3874,30 @@ mod tests {
 
         #[test]
         fn other_engines_are_told_on_conflict_is_removed_in_3_0() {
-            let mut acceleration = acceleration("duckdb", Some("upsert"));
-            acceleration.mode = Mode::File;
-            for refresh_mode in [None, Some(RefreshMode::Changes)] {
-                acceleration.refresh_mode = refresh_mode;
-                assert_eq!(
-                    deprecated_on_conflict_warning("orders", &acceleration),
-                    "Dataset 'orders' sets `acceleration.on_conflict`, which is deprecated and removed in 3.0. Use `engine: cayenne` to keep one row per primary key without it."
-                );
+            for engine in ["arrow", "duckdb"] {
+                let mut acceleration = acceleration(engine, Some("upsert"));
+                for (mode, refresh_mode) in [
+                    (Mode::File, None),
+                    (Mode::File, Some(RefreshMode::Changes)),
+                    (Mode::Memory, None),
+                    (Mode::Memory, Some(RefreshMode::Full)),
+                    (Mode::Memory, Some(RefreshMode::Append)),
+                ] {
+                    acceleration.mode = mode;
+                    acceleration.refresh_mode = refresh_mode;
+                    assert_eq!(
+                        deprecated_on_conflict_warning("orders", &acceleration),
+                        "Dataset 'orders' sets `acceleration.on_conflict`, which is deprecated and removed in 3.0. Use `engine: cayenne` to keep one row per primary key without it."
+                    );
+                }
             }
         }
 
         #[test]
-        fn memory_and_changes_recommend_persistent_cayenne() {
+        fn changes_recommend_persistent_cayenne() {
             let mut acceleration = acceleration("duckdb", Some("upsert"));
             assert_eq!(acceleration.mode, Mode::Memory);
             for (mode, refresh_mode) in [
-                (Mode::Memory, None),
                 (Mode::Memory, Some(RefreshMode::Changes)),
                 (Mode::FileCreate, Some(RefreshMode::Changes)),
                 (Mode::FileUpdate, Some(RefreshMode::Changes)),
