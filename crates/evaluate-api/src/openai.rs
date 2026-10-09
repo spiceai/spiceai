@@ -375,10 +375,18 @@ impl DecisionRequest {
 
         let state = self.input.to_state()?;
         let mut questions = BTreeMap::new();
+        let mut typed_choices = BTreeMap::new();
         let mut asked = Vec::with_capacity(self.questions.len());
         for (index, question) in self.questions.iter().enumerate() {
             let id = question_id(index);
             let (system_one, kind, name) = translate_question(index, question)?;
+            // A choice with a boolean option keeps each option's type for an `OpenAI`
+            // decision model. Any other choice's keys are its values.
+            if let AskedKind::Choice(options) = &kind
+                && let Some(types) = ChoiceTypes::of(options)
+            {
+                typed_choices.insert(id.clone(), types);
+            }
             questions.insert(id.clone(), system_one);
             asked.push(AskedQuestion { id, name, kind });
         }
@@ -390,6 +398,7 @@ impl DecisionRequest {
                 questions,
                 safety_identifier: self.safety_identifier.clone(),
                 reasoning_effort: self.reasoning_effort,
+                typed_choices,
             },
             asked,
         })
@@ -440,6 +449,82 @@ fn choice_key(value: &ChoiceValue, typed: bool) -> String {
         ChoiceValue::Bool(b) => b.to_string(),
         ChoiceValue::String(s) if typed => Value::String(s.clone()).to_string(),
         ChoiceValue::String(s) => s.clone(),
+    }
+}
+
+/// How a choice question with a boolean option was typed, so an `OpenAI` decision model
+/// can be sent each option as the caller sent it. The System One keys follow
+/// `choice_key`: a boolean is keyed `true` or `false`, and a string by its text, or by
+/// its JSON form when a boolean shares that text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ChoiceTypes {
+    false_option: bool,
+    true_option: bool,
+    /// Whether each string option is keyed by its JSON form.
+    json_keys: bool,
+}
+
+impl ChoiceTypes {
+    /// The types of a choice's options, given with their System One keys. `None` for a
+    /// choice without a boolean option, whose keys are its values.
+    fn of(options: &[(String, ChoiceValue)]) -> Option<Self> {
+        let (mut false_option, mut true_option) = (false, false);
+        for (_, value) in options {
+            match value {
+                ChoiceValue::Bool(true) => true_option = true,
+                ChoiceValue::Bool(false) => false_option = true,
+                ChoiceValue::String(_) => {}
+            }
+        }
+        (false_option || true_option).then(|| Self {
+            false_option,
+            true_option,
+            // A string keyed by its JSON form is one whose key is not its text.
+            json_keys: options
+                .iter()
+                .any(|(key, value)| matches!(value, ChoiceValue::String(text) if text != key)),
+        })
+    }
+
+    /// Whether the boolean `flag` is one of the options.
+    fn has(self, flag: bool) -> bool {
+        if flag {
+            self.true_option
+        } else {
+            self.false_option
+        }
+    }
+
+    /// The boolean option keyed `key`, if there is one.
+    fn boolean(self, key: &str) -> Option<bool> {
+        let flag = match key {
+            "true" => true,
+            "false" => false,
+            _ => return None,
+        };
+        self.has(flag).then_some(flag)
+    }
+
+    /// The value the caller sent for the option keyed `key`.
+    fn value(self, key: &str) -> Result<ChoiceValue, serde_json::Error> {
+        match self.boolean(key) {
+            Some(flag) => Ok(ChoiceValue::Bool(flag)),
+            None if self.json_keys => serde_json::from_str(key).map(ChoiceValue::String),
+            None => Ok(ChoiceValue::String(key.to_string())),
+        }
+    }
+
+    /// The key of the option sent as `value`, type included, or the value back when it
+    /// cannot name an option: a boolean that is not one, or a string with a boolean
+    /// option's text. A string's key is checked against the options with the rest of
+    /// the answer, by [`crate::check_answers`].
+    fn key(self, value: ChoiceValue) -> Result<String, ChoiceValue> {
+        match value {
+            ChoiceValue::Bool(flag) if self.has(flag) => Ok(flag.to_string()),
+            ChoiceValue::String(text) if self.json_keys => Ok(Value::String(text).to_string()),
+            ChoiceValue::String(text) if self.boolean(&text).is_none() => Ok(text),
+            value => Err(value),
+        }
     }
 }
 
@@ -736,9 +821,11 @@ fn foregone_answer(question: &Question) -> Option<Answer> {
 
 /// Builds the `OpenAI` decision request that asks `request`'s questions of `model`,
 /// naming each question by its System One id so its answer can be matched back, and
-/// forwarding the request's `safety_identifier`. A choice with a single option is left
-/// out, and [`decision_response_to_system_one`] answers it; when every question is one,
-/// the returned request has no questions and needs no call.
+/// forwarding the request's `safety_identifier`. A choice with a boolean option is sent
+/// the values the caller typed (`typed_choices`), and any other choice its keys. A
+/// choice with a single option is left out, and [`decision_response_to_system_one`]
+/// answers it; when every question is one, the returned request has no questions and
+/// needs no call.
 ///
 /// # Errors
 ///
@@ -815,16 +902,30 @@ pub fn system_one_to_decision_request(
                         ),
                     ));
                 }
+                // A choice with a boolean option is sent the caller's types, because
+                // `OpenAI` reads `true` and `"true"` as different values. Any other
+                // choice's keys are its values.
+                let types = request.typed_choices.get(id).copied();
+                let mut choices = Vec::with_capacity(criteria.len());
+                for (key, description) in criteria {
+                    let value = match types {
+                        Some(types) => types.value(key).map_err(|e| {
+                            InvalidDecisionRequest::new(
+                                format!("questions.{id}.criteria"),
+                                format!("Option '{key}' of '{id}' is not the JSON form of a string: {e}"),
+                            )
+                        })?,
+                        None => ChoiceValue::String(key.clone()),
+                    };
+                    choices.push(ChoiceOption {
+                        value,
+                        description: entry_text(description),
+                    });
+                }
                 DecisionQuestion::Choice {
                     name,
                     instructions: nullable_text(instructions).unwrap_or_default(),
-                    choices: criteria
-                        .iter()
-                        .map(|(value, description)| ChoiceOption {
-                            value: ChoiceValue::String(value.clone()),
-                            description: entry_text(description),
-                        })
-                        .collect(),
+                    choices,
                 }
             }
             Question::Score {
@@ -860,9 +961,9 @@ pub fn system_one_to_decision_request(
 /// # Errors
 ///
 /// Returns a description of the first answer that names no question, repeats one,
-/// carries a boolean choice for a string option, or labels a level with another
-/// level's label. The result still has to pass [`crate::check_answers`], which refuses
-/// a level outside the rubric.
+/// answers a choice with a boolean it does not have or with a boolean option's text,
+/// or labels a level with another level's label. The result still has to pass
+/// [`crate::check_answers`], which refuses a level or option outside the question.
 pub fn decision_response_to_system_one(
     request: &EvaluateRequest,
     response: DecisionResponse,
@@ -893,17 +994,38 @@ pub fn decision_response_to_system_one(
                 confidence,
                 ..
             } => {
-                let ChoiceValue::String(choice) = choice else {
-                    return Err(format!(
-                        "question '{id}': the choice is a boolean, but its options are strings"
-                    ));
+                // A choice with a boolean option was sent the caller's values, so its
+                // answer names each option by value, type included.
+                let types = request.typed_choices.get(&id).copied();
+                let choice = match (types, choice) {
+                    (Some(types), choice) => types.key(choice).map_err(|choice| {
+                        format!(
+                            "question '{id}': the model chose {}, which is not one of its options",
+                            choice_key(&choice, true)
+                        )
+                    })?,
+                    (None, ChoiceValue::String(choice)) => choice,
+                    (None, ChoiceValue::Bool(_)) => {
+                        return Err(format!(
+                            "question '{id}': the choice is a boolean, but its options are strings"
+                        ));
+                    }
                 };
                 let mut distribution = BTreeMap::new();
                 for entry in probabilities {
-                    let ChoiceValue::String(value) = entry.value else {
-                        return Err(format!(
-                            "question '{id}': a probability is for a boolean, but its options are strings"
-                        ));
+                    let value = match (types, entry.value) {
+                        (Some(types), value) => types.key(value).map_err(|value| {
+                            format!(
+                                "question '{id}': a probability is for {}, which is not one of its options",
+                                choice_key(&value, true)
+                            )
+                        })?,
+                        (None, ChoiceValue::String(value)) => value,
+                        (None, ChoiceValue::Bool(_)) => {
+                            return Err(format!(
+                                "question '{id}': a probability is for a boolean, but its options are strings"
+                            ));
+                        }
                     };
                     // A repeated option would otherwise keep its last probability and
                     // pass every later check.
@@ -1153,12 +1275,14 @@ mod tests {
         );
     }
 
-    /// `OpenAI` choice values are typed, so `true` and `"true"` are two options: both
-    /// reach the model as different options and come back with their own probability.
+    /// `OpenAI` choice values are typed, so `true` and `"true"` are two options. System
+    /// One keys are text, so there the string is keyed by its JSON form. An `OpenAI`
+    /// decision model is sent both values as the caller typed them, and its typed answer
+    /// reaches the caller with those types.
     #[test]
     fn a_boolean_and_a_string_with_the_same_text_are_different_choices() {
         let req = request(json!({
-            "model": "jev",
+            "model": "luna",
             "input": "x",
             "questions": [{"type": "choice", "instructions": "Which?", "choices": [
                 {"value": true}, {"value": "true"}, {"value": "maybe"}
@@ -1178,28 +1302,75 @@ mod tests {
             .expect("builds the upstream request");
         assert_eq!(
             serde_json::to_value(&upstream.questions).expect("serializes")[0]["choices"],
-            json!([{"value": "\"maybe\""}, {"value": "\"true\""}, {"value": "true"}])
+            json!([{"value": "maybe"}, {"value": "true"}, {"value": true}])
         );
 
-        let answers: BTreeMap<String, Answer> = serde_json::from_value(json!({
-            "q000": {"type": "choice", "choice": "\"true\"", "probabilities": {"true": 0.3, "\"true\"": 0.6, "\"maybe\"": 0.1}, "confidence": 0.4}
-        }))
-        .expect("answers");
-        let response = translated
-            .decision_response(EvaluateResponse {
-                model: "jev".into(),
-                answers,
-                usage: None,
-            })
-            .expect("maps back");
+        let answered = decision_response_to_system_one(
+            &translated.request,
+            serde_json::from_value(json!({
+                "model": "gpt-6-luna",
+                "answers": [{"type": "choice", "name": "q000", "choice": "true", "probabilities": [
+                    {"value": true, "probability": 0.25},
+                    {"value": "true", "probability": 0.625},
+                    {"value": "maybe", "probability": 0.125}
+                ], "confidence": 0.4}]
+            }))
+            .expect("response"),
+        )
+        .expect("reads back");
+        assert_eq!(
+            serde_json::to_value(&answered.answers).expect("serializes"),
+            json!({"q000": {"type": "choice", "choice": "\"true\"", "probabilities": {
+                "true": 0.25, "\"true\"": 0.625, "\"maybe\"": 0.125
+            }, "confidence": 0.4}})
+        );
+        crate::check_answers("luna", &translated.request.questions, &answered)
+            .expect("a valid answer");
+
+        let response = translated.decision_response(answered).expect("maps back");
         assert_eq!(
             serde_json::to_value(&response).expect("serializes"),
-            json!({"model": "jev", "answers": [{"type": "choice", "name": null, "choice": "true", "probabilities": [
-                {"value": true, "probability": 0.3},
-                {"value": "true", "probability": 0.6},
-                {"value": "maybe", "probability": 0.1}
+            json!({"model": "gpt-6-luna", "answers": [{"type": "choice", "name": null, "choice": "true", "probabilities": [
+                {"value": true, "probability": 0.25},
+                {"value": "true", "probability": 0.625},
+                {"value": "maybe", "probability": 0.125}
             ], "confidence": 0.4}]})
         );
+    }
+
+    /// An `OpenAI` decision model is sent typed options, so an answer that names an
+    /// option by another type names none of them. It is refused, not read by its text.
+    #[test]
+    fn an_answer_that_retypes_an_option_is_an_error() {
+        let translated = request(json!({
+            "model": "luna", "input": "x",
+            "questions": [{"type": "choice", "instructions": "Valid?", "choices": [{"value": true}, {"value": false}]}]
+        }))
+        .to_system_one()
+        .expect("translates");
+        for (answer, expected) in [
+            (
+                json!({"type": "choice", "name": "q000", "choice": "false", "probabilities": [
+                    {"value": true, "probability": 0.25}, {"value": false, "probability": 0.75}
+                ], "confidence": 0.5}),
+                r#"question 'q000': the model chose "false", which is not one of its options"#,
+            ),
+            (
+                json!({"type": "choice", "name": "q000", "choice": false, "probabilities": [
+                    {"value": "true", "probability": 0.25}, {"value": false, "probability": 0.75}
+                ], "confidence": 0.5}),
+                r#"question 'q000': a probability is for "true", which is not one of its options"#,
+            ),
+        ] {
+            let response: DecisionResponse =
+                serde_json::from_value(json!({"model": "gpt-6-luna", "answers": [answer]}))
+                    .expect("response");
+            assert_eq!(
+                decision_response_to_system_one(&translated.request, response)
+                    .expect_err("a re-typed option"),
+                expected
+            );
+        }
     }
 
     /// `OpenAI` asks a choice of at least two options. A single-option choice has one

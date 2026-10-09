@@ -197,6 +197,7 @@ impl Decider {
                         questions: questions.clone(),
                         safety_identifier: None,
                         reasoning_effort: None,
+                        typed_choices: BTreeMap::new(),
                     };
                     Arc::clone(&context).scope(async move {
                         // A refusal answers one question. Under `on_error => 'null'` only

@@ -8397,6 +8397,7 @@ name = "evaluate-api"
 version = "2.4.0-unstable"
 dependencies = [
  "async-trait",
+ "criterion 0.7.0",
  "schemars 1.2.1",
  "serde",
  "serde_json",

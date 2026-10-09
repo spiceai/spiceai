@@ -472,6 +472,14 @@ pub struct EvaluateRequest {
     #[serde(skip)]
     #[schemars(skip)]
     pub reasoning_effort: Option<ReasoningEffort>,
+    /// How an `OpenAI`-shaped caller typed each choice question with a boolean option, by
+    /// question id. Only `OpenAI` decision models read it: their choice values are typed,
+    /// so `true` and `"true"` are different values. A choice without a boolean option
+    /// needs none, because its keys are its values. Skipped in serde so a provider never
+    /// receives it.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub typed_choices: BTreeMap<String, openai::ChoiceTypes>,
 }
 
 /// Token usage reported by the provider.

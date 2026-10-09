@@ -493,6 +493,61 @@ mod tests {
         );
     }
 
+    /// A `/v1/decisions` choice with a boolean option reaches the model with the caller's
+    /// types, because `OpenAI` reads `true` and `"true"` as different values, and the
+    /// model's typed answer reaches the caller with the same types.
+    #[tokio::test]
+    async fn choices_reach_the_model_with_the_callers_types() {
+        let decision: DecisionRequest = serde_json::from_value(json!({
+            "model": "luna",
+            "input": "The refund went through twice.",
+            "questions": [
+                {"type": "choice", "name": "valid", "instructions": "Is the claim valid?", "choices": [{"value": true}, {"value": false}]},
+                {"type": "choice", "instructions": "Which?", "choices": [{"value": true, "description": "Yes"}, {"value": "true"}, {"value": "maybe"}]}
+            ]
+        }))
+        .expect("decision request");
+        let translated = decision.to_system_one().expect("translates");
+
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path("/v1/decisions"))
+            .and(body_json(json!({
+                "model": "gpt-6-luna",
+                "input": "The refund went through twice.",
+                "questions": [
+                    {"type": "choice", "name": "q000", "instructions": "Is the claim valid?", "choices": [{"value": false}, {"value": true}]},
+                    {"type": "choice", "name": "q001", "instructions": "Which?", "choices": [{"value": "maybe"}, {"value": "true"}, {"value": true, "description": "Yes"}]}
+                ]
+            })))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "model": "gpt-6-luna",
+                "answers": [
+                    {"type": "choice", "name": "q000", "choice": false, "probabilities": [{"value": true, "probability": 0.25}, {"value": false, "probability": 0.75}], "confidence": 0.5},
+                    {"type": "choice", "name": "q001", "choice": "true", "probabilities": [{"value": true, "probability": 0.25}, {"value": "true", "probability": 0.625}, {"value": "maybe", "probability": 0.125}], "confidence": 0.4}
+                ]
+            })))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let answered = client(&server)
+            .evaluate(translated.request.clone())
+            .await
+            .expect("answers");
+        let response = translated.decision_response(answered).expect("maps back");
+        assert_eq!(
+            serde_json::to_value(&response).expect("serializes"),
+            json!({
+                "model": "gpt-6-luna",
+                "answers": [
+                    {"type": "choice", "name": "valid", "choice": false, "probabilities": [{"value": true, "probability": 0.25}, {"value": false, "probability": 0.75}], "confidence": 0.5},
+                    {"type": "choice", "name": null, "choice": "true", "probabilities": [{"value": true, "probability": 0.25}, {"value": "true", "probability": 0.625}, {"value": "maybe", "probability": 0.125}], "confidence": 0.4}
+                ]
+            })
+        );
+    }
+
     /// An answer outside the question's options is a wrong result, not a success.
     #[tokio::test]
     async fn an_answer_outside_the_options_is_refused() {

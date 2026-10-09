@@ -404,6 +404,7 @@ mod tests {
                 questions,
                 safety_identifier: None,
                 reasoning_effort: None,
+                typed_choices: BTreeMap::new(),
             })
             .await
             .expect("evaluate succeeds");
@@ -441,6 +442,7 @@ mod tests {
                 questions: BTreeMap::new(),
                 safety_identifier: None,
                 reasoning_effort: None,
+                typed_choices: BTreeMap::new(),
             })
             .await
             .expect_err("empty questions");
@@ -476,6 +478,7 @@ mod tests {
                 questions,
                 safety_identifier: None,
                 reasoning_effort: None,
+                typed_choices: BTreeMap::new(),
             })
             .await
             .expect_err("401");
@@ -514,6 +517,7 @@ mod tests {
                 questions,
                 safety_identifier: None,
                 reasoning_effort: None,
+                typed_choices: BTreeMap::new(),
             })
             .await
             .expect_err("403");
@@ -549,6 +553,7 @@ mod tests {
                 questions,
                 safety_identifier: None,
                 reasoning_effort: None,
+                typed_choices: BTreeMap::new(),
             })
             .await
             .expect_err("404");
@@ -592,6 +597,7 @@ mod tests {
                 questions: noul_question("q"),
                 safety_identifier: None,
                 reasoning_effort: None,
+                typed_choices: BTreeMap::new(),
             })
             .await
             .expect_err("a missing answer must not be published as success");
@@ -622,6 +628,7 @@ mod tests {
                 questions: noul_question("q"),
                 safety_identifier: None,
                 reasoning_effort: None,
+                typed_choices: BTreeMap::new(),
             })
             .await
             .expect_err("a mismatched answer kind must not be published as success");
@@ -736,6 +743,7 @@ mod tests {
                 questions: choice_question("q"),
                 safety_identifier: None,
                 reasoning_effort: None,
+                typed_choices: BTreeMap::new(),
             })
             .await
             .expect_err("an out-of-domain choice must not be published");
@@ -781,6 +789,7 @@ mod tests {
                 questions: score_question("q", 4),
                 safety_identifier: None,
                 reasoning_effort: None,
+                typed_choices: BTreeMap::new(),
             })
             .await
             .expect("a sparse legend with a full distribution is valid");
@@ -811,6 +820,7 @@ mod tests {
                 questions: score_question("q", 2),
                 safety_identifier: None,
                 reasoning_effort: None,
+                typed_choices: BTreeMap::new(),
             })
             .await
             .expect_err("an out-of-range legend key must not be published");
@@ -845,6 +855,7 @@ mod tests {
                 questions: choice_question("q"),
                 safety_identifier: None,
                 reasoning_effort: None,
+                typed_choices: BTreeMap::new(),
             })
             .await
             .expect_err("probabilities summing to 0.3 must not be published");
@@ -872,6 +883,7 @@ mod tests {
                 questions: noul_question("q"),
                 safety_identifier: None,
                 reasoning_effort: None,
+                typed_choices: BTreeMap::new(),
             })
             .await
             .expect_err("an out-of-range noul must not be published");
@@ -901,6 +913,7 @@ mod tests {
                 questions: choice_question("q"),
                 safety_identifier: None,
                 reasoning_effort: None,
+                typed_choices: BTreeMap::new(),
             })
             .await
             .expect_err("out-of-range confidence must not be published");
@@ -933,6 +946,7 @@ mod tests {
                 questions: choice_question("q"),
                 safety_identifier: None,
                 reasoning_effort: None,
+                typed_choices: BTreeMap::new(),
             })
             .await
             .expect_err("an unknown probability key must not be published");
@@ -975,6 +989,7 @@ mod tests {
                 questions,
                 safety_identifier: None,
                 reasoning_effort: None,
+                typed_choices: BTreeMap::new(),
             })
             .await
             .expect_err("empty score criteria must fail closed");
@@ -1008,6 +1023,7 @@ mod tests {
                 questions: choice_question("q"),
                 safety_identifier: None,
                 reasoning_effort: None,
+                typed_choices: BTreeMap::new(),
             })
             .await
             .expect("a well-formed answer is still accepted");
@@ -1036,6 +1052,7 @@ mod tests {
                 questions: choice_question("q"),
                 safety_identifier: None,
                 reasoning_effort: None,
+                typed_choices: BTreeMap::new(),
             })
             .await
             .expect_err("a non-max choice must not be published");
@@ -1069,6 +1086,7 @@ mod tests {
                 questions: choice_question("q"),
                 safety_identifier: None,
                 reasoning_effort: None,
+                typed_choices: BTreeMap::new(),
             })
             .await
             .expect("a tied maximum is still a valid choice");
@@ -1099,6 +1117,7 @@ mod tests {
                 questions: score_question("q", 2),
                 safety_identifier: None,
                 reasoning_effort: None,
+                typed_choices: BTreeMap::new(),
             })
             .await
             .expect_err("a contradictory score must not be published");
@@ -1145,6 +1164,7 @@ mod tests {
                 questions,
                 safety_identifier: None,
                 reasoning_effort: None,
+                typed_choices: BTreeMap::new(),
             })
             .await
             .expect("a two-decimal rounded distribution is still valid");
@@ -1182,6 +1202,7 @@ mod tests {
                 questions: score_question("q", 10),
                 safety_identifier: None,
                 reasoning_effort: None,
+                typed_choices: BTreeMap::new(),
             })
             .await
             .expect("a rounded distribution with its exact score is a valid answer");
@@ -1216,6 +1237,7 @@ mod tests {
                 questions: score_question("q", 10),
                 safety_identifier: None,
                 reasoning_effort: None,
+                typed_choices: BTreeMap::new(),
             })
             .await
             .expect_err("a score half a level from its distribution must not be published");
@@ -1260,6 +1282,7 @@ mod tests {
                 )]),
                 safety_identifier: None,
                 reasoning_effort: None,
+                typed_choices: BTreeMap::new(),
             })
             .await
     }
@@ -1316,6 +1339,7 @@ mod tests {
                 questions: score_question("q", 10),
                 safety_identifier: None,
                 reasoning_effort: None,
+                typed_choices: BTreeMap::new(),
             })
             .await
             .expect_err("a score of 8.8 contradicts a one-hot distribution on level 9");
@@ -1355,6 +1379,7 @@ mod tests {
                 questions,
                 safety_identifier: None,
                 reasoning_effort: None,
+                typed_choices: BTreeMap::new(),
             })
             .await
             .expect_err("503");
@@ -1388,6 +1413,7 @@ mod tests {
                 questions,
                 safety_identifier: None,
                 reasoning_effort: None,
+                typed_choices: BTreeMap::new(),
             })
             .await
             .expect_err("transport failure");
