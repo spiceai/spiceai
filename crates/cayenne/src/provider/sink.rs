@@ -1469,11 +1469,13 @@ mod tests {
                 assert_eq!(keyed_rows(&ctx, &provider).await, [(1, 20)], "{name}");
             } else {
                 let error = result.expect_err(&name);
-                assert!(
-                    error
-                        .to_string()
-                        .contains("cannot order a key's copies by version"),
-                    "{name}: {error}"
+                let DataFusionError::Execution(message) = &error else {
+                    panic!("{name}: expected the sink's refusal, got {error}");
+                };
+                assert_eq!(
+                    message,
+                    "Cayenne table 'versioned' holds rows, so this refresh's append cannot order a key's copies by version against them; the refresh was not applied and the next one resolves them before writing.",
+                    "{name}"
                 );
                 let unchanged = if holds_rows { vec![(9, 1)] } else { Vec::new() };
                 assert_eq!(keyed_rows(&ctx, &provider).await, unchanged, "{name}");
