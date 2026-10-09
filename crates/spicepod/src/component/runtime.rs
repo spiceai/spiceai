@@ -533,6 +533,27 @@ impl Default for TelemetryConfig {
 /// Docs page for the `runtime.params` keys, linked from tuning diagnostics.
 pub const RUNTIME_PARAMS_DOCS_URL: &str = "https://spiceai.org/docs/reference/spicepod/runtime";
 
+/// The runtime-wide switch for adaptive tuning, under `runtime.params`.
+pub const ADAPTIVE_TUNING_PARAM: &str = "adaptive_tuning";
+
+/// The runtime-wide targets the adaptive controller steers toward, under `runtime.params`.
+/// They steer the closed loop and never turn it on.
+pub const TUNING_TARGET_PARAMS: &[&str] = &[
+    "target_replication_lag",
+    "target_freshness",
+    "target_query_latency",
+    "target_convergence_window",
+    "target_qph",
+];
+
+/// Whether `runtime.params` sets any of [`TUNING_TARGET_PARAMS`].
+#[must_use]
+pub fn tuning_targets_set<S: std::hash::BuildHasher>(params: &HashMap<String, String, S>) -> bool {
+    TUNING_TARGET_PARAMS
+        .iter()
+        .any(|key| params.contains_key(*key))
+}
+
 /// Validate `runtime.params.adaptive_tuning`: `enabled` or `disabled`, ignoring case and
 /// surrounding whitespace. An unset parameter is valid (it means `disabled`).
 ///
@@ -542,7 +563,7 @@ pub const RUNTIME_PARAMS_DOCS_URL: &str = "https://spiceai.org/docs/reference/sp
 pub fn validate_tuning_param<S: std::hash::BuildHasher>(
     params: &HashMap<String, String, S>,
 ) -> Result<(), String> {
-    let Some(value) = params.get("adaptive_tuning") else {
+    let Some(value) = params.get(ADAPTIVE_TUNING_PARAM) else {
         return Ok(());
     };
     let mode = value.trim();

@@ -63,18 +63,6 @@ const CAYENNE_SORT_MERGE_MEMORY_POOL_FRACTION_PARAM: &str =
 const CAYENNE_FILTER_PROPAGATION_PARAM: &str = "cayenne_filter_propagation";
 const CAYENNE_OPTIMIZER_RULES_PARAM: &str = "cayenne_optimizer_rules";
 
-/// Runtime-wide adaptive-tuning parameters: the tuning mode and the SLO setpoints
-/// (`target_*`) the closed loop steers toward. Declared here so the keys are part of the
-/// recognized `runtime.params` vocabulary and don't false-warn as unknown; the values
-/// are resolved (and validated) where the per-dataset Cayenne config is built, and
-/// `adaptive_tuning` is also validated when the Spicepod loads.
-const ADAPTIVE_TUNING_PARAM: &str = "adaptive_tuning";
-const TARGET_REPLICATION_LAG_PARAM: &str = "target_replication_lag";
-const TARGET_FRESHNESS_PARAM: &str = "target_freshness";
-const TARGET_QUERY_LATENCY_PARAM: &str = "target_query_latency";
-const TARGET_CONVERGENCE_WINDOW_PARAM: &str = "target_convergence_window";
-const TARGET_QPH_PARAM: &str = "target_qph";
-
 /// Process-global `SQLite` metastore pragma tuning keys (cache, mmap, busy
 /// timeout, WAL autocheckpoint, `auto_vacuum`). Consumed once at startup in
 /// `build_internal`; declared here so they're part of the recognized
@@ -123,15 +111,9 @@ const KNOWN_CAYENNE_RUNTIME_PARAMS: &[&str] = &[
     CAYENNE_METASTORE_INCREMENTAL_VACUUM_PAGES_PARAM,
 ];
 
-/// Runtime-wide tuning keys, which carry no `cayenne_` prefix.
-const TUNING_RUNTIME_PARAMS: &[&str] = &[
-    ADAPTIVE_TUNING_PARAM,
-    TARGET_REPLICATION_LAG_PARAM,
-    TARGET_FRESHNESS_PARAM,
-    TARGET_QUERY_LATENCY_PARAM,
-    TARGET_CONVERGENCE_WINDOW_PARAM,
-    TARGET_QPH_PARAM,
-];
+/// Runtime-wide tuning switch, which carries no `cayenne_` prefix. The `target_*` keys it steers
+/// toward are `spicepod::component::runtime::TUNING_TARGET_PARAMS`.
+const TUNING_RUNTIME_PARAMS: &[&str] = &[spicepod::component::runtime::ADAPTIVE_TUNING_PARAM];
 
 /// Recognized `runtime.params` keys that don't belong to a larger prefix
 /// family (the family lists live next to the code that consumes them:
@@ -163,10 +145,12 @@ fn known_runtime_params() -> Vec<&'static str> {
             + dataconnector::http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS.len()
             + crate::cluster::CLUSTER_GRPC_RUNTIME_PARAMS.len()
             + TUNING_RUNTIME_PARAMS.len()
+            + spicepod::component::runtime::TUNING_TARGET_PARAMS.len()
             + MISC_RUNTIME_PARAMS.len(),
     );
     known.extend_from_slice(KNOWN_CAYENNE_RUNTIME_PARAMS);
     known.extend_from_slice(TUNING_RUNTIME_PARAMS);
+    known.extend_from_slice(spicepod::component::runtime::TUNING_TARGET_PARAMS);
     known.extend_from_slice(crate::accelerated::refresh_task::changes::CDC_RUNTIME_PARAMS);
     known.extend_from_slice(dataconnector::http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS);
     known.extend_from_slice(crate::cluster::CLUSTER_GRPC_RUNTIME_PARAMS);
@@ -3634,6 +3618,7 @@ mod test {
             .chain(crate::accelerated::refresh_task::changes::CDC_RUNTIME_PARAMS)
             .chain(dataconnector::http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS)
             .chain(TUNING_RUNTIME_PARAMS)
+            .chain(spicepod::component::runtime::TUNING_TARGET_PARAMS)
             .chain(MISC_RUNTIME_PARAMS);
         for key in family_keys {
             assert!(

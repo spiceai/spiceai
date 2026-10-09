@@ -92,6 +92,59 @@ pub const PARAMETERS: &[ParameterSpec] = &[
     ParameterSpec::component("goal_qph").moved_to("runtime.params.target_qph"),
 ];
 
+/// What `parse_provider_config` resolves when no Cayenne accelerator is linked. Only the
+/// engine can seed the controller, so `enabled` cannot be honoured here: say so rather than
+/// quietly serving a statically-tuned catalog, which is the same configuration an operator
+/// would get by setting `disabled`.
+///
+/// The engine owns the `adaptive_tuning` vocabulary; the two names are recognized here only
+/// to decide which warning a build that cannot ask should emit, so that a typo is still
+/// reported rather than passing as a valid mode.
+fn outcome_without_accelerator(
+    runtime_params: &HashMap<String, String>,
+) -> data_accelerator_api::AdaptiveTuningOutcome {
+    let value = runtime_params
+        .get("adaptive_tuning")
+        .map(|v| v.trim())
+        .unwrap_or_default();
+    if value.eq_ignore_ascii_case("enabled") {
+        tracing::warn!(
+            "`runtime.params.adaptive_tuning` is `enabled`, but this build links no Cayenne accelerator to size the controller, so this catalog runs with static tuning (`disabled`) instead. Link the `accelerator-cayenne` crate to enable adaptive tuning. See: https://spiceai.org/docs/components/catalogs/cayenne"
+        );
+    }
+    data_accelerator_api::AdaptiveTuningOutcome {
+        tuning_value_invalid: !value.is_empty()
+            && !value.eq_ignore_ascii_case("disabled")
+            && !value.eq_ignore_ascii_case("enabled"),
+        seeds: None,
+        targets: data_accelerator_api::TuningTargets::default(),
+    }
+}
+
+/// The warning for `runtime.params.target_*` set while adaptive tuning is not on: a target
+/// steers the closed loop and never turns it on.
+fn ignored_targets_warning(
+    catalog_name: Option<&str>,
+    runtime_params: &HashMap<String, String>,
+    outcome: &data_accelerator_api::AdaptiveTuningOutcome,
+) -> Option<String> {
+    // Decided from the requested mode and the keys the operator set, not from what the
+    // engine resolved: a build with no accelerator resolves neither, and a request the
+    // build cannot honour has its own warning. An invalid mode is reported separately.
+    let requested = runtime_params
+        .get(spicepod::component::runtime::ADAPTIVE_TUNING_PARAM)
+        .is_some_and(|value| value.trim().eq_ignore_ascii_case("enabled"));
+    (!requested
+        && !outcome.tuning_value_invalid
+        && spicepod::component::runtime::tuning_targets_set(runtime_params))
+    .then(|| {
+        format!(
+            "`runtime.params.target_*` is set but `runtime.params.adaptive_tuning` is `disabled`, so catalog '{}' ignores the targets. Set `runtime.params.adaptive_tuning` to `enabled` to enable target-seeking. See: https://spiceai.org/docs/reference/spicepod/runtime",
+            catalog_name.unwrap_or_default()
+        )
+    })
+}
+
 /// A catalog connector for Cayenne lakehouse catalogs.
 ///
 /// Cayenne catalogs provide a high-performance lakehouse format combining:
@@ -278,36 +331,11 @@ impl CayenneCatalogConnector {
                 .adaptive_tuning_seeds(runtime_params, &data_path, &metastore_path)
                 .await
         } else {
-            // This catalog builds its provider from the `cayenne` library, so it works in a
-            // binary that links no Cayenne *accelerator* — but only the engine can seed the
-            // controller, so `enabled` cannot be honoured here. Say so rather than quietly
-            // serving a statically-tuned catalog, which is the same configuration an
-            // operator would get by setting `disabled`.
-            //
-            // The engine owns the `adaptive_tuning` vocabulary; the two names are recognized here
-            // only to decide which warning a build that cannot ask should emit, so that a
-            // typo is still reported rather than passing as a valid mode.
-            let value = raw_tuning.map(str::trim).unwrap_or_default();
-            if value.eq_ignore_ascii_case("enabled") {
-                tracing::warn!(
-                    "`runtime.params.adaptive_tuning` is `enabled`, but this build links no Cayenne accelerator to size the controller, so this catalog runs with static tuning (`disabled`) instead. Link the `accelerator-cayenne` crate to enable adaptive tuning. See: https://spiceai.org/docs/components/catalogs/cayenne"
-                );
-            }
-            data_accelerator_api::AdaptiveTuningOutcome {
-                tuning_value_invalid: !value.is_empty()
-                    && !value.eq_ignore_ascii_case("disabled")
-                    && !value.eq_ignore_ascii_case("enabled"),
-                seeds: None,
-                targets: data_accelerator_api::TuningTargets::default(),
-            }
+            outcome_without_accelerator(runtime_params)
         };
 
-        // A target steers the closed loop and never turns it on.
-        if outcome.targets.any_set() && outcome.seeds.is_none() {
-            tracing::warn!(
-                "`runtime.params.target_*` is set but `runtime.params.adaptive_tuning` is `disabled`, so catalog '{}' ignores the targets. Set `runtime.params.adaptive_tuning` to `enabled` to enable target-seeking. See: https://spiceai.org/docs/reference/spicepod/runtime",
-                catalog_name.unwrap_or_default()
-            );
+        if let Some(warning) = ignored_targets_warning(catalog_name, runtime_params, &outcome) {
+            tracing::warn!("{warning}");
         }
 
         if outcome.tuning_value_invalid {
@@ -528,6 +556,35 @@ mod tests {
             config.pk_conflict_detection,
             Some(cayenne::metadata::PkConflictDetection::None)
         );
+    }
+
+    fn targets_warning_without_accelerator(runtime_params: &[(&str, &str)]) -> Option<String> {
+        let runtime_params: HashMap<String, String> = runtime_params
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+            .collect();
+        let outcome = outcome_without_accelerator(&runtime_params);
+        ignored_targets_warning(Some("warehouse"), &runtime_params, &outcome)
+    }
+
+    #[test]
+    fn targets_without_adaptive_tuning_are_reported_without_a_linked_accelerator() {
+        let warning = targets_warning_without_accelerator(&[("target_freshness", "5s")])
+            .expect("targets set while adaptive tuning is disabled must be reported");
+        assert_eq!(
+            warning,
+            "`runtime.params.target_*` is set but `runtime.params.adaptive_tuning` is `disabled`, so catalog 'warehouse' ignores the targets. Set `runtime.params.adaptive_tuning` to `enabled` to enable target-seeking. See: https://spiceai.org/docs/reference/spicepod/runtime"
+        );
+        // Requested but unavailable: the missing-accelerator warning covers it, so the
+        // targets are not also reported as ignored by a `disabled` switch.
+        assert_eq!(
+            targets_warning_without_accelerator(&[
+                ("adaptive_tuning", "enabled"),
+                ("target_freshness", "5s"),
+            ]),
+            None
+        );
+        assert_eq!(targets_warning_without_accelerator(&[]), None);
     }
 
     #[tokio::test]

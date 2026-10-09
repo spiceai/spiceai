@@ -106,11 +106,16 @@ fn spicepod(
          \x20     params:\n\
          \x20       cayenne_file_path: {data}\n\
          \x20       cayenne_metadata_dir: {meta}\n\
-         \x20       cayenne_compaction_background_interval_ms: '10000'\n\
+         {interval}\
          {dataset_params}",
         csv = csv.display(),
         data = dir.join("data").display(),
         meta = dir.join("metadata").display(),
+        interval = if dataset_params.contains("cayenne_compaction_background_interval_ms") {
+            ""
+        } else {
+            "        cayenne_compaction_background_interval_ms: '10000'\n"
+        },
     )
 }
 
@@ -214,6 +219,37 @@ async fn unprefixed_retired_dataset_params_are_not_applied_and_warn_once() {
             "the generic unsupported-parameter warning must not repeat it, logs: {logs}"
         );
     }
+}
+
+#[tokio::test(flavor = "multi_thread")]
+async fn compaction_fallback_with_targets_is_one_warning_and_not_reported_as_disabled() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let pod = spicepod(
+        "rt_fallback",
+        dir.path(),
+        "    adaptive_tuning: enabled\n    target_freshness: 5s\n",
+        "        cayenne_compaction_background_interval_ms: '0'\n",
+    );
+    assert!(
+        !dynamic_tuning_of("rt_fallback", &pod, dir.path()).await,
+        "background compaction off must fall back to static tuning"
+    );
+
+    let logs = logged();
+    assert!(
+        !logs.contains("`runtime.params.adaptive_tuning` is `disabled`, so dataset 'rt_fallback'"),
+        "targets set with `adaptive_tuning: enabled` must not be reported as ignored by `disabled`, logs: {logs}"
+    );
+    let fallback = "Dataset 'rt_fallback' cannot use adaptive tuning because";
+    assert_eq!(
+        logs.matches(fallback).count(),
+        1,
+        "expected exactly one fallback warning, logs: {logs}"
+    );
+    assert!(
+        logs.contains("The `runtime.params.target_*` targets are ignored too."),
+        "the fallback warning must say the targets are ignored too, logs: {logs}"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread")]

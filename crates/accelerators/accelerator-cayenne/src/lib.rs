@@ -626,6 +626,20 @@ fn parse_tuning_targets(
     }
 }
 
+/// The warning for a dataset that asked for adaptive tuning while background compaction is
+/// off. `targets_set` appends that the `target_*` targets are ignored too, so one message
+/// covers both.
+fn compaction_fallback_warning(table_name: &str, targets_set: bool) -> String {
+    let targets = if targets_set {
+        " The `runtime.params.target_*` targets are ignored too."
+    } else {
+        ""
+    };
+    format!(
+        "Dataset '{table_name}' cannot use adaptive tuning because `cayenne_compaction_background_interval_ms` is 0 and the tuner runs on the background compaction tick, so it uses static tuning even though `runtime.params.adaptive_tuning` is `enabled`.{targets} Set `cayenne_compaction_background_interval_ms` to a non-zero value to enable adaptive tuning for it."
+    )
+}
+
 const SMALL_WRITE_COMPACTION_TRIGGER_FILES: usize = 4;
 const SMALL_WRITE_COMPACTION_TRIGGER_PROTECTED_SNAPSHOTS: usize = 4;
 const SMALL_WRITE_COMPACTION_TRIGGER_SNAPSHOT_AGE_MS: u64 = 60_000;
@@ -2245,12 +2259,18 @@ impl CayenneAccelerator {
                     "`runtime.params.adaptive_tuning` is `enabled`: no inferred schema metadata available for this table (the source may not expose catalog metadata or the connection role lacks read access); starting from the hardware-derived config and adapting from observed ingest."
                 );
             }
+            // The targets are parsed first because the compaction fallback below mentions them.
+            let targets = parse_tuning_targets(runtime_params);
+            // Whether the operator asked for the closed loop, before any fallback turns it
+            // off: targets are inert only when it was not asked for.
+            let requested_adaptive = config.dynamic_tuning;
             // The closed-loop controller rides the per-table background compaction
             // task's tick; with that task disabled (interval == 0) it would never
             // run (nor emit the autotune gauges), so adaptive falls back to static tuning.
             if config.dynamic_tuning && config.compaction_background_interval_ms == 0 {
                 tracing::warn!(
-                    "Dataset '{table_name}' cannot use adaptive tuning because `cayenne_compaction_background_interval_ms` is 0 and the tuner runs on the background compaction tick, so it uses static tuning even though `runtime.params.adaptive_tuning` is `enabled`. Set `cayenne_compaction_background_interval_ms` to a non-zero value to enable adaptive tuning for it."
+                    "{}",
+                    compaction_fallback_warning(table_name, targets.any_set())
                 );
                 config.dynamic_tuning = false;
             }
@@ -2260,7 +2280,6 @@ impl CayenneAccelerator {
             // targets steer the closed loop but never ENABLE it: `adaptive` is reached
             // only by `runtime.params.adaptive_tuning: enabled`, so a target set without it is
             // inert and warns below. Query latency is stored in ms.
-            let targets = parse_tuning_targets(runtime_params);
             config.goal_replication_lag_secs = targets.replication_lag_secs;
             config.goal_freshness_secs = targets.freshness_secs;
             config.goal_query_latency_ms = targets.query_latency_ms;
@@ -2272,7 +2291,7 @@ impl CayenneAccelerator {
             // loop is off is reported as ignored (below, under the newly-resolved
             // guard so a dataset that keeps failing to load does not repeat it)
             // rather than silently promoting the table into a different regime.
-            let targets_are_inert = any_target && !config.dynamic_tuning;
+            let targets_are_inert = any_target && !requested_adaptive;
             if config.dynamic_tuning {
                 tracing::warn!(
                     target: "spiced::acceleration::cayenne",
@@ -7452,6 +7471,34 @@ mod tests {
     /// Adaptive tuning stays `disabled` unless `runtime.params.adaptive_tuning` is `enabled`. A `target_*`
     /// SLO expresses a target, not a choice of controller, so it must leave the closed
     /// loop off.
+    #[test]
+    fn test_every_runtime_target_param_is_parsed() {
+        for key in spicepod::component::runtime::TUNING_TARGET_PARAMS {
+            let params = std::collections::HashMap::from([((*key).to_string(), "5".to_string())]);
+            assert!(
+                parse_tuning_targets(&params).any_set(),
+                "`{key}` is a runtime target but the accelerator does not read it"
+            );
+        }
+    }
+
+    #[test]
+    fn test_compaction_fallback_warning_mentions_targets_only_when_set() {
+        let without = compaction_fallback_warning("orders", false);
+        assert_eq!(
+            without,
+            "Dataset 'orders' cannot use adaptive tuning because `cayenne_compaction_background_interval_ms` is 0 and the tuner runs on the background compaction tick, so it uses static tuning even though `runtime.params.adaptive_tuning` is `enabled`. Set `cayenne_compaction_background_interval_ms` to a non-zero value to enable adaptive tuning for it."
+        );
+        let with = compaction_fallback_warning("orders", true);
+        assert!(
+            with.contains(
+                "is `enabled`. The `runtime.params.target_*` targets are ignored too. Set"
+            ),
+            "{with}"
+        );
+        assert!(!with.contains("is `disabled`"));
+    }
+
     #[tokio::test]
     async fn test_targets_do_not_enable_adaptive_tuning() {
         let config = tuning_config("global_target", &[("target_replication_lag", "5s")], &[])
