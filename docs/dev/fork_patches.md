@@ -495,8 +495,8 @@ Upstream [64bit/async-openai](https://github.com/64bit/async-openai).
 
 ## clickhouse-rs
 
-Upstream [gengteng/clickhouse-rs](https://github.com/gengteng/clickhouse-rs), pinned
-by revision on branch `async-await`.
+Upstream [gengteng/clickhouse-rs](https://github.com/gengteng/clickhouse-rs), branch
+`async-await`.
 
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|
