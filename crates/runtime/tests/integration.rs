@@ -84,6 +84,7 @@ mod cayenne;
 mod cayenne_catalog_ddl;
 #[cfg(feature = "duckdb")]
 mod clickbench;
+mod clickhouse;
 mod cluster;
 mod cors;
 #[cfg(feature = "cosmosdb")]
