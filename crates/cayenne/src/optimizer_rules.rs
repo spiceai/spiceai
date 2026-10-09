@@ -2287,7 +2287,7 @@ mod tests {
     };
     use crate::provider::CayenneAccelerationExec;
     use crate::provider::scan::ScanDynamicFilter;
-    use arrow::array::{Decimal128Array, Int32Array, Int64Array, StringArray};
+    use arrow::array::{ArrayRef, Decimal128Array, Int32Array, Int64Array, StringArray};
     use arrow::datatypes::{DataType, Field, Schema};
     use arrow::record_batch::RecordBatch;
     use datafusion::common::{JoinType, NullEquality};
@@ -3519,6 +3519,29 @@ mod tests {
             path,
             Precision::Exact(ANTI_JOIN_SORT_MERGE_MIN_ROWS + 1),
         )
+    }
+
+    /// A Cayenne scan of a `mode: memory` table: a `DataSourceExec` over
+    /// in-memory batches with no file behind it, so the scan carries no
+    /// file-scan identity. `rows` rows of `schema`, every column a running
+    /// `Int64`.
+    fn memory_mode_cayenne_exec(schema: &Arc<Schema>, rows: usize) -> Arc<dyn ExecutionPlan> {
+        let row_count = i64::try_from(rows).expect("row count should fit in i64");
+        let columns = schema
+            .fields()
+            .iter()
+            .map(|_| Arc::new(Int64Array::from_iter_values(0..row_count)) as ArrayRef)
+            .collect::<Vec<_>>();
+        let batch = RecordBatch::try_new(Arc::clone(schema), columns)
+            .expect("the batch should match its schema");
+        let memory = MemorySourceConfig::try_new_exec(&[vec![batch]], Arc::clone(schema), None)
+            .expect("the memory source should accept the batch");
+        let scan = CayenneAccelerationExec::new(memory);
+        assert!(
+            scan.scan_identity().is_none(),
+            "a memory-mode scan carries no file-scan identity"
+        );
+        Arc::new(scan)
     }
 
     fn order_line_schema() -> Arc<Schema> {
@@ -6085,6 +6108,63 @@ mod tests {
         assert!(
             optimized.is::<SortMergeJoinExec>(),
             "a large inner hash join over the memory gate should become a sort-merge join"
+        );
+    }
+
+    /// A `mode: memory` table scans in-memory batches, which carry no file-scan
+    /// identity; the hash table its join builds is as non-spillable as a
+    /// `mode: file` one, so the memory gate must evaluate it the same way.
+    /// Regression test for #14521.
+    #[test]
+    fn rewrites_large_inner_hash_join_over_memory_mode_scans_under_memory_gate() {
+        let schema = order_line_schema();
+        // 4,096 rows × 24 bytes × the 2.5 hash-table factor ≈ 240 KiB of build.
+        let left = memory_mode_cayenne_exec(&schema, 4096);
+        let right = memory_mode_cayenne_exec(&schema, 4096);
+        let join = Arc::new(hash_join_with_join_type(
+            left,
+            right,
+            "order_id",
+            "order_id",
+            JoinType::Inner,
+            NullEquality::NullEqualsNothing,
+        ));
+        // 1 MiB pool × 0.125 = 128 KiB gate, below the ~240 KiB build.
+        let config = config_with_cayenne_optimizer(None, Some(0.125), Some(1024 * 1024));
+
+        let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
+
+        assert!(
+            optimized.is::<SortMergeJoinExec>(),
+            "a large inner hash join over memory-mode Cayenne scans should become a sort-merge join, got {}",
+            displayable(optimized.as_ref()).indent(true)
+        );
+    }
+
+    /// The same memory-mode join under a pool its build side fits stays a hash
+    /// join: the gate, not the table's mode, decides the rewrite.
+    #[test]
+    fn leaves_memory_mode_inner_hash_join_when_build_estimate_fits_memory_gate() {
+        let schema = order_line_schema();
+        let left = memory_mode_cayenne_exec(&schema, 4096);
+        let right = memory_mode_cayenne_exec(&schema, 4096);
+        let join = Arc::new(hash_join_with_join_type(
+            left,
+            right,
+            "order_id",
+            "order_id",
+            JoinType::Inner,
+            NullEquality::NullEqualsNothing,
+        ));
+        // 64 MiB pool × 0.125 = 8 MiB gate, far above the ~240 KiB build.
+        let config = config_with_cayenne_optimizer(None, Some(0.125), Some(64 * 1024 * 1024));
+
+        let optimized = optimize_anti_join_sort_merge_with_config(join, &config);
+
+        assert!(
+            optimized.is::<HashJoinExec>(),
+            "a memory-mode join whose build side fits the gate should stay a hash join, got {}",
+            displayable(optimized.as_ref()).indent(true)
         );
     }
 
