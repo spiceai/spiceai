@@ -27,7 +27,7 @@ limitations under the License.
 
 use std::collections::HashMap;
 use std::hash::BuildHasher;
-use std::num::NonZeroU32;
+use std::num::{NonZeroU32, ParseFloatError};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, LazyLock, RwLock as StdRwLock};
 use std::time::Duration;
@@ -287,27 +287,12 @@ impl HttpRateControlConfig {
             );
         }
         if self.has_limit() && requested.has_limit() {
-            let (existing_threshold, requested_threshold) = (
-                self.adaptive.failure_threshold(),
-                requested.adaptive.failure_threshold(),
+            compare(
+                "rate_control_failure_threshold",
+                format_failure_threshold(self.adaptive.failure_threshold()),
+                format_failure_threshold(requested.adaptive.failure_threshold()),
+                None,
             );
-            if !same_failure_threshold(existing_threshold, requested_threshold) {
-                let (mut existing_value, mut requested_value) = (
-                    format_failure_threshold(existing_threshold),
-                    format_failure_threshold(requested_threshold),
-                );
-                // Only thresholds a few ulps beyond one setting read the same.
-                if existing_value == requested_value {
-                    existing_value = format!("{existing_threshold:?}");
-                    requested_value = format!("{requested_threshold:?}");
-                }
-                compare(
-                    "rate_control_failure_threshold",
-                    existing_value,
-                    requested_value,
-                    None,
-                );
-            }
 
             // Name the cluster default only when it shaped one of the values.
             let resolved_by_cluster = cluster_window.is_some_and(|cluster_window| {
@@ -368,26 +353,40 @@ fn format_duration(duration: Duration) -> String {
     }
 }
 
-/// Whether two failure thresholds are one setting. The same error rate written
-/// as a percentage and as a fraction (`33.3%` and `0.333`) parses to floats an
-/// ulp or two apart, which throttle identically.
-fn same_failure_threshold(a: f64, b: f64) -> bool {
-    (a - b).abs() <= 4.0 * f64::EPSILON * a.abs().max(b.abs())
-}
-
 /// A failure threshold as the conflict error quotes it: a percentage to the
-/// fewest decimal places that still read back as the same threshold, such as
-/// `10%`, `33.3%` or `99.99995%`.
+/// fewest decimal places that parse back to exactly this threshold, such as
+/// `10%`, `33.3%` or `99.99995%`, or else the fraction itself. The text is
+/// exact, so two thresholds quote the same only when they are equal.
 fn format_failure_threshold(failure_threshold: f64) -> String {
     let percent = failure_threshold * 100.0;
-    let text = (0..=15)
+    (0..=15)
         .map(|decimals| format!("{percent:.decimals$}"))
         .find(|text| {
-            text.parse::<f64>()
-                .is_ok_and(|parsed| same_failure_threshold(parsed / 100.0, failure_threshold))
+            parse_percentage(text)
+                .is_ok_and(|parsed| parsed.to_bits() == failure_threshold.to_bits())
         })
-        .unwrap_or_else(|| percent.to_string());
-    format!("{text}%")
+        .map_or_else(
+            || format!("{failure_threshold:?}"),
+            |text| format!("{text}%"),
+        )
+}
+
+/// Parse a percentage, the `33.3` of `33.3%`, into the fraction it denotes.
+///
+/// A plain decimal is parsed with its exponent shifted (`33.3e-2`), so it
+/// rounds once, to the same float as its fraction spelling `0.333`. Dividing
+/// the parsed `33.3` by 100 rounds twice and lands an ulp away, and components
+/// sharing an origin compare thresholds exactly.
+fn parse_percentage(percent: &str) -> Result<f64, ParseFloatError> {
+    let percent = percent.trim();
+    if percent
+        .bytes()
+        .all(|byte| byte.is_ascii_digit() || matches!(byte, b'.' | b'+' | b'-'))
+    {
+        format!("{percent}e-2").parse()
+    } else {
+        percent.parse::<f64>().map(|value| value / 100.0)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1709,7 +1708,7 @@ fn parse_optional_failure_threshold_param<S: BuildHasher>(
     // `25%` -> 0.25; a bare `0.25` -> 0.25. A bare `25` parses to 25.0 and is
     // rejected downstream as out of range, guiding the user to `25%`.
     let parsed = if let Some(percent) = trimmed.strip_suffix('%') {
-        percent.trim().parse::<f64>().map(|value| value / 100.0)
+        parse_percentage(percent)
     } else {
         trimmed.parse::<f64>()
     };
@@ -2169,18 +2168,42 @@ mod tests {
         }
     }
 
-    /// The same error rate written as a percentage and as a fraction parses to
-    /// adjacent floats (`33.3 / 100.0 != 0.333`), and must still be one setting,
-    /// while thresholds that throttle differently never are, even near 100%.
+    /// The same error rate written as a percentage and as a fraction must parse
+    /// to one float, or two components that spell it differently conflict.
+    /// Dividing the parsed `33.3` by 100 lands an ulp away from `0.333`.
     #[test]
-    fn spellings_of_one_failure_threshold_do_not_conflict() {
-        let as_percentage = 33.3 / 100.0;
-        let as_fraction = 0.333;
-        assert_ne!(
-            f64::to_bits(as_percentage),
-            f64::to_bits(as_fraction),
-            "the two spellings must parse to different floats for this test to mean anything"
+    fn a_percentage_parses_to_the_float_of_its_fraction_spelling() {
+        assert_ne!(f64::to_bits(33.3 / 100.0), f64::to_bits(0.333));
+        for (percentage, fraction) in [
+            ("33.3", "0.333"),
+            ("14.3", "0.143"),
+            ("57.7", "0.577"),
+            (" 25 ", "0.25"),
+            ("99.9999", "0.999999"),
+            ("+5.", "0.05"),
+        ] {
+            let parsed = parse_percentage(percentage).expect("a plain decimal parses");
+            let expected: f64 = fraction.parse().expect("test fraction parses");
+            assert_eq!(
+                parsed.to_bits(),
+                expected.to_bits(),
+                "'{percentage}%' must parse to the float of {fraction}"
+            );
+        }
+        assert_eq!(
+            parse_percentage("1e1").map(f64::to_bits),
+            Ok(0.1_f64.to_bits())
         );
+        let error = |text| parse_percentage(text).map_err(|error| error.to_string());
+        assert_eq!(error(""), Err("invalid float literal".to_string()));
+        assert_eq!(error("1.2.3"), Err("invalid float literal".to_string()));
+    }
+
+    /// The controller runs on `k = 1 / (1 - threshold)`, which magnifies any
+    /// difference near 100%, so thresholds are compared exactly: one ulp below
+    /// 1.0 and two ulps below it are a factor of two apart in `k`.
+    #[test]
+    fn failure_thresholds_are_compared_exactly() {
         let threshold = |failure_threshold| {
             with_adaptive(
                 AdaptiveRateControl::with_default_window(failure_threshold)
@@ -2193,16 +2216,16 @@ mod tests {
             existing: existing.to_string(),
             note: None,
         };
+        let percentage = |text| parse_percentage(text).expect("a plain decimal parses");
 
         assert_eq!(
-            threshold(as_percentage).conflicts_with(&threshold(as_fraction), None),
+            threshold(percentage("33.3")).conflicts_with(&threshold(0.333), None),
             Vec::new()
         );
         assert_eq!(
-            threshold(as_fraction).conflicts_with(&threshold(0.334), None),
+            threshold(0.333).conflicts_with(&threshold(0.334), None),
             vec![threshold_conflict("33.3%", "33.4%")]
         );
-        // `k = 1 / (1 - threshold)` is 2,000,000 and 10,000,000 here.
         assert_eq!(
             threshold(0.999_999_5).conflicts_with(&threshold(0.999_999_9), None),
             vec![threshold_conflict("99.99995%", "99.99999%")]
@@ -2210,6 +2233,16 @@ mod tests {
         assert_eq!(
             threshold(1e-7).conflicts_with(&threshold(4e-7), None),
             vec![threshold_conflict("0.00001%", "0.00004%")]
+        );
+
+        let one_ulp_below_one = f64::from_bits(1.0_f64.to_bits() - 1);
+        let two_ulps_below_one = f64::from_bits(1.0_f64.to_bits() - 2);
+        assert_eq!(
+            threshold(one_ulp_below_one).conflicts_with(&threshold(two_ulps_below_one), None),
+            vec![threshold_conflict(
+                "99.99999999999999%",
+                "0.9999999999999998"
+            )]
         );
     }
 
