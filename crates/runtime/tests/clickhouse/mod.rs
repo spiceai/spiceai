@@ -38,6 +38,8 @@ const CLICKHOUSE_PASSWORD: &str = "integration-test-pw";
 const CLICKHOUSE_TCP_PORT: u16 = 9000;
 
 /// One column per mapped type, with NULLs, empty values and each type's boundaries.
+/// The first `map` repeats a key: `ClickHouse` keeps both entries in order, and a decoder that
+/// collected the entries by key would lose one.
 /// `dt64_tokyo` carries an explicit timezone: the connector reads every timestamp as a
 /// UTC instant, so its rows show the Tokyo wall-clock time minus nine hours.
 const FIXTURE: &str = "
@@ -61,7 +63,7 @@ CREATE TABLE types (
 ) ENGINE = MergeTree ORDER BY id;
 INSERT INTO types VALUES
     (1, 'x', 'a', '2024-04-24 12:34:56.789', '2024-01-01 09:00:00.123456789', '2024-04-24 12:34:56',
-     ['p', NULL], {'b': 2, 'a': 1}, (1, 'one'), (10, 'ten'), 'a', 'x',
+     ['p', NULL], {'b': 2, 'a': 1, 'b': 3}, (1, 'one'), (10, 'ten'), 'a', 'x',
      340282366920938463463374607431768211455, -170141183460469231731687303715884105728, '127.0.0.1', '2001:db8::1'),
     (2, '', NULL, '1969-12-31 23:59:59.999', '1970-01-01 09:00:00', '1970-01-01 00:00:00',
      [], {}, (-2, ''), (-1, NULL), 'b', 'y',
