@@ -4347,6 +4347,28 @@ mod tests {
             );
         }
 
+        // Following the refusal's advice must load the dataset, even when both
+        // spellings are `none`: setting the named parameter to `auto` overrides
+        // the other spelling, which removing it would expose.
+        for params in [
+            vec![
+                ("cayenne_pk_conflict_detection", "none"),
+                ("pk_conflict_detection", "none"),
+            ],
+            vec![("pk_conflict_detection", "none")],
+        ] {
+            let refused = acceleration_with_params(WriteMode::WriteThrough, &params);
+            let (param, _) = pk_conflict_detection_refusal(&refused, RefreshMode::Changes)
+                .expect("none on a CDC dataset is refused");
+            let mut advised = refused.clone();
+            advised.params.insert(param.to_string(), "auto".to_string());
+            assert_eq!(
+                pk_conflict_detection_refusal(&advised, RefreshMode::Changes),
+                None,
+                "{params:?}: setting '{param}' to 'auto' must load"
+            );
+        }
+
         let not_cayenne = Acceleration {
             engine: Engine::DuckDB,
             ..acceleration_with_params(WriteMode::WriteThrough, &none)
@@ -4380,7 +4402,7 @@ mod tests {
                 "Failed to register dataset orders (postgres)",
                 "'cayenne_pk_conflict_detection: none'",
                 consequence,
-                "Remove 'cayenne_pk_conflict_detection'",
+                "Set 'cayenne_pk_conflict_detection' to 'auto'",
                 "https://spiceai.org/docs/components/data-accelerators/cayenne",
             ] {
                 assert!(

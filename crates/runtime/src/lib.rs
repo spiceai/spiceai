@@ -365,7 +365,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to register dataset {dataset_name} ({connector}): '{param}: none' turns off the primary-key check Cayenne uses to replace a stored row, but {consequence}. Remove '{param}'. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+        "Failed to register dataset {dataset_name} ({connector}): '{param}: none' turns off the primary-key check Cayenne uses to replace a stored row, but {consequence}. Set '{param}' to 'auto', its default. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
     ))]
     PkConflictDetectionDisabled {
         dataset_name: String,
