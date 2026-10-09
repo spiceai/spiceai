@@ -128,7 +128,8 @@ limitations under the License.
 //! after its last refresh. Grants already written stand, so a replica that
 //! starts with a lower limit holds the cluster to it from the second window
 //! after it first leases. Each replica logs a warning naming the origin and
-//! the limits when they start to differ, and a note when they agree again.
+//! the limits when they start to differ, and a note once every running
+//! replica sets its limit, whether the others changed theirs or stopped.
 //! A limiter no replica has written for as many windows as the file retains
 //! is dropped, so limit changes leave no trail in the file.
 //!
@@ -1984,8 +1985,9 @@ impl LeasedBucket {
     /// or `None` when they have not changed since the last report.
     ///
     /// Warns when they start to differ from this replica's, or change while
-    /// they do, naming every value, and notes once they agree again. Reported
-    /// on a change only, not on every tick.
+    /// they do, naming every value, and notes once no running replica sets a
+    /// different one, whether the others changed their limit or stopped.
+    /// Reported on a change only, not on every tick.
     fn sibling_limits_change(&self, sibling_limits: &BTreeSet<u64>) -> Option<SiblingLimitsChange> {
         {
             let mut reported = self.reported_sibling_limits.lock();
@@ -2132,17 +2134,19 @@ fn limits_differ_warning(origin: &str, key: LimiterKey<'_>, others: &BTreeSet<u6
     let lowest = others.iter().copied().fold(own, u64::min);
     let others = list_values(others);
     format!(
-        "Instances sharing cluster rate control for origin '{origin}' set `{setting}` to different values (this instance: {own}; other instances: {others}), so the cluster is held to the lowest value, {lowest}, until every instance sets the same one. Set the same `{setting}` on every instance that shares `runtime.state.location`. See: https://spiceai.org/docs/reference/spicepod/runtime#runtimesource_rate_control"
+        "Instances sharing cluster rate control for origin '{origin}' set `{setting}` to different values (this instance: {own}; other running instances: {others}), so the cluster is held to the lowest value, {lowest}, until every running instance sets the same one. Set the same `{setting}` on every instance that shares `runtime.state.location`. See: https://spiceai.org/docs/reference/spicepod/runtime#runtimesource_rate_control"
     )
 }
 
-/// The note a replica logs once every replica it shares a quota with agrees on
-/// the limit again, closing the warning [`limits_differ_warning`] opened.
+/// The note a replica logs once no running replica it shares a quota with sets
+/// a different limit, closing the warning [`limits_differ_warning`] opened.
+/// Worded for running replicas: the others may have changed their limit or
+/// stopped.
 fn limits_agree_notice(origin: &str, key: LimiterKey<'_>) -> String {
     let setting = key.setting();
     let limit = key.limit;
     format!(
-        "Instances sharing cluster rate control for origin '{origin}' now all set `{setting}` to {limit}, so the cluster is held to {limit}."
+        "Every running instance sharing cluster rate control for origin '{origin}' now sets `{setting}` to {limit}, so the cluster is held to {limit}."
     )
 }
 
@@ -3847,8 +3851,8 @@ mod tests {
     }
 
     /// The warning names the origin, the setting, this replica's value and every
-    /// other one, and the value the cluster is held to; the notice that closes
-    /// it names the value the replicas agree on.
+    /// other running one, and the value the cluster is held to; the notice that
+    /// closes it names the value every running replica sets.
     #[test]
     fn limit_log_lines_name_the_origin_the_setting_and_every_value() {
         let origin = "http://127.0.0.1:37081";
@@ -3858,21 +3862,21 @@ mod tests {
         };
         assert_eq!(
             limits_differ_warning(origin, key, &BTreeSet::from([10])),
-            "Instances sharing cluster rate control for origin 'http://127.0.0.1:37081' set `requests_per_second_limit` to different values (this instance: 20; other instances: 10), so the cluster is held to the lowest value, 10, until every instance sets the same one. Set the same `requests_per_second_limit` on every instance that shares `runtime.state.location`. See: https://spiceai.org/docs/reference/spicepod/runtime#runtimesource_rate_control"
+            "Instances sharing cluster rate control for origin 'http://127.0.0.1:37081' set `requests_per_second_limit` to different values (this instance: 20; other running instances: 10), so the cluster is held to the lowest value, 10, until every running instance sets the same one. Set the same `requests_per_second_limit` on every instance that shares `runtime.state.location`. See: https://spiceai.org/docs/reference/spicepod/runtime#runtimesource_rate_control"
         );
         assert_eq!(
             limits_differ_warning(origin, key, &BTreeSet::from([30, 25, 40])),
-            "Instances sharing cluster rate control for origin 'http://127.0.0.1:37081' set `requests_per_second_limit` to different values (this instance: 20; other instances: 25, 30 and 40), so the cluster is held to the lowest value, 20, until every instance sets the same one. Set the same `requests_per_second_limit` on every instance that shares `runtime.state.location`. See: https://spiceai.org/docs/reference/spicepod/runtime#runtimesource_rate_control"
+            "Instances sharing cluster rate control for origin 'http://127.0.0.1:37081' set `requests_per_second_limit` to different values (this instance: 20; other running instances: 25, 30 and 40), so the cluster is held to the lowest value, 20, until every running instance sets the same one. Set the same `requests_per_second_limit` on every instance that shares `runtime.state.location`. See: https://spiceai.org/docs/reference/spicepod/runtime#runtimesource_rate_control"
         );
         assert_eq!(
             limits_agree_notice(origin, key),
-            "Instances sharing cluster rate control for origin 'http://127.0.0.1:37081' now all set `requests_per_second_limit` to 20, so the cluster is held to 20."
+            "Every running instance sharing cluster rate control for origin 'http://127.0.0.1:37081' now sets `requests_per_second_limit` to 20, so the cluster is held to 20."
         );
     }
 
     /// A change in the other replicas' limits is reported once: a warning
-    /// naming them when they start to differ or change, a note when they agree
-    /// again, and nothing on the ticks in between.
+    /// naming them when they start to differ or change, a note when no running
+    /// replica sets a different one, and nothing on the ticks in between.
     #[tokio::test]
     async fn limit_changes_are_reported_once() {
         let bucket = per_second_bucket(&Arc::new(InMemory::new()), "a", 20, Duration::from_secs(1));
