@@ -498,7 +498,7 @@ fn apply_layout_option(args: &DatasetTestArgs, app: &mut App) -> anyhow::Result<
     let query_set = args.load_query_set()?;
     let tables = benchmark_tables(&query_set).ok_or_else(|| {
         anyhow::anyhow!(
-            "--layout needs a query set with layout keys (tpch, tpcds or clickbench), not {query_set:?}"
+            "--layout needs a benchmark query set with layout keys (tpch, tpch[parameterized], tpcds, clickbench or chbench), not {query_set:?}"
         )
     })?;
     let applied = apply_layout(&mut app.datasets, tables, layout)?;
