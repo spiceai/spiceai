@@ -57,6 +57,7 @@ use crate::cayenne::transaction::{describe, run_txn};
 use crate::postgres::common;
 use crate::utils::{
     register_test_connectors, run_query, runtime_ready_check, test_request_context,
+    wait_until_true,
 };
 use crate::{configure_test_datafusion, init_tracing};
 
@@ -482,6 +483,156 @@ async fn a_plain_cdc_dataset_bootstraps_and_follows_the_source() -> Result<(), a
             })
             .await?;
 
+            rt.shutdown().await;
+            Ok(())
+        })
+        .await
+}
+
+/// Regression test for #14924: `REPLICA IDENTITY FULL` does not give a table a
+/// key. A changes dataset over a table with no primary key fails to load, with
+/// an error that names both fixes. The same table with a declared
+/// `primary_key`, and a table whose own primary key is not declared on the
+/// dataset, both load and follow UPDATE and DELETE.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_changes_dataset_loads_only_with_a_primary_key() -> Result<(), anyhow::Error> {
+    use runtime::status::ComponentStatus;
+
+    let _tracing = init_tracing(Some(tracing_filter()));
+
+    test_request_context()
+        .scope(async {
+            let container = common::start_postgres_docker_container_with_logical_wal().await?;
+            let port = usize::from(container.host_port(5432)?);
+            let source = connect(port).await?;
+            exec(
+                &source,
+                "CREATE TABLE public.cdc_keyless (k text NOT NULL, v int NOT NULL); \
+                 ALTER TABLE public.cdc_keyless REPLICA IDENTITY FULL; \
+                 INSERT INTO public.cdc_keyless VALUES ('a', 1), ('b', 2); \
+                 CREATE TABLE public.cdc_source_key (id int PRIMARY KEY, v int NOT NULL); \
+                 INSERT INTO public.cdc_source_key VALUES (1, 1), (2, 2)",
+            )
+            .await?;
+
+            let keyless_dir = tempfile::tempdir()?;
+            let mut keyless = cdc_dataset(
+                port,
+                "cdc_keyless",
+                None,
+                keyless_dir.path(),
+                WriteMode::WriteThrough,
+            );
+            let keyed_dir = tempfile::tempdir()?;
+            let mut keyed = cdc_dataset(
+                port,
+                "cdc_keyless",
+                None,
+                keyed_dir.path(),
+                WriteMode::WriteThrough,
+            );
+            keyed.name = "cdc_keyed".to_string();
+            let source_key_dir = tempfile::tempdir()?;
+            let mut source_key = cdc_dataset(
+                port,
+                "cdc_source_key",
+                None,
+                source_key_dir.path(),
+                WriteMode::WriteThrough,
+            );
+            for (dataset, key) in [
+                (&mut keyless, None),
+                (&mut keyed, Some("k")),
+                (&mut source_key, None),
+            ] {
+                let acceleration = dataset
+                    .acceleration
+                    .as_mut()
+                    .ok_or_else(|| anyhow!("cdc_dataset sets an acceleration"))?;
+                acceleration.primary_key = key.map(ToString::to_string);
+                acceleration.on_conflict = key
+                    .map(|key| (key.to_string(), OnConflictBehavior::Upsert))
+                    .into_iter()
+                    .collect();
+            }
+
+            register_test_connectors().await;
+            configure_test_datafusion();
+            let app = AppBuilder::new("cdc_keyless")
+                .with_dataset(keyless)
+                .with_dataset(keyed)
+                .with_dataset(source_key)
+                .build();
+            let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+            // A refused dataset is retried, so loading never finishes.
+            let load = tokio::spawn(Arc::clone(&rt).load_components());
+
+            let name = datafusion::common::TableReference::from("cdc_keyless");
+            let refused = wait_until_true(Duration::from_mins(1), || async {
+                matches!(
+                    rt.status().get_dataset_statuses().get(&name),
+                    Some(ComponentStatus::Error(_))
+                )
+            })
+            .await;
+            let status = rt.status().get_dataset_statuses().get(&name).cloned();
+            anyhow::ensure!(refused, "the keyless dataset should fail to load, got {status:?}");
+            let Some(ComponentStatus::Error(Some(message))) = status else {
+                anyhow::bail!("expected an error message, got {status:?}");
+            };
+            assert_eq!(
+                message,
+                "Not served: waits for its source because it uses `refresh_mode: changes`. \
+                 Cause: Cannot setup the dataset cdc_keyless (postgres) with an invalid configuration. \
+                 Table `public.cdc_keyless` has no primary key, and `refresh_mode: changes` needs \
+                 one to apply UPDATE and DELETE events. Set `acceleration.primary_key` to the \
+                 columns that identify a row, and run \
+                 `ALTER TABLE public.cdc_keyless REPLICA IDENTITY FULL;` so Postgres sends those \
+                 columns with every change."
+            );
+
+            for table in ["cdc_keyed", "cdc_source_key"] {
+                let name = datafusion::common::TableReference::from(table);
+                let ready = wait_until_true(Duration::from_mins(1), || async {
+                    matches!(
+                        rt.status().get_dataset_statuses().get(&name),
+                        Some(ComponentStatus::Ready)
+                    )
+                })
+                .await;
+                let status = rt.status().get_dataset_statuses().get(&name).cloned();
+                anyhow::ensure!(ready, "{table} should load, got {status:?}");
+                let sum = format!("SELECT sum(v) FROM {table}");
+                wait_for(&format!("the {table} bootstrap"), Some(3), || {
+                    accel_scalar(&rt, &sum)
+                })
+                .await?;
+            }
+            exec(
+                &source,
+                "UPDATE public.cdc_keyless SET v = 10 WHERE k = 'a'; \
+                 DELETE FROM public.cdc_keyless WHERE k = 'b'; \
+                 UPDATE public.cdc_source_key SET v = 10 WHERE id = 1; \
+                 DELETE FROM public.cdc_source_key WHERE id = 2",
+            )
+            .await?;
+            // 10 only once the UPDATE replaced one row and the DELETE removed the other.
+            for table in ["cdc_keyed", "cdc_source_key"] {
+                let sum = format!("SELECT sum(v) FROM {table}");
+                wait_for(&format!("the {table} update and delete"), Some(10), || {
+                    accel_scalar(&rt, &sum)
+                })
+                .await?;
+                assert_accel(
+                    &rt,
+                    &format!("SELECT count(*) FROM {table}"),
+                    1,
+                    "one row remains",
+                )
+                .await?;
+            }
+
+            load.abort();
             rt.shutdown().await;
             Ok(())
         })

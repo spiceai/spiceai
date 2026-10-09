@@ -88,15 +88,19 @@ pub enum Error {
     LogicalReplicationNotEnabled,
 
     #[snafu(display(
-        "Table {schema}.{table} has REPLICA IDENTITY NOTHING. Logical replication requires \
-         REPLICA IDENTITY DEFAULT (primary key) or FULL. Run: \
-         ALTER TABLE {schema}.{table} REPLICA IDENTITY FULL;"
+        "Table {schema}.{table} has REPLICA IDENTITY NOTHING, so Postgres sends no row identity \
+         with UPDATE and DELETE events. If the table has a primary key, run \
+         `ALTER TABLE {schema}.{table} REPLICA IDENTITY DEFAULT;`. Otherwise run \
+         `ALTER TABLE {schema}.{table} REPLICA IDENTITY FULL;` and set `acceleration.primary_key` \
+         on the dataset."
     ))]
     UnsupportedReplicaIdentity { schema: String, table: String },
 
     #[snafu(display(
-        "Table {schema}.{table} has no primary key and no REPLICA IDENTITY FULL. \
-         Logical replication requires a primary key on the source table."
+        "Table {schema}.{table} has no primary key and REPLICA IDENTITY DEFAULT, so Postgres \
+         sends no row identity with UPDATE and DELETE events. Add a primary key to the table, or \
+         run `ALTER TABLE {schema}.{table} REPLICA IDENTITY FULL;` and set \
+         `acceleration.primary_key` on the dataset."
     ))]
     MissingPrimaryKey { schema: String, table: String },
 
