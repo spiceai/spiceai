@@ -128,14 +128,6 @@ mod tests {
     }
 
     #[test]
-    fn an_empty_response_is_still_billed() {
-        assert!(
-            response(Vec::new()).get_memory_size() > 0,
-            "an entry the cache is holding is never free"
-        );
-    }
-
-    #[test]
     fn arc_payloads_are_billed_beyond_the_enum_pointer() {
         let empty = response(Vec::new());
         let pointer_only = std::mem::size_of::<CachedEmbeddingResult>() + ENTRY_OVERHEAD_BYTES;

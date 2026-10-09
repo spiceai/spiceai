@@ -496,6 +496,7 @@ impl Drop for HealthMonitor {
 #[cfg(test)]
 mod tests {
     use super::{EndpointStats, FailureKind, HealthCheckReport, ProbeSample, breach_log_line};
+    use crate::test_support::printed_by;
     use std::time::Duration;
 
     fn healthy(latency: Duration) -> ProbeSample {
@@ -603,25 +604,48 @@ mod tests {
         );
     }
 
-    /// An endpoint with no samples must render alongside populated ones without
-    /// panicking, and every row must carry the same column count.
+    /// An endpoint with no samples must render alongside populated ones, every
+    /// row must carry the same column count, and the empty endpoint shows dashes
+    /// rather than a `0.0ms` that would read as a measurement.
     #[test]
     fn latency_summary_renders_healthy_slow_and_empty_endpoints() {
-        let mut populated = EndpointStats::default();
-        for ms in [1, 2, 2, 3, 4] {
-            populated.record_sample(&healthy(Duration::from_millis(ms)));
-        }
-        for ms in [130, 260, 600, 1_400] {
-            populated.record_sample(&slow(Duration::from_millis(ms)));
-        }
+        let printed = printed_by(
+            concat!(
+                module_path!(),
+                "::latency_summary_renders_healthy_slow_and_empty_endpoints"
+            ),
+            || {
+                let mut populated = EndpointStats::default();
+                for ms in [1, 2, 2, 3, 4] {
+                    populated.record_sample(&healthy(Duration::from_millis(ms)));
+                }
+                for ms in [130, 260, 600, 1_400] {
+                    populated.record_sample(&slow(Duration::from_millis(ms)));
+                }
 
-        let mut report = HealthCheckReport::default();
-        report.endpoints.insert("/health", populated);
-        report
-            .endpoints
-            .insert("/v1/ready", EndpointStats::default());
+                let mut report = HealthCheckReport::default();
+                report.endpoints.insert("/health", populated);
+                report
+                    .endpoints
+                    .insert("/v1/ready", EndpointStats::default());
 
-        report.print_latency_summary("test");
+                report.print_latency_summary("test");
+            },
+        );
+        // Nearest-rank percentiles over 9 samples: p50 is the 5th (4ms), and
+        // p90 and above are the 9th (1400ms).
+        assert_eq!(
+            printed,
+            concat!(
+                "\n",
+                "=== Liveness / Readiness Probes (test) ===\n",
+                "  endpoint      samples        p50        p90        p99      p99.9        max   >125ms   >500ms  timeouts  refused\n",
+                "  /health             9      4.0ms   1400.0ms   1400.0ms   1400.0ms   1400.0ms        4        2         0        0\n",
+                "  /v1/ready           0          -          -          -          -          -        0        0         0        0\n",
+                "  ERROR: /health exceeded 500ms on 2 sample(s) (max 1400ms) — the HTTP server stalls under load\n",
+                "\n",
+            )
+        );
     }
 
     /// A probe that never returns is cut off by `PROBE_TIMEOUT` and must be counted

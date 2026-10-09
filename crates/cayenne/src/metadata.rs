@@ -2078,6 +2078,27 @@ pub struct TableStatistics {
     pub ndv_sketches: Option<Vec<u8>>,
 }
 
+/// A persisted secondary index run of a table, recorded in the metastore.
+///
+/// The run's bytes live in the table's object store at
+/// `<table>/_lookup_index/<index_key>/<run_name>`: the metastore records which
+/// runs exist, so opening a table reads the runs it lists rather than listing
+/// the directory, and a file the metastore does not list is an orphan.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IndexRunRecord {
+    /// Table the run indexes (`UUIDv7`).
+    pub table_id: String,
+    /// The index key's directory: a digest of the key's columns, their stored
+    /// types and the run format.
+    pub index_key: String,
+    /// The run's file name, a digest of its content.
+    pub run_name: String,
+    /// Rows the run indexes.
+    pub row_count: u64,
+    /// Size of the run's file.
+    pub size_bytes: u64,
+}
+
 /// A small batch of insert data inlined directly in the metastore.
 ///
 /// For streaming workloads that produce many tiny writes, storing data as
@@ -2164,6 +2185,8 @@ pub struct TableStorageStats {
     pub file_statistics_rows: i64,
     /// Re-insert records held in the metastore.
     pub insert_records: i64,
+    /// Registered persisted secondary-index runs.
+    pub index_run_rows: i64,
     /// Inline (level-0) data entries not yet checkpointed to Vortex files.
     pub inlined_entries: i64,
     /// Rows held in those inline entries.

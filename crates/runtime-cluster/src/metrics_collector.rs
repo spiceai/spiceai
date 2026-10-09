@@ -456,6 +456,110 @@ impl SchedulerMetricsCollector for OtelSchedulerMetricsCollector {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use prometheus::proto::MetricType;
+
+    /// Set on the child process `run_in_own_process` spawns.
+    const OWN_PROCESS_ENV: &str = "SPICE_RUNTIME_TEST_OWN_PROCESS";
+
+    /// Re-runs the test `name` (in this module) alone in a fresh process of this
+    /// test binary and asserts it passed there. Returns `true` only inside that
+    /// child, where the caller runs the test body; returns `false` in the parent
+    /// once the child has passed.
+    ///
+    /// The cluster instruments are `LazyLock`s bound to whichever meter provider
+    /// is global when the cluster meter is first touched, and under `cargo test`
+    /// sibling tests share both that binding and the series they write, so a
+    /// test that reads the instruments back needs a process of its own.
+    fn run_in_own_process(name: &str) -> bool {
+        if std::env::var_os(OWN_PROCESS_ENV).is_some() {
+            return true;
+        }
+
+        // libtest names tests by module path without the crate name.
+        let module = module_path!()
+            .split_once("::")
+            .map_or(module_path!(), |(_, module)| module);
+        let test = format!("{module}::{name}");
+        let output =
+            std::process::Command::new(std::env::current_exe().expect("to locate the test binary"))
+                .args([test.as_str(), "--exact"])
+                .env(OWN_PROCESS_ENV, "1")
+                .output()
+                .expect("to run the test binary");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains("test result: ok. 1 passed"),
+            "{test} failed in its own process ({}):\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            output.status
+        );
+        false
+    }
+
+    /// Installs a global meter provider that exports to a Prometheus registry
+    /// configured exactly as `/metrics` serves it, and returns that registry.
+    fn install_prometheus_meter_provider() -> prometheus::Registry {
+        let registry = prometheus::Registry::new();
+        let provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
+            .with_resource(opentelemetry_sdk::Resource::builder().build())
+            .with_reader(
+                crate::prometheus_reader(registry.clone()).expect("to build the prometheus reader"),
+            )
+            .build();
+        opentelemetry::global::set_meter_provider(provider);
+        registry
+    }
+
+    /// One exported series: a counter or gauge reads as its value, a histogram
+    /// as its sample count and sum.
+    #[derive(Debug, PartialEq)]
+    enum Series {
+        Value(f64),
+        Histogram { count: u64, sum: f64 },
+    }
+
+    /// The series of metric `name` whose label set is exactly `labels`, or
+    /// `None` when the registry exported no such series.
+    fn series(
+        registry: &prometheus::Registry,
+        name: &str,
+        labels: &[(&str, &str)],
+    ) -> Option<Series> {
+        let mut expected: Vec<(String, String)> = labels
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect();
+        expected.sort();
+        let family = registry
+            .gather()
+            .into_iter()
+            .find(|family| family.name() == name)?;
+        let field_type = family.get_field_type();
+        family.get_metric().iter().find_map(|metric| {
+            let mut actual: Vec<(String, String)> = metric
+                .get_label()
+                .iter()
+                .map(|label| (label.name().to_string(), label.value().to_string()))
+                .collect();
+            actual.sort();
+            if actual != expected {
+                return None;
+            }
+            Some(match field_type {
+                MetricType::COUNTER => Series::Value(metric.get_counter().value()),
+                MetricType::GAUGE => Series::Value(metric.get_gauge().value()),
+                MetricType::HISTOGRAM => {
+                    let histogram = metric.get_histogram();
+                    Series::Histogram {
+                        count: histogram.get_sample_count(),
+                        sum: histogram.get_sample_sum(),
+                    }
+                }
+                other => panic!("unexpected metric type {other:?} for {name}"),
+            })
+        })
+    }
 
     // =========================================================================
     // OtelExecutorMetricsCollector Tests
@@ -469,37 +573,113 @@ mod tests {
 
     #[test]
     fn test_executor_record_task_started() {
+        if !run_in_own_process("test_executor_record_task_started") {
+            return;
+        }
+        let registry = install_prometheus_meter_provider();
         let collector = OtelExecutorMetricsCollector::new("test-executor".to_string());
-        // Should not panic
         collector.record_task_started(&JobId::new("job-1"), 1, 0);
+
+        assert_eq!(
+            series(
+                &registry,
+                "executor_tasks_active",
+                &[("node_id", "test-executor")]
+            ),
+            Some(Series::Value(1.0))
+        );
+        assert_eq!(
+            series(
+                &registry,
+                "node_tasks_active",
+                &[("node_id", "test-executor"), ("role", "executor")]
+            ),
+            Some(Series::Value(1.0))
+        );
     }
 
     #[test]
     fn test_executor_record_task_failed() {
+        if !run_in_own_process("test_executor_record_task_failed") {
+            return;
+        }
+        let registry = install_prometheus_meter_provider();
         let collector = OtelExecutorMetricsCollector::new("test-executor".to_string());
-        // Should not panic
+        collector.record_task_started(&JobId::new("job-1"), 1, 0);
         collector.record_task_failed(&JobId::new("job-1"), 1, 0, "timeout");
+
+        assert_eq!(
+            series(
+                &registry,
+                "executor_task_failures",
+                &[("node_id", "test-executor"), ("error_type", "timeout")]
+            ),
+            Some(Series::Value(1.0))
+        );
+        assert_eq!(
+            series(
+                &registry,
+                "executor_tasks_total",
+                &[("node_id", "test-executor"), ("status", "failed")]
+            ),
+            Some(Series::Value(1.0))
+        );
+        assert_eq!(
+            series(
+                &registry,
+                "node_task_failures",
+                &[
+                    ("node_id", "test-executor"),
+                    ("role", "executor"),
+                    ("error_type", "timeout")
+                ]
+            ),
+            Some(Series::Value(1.0))
+        );
+        // The failed task is no longer running.
+        assert_eq!(
+            series(
+                &registry,
+                "executor_tasks_active",
+                &[("node_id", "test-executor")]
+            ),
+            Some(Series::Value(0.0))
+        );
+        assert_eq!(
+            series(
+                &registry,
+                "node_tasks_active",
+                &[("node_id", "test-executor"), ("role", "executor")]
+            ),
+            Some(Series::Value(0.0))
+        );
     }
 
     #[test]
     fn test_executor_record_shuffle_write() {
+        if !run_in_own_process("test_executor_record_shuffle_write") {
+            return;
+        }
+        let registry = install_prometheus_meter_provider();
         let collector = OtelExecutorMetricsCollector::new("test-executor".to_string());
-        // Should not panic
         collector.record_shuffle_write(&JobId::new("job-1"), 1, 0, 1024, 100, 50);
-    }
 
-    #[test]
-    fn test_executor_record_shuffle_read() {
-        let collector = OtelExecutorMetricsCollector::new("test-executor".to_string());
-        // Should not panic
-        collector.record_shuffle_read(&JobId::new("job-1"), 1, 0, 2048, 200, 75);
-    }
-
-    #[test]
-    fn test_executor_record_memory_available() {
-        let collector = OtelExecutorMetricsCollector::new("test-executor".to_string());
-        // Should not panic
-        collector.record_memory_available(1024 * 1024 * 1024); // 1 GB
+        let node = [("node_id", "test-executor")];
+        assert_eq!(
+            series(&registry, "executor_shuffle_write_bytes", &node),
+            Some(Series::Value(1024.0))
+        );
+        assert_eq!(
+            series(&registry, "executor_shuffle_write_rows", &node),
+            Some(Series::Value(100.0))
+        );
+        assert_eq!(
+            series(&registry, "executor_shuffle_write_duration_ms", &node),
+            Some(Series::Histogram {
+                count: 1,
+                sum: 50.0
+            })
+        );
     }
 
     // =========================================================================
@@ -510,27 +690,6 @@ mod tests {
     fn test_scheduler_collector_new() {
         let collector = OtelSchedulerMetricsCollector::new("test-scheduler".to_string());
         assert_eq!(collector.node_id, "test-scheduler");
-    }
-
-    #[test]
-    fn test_scheduler_job_lifecycle() {
-        let collector = OtelSchedulerMetricsCollector::new("test-scheduler".to_string());
-        let now = 1_000_000_u64;
-
-        // Job lifecycle methods should not panic
-        collector.record_submitted(&JobId::new("job-1"), now, now + 100);
-        collector.record_completed(&JobId::new("job-1"), now, now + 5000);
-        collector.record_failed(&JobId::new("job-2"), now, now + 1000);
-        collector.record_cancelled(&JobId::new("job-3"));
-    }
-
-    #[test]
-    fn test_scheduler_queue_sizes() {
-        let collector = OtelSchedulerMetricsCollector::new("test-scheduler".to_string());
-
-        // Queue size methods should not panic
-        collector.set_pending_tasks_queue_size(10);
-        collector.set_pending_jobs_queue_size(5);
     }
 
     #[test]
@@ -556,31 +715,84 @@ mod tests {
 
     #[test]
     fn test_scheduler_task_scheduling() {
+        if !run_in_own_process("test_scheduler_task_scheduling") {
+            return;
+        }
+        let registry = install_prometheus_meter_provider();
         let collector = OtelSchedulerMetricsCollector::new("test-scheduler".to_string());
 
-        // Task scheduling methods should not panic
+        // Two tasks are scheduled; one completes, the other fails and is retried.
         collector.record_task_scheduled(&JobId::new("job-1"), 1, "executor-1", 50);
+        collector.record_task_scheduled(&JobId::new("job-2"), 2, "executor-2", 30);
         collector.record_task_completed(&JobId::new("job-1"), 1, "executor-1");
         collector.record_task_failed(&JobId::new("job-2"), 2, "executor-2", "network_error");
-        collector.record_task_retry(&JobId::new("job-3"), 3);
-    }
+        collector.record_task_retry(&JobId::new("job-2"), 2);
 
-    #[test]
-    fn test_scheduler_executor_management() {
-        let collector = OtelSchedulerMetricsCollector::new("test-scheduler".to_string());
-
-        // Executor management methods should not panic
-        collector.set_active_executor_count(3);
-        collector.record_executor_registered("executor-1");
-        collector.record_executor_deregistered("executor-1");
-    }
-
-    #[test]
-    fn test_scheduler_planning_duration() {
-        let collector = OtelSchedulerMetricsCollector::new("test-scheduler".to_string());
-
-        // Planning duration should not panic
-        collector.record_planning_duration(&JobId::new("job-1"), 250);
+        let node = [("node_id", "test-scheduler")];
+        assert_eq!(
+            series(&registry, "scheduler_task_scheduling_latency_ms", &node),
+            Some(Series::Histogram {
+                count: 2,
+                sum: 80.0
+            })
+        );
+        assert_eq!(
+            series(&registry, "scheduler_executor_assignments", &node),
+            Some(Series::Value(2.0))
+        );
+        assert_eq!(
+            series(
+                &registry,
+                "node_tasks_total",
+                &[
+                    ("node_id", "test-scheduler"),
+                    ("role", "scheduler"),
+                    ("status", "completed")
+                ]
+            ),
+            Some(Series::Value(1.0))
+        );
+        assert_eq!(
+            series(
+                &registry,
+                "node_tasks_total",
+                &[
+                    ("node_id", "test-scheduler"),
+                    ("role", "scheduler"),
+                    ("status", "failed")
+                ]
+            ),
+            Some(Series::Value(1.0))
+        );
+        assert_eq!(
+            series(
+                &registry,
+                "node_task_failures",
+                &[
+                    ("node_id", "test-scheduler"),
+                    ("role", "scheduler"),
+                    ("error_type", "network_error")
+                ]
+            ),
+            Some(Series::Value(1.0))
+        );
+        assert_eq!(
+            series(
+                &registry,
+                "node_task_retries",
+                &[("node_id", "test-scheduler"), ("role", "scheduler")]
+            ),
+            Some(Series::Value(1.0))
+        );
+        // Both tasks have finished, one way or the other.
+        assert_eq!(
+            series(
+                &registry,
+                "node_tasks_active",
+                &[("node_id", "test-scheduler"), ("role", "scheduler")]
+            ),
+            Some(Series::Value(0.0))
+        );
     }
 
     // =========================================================================
@@ -589,9 +801,14 @@ mod tests {
 
     #[test]
     fn test_full_task_execution_flow_without_stage() {
-        // Simulates a complete task execution flow from start to finish
-        // Note: record_stage is tested via actual integration tests since it requires
-        // a real QueryStageExecutor implementation
+        if !run_in_own_process("test_full_task_execution_flow_without_stage") {
+            return;
+        }
+        let registry = install_prometheus_meter_provider();
+        // Simulates a task execution flow from scheduling to the scheduler's
+        // completion. Note: the executor's own completion callback,
+        // `record_stage`, needs a real `QueryStageExecutor` and is not part of
+        // this flow, so the executor still counts the task as running.
         let executor = OtelExecutorMetricsCollector::new("executor-1".to_string());
         let scheduler = OtelSchedulerMetricsCollector::new("scheduler-1".to_string());
 
@@ -610,10 +827,116 @@ mod tests {
         // Scheduler records completion
         scheduler.record_task_completed(&JobId::new("job-1"), 1, "executor-1");
         scheduler.record_stage_completed(&JobId::new("job-1"), 1, 600);
+
+        let scheduler_node = [("node_id", "scheduler-1")];
+        assert_eq!(
+            series(
+                &registry,
+                "scheduler_task_scheduling_latency_ms",
+                &scheduler_node
+            ),
+            Some(Series::Histogram {
+                count: 1,
+                sum: 10.0
+            })
+        );
+        assert_eq!(
+            series(&registry, "scheduler_executor_assignments", &scheduler_node),
+            Some(Series::Value(1.0))
+        );
+        assert_eq!(
+            series(
+                &registry,
+                "node_tasks_active",
+                &[("node_id", "scheduler-1"), ("role", "scheduler")]
+            ),
+            Some(Series::Value(0.0))
+        );
+        assert_eq!(
+            series(
+                &registry,
+                "node_tasks_total",
+                &[
+                    ("node_id", "scheduler-1"),
+                    ("role", "scheduler"),
+                    ("status", "completed")
+                ]
+            ),
+            Some(Series::Value(1.0))
+        );
+        assert_eq!(
+            series(
+                &registry,
+                "scheduler_stages_total",
+                &[("node_id", "scheduler-1"), ("status", "completed")]
+            ),
+            Some(Series::Value(1.0))
+        );
+        assert_eq!(
+            series(&registry, "scheduler_stage_duration_ms", &scheduler_node),
+            Some(Series::Histogram {
+                count: 1,
+                sum: 600.0
+            })
+        );
+
+        let executor_node = [("node_id", "executor-1")];
+        for (name, expected) in [
+            ("executor_shuffle_read_local_bytes", 512.0),
+            ("executor_shuffle_read_local_rows", 50.0),
+            ("executor_shuffle_read_local_count", 1.0),
+            ("executor_shuffle_read_remote_bytes", 512.0),
+            ("executor_shuffle_read_remote_rows", 50.0),
+            ("executor_shuffle_read_remote_count", 1.0),
+            ("executor_shuffle_write_bytes", 512.0),
+            ("executor_shuffle_write_rows", 50.0),
+            // Still running: `record_stage` is not part of this flow.
+            ("executor_tasks_active", 1.0),
+        ] {
+            assert_eq!(
+                series(&registry, name, &executor_node),
+                Some(Series::Value(expected)),
+                "{name}"
+            );
+        }
+        assert_eq!(
+            series(
+                &registry,
+                "executor_shuffle_read_local_duration_ms",
+                &executor_node
+            ),
+            Some(Series::Histogram {
+                count: 1,
+                sum: 10.0
+            })
+        );
+        assert_eq!(
+            series(
+                &registry,
+                "executor_shuffle_read_remote_duration_ms",
+                &executor_node
+            ),
+            Some(Series::Histogram {
+                count: 1,
+                sum: 20.0
+            })
+        );
+        assert_eq!(
+            series(
+                &registry,
+                "node_tasks_active",
+                &[("node_id", "executor-1"), ("role", "executor")]
+            ),
+            Some(Series::Value(1.0))
+        );
     }
 
     #[test]
     fn test_task_failure_flow() {
+        if !run_in_own_process("test_task_failure_flow") {
+            return;
+        }
+        let registry = install_prometheus_meter_provider();
         // Simulates a task failure scenario
         let executor = OtelExecutorMetricsCollector::new("executor-2".to_string());
         let scheduler = OtelSchedulerMetricsCollector::new("scheduler-1".to_string());
@@ -629,5 +952,75 @@ mod tests {
         scheduler.record_task_failed(&JobId::new("job-fail"), 1, "executor-2", "out_of_memory");
         scheduler.record_task_retry(&JobId::new("job-fail"), 1);
         scheduler.record_stage_retry(&JobId::new("job-fail"), 1);
+
+        assert_eq!(
+            series(
+                &registry,
+                "executor_task_failures",
+                &[("node_id", "executor-2"), ("error_type", "out_of_memory")]
+            ),
+            Some(Series::Value(1.0))
+        );
+        assert_eq!(
+            series(
+                &registry,
+                "executor_tasks_total",
+                &[("node_id", "executor-2"), ("status", "failed")]
+            ),
+            Some(Series::Value(1.0))
+        );
+        assert_eq!(
+            series(
+                &registry,
+                "node_task_failures",
+                &[
+                    ("node_id", "scheduler-1"),
+                    ("role", "scheduler"),
+                    ("error_type", "out_of_memory")
+                ]
+            ),
+            Some(Series::Value(1.0))
+        );
+        assert_eq!(
+            series(
+                &registry,
+                "node_task_retries",
+                &[("node_id", "scheduler-1"), ("role", "scheduler")]
+            ),
+            Some(Series::Value(1.0))
+        );
+        assert_eq!(
+            series(
+                &registry,
+                "scheduler_stage_retries",
+                &[("node_id", "scheduler-1")]
+            ),
+            Some(Series::Value(1.0))
+        );
+        // The failed task is no longer running on either side.
+        assert_eq!(
+            series(
+                &registry,
+                "executor_tasks_active",
+                &[("node_id", "executor-2")]
+            ),
+            Some(Series::Value(0.0))
+        );
+        assert_eq!(
+            series(
+                &registry,
+                "node_tasks_active",
+                &[("node_id", "executor-2"), ("role", "executor")]
+            ),
+            Some(Series::Value(0.0))
+        );
+        assert_eq!(
+            series(
+                &registry,
+                "node_tasks_active",
+                &[("node_id", "scheduler-1"), ("role", "scheduler")]
+            ),
+            Some(Series::Value(0.0))
+        );
     }
 }

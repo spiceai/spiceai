@@ -27,6 +27,8 @@ use rmcp::{
     },
     service::RequestContext,
 };
+use runtime_auth::{AuthPrincipalRef, AuthRequestContext};
+use runtime_request_context::{Protocol, RequestContext as SpiceRequestContext};
 use serde_json::{Map, Value, json};
 use std::{
     borrow::Cow,
@@ -594,6 +596,192 @@ impl RuntimeServer {
     }
 }
 
+/// Recover the Spice [`SpiceRequestContext`] that authenticated this MCP HTTP
+/// request.
+///
+/// rmcp's Streamable HTTP transport runs `call_tool` on a session worker
+/// task (`tokio::spawn`) that does **not** inherit the task-local
+/// [`SpiceRequestContext`] installed by the HTTP `track_metrics` middleware.
+/// Without re-entering that context here, `current_principal_requires_read_only`
+/// sees no principal and treats the call as auth-disabled (writes allowed) —
+/// a privilege escalation for read-only API keys.
+///
+/// Each `/v1/mcp` request carries its own `http::request::Parts` (injected by
+/// rmcp). Auth and metrics middleware stash the concrete
+/// [`SpiceRequestContext`] (and [`AuthPrincipalRef`]) on those Parts, so a
+/// session started with one key and reused with another still evaluates the
+/// **current** request's principal.
+fn spice_request_context_from_mcp(
+    mcp_ctx: &RequestContext<RoleServer>,
+) -> Option<Arc<SpiceRequestContext>> {
+    let parts = mcp_ctx.extensions.get::<http::request::Parts>()?;
+    spice_request_context_from_http_parts(parts)
+}
+
+/// Restore the authenticated Spice request context from HTTP `Parts` that rmcp
+/// injects into each MCP request. See [`spice_request_context_from_mcp`].
+fn spice_request_context_from_http_parts(
+    parts: &http::request::Parts,
+) -> Option<Arc<SpiceRequestContext>> {
+    if let Some(ctx) = parts.extensions.get::<Arc<SpiceRequestContext>>() {
+        return Some(Arc::clone(ctx));
+    }
+
+    let principal = parts
+        .extensions
+        .get::<AuthPrincipalRef>()
+        .cloned()
+        .or_else(|| {
+            parts
+                .extensions
+                .get::<Arc<dyn AuthRequestContext + Send + Sync>>()
+                .and_then(|ctx| ctx.auth_principal().map(Arc::clone))
+        })?;
+
+    let ctx = Arc::new(SpiceRequestContext::builder(Protocol::Http).build());
+    if let Err(err) = ctx.set_auth_principal(principal) {
+        tracing::warn!(%err, "Failed to restore auth principal for MCP tool call");
+        return None;
+    }
+    Some(ctx)
+}
+
+/// The error for a `tools/call` whose authenticated principal cannot be
+/// recovered from the HTTP request Parts.
+///
+/// `/v1/mcp` is gated by `require_auth_configured`, so reaching the handler
+/// without a principal means the request's identity did not reach the rmcp
+/// worker. The call is refused rather than run: with no principal the tool
+/// would run as if auth were disabled (writes allowed), and under a stand-in
+/// identity every such caller would share that identity's cache namespace.
+fn missing_principal_refusal(tool_name: &str) -> String {
+    format!(
+        "Failed to run MCP tool '{tool_name}': the credentials on its `/v1/mcp` request could not be resolved, so the call was refused and the tool did not run. Retry the request, and report it at https://github.com/spiceai/spiceai/issues if it keeps failing. See https://spiceai.org/docs/api/auth"
+    )
+}
+
+impl RuntimeServer {
+    async fn call_tool_with_auth(
+        &self,
+        request: CallToolRequestParams,
+        tool_name: String,
+        arguments: Option<Map<String, Value>>,
+    ) -> Result<CallToolResponse, McpError> {
+        const MAX_TOOL_NAME_LENGTH: usize = 256;
+
+        // Security: Validate tool name to prevent injection attacks
+        if tool_name.len() > MAX_TOOL_NAME_LENGTH {
+            return Err(McpError::invalid_params(
+                format!(
+                    "Tool name too long ({} chars). Maximum: {MAX_TOOL_NAME_LENGTH}",
+                    tool_name.len()
+                ),
+                None,
+            ));
+        }
+
+        // Security: Validate tool name contains only safe characters
+        if !tool_name
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.' || c == '/')
+        {
+            return Err(McpError::invalid_params(
+                    "Tool name contains invalid characters. Only alphanumeric, underscore, hyphen, dot, and forward-slash allowed".to_string(),
+                    None,
+                ));
+        }
+
+        let resolved = match self.get_tool(tool_name.as_ref()).await {
+            ResolveOutcome::Ready(resolved) => resolved,
+            ResolveOutcome::Retry => {
+                return Err(McpError::invalid_params(
+                    format!(
+                        "Tool '{tool_name}' was not in the schema used to validate this request, so it was not executed. Retry the call so `Mcp-Param-*` headers can be checked."
+                    ),
+                    None,
+                ));
+            }
+            ResolveOutcome::Missing => {
+                return Err(McpError::method_not_found::<
+                    rmcp::model::CallToolRequestMethod,
+                >());
+            }
+        };
+
+        // If possible, we pass the call through to the MCP server.
+        if let Some(mcp_proxy) = resolved.tool.as_mcp_proxy().await {
+            tracing::debug!("{tool_name} uses MCP. Will call directly");
+
+            // `call_tool_once` forwards the whole MRTR request
+            // (`arguments`, `input_responses`, `request_state`).
+            // Checking only `arguments` lets a 2 MiB `requestState`
+            // pass the 1 MiB guard (`checked_arguments_bytes=2
+            // full_request_exceeds_max=True`).
+            forwarded_call_within_limits(&request)?;
+
+            // Record the proxied call in task history so tool calls made
+            // through the `/v1/mcp` gateway are audited identically to
+            // model-driven tool calls (see `McpToolWrapper::call`). Without
+            // this, gateway tool calls bypass the task_history span entirely.
+            let input = serde_json::to_string(&arguments).unwrap_or_default();
+
+            // Labelled from the canonical identity `get_tool` resolved, never
+            // the requested spelling — see `get_tool`.
+            let exposed_name = &resolved.exposed_name;
+            let (task_name, mcp_server) = resolved.task_history_labels();
+            let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::mcp", tool = %exposed_name, input = %input);
+            tracing::info!(target: "task_history", parent: &span, task_override = %task_name, "labels");
+            if let Some(mcp_server) = mcp_server {
+                tracing::info!(target: "task_history", parent: &span, mcp_server = %mcp_server, "labels");
+            }
+
+            return match mcp_proxy
+                .call_tool_once(request)
+                .instrument(span.clone())
+                .await
+            {
+                Ok(response) => {
+                    if let CallToolResponse::Complete(result) = &response
+                        && let Ok(captured_output) = serde_json::to_string(&result.content)
+                    {
+                        tracing::info!(target: "task_history", parent: &span, captured_output = %captured_output);
+                    }
+                    Ok(response)
+                }
+                Err(e) => {
+                    tracing::error!(target: "task_history", parent: &span, "{e}");
+                    Err(McpError::internal_error(e.to_string(), None))
+                }
+            };
+        }
+
+        let args = serde_json::to_string(&arguments)
+            .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
+
+        // Security: Validate serialized argument size to prevent DoS
+        if args.len() > MAX_TOOL_CALL_PAYLOAD_BYTES {
+            return Err(McpError::invalid_params(
+                format!(
+                    "Arguments too large ({} bytes). Maximum: {MAX_TOOL_CALL_PAYLOAD_BYTES} bytes",
+                    args.len()
+                ),
+                None,
+            ));
+        }
+
+        let result = resolved
+            .tool
+            .call(args.as_str())
+            .await
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        let text = serde_json::to_string(&result)
+            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
+
+        Ok(CallToolResult::success(vec![ContentBlock::text(text)]).into())
+    }
+}
+
 impl ServerHandler for RuntimeServer {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
@@ -614,123 +802,24 @@ impl ServerHandler for RuntimeServer {
     fn call_tool(
         &self,
         request: CallToolRequestParams,
-        _context: RequestContext<RoleServer>,
+        context: RequestContext<RoleServer>,
     ) -> impl Future<Output = Result<CallToolResponse, McpError>> + Send + '_ {
-        let tool_name = request.name.clone();
+        let tool_name = request.name.clone().into_owned();
         let arguments = request.arguments.clone();
         Box::pin(async move {
-            const MAX_TOOL_NAME_LENGTH: usize = 256;
-
-            // Security: Validate tool name to prevent injection attacks
-            if tool_name.len() > MAX_TOOL_NAME_LENGTH {
-                return Err(McpError::invalid_params(
-                    format!(
-                        "Tool name too long ({} chars). Maximum: {MAX_TOOL_NAME_LENGTH}",
-                        tool_name.len()
-                    ),
-                    None,
-                ));
-            }
-
-            // Security: Validate tool name contains only safe characters
-            if !tool_name
-                .chars()
-                .all(|c| c.is_alphanumeric() || c == '_' || c == '-' || c == '.' || c == '/')
-            {
-                return Err(McpError::invalid_params(
-                    "Tool name contains invalid characters. Only alphanumeric, underscore, hyphen, dot, and forward-slash allowed".to_string(),
-                    None,
-                ));
-            }
-
-            let resolved = match self.get_tool(tool_name.as_ref()).await {
-                ResolveOutcome::Ready(resolved) => resolved,
-                ResolveOutcome::Retry => {
-                    return Err(McpError::invalid_params(
-                        format!(
-                            "Tool '{tool_name}' was not in the schema used to validate this request, so it was not executed. Retry the call so `Mcp-Param-*` headers can be checked."
-                        ),
-                        None,
-                    ));
-                }
-                ResolveOutcome::Missing => {
-                    return Err(McpError::method_not_found::<
-                        rmcp::model::CallToolRequestMethod,
-                    >());
-                }
+            let spice_ctx = spice_request_context_from_mcp(&context)
+                .filter(|ctx| AuthRequestContext::auth_principal(ctx.as_ref()).is_some());
+            let Some(spice_ctx) = spice_ctx else {
+                // `/v1/mcp` requires `runtime.auth`, so a missing principal means
+                // the request's identity did not reach this worker. Refuse the
+                // call; see `missing_principal_refusal`.
+                let message = missing_principal_refusal(&tool_name);
+                tracing::error!(tool = %tool_name, "{message}");
+                return Err(McpError::internal_error(message, None));
             };
-
-            // If possible, we pass the call through to the MCP server.
-            if let Some(mcp_proxy) = resolved.tool.as_mcp_proxy().await {
-                tracing::debug!("{tool_name} uses MCP. Will call directly");
-
-                // `call_tool_once` forwards the whole MRTR request
-                // (`arguments`, `input_responses`, `request_state`).
-                // Checking only `arguments` lets a 2 MiB `requestState`
-                // pass the 1 MiB guard (`checked_arguments_bytes=2
-                // full_request_exceeds_max=True`).
-                forwarded_call_within_limits(&request)?;
-
-                // Record the proxied call in task history so tool calls made
-                // through the `/v1/mcp` gateway are audited identically to
-                // model-driven tool calls (see `McpToolWrapper::call`). Without
-                // this, gateway tool calls bypass the task_history span entirely.
-                let input = serde_json::to_string(&arguments).unwrap_or_default();
-
-                // Labelled from the canonical identity `get_tool` resolved, never
-                // the requested spelling — see `get_tool`.
-                let exposed_name = &resolved.exposed_name;
-                let (task_name, mcp_server) = resolved.task_history_labels();
-                let span = tracing::span!(target: "task_history", tracing::Level::INFO, "tool_use::mcp", tool = %exposed_name, input = %input);
-                tracing::info!(target: "task_history", parent: &span, task_override = %task_name, "labels");
-                if let Some(mcp_server) = mcp_server {
-                    tracing::info!(target: "task_history", parent: &span, mcp_server = %mcp_server, "labels");
-                }
-
-                return match mcp_proxy
-                    .call_tool_once(request)
-                    .instrument(span.clone())
-                    .await
-                {
-                    Ok(response) => {
-                        if let CallToolResponse::Complete(result) = &response
-                            && let Ok(captured_output) = serde_json::to_string(&result.content)
-                        {
-                            tracing::info!(target: "task_history", parent: &span, captured_output = %captured_output);
-                        }
-                        Ok(response)
-                    }
-                    Err(e) => {
-                        tracing::error!(target: "task_history", parent: &span, "{e}");
-                        Err(McpError::internal_error(e.to_string(), None))
-                    }
-                };
-            }
-
-            let args = serde_json::to_string(&arguments)
-                .map_err(|e| McpError::invalid_params(e.to_string(), None))?;
-
-            // Security: Validate serialized argument size to prevent DoS
-            if args.len() > MAX_TOOL_CALL_PAYLOAD_BYTES {
-                return Err(McpError::invalid_params(
-                    format!(
-                        "Arguments too large ({} bytes). Maximum: {MAX_TOOL_CALL_PAYLOAD_BYTES} bytes",
-                        args.len()
-                    ),
-                    None,
-                ));
-            }
-
-            let result = resolved
-                .tool
-                .call(args.as_str())
+            spice_ctx
+                .scope(self.call_tool_with_auth(request, tool_name, arguments))
                 .await
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-
-            let text = serde_json::to_string(&result)
-                .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-
-            Ok(CallToolResult::success(vec![ContentBlock::text(text)]).into())
         })
     }
 
@@ -940,10 +1029,12 @@ fn tools_listed_by_name_vec(mut tools: Vec<Tool>) -> Vec<Tool> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::builtin::function_tool::current_principal_requires_read_only;
     use crate::catalog::SpiceToolCatalog;
     use rmcp::model::InputRequiredResult;
     use rmcp::service::ServiceError;
-    use spicepod::component::runtime::CorsConfig;
+    use runtime_auth::{AuthPrincipalRef, AuthRequestContext};
+    use spicepod::component::runtime::{ApiKey, CorsConfig};
     use tools::McpProxy;
 
     struct StubTool(&'static str);
@@ -1690,6 +1781,7 @@ mod tests {
             .recv()
             .expect("replace_from_map must enter try_all before the catalog publishes");
 
+        let (publishing_tx, publishing_rx) = std::sync::mpsc::channel();
         let publish_snapshot = Arc::clone(&snapshot);
         let publisher = std::thread::spawn(move || {
             let mut listed = HashMap::new();
@@ -1697,21 +1789,34 @@ mod tests {
                 "deploy".to_string(),
                 mcp_tool_from_spice("deploy", &ZoneAnnotatedTool),
             );
+            publishing_tx
+                .send(())
+                .expect("the test waits for the catalog publish to start");
             let changed = apply_listed_catalog_cache(&publish_snapshot, "srv", &listed, true);
             publish_snapshot.bump_if(changed);
         });
 
-        // Give the publisher time to block on the publish lock (or, on
-        // the unsynchronized path, to write Zone before we release).
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        publishing_rx
+            .recv()
+            .expect("the catalog publish must start while replace_from_map is gated");
+        // replace_from_map is parked inside try_all. Holding the publish lock
+        // there is what makes the racing catalog publish wait and land last;
+        // collecting outside it leaves the lock free here.
+        assert!(
+            matches!(
+                snapshot.publish.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ),
+            "replace_from_map must collect from try_all under the snapshot publish lock"
+        );
         let exposed = encode_tool_name("srv", "deploy");
-        assert_ne!(
+        assert_eq!(
             snapshot
                 .get(&exposed)
                 .as_ref()
                 .and_then(x_mcp_header_region),
-            Some("Zone"),
-            "catalog publish must wait for replace_from_map; Zone already present means a stale overwrite can follow"
+            None,
+            "nothing may publish while replace_from_map holds the publish lock"
         );
 
         release_tx
@@ -1732,9 +1837,10 @@ mod tests {
             Some("Zone"),
             "final_schema must be Zone after the catalog publish; Region after Zone is the stale overwrite"
         );
-        assert!(
-            snapshot.epoch() >= 2,
-            "both the full replace and the catalog publish bump the epoch"
+        assert_eq!(
+            snapshot.epoch(),
+            2,
+            "the full replace and the catalog publish each bump the epoch once"
         );
     }
 
@@ -1771,6 +1877,7 @@ mod tests {
             .recv()
             .expect("replace_listed_from_map must enter try_all before the catalog publishes");
 
+        let (publishing_tx, publishing_rx) = std::sync::mpsc::channel();
         let publish_snapshot = Arc::clone(&snapshot);
         let publisher = std::thread::spawn(move || {
             let mut listed = HashMap::new();
@@ -1778,19 +1885,34 @@ mod tests {
                 "deploy".to_string(),
                 mcp_tool_from_spice("deploy", &ZoneAnnotatedTool),
             );
+            publishing_tx
+                .send(())
+                .expect("the test waits for the catalog publish to start");
             let changed = apply_listed_catalog_cache(&publish_snapshot, "srv", &listed, true);
             publish_snapshot.bump_if(changed);
         });
 
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        publishing_rx
+            .recv()
+            .expect("the catalog publish must start while replace_listed_from_map is gated");
+        // replace_listed_from_map is parked inside try_all. Holding the publish
+        // lock there is what makes the racing catalog publish wait and land
+        // last; collecting outside it leaves the lock free here.
+        assert!(
+            matches!(
+                snapshot.publish.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ),
+            "replace_listed_from_map must collect from try_all under the snapshot publish lock"
+        );
         let exposed = encode_tool_name("srv", "deploy");
-        assert_ne!(
+        assert_eq!(
             snapshot
                 .get(&exposed)
                 .as_ref()
                 .and_then(x_mcp_header_region),
-            Some("Zone"),
-            "catalog publish must wait for replace_listed_from_map; Zone already present means a stale overwrite can follow"
+            None,
+            "nothing may publish while replace_listed_from_map holds the publish lock"
         );
 
         release_tx
@@ -1811,9 +1933,10 @@ mod tests {
             Some("Zone"),
             "final_schema must be Zone after the catalog publish; Region after Zone is the stale overwrite"
         );
-        assert!(
-            snapshot.epoch() >= 2,
-            "both the listed replace and the catalog publish bump the epoch"
+        assert_eq!(
+            snapshot.epoch(),
+            2,
+            "the listed replace and the catalog publish each bump the epoch once"
         );
     }
 
@@ -1850,6 +1973,7 @@ mod tests {
             .recv()
             .expect("merge_from_map must enter try_all before the catalog publishes");
 
+        let (publishing_tx, publishing_rx) = std::sync::mpsc::channel();
         let publish_snapshot = Arc::clone(&snapshot);
         let publisher = std::thread::spawn(move || {
             let mut listed = HashMap::new();
@@ -1857,19 +1981,34 @@ mod tests {
                 "deploy".to_string(),
                 mcp_tool_from_spice("deploy", &ZoneAnnotatedTool),
             );
+            publishing_tx
+                .send(())
+                .expect("the test waits for the catalog publish to start");
             let changed = apply_listed_catalog_cache(&publish_snapshot, "srv", &listed, true);
             publish_snapshot.bump_if(changed);
         });
 
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        publishing_rx
+            .recv()
+            .expect("the catalog publish must start while merge_from_map is gated");
+        // merge_from_map is parked inside try_all. Holding the publish lock
+        // there is what makes the racing catalog publish wait and land last;
+        // collecting outside it leaves the lock free here.
+        assert!(
+            matches!(
+                snapshot.publish.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ),
+            "merge_from_map must collect from try_all under the snapshot publish lock"
+        );
         let exposed = encode_tool_name("srv", "deploy");
-        assert_ne!(
+        assert_eq!(
             snapshot
                 .get(&exposed)
                 .as_ref()
                 .and_then(x_mcp_header_region),
-            Some("Zone"),
-            "catalog publish must wait for merge_from_map; Zone already present means a stale overwrite can follow"
+            None,
+            "nothing may publish while merge_from_map holds the publish lock"
         );
 
         release_tx
@@ -1887,6 +2026,11 @@ mod tests {
                 .and_then(x_mcp_header_region),
             Some("Zone"),
             "final_schema must be Zone after the catalog publish; Region after Zone is the stale overwrite"
+        );
+        assert_eq!(
+            snapshot.epoch(),
+            2,
+            "the merge and the catalog publish each bump the epoch once"
         );
     }
 
@@ -2972,11 +3116,13 @@ mod tests {
         if let Some(value) = param_header {
             builder = builder.header(format!("mcp-param-{param}"), value);
         }
-        let request = builder
-            .body(http_body_util::Full::new(bytes::Bytes::from(
-                body.to_string(),
-            )))
-            .expect("valid tools/call request");
+        let request = authenticated(
+            builder
+                .body(http_body_util::Full::new(bytes::Bytes::from(
+                    body.to_string(),
+                )))
+                .expect("valid tools/call request"),
+        );
         let response = service.handle(request).await;
         let status = response.status();
         let collected = http_body_util::BodyExt::collect(response.into_body())
@@ -3551,7 +3697,7 @@ mod tests {
                 body.to_string(),
             )))
             .expect("valid oversized tools/call request");
-        let response = service.handle(request).await;
+        let response = service.handle(authenticated(request)).await;
         let status = response.status();
         let collected = http_body_util::BodyExt::collect(response.into_body())
             .await
@@ -3971,11 +4117,13 @@ mod tests {
         if let Some(origin) = origin {
             builder = builder.header(http::header::ORIGIN, origin);
         }
-        let request = builder
-            .body(http_body_util::Full::new(bytes::Bytes::from(
-                body.to_string(),
-            )))
-            .expect("valid tools/call request");
+        let request = authenticated(
+            builder
+                .body(http_body_util::Full::new(bytes::Bytes::from(
+                    body.to_string(),
+                )))
+                .expect("valid tools/call request"),
+        );
         service.handle(request).await.status()
     }
 
@@ -4108,6 +4256,522 @@ mod tests {
             status,
             http::StatusCode::FORBIDDEN,
             "default CORS * must 403 Origin https://evil.example, got {status}"
+        );
+    }
+
+    /// Probe tool that reports whether the calling principal is read-only.
+    struct PrincipalProbeTool;
+
+    #[async_trait::async_trait]
+    impl SpiceModelTool for PrincipalProbeTool {
+        fn name(&self) -> Cow<'_, str> {
+            Cow::Borrowed("principal_probe")
+        }
+        fn description(&self) -> Option<Cow<'_, str>> {
+            Some(Cow::Borrowed("reports read-only posture"))
+        }
+        fn parameters(&self) -> Option<Value> {
+            Some(json!({"type": "object", "properties": {}}))
+        }
+        async fn call(
+            &self,
+            _arg: &str,
+        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+            Ok(json!({
+                "read_only": current_principal_requires_read_only().await
+            }))
+        }
+    }
+
+    /// Tool that refuses when the principal is read-only (mimics `sql` / `store_memory`).
+    struct WriteGatedTool;
+
+    #[async_trait::async_trait]
+    impl SpiceModelTool for WriteGatedTool {
+        fn name(&self) -> Cow<'_, str> {
+            Cow::Borrowed("write_gated")
+        }
+        fn description(&self) -> Option<Cow<'_, str>> {
+            Some(Cow::Borrowed("write-gated probe"))
+        }
+        fn parameters(&self) -> Option<Value> {
+            Some(json!({"type": "object", "properties": {}}))
+        }
+        async fn call(
+            &self,
+            _arg: &str,
+        ) -> Result<Value, Box<dyn std::error::Error + Send + Sync>> {
+            if current_principal_requires_read_only().await {
+                return Err("read-only SQL context: write rejected".into());
+            }
+            Ok(json!({"wrote": true}))
+        }
+    }
+
+    fn principal_probe_server() -> RuntimeServer {
+        let mut tools = HashMap::new();
+        tools.insert(
+            "principal_probe".to_string(),
+            Tooling::Tool(Arc::new(PrincipalProbeTool) as Arc<dyn SpiceModelTool>),
+        );
+        tools.insert(
+            "write_gated".to_string(),
+            Tooling::Tool(Arc::new(WriteGatedTool) as Arc<dyn SpiceModelTool>),
+        );
+        RuntimeServer::new(Arc::new(RwLock::new(tools)))
+    }
+
+    fn mcp_http_service(
+        server: RuntimeServer,
+    ) -> rmcp::transport::streamable_http_server::StreamableHttpService<
+        RuntimeServer,
+        rmcp::transport::streamable_http_server::session::local::LocalSessionManager,
+    > {
+        rmcp::transport::streamable_http_server::StreamableHttpService::new(
+            move || Ok(server.clone()),
+            Arc::new(
+                rmcp::transport::streamable_http_server::session::local::LocalSessionManager::default(),
+            ),
+            rmcp::transport::streamable_http_server::StreamableHttpServerConfig::default()
+                .with_legacy_session_mode(true)
+                .disable_allowed_hosts()
+                .with_json_response(true),
+        )
+    }
+
+    fn spice_ctx_with_api_key(key: &str) -> Arc<SpiceRequestContext> {
+        let ctx = Arc::new(SpiceRequestContext::builder(Protocol::Http).build());
+        let principal: AuthPrincipalRef = Arc::new(ApiKey::parse_str(key));
+        ctx.set_auth_principal(principal)
+            .expect("set_auth_principal");
+        ctx
+    }
+
+    /// Mirror HTTP `track_metrics` + `AuthLayer`: put the concrete context and its
+    /// principal on the request extensions, so rmcp injects them via Parts into
+    /// `call_tool`.
+    fn insert_spice_ctx<B>(request: &mut http::Request<B>, ctx: Arc<SpiceRequestContext>) {
+        if let Some(principal) = AuthRequestContext::auth_principal(ctx.as_ref()) {
+            request.extensions_mut().insert(Arc::clone(principal));
+        }
+        let auth_ctx: Arc<dyn AuthRequestContext + Send + Sync> =
+            Arc::clone(&ctx) as Arc<dyn AuthRequestContext + Send + Sync>;
+        request.extensions_mut().insert(auth_ctx);
+        request.extensions_mut().insert(ctx);
+    }
+
+    /// `request` as a real `/v1/mcp` request reaches rmcp: authenticated, here
+    /// with a read-write API key. For tests of something other than auth, which
+    /// would otherwise be refused for having no principal.
+    fn authenticated<B>(mut request: http::Request<B>) -> http::Request<B> {
+        insert_spice_ctx(&mut request, spice_ctx_with_api_key("test-key:rw"));
+        request
+    }
+
+    fn http_parts_with_spice_ctx(ctx: Arc<SpiceRequestContext>) -> http::request::Parts {
+        let mut request = http::Request::new(());
+        insert_spice_ctx(&mut request, ctx);
+        request.into_parts().0
+    }
+
+    #[tokio::test]
+    async fn http_parts_restore_read_only_principal_into_scope() {
+        let ctx = spice_ctx_with_api_key("topsecret123");
+        let parts = http_parts_with_spice_ctx(Arc::clone(&ctx));
+        let restored = spice_request_context_from_http_parts(&parts)
+            .expect("must restore RequestContext from Parts");
+        let read_only = restored
+            .scope(async { current_principal_requires_read_only().await })
+            .await;
+        assert!(
+            read_only,
+            "RO API key restored from HTTP Parts must require read-only"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_parts_restore_read_write_principal_into_scope() {
+        let ctx = spice_ctx_with_api_key("writer456:rw");
+        let parts = http_parts_with_spice_ctx(ctx);
+        let restored = spice_request_context_from_http_parts(&parts)
+            .expect("must restore RequestContext from Parts");
+        let read_only = restored
+            .scope(async { current_principal_requires_read_only().await })
+            .await;
+        assert!(
+            !read_only,
+            "RW API key restored from HTTP Parts must allow writes"
+        );
+    }
+
+    #[tokio::test]
+    async fn http_parts_with_only_auth_principal_ref_rebuilds_context() {
+        // Fallback path: AuthLayer inserts AuthPrincipalRef even if concrete
+        // RequestContext Arc is missing (older middleware shape).
+        let mut request = http::Request::new(());
+        let principal: AuthPrincipalRef = Arc::new(ApiKey::parse_str("topsecret123"));
+        request.extensions_mut().insert(principal);
+        let parts = request.into_parts().0;
+        let restored = spice_request_context_from_http_parts(&parts)
+            .expect("must rebuild from AuthPrincipalRef");
+        let read_only = restored
+            .scope(async { current_principal_requires_read_only().await })
+            .await;
+        assert!(read_only, "rebuilt RO principal must require read-only");
+    }
+
+    async fn post_tools_call_with_spice_ctx(
+        service: &rmcp::transport::streamable_http_server::StreamableHttpService<
+            RuntimeServer,
+            rmcp::transport::streamable_http_server::session::local::LocalSessionManager,
+        >,
+        tool_name: &str,
+        spice_ctx: Option<Arc<SpiceRequestContext>>,
+    ) -> (http::StatusCode, Value) {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": tool_name,
+                "arguments": {},
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientInfo": {
+                        "name": "runtime-tools-test",
+                        "version": "0.0.0"
+                    },
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }
+            }
+        });
+        let mut request = http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", "localhost")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-method", "tools/call")
+            .header("mcp-name", tool_name)
+            .body(http_body_util::Full::new(bytes::Bytes::from(
+                body.to_string(),
+            )))
+            .expect("valid tools/call request");
+        if let Some(ctx) = spice_ctx {
+            insert_spice_ctx(&mut request, ctx);
+        }
+        let response = service.handle(request).await;
+        let status = response.status();
+        let collected = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("response body");
+        let bytes = collected.to_bytes();
+        let json_str = std::str::from_utf8(&bytes).unwrap_or("<non-utf8>");
+        let json_payload = json_str
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap_or(json_str);
+        let json: Value = serde_json::from_str(json_payload)
+            .unwrap_or_else(|e| panic!("JSON-RPC body ({status}): {e}: {json_str:?}"));
+        (status, json)
+    }
+
+    fn tool_result_text(json: &Value) -> String {
+        // tools/call success: result.content[0].text is a JSON string of the tool Value
+        let text = json
+            .pointer("/result/content/0/text")
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("missing tool result text: {json}"));
+        text.to_string()
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_call_sees_read_only_principal_from_http_parts() {
+        let service = mcp_http_service(principal_probe_server());
+        let ctx = spice_ctx_with_api_key("topsecret123"); // default = read-only
+        let (status, json) =
+            post_tools_call_with_spice_ctx(&service, "principal_probe", Some(ctx)).await;
+        assert_eq!(status, http::StatusCode::OK, "unexpected status: {json}");
+        let payload: Value =
+            serde_json::from_str(&tool_result_text(&json)).expect("tool payload json");
+        assert_eq!(
+            payload.get("read_only"),
+            Some(&Value::Bool(true)),
+            "RO API key on MCP tools/call must restore read-only principal; got {payload} from {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_call_sees_read_write_principal_from_http_parts() {
+        let service = mcp_http_service(principal_probe_server());
+        let ctx = spice_ctx_with_api_key("writer456:rw");
+        let (status, json) =
+            post_tools_call_with_spice_ctx(&service, "principal_probe", Some(ctx)).await;
+        assert_eq!(status, http::StatusCode::OK, "unexpected status: {json}");
+        let payload: Value =
+            serde_json::from_str(&tool_result_text(&json)).expect("tool payload json");
+        assert_eq!(
+            payload.get("read_only"),
+            Some(&Value::Bool(false)),
+            "RW API key on MCP tools/call must allow writes; got {payload} from {json}"
+        );
+    }
+
+    /// Asserts that a `tools/call` of `tool` was refused for having no principal,
+    /// so the tool never ran.
+    fn assert_missing_principal_refusal(json: &Value, tool: &str) {
+        assert_eq!(
+            json.pointer("/error/code").and_then(Value::as_i64),
+            Some(-32603),
+            "a tools/call without a principal must be refused; got {json}"
+        );
+        assert_eq!(
+            json.pointer("/error/message").and_then(Value::as_str),
+            Some(missing_principal_refusal(tool).as_str()),
+            "unexpected refusal; got {json}"
+        );
+    }
+
+    #[test]
+    fn missing_principal_refusal_names_the_tool_and_the_fix() {
+        assert_eq!(
+            missing_principal_refusal("sql"),
+            "Failed to run MCP tool 'sql': the credentials on its `/v1/mcp` request could not be resolved, so the call was refused and the tool did not run. Retry the request, and report it at https://github.com/spiceai/spiceai/issues if it keeps failing. See https://spiceai.org/docs/api/auth"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_call_without_principal_is_refused() {
+        // /v1/mcp requires `runtime.auth` (`require_auth_configured`). A call with
+        // no principal on its Parts must run neither as auth-disabled (writable)
+        // nor under a stand-in identity: neither tool may run.
+        let service = mcp_http_service(principal_probe_server());
+        for tool in ["principal_probe", "write_gated"] {
+            let (status, json) = post_tools_call_with_spice_ctx(&service, tool, None).await;
+            assert_eq!(status, http::StatusCode::OK, "unexpected status: {json}");
+            assert_missing_principal_refusal(&json, tool);
+        }
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_call_context_without_principal_is_refused() {
+        // Concrete RequestContext present but no auth principal (auth layer
+        // skipped / principal never set): refused the same way.
+        let service = mcp_http_service(principal_probe_server());
+        let ctx = Arc::new(SpiceRequestContext::builder(Protocol::Http).build());
+        let (status, json) =
+            post_tools_call_with_spice_ctx(&service, "principal_probe", Some(ctx)).await;
+        assert_eq!(status, http::StatusCode::OK, "unexpected status: {json}");
+        assert_missing_principal_refusal(&json, "principal_probe");
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_call_rejects_write_for_read_only_key() {
+        let service = mcp_http_service(principal_probe_server());
+        let ctx = spice_ctx_with_api_key("topsecret123");
+        let (status, json) =
+            post_tools_call_with_spice_ctx(&service, "write_gated", Some(ctx)).await;
+        assert_eq!(
+            status,
+            http::StatusCode::OK,
+            "MCP returns 200 with error payload: {json}"
+        );
+        // Tool error becomes MCP internal_error or isError result depending on path.
+        let is_error = json.pointer("/result/isError").and_then(Value::as_bool) == Some(true)
+            || json.get("error").is_some();
+        let text = json.to_string();
+        assert!(
+            is_error && text.contains("read-only"),
+            "RO key must reject write_gated tool; got {json}"
+        );
+    }
+
+    #[tokio::test]
+    async fn mcp_tools_call_allows_write_for_read_write_key() {
+        let service = mcp_http_service(principal_probe_server());
+        let ctx = spice_ctx_with_api_key("writer456:rw");
+        let (status, json) =
+            post_tools_call_with_spice_ctx(&service, "write_gated", Some(ctx)).await;
+        assert_eq!(status, http::StatusCode::OK, "unexpected status: {json}");
+        assert_ne!(
+            json.pointer("/result/isError").and_then(Value::as_bool),
+            Some(true),
+            "RW key must succeed write_gated; got {json}"
+        );
+        let payload: Value =
+            serde_json::from_str(&tool_result_text(&json)).expect("tool payload json");
+        assert_eq!(payload.get("wrote"), Some(&Value::Bool(true)));
+    }
+
+    /// Initialize a legacy-era MCP session and return its `Mcp-Session-Id`.
+    ///
+    /// `2026-07-28` is always sessionless; only legacy `initialize` creates a
+    /// session worker that can retain prior request state across tools/call.
+    async fn initialize_legacy_mcp_session(
+        service: &rmcp::transport::streamable_http_server::StreamableHttpService<
+            RuntimeServer,
+            rmcp::transport::streamable_http_server::session::local::LocalSessionManager,
+        >,
+    ) -> String {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "runtime-tools-test", "version": "0.0.0"}
+            }
+        });
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", "localhost")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-protocol-version", "2025-11-25")
+            .body(http_body_util::Full::new(bytes::Bytes::from(
+                body.to_string(),
+            )))
+            .expect("valid initialize request");
+        let response = service.handle(request).await;
+        let status = response.status();
+        let session_id = response
+            .headers()
+            .get("mcp-session-id")
+            .unwrap_or_else(|| panic!("initialize must return Mcp-Session-Id, status={status}"))
+            .to_str()
+            .expect("session id utf8")
+            .to_owned();
+        let _ = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("initialize body");
+
+        let initialized = http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", "localhost")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-protocol-version", "2025-11-25")
+            .header("mcp-session-id", &session_id)
+            .body(http_body_util::Full::new(bytes::Bytes::from(
+                r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            )))
+            .expect("valid initialized notification");
+        let response = service.handle(initialized).await;
+        assert!(
+            response.status().is_success() || response.status() == http::StatusCode::ACCEPTED,
+            "notifications/initialized must be accepted, got {}",
+            response.status()
+        );
+        let _ = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("initialized body");
+        session_id
+    }
+
+    async fn post_legacy_tools_call_with_session(
+        service: &rmcp::transport::streamable_http_server::StreamableHttpService<
+            RuntimeServer,
+            rmcp::transport::streamable_http_server::session::local::LocalSessionManager,
+        >,
+        session_id: &str,
+        tool_name: &str,
+        spice_ctx: Option<Arc<SpiceRequestContext>>,
+        rpc_id: u64,
+    ) -> (http::StatusCode, Value) {
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": rpc_id,
+            "method": "tools/call",
+            "params": {
+                "name": tool_name,
+                "arguments": {}
+            }
+        });
+        let mut request = http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", "localhost")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-protocol-version", "2025-11-25")
+            .header("mcp-session-id", session_id)
+            .body(http_body_util::Full::new(bytes::Bytes::from(
+                body.to_string(),
+            )))
+            .expect("valid legacy tools/call request");
+        if let Some(ctx) = spice_ctx {
+            insert_spice_ctx(&mut request, ctx);
+        }
+        let response = service.handle(request).await;
+        let status = response.status();
+        let collected = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("response body");
+        let bytes = collected.to_bytes();
+        let json_str = std::str::from_utf8(&bytes).unwrap_or("<non-utf8>");
+        // Legacy session responses are SSE; skip empty `data:` keepalive frames.
+        let json_payload = json_str
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("data: ")
+                    .map(str::trim)
+                    .filter(|payload| !payload.is_empty())
+            })
+            .unwrap_or(json_str);
+        let json: Value = serde_json::from_str(json_payload)
+            .unwrap_or_else(|e| panic!("JSON-RPC body ({status}): {e}: {json_str:?}"));
+        (status, json)
+    }
+
+    #[tokio::test]
+    async fn mcp_session_reuse_evaluates_current_request_principal() {
+        // Legacy session worker can retain prior-request state; each tools/call
+        // must still evaluate the *current* request's HTTP Parts principal.
+        let service = mcp_http_service(principal_probe_server());
+        let session_id = initialize_legacy_mcp_session(&service).await;
+
+        let rw = spice_ctx_with_api_key("writer456:rw");
+        let (write_status, write_json) = post_legacy_tools_call_with_session(
+            &service,
+            &session_id,
+            "principal_probe",
+            Some(rw),
+            2,
+        )
+        .await;
+        assert_eq!(
+            write_status,
+            http::StatusCode::OK,
+            "RW tools/call on legacy session: {write_json}"
+        );
+        let write_payload: Value =
+            serde_json::from_str(&tool_result_text(&write_json)).expect("rw payload");
+        assert_eq!(write_payload.get("read_only"), Some(&Value::Bool(false)));
+
+        let ro = spice_ctx_with_api_key("topsecret123");
+        let (read_status, read_json) = post_legacy_tools_call_with_session(
+            &service,
+            &session_id,
+            "principal_probe",
+            Some(ro),
+            3,
+        )
+        .await;
+        assert_eq!(
+            read_status,
+            http::StatusCode::OK,
+            "RO tools/call on same legacy session: {read_json}"
+        );
+        let read_payload: Value =
+            serde_json::from_str(&tool_result_text(&read_json)).expect("ro payload");
+        assert_eq!(
+            read_payload.get("read_only"),
+            Some(&Value::Bool(true)),
+            "same Mcp-Session-Id must still use the current request principal, not a prior session key; got {read_payload} from {read_json}"
         );
     }
 }

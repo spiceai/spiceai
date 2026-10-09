@@ -373,10 +373,168 @@ pub fn record_executor_scheduler_connection_retry(node_id: &str, scheduler: &str
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use opentelemetry_sdk::metrics::SdkMeterProvider;
+    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData, ResourceMetrics};
+    use opentelemetry_sdk::metrics::reader::MetricReader as _;
+    use telemetry::metrics_reader::MetricsReader;
+
     use super::*;
 
+    /// Set on the child process `run_in_own_process` spawns.
+    const OWN_PROCESS_ENV: &str = "SPICE_RUNTIME_CLUSTER_TEST_OWN_PROCESS";
+
+    /// Re-runs the test `name` (in this module) alone in a fresh process of this
+    /// test binary and asserts it passed there. Returns `true` only inside that
+    /// child, where the caller runs the test body; returns `false` in the parent
+    /// once the child has passed.
+    ///
+    /// The instruments here are `LazyLock`s bound to whichever meter provider is
+    /// global when `CLUSTER_METER` is first touched, and under `cargo test` a
+    /// sibling test that plans a query or assigns a partition can touch it first,
+    /// binding every instrument to the no-op provider. A test that reads the
+    /// instruments back needs a process of its own.
+    fn run_in_own_process(name: &str) -> bool {
+        if std::env::var_os(OWN_PROCESS_ENV).is_some() {
+            return true;
+        }
+
+        // libtest names tests by module path without the crate name.
+        let module = module_path!()
+            .split_once("::")
+            .map_or(module_path!(), |(_, module)| module);
+        let test = format!("{module}::{name}");
+        let output =
+            std::process::Command::new(std::env::current_exe().expect("to locate the test binary"))
+                .args([test.as_str(), "--exact"])
+                .env(OWN_PROCESS_ENV, "1")
+                .output()
+                .expect("to run the test binary");
+
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(
+            output.status.success() && stdout.contains("test result: ok. 1 passed"),
+            "{test} failed in its own process ({}):\nstdout:\n{stdout}\nstderr:\n{stderr}",
+            output.status
+        );
+        false
+    }
+
+    /// One exported series: a counter or gauge reads as its value, a histogram
+    /// as its sample count and sum.
+    #[derive(Debug, PartialEq)]
+    enum Series {
+        Value(u64),
+        U64Histogram { count: u64, sum: u64 },
+        F64Histogram { count: u64, sum: f64 },
+    }
+
+    /// A metric name with its label set, sorted so it compares independent of
+    /// the order the labels were recorded in.
+    type SeriesKey = (String, Vec<(String, String)>);
+
+    fn series_key(name: &str, labels: &[(&str, &str)]) -> SeriesKey {
+        let mut labels: Vec<(String, String)> = labels
+            .iter()
+            .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+            .collect();
+        labels.sort();
+        (name.to_string(), labels)
+    }
+
+    fn point_key<'a, I>(name: &str, attributes: I) -> SeriesKey
+    where
+        I: IntoIterator<Item = &'a KeyValue>,
+    {
+        let mut labels: Vec<(String, String)> = attributes
+            .into_iter()
+            .map(|attribute| {
+                (
+                    attribute.key.as_str().to_string(),
+                    attribute.value.as_str().to_string(),
+                )
+            })
+            .collect();
+        labels.sort();
+        (name.to_string(), labels)
+    }
+
+    /// Every series `reader` exports, by metric name and label set.
+    fn exported_series(reader: &MetricsReader) -> BTreeMap<SeriesKey, Series> {
+        let mut resource_metrics = ResourceMetrics::default();
+        reader
+            .collect(&mut resource_metrics)
+            .expect("collect the cluster metrics");
+
+        let mut series = BTreeMap::new();
+        for metric in resource_metrics
+            .scope_metrics()
+            .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
+        {
+            let name = metric.name();
+            match metric.data() {
+                AggregatedMetrics::U64(MetricData::Sum(sum)) => {
+                    for point in sum.data_points() {
+                        series.insert(
+                            point_key(name, point.attributes()),
+                            Series::Value(point.value()),
+                        );
+                    }
+                }
+                AggregatedMetrics::U64(MetricData::Gauge(gauge)) => {
+                    for point in gauge.data_points() {
+                        series.insert(
+                            point_key(name, point.attributes()),
+                            Series::Value(point.value()),
+                        );
+                    }
+                }
+                AggregatedMetrics::U64(MetricData::Histogram(histogram)) => {
+                    for point in histogram.data_points() {
+                        series.insert(
+                            point_key(name, point.attributes()),
+                            Series::U64Histogram {
+                                count: point.count(),
+                                sum: point.sum(),
+                            },
+                        );
+                    }
+                }
+                AggregatedMetrics::F64(MetricData::Histogram(histogram)) => {
+                    for point in histogram.data_points() {
+                        series.insert(
+                            point_key(name, point.attributes()),
+                            Series::F64Histogram {
+                                count: point.count(),
+                                sum: point.sum(),
+                            },
+                        );
+                    }
+                }
+                other => panic!("unexpected aggregation exported for {name}: {other:?}"),
+            }
+        }
+        series
+    }
+
+    /// Every helper exports its documented metric name, label set and value
+    /// through a real SDK meter provider. A partition-state operation with a
+    /// zero count exports no series at all, and the last value set on a gauge
+    /// is the one it reports.
     #[test]
     fn helpers_do_not_panic() {
+        if !run_in_own_process("helpers_do_not_panic") {
+            return;
+        }
+        let reader = MetricsReader::new();
+        global::set_meter_provider(
+            SdkMeterProvider::builder()
+                .with_reader(reader.clone())
+                .build(),
+        );
+
         record_query_executor_count("sched-1:5000", 3);
         record_query_planning_failure("sched-1:5000", PlanningFailure::MissingPartitions);
         record_query_planning_failure("sched-1:5000", PlanningFailure::NoExecutors);
@@ -403,5 +561,132 @@ mod tests {
 
         set_executor_scheduler_active_connection("exec-1:6000", "sched-1:5000", true);
         record_executor_scheduler_connection_retry("exec-1:6000", "sched-1:5000");
+
+        let scheduler = ("node_id", "sched-1:5000");
+        let executor_node = ("node_id", "exec-1:6000");
+        let dataset = ("dataset", "eth.recent_blocks");
+        let executor = ("executor", "exec-1:6000");
+        let expected = BTreeMap::from([
+            (
+                series_key("query_executor_count", &[scheduler]),
+                Series::U64Histogram { count: 1, sum: 3 },
+            ),
+            (
+                series_key(
+                    "query_planning_failures",
+                    &[scheduler, ("error_type", "missing_partitions")],
+                ),
+                Series::Value(1),
+            ),
+            (
+                series_key(
+                    "query_planning_failures",
+                    &[scheduler, ("error_type", "no_executors")],
+                ),
+                Series::Value(1),
+            ),
+            (
+                series_key(
+                    "scheduler_partitions_count",
+                    &[scheduler, dataset, ("status", "assigned")],
+                ),
+                Series::Value(10),
+            ),
+            (
+                series_key(
+                    "scheduler_partitions_count",
+                    &[scheduler, dataset, ("status", "unassigned")],
+                ),
+                Series::Value(2),
+            ),
+            (
+                series_key(
+                    "scheduler_partition_assignments",
+                    &[scheduler, executor, ("status", "committed")],
+                ),
+                Series::Value(1),
+            ),
+            (
+                series_key(
+                    "scheduler_partition_assignments",
+                    &[scheduler, executor, ("status", "failed")],
+                ),
+                Series::Value(1),
+            ),
+            (
+                series_key(
+                    "scheduler_partition_discovery_duration_ms",
+                    &[scheduler, dataset],
+                ),
+                Series::F64Histogram {
+                    count: 1,
+                    sum: 42.0,
+                },
+            ),
+            (
+                series_key(
+                    "scheduler_partition_state_operations",
+                    &[scheduler, ("status", "added")],
+                ),
+                Series::Value(4),
+            ),
+            (
+                series_key(
+                    "scheduler_partition_state_operations",
+                    &[scheduler, ("status", "removed")],
+                ),
+                Series::Value(1),
+            ),
+            (
+                series_key(
+                    "scheduler_partitioned_write_forwards",
+                    &[scheduler, executor, ("status", "completed")],
+                ),
+                Series::Value(1),
+            ),
+            (
+                series_key(
+                    "scheduler_partitioned_write_forwards",
+                    &[scheduler, executor, ("status", "failed")],
+                ),
+                Series::Value(1),
+            ),
+            (
+                series_key(
+                    "executor_assigned_partitions_count",
+                    &[executor_node, dataset],
+                ),
+                Series::Value(7),
+            ),
+            (
+                series_key(
+                    "scheduler_executor_active_connections",
+                    &[scheduler, executor],
+                ),
+                Series::Value(0),
+            ),
+            (
+                series_key(
+                    "scheduler_executor_connection_retries",
+                    &[scheduler, executor],
+                ),
+                Series::Value(1),
+            ),
+            (
+                series_key(
+                    "executor_scheduler_active_connections",
+                    &[executor_node, ("scheduler", "sched-1:5000")],
+                ),
+                Series::Value(1),
+            ),
+            (
+                series_key(
+                    "executor_scheduler_connection_retries",
+                    &[executor_node, ("scheduler", "sched-1:5000")],
+                ),
+                Series::Value(1),
+            ),
+        ]);
+        assert_eq!(exported_series(&reader), expected);
     }
 }

@@ -478,64 +478,165 @@ mod tests {
 
     // Tests for header support
 
-    #[test]
-    fn test_create_http_exporter_with_headers() {
+    /// One collected batch holding a single counter point, so an export has
+    /// data to send.
+    fn collected_metrics() -> ResourceMetrics {
+        use opentelemetry::metrics::MeterProvider as _;
+        use opentelemetry_sdk::metrics::reader::MetricReader as _;
+
+        let reader = telemetry::metrics_reader::MetricsReader::new();
+        let provider = opentelemetry_sdk::metrics::SdkMeterProvider::builder()
+            .with_reader(reader.clone())
+            .build();
+        provider
+            .meter("otel_push_exporter_test")
+            .u64_counter("exported_counter")
+            .build()
+            .add(1, &[]);
+        let mut metrics = ResourceMetrics::default();
+        reader
+            .collect(&mut metrics)
+            .expect("collect the test counter");
+        metrics
+    }
+
+    /// Serves an OTLP/HTTP collector on a loopback port. Returns its base URL
+    /// and a receiver of the path and headers of every request it answers.
+    async fn serve_http_collector() -> (
+        String,
+        tokio::sync::mpsc::UnboundedReceiver<(String, axum::http::HeaderMap)>,
+    ) {
+        let (requests, received) = tokio::sync::mpsc::unbounded_channel();
+        let collector = axum::Router::new().fallback(
+            move |uri: axum::http::Uri, headers: axum::http::HeaderMap| {
+                let requests = requests.clone();
+                async move {
+                    requests.send((uri.path().to_string(), headers)).ok();
+                    axum::http::StatusCode::OK
+                }
+            },
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the test collector");
+        let address = listener
+            .local_addr()
+            .expect("the test collector has an address");
+        tokio::spawn(async move {
+            axum::serve(listener, collector)
+                .await
+                .expect("the test collector serves");
+        });
+        (format!("http://{address}"), received)
+    }
+
+    fn header<'a>(headers: &'a axum::http::HeaderMap, name: &str) -> Option<&'a str> {
+        headers.get(name).and_then(|value| value.to_str().ok())
+    }
+
+    #[tokio::test]
+    async fn test_create_http_exporter_with_headers() {
+        let (collector, mut requests) = serve_http_collector().await;
         let headers = HashMap::from([
             ("DD-API-KEY".to_string(), "test-key".to_string()),
             ("X-Custom".to_string(), "value".to_string()),
         ]);
-        // HTTP exporter with headers should build successfully
-        let result = create_http_exporter(
-            "http://localhost:4318/v1/metrics",
-            headers,
-            Temporality::Delta,
-        );
-        assert!(
-            result.is_ok(),
-            "HTTP exporter with headers should build: {result:?}"
-        );
+        let metrics = collected_metrics();
+
+        // An endpoint that already names the OTLP metrics path is used as
+        // given; a bare one, with or without a trailing slash, gets it appended.
+        for endpoint in [
+            format!("{collector}/v1/metrics"),
+            collector.clone(),
+            format!("{collector}/"),
+        ] {
+            let exporter = create_http_exporter(&endpoint, headers.clone(), Temporality::Delta)
+                .unwrap_or_else(|e| panic!("HTTP exporter for {endpoint} should build: {e}"));
+            exporter
+                .export(&metrics)
+                .await
+                .unwrap_or_else(|e| panic!("export to {endpoint} should succeed: {e:?}"));
+
+            let (path, received) =
+                tokio::time::timeout(std::time::Duration::from_secs(5), requests.recv())
+                    .await
+                    .unwrap_or_else(|_| {
+                        panic!("the collector should receive the export to {endpoint}")
+                    })
+                    .expect("the test collector is still running");
+            assert_eq!(path, "/v1/metrics", "{endpoint}");
+            assert_eq!(
+                header(&received, "dd-api-key"),
+                Some("test-key"),
+                "{endpoint}"
+            );
+            assert_eq!(header(&received, "x-custom"), Some("value"), "{endpoint}");
+        }
     }
 
-    #[test]
-    fn test_create_http_exporter_without_headers() {
-        let headers = HashMap::new();
-        let result = create_http_exporter(
-            "http://localhost:4318/v1/metrics",
-            headers,
-            Temporality::Delta,
-        );
-        assert!(
-            result.is_ok(),
-            "HTTP exporter without headers should build: {result:?}"
-        );
+    /// An OTLP/gRPC collector that records the metadata of every export.
+    struct MetadataCapture(tokio::sync::mpsc::UnboundedSender<tonic::metadata::MetadataMap>);
+
+    #[tonic::async_trait]
+    impl opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_server::MetricsService
+        for MetadataCapture
+    {
+        async fn export(
+            &self,
+            request: tonic::Request<
+                opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequest,
+            >,
+        ) -> std::result::Result<
+            tonic::Response<
+                opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceResponse,
+            >,
+            tonic::Status,
+        > {
+            self.0.send(request.metadata().clone()).ok();
+            Ok(tonic::Response::new(
+                opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceResponse::default(),
+            ))
+        }
     }
 
-    #[test]
-    fn test_create_grpc_exporter_with_valid_headers() {
-        // tonic requires a tokio runtime to be available during exporter construction
-        let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
-        let _guard = rt.enter();
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_create_grpc_exporter_with_valid_headers() {
+        use opentelemetry_proto::tonic::collector::metrics::v1::metrics_service_server::MetricsServiceServer;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the test collector");
+        let address = listener
+            .local_addr()
+            .expect("the test collector has an address");
+        let (metadata_sender, mut received) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            tonic::transport::Server::builder()
+                .add_service(MetricsServiceServer::new(MetadataCapture(metadata_sender)))
+                .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+                .await
+                .expect("the test collector serves");
+        });
+
         let headers = HashMap::from([
             ("api-key".to_string(), "test-key".to_string()),
             ("x-custom-header".to_string(), "value".to_string()),
         ]);
-        let result = create_grpc_exporter("http://localhost:4317", &headers, Temporality::Delta);
-        assert!(
-            result.is_ok(),
-            "gRPC exporter with valid headers should build: {result:?}"
-        );
-    }
+        let exporter =
+            create_grpc_exporter(&format!("http://{address}"), &headers, Temporality::Delta)
+                .expect("gRPC exporter with valid headers should build");
+        exporter
+            .export(&collected_metrics())
+            .await
+            .expect("the export should reach the test collector");
 
-    #[test]
-    fn test_create_grpc_exporter_without_headers() {
-        let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
-        let _guard = rt.enter();
-        let headers = HashMap::new();
-        let result = create_grpc_exporter("http://localhost:4317", &headers, Temporality::Delta);
-        assert!(
-            result.is_ok(),
-            "gRPC exporter without headers should build: {result:?}"
-        );
+        let metadata = tokio::time::timeout(std::time::Duration::from_secs(5), received.recv())
+            .await
+            .expect("the collector should receive the export")
+            .expect("the test collector is still running");
+        let value = |key: &str| metadata.get(key).and_then(|value| value.to_str().ok());
+        assert_eq!(value("api-key"), Some("test-key"));
+        assert_eq!(value("x-custom-header"), Some("value"));
     }
 
     #[test]

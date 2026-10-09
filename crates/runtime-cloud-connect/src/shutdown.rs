@@ -74,6 +74,9 @@ mod tests {
 
     #[tokio::test]
     async fn wait_returns_immediately_after_trigger() {
+        // The race a bare `Notify` loses: the trigger lands before any waiter
+        // registers, so its `notify_waiters()` wakes nobody and a later wait
+        // would hang. The latched flag is what lets this wait observe it.
         let s = Shutdown::new();
         s.trigger();
         // Must not hang.
@@ -95,22 +98,5 @@ mod tests {
             .await
             .expect("waiter should resolve")
             .expect("waiter task did not panic");
-    }
-
-    #[tokio::test]
-    async fn trigger_before_first_waiter_is_not_lost() {
-        // This is the race the previous `Notify`-only impl had: trigger
-        // before any waiter registers, then start waiting — the bare
-        // `notify_waiters()` would be lost. The latched flag fixes it.
-        let s = Shutdown::new();
-        s.trigger();
-        let waiter = Arc::clone(&s);
-        tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            tokio::spawn(async move { waiter.wait().await }),
-        )
-        .await
-        .expect("waiter must observe the latched signal")
-        .expect("waiter task did not panic");
     }
 }

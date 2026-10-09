@@ -1,0 +1,5 @@
+---
+source: crates/search/src/pipeline.rs
+expression: "format!(\"{:?}\", prepare_keywords(&keywords, \"hello\"))"
+---
+Ok([Like(Like { negated: false, expr: Column(Column { relation: None, name: "hello" }), pattern: Literal(Utf8("%keyword1%"), None), escape_char: None, case_insensitive: true }), Like(Like { negated: false, expr: Column(Column { relation: None, name: "hello" }), pattern: Literal(Utf8("%"key word2"%"), None), escape_char: None, case_insensitive: true }), Like(Like { negated: false, expr: Column(Column { relation: None, name: "hello" }), pattern: Literal(Utf8("%key word3%"), None), escape_char: None, case_insensitive: true }), Like(Like { negated: false, expr: Column(Column { relation: None, name: "hello" }), pattern: Literal(Utf8("%keyword4%"), None), escape_char: None, case_insensitive: true })])

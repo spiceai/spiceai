@@ -26,6 +26,8 @@ limitations under the License.
 //!   that the files span several record batches;
 //! - an append refresh, where a late row older than the stored version (inside
 //!   `refresh_append_overlap`) must not replace it, and a newer row must;
+//! - an append refresh with `retention_sql`, which removes a key whose newest version
+//!   it matches, in the first load and in a later append;
 //! - a NULL `time_column`, which is older than any time;
 //! - a `localpod` child of a file-mode Cayenne parent, which must keep the same
 //!   versions as its parent.
@@ -81,6 +83,17 @@ async fn load(
     refresh: RefreshMode,
     label: &str,
 ) -> (Arc<Runtime>, bool) {
+    load_with_retention(source, accel_dir, mode, refresh, None, label).await
+}
+
+async fn load_with_retention(
+    source: &Path,
+    accel_dir: &Path,
+    mode: &Mode,
+    refresh: RefreshMode,
+    retention_sql: Option<&str>,
+    label: &str,
+) -> (Arc<Runtime>, bool) {
     let mut params = HashMap::new();
     if *mode == Mode::File {
         params.insert(
@@ -106,6 +119,9 @@ async fn load(
         refresh_append_overlap: Some("7d".to_string()),
         params: (!params.is_empty()).then(|| Params::from_string_map(params)),
         primary_key: Some("id".to_string()),
+        retention_sql: retention_sql.map(str::to_string),
+        retention_check_enabled: retention_sql.is_some(),
+        retention_check_interval: retention_sql.map(|_| "200ms".to_string()),
         ..Acceleration::default()
     });
 
@@ -265,6 +281,83 @@ async fn append_refresh_keeps_a_stored_newer_version_and_takes_a_newer_one() {
         .await;
 }
 
+/// An append with `retention_sql` loads, and its retention check deletes the rows it
+/// matches after each key's newest version is chosen: a key whose newest version
+/// matches is gone, and an older version of it does not take its place.
+#[tokio::test]
+async fn append_refresh_with_retention_sql_keeps_the_newest_version_of_each_key() {
+    test_request_context()
+        .scope(async {
+            for mode in modes() {
+                let label = format!("append_retention_{mode:?}");
+                let source = tempfile::tempdir().expect("source dir");
+                let accel = tempfile::tempdir().expect("acceleration dir");
+
+                let mut a = vec![
+                    (1, "2026-01-10T00:00:00", "id1-newest"),
+                    (2, "2026-01-05T00:00:00", "id2-older"),
+                    (3, "2026-01-01T00:00:00", "expired"),
+                    (7, "2026-01-02T00:00:00", "id7-older"),
+                ];
+                a.extend((0..FILLER_KEYS).map(|i| (1_000 + i, "2026-01-01T00:00:00", "filler")));
+                write(source.path(), "a.csv", &csv(&a));
+                write(
+                    source.path(),
+                    "b.csv",
+                    &csv(&[
+                        (1, "2026-01-08T00:00:00", "id1-older"),
+                        (2, "2026-01-07T00:00:00", "id2-newest"),
+                        (7, "2026-01-09T00:00:00", "expired"),
+                    ]),
+                );
+
+                let (rt, ready) = load_with_retention(
+                    source.path(),
+                    accel.path(),
+                    &mode,
+                    RefreshMode::Append,
+                    Some(&format!("DELETE FROM {TABLE} WHERE v = 'expired'")),
+                    &label,
+                )
+                .await;
+                assert!(ready, "{label}: the dataset should load");
+                assert_eq!(values_of(&rt, 1).await, ["id1-newest"], "{label}: key 1");
+                assert_eq!(values_of(&rt, 2).await, ["id2-newest"], "{label}: key 2");
+                assert!(
+                    wait_until_true(Duration::from_mins(1), || async {
+                        values_of(&rt, 3).await.is_empty() && values_of(&rt, 7).await.is_empty()
+                    })
+                    .await,
+                    "{label}: retention never removed the expired keys: key 3 {:?}, key 7 {:?}",
+                    values_of(&rt, 3).await,
+                    values_of(&rt, 7).await
+                );
+                assert_eq!(rows(&rt).await, 2 + FILLER_KEYS, "{label}: initial load");
+
+                write(
+                    source.path(),
+                    "c.csv",
+                    &csv(&[
+                        (2, "2026-01-12T00:00:00", "expired"),
+                        (8, "2026-01-11T00:00:00", "new-key"),
+                    ]),
+                );
+                trigger_refresh(&rt, TABLE).await.expect("refresh");
+                assert!(
+                    wait_until_true(Duration::from_mins(1), || async {
+                        values_of(&rt, 8).await == ["new-key"] && values_of(&rt, 2).await.is_empty()
+                    })
+                    .await,
+                    "{label}: after the append, key 8 is {:?} and key 2 (newest version expired) is {:?}",
+                    values_of(&rt, 8).await,
+                    values_of(&rt, 2).await
+                );
+                assert_eq!(rows(&rt).await, 2 + FILLER_KEYS, "{label}: after the append");
+            }
+        })
+        .await;
+}
+
 #[tokio::test]
 async fn a_null_time_column_is_the_oldest_version() {
     test_request_context()
@@ -298,6 +391,46 @@ async fn a_null_time_column_is_the_oldest_version() {
                 assert_eq!(values_of(&rt, 2).await, ["timed"], "{label}: key 2");
                 assert_eq!(values_of(&rt, 3).await, ["timed"], "{label}: key 3");
                 assert_eq!(rows(&rt).await, 3, "{label}: one row per key");
+            }
+        })
+        .await;
+}
+
+/// The same, in a write too large to buffer, so a file-mode refresh resolves its keys
+/// through the streaming path, which carries each surviving row's time, a NULL one
+/// included, in its own columns.
+#[tokio::test]
+async fn a_null_time_column_is_the_oldest_version_in_a_streamed_write() {
+    test_request_context()
+        .scope(async {
+            for mode in modes() {
+                let label = format!("null_streamed_{mode:?}");
+                let source = tempfile::tempdir().expect("source dir");
+                let accel = tempfile::tempdir().expect("acceleration dir");
+                let mut source_rows = vec![
+                    (1, "", "only-null"),
+                    (2, "2026-01-03T00:00:00", "timed"),
+                    (2, "", "null"),
+                    (3, "", "null"),
+                    (3, "2026-01-01T00:00:00", "timed"),
+                ];
+                source_rows
+                    .extend((0..FILLER_KEYS).map(|i| (1_000 + i, "2026-01-01T00:00:00", "filler")));
+                write(source.path(), "a.csv", &csv(&source_rows));
+
+                let (rt, ready) = load(
+                    source.path(),
+                    accel.path(),
+                    &mode,
+                    RefreshMode::Full,
+                    &label,
+                )
+                .await;
+                assert!(ready, "{label}: a NULL time_column loads");
+                assert_eq!(values_of(&rt, 1).await, ["only-null"], "{label}: key 1");
+                assert_eq!(values_of(&rt, 2).await, ["timed"], "{label}: key 2");
+                assert_eq!(values_of(&rt, 3).await, ["timed"], "{label}: key 3");
+                assert_eq!(rows(&rt).await, 3 + FILLER_KEYS, "{label}: one row per key");
             }
         })
         .await;

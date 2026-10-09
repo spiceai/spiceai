@@ -406,9 +406,29 @@ mod tests {
 
     #[test]
     fn snowflake_table_path_rejects_invalid_identifier_paths() {
-        quote_snowflake_table_path(r#""unterminated.table"#)
-            .expect_err("should reject unterminated quoted identifier");
-        quote_snowflake_table_path("a.b.c.d").expect_err("should reject 4-part identifier");
+        use datafusion::sql::sqlparser::parser::ParserError;
+
+        assert_eq!(
+            quote_snowflake_table_path(r#""unterminated.table"#)
+                .expect_err("should reject unterminated quoted identifier"),
+            ParserError::TokenizerError(
+                "Expected close delimiter '\"' before EOF. at Line: 1, Column: 1".to_string()
+            )
+        );
+        assert_eq!(
+            quote_snowflake_table_path("a.b.c.d").expect_err("should reject 4-part identifier"),
+            ParserError::ParserError(
+                "Invalid Snowflake table path: expected 1-3 identifier parts, got: a.b.c.d"
+                    .to_string()
+            )
+        );
+        // A quoted identifier may hold any character, but a NUL byte cannot be
+        // passed through to Snowflake.
+        assert_eq!(
+            quote_snowflake_table_path("schema.\"ta\0ble\"")
+                .expect_err("should reject a NUL byte inside a quoted identifier"),
+            ParserError::ParserError("Snowflake identifiers cannot contain NUL bytes".to_string())
+        );
     }
 
     struct MockConn;

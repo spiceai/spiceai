@@ -545,8 +545,15 @@ mod tests {
             .await
             .expect("Failed to create initial checkpoint");
 
-        // Sleep for a short time to ensure the timestamp changes
-        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        // Age the row by a week, so the update below provably moves `updated_at`
+        // forward despite SQLite's one-second timestamp resolution, and so any
+        // rewrite of `created_at` shows.
+        backdate_both_timestamps_by_seven_days(&checkpoint).await;
+        let (created_before, updated_before) = stored_timestamps(&checkpoint).await;
+        assert_eq!(
+            created_before, updated_before,
+            "both timestamps were backdated to the same instant"
+        );
 
         // Create updated schema
         let schema2 = Schema::new(vec![
@@ -569,35 +576,16 @@ mod tests {
             .expect("Schema should exist");
         assert_eq!(&schema2, retrieved_schema.as_ref());
 
-        // Verify that the updated_at timestamp has changed
-        let conn_sync = checkpoint.pool.connect_sync();
-        let conn = conn_sync
-            .as_any()
-            .downcast_ref::<SqliteConnection>()
-            .expect("sqlite connection");
-        let result = conn.conn
-            .call(move |conn| {
-                let query = format!(
-                    "SELECT created_at, updated_at FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ?",
-                );
-                let mut stmt = conn.prepare(&query)?;
-                let mut rows = stmt.query([&checkpoint.dataset_name])?;
-
-                if let Some(row) = rows.next()? {
-                    let created_at: String = row.get(0)?;
-                    let updated_at: String = row.get(1)?;
-                    Ok((created_at, updated_at))
-                } else {
-                    Err(rusqlite::Error::QueryReturnedNoRows)
-                }
-            })
-            .await
-            .expect("Failed to fetch checkpoint data");
-
-        let (created_at, updated_at) = result;
-        assert_ne!(
-            created_at, updated_at,
-            "created_at and updated_at should be different"
+        // The update refreshes `updated_at` and leaves `created_at` as it was. Both
+        // are `YYYY-MM-DD HH:MM:SS` text, so string order is time order.
+        let (created_after, updated_after) = stored_timestamps(&checkpoint).await;
+        assert_eq!(
+            created_after, created_before,
+            "an update must not rewrite created_at"
+        );
+        assert!(
+            updated_after > updated_before,
+            "an update must move updated_at forward: {updated_before} -> {updated_after}"
         );
     }
 
@@ -686,15 +674,24 @@ mod tests {
             .expect("Failed to get checkpoint time")
             .expect("Checkpoint time should exist");
 
-        // Verify the checkpoint time is recent
+        // Verify the checkpoint time is recent. SQLite stamps it from the same wall
+        // clock at one-second resolution, so a few seconds is the tolerance.
         let now = SystemTime::now();
         let time_diff = now
             .duration_since(checkpoint_time)
             .expect("Time difference should be positive");
         assert!(time_diff.as_secs() < 5, "Checkpoint time should be recent");
 
-        // Sleep for a short time to ensure the timestamp changes
-        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+        // Backdate the recorded refresh by a week: the clock reports exactly that,
+        // and the next checkpoint must move it forward again, with no wait on
+        // SQLite's one-second timestamp resolution.
+        backdate_checkpoint_by_seven_days(&checkpoint).await;
+        let backdated = checkpoint
+            .last_checkpoint_time()
+            .await
+            .expect("Failed to get backdated checkpoint time")
+            .expect("Backdated checkpoint time should exist");
+        assert_a_week_apart(backdated, checkpoint_time);
 
         // Update the checkpoint
         checkpoint
@@ -709,10 +706,20 @@ mod tests {
             .expect("Failed to get new checkpoint time")
             .expect("New checkpoint time should exist");
 
-        // Verify the new checkpoint time is more recent than the old one
+        // The update stamps the current time over the backdated one.
+        assert_a_week_apart(backdated, new_checkpoint_time);
+    }
+
+    /// `later` is seven days after `earlier`, within the few seconds that
+    /// one-second timestamps and the statements between them account for.
+    fn assert_a_week_apart(earlier: SystemTime, later: SystemTime) {
+        const WEEK: std::time::Duration = std::time::Duration::from_hours(7 * 24);
+        let gap = later
+            .duration_since(earlier)
+            .expect("the later time is after the earlier one");
         assert!(
-            new_checkpoint_time > checkpoint_time,
-            "New checkpoint time should be more recent"
+            gap.abs_diff(WEEK) <= std::time::Duration::from_secs(5),
+            "expected the times a week apart, got {gap:?}"
         );
     }
 
@@ -832,6 +839,57 @@ mod tests {
             })
             .await
             .expect("backdate updated_at");
+    }
+
+    /// Backdates both of the checkpoint's timestamps by seven days, as a row first
+    /// written a week ago would read.
+    async fn backdate_both_timestamps_by_seven_days(checkpoint: &SqliteDatasetCheckpointer) {
+        let conn_sync = checkpoint.pool.connect_sync();
+        let conn = conn_sync
+            .as_any()
+            .downcast_ref::<SqliteConnection>()
+            .expect("sqlite connection");
+        conn.conn
+            .call(move |conn| {
+                // One statement, so both read the same 'now'.
+                conn.execute(
+                    &format!(
+                        "UPDATE {CHECKPOINT_TABLE_NAME} SET created_at = datetime('now', '-7 days'), updated_at = datetime('now', '-7 days')"
+                    ),
+                    [],
+                )?;
+                Ok::<(), rusqlite::Error>(())
+            })
+            .await
+            .expect("backdate created_at and updated_at");
+    }
+
+    /// The checkpoint row's `created_at` and `updated_at`, as `SQLite` stores them.
+    async fn stored_timestamps(checkpoint: &SqliteDatasetCheckpointer) -> (String, String) {
+        let dataset_name = checkpoint.dataset_name.clone();
+        let conn_sync = checkpoint.pool.connect_sync();
+        let conn = conn_sync
+            .as_any()
+            .downcast_ref::<SqliteConnection>()
+            .expect("sqlite connection");
+        conn.conn
+            .call(move |conn| {
+                let query = format!(
+                    "SELECT created_at, updated_at FROM {CHECKPOINT_TABLE_NAME} WHERE dataset_name = ?",
+                );
+                let mut stmt = conn.prepare(&query)?;
+                let mut rows = stmt.query([&dataset_name])?;
+
+                if let Some(row) = rows.next()? {
+                    let created_at: String = row.get(0)?;
+                    let updated_at: String = row.get(1)?;
+                    Ok((created_at, updated_at))
+                } else {
+                    Err(rusqlite::Error::QueryReturnedNoRows)
+                }
+            })
+            .await
+            .expect("read the checkpoint timestamps")
     }
 
     /// Datasets sharing one database file (Cayenne's metastore) each open the checkpoint

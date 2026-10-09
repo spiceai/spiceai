@@ -48,6 +48,7 @@ runtime-table-partition = { path = "../runtime-table-partition" }
 runtime-udfs-api = { path = "../runtime-udfs-api" }
 search = { path = "../search", default-features = false }
 serde.workspace = true
+serde_json.workspace = true
 snafu.workspace = true
 spice-table = { path = "../spice-table" }
 spicepod = { path = "../spicepod" }
@@ -55,7 +56,7 @@ telemetry = { path = "../telemetry" }
 twox-hash.workspace = true
 tokio.workspace = true
 tokio-stream.workspace = true
-tokio-util.workspace = true
+tokio-util = { workspace = true, features = ["rt"] }
 tracing.workspace = true
 util = { path = "../util", features = ["datafusion"] }
 utoipa = { workspace = true, optional = true }

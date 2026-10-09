@@ -1,0 +1,10 @@
+---
+source: crates/test-framework/src/spicetest/text_to_sql/parse.rs
+expression: "format_result(&tables, &projections)"
+---
+Tables:
+  spice.public.satscores
+  spice.public.schools
+
+Projections:
+  spice.public.schools.School

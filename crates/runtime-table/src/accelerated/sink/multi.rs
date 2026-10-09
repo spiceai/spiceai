@@ -546,9 +546,14 @@ mod tests {
             tx.send(create_test_record_batch(&[i])).unwrap_or_default();
         }
 
-        // Verify we get an error when reading from a lagged stream
+        // A lagged child must fail on the batches it missed rather than write
+        // fewer rows: capacity 1 and ten sends leave the receiver nine behind.
         let result = stream.next().await.expect("should have an item");
-        result.expect_err("expected lagging error");
+        let err = result.expect_err("expected lagging error");
+        let DataFusionError::External(source) = &err else {
+            panic!("expected the broadcast lag as an external error, got: {err}");
+        };
+        assert_eq!(source.to_string(), "channel lagged by 9");
     }
 
     #[tokio::test]
@@ -661,7 +666,10 @@ mod tests {
         );
     }
 
-    #[tokio::test]
+    /// The children take 50, 100 and 150 ms over their batch, yet the barrier
+    /// releases them together. Paused time makes that exact: every child's
+    /// elapsed time is the slowest child's 150 ms, not its own.
+    #[tokio::test(start_paused = true)]
     async fn test_multiple_children_synchronization() {
         let barrier = Arc::new(Barrier::new(3)); // 3 children
         let (tx, rx1) = broadcast::channel(32);
@@ -707,19 +715,26 @@ mod tests {
         // Wait for all tasks
         let results = futures::future::join_all(tasks).await;
 
-        // Verify all tasks completed successfully and got the same data
+        // Every child got the one batch, and none was released before the
+        // slowest had finished its own.
         for result in results {
-            let (batches, _) = result.expect("task completed");
-            assert_eq!(batches.len(), 1);
-            // Verify batch contents
+            let (batches, elapsed) = result.expect("task completed");
+            assert_eq!(batches, vec![create_test_record_batch(&[1, 2, 3])]);
+            assert_eq!(
+                elapsed,
+                Duration::from_millis(150),
+                "the barrier releases every child together, when the slowest finishes"
+            );
         }
     }
 
+    /// Reads `stream` to its end, spending `delay` on each batch, and reports
+    /// how long that took on the (possibly paused) tokio clock.
     async fn process_stream(
         mut stream: RecordBatchBroadcastStream,
         delay: Duration,
     ) -> (Vec<RecordBatch>, Duration) {
-        let start = std::time::Instant::now();
+        let start = tokio::time::Instant::now();
         let mut results = Vec::new();
         while let Some(result) = stream.next().await {
             sleep(delay).await;

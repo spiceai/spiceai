@@ -567,16 +567,20 @@ mod tests {
 
     #[test]
     fn checkpoint_meta_parse_non_schema_json_as_err() {
-        assert!(
-            CheckpointMeta::parse(r#""just a string""#).is_err(),
+        const NEITHER: &str = "persisted checkpoint schema_json is neither a v2 CheckpointMeta envelope nor a legacy Arrow schema object";
+        assert_eq!(
+            CheckpointMeta::parse(r#""just a string""#),
+            Err(NEITHER.to_string()),
             "non-object JSON must not look like a legacy Arrow schema"
         );
-        assert!(
-            CheckpointMeta::parse(r#"{"not_fields":[]}"#).is_err(),
+        assert_eq!(
+            CheckpointMeta::parse(r#"{"not_fields":[]}"#),
+            Err(NEITHER.to_string()),
             "object without `fields` must not look like a legacy Arrow schema"
         );
-        assert!(
-            CheckpointMeta::parse("42").is_err(),
+        assert_eq!(
+            CheckpointMeta::parse("42"),
+            Err(NEITHER.to_string()),
             "numeric JSON must not look like a legacy Arrow schema"
         );
     }

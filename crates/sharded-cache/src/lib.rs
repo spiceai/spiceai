@@ -2174,24 +2174,49 @@ mod tests {
 
     #[test]
     fn tinylfu_keeps_a_hot_key_over_a_one_shot() {
-        let cache: ShardedCache<TestValue> =
-            ShardedCache::new(100, Duration::from_mins(1), EvictionPolicy::TinyLfu);
+        // Both keys land on shard 0, and the 100-byte budget holds only one of
+        // the two 100-byte values.
         let hot = 16u64;
-        cache.insert(hot, TestValue::with_size("hot", 100), 100);
-        for _ in 0..64 {
-            assert!(cache.get(&hot).is_some());
-        }
-        for one_shot in (32..48).step_by(16) {
-            cache.insert(
-                one_shot,
-                TestValue::with_size(&format!("c{one_shot}"), 100),
-                100,
-            );
-        }
-        assert!(
-            cache.get(&hot).is_some(),
-            "`TinyLFU` must not admit one-shot keys over a frequently read resident"
+        let one_shot = 32u64;
+        let data = |cache: &ShardedCache<TestValue>, key: u64| {
+            cache.get(&key).map(|value| value.data.clone())
+        };
+        let read_hot_then_insert_one_shot = |policy: EvictionPolicy| {
+            let cache: ShardedCache<TestValue> =
+                ShardedCache::new(100, Duration::from_mins(1), policy);
+            cache.insert(hot, TestValue::with_size("hot", 100), 100);
+            for _ in 0..64 {
+                assert_eq!(data(&cache, hot), Some("hot".to_string()), "{policy:?}");
+            }
+            cache.insert(one_shot, TestValue::with_size("one-shot", 100), 100);
+            cache
+        };
+
+        let tinylfu = read_hot_then_insert_one_shot(EvictionPolicy::TinyLfu);
+        assert_eq!(
+            data(&tinylfu, hot),
+            Some("hot".to_string()),
+            "`TinyLFU` must not admit a one-shot key over a frequently read resident"
         );
+        assert_eq!(
+            data(&tinylfu, one_shot),
+            None,
+            "the one-shot key is refused"
+        );
+        assert_eq!(tinylfu.len(), 1);
+        assert_eq!(tinylfu.weighted_size(), 100);
+
+        // The same sequence under LRU evicts the hot key, so keeping it above is
+        // the admission policy's doing rather than the access pattern's.
+        let lru = read_hot_then_insert_one_shot(EvictionPolicy::Lru);
+        assert_eq!(
+            data(&lru, hot),
+            None,
+            "LRU evicts the least recently used key"
+        );
+        assert_eq!(data(&lru, one_shot), Some("one-shot".to_string()));
+        assert_eq!(lru.len(), 1);
+        assert_eq!(lru.weighted_size(), 100);
     }
 
     struct CountingListener;

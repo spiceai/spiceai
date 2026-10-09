@@ -573,8 +573,19 @@ mod tests {
     #[tokio::test]
     async fn test_builder_missing_bucket() {
         let url = Url::parse("s3:///path/to/data").expect("valid url");
-        let result = S3ObjectStoreBuilder::from_url(&url, Handle::current());
-        let _ = result.expect_err("should fail with missing bucket");
+        let err = S3ObjectStoreBuilder::from_url(&url, Handle::current())
+            .expect_err("should fail with missing bucket");
+        assert!(
+            matches!(
+                &err,
+                S3ObjectStoreBuilderError::MissingBucket { url } if url == "s3:///path/to/data"
+            ),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "Missing bucket name in S3 URL: s3:///path/to/data"
+        );
     }
 
     #[tokio::test]

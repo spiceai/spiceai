@@ -152,9 +152,13 @@ fn make_dataset(
             .then(|| Params::from_string_map(engine.accel_params.clone())),
         refresh_mode: Some(RefreshMode::Changes),
         primary_key: Some(ds.primary_key.to_string()),
-        on_conflict: vec![(ds.primary_key.to_string(), OnConflictBehavior::Upsert)]
-            .into_iter()
-            .collect(),
+        // Cayenne keeps one row per primary key on its own; the other engines
+        // replace a row only through an `on_conflict` upsert keyed on it.
+        on_conflict: if engine.engine == "cayenne" {
+            HashMap::new()
+        } else {
+            HashMap::from([(ds.primary_key.to_string(), OnConflictBehavior::Upsert)])
+        },
         ..Acceleration::default()
     });
     dataset

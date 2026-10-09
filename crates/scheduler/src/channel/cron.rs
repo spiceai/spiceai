@@ -43,6 +43,22 @@ static CRON_PARSER: LazyLock<CronParser> = LazyLock::new(|| {
         .build()
 });
 
+/// The first time `cron` fires after `after`, evaluated in local time as cron refresh
+/// schedules are.
+///
+/// # Errors
+///
+/// Returns an error if `cron` cannot be parsed or has no further occurrence.
+pub fn next_cron_time(cron: &str, after: std::time::SystemTime) -> Result<std::time::SystemTime> {
+    let cron = CRON_PARSER
+        .parse(cron)
+        .context(crate::FailedToParseCronSnafu)?;
+    let next = cron
+        .find_next_occurrence(&chrono::DateTime::<Local>::from(after), false)
+        .context(crate::FailedToDetermineNextCronRunTimeSnafu)?;
+    Ok(next.into())
+}
+
 impl CronRequestChannel {
     /// Creates a new `CronRequestChannel` with the given cron expression.
     ///
@@ -225,10 +241,21 @@ mod tests {
         // With Year::Optional, "* * * * * * *" (7 fields) is valid cron that runs every
         // second of every year. An 8-field expression, however, should be rejected.
         let cron_expression = "* * * * * * * *".into();
-        let channel = CronRequestChannel::new(&cron_expression);
+        let Err(err) = CronRequestChannel::new(&cron_expression) else {
+            panic!("8-field cron expression should be rejected");
+        };
         assert!(
-            channel.is_err(),
-            "8-field cron expression should be rejected"
+            matches!(
+                &err,
+                crate::Error::FailedToParseCron {
+                    source: croner::errors::CronError::InvalidPattern(message)
+                } if message == "Pattern must have between 5 and 7 fields."
+            ),
+            "unexpected error: {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "Failed to parse cron expression. Invalid pattern: Pattern must have between 5 and 7 fields. Confirm the cron expression is valid, and try again."
         );
     }
 
@@ -263,8 +290,13 @@ mod tests {
         assert!(!request.cancel_running);
         assert!(!request.clear_queue);
 
-        task_completion.notify_waiters();
+        // `notify_one` stores a permit when the evaluator is not yet waiting on
+        // the completion notification, so the wakeup cannot be lost to the
+        // race between its send and its next `notified()`.
+        task_completion.notify_one();
 
+        // Two seconds into the five-second interval is the time under test:
+        // the reset lands between two scheduled runs.
         tokio::select! {
             request = rx.recv() => {
                 panic!("Should not receive a task request yet, got: {request:?}");
@@ -274,8 +306,7 @@ mod tests {
             }
         }
 
-        tokio::time::sleep(Duration::from_millis(10)).await;
-        task_completion.notify_waiters();
+        task_completion.notify_one();
         let now = Local::now();
 
         let request = rx

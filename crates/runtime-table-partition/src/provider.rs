@@ -1181,16 +1181,68 @@ mod tests {
             .register_table("partitioned_table", Arc::new(provider))
             .expect("register partitioned table");
 
-        context
+        let ordered = context
             .sql(
                 "SELECT id FROM partitioned_table \
                  ORDER BY bucket(10, id) DESC",
             )
             .await
             .expect("build logical plan")
-            .create_physical_plan()
+            .collect()
             .await
-            .expect("UDF ordering over a partitioned union must produce a valid physical plan");
+            .expect("UDF ordering over a partitioned union must plan and execute");
+        let ordered_ids: Vec<i32> = ordered
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("id is an Int32 column")
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+
+        // Every row of both partitions comes back exactly once.
+        let mut sorted_ids = ordered_ids.clone();
+        sorted_ids.sort_unstable();
+        assert_eq!(sorted_ids, vec![1, 2, 3, 4, 5, 6]);
+
+        // And in descending bucket order. Ids that share a bucket may come back in
+        // either order, so the order is checked against each id's bucket, read back
+        // through the same UDF, rather than against one fixed sequence.
+        let buckets: std::collections::HashMap<i32, i64> = context
+            .sql("SELECT id, CAST(bucket(10, id) AS BIGINT) FROM partitioned_table")
+            .await
+            .expect("build logical plan")
+            .collect()
+            .await
+            .expect("bucket every id")
+            .iter()
+            .flat_map(|batch| {
+                let ids = batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<Int32Array>()
+                    .expect("id is an Int32 column")
+                    .values()
+                    .to_vec();
+                let batch_buckets = batch
+                    .column(1)
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int64Array>()
+                    .expect("the bucket was cast to BIGINT")
+                    .values()
+                    .to_vec();
+                ids.into_iter().zip(batch_buckets)
+            })
+            .collect();
+        let ordered_buckets: Vec<i64> = ordered_ids.iter().map(|id| buckets[id]).collect();
+        assert!(
+            ordered_buckets.is_sorted_by(|earlier, later| earlier >= later),
+            "rows must come back in bucket(10, id) DESC order, got ids {ordered_ids:?} with buckets {ordered_buckets:?}"
+        );
     }
 
     #[tokio::test]
@@ -1984,19 +2036,15 @@ mod tests {
             .expect("scan failed");
 
         let recorded = tracker.lock().expect("lock poisoned");
-        // At least one partition scanned
-        assert!(
-            !recorded.is_empty(),
-            "Expected at least one partition to be scanned"
+        // `user_id = 100` pins one bucket, so pruning keeps exactly one of the three
+        // partitions. That scan must still receive the base-column filter, and only
+        // it: other user ids hash to the same bucket, so the bucket alone does not
+        // select the row (correctness requirement).
+        assert_eq!(
+            *recorded,
+            vec![vec![col("user_id").eq(lit(100i32))]],
+            "expected exactly one partition scanned, with `user_id = 100` as its only data filter"
         );
-
-        // The data filter `user_id = 100` MUST be present (correctness requirement)
-        for (idx, filters) in recorded.iter().enumerate() {
-            assert!(
-                !filters.is_empty(),
-                "Partition {idx}: expected data filter user_id=100 to be passed through",
-            );
-        }
     }
 
     #[tokio::test]

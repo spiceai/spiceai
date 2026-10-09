@@ -71,6 +71,12 @@ use std::time::Duration;
 
 const DEFAULT_CLIENT_TIMEOUT_SECS: u64 = 30;
 
+/// The `client_timeout` an HTTPS dataset gets when it sets none. Also the
+/// default bound for the rate-control acquire wait, so it must stay equal to
+/// the GraphQL client's timeout for datasets that share an origin.
+pub const DEFAULT_CLIENT_TIMEOUT: Duration = Duration::from_secs(DEFAULT_CLIENT_TIMEOUT_SECS);
+const DEFAULT_CONNECT_TIMEOUT_SECS: u64 = 10;
+
 fn parse_pagination_max_pages(value: &str) -> Option<usize> {
     let trimmed = value.trim();
     if trimmed.eq_ignore_ascii_case("nolimit") {
@@ -442,12 +448,13 @@ impl Https {
             })
             .unwrap_or_default();
 
-        let rate_control = http_rate_control::resolve_config(
+        let mut rate_control = http_rate_control::resolve_config(
             &self.params,
             self.runtime_rate_control_params.as_ref(),
             dataset,
             "https",
         )?;
+        rate_control.apply_default_acquire_timeout(self.configured_client_timeout());
 
         // Both of these bound memory, so an unparseable value is refused rather
         // than quietly replaced by a default: silently falling back would leave
@@ -463,7 +470,7 @@ impl Https {
                     dataconnector: "https".to_string(),
                     connector_component: ConnectorComponent::from(dataset),
                     message: format!(
-                        "Invalid `response_cache_max_size_bytes` value '{value}'. Expected a whole number of bytes, for example '67108864' for 64 MiB. Use '0' to disable the response cache. See: https://spiceai.org/docs/components/data-connectors/http"
+                        "Invalid `response_cache_max_size_bytes` value '{value}'. Expected a whole number of bytes, for example '67108864' for 64 MiB. Use '0' to disable the response cache. See: https://spiceai.org/docs/components/data-connectors/https"
                     ),
                 }
             })?,
@@ -481,7 +488,7 @@ impl Https {
                     dataconnector: "https".to_string(),
                     connector_component: ConnectorComponent::from(dataset),
                     message: format!(
-                        "Invalid `response_cache_fallback_ttl` value '{value}'. Expected a duration, for example '5m' or '30s'. Leave it unset to keep responses from an origin that sends no `Cache-Control` uncached. See: https://spiceai.org/docs/components/data-connectors/http"
+                        "Invalid `response_cache_fallback_ttl` value '{value}'. Expected a duration, for example '5m' or '30s'. Leave it unset to keep responses from an origin that sends no `Cache-Control` uncached. See: https://spiceai.org/docs/components/data-connectors/https"
                     ),
                     source: Box::new(source),
                 }
@@ -923,22 +930,31 @@ impl Https {
     }
 
     /// Build HTTP client with configured timeouts and connection pool settings
-    async fn build_http_client(&self, dataset: &DatasetSpec) -> DataConnectorResult<Client> {
-        let timeout_secs = self
-            .params
-            .get("client_timeout")
-            .expose()
-            .ok()
-            .and_then(|t| t.parse::<u64>().ok())
-            .unwrap_or(DEFAULT_CLIENT_TIMEOUT_SECS);
+    fn configured_client_timeout(&self) -> Duration {
+        Duration::from_secs(
+            self.params
+                .get("client_timeout")
+                .expose()
+                .ok()
+                .and_then(|t| t.parse::<u64>().ok())
+                .unwrap_or(DEFAULT_CLIENT_TIMEOUT_SECS),
+        )
+    }
 
-        let connect_timeout_secs = self
-            .params
-            .get("connect_timeout")
-            .expose()
-            .ok()
-            .and_then(|t| t.parse::<u64>().ok())
-            .unwrap_or(10);
+    fn configured_connect_timeout(&self) -> Duration {
+        Duration::from_secs(
+            self.params
+                .get("connect_timeout")
+                .expose()
+                .ok()
+                .and_then(|t| t.parse::<u64>().ok())
+                .unwrap_or(DEFAULT_CONNECT_TIMEOUT_SECS),
+        )
+    }
+
+    async fn build_http_client(&self, dataset: &DatasetSpec) -> DataConnectorResult<Client> {
+        let client_timeout = self.configured_client_timeout();
+        let connect_timeout = self.configured_connect_timeout();
 
         let pool_max_idle_per_host = self
             .params
@@ -958,8 +974,8 @@ impl Https {
 
         let mut builder = Client::builder()
             .user_agent(util::spiceai_user_agent())
-            .connect_timeout(Duration::from_secs(connect_timeout_secs))
-            .timeout(Duration::from_secs(timeout_secs))
+            .connect_timeout(connect_timeout)
+            .timeout(client_timeout)
             .redirect(reqwest::redirect::Policy::custom(|attempt| {
                 const MAX_REDIRECTS: usize = 5;
                 if attempt.previous().len() >= MAX_REDIRECTS {
@@ -1408,7 +1424,7 @@ impl Https {
 
         let rate_limiter = self
             .rate_control_registry
-            .shared_rate_limiter(&base_url)
+            .shared_rate_limiter_for_config(&base_url, &rate_control)
             .await;
         self.metrics.set_rate_limiter(&rate_limiter);
         let rate_limiter: Arc<dyn RateLimiter> = rate_limiter;
@@ -3307,6 +3323,31 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         .await;
         let dataset = test_dataset("https://example.com/api", RefreshMode::Append, None).await;
 
+        // The identity comes from exactly the inline PEMs given, in their roles.
+        match connector
+            .resolve_client_identity_config(&dataset)
+            .expect("inline mTLS params should be valid")
+            .expect("expected a client identity config")
+        {
+            ClientIdentityConfig::FromPem {
+                cert_pem: resolved_cert,
+                key_pem: resolved_key,
+            } => {
+                assert_eq!(resolved_cert, cert_pem.as_bytes());
+                assert_eq!(resolved_key, key_pem.as_bytes());
+            }
+            config @ ClientIdentityConfig::FromFiles { .. } => {
+                panic!("expected an inline identity config, got {config:?}")
+            }
+        }
+        assert!(
+            connector
+                .resolve_client_identity(&dataset)
+                .await
+                .expect("the inline identity should parse")
+                .is_some(),
+            "a configured inline identity must yield a client identity"
+        );
         connector
             .build_http_client(&dataset)
             .await
@@ -3335,6 +3376,31 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         .await;
         let dataset = test_dataset("https://example.com/api", RefreshMode::Append, None).await;
 
+        // The identity is read from exactly the two files given, in their roles.
+        match connector
+            .resolve_client_identity_config(&dataset)
+            .expect("file-based mTLS params should be valid")
+            .expect("expected a client identity config")
+        {
+            ClientIdentityConfig::FromFiles {
+                cert_path: resolved_cert,
+                key_path: resolved_key,
+            } => {
+                assert_eq!(resolved_cert, cert_path);
+                assert_eq!(resolved_key, key_path);
+            }
+            config @ ClientIdentityConfig::FromPem { .. } => {
+                panic!("expected a file-based identity config, got {config:?}")
+            }
+        }
+        assert!(
+            connector
+                .resolve_client_identity(&dataset)
+                .await
+                .expect("the identity files should be read and parse")
+                .is_some(),
+            "a configured file identity must yield a client identity"
+        );
         connector
             .build_http_client(&dataset)
             .await
@@ -3465,20 +3531,47 @@ uGgYIHbi/F+GaiUPzDyqe5p9
     /// Rate-control metrics keep working through the combined provider — a
     /// delegating impl that silently answered `None` would leave them
     /// registered but never observed.
+    /// An `AsyncInstrument` that records what a metric callback observes.
+    #[derive(Default)]
+    struct RecordingInstrument(parking_lot::Mutex<Vec<u64>>);
+
+    impl opentelemetry::metrics::AsyncInstrument<u64> for RecordingInstrument {
+        fn observe(&self, measurement: u64, _attributes: &[KeyValue]) {
+            self.0.lock().push(measurement);
+        }
+    }
+
     #[tokio::test]
     async fn rate_control_metrics_still_observe_through_the_combined_provider() {
         let connector = test_connector_with(&[("max_concurrent_requests", "4")]).await;
+        // Apply the resolved config the way creating the table provider does,
+        // so the metric has the configured value to report.
+        let dataset = test_dataset("https://example.com/api", RefreshMode::Append, None).await;
+        let config = http_rate_control::resolve_config(
+            &connector.params,
+            connector.runtime_rate_control_params.as_ref(),
+            &dataset,
+            "https",
+        )
+        .expect("the rate-control config should resolve");
+        connector.metrics.set_config(&config);
         let metrics_provider =
             DataConnector::metrics_provider(&connector).expect("the connector exposes metrics");
 
         let metric = metrics_provider
             .get_metric("rate_control_max_concurrent_requests")
             .expect("rate-control metrics remain available");
-        assert!(
-            metrics_provider
-                .callback_to_observe_metric(metric, vec![])
-                .is_some(),
-            "a rate-control metric must still be observed, not just listed"
+        let Some(ObserveMetricCallback::U64(callback)) =
+            metrics_provider.callback_to_observe_metric(metric, vec![])
+        else {
+            panic!("a rate-control metric must still be observed, as a u64, not just listed");
+        };
+        let observed = RecordingInstrument::default();
+        callback(&observed);
+        assert_eq!(
+            *observed.0.lock(),
+            vec![4],
+            "the callback must observe the configured max_concurrent_requests"
         );
     }
 

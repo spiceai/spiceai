@@ -3233,8 +3233,8 @@ mod tests {
         Ok(())
     }
 
-    #[test]
-    fn stats_aggregate_rewriter_folds_sum_over_cayenne_scan() -> DFResult<()> {
+    #[tokio::test]
+    async fn stats_aggregate_rewriter_folds_sum_over_cayenne_scan() -> DFResult<()> {
         let schema = maintained_aggregate_test_schema();
         let stats = value_sum_statistics(Precision::Exact(ScalarValue::Int64(Some(6))));
         let scan = Arc::new(CayenneAccelerationExec::new(file_exec_with_statistics(
@@ -3242,14 +3242,31 @@ mod tests {
         )));
         let aggregate = sum_value_aggregate(scan, schema)?;
 
-        let optimized =
-            CayenneStatsAggregateRewriter::new().optimize(aggregate, &ConfigOptions::default())?;
+        let optimized = CayenneStatsAggregateRewriter::new()
+            .optimize(Arc::clone(&aggregate), &ConfigOptions::default())?;
 
         assert!(
             optimized
                 .downcast_ref::<MaintainedAggregateExec>()
                 .is_some(),
             "exact whole-file sum over an unfiltered Cayenne scan must fold"
+        );
+        // The fold serves the footer's exact sum under the aggregate's own schema,
+        // in place of scanning the file.
+        assert_eq!(optimized.schema(), aggregate.schema());
+        let task = datafusion::execution::context::SessionContext::new().task_ctx();
+        let batches = datafusion::physical_plan::collect(optimized, task).await?;
+        let expected = [
+            "+------------+",
+            "| sum(value) |",
+            "+------------+",
+            "| 6          |",
+            "+------------+",
+        ]
+        .join("\n");
+        assert_eq!(
+            arrow::util::pretty::pretty_format_batches(&batches)?.to_string(),
+            expected
         );
         Ok(())
     }

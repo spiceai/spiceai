@@ -466,21 +466,31 @@ mod tests {
     #[tokio::test]
     async fn test_built_controller_respects_concurrency() {
         let rc = config(2, 10000).build();
+        assert_eq!(rc.available_permits(), Some(2));
 
         let _p1 = rc.acquire().await.expect("p1 should be acquired");
         let p2 = rc.acquire().await.expect("p2 should be acquired");
+        assert_eq!(rc.available_permits(), Some(0));
 
-        tokio::select! {
-            _ = rc.acquire() => panic!("Expected semaphore to block with concurrency=2"),
-            () = tokio::time::sleep(std::time::Duration::from_millis(50)) => {}
-        }
+        // Bounded by time rather than checked on its first poll: acquire ends
+        // in its jitter sleep, and even a zero-length sleep is pending on that
+        // first poll, so a first-poll check would pass whether or not the cap
+        // held. Keep this future pinned so the later admission is the same
+        // request that stayed blocked.
+        let mut third = std::pin::pin!(rc.acquire());
+        let blocked =
+            tokio::time::timeout(std::time::Duration::from_millis(50), third.as_mut()).await;
+        assert!(
+            blocked.is_err(),
+            "Expected the semaphore to block a third request with concurrency=2, got {blocked:?}"
+        );
 
+        // Releasing one permit admits the waiting request, which then holds it.
         drop(p2);
-        tokio::select! {
-            result = rc.acquire() => { result.expect("permit should be acquired after drop"); },
-            () = tokio::time::sleep(std::time::Duration::from_millis(100)) => {
-                panic!("Expected to acquire permit after drop");
-            }
-        }
+        let _p3 = tokio::time::timeout(std::time::Duration::from_secs(5), third)
+            .await
+            .expect("the waiting request should be admitted once a permit is released")
+            .expect("permit should be acquired after drop");
+        assert_eq!(rc.available_permits(), Some(0));
     }
 }

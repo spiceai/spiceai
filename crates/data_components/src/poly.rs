@@ -153,7 +153,8 @@ impl TableLayer for PolyTableProvider {
             | LayerWalk::CdcDetection
             | LayerWalk::Source
             | LayerWalk::RetentionDelete
-            | LayerWalk::Index => None,
+            | LayerWalk::Index
+            | LayerWalk::Passthrough => None,
         }
     }
 

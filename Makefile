@@ -62,17 +62,15 @@ ci:
 	make -C bin/spiced
 
 # Local CI attestation ("developer sign-off"). Skips Rust lint/build/tests when
-# the branch has no Rust-affecting files vs trunk (.rs, Cargo.toml/lock,
-# rust-toolchain*, .cargo/*); otherwise target-lints changed crates, then full
+# the branch has no Rust-affecting files vs trunk (sources, fixtures, build
+# inputs, and gate configuration); otherwise target-lints changed crates, then full
 # lint + unit tests. Posts a `signoff` commit status on HEAD so the PR can enter
 # the merge queue. See scripts/signoff and docs/dev/ci_signoff.md.
 .PHONY: signoff
 signoff:
 	@./scripts/signoff
 
-# Remote sign-off for the current branch: probe lab SSH hosts (192.168.1.100,
-# 192.168.1.101) for a Git checkout at $HOME/dev/spice2 and run scripts/signoff
-# there when available; otherwise dispatch the self-hosted GitHub Actions
+# Remote sign-off for the current branch: dispatch the self-hosted GitHub Actions
 # signoff.yml workflow. Supports Git and JJ via scripts/signoff remote. Skips
 # Rust lint/build/tests when the branch has no Rust-affecting files vs trunk
 # (same as local signoff).
@@ -191,8 +189,17 @@ endif
 # target whose required-features are unmet *without saying so* — the very way
 # three lanes once went unbuilt — the `nextest` target says out loud that this
 # one did not run.
+# Lint, test compilation, and CLI verification must enable the same capabilities.
+# The differential-test feature also belongs in lint's resolve so the two gates
+# check the same Cayenne implementation.
+RUST_GATE_FEATURES := adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,http-functions,wasm-functions,rate-control,spicebench,cayenne/result-correctness-duckdb
 NEXTEST_SELECTION := --all --exclude libnfs \
-	--features cayenne/result-correctness-duckdb
+	--features $(RUST_GATE_FEATURES)
+
+.PHONY: print-rust-gate-features
+print-rust-gate-features:
+	@printf '%s\n' '$(RUST_GATE_FEATURES)'
+
 # `kind(=bin)` selects the unit tests of every bin target: the `spice` CLI's
 # `main.rs` tests, `spice-substrait-compliance`'s fork-ledger guards
 # (docs/dev/fork_patches.md), `testoperator`'s dispatch-file oracle guard,
@@ -212,7 +219,15 @@ NEXTEST_SELECTION := --all --exclude libnfs \
 # memory — needing no credentials and no service, and `--all --tests` compiles
 # all three whether or not they are selected, so leaving them out saved only the
 # seconds of running them and cost the coverage the ledger claimed.
-NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + kind(=bin) + (package(=cayenne) & kind(=test)) + (package(=runtime-cloud-connect) & kind(=test)) + (package(=spice) & binary(=cli_integration)) + (package(=spice) & binary(=connect_service_cli)) + (package(=spiced) & binary(=dependency_logging)) + (package(=llms) & binary(=anthropic_stream_errors)) + (package(=llms) & binary(=list_models_errors)) + (package(=llms) & binary(=model2vec_hf_cache)) + binary(=metrics) + (package(=testoperator) & (test(=commands::tests::benchmark_dispatches_validate_results_against_an_oracle) | test(=commands::tests::nextest_filter_selects_the_oracle_dispatch_guard_by_its_rustc_name))) + (package(=runtime-udfs-api) & binary(=json_semantics)) + (package(=connector-adbc) & binary(=adbc_cancellation)) + (package(=spiced) & binary(=cpu_budget))
+# `runtime`'s `rate_control` binary holds the HTTP rate-control tests, which are
+# self-contained and gate the parameter validation and shared-origin rules.
+# They need `runtime/rate-control`, which `rate-control` in RUST_GATE_FEATURES
+# enables for NEXTEST_SELECTION, to be built at all —
+# the target's `required-features` drops it otherwise. They are kept out of
+# `runtime`'s `integration` binary on purpose: selecting any test there makes
+# nextest execute that binary to list it, and its debug build on macOS is too
+# large to load (dyld aborts before `main`, failing the whole run).
+NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + kind(=bin) + (package(=runtime) & binary(=rate_control)) + (package(=cayenne) & kind(=test)) + (package(=runtime-acceleration) & binary(=optional_snapshot_files)) + (package(=runtime-cloud-connect) & kind(=test)) + (package(=spice) & binary(=cli_integration)) + (package(=spice) & binary(=connect_service_cli)) + (package(=spiced) & binary(=dependency_logging)) + (package(=llms) & binary(=anthropic_stream_errors)) + (package(=llms) & binary(=list_models_errors)) + (package(=llms) & binary(=model2vec_hf_cache)) + binary(=metrics) + (package(=testoperator) & (test(=commands::tests::benchmark_dispatches_validate_results_against_an_oracle) | test(=commands::tests::nextest_filter_selects_the_oracle_dispatch_guard_by_its_rustc_name))) + (package(=runtime-udfs-api) & binary(=json_semantics)) + (package(=connector-adbc) & binary(=adbc_cancellation)) + (package(=spiced) & binary(=cpu_budget))
 # Extra narrowing for callers that can't run everything (CI lacks credentials
 # for some tests). It has to *intersect* the expression above rather than sit
 # beside it: nextest unions repeated `-E` flags, so a second `-E 'not (…)'` would
@@ -323,7 +338,7 @@ _FEATURES_FLAGS := --features $(FEATURES)
 else ifneq ($(strip $(PACKAGES)),)
 _FEATURES_FLAGS :=
 else
-_FEATURES_FLAGS := --features adbc,aws-secrets-manager,keyring-secret-store,models,odbc,release,mcp,snapshots,elasticsearch,http-functions,wasm-functions,rate-control,spicebench
+_FEATURES_FLAGS := --features $(RUST_GATE_FEATURES)
 endif
 
 ## The guard scripts below need Python 3.11+ (stdlib `tomllib`). The sign-off
