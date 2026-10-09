@@ -2859,23 +2859,24 @@ pub struct CayenneTableProviderBuilder {
 }
 
 /// Whether a table's secondary index runs persist as run files, so a
-/// reopened table reads back only the files none covers. Hidden, for testing;
-/// the default comes from `SPICE_CAYENNE_INDEX_PERSISTENCE=enabled`.
+/// reopened table reads back only the files none covers. On by default;
+/// `SPICE_CAYENNE_INDEX_PERSISTENCE=disabled` turns it off.
 #[doc(hidden)]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum IndexPersistence {
-    #[default]
     Disabled,
+    #[default]
     Enabled,
 }
 
 impl IndexPersistence {
     fn from_env() -> Self {
-        if std::env::var(super::lookup_index::PERSISTENCE_ENV).is_ok_and(|value| value == "enabled")
+        if std::env::var(super::lookup_index::PERSISTENCE_ENV)
+            .is_ok_and(|value| value == "disabled")
         {
-            Self::Enabled
-        } else {
             Self::Disabled
+        } else {
+            Self::Enabled
         }
     }
 }
