@@ -588,17 +588,15 @@ impl CayenneDataSink {
     /// that holds no rows, so it can skip the conflict check that finds nothing
     /// to conflict with.
     ///
-    /// The table must resolve repeated keys after the write (a primary key, an
-    /// `on_conflict`, no partition column) and have no retention filter, the
-    /// conditions under which an append takes that path; a keyed table also never
+    /// The table must resolve repeated keys after the write and have no retention
+    /// filter (`CayenneTableProvider::takes_first_load`); a keyed table also never
     /// takes a staged append, so no staged publish can land beneath the load.
     /// Emptiness is observed under the lock this returns, which the load holds
-    /// until it publishes.
+    /// until it publishes. This is the only append that takes row versions, which
+    /// a refresh hands one only after `CayenneTableProvider::takes_versioned_append`
+    /// says it would be taken.
     async fn lock_for_first_load(&self) -> Option<tokio::sync::OwnedMutexGuard<()>> {
-        if self.table.metadata().partition_column.is_some()
-            || self.table.has_retention_delete_filters()
-            || !matches!(self.table.key_resolver(), Ok(Some(_)))
-        {
+        if !self.table.takes_first_load() {
             return None;
         }
         let write_guard = self.table.write_lock_arc().lock_owned().await;
@@ -1350,6 +1348,139 @@ mod tests {
             Arc::clone(context),
         );
         sink.write_all(stream, &ctx.task_ctx()).await
+    }
+
+    /// Each row's time, read from the second column, as a refresh supplies it from a
+    /// dataset's `time_column`.
+    #[derive(Debug)]
+    struct SecondColumnVersions;
+
+    impl util::session_state::RowVersions for SecondColumnVersions {
+        fn versions(&self, batch: &RecordBatch) -> datafusion::error::Result<Int64Array> {
+            batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .cloned()
+                .ok_or_else(|| DataFusionError::Internal("versions are not Int64".to_string()))
+        }
+    }
+
+    /// `takes_versioned_append` is the question a refresh asks before it hands an
+    /// append its row versions, so it must answer what the sink then does: a `true`
+    /// the sink refuses fails every refresh (#14876, #14883), and a `false` for an
+    /// append the sink would take makes the refresh resolve the versions itself.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn takes_versioned_append_answers_what_the_sink_does() {
+        use datafusion_expr::{col, lit};
+
+        /// The tables a refresh can append to with row versions.
+        #[derive(Clone, Copy, Debug)]
+        enum Shape {
+            EmptyKeyed,
+            HoldsRows,
+            RetentionFilter,
+            WithoutOnConflict,
+            MemoryMode,
+        }
+        for shape in [
+            Shape::EmptyKeyed,
+            Shape::HoldsRows,
+            Shape::RetentionFilter,
+            Shape::WithoutOnConflict,
+            Shape::MemoryMode,
+        ] {
+            let name = format!("{shape:?}");
+            // Only a first load into a table that holds no rows can order a key's
+            // copies by version.
+            let takes = matches!(shape, Shape::EmptyKeyed);
+            let ctx = SessionContext::new();
+            let temp_dir = tempfile::tempdir().expect("temp dir");
+            let metadata_dir = format!("{}/metadata", temp_dir.path().to_str().expect("path"));
+            let data_dir = format!("{}/data", temp_dir.path().to_str().expect("path"));
+            std::fs::create_dir_all(&metadata_dir).expect("metadata dir");
+            let catalog = Arc::new(
+                CayenneCatalog::new(format!("sqlite://{metadata_dir}/cayenne.db"))
+                    .expect("catalog"),
+            ) as Arc<dyn MetadataCatalog>;
+            catalog.init().await.expect("catalog init");
+
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int64, false),
+                Field::new("version", DataType::Int64, false),
+            ]));
+            let vortex_config = VortexConfig {
+                memory_mode: matches!(shape, Shape::MemoryMode),
+                ..VortexConfig::default()
+            };
+            let context = CayenneContext::new(&vortex_config, ctx.runtime_env(), "versioned");
+            let options = CreateTableOptions {
+                table_name: "versioned".to_string(),
+                schema: Arc::clone(&schema),
+                primary_key: vec!["id".to_string()],
+                // `cayenne_pk_conflict_detection: none` creates a keyed table without
+                // `on_conflict`.
+                on_conflict: (!matches!(shape, Shape::WithoutOnConflict))
+                    .then(|| OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()]))),
+                base_path: data_dir,
+                partition_column: None,
+                vortex_config,
+            };
+            let mut builder =
+                CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
+                    .with_context(Arc::clone(&context));
+            if matches!(shape, Shape::RetentionFilter) {
+                builder = builder.with_retention_filters(vec![col("id").lt(lit(0_i64))]);
+            }
+            let provider = builder.create(options).await.expect("table created");
+            let holds_rows = matches!(shape, Shape::HoldsRows);
+            if holds_rows {
+                append_rows(
+                    &provider,
+                    &context,
+                    &schema,
+                    &ctx,
+                    vec![keyed_batch(&schema, &[(9, 1)])],
+                )
+                .await
+                .expect("seed write");
+            }
+
+            assert_eq!(provider.takes_versioned_append().await, takes, "{name}");
+
+            // Two copies of key 1 in one write, the newer first: ordering them by
+            // arrival would keep the older.
+            let mut table = provider.clone_for_write();
+            table.row_versions = Some(Arc::new(SecondColumnVersions));
+            let sink = CayenneDataSink::new(
+                table,
+                InsertOp::Append,
+                Arc::clone(&schema),
+                Arc::clone(&context),
+            );
+            let batch = keyed_batch(&schema, &[(1, 20), (1, 10)]);
+            let stream = Box::pin(RecordBatchStreamAdapter::new(
+                Arc::clone(&schema),
+                futures::stream::iter([Ok(batch)]),
+            ));
+            let result = sink.write_all(stream, &ctx.task_ctx()).await;
+            if takes {
+                result.expect(&name);
+                assert_eq!(keyed_rows(&ctx, &provider).await, [(1, 20)], "{name}");
+            } else {
+                let error = result.expect_err(&name);
+                let DataFusionError::Execution(message) = &error else {
+                    panic!("{name}: expected the sink's refusal, got {error}");
+                };
+                assert_eq!(
+                    message,
+                    "Cayenne table 'versioned' holds rows, so this refresh's append cannot order a key's copies by version against them; the refresh was not applied and the next one resolves them before writing.",
+                    "{name}"
+                );
+                let unchanged = if holds_rows { vec![(9, 1)] } else { Vec::new() };
+                assert_eq!(keyed_rows(&ctx, &provider).await, unchanged, "{name}");
+            }
+        }
     }
 
     /// Staged writes keep their write-time footer-cache entries: the Vortex

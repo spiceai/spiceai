@@ -12838,6 +12838,29 @@ impl CayenneTableProvider {
         )
     }
 
+    /// Whether an append into this table, once it holds no rows, is written as one
+    /// first load (`CayenneDataSink::lock_for_first_load`): the table resolves the
+    /// keys a write repeats after writing it (a primary key, an `on_conflict`, no
+    /// partition column) and has no retention filter.
+    pub(crate) fn takes_first_load(&self) -> bool {
+        self.table_metadata.partition_column.is_none()
+            && !self.has_retention_delete_filters()
+            && matches!(self.key_resolver(), Ok(Some(_)))
+    }
+
+    /// Whether a refresh's append that carries row versions would be taken now.
+    ///
+    /// Row versions order a key's copies only against the copies one write holds,
+    /// which is all of them only in a first load into a table that holds no rows,
+    /// so that is the only versioned append the sink takes; it refuses any other.
+    /// A refresh asks this before handing an append its versions and otherwise
+    /// resolves them itself. The write observes emptiness again under the write
+    /// lock, so a write landing in between makes the sink refuse that append, and
+    /// the next refresh, which sees the rows, resolves its versions itself.
+    pub async fn takes_versioned_append(&self) -> bool {
+        !self.is_memory_resident_mode() && self.takes_first_load() && self.holds_no_rows().await
+    }
+
     pub(crate) fn clear_cached_pk_keyset(&self) {
         {
             let mut guard = self.pk_keyset_cache.lock();
