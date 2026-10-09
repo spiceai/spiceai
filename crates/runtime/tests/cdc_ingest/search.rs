@@ -303,3 +303,69 @@ async fn cdc_with_embeddings_and_full_text_search_indexes_changed_row() -> anyho
         })
         .await
 }
+
+/// Start the `docs` CDC dataset over a `DuckDB` `mode: file` acceleration at `db_path`.
+#[cfg(feature = "duckdb")]
+async fn start_file_accelerated(db_path: &str) -> anyhow::Result<Arc<Runtime>> {
+    use spicepod::{acceleration::Mode, param::Params};
+
+    configure_test_datafusion();
+    let mut dataset = docs_dataset(false, true);
+    if let Some(acceleration) = dataset.acceleration.as_mut() {
+        acceleration.engine = Some("duckdb".to_string());
+        acceleration.mode = Mode::File;
+        acceleration.params = Some(Params::from_string_map(HashMap::from([(
+            "duckdb_file".to_string(),
+            db_path.to_string(),
+        )])));
+    }
+    let app = AppBuilder::new("cdc_search_restart_test")
+        .with_dataset(dataset)
+        .build();
+    let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+    let load_rt = Arc::clone(&rt);
+    tokio::select! {
+        () = tokio::time::sleep(Duration::from_mins(3)) => {
+            anyhow::bail!("timed out loading components");
+        }
+        () = load_rt.load_components() => {}
+    }
+    runtime_ready_check(&rt).await;
+    Ok(rt)
+}
+
+/// Regression test for #14618 on a stream-attached index: a `refresh_mode: changes` dataset
+/// over a `DuckDB` `mode: file` acceleration keeps its rows across a restart, while its
+/// in-memory full-text index starts empty. The index has to be rebuilt from the acceleration
+/// before the changes stream starts, or a search after the restart finds nothing.
+#[cfg(feature = "duckdb")]
+#[tokio::test]
+async fn cdc_full_text_search_finds_persisted_rows_after_a_restart() -> anyhow::Result<()> {
+    let _tracing = init_tracing(Some("integration=debug,runtime=debug,info"));
+    let dir = tempfile::tempdir()?;
+    let db_path = dir.path().join("docs.db").to_string_lossy().to_string();
+    let search = "SELECT id FROM text_search(docs, 'peregrine', content) LIMIT 4";
+
+    test_request_context()
+        .scope(async {
+            let first = start_file_accelerated(&db_path).await?;
+            apply_create_then_update(&first).await?;
+            anyhow::ensure!(
+                eventually_finds(&first, search, 1).await,
+                "text_search cannot find the changed row before the restart"
+            );
+            first.shutdown().await;
+            drop(first);
+
+            let restarted = start_file_accelerated(&db_path).await?;
+            assert_row_applied(&restarted, 1, "a peregrine falcon in flight").await?;
+            anyhow::ensure!(
+                eventually_finds(&restarted, search, 1).await,
+                "the acceleration kept the row across the restart, but text_search cannot find it: \
+                 the full-text index was not rebuilt from the acceleration"
+            );
+            restarted.shutdown().await;
+            Ok(())
+        })
+        .await
+}
