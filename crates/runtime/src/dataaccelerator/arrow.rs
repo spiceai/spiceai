@@ -175,6 +175,12 @@ data_accelerator_api::register_data_accelerator!(Engine::Arrow, ArrowAccelerator
 mod tests {
     use super::*;
     use crate::component::dataset::acceleration::Acceleration;
+    use crate::component::dataset::schema_inference::apply_inferred_schema;
+    use crate::parameters::Parameters;
+    use arrow::datatypes::{DataType, Field, Schema};
+    use data_components::inferred_schema::{InferredSchema, InferredSortColumn};
+    use runtime_secrets::{Secrets, get_params_with_secrets};
+    use tokio::sync::RwLock;
 
     /// Regression test for #14023: the sort order schema inference writes into
     /// the acceleration params must be spelled the way this accelerator's
