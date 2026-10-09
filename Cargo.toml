@@ -272,7 +272,7 @@ datafusion-common-runtime = "55.2.0"
 datafusion-datasource = "55.2.0"
 datafusion-execution = "55.2.0"
 datafusion-expr = "55.2.0"
-datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "750561d79e88fd48afd06b6a136e3bc1dc2b8a12", features = ["sql"] } # branch: spiceai-55
+datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "2fc46179fa45b764e8c2996bf04aa58fc652d069", features = ["sql"] } # branch: spiceai-55
 datafusion-functions = "55.2.0"
 datafusion-functions-aggregate = "55.2.0"
 datafusion-functions-aggregate-common = "55.2.0"
@@ -287,7 +287,7 @@ datafusion-proto-common = "55.2.0"
 datafusion-pruning = "55.2.0"
 datafusion-spark = "55.2.0"
 datafusion-substrait = "55.2.0"
-datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "b4a86350d571921829e5ad141d94dc2470f98b17" } # branch: spiceai-55
+datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "ef2e59053978a7f4f795065598999c5eb31f4c69" } # branch: spiceai-55
 delta_kernel = { version = "0.27.1", features = ["arrow-59", "internal-api"] }
 delta_kernel_default_engine = { version = "0.27.1", default-features = false, features = [
     "arrow-59",
