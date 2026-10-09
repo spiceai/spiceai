@@ -274,7 +274,9 @@ mod tests {
         match error {
             DataConnectorError::InvalidConfigurationNoSource { message, .. } => {
                 assert!(
-                    message.contains("different rate-control settings"),
+                    message.contains(
+                        "differs from those already targeting it: `max_concurrent_requests` is 3 here and 2 there."
+                    ),
                     "expected conflict message, got: {message}"
                 );
             }

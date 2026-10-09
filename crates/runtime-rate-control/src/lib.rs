@@ -91,23 +91,20 @@ type GovernorRateLimiter = RateLimiter<NotKeyed, InMemoryState, DefaultClock, No
 /// default and the wrong thing to be stuck with — hence the floor is logged
 /// rather than silent.
 fn half_life_windows(origin: &str, configured: Option<Duration>, window: Duration) -> f64 {
-    let Some(configured) = configured else {
+    if window.is_zero() {
         return 1.0;
-    };
-    let window_ms = duration_millis_u64(window).max(1);
-    let configured_ms = duration_millis_u64(configured);
-    #[expect(
-        clippy::cast_precision_loss,
-        reason = "both are millisecond durations; the quotient is a small window count"
-    )]
-    let windows = (configured_ms as f64) / (window_ms as f64);
-    if windows < 1.0 {
+    }
+    let half_life = adaptive::cluster_half_life(configured, window);
+    if let Some(configured) = configured
+        && configured < half_life
+    {
+        let configured_ms = duration_millis_u64(configured);
+        let window_ms = duration_millis_u64(window);
         tracing::info!(
             "Cluster rate control for origin '{origin}' raised `rate_control_window` from {configured_ms}ms to the {window_ms}ms `refresh_interval`. The shared state records request outcomes one window at a time, so the reaction and recovery half-life cannot be shorter than one window."
         );
-        return 1.0;
     }
-    windows
+    half_life.as_secs_f64() / window.as_secs_f64()
 }
 
 #[derive(Debug, Snafu)]

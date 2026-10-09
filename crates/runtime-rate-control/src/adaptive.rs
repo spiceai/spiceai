@@ -89,9 +89,14 @@ pub enum AdaptiveRateControlError {
 
 /// The two validated adaptive hyperparameters, resolved from user config.
 ///
-/// A small `Copy` value the rate-control config stores and compares; the live
+/// A small `Copy` value the rate-control config stores; the live
 /// [`AdaptiveController`] is built from it via [`AdaptiveController::new`].
-#[derive(Clone, Copy, Debug, PartialEq)]
+///
+/// Deliberately not `PartialEq`: an explicit window equal to the default and
+/// an unset one compare unequal field by field, yet run the same half-life on a
+/// single node. Compare [`Self::failure_threshold`] and
+/// [`Self::effective_window`] instead.
+#[derive(Clone, Copy, Debug)]
 pub struct AdaptiveRateControl {
     /// The error rate above which throttling begins, as a fraction in `(0, 1)`.
     /// Kept alongside `k` so user-facing messages can quote the configured value.
@@ -170,12 +175,36 @@ impl AdaptiveRateControl {
         (!self.window_is_default).then_some(self.window)
     }
 
+    /// The decay half-life this control runs at: [`Self::window`] on a single
+    /// node. Cluster rate control records outcomes one lease window
+    /// (`cluster_window`) at a time, so there an unset window runs at one lease
+    /// window and a shorter one is raised to it.
+    #[must_use]
+    pub fn effective_window(&self, cluster_window: Option<Duration>) -> Duration {
+        cluster_window.map_or(self.window, |cluster_window| {
+            cluster_half_life(self.configured_window(), cluster_window)
+        })
+    }
+
     /// The factor the weighted accept count is multiplied by,
     /// `1 / (1 - failure_threshold)`.
     #[must_use]
     pub fn k(&self) -> f64 {
         self.k
     }
+}
+
+/// The half-life cluster rate control runs at for a `configured` window and the
+/// lease window `cluster_window` (the shared `refresh_interval`).
+///
+/// The shared state records request outcomes one window at a time, so one
+/// window is the shortest half-life it can express: an unset window takes one
+/// window, and a shorter one is raised to it.
+pub(crate) fn cluster_half_life(
+    configured: Option<Duration>,
+    cluster_window: Duration,
+) -> Duration {
+    configured.map_or(cluster_window, |configured| configured.max(cluster_window))
 }
 
 impl Default for AdaptiveRateControl {
@@ -483,10 +512,63 @@ mod tests {
     /// defaults.
     #[test]
     fn default_matches_the_documented_defaults() {
-        assert_eq!(
-            AdaptiveRateControl::default(),
+        let default = AdaptiveRateControl::default();
+        let documented =
             AdaptiveRateControl::with_default_window(DEFAULT_ADAPTIVE_FAILURE_THRESHOLD)
-                .expect("the defaults must be valid")
+                .expect("the defaults must be valid");
+        assert_eq!(
+            (
+                default.failure_threshold.to_bits(),
+                default.k.to_bits(),
+                default.window,
+                default.window_is_default
+            ),
+            (
+                documented.failure_threshold.to_bits(),
+                documented.k.to_bits(),
+                documented.window,
+                documented.window_is_default
+            )
+        );
+    }
+
+    /// An explicit window equal to the default runs the same half-life as an
+    /// unset one on a single node (#14914). Under cluster rate control an unset
+    /// window takes one lease window instead, and an explicit one is raised to
+    /// at least one.
+    #[test]
+    fn effective_window_resolves_the_default_per_deployment() {
+        let unset = AdaptiveRateControl::with_default_window(0.1).expect("valid control");
+        let explicit_default = control(0.1);
+        let explicit_minute =
+            AdaptiveRateControl::new(0.1, Duration::from_mins(1)).expect("valid control");
+
+        assert_eq!(unset.effective_window(None), DEFAULT_ADAPTIVE_WINDOW);
+        assert_eq!(
+            explicit_default.effective_window(None),
+            DEFAULT_ADAPTIVE_WINDOW
+        );
+        assert_eq!(
+            explicit_minute.effective_window(None),
+            Duration::from_mins(1)
+        );
+
+        let short_lease = Some(Duration::from_secs(1));
+        assert_eq!(unset.effective_window(short_lease), Duration::from_secs(1));
+        assert_eq!(
+            explicit_default.effective_window(short_lease),
+            DEFAULT_ADAPTIVE_WINDOW
+        );
+
+        let long_lease = Some(Duration::from_secs(30));
+        assert_eq!(unset.effective_window(long_lease), Duration::from_secs(30));
+        assert_eq!(
+            explicit_default.effective_window(long_lease),
+            Duration::from_secs(30)
+        );
+        assert_eq!(
+            explicit_minute.effective_window(long_lease),
+            Duration::from_mins(1)
         );
     }
 

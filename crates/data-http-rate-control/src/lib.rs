@@ -75,6 +75,8 @@ pub const HTTP_RATE_CONTROL_RUNTIME_PARAMS: &[&str] = &[
     RUNTIME_RATE_CONTROL_ACQUIRE_TIMEOUT,
 ];
 const MIN_PERSISTED_INSTANCE_TTL: Duration = Duration::from_secs(5);
+const RATE_CONTROL_DOCS_URL: &str =
+    "https://spiceai.org/docs/components/data-connectors/https/deployment#rate-control";
 
 // Fallback for direct connector construction without a Runtime. Factory-created
 // connectors use Runtime's per-instance registry so reloads/tests do not reuse
@@ -148,7 +150,11 @@ pub fn global_registry() -> Arc<HttpRateControlRegistry> {
 /// Rate control is always adaptive. On a healthy origin, or with a connector
 /// that reports no request outcomes, adaptive control applies the configured
 /// limits unchanged. With no configured limit there is nothing to scale.
-#[derive(Clone, Debug, PartialEq)]
+///
+/// Not `PartialEq`, because two configs can differ field by field and still
+/// run one origin the same way: components that share an origin are compared
+/// parameter by parameter, as each one resolves for the deployment.
+#[derive(Clone, Debug)]
 pub struct HttpRateControlConfig {
     pub max_concurrent_requests: Option<usize>,
     pub requests_per_second: Option<NonZeroU32>,
@@ -206,6 +212,182 @@ impl HttpRateControlConfig {
             || self.requests_per_second.is_some()
             || self.requests_per_minute.is_some()
     }
+
+    /// The bound on the wait for rate-control capacity, or `None` when the wait
+    /// is unbounded. A zero timeout is the documented spelling of no bound.
+    fn acquire_bound(&self) -> Option<Duration> {
+        self.acquire_timeout.filter(|timeout| !timeout.is_zero())
+    }
+
+    /// The parameters that `requested` resolves to a different value than this
+    /// config, in the order the parameters are documented.
+    ///
+    /// Each parameter is compared as it resolves for this deployment, so a
+    /// conflict means the shared controller would run differently for
+    /// `requested`. `cluster_window` is the cluster rate-control lease window
+    /// (`refresh_interval`), or `None` on a single node, where
+    /// `rate_control_window` defaults differently.
+    fn conflicts_with(
+        &self,
+        requested: &Self,
+        cluster_window: Option<Duration>,
+    ) -> Vec<SettingConflict> {
+        let mut conflicts = Vec::new();
+        let mut compare = |parameter, existing: String, requested: String, note| {
+            if existing != requested {
+                conflicts.push(SettingConflict {
+                    parameter,
+                    requested,
+                    existing,
+                    note,
+                });
+            }
+        };
+
+        for (parameter, existing_value, requested_value) in [
+            (
+                "max_concurrent_requests",
+                format_limit(self.max_concurrent_requests),
+                format_limit(requested.max_concurrent_requests),
+            ),
+            (
+                "requests_per_second_limit",
+                format_limit(self.requests_per_second),
+                format_limit(requested.requests_per_second),
+            ),
+            (
+                "requests_per_minute_limit",
+                format_limit(self.requests_per_minute),
+                format_limit(requested.requests_per_minute),
+            ),
+            (
+                "rate_control_jitter_min",
+                format_duration(self.jitter_min),
+                format_duration(requested.jitter_min),
+            ),
+            (
+                "rate_control_jitter_max",
+                format_duration(self.jitter_max),
+                format_duration(requested.jitter_max),
+            ),
+        ] {
+            compare(parameter, existing_value, requested_value, None);
+        }
+
+        // The remaining settings shape only a controller that exists (any limit
+        // or jitter) and, for the adaptive tuning, one with a limit to scale. A
+        // setting either side does not use cannot conflict, and whether a side
+        // uses it follows from the settings compared above.
+        if self.is_enabled() && requested.is_enabled() {
+            compare(
+                "rate_control_acquire_timeout",
+                format_duration(self.acquire_bound().unwrap_or_default()),
+                format_duration(requested.acquire_bound().unwrap_or_default()),
+                Some(ACQUIRE_TIMEOUT_DEFAULT_NOTE),
+            );
+        }
+        if self.has_limit() && requested.has_limit() {
+            let (existing_threshold, requested_threshold) = (
+                self.adaptive.failure_threshold(),
+                requested.adaptive.failure_threshold(),
+            );
+            if !same_failure_threshold(existing_threshold, requested_threshold) {
+                let (mut existing_value, mut requested_value) = (
+                    format_failure_threshold(existing_threshold),
+                    format_failure_threshold(requested_threshold),
+                );
+                // Only thresholds a few ulps beyond one setting read the same.
+                if existing_value == requested_value {
+                    existing_value = format!("{existing_threshold:?}");
+                    requested_value = format!("{requested_threshold:?}");
+                }
+                compare(
+                    "rate_control_failure_threshold",
+                    existing_value,
+                    requested_value,
+                    None,
+                );
+            }
+
+            // Name the cluster default only when it shaped one of the values.
+            let resolved_by_cluster = cluster_window.is_some_and(|cluster_window| {
+                [self, requested].iter().any(|config| {
+                    config
+                        .adaptive
+                        .configured_window()
+                        .is_none_or(|window| window < cluster_window)
+                })
+            });
+            compare(
+                "rate_control_window",
+                format_duration(self.adaptive.effective_window(cluster_window)),
+                format_duration(requested.adaptive.effective_window(cluster_window)),
+                resolved_by_cluster.then_some(CLUSTER_WINDOW_DEFAULT_NOTE),
+            );
+        }
+
+        conflicts
+    }
+}
+
+/// Explains an acquire-timeout conflict, which components that never set the
+/// parameter can still hit.
+const ACQUIRE_TIMEOUT_DEFAULT_NOTE: &str =
+    "An unset `rate_control_acquire_timeout` defaults to each component's `client_timeout`.";
+
+/// Explains a window conflict under cluster rate control, where an unset window
+/// does not resolve to the documented single-node default.
+const CLUSTER_WINDOW_DEFAULT_NOTE: &str = "With cluster rate control, an unset `rate_control_window` resolves to `runtime.source_rate_control.refresh_interval`, and a shorter one is raised to it.";
+
+/// A rate-control parameter that a component resolves to a different value
+/// than the components already sharing its origin.
+#[derive(Debug, PartialEq, Eq)]
+struct SettingConflict {
+    parameter: &'static str,
+    /// The value for the component being set up.
+    requested: String,
+    /// The value the origin's shared controller was built with.
+    existing: String,
+    /// How a default produced one of the values, when the values alone do not
+    /// show it.
+    note: Option<&'static str>,
+}
+
+/// A request limit as the conflict error quotes it.
+fn format_limit(limit: Option<impl std::fmt::Display>) -> String {
+    limit.map_or_else(|| "unset".to_string(), |limit| limit.to_string())
+}
+
+/// A duration as the conflict error quotes it: `0`, `5ms`, `1.5s`. The text is
+/// exact, so two durations quote the same only when they are equal.
+fn format_duration(duration: Duration) -> String {
+    if duration.is_zero() {
+        "0".to_string()
+    } else {
+        format!("{duration:?}")
+    }
+}
+
+/// Whether two failure thresholds are one setting. The same error rate written
+/// as a percentage and as a fraction (`33.3%` and `0.333`) parses to floats an
+/// ulp or two apart, which throttle identically.
+fn same_failure_threshold(a: f64, b: f64) -> bool {
+    (a - b).abs() <= 4.0 * f64::EPSILON * a.abs().max(b.abs())
+}
+
+/// A failure threshold as the conflict error quotes it: a percentage to the
+/// fewest decimal places that still read back as the same threshold, such as
+/// `10%`, `33.3%` or `99.99995%`.
+fn format_failure_threshold(failure_threshold: f64) -> String {
+    let percent = failure_threshold * 100.0;
+    let text = (0..=15)
+        .map(|decimals| format!("{percent:.decimals$}"))
+        .find(|text| {
+            text.parse::<f64>()
+                .is_ok_and(|parsed| same_failure_threshold(parsed / 100.0, failure_threshold))
+        })
+        .unwrap_or_else(|| percent.to_string());
+    format!("{text}%")
 }
 
 #[derive(Clone, Debug)]
@@ -972,6 +1154,14 @@ impl HttpRateControlRegistry {
         }
     }
 
+    /// The cluster rate-control lease window (`refresh_interval`), or `None`
+    /// when rate control is local to this instance.
+    fn cluster_window(&self) -> Option<Duration> {
+        self.persisted_governor_state
+            .as_ref()
+            .map(|persisted_state| persisted_state.refresh_interval)
+    }
+
     pub fn start_persistence_task(self: &Arc<Self>) {
         let Some(persisted_state) = &self.persisted_governor_state else {
             return;
@@ -1138,11 +1328,21 @@ impl HttpRateControlRegistry {
         dataconnector: &'static str,
     ) -> DataConnectorResult<SharedRateControllerReservation> {
         let key = rate_control_key(base_url);
+        let cluster_window = self.cluster_window();
         let mut rate_controllers = self.rate_controllers.write().await;
 
         if let Some(existing) = rate_controllers.get_mut(&key) {
-            if existing.shared.config != *config {
-                return conflicting_config_error(connector_component, dataconnector, &key);
+            let conflicts = existing
+                .shared
+                .config
+                .conflicts_with(config, cluster_window);
+            if !conflicts.is_empty() {
+                return conflicting_config_error(
+                    connector_component,
+                    dataconnector,
+                    &key,
+                    &conflicts,
+                );
             }
             existing.pending_registrations = existing.pending_registrations.saturating_add(1);
             let shared = existing.shared.clone();
@@ -1212,11 +1412,13 @@ impl HttpRateControlRegistry {
         dataconnector: &'static str,
     ) -> DataConnectorResult<SharedRateController> {
         let key = rate_control_key(base_url);
+        let cluster_window = self.cluster_window();
         let rate_controllers = self.rate_controllers.read().await;
         if let Some(existing) = rate_controllers.get(&key) {
             return resolve_existing_controller(
                 &existing.shared,
                 config,
+                cluster_window,
                 connector_component,
                 dataconnector,
                 &key,
@@ -1229,6 +1431,7 @@ impl HttpRateControlRegistry {
             return resolve_existing_controller(
                 &existing.shared,
                 config,
+                cluster_window,
                 connector_component,
                 dataconnector,
                 &key,
@@ -1320,9 +1523,7 @@ fn build_shared_rate_controller(
     }
     // A zero timeout means "no bound" (wait indefinitely), matching the param
     // docs. It is the only spelling for that: parsing rejects 'inf'.
-    if let Some(acquire_timeout) = config.acquire_timeout
-        && !acquire_timeout.is_zero()
-    {
+    if let Some(acquire_timeout) = config.acquire_bound() {
         builder = builder.with_acquire_timeout(acquire_timeout);
     }
 
@@ -1363,15 +1564,17 @@ fn warn_about_inert_cluster_settings(
 fn resolve_existing_controller(
     existing: &SharedRateController,
     config: &HttpRateControlConfig,
+    cluster_window: Option<Duration>,
     connector_component: &ConnectorComponent,
     dataconnector: &'static str,
     key: &str,
 ) -> DataConnectorResult<SharedRateController> {
-    if existing.config == *config {
+    let conflicts = existing.config.conflicts_with(config, cluster_window);
+    if conflicts.is_empty() {
         return Ok(existing.clone());
     }
 
-    conflicting_config_error(connector_component, dataconnector, key)
+    conflicting_config_error(connector_component, dataconnector, key, &conflicts)
 }
 
 fn parse_optional_nonzero_u32_param<S: BuildHasher>(
@@ -1730,14 +1933,45 @@ fn conflicting_config_error<T>(
     connector_component: &ConnectorComponent,
     dataconnector: &'static str,
     key: &str,
+    conflicts: &[SettingConflict],
 ) -> DataConnectorResult<T> {
     Err(DataConnectorError::InvalidConfigurationNoSource {
         dataconnector: dataconnector.to_string(),
         connector_component: connector_component.clone(),
-        message: format!(
-            "Multiple HTTP-based components target {key} with different rate-control settings. Use the same max_concurrent_requests, requests_per_second_limit, requests_per_minute_limit, rate_control_jitter_min, rate_control_jitter_max, rate_control_acquire_timeout, rate_control_failure_threshold and rate_control_window values for components sharing an origin."
-        ),
+        message: conflicting_config_message(key, conflicts),
     })
+}
+
+/// Why a component cannot share its origin's rate control: every parameter it
+/// resolves differently, with both values, and how to reconcile them.
+fn conflicting_config_message(key: &str, conflicts: &[SettingConflict]) -> String {
+    let differences = conflicts
+        .iter()
+        .map(|conflict| {
+            format!(
+                "`{}` is {} here and {} there",
+                conflict.parameter, conflict.requested, conflict.existing
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    let parameters = conflicts
+        .iter()
+        .map(|conflict| format!("`{}`", conflict.parameter))
+        .collect::<Vec<_>>();
+    let parameters = match parameters.split_last() {
+        Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
+        _ => parameters.concat(),
+    };
+    let notes = conflicts
+        .iter()
+        .filter_map(|conflict| conflict.note)
+        .map(|note| format!(" {note}"))
+        .collect::<String>();
+
+    format!(
+        "Components that target origin '{key}' share one rate controller and must resolve to the same rate-control settings, but this one differs from those already targeting it: {differences}. Set {parameters} to matching values on every component that targets this origin.{notes} See: {RATE_CONTROL_DOCS_URL}"
+    )
 }
 
 fn duration_millis_u64(duration: Duration) -> u64 {
@@ -1923,5 +2157,163 @@ mod tests {
         assert!(owner.is_owner());
         assert!(!other.claim_owner());
         assert!(!other.is_owner());
+    }
+
+    fn with_adaptive(adaptive: AdaptiveRateControl) -> HttpRateControlConfig {
+        HttpRateControlConfig {
+            adaptive,
+            ..rps_config(10)
+        }
+    }
+
+    /// The same error rate written as a percentage and as a fraction parses to
+    /// adjacent floats (`33.3 / 100.0 != 0.333`), and must still be one setting,
+    /// while thresholds that throttle differently never are, even near 100%.
+    #[test]
+    fn spellings_of_one_failure_threshold_do_not_conflict() {
+        let as_percentage = 33.3 / 100.0;
+        let as_fraction = 0.333;
+        assert_ne!(
+            f64::to_bits(as_percentage),
+            f64::to_bits(as_fraction),
+            "the two spellings must parse to different floats for this test to mean anything"
+        );
+        let threshold = |failure_threshold| {
+            with_adaptive(
+                AdaptiveRateControl::with_default_window(failure_threshold)
+                    .expect("valid adaptive control"),
+            )
+        };
+        let threshold_conflict = |existing: &str, requested: &str| SettingConflict {
+            parameter: "rate_control_failure_threshold",
+            requested: requested.to_string(),
+            existing: existing.to_string(),
+            note: None,
+        };
+
+        assert_eq!(
+            threshold(as_percentage).conflicts_with(&threshold(as_fraction), None),
+            Vec::new()
+        );
+        assert_eq!(
+            threshold(as_fraction).conflicts_with(&threshold(0.334), None),
+            vec![threshold_conflict("33.3%", "33.4%")]
+        );
+        // `k = 1 / (1 - threshold)` is 2,000,000 and 10,000,000 here.
+        assert_eq!(
+            threshold(0.999_999_5).conflicts_with(&threshold(0.999_999_9), None),
+            vec![threshold_conflict("99.99995%", "99.99999%")]
+        );
+        assert_eq!(
+            threshold(1e-7).conflicts_with(&threshold(4e-7), None),
+            vec![threshold_conflict("0.00001%", "0.00004%")]
+        );
+    }
+
+    /// An unset `acquire_timeout` (no bound) and an explicit `0` (the
+    /// documented spelling of no bound) are one setting.
+    #[test]
+    fn an_unbounded_acquire_wait_is_one_setting() {
+        let unbounded = |acquire_timeout| HttpRateControlConfig {
+            acquire_timeout,
+            ..rps_config(10)
+        };
+
+        assert_eq!(
+            unbounded(None).conflicts_with(&unbounded(Some(Duration::ZERO)), None),
+            Vec::new()
+        );
+        assert_eq!(
+            unbounded(None).conflicts_with(&unbounded(Some(Duration::from_secs(30))), None),
+            vec![SettingConflict {
+                parameter: "rate_control_acquire_timeout",
+                requested: "30s".to_string(),
+                existing: "0".to_string(),
+                note: Some(ACQUIRE_TIMEOUT_DEFAULT_NOTE),
+            }]
+        );
+    }
+
+    /// The acquire bound only shapes a controller that exists, and the adaptive
+    /// tuning one with a limit to scale. Components that differ only in those
+    /// settings where neither uses them share the origin; components whose
+    /// limits differ are told about the limits alone.
+    #[test]
+    fn settings_a_component_does_not_use_cannot_conflict() {
+        let unlimited = |acquire_timeout: u64, failure_threshold| HttpRateControlConfig {
+            acquire_timeout: Some(Duration::from_secs(acquire_timeout)),
+            adaptive: AdaptiveRateControl::new(failure_threshold, Duration::from_secs(20))
+                .expect("valid adaptive control"),
+            ..HttpRateControlConfig::disabled()
+        };
+
+        assert_eq!(
+            unlimited(30, 0.1).conflicts_with(&unlimited(60, 0.5), None),
+            Vec::new(),
+            "without a controller, neither the acquire bound nor the tuning applies"
+        );
+
+        let jitter_only = |acquire_timeout, failure_threshold| HttpRateControlConfig {
+            jitter_max: Duration::from_millis(10),
+            ..unlimited(acquire_timeout, failure_threshold)
+        };
+        assert_eq!(
+            jitter_only(30, 0.1).conflicts_with(&jitter_only(30, 0.5), None),
+            Vec::new(),
+            "without a limit, the adaptive tuning has nothing to scale"
+        );
+        assert_eq!(
+            jitter_only(30, 0.1)
+                .conflicts_with(&jitter_only(60, 0.1), None)
+                .into_iter()
+                .map(|conflict| conflict.parameter)
+                .collect::<Vec<_>>(),
+            vec!["rate_control_acquire_timeout"],
+            "a controller with jitter alone still bounds the wait"
+        );
+
+        let limited = HttpRateControlConfig {
+            acquire_timeout: Some(Duration::from_secs(60)),
+            ..rps_config(10)
+        };
+        assert_eq!(
+            unlimited(30, 0.5).conflicts_with(&limited, None),
+            vec![SettingConflict {
+                parameter: "requests_per_second_limit",
+                requested: "10".to_string(),
+                existing: "unset".to_string(),
+                note: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn conflict_message_quotes_each_differing_parameter() {
+        let window = |window| {
+            with_adaptive(AdaptiveRateControl::new(0.1, window).expect("valid adaptive control"))
+        };
+        let unset_window = with_adaptive(AdaptiveRateControl::default());
+        let origin = "https://api.example.com:443";
+
+        let single_node = unset_window.conflicts_with(&window(Duration::from_secs(20)), None);
+        assert_eq!(
+            conflicting_config_message(origin, &single_node),
+            "Components that target origin 'https://api.example.com:443' share one rate controller and must resolve to the same rate-control settings, but this one differs from those already targeting it: `rate_control_window` is 20s here and 10s there. Set `rate_control_window` to matching values on every component that targets this origin. See: https://spiceai.org/docs/components/data-connectors/https/deployment#rate-control"
+        );
+
+        let cluster_window = Some(Duration::from_secs(1));
+        let existing = HttpRateControlConfig {
+            jitter_min: Duration::from_millis(5),
+            ..unset_window
+        };
+        let requested = HttpRateControlConfig {
+            requests_per_second: NonZeroU32::new(20),
+            ..window(runtime_rate_control::DEFAULT_ADAPTIVE_WINDOW)
+        };
+        let cluster = existing.conflicts_with(&requested, cluster_window);
+        assert_eq!(
+            conflicting_config_message(origin, &cluster),
+            "Components that target origin 'https://api.example.com:443' share one rate controller and must resolve to the same rate-control settings, but this one differs from those already targeting it: `requests_per_second_limit` is 20 here and 10 there; `rate_control_jitter_min` is 0 here and 5ms there; `rate_control_window` is 10s here and 1s there. Set `requests_per_second_limit`, `rate_control_jitter_min` and `rate_control_window` to matching values on every component that targets this origin. With cluster rate control, an unset `rate_control_window` resolves to `runtime.source_rate_control.refresh_interval`, and a shorter one is raised to it. See: https://spiceai.org/docs/components/data-connectors/https/deployment#rate-control"
+        );
     }
 }
