@@ -213,6 +213,17 @@ impl HttpRateControlConfig {
             || self.requests_per_minute.is_some()
     }
 
+    /// Whether the controller built from this config adapts its limits. On a
+    /// single node it scales any limit; cluster rate control scales only the
+    /// leased request-rate budget, never `max_concurrent_requests`.
+    fn adapts(&self, cluster_window: Option<Duration>) -> bool {
+        if cluster_window.is_some() {
+            self.requests_per_second.is_some() || self.requests_per_minute.is_some()
+        } else {
+            self.has_limit()
+        }
+    }
+
     /// The bound on the wait for rate-control capacity, or `None` when the wait
     /// is unbounded. A zero timeout is the documented spelling of no bound.
     fn acquire_bound(&self) -> Option<Duration> {
@@ -275,9 +286,9 @@ impl HttpRateControlConfig {
         }
 
         // The remaining settings shape only a controller that exists (any limit
-        // or jitter) and, for the adaptive tuning, one with a limit to scale. A
-        // setting either side does not use cannot conflict, and whether a side
-        // uses it follows from the settings compared above.
+        // or jitter) and, for the adaptive tuning, one that adapts. A setting
+        // either side does not use cannot conflict, and whether a side uses it
+        // follows from the settings compared above.
         if self.is_enabled() && requested.is_enabled() {
             compare(
                 "rate_control_acquire_timeout",
@@ -286,7 +297,7 @@ impl HttpRateControlConfig {
                 Some(ACQUIRE_TIMEOUT_DEFAULT_NOTE),
             );
         }
-        if self.has_limit() && requested.has_limit() {
+        if self.adapts(cluster_window) && requested.adapts(cluster_window) {
             compare(
                 "rate_control_failure_threshold",
                 format_failure_threshold(self.adaptive.failure_threshold()),
@@ -2097,6 +2108,63 @@ mod tests {
             .await
             .expect("lease the first window");
         assert_eq!(controller.admission_coefficient(), Some(1.0));
+    }
+
+    /// Cluster rate control adapts by scaling the leased request-rate budget,
+    /// and `max_concurrent_requests` is never leased, so a cluster controller
+    /// limited only by concurrency adapts nothing and its tuning cannot
+    /// conflict. On a single node the same controller adapts, so it can.
+    #[tokio::test]
+    async fn only_a_controller_that_adapts_compares_its_tuning() {
+        let persisted_state = HttpRateControlPersistedState {
+            store: Arc::new(object_store::memory::InMemory::new()),
+            base_prefix: String::new(),
+            refresh_interval: Duration::from_secs(1),
+            instance_id: "instance".to_string(),
+            instance_ttl: Duration::from_secs(5),
+        };
+        let concurrency_only = |failure_threshold| HttpRateControlConfig {
+            max_concurrent_requests: Some(4),
+            adaptive: AdaptiveRateControl::with_default_window(failure_threshold)
+                .expect("valid adaptive control"),
+            ..HttpRateControlConfig::disabled()
+        };
+        let origin = "https://concurrency-only.example.com:443";
+
+        let cluster = build_shared_rate_controller(
+            origin,
+            "spicepod",
+            &concurrency_only(0.1),
+            Some(&persisted_state),
+        )
+        .controller
+        .expect("a limited origin has a controller");
+        cluster
+            .refresh_and_persist_state_snapshot()
+            .await
+            .expect("refresh the cluster state");
+        assert_eq!(cluster.admission_coefficient(), None, "nothing adapts");
+        let single_node =
+            build_shared_rate_controller(origin, "spicepod", &concurrency_only(0.1), None)
+                .controller
+                .expect("a limited origin has a controller");
+        assert_eq!(single_node.admission_coefficient(), Some(1.0));
+
+        let conflicting_parameters = |cluster_window| {
+            concurrency_only(0.1)
+                .conflicts_with(&concurrency_only(0.5), cluster_window)
+                .into_iter()
+                .map(|conflict| conflict.parameter)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            conflicting_parameters(Some(persisted_state.refresh_interval)),
+            Vec::<&str>::new()
+        );
+        assert_eq!(
+            conflicting_parameters(None),
+            vec!["rate_control_failure_threshold"]
+        );
     }
 
     #[test]
