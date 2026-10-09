@@ -122,12 +122,17 @@ limitations under the License.
 //! ```
 //!
 //! The lowest limit is the only one that exceeds no replica's configuration.
-//! A sibling counts while a replica holds a lease under it for the window or
-//! one of the two before it (see [`PersistedLimiter::is_leasing`]), so a
+//! A sibling counts while a replica holds a lease under it within two windows
+//! of the window being leased (see [`PersistedLimiter::is_leasing`]), so a
 //! replica that stops stops holding the cluster to its limit three windows
 //! after its last refresh. Grants already written stand, so a replica that
 //! starts with a lower limit holds the cluster to it from the second window
 //! after it first leases.
+//!
+//! Window ids come from each replica's own clock, so the budget of a window
+//! holds in real time only while the replicas' clocks agree to well within a
+//! window, whether they share one limit or several: a replica a window ahead
+//! spends the next window's budget while its peers spend this one's.
 //!
 //! Replicas that agree on a limit share one key, and so one limiter. A replica
 //! of a version that does not read siblings sees only its own limiter: it is
@@ -438,17 +443,16 @@ impl PersistedLimiter {
     ///
     /// Every refresh leases the current window and pre-leases the next, so a
     /// running replica holds a lease in `window_id` or the window before it,
-    /// whichever window it last refreshed in. Two windows back also counts, so
-    /// a replica whose clock runs up to a window behind still counts. A replica
-    /// that stopped drops out three windows after its last refresh.
+    /// whichever window it last refreshed in. Windows up to two either side
+    /// count, so a replica whose clock runs up to a window ahead of or behind
+    /// this one's still counts, a newly started one included. A replica that
+    /// stopped drops out three windows after its last refresh.
     fn is_leasing(&self, window_id: u64) -> bool {
-        (0..=2)
-            .filter_map(|age| window_id.checked_sub(age))
-            .any(|id| {
-                self.windows
-                    .get(&id.to_string())
-                    .is_some_and(|window| !window.leases.is_empty())
-            })
+        (window_id.saturating_sub(2)..=window_id.saturating_add(2)).any(|id| {
+            self.windows
+                .get(&id.to_string())
+                .is_some_and(|window| !window.leases.is_empty())
+        })
     }
 
     /// Exponentially weighted (recent weighted highest) demand over the previous `lookback_windows`
@@ -3925,10 +3929,10 @@ mod tests {
         assert_eq!(unthrottled.at(30).whole, 20);
     }
 
-    /// A sibling counts while some replica holds a lease under it in the window
-    /// or one of the two before it, and not once its last lease is older.
+    /// A sibling counts while some replica holds a lease under it within two
+    /// windows of the one being leased, either side, and not further away.
     #[test]
-    fn a_sibling_is_leasing_for_three_windows_from_its_last_lease() {
+    fn a_sibling_is_leasing_within_two_windows_of_a_lease() {
         let lease = PersistedLease {
             granted: 0,
             consumed: 0,
@@ -3949,10 +3953,67 @@ mod tests {
             .leases
             .insert("a".to_string(), lease);
 
-        let leasing: Vec<u64> = (98..=104)
+        let leasing: Vec<u64> = (96..=104)
             .filter(|window_id| limiter.is_leasing(*window_id))
             .collect();
-        assert_eq!(leasing, vec![100, 101, 102]);
+        assert_eq!(leasing, vec![98, 99, 100, 101, 102]);
+    }
+
+    /// Replicas whose clocks run a window apart, each leasing the windows its
+    /// own clock reads, still find each other: the one under the higher limit
+    /// is held to the lower one in every window it leases once it has seen the
+    /// other, whichever replica runs ahead.
+    #[test]
+    fn replicas_a_window_apart_are_held_to_the_lowest() {
+        let window = Duration::from_secs(1);
+        let start = 100;
+        let start_time = UNIX_EPOCH + Duration::from_millis(100_300);
+        let busy = WindowCounts {
+            attempted: 50,
+            ..WindowCounts::default()
+        };
+
+        for (ahead_limit, behind_limit) in [(10, 20), (20, 10)] {
+            let store = Arc::new(InMemory::new());
+            let ahead = per_second_bucket(&store, "ahead", ahead_limit, window);
+            let behind = per_second_bucket(&store, "behind", behind_limit, window);
+            let mut state = PersistedRateControlState::fresh(window);
+
+            // Each round, both lease their current window and pre-lease the
+            // next, the replica ahead first, by clocks a window apart.
+            for round in 0..5 {
+                for (bucket, current, now) in [
+                    (&ahead, start + round + 1, start_time + window * (round + 1)),
+                    (&behind, start + round, start_time + window * round),
+                ] {
+                    bucket.process_window(&mut state, u64::from(current), now, busy, 50);
+                    bucket.process_window(
+                        &mut state,
+                        u64::from(current) + 1,
+                        now,
+                        WindowCounts::default(),
+                        50,
+                    );
+                }
+            }
+
+            // A replica at 20 that leased before the one at 10 existed keeps
+            // those grants; every window either leased after that holds at most
+            // 10. When the replica at 10 runs ahead, the one at 20 has seen it
+            // before its first lease.
+            let first_held = if ahead_limit == 10 { start } else { start + 3 };
+            for window_id in u64::from(first_held)..=u64::from(start) + 5 {
+                let granted: u64 = state
+                    .limiters
+                    .values()
+                    .map(|limiter| limiter.granted_in(window_id))
+                    .sum();
+                assert!(
+                    granted <= 10,
+                    "replica at {ahead_limit} a window ahead of one at {behind_limit}: window {window_id} holds {granted} tokens, above the lower limit of 10"
+                );
+            }
+        }
     }
 
     #[tokio::test]
