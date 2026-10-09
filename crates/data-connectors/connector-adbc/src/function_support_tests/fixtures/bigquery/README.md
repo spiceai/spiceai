@@ -7,9 +7,11 @@ credentials, service or network connection.
 The E2E Test CI workflow's `run_all_tests` release gate executes every corpus
 statement through real BigQuery using `test/scripts/bigquery_corpus.py`. It creates
 isolated tables from `schemas.json`, checks federation plans and successful
-execution, and requires 269 successful data-query jobs — one per remote subtree,
-so the three queries a rounding cast splits contribute nine between them.
-The eight table-free
+execution, and requires 264 successful data-query jobs, one per remote subtree
+that runs. The plans hold 278 remote subtrees: the three queries a rounding cast
+splits contribute nine of them, and the four an ordered aggregate splits
+contribute thirteen. Against the empty fixtures, 14 of them sit on the probe side
+of an empty join build side and never run (#14848). The eight table-free
 statements execute locally. Queries 168 and 169 divide by cohort counts, so they
 execute last against synthetic cohorts with nonzero denominators and exact
 expected results. The other queries execute against empty tables, which does not
