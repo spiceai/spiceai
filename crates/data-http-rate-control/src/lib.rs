@@ -1963,11 +1963,14 @@ fn conflicting_config_message(key: &str, conflicts: &[SettingConflict]) -> Strin
         Some((last, rest)) if !rest.is_empty() => format!("{} and {last}", rest.join(", ")),
         _ => parameters.concat(),
     };
-    let notes = conflicts
-        .iter()
-        .filter_map(|conflict| conflict.note)
-        .map(|note| format!(" {note}"))
-        .collect::<String>();
+    let notes = conflicts.iter().filter_map(|conflict| conflict.note).fold(
+        String::new(),
+        |mut notes, note| {
+            notes.push(' ');
+            notes.push_str(note);
+            notes
+        },
+    );
 
     format!(
         "Components that target origin '{key}' share one rate controller and must resolve to the same rate-control settings, but this one differs from those already targeting it: {differences}. Set {parameters} to matching values on every component that targets this origin.{notes} See: {RATE_CONTROL_DOCS_URL}"
