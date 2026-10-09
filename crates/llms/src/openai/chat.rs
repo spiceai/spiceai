@@ -185,7 +185,8 @@ mod service_tier_tests {
     //! `OpenAI` reports the tier that served a request in `service_tier`, and the set of tiers
     //! grows on its side, so a reply naming a tier the client has never seen has to load and serve
     //! like any other. These drive the health check a model load runs, a request, and a stream
-    //! through each backend against a local endpoint that answers on such a tier.
+    //! through each backend against a local endpoint that answers on such a tier, and pin the
+    //! request side to the tiers the published API lists.
 
     use std::fmt::Write as _;
     use std::io::{Read as _, Write as _};
@@ -195,6 +196,7 @@ mod service_tier_tests {
 
     use async_openai::config::OpenAIConfig;
     use async_openai::types::chat::CreateChatCompletionRequest;
+    use async_openai::types::responses::CreateResponse;
     use futures::TryStreamExt as _;
     use rstest::rstest;
     use serde_json::{Value, json};
@@ -391,7 +393,7 @@ mod service_tier_tests {
         body
     }
 
-    fn request(service_tier: Option<&str>) -> CreateChatCompletionRequest {
+    fn request_json(service_tier: Option<&str>) -> Value {
         let mut request = json!({
             "model": "gpt-4o-mini",
             "messages": [{"role": "user", "content": "hello"}]
@@ -399,7 +401,11 @@ mod service_tier_tests {
         if let Some(tier) = service_tier {
             request["service_tier"] = json!(tier);
         }
-        serde_json::from_value(request).expect("a request may name any service tier")
+        request
+    }
+
+    fn request(service_tier: Option<&str>) -> CreateChatCompletionRequest {
+        serde_json::from_value(request_json(service_tier)).expect("the request deserializes")
     }
 
     /// The failure reported in #14916: the model never loads because its health check, which
@@ -438,12 +444,12 @@ mod service_tier_tests {
     #[case::chat_completions(ChatBackend::ChatCompletions)]
     #[case::responses(ChatBackend::Responses)]
     #[tokio::test]
-    async fn an_unnamed_tier_is_forwarded_and_reported_back(#[case] backend: ChatBackend) {
+    async fn a_reply_on_an_unnamed_tier_is_reported_back(#[case] backend: ChatBackend) {
         let (api_base, rx) = serve_one("application/json", reply(backend, UNNAMED_TIER, "ok"));
 
         let response = tokio::time::timeout(
             TIMEOUT,
-            client(backend, &api_base).chat_request(request(Some(UNNAMED_TIER))),
+            client(backend, &api_base).chat_request(request(Some("priority"))),
         )
         .await
         .expect("the request finished")
@@ -457,13 +463,56 @@ mod service_tier_tests {
             "{backend:?} sent {}",
             sent.request_line
         );
-        assert_eq!(sent.body["service_tier"], json!(UNNAMED_TIER));
+        assert_eq!(
+            sent.body["service_tier"],
+            json!("priority"),
+            "the client's tier reaches the server"
+        );
 
         assert_eq!(
             serde_json::to_value(&response.service_tier).expect("serialize the tier"),
-            json!(UNNAMED_TIER)
+            json!(UNNAMED_TIER),
+            "the tier the server reports reaches the client"
         );
         assert_eq!(response.choices[0].message.content.as_deref(), Some("ok"));
+    }
+
+    /// Only replies are open. A request still names one of the tiers the published API lists,
+    /// because `/v1/chat/completions` and `/v1/responses` deserialize into these request types and
+    /// their accepted values are user-facing. This fails if a fork re-cut opens the request side.
+    #[test]
+    fn a_request_naming_an_unnamed_tier_is_refused() {
+        let error =
+            serde_json::from_value::<CreateChatCompletionRequest>(request_json(Some(UNNAMED_TIER)))
+                .expect_err("a chat request naming an unnamed tier has to be refused")
+                .to_string();
+        assert!(
+            error.contains("unknown variant `fast`"),
+            "refused for another reason: {error}"
+        );
+
+        let responses_request =
+            |tier: &str| json!({"model": "gpt-4o-mini", "input": "hello", "service_tier": tier});
+        let error = serde_json::from_value::<CreateResponse>(responses_request(UNNAMED_TIER))
+            .expect_err("a responses request naming an unnamed tier has to be refused")
+            .to_string();
+        assert!(
+            error.contains("unknown variant `fast`"),
+            "refused for another reason: {error}"
+        );
+
+        // The control: the same requests on a named tier are accepted, so the refusals above are
+        // about the tier rather than the shape of the request.
+        assert_eq!(
+            request(Some("priority")).service_tier,
+            Some(async_openai::types::chat::ServiceTier::Priority)
+        );
+        assert_eq!(
+            serde_json::from_value::<CreateResponse>(responses_request("priority"))
+                .expect("a responses request on a named tier deserializes")
+                .service_tier,
+            Some(async_openai::types::responses::ServiceTier::Priority)
+        );
     }
 
     #[rstest]
