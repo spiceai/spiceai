@@ -82,10 +82,17 @@ pub struct PartitionedWalEntry {
     /// uses this to find the partition's `CayenneTableProvider` in the
     /// already-loaded partition map.
     pub table_id: String,
-    /// Fresh snapshot containing the complete post-commit partition contents.
-    /// Optional for compatibility with WALs written before deferred snapshots.
+    /// Fresh snapshot this partition's write publishes: the complete
+    /// post-commit partition contents, or, for an overlay, a protected snapshot
+    /// holding only the write's rows. Optional for compatibility with WALs
+    /// written before deferred snapshots.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_snapshot_id: Option<String>,
+    /// The target is a protected snapshot over the partition's unchanged current
+    /// snapshot, so the commit recorded its sequence rather than moving the
+    /// partition's pointer to it. Absent in WALs written before overlays.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub overlay: bool,
     /// Absolute path of this partition's own per-partition staging WAL file,
     /// if it had one staged when the cross-partition WAL was written. May be
     /// `None` for partitions that were beyond the coordinator's prepare
@@ -543,6 +550,7 @@ mod tests {
                 PartitionedWalEntry {
                     table_id: "01HY0000000000000000000001".to_string(),
                     target_snapshot_id: None,
+                    overlay: false,
                     staging_wal_path: Some(
                         "/data/p1/_staging/01HZ0000000000000000000000/_wal.json".to_string(),
                     ),
@@ -550,6 +558,7 @@ mod tests {
                 PartitionedWalEntry {
                     table_id: "01HY0000000000000000000002".to_string(),
                     target_snapshot_id: None,
+                    overlay: false,
                     staging_wal_path: None,
                 },
             ],

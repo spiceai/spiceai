@@ -27,6 +27,7 @@ use crate::opentelemetry::create_metrics_service;
 use app::{App, spicepod::component::runtime::FlightIpcCompression};
 use arrow::array::RecordBatch;
 use arrow::datatypes::{DataType, Schema};
+use arrow::error::ArrowError;
 use arrow::ipc::writer::{DictionaryTracker, IpcDataGenerator, IpcWriteContext};
 use arrow_flight::encode::FlightDataEncoderBuilder;
 use arrow_flight::error::FlightError;
@@ -236,8 +237,10 @@ impl Service {
             .read_only(read_only)
             .build();
 
-        let (dataset_schema, parameter_schema) =
-            query.get_schema().await.map_err(handle_datafusion_error)?;
+        let (dataset_schema, parameter_schema) = query
+            .get_schema()
+            .await
+            .map_err(|e| handle_datafusion_error(&e))?;
 
         // The logical plan may report Utf8View/BinaryView, but the physical
         // execution (with `expand_views_at_output = true`) will produce
@@ -628,7 +631,7 @@ impl Stream for InlineFlightStream {
                 }
                 Poll::Ready(Some(Err(e))) => {
                     this.data_stream = None;
-                    return Poll::Ready(Some(Err(handle_datafusion_error(find_datafusion_root(
+                    return Poll::Ready(Some(Err(handle_datafusion_error(&find_datafusion_root(
                         e,
                     )))));
                 }
@@ -724,7 +727,7 @@ fn spawn_flight_encode_stream(
                     },
                     Err(e) => {
                         let e = find_datafusion_root(e);
-                        let _ = tx.send(Err(handle_datafusion_error(e))).await;
+                        let _ = tx.send(Err(handle_datafusion_error(&e))).await;
                         return;
                     }
                 }
@@ -948,7 +951,7 @@ where
 fn handle_query_error(e: query::Error) -> Status {
     match e {
         query::Error::BindingParameters { source }
-        | query::Error::UnableToExecuteQuery { source } => handle_datafusion_error(source),
+        | query::Error::UnableToExecuteQuery { source } => handle_datafusion_error(&source),
         query::Error::QueryCancelled { .. } => Status::cancelled(e.to_string()),
         query::Error::QueryTimedOut { .. } => Status::deadline_exceeded(e.to_string()),
         _ => to_tonic_err(e),
@@ -962,7 +965,7 @@ pub(crate) fn transaction_error_to_status(error: query::TransactionError) -> Sta
     use query::TransactionError;
     match error {
         TransactionError::Rejected(message) => Status::invalid_argument(message),
-        TransactionError::Plan(e) | TransactionError::Stream(e) => handle_datafusion_error(e),
+        TransactionError::Plan(e) | TransactionError::Stream(e) => handle_datafusion_error(&e),
         TransactionError::Query(e) => handle_query_error(e),
         TransactionError::Conflict { table } => Status::aborted(format!(
             "transaction write conflict on '{table}': a participant table changed since the transaction started; retry"
@@ -973,18 +976,20 @@ pub(crate) fn transaction_error_to_status(error: query::TransactionError) -> Sta
     }
 }
 
-pub(crate) fn handle_datafusion_error(e: DataFusionError) -> Status {
-    if query::is_cancellation_error(&e) {
+/// A failure caused by the query or by the values it computes is a client error;
+/// `Internal` is kept for failures of the runtime itself.
+pub(crate) fn handle_datafusion_error(e: &DataFusionError) -> Status {
+    if query::is_cancellation_error(e) {
         return Status::cancelled(e.to_string());
     }
-    if query::is_timeout_error(&e) {
+    if query::is_timeout_error(e) {
         return Status::deadline_exceeded(e.to_string());
     }
     match e {
         DataFusionError::Plan(err_msg) | DataFusionError::Execution(err_msg) => {
             Status::invalid_argument(err_msg)
         }
-        DataFusionError::SQL(sql_err, _) => match *sql_err {
+        DataFusionError::SQL(sql_err, _) => match sql_err.as_ref() {
             ParserError::RecursionLimitExceeded => {
                 Status::invalid_argument("Recursion limit exceeded")
             }
@@ -1012,37 +1017,37 @@ pub(crate) fn handle_datafusion_error(e: DataFusionError) -> Status {
                         error.metadata_mut().insert("spiceai-retryable", 1.into());
                         error
                     }
-                    _ => to_tonic_err(e),
+                    _ => Status::internal(e.to_string()),
                 }
             } else if let Some(err) = e.downcast_ref::<llms::embeddings::Error>() {
                 match err {
                     llms::embeddings::Error::RateLimited { .. } => {
                         Status::unavailable(err.to_string())
                     }
-                    _ => to_tonic_err(e),
+                    _ => Status::internal(e.to_string()),
                 }
             } else {
-                to_tonic_err(e)
+                Status::internal(e.to_string())
             }
         }
         DataFusionError::ResourcesExhausted(source) => Status::resource_exhausted(source),
         DataFusionError::Diagnostic(_, source) | DataFusionError::Context(_, source) => {
-            handle_datafusion_error(*source)
+            handle_datafusion_error(source)
         }
-        DataFusionError::Shared(source) => {
-            // Optimize: avoid string allocation for common case
-            Status::internal(format!("Shared DataFusion error: {source}"))
-        }
-        DataFusionError::Collection(sources) => {
-            // Handle first error efficiently without collecting all
-            if let Some(first_error) = sources.into_iter().next() {
-                handle_datafusion_error(first_error)
-            } else {
+        // `RepartitionExec` and joins share one input failure with every consuming
+        // partition, so the wrapped error decides the status.
+        DataFusionError::Shared(source) => handle_datafusion_error(source),
+        DataFusionError::Collection(sources) => match sources.first() {
+            Some(first_error) => handle_datafusion_error(first_error),
+            None => {
                 Status::internal("Several DataFusion errors occurred, but no details available")
             }
-        }
+        },
         DataFusionError::NotImplemented(message) => {
             Status::invalid_argument(format!("Unsupported Query. {message}"))
+        }
+        DataFusionError::ArrowError(source, _) if is_query_arrow_error(source) => {
+            Status::invalid_argument(source.to_string())
         }
         DataFusionError::Internal(_)
         | DataFusionError::ArrowError(..)
@@ -1052,8 +1057,21 @@ pub(crate) fn handle_datafusion_error(e: DataFusionError) -> Status {
         | DataFusionError::Substrait(_)
         | DataFusionError::Configuration(_)
         | DataFusionError::Ffi(_)
-        | DataFusionError::ExecutionJoin(_) => to_tonic_err(e),
+        | DataFusionError::ExecutionJoin(_) => Status::internal(e.to_string()),
     }
+}
+
+/// Whether a compute kernel rejected the values the query asked it to compute — a
+/// cast the data cannot satisfy, a division by zero, an overflow, an unparsable
+/// string — rather than failing on runtime state.
+fn is_query_arrow_error(e: &ArrowError) -> bool {
+    matches!(
+        e,
+        ArrowError::CastError(_)
+            | ArrowError::DivideByZero
+            | ArrowError::ArithmeticOverflow(_)
+            | ArrowError::ParseError(_)
+    )
 }
 
 #[derive(Debug, Snafu)]
@@ -2050,6 +2068,63 @@ mod tests {
             pool.reserved(),
             0,
             "every queued FlightData reservation must be released once the response is consumed"
+        );
+    }
+
+    /// A failure `RepartitionExec` shared with its output partitions keeps the status
+    /// of the failure it wraps: an HTTP origin's 404 is the query's problem, a
+    /// runtime bug stays a runtime bug.
+    #[test]
+    fn a_shared_failure_takes_the_status_of_its_cause() {
+        let origin_404 =
+            "Failed to fetch http://127.0.0.1 for dataset 'origin': the origin answered 404";
+        let status = handle_datafusion_error(&DataFusionError::Shared(Arc::new(
+            DataFusionError::Plan(origin_404.to_string()),
+        )));
+        assert_eq!(
+            (status.code(), status.message()),
+            (tonic::Code::InvalidArgument, origin_404)
+        );
+
+        let status = handle_datafusion_error(&DataFusionError::Shared(Arc::new(
+            DataFusionError::Internal("bug".to_string()),
+        )));
+        assert_eq!(status.code(), tonic::Code::Internal);
+        assert!(
+            status.message().starts_with("Internal error: bug"),
+            "{}",
+            status.message()
+        );
+    }
+
+    /// Only an Arrow failure on the values the query computes is the client's; one
+    /// raised by the runtime's own buffers stays `Internal`.
+    #[test]
+    fn arrow_failures_outside_the_computed_values_stay_internal() {
+        let status = handle_datafusion_error(&DataFusionError::ArrowError(
+            Box::new(ArrowError::ArithmeticOverflow(
+                "Overflow happened on: 9223372036854775807 + 1".to_string(),
+            )),
+            None,
+        ));
+        assert_eq!(
+            (status.code(), status.message()),
+            (
+                tonic::Code::InvalidArgument,
+                "Arithmetic overflow: Overflow happened on: 9223372036854775807 + 1"
+            )
+        );
+
+        let status = handle_datafusion_error(&DataFusionError::ArrowError(
+            Box::new(ArrowError::MemoryError("buffer too small".to_string())),
+            None,
+        ));
+        assert_eq!(
+            (status.code(), status.message()),
+            (
+                tonic::Code::Internal,
+                "Arrow error: Memory error: buffer too small"
+            )
         );
     }
 }
