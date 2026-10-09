@@ -1267,9 +1267,21 @@ fn build_input_row_estimate(hash_join: &HashJoinExec) -> Option<usize> {
 /// Whether either side of the join reads Cayenne-accelerated data. Keeps the
 /// memory-gated rewrite scoped to Cayenne query plans without the restrictive
 /// same-source join-key pairing required by the legacy semi/anti path.
+///
+/// Every [`CayenneAccelerationExec`] counts, whatever it reads. A `mode: memory`
+/// table scans an in-memory source and so carries no file-scan identity, but
+/// the hash table its join builds is as non-spillable as a `mode: file` one;
+/// only the dynamic-filter sharing paths need the identity.
 fn join_touches_cayenne(hash_join: &HashJoinExec) -> bool {
-    !collect_cayenne_scans(hash_join.left()).is_empty()
-        || !collect_cayenne_scans(hash_join.right()).is_empty()
+    plan_contains_cayenne_scan(hash_join.left()) || plan_contains_cayenne_scan(hash_join.right())
+}
+
+fn plan_contains_cayenne_scan(plan: &Arc<dyn ExecutionPlan>) -> bool {
+    plan.downcast_ref::<CayenneAccelerationExec>().is_some()
+        || plan
+            .children()
+            .iter()
+            .any(|child| plan_contains_cayenne_scan(child))
 }
 
 fn join_reads_materialized_cte(hash_join: &HashJoinExec) -> bool {
