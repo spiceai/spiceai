@@ -1285,15 +1285,15 @@ impl CayenneTableProvider {
 
     /// Begin a staged append whose visibility a cross-partition commit decides.
     ///
-    /// A table that resolves keys by tombstone — one with a primary key, which
-    /// deletes by key — stages the append into a protected snapshot holding only
-    /// its rows, the layout the single-table write gives an upsert: the stored
-    /// copies it supersedes stay in the current snapshot behind their
-    /// tombstones, and the shared catalog transaction commits the snapshot by
-    /// recording its sequence. A key-level tombstone could not tell a stored copy
-    /// from its replacement if both sat in one snapshot.
+    /// A table with a primary key supersedes a stored key by tombstoning it, so
+    /// an append that supersedes keys, or lands among tombstones, is staged into
+    /// a protected snapshot holding only its rows, the layout the single-table
+    /// write gives an upsert: the stored copies it supersedes stay in the current
+    /// snapshot behind their tombstones, and the shared catalog transaction
+    /// commits the snapshot by recording its sequence. A key-level tombstone could
+    /// not tell a stored copy from its replacement if both sat in one snapshot.
     ///
-    /// Any other table stages into a fresh snapshot cloned from the current one,
+    /// Any other append stages into a fresh snapshot cloned from the current one,
     /// which the shared transaction commits by pointing the table at it.
     ///
     /// Either target stays invisible until the transaction commits and the
@@ -1395,10 +1395,11 @@ impl CayenneTableProvider {
         let may_have_on_conflict_deletions = prepared_insert.may_have_on_conflict_deletions();
         // An append that supersedes stored keys, or lands on a table already
         // holding tombstones, publishes on-conflict state: tombstones and
-        // re-insert records keyed by primary key, plus the target's sequence. On a
-        // key-deletion table that state only separates the two copies of a key
-        // across snapshots, so its target is an overlay. A position-deletion
-        // table hides a superseded row by its position, which the clone keeps.
+        // re-insert records keyed by primary key, plus the target's sequence.
+        // With a primary key, that state separates the two copies of a key only
+        // across snapshots, so the target is an overlay. A table without one
+        // hides a deleted row by its position in a file (`is_position_based`),
+        // which the clone keeps.
         let publishes_on_conflict = may_have_on_conflict_deletions || self.has_pending_deletions();
         let overlay = publishes_on_conflict && !self.is_position_based();
         if !overlay

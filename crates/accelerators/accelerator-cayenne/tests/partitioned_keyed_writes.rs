@@ -62,6 +62,19 @@ async fn partitioned_table(
     dir: &Path,
     keyed: bool,
 ) -> Arc<dyn TableProvider> {
+    try_partitioned_table(ctx, dir, keyed, &[])
+        .await
+        .expect("partitioned table")
+}
+
+/// [`partitioned_table`] with extra acceleration `params`, returning the error
+/// creating or reopening it reports.
+async fn try_partitioned_table(
+    ctx: &SessionContext,
+    dir: &Path,
+    keyed: bool,
+    params: &[(&str, &str)],
+) -> Result<Arc<dyn TableProvider>, String> {
     let source = TestAccelerationSource::new("t").with_acceleration(Acceleration {
         enabled: true,
         engine: Engine::Cayenne,
@@ -83,6 +96,11 @@ async fn partitioned_table(
             ),
         ]
         .into_iter()
+        .chain(
+            params
+                .iter()
+                .map(|(key, value)| ((*key).to_string(), (*value).to_string())),
+        )
         .collect(),
         ..Default::default()
     });
@@ -102,7 +120,7 @@ async fn partitioned_table(
             Arc::new(ctx.clone()),
         )
         .await
-        .expect("partitioned table")
+        .map_err(|error| error.to_string())
 }
 
 /// Every row of `t`, ordered.
@@ -309,4 +327,269 @@ async fn an_unkeyed_partitioned_table_keeps_every_row() {
 
     reopen(&ctx, dir.path(), false, table).await;
     assert_eq!(rows(&ctx).await, expected);
+}
+
+/// The partition children of `table`, each with the `w` its rows hold.
+async fn children(table: &Arc<dyn TableProvider>) -> Vec<(i64, Arc<dyn TableProvider>)> {
+    let partitioned = spice_table::find_concrete::<
+        runtime_table_partition::provider::PartitionTableProvider,
+    >(table.as_ref(), spice_table::LayerWalk::Write)
+    .expect("partitioned table");
+    let mut children = Vec::new();
+    for child in partitioned.partition_table_providers().await {
+        let ctx = SessionContext::new();
+        ctx.register_table("c", Arc::clone(&child))
+            .expect("register child");
+        let batches = ctx
+            .sql("SELECT DISTINCT w FROM c")
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect("partition value");
+        let w = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("w")
+            .value(0);
+        children.push((w, child));
+    }
+    children.sort_by_key(|(w, _)| *w);
+    children
+}
+
+/// Stop the cross-partition coordinator's steps for one write partway, as a
+/// crash would: write the top-level partitioned WAL and move each partition's
+/// staged files into its target, then, when `committed`, run the shared catalog
+/// transaction. The receipts and their payloads are leaked, not dropped, so no
+/// cleanup runs.
+async fn crash_partitioned_append(
+    dir: &Path,
+    table: &Arc<dyn TableProvider>,
+    writes: &[(i64, Vec<Row>)],
+    committed: bool,
+) -> Vec<bool> {
+    use cayenne::{CayenneCatalog, CayenneTableProvider, PartitionedWal, PartitionedWalEntry};
+
+    let catalog = CayenneCatalog::new(format!(
+        "sqlite://{}/cayenne.db",
+        dir.join("metadata").display()
+    ))
+    .expect("catalog");
+    let children = children(table).await;
+    let schema = schema();
+    let mut prepared = Vec::new();
+    for (w, rows) in writes {
+        let (_, child) = children
+            .iter()
+            .find(|(value, _)| value == w)
+            .expect("a partition for each write");
+        let cayenne = child
+            .downcast_ref::<CayenneTableProvider>()
+            .expect("Cayenne partition");
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.0))),
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.1))),
+                Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.2))),
+            ],
+        )
+        .expect("rows");
+        let stream = Box::pin(
+            datafusion::physical_plan::stream::RecordBatchStreamAdapter::new(
+                Arc::clone(&schema),
+                futures::stream::iter(vec![Ok(batch)]),
+            ),
+        );
+        prepared.push(
+            cayenne
+                .begin_deferred_snapshot_append(stream, 1)
+                .await
+                .expect("stage partition append"),
+        );
+    }
+    let table_root = dir.join("data").join("t");
+    PartitionedWal::new(
+        uuid::Uuid::now_v7().to_string(),
+        table_root.to_string_lossy().to_string(),
+        prepared
+            .iter()
+            .map(|receipt| PartitionedWalEntry {
+                table_id: receipt.table_id().to_string(),
+                target_snapshot_id: Some(receipt.target_snapshot_id().to_string()),
+                overlay: receipt.publishes_overlay(),
+                staging_wal_path: Some(receipt.staging_wal_path().to_string_lossy().to_string()),
+            })
+            .collect(),
+    )
+    .write_to(&table_root)
+    .await
+    .expect("top-level WAL");
+    for receipt in &mut prepared {
+        let fence = receipt.lock_listing_fence_write_owned().await;
+        receipt
+            .apply_under_held_barrier()
+            .await
+            .expect("move staged files");
+        drop(fence);
+        receipt.prepare_deferred_manifest().await.expect("manifest");
+    }
+    let overlays = prepared
+        .iter()
+        .map(cayenne::PreparedStagedAppend::publishes_overlay)
+        .collect();
+    if committed {
+        let mut payloads: Vec<_> = prepared
+            .iter_mut()
+            .map(cayenne::PreparedStagedAppend::take_prepared_on_conflict)
+            .collect();
+        let mut txn = catalog.begin_transaction().await.expect("begin");
+        let pointers: Vec<(&str, &str)> = prepared
+            .iter()
+            .filter(|receipt| !receipt.publishes_overlay())
+            .map(|receipt| (receipt.table_id(), receipt.target_snapshot_id()))
+            .collect();
+        catalog
+            .set_current_snapshots_in_txn(&mut *txn, &pointers)
+            .await
+            .expect("pointers");
+        for payload in payloads.iter_mut().flatten() {
+            catalog
+                .apply_prepared_on_conflict_in_txn(&mut *txn, payload)
+                .await
+                .expect("on-conflict payload");
+        }
+        for receipt in &prepared {
+            if let Some(manifest) = receipt.deferred_manifest() {
+                catalog
+                    .replace_snapshot_files_in_txn(
+                        &mut *txn,
+                        receipt.table_id(),
+                        receipt.target_snapshot_id(),
+                        manifest,
+                    )
+                    .await
+                    .expect("manifest");
+            } else if receipt.publishes_overlay() {
+                catalog
+                    .clear_table_statistics_in_txn(&mut *txn, receipt.table_id())
+                    .await
+                    .expect("statistics");
+            }
+        }
+        txn.commit().await.expect("commit");
+        for mut payload in payloads.into_iter().flatten() {
+            payload.mark_catalog_committed();
+            std::mem::forget(payload);
+        }
+    }
+    for receipt in prepared {
+        std::mem::forget(receipt);
+    }
+    overlays
+}
+
+/// The cross-partition WALs left at the table root.
+fn partitioned_wals(dir: &Path) -> usize {
+    std::fs::read_dir(dir.join("data").join("t").join("_partitioned_wal"))
+        .map_or(0, Iterator::count)
+}
+
+/// A restart after a crash before the shared catalog transaction rolls every
+/// partition's overlay back and removes the top-level WAL.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restart_rolls_back_a_partitioned_append_the_catalog_never_committed() {
+    let dir = tempfile::tempdir().expect("dir");
+    let ctx = SessionContext::new();
+    let table = partitioned_table(&ctx, dir.path(), true).await;
+    ctx.register_table("t", Arc::clone(&table))
+        .expect("register");
+    sql(&ctx, "INSERT INTO t VALUES (1, 1, 0), (2, 0, 0), (3, 1, 0)").await;
+
+    let overlays = crash_partitioned_append(
+        dir.path(),
+        &table,
+        &[(0, vec![(2, 0, 7), (4, 0, 7)]), (1, vec![(1, 1, 7)])],
+        false,
+    )
+    .await;
+    assert_eq!(overlays, [true, true]);
+    assert_eq!(partitioned_wals(dir.path()), 1);
+
+    reopen(&ctx, dir.path(), true, table).await;
+    assert_eq!(rows(&ctx).await, [(1, 1, 0), (2, 0, 0), (3, 1, 0)]);
+    assert_eq!(partitioned_wals(dir.path()), 0);
+}
+
+/// A restart after a crash between the shared catalog transaction and the
+/// in-memory publication rolls every partition's overlay forward.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restart_rolls_forward_a_partitioned_append_the_catalog_committed() {
+    let dir = tempfile::tempdir().expect("dir");
+    let ctx = SessionContext::new();
+    let table = partitioned_table(&ctx, dir.path(), true).await;
+    ctx.register_table("t", Arc::clone(&table))
+        .expect("register");
+    sql(&ctx, "INSERT INTO t VALUES (1, 1, 0), (2, 0, 0), (3, 1, 0)").await;
+
+    let overlays = crash_partitioned_append(
+        dir.path(),
+        &table,
+        &[(0, vec![(2, 0, 7), (4, 0, 7)]), (1, vec![(1, 1, 7)])],
+        true,
+    )
+    .await;
+    assert_eq!(overlays, [true, true]);
+
+    reopen(&ctx, dir.path(), true, table).await;
+    assert_eq!(
+        rows(&ctx).await,
+        [(1, 1, 7), (2, 0, 7), (3, 1, 0), (4, 0, 7)]
+    );
+    assert_eq!(partitioned_wals(dir.path()), 0);
+}
+
+/// One write can commit an overlay in one partition and move another
+/// partition's pointer: with primary-key conflict detection off, only a
+/// partition that already holds tombstones publishes on-conflict state. A
+/// restart after the shared transaction committed must read both as committed;
+/// judging the overlay by its unmoved pointer would call the commit mixed and
+/// refuse to open the table.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_restart_reads_a_committed_overlay_and_pointer_move_as_one_commit() {
+    let params = [("cayenne_pk_conflict_detection", "none")];
+    let dir = tempfile::tempdir().expect("dir");
+    let ctx = SessionContext::new();
+    let table = try_partitioned_table(&ctx, dir.path(), true, &params)
+        .await
+        .expect("partitioned table");
+    ctx.register_table("t", Arc::clone(&table))
+        .expect("register");
+    sql(&ctx, "INSERT INTO t VALUES (1, 1, 0), (2, 0, 0), (3, 1, 0)").await;
+    // A tombstone in partition w = 1 only.
+    sql(&ctx, "DELETE FROM t WHERE id = 3").await;
+
+    let overlays = crash_partitioned_append(
+        dir.path(),
+        &table,
+        &[(0, vec![(4, 0, 7)]), (1, vec![(5, 1, 7)])],
+        true,
+    )
+    .await;
+    assert_eq!(overlays, [false, true]);
+
+    drop(table);
+    ctx.deregister_table("t").expect("deregister");
+    let reopened = try_partitioned_table(&ctx, dir.path(), true, &params)
+        .await
+        .expect("a committed write reopens");
+    ctx.register_table("t", reopened)
+        .expect("register reopened");
+    assert_eq!(
+        rows(&ctx).await,
+        [(1, 1, 0), (2, 0, 0), (4, 0, 7), (5, 1, 7)]
+    );
+    assert_eq!(partitioned_wals(dir.path()), 0);
 }
