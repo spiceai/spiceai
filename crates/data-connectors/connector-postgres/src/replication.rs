@@ -1424,6 +1424,9 @@ pub(crate) fn changes_dataset_lacks_primary_key(
         && extract_primary_keys(provider).is_empty()
 }
 
+/// Where the replica identity and primary key requirements are documented.
+const CDC_DOCS: &str = "https://spiceai.org/docs/features/cdc/postgres-replication";
+
 /// The fix for [`changes_dataset_lacks_primary_key`]: a declared key, plus a
 /// replica identity that makes Postgres send that key's columns with every
 /// UPDATE and DELETE.
@@ -1445,7 +1448,7 @@ pub(crate) fn missing_primary_key_message(dataset: &DatasetSpec) -> String {
          that identify a row{on_conflict_note}. Postgres sends those columns with every \
          change only under `REPLICA IDENTITY FULL` (run \
          `ALTER TABLE {schema_name}.{table_name} REPLICA IDENTITY FULL;`) or \
-         `REPLICA IDENTITY USING INDEX` on a unique index over them."
+         `REPLICA IDENTITY USING INDEX` on a unique index over them. See: {CDC_DOCS}"
     )
 }
 

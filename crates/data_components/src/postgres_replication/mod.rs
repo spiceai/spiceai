@@ -92,7 +92,7 @@ pub enum Error {
          with UPDATE and DELETE events. If the table has a primary key, run \
          `ALTER TABLE {schema}.{table} REPLICA IDENTITY DEFAULT;`. Otherwise run \
          `ALTER TABLE {schema}.{table} REPLICA IDENTITY FULL;` and set `acceleration.primary_key` \
-         on the dataset."
+         on the dataset. See: https://spiceai.org/docs/features/cdc/postgres-replication"
     ))]
     UnsupportedReplicaIdentity { schema: String, table: String },
 
@@ -100,7 +100,7 @@ pub enum Error {
         "Table {schema}.{table} has no primary key and REPLICA IDENTITY DEFAULT, so Postgres \
          sends no row identity with UPDATE and DELETE events. Add a primary key to the table, or \
          run `ALTER TABLE {schema}.{table} REPLICA IDENTITY FULL;` and set \
-         `acceleration.primary_key` on the dataset."
+         `acceleration.primary_key` on the dataset. See: https://spiceai.org/docs/features/cdc/postgres-replication"
     ))]
     MissingPrimaryKey { schema: String, table: String },
 
