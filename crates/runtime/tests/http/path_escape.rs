@@ -135,31 +135,20 @@ async fn test_http_request_path_cannot_escape_allowed_paths() -> Result<(), Stri
             );
             assert_eq!(take_requested(&requested), vec!["/api/v1/shows/1"]);
 
-            let dot_segment = |raw: &str| {
-                format!(
-                    "Failed to execute query: Error during planning: The 'request_path' value '{raw}' contains a '.' or '..' segment (including percent-encoded forms such as '%2e%2e'), which is not allowed for security reasons."
-                )
-            };
-            let rewritten = |raw: &str, sent: &str| {
-                format!(
-                    "Failed to execute query: Error during planning: The 'request_path' value '{raw}' would be requested as '{sent}', because URLs cannot contain tabs or newlines and treat '\\' as '/'. Use '{sent}' as the 'request_path' value instead."
-                )
-            };
+            // Asserted in full: the error reaches logs and query history, so it must not
+            // repeat the path, which can carry identifiers or tokens, or a newline from it.
+            let dot_segment = "Failed to execute query: Error during planning: The 'request_path' value contains a '.' or '..' segment, including a percent-encoded one such as '%2e%2e', which is not allowed for security reasons. Remove the segment from the path.";
+            let rewritten = "Failed to execute query: Error during planning: The 'request_path' value would be changed before the request is sent, because URLs cannot contain tabs or newlines and treat '\\' as '/'. Remove those characters, using '/' to separate path segments.";
             // Each matches `/shows/**` as written. Without the check, URL parsing sends the
-            // first five to `/api/v1/people/1` and the sixth to `/admin`, outside the base path.
+            // first six to `/api/v1/people/1` and the last to `/admin`, outside the base path.
             let escapes = [
-                ("/shows/%2e%2e/people/1", dot_segment("/shows/%2e%2e/people/1")),
-                ("/shows/%2E%2E/people/1", dot_segment("/shows/%2E%2E/people/1")),
-                ("/shows/.%2e/people/1", dot_segment("/shows/.%2e/people/1")),
-                ("/shows/%2e./people/1", dot_segment("/shows/%2e./people/1")),
-                (
-                    "/shows/.\t./people/1",
-                    rewritten("/shows/.\t./people/1", "/people/1"),
-                ),
-                (
-                    "/shows/%2e%2e/%2e%2e/%2e%2e/admin",
-                    dot_segment("/shows/%2e%2e/%2e%2e/%2e%2e/admin"),
-                ),
+                ("/shows/%2e%2e/people/1", dot_segment),
+                ("/shows/%2E%2E/people/1", dot_segment),
+                ("/shows/.%2e/people/1", dot_segment),
+                ("/shows/%2e./people/1", dot_segment),
+                ("/shows/.\t./people/1", rewritten),
+                ("/shows/.\n./people/1", rewritten),
+                ("/shows/%2e%2e/%2e%2e/%2e%2e/admin", dot_segment),
             ];
             for (raw, expected) in escapes {
                 match query(&rt, raw).await {

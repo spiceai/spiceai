@@ -3468,6 +3468,10 @@ struct PaginationState {
     recent_page_urls: VecDeque<String>,
 }
 
+const REQUEST_PATH_DOT_SEGMENT_MESSAGE: &str = "The 'request_path' value contains a '.' or '..' segment, including a percent-encoded one such as '%2e%2e', which is not allowed for security reasons. Remove the segment from the path.";
+
+const REQUEST_PATH_REWRITTEN_MESSAGE: &str = "The 'request_path' value would be changed before the request is sent, because URLs cannot contain tabs or newlines and treat '\\' as '/'. Remove those characters, using '/' to separate path segments.";
+
 /// Rejects a `request_path` the HTTP request would not send as written.
 ///
 /// `allowed_request_paths` is matched against the path as written, but the request goes to
@@ -3478,6 +3482,9 @@ struct PaginationState {
 /// parsing catches every such rewrite rather than a list of known encodings. The segment
 /// check also rejects a dot segment behind an encoded slash (`%2e%2e%2fadmin`), which the
 /// URL parser leaves alone but an origin that decodes `%2f` before routing would resolve.
+///
+/// The messages do not repeat the value: a path can carry identifiers or tokens, and these
+/// errors reach logs and query history.
 fn ensure_request_path_is_sent_as_written(raw: &str, base_url: &Url) -> Result<()> {
     let decoded = percent_encoding::percent_decode_str(raw).decode_utf8_lossy();
     if decoded
@@ -3485,20 +3492,17 @@ fn ensure_request_path_is_sent_as_written(raw: &str, base_url: &Url) -> Result<(
         .any(|segment| segment == "." || segment == "..")
     {
         return Err(Error::FilterRejected {
-            message: format!(
-                "The 'request_path' value '{raw}' contains a '.' or '..' segment (including percent-encoded forms such as '%2e%2e'), which is not allowed for security reasons."
-            ),
+            message: REQUEST_PATH_DOT_SEGMENT_MESSAGE.to_string(),
         });
     }
 
+    // Only the request path is compared, so replacing the base path here is deliberate: the
+    // base path is joined in front of an accepted value, which cannot remove a segment of it.
     let mut url = base_url.clone();
     url.set_path(raw);
-    let sent = url.path();
-    if percent_encoding::percent_decode_str(sent).decode_utf8_lossy() != decoded {
+    if percent_encoding::percent_decode_str(url.path()).decode_utf8_lossy() != decoded {
         return Err(Error::FilterRejected {
-            message: format!(
-                "The 'request_path' value '{raw}' would be requested as '{sent}', because URLs cannot contain tabs or newlines and treat '\\' as '/'. Use '{sent}' as the 'request_path' value instead."
-            ),
+            message: REQUEST_PATH_REWRITTEN_MESSAGE.to_string(),
         });
     }
 
@@ -6999,55 +7003,25 @@ mod tests {
     #[test]
     fn test_request_path_rewritten_by_url_parsing_is_rejected() {
         let base_url = Url::parse("https://api.example.com/api/v1").expect("valid URL");
-        let dot_segment = |raw: &str| {
-            format!(
-                "The 'request_path' value '{raw}' contains a '.' or '..' segment (including percent-encoded forms such as '%2e%2e'), which is not allowed for security reasons."
-            )
-        };
-        let rewritten = |raw: &str, sent: &str| {
-            format!(
-                "The 'request_path' value '{raw}' would be requested as '{sent}', because URLs cannot contain tabs or newlines and treat '\\' as '/'. Use '{sent}' as the 'request_path' value instead."
-            )
-        };
+        // The messages are asserted in full so a reword cannot reintroduce the path, which
+        // may carry identifiers or tokens, or a raw newline from it.
+        let dot_segment = "The 'request_path' value contains a '.' or '..' segment, including a percent-encoded one such as '%2e%2e', which is not allowed for security reasons. Remove the segment from the path.";
+        let rewritten = "The 'request_path' value would be changed before the request is sent, because URLs cannot contain tabs or newlines and treat '\\' as '/'. Remove those characters, using '/' to separate path segments.";
 
         let cases = [
-            (
-                "/shows/%2e%2e/people/1",
-                dot_segment("/shows/%2e%2e/people/1"),
-            ),
-            (
-                "/shows/%2E%2E/people/1",
-                dot_segment("/shows/%2E%2E/people/1"),
-            ),
-            (
-                "/shows/%2E%2e/people/1",
-                dot_segment("/shows/%2E%2e/people/1"),
-            ),
-            ("/shows/.%2e/people/1", dot_segment("/shows/.%2e/people/1")),
-            ("/shows/%2e./people/1", dot_segment("/shows/%2e./people/1")),
-            ("/shows/%2e/people/1", dot_segment("/shows/%2e/people/1")),
-            ("/shows/./people/1", dot_segment("/shows/./people/1")),
-            (
-                "/shows/%2e%2e/%2e%2e/%2e%2e/admin",
-                dot_segment("/shows/%2e%2e/%2e%2e/%2e%2e/admin"),
-            ),
-            (
-                "/shows/%2e%2e%2fadmin",
-                dot_segment("/shows/%2e%2e%2fadmin"),
-            ),
-            (
-                "/shows/%2e%2e%5cadmin",
-                dot_segment("/shows/%2e%2e%5cadmin"),
-            ),
-            (
-                "/shows/.\t./people/1",
-                rewritten("/shows/.\t./people/1", "/people/1"),
-            ),
-            (
-                "/shows/.\n./people/1",
-                rewritten("/shows/.\n./people/1", "/people/1"),
-            ),
-            ("/shows/a\\b", rewritten("/shows/a\\b", "/shows/a/b")),
+            ("/shows/%2e%2e/people/1", dot_segment),
+            ("/shows/%2E%2E/people/1", dot_segment),
+            ("/shows/%2E%2e/people/1", dot_segment),
+            ("/shows/.%2e/people/1", dot_segment),
+            ("/shows/%2e./people/1", dot_segment),
+            ("/shows/%2e/people/1", dot_segment),
+            ("/shows/./people/1", dot_segment),
+            ("/shows/%2e%2e/%2e%2e/%2e%2e/admin", dot_segment),
+            ("/shows/%2e%2e%2fadmin", dot_segment),
+            ("/shows/%2e%2e%5cadmin", dot_segment),
+            ("/shows/.\t./people/1", rewritten),
+            ("/shows/.\n./people/1", rewritten),
+            ("/shows/a\\b", rewritten),
         ];
         for (raw, expected) in cases {
             match ensure_request_path_is_sent_as_written(raw, &base_url) {
