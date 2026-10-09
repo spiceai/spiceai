@@ -3389,22 +3389,6 @@ fn configured_retention_setting(acceleration: &Acceleration) -> Option<String> {
     }
 }
 
-/// The parameter that turns Cayenne's primary-key conflict detection off, when
-/// this acceleration sets one.
-///
-/// Mirrors how the Cayenne accelerator reads it: the prefixed key wins over the
-/// unprefixed one, and the value is matched without regard to case.
-fn disabled_pk_conflict_detection_param(acceleration: &Acceleration) -> Option<&'static str> {
-    if acceleration.engine != Engine::Cayenne {
-        return None;
-    }
-    ["cayenne_pk_conflict_detection", "pk_conflict_detection"]
-        .into_iter()
-        .find_map(|key| acceleration.params.get(key).map(|value| (key, value)))
-        .filter(|(_, value)| value.eq_ignore_ascii_case("none"))
-        .map(|(key, _)| key)
-}
-
 /// A way a dataset rewrites a key it already stores, which Cayenne can do
 /// correctly only with its primary-key check on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3441,12 +3425,13 @@ impl KeyedWrites {
 /// its key nor records the key for write-back delivery. v2.3.2 refused these
 /// configurations by refusing `none` beside the `on_conflict` upsert each of
 /// them needed; Cayenne no longer receives `on_conflict`, so they are refused
-/// here instead. A full or append refresh still loads, as it did then.
+/// here instead. A full or append refresh is not refused, as it was not then;
+/// how those behave under `none` is tracked in #14883.
 fn pk_conflict_detection_refusal(
     acceleration: &Acceleration,
     refresh_mode: RefreshMode,
 ) -> Option<(&'static str, KeyedWrites)> {
-    let param = disabled_pk_conflict_detection_param(acceleration)?;
+    let param = data_accelerator_api::cayenne_pk_conflict_detection_disabled_by(acceleration)?;
     let writes = match (&acceleration.write_mode, refresh_mode) {
         (spicepod::acceleration::WriteMode::WriteBack, _) => KeyedWrites::WriteBack,
         (_, RefreshMode::Changes) => KeyedWrites::Changes,
