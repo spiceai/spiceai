@@ -185,7 +185,8 @@ pub enum RuntimeReadyState {
 /// controller, which moves them within the statically derived bounds. The
 /// `runtime.params.target_*` setpoints steer the controller and never turn it on.
 ///
-/// The value is matched ignoring case and surrounding whitespace. Anything else fails the
+/// Only the exact values `enabled` and `disabled` are accepted, matching the published
+/// schema. Anything else, including a different case or surrounding whitespace, fails the
 /// Spicepod load.
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Default)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
@@ -199,19 +200,16 @@ pub enum AdaptiveTuning {
 }
 
 impl AdaptiveTuning {
-    /// Resolve a raw value, ignoring case and surrounding whitespace.
+    /// Resolve a raw value. Only `enabled` and `disabled` are valid.
     ///
     /// # Errors
     ///
-    /// Returns a user-facing error naming the invalid value.
+    /// Returns a user-facing error naming the invalid value as written.
     pub fn parse(raw: &str) -> Result<Self, String> {
-        let value = raw.trim();
-        if value.eq_ignore_ascii_case("enabled") {
-            Ok(Self::Enabled)
-        } else if value.eq_ignore_ascii_case("disabled") {
-            Ok(Self::Disabled)
-        } else {
-            Err(invalid_tuning_message(value))
+        match raw {
+            "enabled" => Ok(Self::Enabled),
+            "disabled" => Ok(Self::Disabled),
+            _ => Err(invalid_tuning_message(raw)),
         }
     }
 
@@ -2803,12 +2801,22 @@ datasets:
         for (value, expected) in [
             ("disabled", AdaptiveTuning::Disabled),
             ("enabled", AdaptiveTuning::Enabled),
-            ("ENABLED", AdaptiveTuning::Enabled),
-            (" disabled ", AdaptiveTuning::Disabled),
         ] {
             let yaml = format!("adaptive_tuning: \"{value}\"\n");
             let runtime: Runtime = yaml::from_str(&yaml).expect("valid tuning must parse");
             assert_eq!(runtime.adaptive_tuning, expected, "value {value:?}");
+        }
+    }
+
+    #[test]
+    fn test_adaptive_tuning_is_matched_exactly() {
+        for value in ["ENABLED", "Disabled", " enabled", "disabled "] {
+            let error = yaml::from_str::<Runtime>(&format!("adaptive_tuning: \"{value}\"\n"))
+                .expect_err("only the exact schema values may load");
+            assert!(
+                error.to_string().contains(&invalid_tuning_message(value)),
+                "unexpected error for {value:?}: {error}"
+            );
         }
     }
 

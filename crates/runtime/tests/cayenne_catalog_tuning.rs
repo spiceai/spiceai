@@ -21,7 +21,7 @@ limitations under the License.
 //! table's Cayenne provider runs the closed-loop tuner.
 
 #![cfg(not(windows))]
-#![allow(clippy::expect_used, dead_code)]
+#![expect(clippy::expect_used, dead_code)]
 
 // Accelerator engines self-register through a linkme slice; the linker drops an unreferenced
 // slice static, so a binary exercising Cayenne must name the crate itself.

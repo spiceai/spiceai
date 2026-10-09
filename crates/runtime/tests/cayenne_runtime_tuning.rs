@@ -23,7 +23,7 @@ limitations under the License.
 
 #![cfg(not(windows))]
 #![recursion_limit = "256"]
-#![allow(clippy::expect_used)]
+#![expect(clippy::expect_used)]
 
 // Accelerator engines self-register through a linkme slice; the linker drops an unreferenced
 // slice static, so a binary exercising Cayenne must name the crate itself.
