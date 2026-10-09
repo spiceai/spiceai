@@ -240,9 +240,11 @@ impl ReciprocalRankFusionSubqueryArgs {
     ) -> Result<(Expr, ReciprocalRankFusionSubqueryArgs)> {
         if let Expr::ScalarFunction(ScalarFunction { args, func }) = expr {
             let mut args = args.clone();
+            // Only `rank_weight` belongs to `rrf`. Other named arguments, such as
+            // `limit`, stay on the nested search call.
             let rrf_args = args
                 .extract_if(.., |arg| {
-                    matches!(arg, Expr::Literal(_, Some(meta)) if meta.inner().contains_key("spice.parameter_name"))
+                    matches!(arg, Expr::Literal(_, Some(meta)) if meta.inner().get("spice.parameter_name").is_some_and(|name| name == "rank_weight"))
                 })
                 .filter_map(|arg| match arg {
                     Expr::Literal(value, Some(meta)) => meta
@@ -987,7 +989,7 @@ impl ReciprocalRankFusion {
 
                 // Propagate the RRF-level `limit` into each subquery as a wider
                 // candidate pool — but only when the subquery itself does not
-                // already specify an explicit `limit` positional argument. We
+                // already specify an explicit `limit` argument. We
                 // must not override a user-provided limit (e.g.
                 // `text_search(..., 1000)` nested inside `rrf(..., limit => 25)`).
                 //
@@ -1402,6 +1404,7 @@ mod tests {
     use datafusion::scalar::ScalarValue;
     use datafusion_expr::expr::ScalarFunction;
     use datafusion_expr::{col, lit};
+    use runtime_proto::rrf_nested_query::Query;
     use std::collections::BTreeMap;
     use std::sync::Arc;
 
@@ -1573,6 +1576,55 @@ mod tests {
             parsed.rrf_subquery_arguments[0].rank_weight,
             Some(2.5),
             "rank_weight should be 2.5"
+        );
+    }
+
+    #[test]
+    fn nested_search_keeps_its_named_arguments() {
+        let with_named_args = |expr: Expr, named_args: Vec<Expr>| {
+            let Expr::ScalarFunction(mut search) = expr else {
+                panic!("search stubs are scalar functions");
+            };
+            search.args.extend(named_args);
+            Expr::ScalarFunction(search)
+        };
+
+        let parsed = ReciprocalRankFusionArgs::from_udtf_exprs(&[
+            with_named_args(
+                vector_search_expr("foo", "query"),
+                vec![
+                    named_arg("limit", ScalarValue::Int64(Some(5))),
+                    named_arg("include_score", false),
+                    named_arg("distance_metric", "l2"),
+                    named_arg("rank_weight", 2.5f64),
+                ],
+            ),
+            with_named_args(
+                text_search_expr("foo", "query"),
+                vec![named_arg("limit", ScalarValue::Int64(Some(7)))],
+            ),
+        ])
+        .expect("Expected success");
+        let queries = parsed
+            .to_serializable()
+            .expect("Expected serializable args")
+            .queries;
+
+        let Some(Query::VectorSearch(vector_search)) = &queries[0].query else {
+            panic!("Expected a vector_search query, got {:?}", queries[0]);
+        };
+        let vector_args = vector_search.args.as_ref().expect("vector_search args");
+        assert_eq!(vector_args.limit, Some(5));
+        assert_eq!(vector_args.include_score, Some(false));
+        assert_eq!(vector_args.distance_metric.as_deref(), Some("l2"));
+        assert_eq!(vector_search.rank_weight, Some(2.5));
+
+        let Some(Query::TextSearch(text_search)) = &queries[1].query else {
+            panic!("Expected a text_search query, got {:?}", queries[1]);
+        };
+        assert_eq!(
+            text_search.args.as_ref().and_then(|args| args.limit),
+            Some(7)
         );
     }
 
