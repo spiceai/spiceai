@@ -25,6 +25,7 @@ use arrow::array::{Array, ArrayRef, RecordBatch, TimestampNanosecondArray};
 use arrow::compute::cast;
 use arrow::datatypes::{DataType, SchemaRef, TimeUnit};
 use arrow_tools::format::SchemaDisplay;
+use data_components::http::provider::HttpTableProvider;
 use datafusion::common::{DataFusionError, Result as DataFusionResult, TableReference};
 use datafusion::datasource::TableProvider;
 use datafusion::execution::TaskContext;
@@ -566,6 +567,89 @@ pub fn extend_schema_with_cache_namespace(
 /// refresh is rebuilt from and the key eviction removes an entry by.
 pub const REQUEST_KEY_COLUMNS: [&str; 3] = ["request_path", "request_query", "request_body"];
 
+/// The request-key column that tells an HTTP GET from a POST: the HTTP
+/// connector sends a POST for each body a lookup's filters name and a GET when
+/// they name none.
+pub const REQUEST_BODY_COLUMN: &str = "request_body";
+
+/// Whether `filters` make the HTTP connector send an explicit-empty POST.
+///
+/// Its response is stored with `request_body = ''`, exactly as a GET's is, so
+/// the cache cannot tell the two apart; such a read bypasses the cache and goes
+/// to the source, as the unaccelerated dataset would.
+#[must_use]
+pub fn sends_explicit_empty_request_body(filters: &[Expr]) -> bool {
+    HttpTableProvider::request_filter_values(filters, REQUEST_BODY_COLUMN).contains(&"")
+}
+
+/// The storage-only predicates that keep a lookup to the entries of the method
+/// it uses: `request_body = ''` when the lookup names a request but sends no
+/// body. The HTTP connector stores a GET with `request_body = ''` and a POST
+/// with its body, so without it a GET lookup would match a POST cached for the
+/// same path.
+///
+/// Only `request_body` identifies a cached request reliably: a paginated
+/// response stores each page's own path and query, but every page the
+/// request's body. Empty when the lookup has no predicate on a request column,
+/// so filters only on other columns read across every cached entry, as an
+/// unfiltered scan does.
+///
+/// Like the namespace predicate, they scope the accelerator read only; the
+/// source still receives the user's filters, so the request is unchanged.
+#[must_use]
+pub fn request_identity_filters(
+    filters: &[Expr],
+    cache_schema: &arrow::datatypes::Schema,
+) -> Vec<Expr> {
+    // Any predicate on a request column makes the read a lookup — even one the
+    // connector turns into no request value, such as `request_body <> 'z'`,
+    // which still sends a GET. Request headers count, though they are not part
+    // of the key an entry is evicted and refreshed by.
+    let names_request = filters.iter().flat_map(Expr::column_refs).any(|column| {
+        REQUEST_KEY_COLUMNS
+            .into_iter()
+            .chain(["request_headers"])
+            .any(|name| column.name == name)
+    });
+    if names_request
+        && cache_schema.column_with_name(REQUEST_BODY_COLUMN).is_some()
+        && HttpTableProvider::request_filter_values(filters, REQUEST_BODY_COLUMN).is_empty()
+    {
+        vec![col(REQUEST_BODY_COLUMN).eq(lit(""))]
+    } else {
+        Vec::new()
+    }
+}
+
+/// The filters that re-request a stored entry from the source. The row stores
+/// a GET with `request_body = ''`, and an explicit-empty POST is never cached,
+/// so that predicate is dropped: sent to the source it would replay the GET as
+/// an empty POST and store the POST's response under the GET's entry.
+fn source_replay_filters(filters: &[Expr]) -> Vec<Expr> {
+    filters
+        .iter()
+        .filter(|filter| !is_empty_request_body_predicate(filter))
+        .cloned()
+        .collect()
+}
+
+fn is_empty_request_body_predicate(filter: &Expr) -> bool {
+    let Expr::BinaryExpr(binary) = filter else {
+        return false;
+    };
+    binary.op == datafusion::logical_expr::Operator::Eq
+        && matches!(binary.left.as_ref(), Expr::Column(column) if column.name == REQUEST_BODY_COLUMN)
+        && matches!(
+            binary.right.as_ref(),
+            Expr::Literal(
+                ScalarValue::Utf8(Some(value))
+                    | ScalarValue::LargeUtf8(Some(value))
+                    | ScalarValue::Utf8View(Some(value)),
+                _,
+            ) if value.is_empty()
+        )
+}
+
 /// Maximum number of concurrent refresh requests
 const MAX_CONCURRENT_REFRESHES: usize = 10;
 
@@ -905,6 +989,12 @@ async fn flush_cache_writes(
             }
         };
         let mut filters = req.filters;
+        // A GET entry's replace must not delete the POST entries cached for
+        // the same path, so it carries the predicate its lookup reads by.
+        if !filters.is_empty() {
+            let identity = request_identity_filters(&filters, &storage_schema);
+            filters.extend(identity);
+        }
         if needs_namespace_stamp {
             filters.push(namespace_filter_expr(ns_id));
         }
@@ -1537,7 +1627,7 @@ impl CacheRefreshHelper {
                     &federated,
                     &session_state,
                     &dataset_name,
-                    &row_filters,
+                    &source_replay_filters(&row_filters),
                     None,
                     cache_write_tx.task_context(&session_state),
                     cache_write_tx.memory_pool(),
@@ -4269,8 +4359,9 @@ mod pool_tests {
                     .is_err(),
                 "public empty path stays invalid"
             );
+            // A GET: the row stores `request_body = ''`, which the refresh
+            // must not replay as an explicit-empty POST (#14768).
             let filters = vec![
-                col("request_body").eq(lit("")),
                 col("request_path").eq(lit("/items")),
                 col("request_query").eq(lit("key=A")),
             ];
@@ -4361,7 +4452,7 @@ mod pool_tests {
             assert!(
                 requests
                     .iter()
-                    .all(|wire| wire.starts_with("POST /items?key=A ")),
+                    .all(|wire| wire.starts_with("GET /items?key=A ")),
                 "enriched={enriched}: {requests:?}",
             );
             println!(
@@ -4515,6 +4606,128 @@ mod tests {
     use parking_lot::RwLock;
     use std::sync::Arc;
     use std::time::{Duration, SystemTime};
+
+    /// Every filter shape that makes the HTTP connector send an empty POST
+    /// body bypasses the cache; shapes that send a GET or a non-empty body do
+    /// not.
+    #[test]
+    fn explicit_empty_request_body_is_detected_in_every_filter_shape() {
+        let body = || col("request_body");
+        let cases: Vec<(&str, Vec<Expr>, bool)> = vec![
+            ("eq ''", vec![body().eq(lit(""))], true),
+            (
+                "in list",
+                vec![body().in_list(vec![lit("x"), lit("")], false)],
+                true,
+            ),
+            ("or", vec![body().eq(lit("x")).or(body().eq(lit("")))], true),
+            (
+                "beside other filters",
+                vec![col("request_path").eq(lit("/items")), body().eq(lit(""))],
+                true,
+            ),
+            ("eq 'x'", vec![body().eq(lit("x"))], false),
+            ("not eq '' sends a GET", vec![body().not_eq(lit(""))], false),
+            (
+                "no body filter",
+                vec![col("request_path").eq(lit("/items"))],
+                false,
+            ),
+            (
+                "empty query, no body",
+                vec![col("request_query").eq(lit(""))],
+                false,
+            ),
+            ("no filters", vec![], false),
+        ];
+        for (name, filters, expected) in cases {
+            assert_eq!(
+                sends_explicit_empty_request_body(&filters),
+                expected,
+                "{name}: {filters:?}"
+            );
+        }
+    }
+
+    /// A lookup that names a request but sends no body is pinned to GET
+    /// entries; a POST lookup, one that names no request value, or a cache
+    /// without the column, is not pinned.
+    #[test]
+    fn request_identity_filters_pin_get_lookups_to_get_entries() {
+        let http = Schema::new(vec![
+            Field::new("request_path", DataType::Utf8, true),
+            Field::new("request_query", DataType::Utf8, true),
+            Field::new("request_body", DataType::Utf8, true),
+        ]);
+        let other = Schema::new(vec![Field::new("id", DataType::Int32, true)]);
+        let get = vec![col("request_body").eq(lit(""))];
+        let path = col("request_path").eq(lit("/items"));
+        let cases: Vec<(&str, Vec<Expr>, &Schema, Vec<Expr>)> = vec![
+            ("path only", vec![path.clone()], &http, get.clone()),
+            (
+                "query only",
+                vec![col("request_query").eq(lit("q=a"))],
+                &http,
+                get.clone(),
+            ),
+            (
+                "body predicate that sends no body",
+                vec![path.clone(), col("request_body").not_eq(lit("z"))],
+                &http,
+                get.clone(),
+            ),
+            (
+                "path and body",
+                vec![path.clone(), col("request_body").eq(lit("x"))],
+                &http,
+                vec![],
+            ),
+            (
+                "headers only",
+                vec![col("request_headers").eq(lit(r#"{"x-test":"a"}"#))],
+                &http,
+                get.clone(),
+            ),
+            (
+                "no request value named",
+                vec![col("response_status").eq(lit(200_u16))],
+                &http,
+                vec![],
+            ),
+            (
+                "only a body predicate that sends no body",
+                vec![col("request_body").not_eq(lit("z"))],
+                &http,
+                get,
+            ),
+            ("not an HTTP cache", vec![path], &other, vec![]),
+        ];
+        for (name, filters, schema, expected) in cases {
+            assert_eq!(
+                request_identity_filters(&filters, schema),
+                expected,
+                "{name}"
+            );
+        }
+    }
+
+    /// A stored GET entry is re-requested without its `request_body = ''`
+    /// predicate, and every other request predicate is kept.
+    #[test]
+    fn source_replay_filters_drop_only_the_empty_body() {
+        let path = col("request_path").eq(lit("/items"));
+        let query = col("request_query").eq(lit(""));
+        let empty_body = col("request_body").eq(lit(""));
+        let body = col("request_body").eq(lit("x"));
+        assert_eq!(
+            source_replay_filters(&[path.clone(), query.clone(), empty_body]),
+            vec![path.clone(), query.clone()]
+        );
+        assert_eq!(
+            source_replay_filters(&[path.clone(), query.clone(), body.clone()]),
+            vec![path, query, body]
+        );
+    }
 
     /// Test-only stand-in for the shared `Arc<SessionState>`.
     fn test_session_state() -> Arc<SessionState> {
