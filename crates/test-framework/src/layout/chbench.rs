@@ -21,10 +21,17 @@ limitations under the License.
 //! are those the adaptive CH-benCH Spicepods cluster on.
 //!
 //! The OLTP workload sets `o_carrier_id` and `ol_delivery_d`, NULL until an
-//! order is delivered, so a table sorted, partitioned or timed on them sees
-//! updates move rows between sort positions and partitions — under CDC, the
-//! paths a layout most changes. The seed writes one constant timestamp, which
-//! the workload's own writes then follow.
+//! order is delivered, so a table sorted or timed on them sees updates move
+//! rows between sort positions — under CDC, the paths a layout most changes.
+//! The seed writes one constant timestamp, which the workload's own writes then
+//! follow.
+//!
+//! Partitions take no column an update changes: a keyed partitioned
+//! acceleration resolves each key within its partition, so an update that moved
+//! a row to another partition would leave its old version behind (#14596).
+//! Every keyed table partitions on its own primary key, and on the district or
+//! item column rather than the warehouse: SF 1 has one warehouse, which would
+//! put every row in one partition and leave the cross-partition write untested.
 
 use spicepod::component::dataset::TimeFormat;
 
@@ -56,7 +63,7 @@ pub(super) static TABLES: &[TableKeys] = &[
         sort: &["c_state", "c_id"],
         cluster: &["c_w_id", "c_state"],
         time_column: Some(("c_since", TimeFormat::Timestamp)),
-        partition_by: Some("bucket(4, c_w_id)"),
+        partition_by: Some("bucket(4, c_d_id)"),
     },
     TableKeys {
         table: "history",
@@ -65,7 +72,7 @@ pub(super) static TABLES: &[TableKeys] = &[
         sort: &["h_date"],
         cluster: &["h_w_id", "h_d_id"],
         time_column: Some(("h_date", TimeFormat::Timestamp)),
-        partition_by: Some("bucket(4, h_w_id)"),
+        partition_by: Some("bucket(4, h_d_id)"),
     },
     TableKeys {
         table: "new_order",
@@ -74,7 +81,7 @@ pub(super) static TABLES: &[TableKeys] = &[
         sort: &["no_o_id"],
         cluster: &["no_w_id", "no_d_id"],
         time_column: None,
-        partition_by: Some("bucket(4, no_w_id)"),
+        partition_by: Some("bucket(4, no_d_id)"),
     },
     TableKeys {
         table: "oorder",
@@ -83,7 +90,7 @@ pub(super) static TABLES: &[TableKeys] = &[
         sort: &["o_entry_d", "o_id"],
         cluster: &["o_w_id", "o_carrier_id"],
         time_column: Some(("o_entry_d", TimeFormat::Timestamp)),
-        partition_by: Some("bucket(4, o_carrier_id)"),
+        partition_by: Some("bucket(4, o_d_id)"),
     },
     TableKeys {
         table: "order_line",
@@ -96,7 +103,7 @@ pub(super) static TABLES: &[TableKeys] = &[
         sort: &["ol_delivery_d", "ol_o_id"],
         cluster: &["ol_w_id", "ol_i_id"],
         time_column: Some(("ol_delivery_d", TimeFormat::Timestamp)),
-        partition_by: Some("date_trunc('day', ol_delivery_d)"),
+        partition_by: Some("bucket(4, ol_d_id)"),
     },
     TableKeys {
         table: "stock",
@@ -105,7 +112,7 @@ pub(super) static TABLES: &[TableKeys] = &[
         sort: &["s_quantity", "s_i_id"],
         cluster: &["s_w_id", "s_quantity"],
         time_column: None,
-        partition_by: Some("bucket(4, s_w_id)"),
+        partition_by: Some("bucket(4, s_i_id)"),
     },
     TableKeys {
         table: "item",
