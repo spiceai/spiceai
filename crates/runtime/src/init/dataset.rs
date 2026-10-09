@@ -2460,6 +2460,7 @@ impl Runtime {
                 connector: ds.source().to_string(),
                 param,
                 consequence: writes.consequence(),
+                advice: pk_conflict_detection_advice(acceleration_settings),
             }
             .fail()?;
         }
@@ -3389,6 +3390,18 @@ fn configured_retention_setting(acceleration: &Acceleration) -> Option<String> {
     }
 }
 
+/// The fix the conflict-detection refusal offers: set the canonical
+/// `cayenne_pk_conflict_detection` to `auto`, which takes precedence over the
+/// unprefixed spelling, and drop that spelling, which parameter validation
+/// warns is ignored.
+fn pk_conflict_detection_advice(acceleration: &Acceleration) -> String {
+    if acceleration.params.contains_key("pk_conflict_detection") {
+        "Set 'cayenne_pk_conflict_detection' to 'auto', its default, and remove 'pk_conflict_detection'.".to_string()
+    } else {
+        "Set 'cayenne_pk_conflict_detection' to 'auto', its default.".to_string()
+    }
+}
+
 /// A way a dataset rewrites a key it already stores, which Cayenne can do
 /// correctly only with its primary-key check on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3422,11 +3435,12 @@ impl KeyedWrites {
 /// break, for an acceleration whose refresh mode resolves to `refresh_mode`.
 ///
 /// With the check off, a staged upsert neither supersedes the stored row for
-/// its key nor records the key for write-back delivery. v2.3.2 refused these
-/// configurations by refusing `none` beside the `on_conflict` upsert each of
-/// them needed; Cayenne no longer receives `on_conflict`, so they are refused
-/// here instead. A full or append refresh is not refused, as it was not then;
-/// how those behave under `none` is tracked in #14883.
+/// its key nor records the key for write-back delivery, so every configuration
+/// that rewrites a stored key would keep duplicate rows or drop writes. The
+/// refusal is decided from the configuration alone, without the source's
+/// constraints: a key can come from those as well as from `primary_key`, and
+/// they are only known once the source is reachable. A full or append refresh
+/// is not refused; how those behave under `none` is tracked in #14883.
 fn pk_conflict_detection_refusal(
     acceleration: &Acceleration,
     refresh_mode: RefreshMode,
@@ -4188,9 +4202,9 @@ mod tests {
         );
     }
 
-    /// Regression test for #14886: Cayenne no longer uses `on_conflict`, and the
-    /// runtime warns users to remove it, so write-back must load without it — and
-    /// still load with it, for Spicepods that have not removed it yet.
+    /// Regression test for #14886: Cayenne keeps one row per primary key without
+    /// `on_conflict`, and the runtime warns users to remove it, so write-back must
+    /// load without it — and still load with it, for Spicepods that still set it.
     #[tokio::test]
     async fn validate_dataset_loads_write_back_with_or_without_on_conflict() {
         let runtime = Arc::new(crate::Runtime::builder().build().await);
@@ -4276,9 +4290,9 @@ mod tests {
         }
     }
 
-    /// Regression test for #14889 and its siblings: v2.3.2 refused
-    /// `cayenne_pk_conflict_detection: none` on every dataset that rewrites a
-    /// stored key, and loaded it everywhere else.
+    /// Regression test for #14889 and its siblings: `cayenne_pk_conflict_detection:
+    /// none` is refused on every dataset that rewrites a stored key, and loads
+    /// everywhere else.
     #[test]
     fn pk_conflict_detection_none_is_refused_wherever_a_stored_key_is_rewritten() {
         use spicepod::acceleration::WriteMode;
@@ -4347,9 +4361,9 @@ mod tests {
             );
         }
 
-        // Following the refusal's advice must load the dataset, even when both
-        // spellings are `none`: setting the named parameter to `auto` overrides
-        // the other spelling, which removing it would expose.
+        // Following the refusal's advice must load the dataset with no ignored
+        // parameter left behind, whichever spellings were set: the canonical key
+        // set to `auto`, and the unprefixed spelling removed when it is present.
         for params in [
             vec![
                 ("cayenne_pk_conflict_detection", "none"),
@@ -4358,14 +4372,28 @@ mod tests {
             vec![("pk_conflict_detection", "none")],
         ] {
             let refused = acceleration_with_params(WriteMode::WriteThrough, &params);
-            let (param, _) = pk_conflict_detection_refusal(&refused, RefreshMode::Changes)
-                .expect("none on a CDC dataset is refused");
+            assert!(
+                pk_conflict_detection_refusal(&refused, RefreshMode::Changes).is_some(),
+                "{params:?}: none on a CDC dataset is refused"
+            );
+            let advice = pk_conflict_detection_advice(&refused);
             let mut advised = refused.clone();
-            advised.params.insert(param.to_string(), "auto".to_string());
+            advised.params.insert(
+                "cayenne_pk_conflict_detection".to_string(),
+                "auto".to_string(),
+            );
+            if advice.contains("remove 'pk_conflict_detection'") {
+                advised.params.remove("pk_conflict_detection");
+            }
             assert_eq!(
                 pk_conflict_detection_refusal(&advised, RefreshMode::Changes),
                 None,
-                "{params:?}: setting '{param}' to 'auto' must load"
+                "{params:?}: following {advice:?} must load"
+            );
+            assert!(
+                !advised.params.contains_key("pk_conflict_detection"),
+                "{params:?}: following {advice:?} must not leave the ignored spelling: {:?}",
+                advised.params
             );
         }
 
@@ -4395,6 +4423,10 @@ mod tests {
                 connector: "postgres".to_string(),
                 param: "cayenne_pk_conflict_detection",
                 consequence: writes.consequence(),
+                advice: pk_conflict_detection_advice(&acceleration_with_params(
+                    spicepod::acceleration::WriteMode::WriteThrough,
+                    &[("cayenne_pk_conflict_detection", "none")],
+                )),
             }
             .build()
             .to_string();
@@ -5548,6 +5580,7 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
             connector: "postgres".to_string(),
             param: "cayenne_pk_conflict_detection",
             consequence: KeyedWrites::Changes.consequence(),
+            advice: "Set 'cayenne_pk_conflict_detection' to 'auto', its default.",
         }
         .build();
         let undeclared_key = DurableWriteBackUndeclaredPrimaryKeySnafu {

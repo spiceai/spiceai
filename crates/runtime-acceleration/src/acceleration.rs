@@ -2145,8 +2145,9 @@ mod tests {
         assert!(durable_write_back_acceleration().resolves_to_durable_write_back());
     }
 
-    /// Regression test for #14886: Cayenne no longer uses `on_conflict`, so
-    /// write-back must neither require it nor change its answer when it is set.
+    /// Regression test for #14886: Cayenne keeps one row per primary key without
+    /// `on_conflict`, so write-back must neither require it nor change its answer
+    /// when it is set.
     #[test]
     fn durable_write_back_does_not_depend_on_on_conflict() {
         let without = durable_write_back_acceleration();
