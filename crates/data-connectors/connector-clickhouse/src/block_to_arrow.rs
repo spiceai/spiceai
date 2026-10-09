@@ -67,8 +67,10 @@ pub(crate) enum Error {
         value: String,
     },
 
-    #[snafu(display("The {clickhouse_type} value {value} is out of the range Arrow can hold"))]
-    ValueOutOfRange {
+    #[snafu(display(
+        "The {clickhouse_type} value {value} is outside the range an Arrow timestamp of its precision can hold (nanosecond timestamps end at 2262-04-11)"
+    ))]
+    TimestampOutOfRange {
         clickhouse_type: SqlType,
         value: String,
     },
@@ -456,12 +458,21 @@ fn append_timestamp<T: ArrowTimestampType>(
         .checked_sub(precision)
         .and_then(|digits| 10_i64.checked_pow(digits))
         .and_then(|factor| ticks.checked_mul(factor))
-        .ok_or_else(|| Error::ValueOutOfRange {
+        .ok_or_else(|| Error::TimestampOutOfRange {
             clickhouse_type: clickhouse_type.clone(),
-            value: ticks.to_string(),
+            value: datetime64_text(ticks, precision),
         })?;
     builder.append_value(scaled);
     Ok(())
+}
+
+/// A `DateTime64(precision)` value as UTC date and time text, for error messages.
+fn datetime64_text(ticks: i64, precision: u32) -> String {
+    let parts = 10_i64.checked_pow(precision).and_then(|scale| {
+        let nanos = ticks.rem_euclid(scale) * 10_i64.checked_pow(9_u32.checked_sub(precision)?)?;
+        chrono::DateTime::from_timestamp(ticks.div_euclid(scale), u32::try_from(nanos).ok()?)
+    });
+    parts.map_or_else(|| ticks.to_string(), |time| time.naive_utc().to_string())
 }
 
 fn enum_name<V: Copy + PartialEq + std::fmt::Display>(
@@ -726,6 +737,53 @@ mod tests {
             .map(|unit| DataType::Timestamp(unit, None))
         );
         insta::assert_snapshot!("datetime64_units", converted(&block));
+    }
+
+    /// `DateTime64(7)` and `DateTime64(8)` reach 2299, past the last nanosecond an `i64`
+    /// holds, and no coarser unit keeps their digits: such a value is an error, never a
+    /// truncated or wrapped timestamp.
+    #[test]
+    fn a_datetime64_past_the_nanosecond_range_is_an_error() {
+        use arrow::array::TimestampNanosecondBuilder;
+        use arrow::datatypes::TimestampNanosecondType;
+        use chrono_tz::Tz;
+        use clickhouse_rs::types::{DateTimeType, SqlType};
+
+        let clickhouse_type = SqlType::DateTime(DateTimeType::DateTime64(8, Tz::UTC));
+        let mut builder = TimestampNanosecondBuilder::new();
+        // 10^-8 s ticks: `i64::MAX / 10` is 2262-04-11 23:47:16.854775800, the last value that fits.
+        let last = i64::MAX / 10;
+        super::append_timestamp::<TimestampNanosecondType>(
+            &mut builder,
+            &clickhouse_type,
+            8,
+            Some(last),
+        )
+        .expect("the last representable DateTime64(8) value converts");
+
+        for (ticks, text) in [
+            (last + 1, "2262-04-11 23:47:16.854775810"),
+            // The latest value a ClickHouse DateTime64(8) holds.
+            (1_041_379_199_999_999_999, "2299-12-31 23:59:59.999999990"),
+        ] {
+            let error = super::append_timestamp::<TimestampNanosecondType>(
+                &mut builder,
+                &clickhouse_type,
+                8,
+                Some(ticks),
+            )
+            .expect_err("a value past 2262-04-11 has no nanosecond timestamp");
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "The DateTime64(8, 'UTC') value {text} is outside the range an Arrow timestamp of its precision can hold (nanosecond timestamps end at 2262-04-11)"
+                )
+            );
+        }
+
+        let timestamps = builder.finish();
+        assert_eq!(timestamps.len(), 1, "only the value that fits was appended");
+        assert_eq!(timestamps.value(0), last * 10);
     }
 
     #[test]
