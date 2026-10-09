@@ -34,7 +34,10 @@ limitations under the License.
 //!
 //! Environment overrides: `SIZES` (comma-separated entry counts), `SECS`
 //! (seconds per hit phase), `READERS`, `WRITER` (inserts per second, `0` for
-//! none), `POLICY` (`lru`, `lfu`, `tinylfu`).
+//! none), `POLICY` (`lru`, `lfu`, `tinylfu`), and `BUDGET_PERCENT`: a byte
+//! budget of that percentage of the prefill instead of one far above it, so
+//! prefill and every later insert run the size-eviction path. Readers then
+//! miss on evicted keys and count those misses instead of asserting hits.
 //!
 //! ```text
 //! cargo bench -p sharded-cache --bench size_scaling
@@ -49,7 +52,7 @@ limitations under the License.
 use sharded_cache::{EvictionPolicy, ShardedCache};
 use std::hint::black_box;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 const DEFAULT_SIZES: [usize; 7] = [
@@ -62,6 +65,8 @@ const MAX_WEIGHT: u64 = 1 << 50;
 const TTL: Duration = Duration::from_mins(48 * 60 + 1);
 const DEFAULT_WRITER_INSERTS_PER_SEC: u64 = 2_000;
 const SWEEP_SAMPLES: usize = 5;
+/// Reader misses in `BUDGET_PERCENT` runs, where evicted keys stop hitting.
+static MISSES: AtomicU64 = AtomicU64::new(0);
 /// Unrecorded run time at the start of each hit phase, so every arm's threads
 /// reach the same steady state (core placement, clock) before measurement
 /// rather than inheriting whatever the previous phase left behind.
@@ -110,7 +115,7 @@ impl Histogram {
         if v < 64 {
             return v as usize;
         }
-        let msb = 63 - v.leading_zeros();
+        let msb = v.ilog2();
         let sub = ((v >> (msb - SUB_BITS)) as usize) & (SUBS - 1);
         64 + (msb as usize - 6) * SUBS + sub
     }
@@ -196,6 +201,7 @@ fn hit_phase(
     secs: u64,
     sweep_every: Option<Duration>,
     seed: u64,
+    evicting: bool,
 ) -> Phase {
     let stop = Arc::new(AtomicBool::new(false));
     let record_from = Instant::now() + WARMUP;
@@ -212,8 +218,12 @@ fn hit_phase(
                     let start = Instant::now();
                     let got = cache.get(&key);
                     let elapsed = start.elapsed().as_nanos() as u64;
-                    let got = got.expect("a prefilled key must hit");
-                    black_box(got.0);
+                    if let Some(got) = got {
+                        black_box(got.0);
+                    } else {
+                        assert!(evicting, "a prefilled key must hit");
+                        MISSES.fetch_add(1, Ordering::Relaxed);
+                    }
                     if start >= record_from {
                         hist.record(elapsed);
                     }
@@ -378,9 +388,9 @@ fn hist_row(label: &str, n: usize, h: &Histogram) {
 
 fn main() {
     // `cargo bench` passes `--bench`; nothing here takes arguments.
-    let sizes: Vec<usize> = std::env::var("SIZES")
-        .ok()
-        .map(|s| {
+    let sizes: Vec<usize> = std::env::var("SIZES").ok().map_or_else(
+        || DEFAULT_SIZES.to_vec(),
+        |s| {
             s.split(',')
                 .map(|n| {
                     n.trim()
@@ -388,8 +398,8 @@ fn main() {
                         .expect("SIZES must be comma-separated integers")
                 })
                 .collect()
-        })
-        .unwrap_or_else(|| DEFAULT_SIZES.to_vec());
+        },
+    );
     let secs: u64 = env_or("SECS", 5);
     let readers: usize = env_or("READERS", 8);
     let policy = policy();
@@ -401,7 +411,13 @@ fn main() {
     let mut sweep_rows = Vec::new();
     let mut hist_rows = Vec::new();
     for (i, &n) in sizes.iter().enumerate() {
-        let cache: Arc<ShardedCache<Value>> = Arc::new(ShardedCache::new(MAX_WEIGHT, TTL, policy));
+        let budget_percent: Option<u64> = std::env::var("BUDGET_PERCENT")
+            .ok()
+            .map(|v| v.parse().expect("BUDGET_PERCENT must be an integer"));
+        let evicting = budget_percent.is_some();
+        let max_weight =
+            budget_percent.map_or(MAX_WEIGHT, |pct| n as u64 * ENTRY_WEIGHT as u64 * pct / 100);
+        let cache: Arc<ShardedCache<Value>> = Arc::new(ShardedCache::new(max_weight, TTL, policy));
         let mut rng = Rng(0x5EED ^ n as u64);
         let mut keys = Vec::with_capacity(n);
         let fill_start = Instant::now();
@@ -411,7 +427,9 @@ fn main() {
             keys.push(key);
         }
         let fill = fill_start.elapsed();
-        assert_eq!(cache.len(), n, "nothing may evict or expire during prefill");
+        if !evicting {
+            assert_eq!(cache.len(), n, "nothing may evict or expire during prefill");
+        }
         // Prefill links each shard's LRU list in slab order, which a sweep walks
         // as a sequential scan. Production hits relink entries to the front in
         // request order, so scramble recency with one random hit per entry
@@ -431,7 +449,7 @@ fn main() {
         sweeps.sort();
 
         let seed = 0xB00 + i as u64;
-        let quiet = hit_phase(&cache, &keys, readers, secs, None, seed);
+        let quiet = hit_phase(&cache, &keys, readers, secs, None, seed, evicting);
         let swept = hit_phase(
             &cache,
             &keys,
@@ -439,13 +457,16 @@ fn main() {
             secs,
             Some(Duration::from_secs(1)),
             seed,
+            evicting,
         );
         let mut live_sweeps = swept.sweeps.clone();
         live_sweeps.sort();
         eprintln!(
-            "N={n}: prefill {fill:?}, sweep median {:?}, live sweeps {:?}",
+            "N={n}: prefill {fill:?}, sweep median {:?}, live sweeps {:?}, resident {}, reader misses {}",
             sweeps[SWEEP_SAMPLES / 2],
-            live_sweeps
+            live_sweeps,
+            cache.len(),
+            MISSES.swap(0, Ordering::Relaxed)
         );
         let mass = mass_expiry_phase(n, readers, seed);
         eprintln!("N={n}: mass expiry of {} entries took {:?}", n / 2, mass.1);
