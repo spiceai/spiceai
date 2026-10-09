@@ -757,6 +757,9 @@ pub struct Refresher {
     engine_type_rewrites: arrow_tools::type_rewrite::TypeRewriteRules,
     /// Per-dataset `cdc_*` parameter overrides drawn from `dataset.acceleration.params`.
     cdc_param_overrides: Option<Arc<HashMap<String, String>>>,
+    /// The status an existing acceleration starts with, applied by [`Self::start`] once the
+    /// dataset's indexes have been rebuilt from it, and before any refresh can report its own.
+    initial_status: Option<status::ComponentStatus>,
 }
 
 impl std::fmt::Debug for Refresher {
@@ -820,6 +823,7 @@ impl Refresher {
             is_s3_express_acceleration: false,
             engine_type_rewrites: &[],
             cdc_param_overrides: None,
+            initial_status: None,
         }
     }
 
@@ -927,6 +931,15 @@ impl Refresher {
     /// Set the bootstrap status from dataset initialization.
     pub fn set_bootstrap_status(&mut self, bootstrap_status: BootstrapStatus) -> &mut Self {
         self.bootstrap_status = bootstrap_status;
+        self
+    }
+
+    /// Sets the status [`Self::start`] reports for the dataset once its indexes are rebuilt.
+    pub fn set_initial_status(
+        &mut self,
+        initial_status: Option<status::ComponentStatus>,
+    ) -> &mut Self {
+        self.initial_status = initial_status;
         self
     }
 
@@ -1083,6 +1096,15 @@ impl Refresher {
         // restart loads only what the accelerator is missing, or nothing at all, so an index
         // that starts empty would otherwise never catch up (#14618).
         self.rebuild_indexes_from_accelerator().await?;
+
+        // An existing acceleration is servable from here on, but not before: reporting it ready
+        // earlier would let `/v1/ready` answer while the dataset is still unregistered and its
+        // rebuild still running. Reported before the refresh starts, so a refresh that runs
+        // reports `Refreshing` over it rather than being overwritten by it.
+        if let Some(initial_status) = self.initial_status.take() {
+            self.runtime_status
+                .update_dataset(&self.dataset_name, initial_status);
+        }
 
         let time_column = self.refresh.read().await.time_column.clone();
         let initial_refresh_delay = {
@@ -2826,6 +2848,110 @@ mod tests {
         );
 
         drop(refresh_handle);
+    }
+
+    /// Records the dataset's status each time the startup rebuild writes through it.
+    #[derive(Debug)]
+    struct StatusProbeIndex {
+        status: Arc<status::RuntimeStatus>,
+        dataset: TableReference,
+        seen: parking_lot::Mutex<Vec<Option<status::ComponentStatus>>>,
+    }
+
+    #[async_trait]
+    impl spice_table::Index for StatusProbeIndex {
+        fn name(&self) -> &'static str {
+            "status_probe"
+        }
+
+        fn required_columns(&self) -> Vec<String> {
+            vec!["time_in_string".to_string()]
+        }
+
+        async fn compute_index(
+            &self,
+            batches: Vec<RecordBatch>,
+        ) -> Result<Vec<RecordBatch>, datafusion::error::DataFusionError> {
+            self.seen
+                .lock()
+                .push(self.status.get_dataset_status(&self.dataset));
+            Ok(batches)
+        }
+
+        fn requires_rebuild(&self) -> bool {
+            true
+        }
+
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+    }
+
+    /// An existing acceleration's initial status is reported only once its search indexes are
+    /// rebuilt: reported earlier, `/v1/ready` answers while the rebuild still runs and before
+    /// the dataset is registered, so every query against it fails (#14618).
+    #[tokio::test]
+    async fn the_initial_status_is_reported_only_after_the_index_rebuild() {
+        let status = status::RuntimeStatus::new();
+        let dataset = TableReference::bare("docs");
+        status.update_dataset(&dataset, status::ComponentStatus::Refreshing);
+
+        let schema = Arc::new(Schema::new(vec![Field::new(
+            "time_in_string",
+            DataType::Utf8,
+            false,
+        )]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(StringArray::from(vec!["1970-01-01"]))],
+        )
+        .expect("data should be created");
+        let probe = Arc::new(StatusProbeIndex {
+            status: Arc::clone(&status),
+            dataset: dataset.clone(),
+            seen: parking_lot::Mutex::new(Vec::new()),
+        });
+        let accelerator = spice_table::SpiceTable::over(
+            Arc::new(spice_table::IndexLayer::with_indexes(vec![
+                Arc::clone(&probe) as Arc<dyn spice_table::Index + Send + Sync>,
+            ])),
+            Arc::new(
+                MemTable::try_new(Arc::clone(&schema), vec![vec![batch]])
+                    .expect("mem table should be created"),
+            ),
+        );
+        let federated = Arc::new(FederatedTable::new_unchecked(Arc::new(
+            MemTable::try_new(schema, vec![]).expect("mem table should be created"),
+        )));
+
+        let mut refresher = Refresher::new(
+            Arc::clone(&status),
+            dataset.clone(),
+            federated,
+            Some("mem_table".to_string()),
+            Arc::new(RwLock::new(Refresh::new(RefreshMode::Full))),
+            accelerator,
+            None,
+            None,
+            Handle::current(),
+            Arc::new(Mutex::new(())),
+        );
+        refresher.set_initial_status(Some(status::ComponentStatus::Ready));
+        refresher
+            .start(AccelerationRefreshMode::Disabled)
+            .await
+            .expect("the refresher starts");
+
+        assert_eq!(
+            *probe.seen.lock(),
+            vec![Some(status::ComponentStatus::Refreshing)],
+            "the dataset must not be reported ready while its index is still being rebuilt"
+        );
+        assert_eq!(
+            status.get_dataset_status(&dataset),
+            Some(status::ComponentStatus::Ready),
+            "once rebuilt, the existing acceleration reports its initial status"
+        );
     }
 
     async fn setup_and_test(

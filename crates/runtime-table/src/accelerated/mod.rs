@@ -462,6 +462,8 @@ pub struct Builder {
     checkpointer: Option<Arc<dyn DatasetCheckpointer>>,
     synchronize_with: Option<SynchronizedTable>,
     initial_load_complete: bool,
+    /// See [`Builder::initial_status`].
+    initial_status: Option<status::ComponentStatus>,
     snapshot_creation_config: Option<SnapshotCreationConfig>,
     /// Per-dataset state for `RefreshMode::Snapshot`. Required when the
     /// refresh mode is Snapshot; ignored otherwise.
@@ -528,6 +530,7 @@ impl Builder {
             write_back: false,
             write_back_deliverer: None,
             initial_load_complete: false,
+            initial_status: None,
             refresh_semaphore: None,
             snapshot_creation_config: None,
             snapshot_refresh_state: None,
@@ -779,6 +782,14 @@ impl Builder {
     /// This will allow the table to be marked as ready immediately.
     pub fn initial_load_complete(&mut self, initial_load_complete: bool) -> &mut Self {
         self.initial_load_complete = initial_load_complete;
+        self
+    }
+
+    /// The status the dataset reports once its existing acceleration can serve it. It is
+    /// applied when the refresher starts, after the dataset's search indexes are rebuilt from
+    /// that acceleration, so the dataset is never reported ready while the rebuild runs.
+    pub fn initial_status(&mut self, initial_status: status::ComponentStatus) -> &mut Self {
+        self.initial_status = Some(initial_status);
         self
     }
 
@@ -1121,6 +1132,7 @@ impl Builder {
         refresher.with_snapshot_creation_config(self.snapshot_creation_config);
         refresher.with_snapshot_refresh_state(self.snapshot_refresh_state);
         refresher.set_bootstrap_status(self.bootstrap_status);
+        refresher.set_initial_status(self.initial_status.clone());
 
         if let Some(ref resource_monitor) = self.resource_monitor {
             refresher.with_resource_monitor(resource_monitor.clone());
@@ -1236,6 +1248,12 @@ impl Builder {
                 // refresh that cannot arrive. Dataset readiness is a separate
                 // concern handled above.
                 refresh_completion.close();
+                // Without a refresher start, nothing else reports the existing
+                // acceleration's initial status, so report it here.
+                if let Some(initial_status) = self.initial_status.clone() {
+                    self.runtime_status
+                        .update_dataset(&self.dataset_name, initial_status);
+                }
                 (None, None)
             } else {
                 (

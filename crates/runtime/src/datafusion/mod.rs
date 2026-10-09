@@ -3894,6 +3894,7 @@ impl DataFusion {
         // to wait for the first refresh to complete to mark it ready.
         // For caching mode, we always start ready since it fetches data on-demand.
         let mut initial_load_complete = matches!(refresh_mode, RefreshMode::Caching);
+        let mut initial_status = None;
         if !initial_load_complete
             && let Ok(checkpoint) = dataset_checkpointer(
                 dataset,
@@ -3931,13 +3932,16 @@ impl DataFusion {
                 // `Refreshing` itself when it starts.
                 let awaits_source = effective_ready_state == ReadyState::OnSchemaResolved
                     && source_table_provider.awaits_source();
-                let initial_status = if awaits_source {
+                //
+                // Reported when the refresher starts rather than here: the dataset's search
+                // indexes are rebuilt from the acceleration first, and it is not registered
+                // until they are, so reporting it ready now would let `/v1/ready` answer while
+                // queries against it still fail.
+                initial_status = Some(if awaits_source {
                     status::ComponentStatus::Initializing
                 } else {
                     status::ComponentStatus::Ready
-                };
-                self.runtime_status
-                    .update_dataset(&dataset.name, initial_status);
+                });
                 initial_load_complete = true;
             }
         }
@@ -4271,6 +4275,9 @@ impl DataFusion {
         );
 
         accelerated_table_builder.initial_load_complete(initial_load_complete);
+        if let Some(initial_status) = initial_status {
+            accelerated_table_builder.initial_status(initial_status);
+        }
 
         // Caching mode requires federation to be disabled so that queries go through
         // AcceleratedTable::scan to trigger the cache miss/hit logic
