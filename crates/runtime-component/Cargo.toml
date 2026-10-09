@@ -29,5 +29,9 @@ spicepod = { path = "../spicepod" }
 tracing.workspace = true
 util = { path = "../util" }
 
+[dev-dependencies]
+tempfile.workspace = true
+yaml = { path = "../yaml" }
+
 [lints]
 workspace = true

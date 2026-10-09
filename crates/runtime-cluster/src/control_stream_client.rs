@@ -27,10 +27,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::ExecutorOutboundBroadcaster;
 use ballista_core::utils::{GrpcClientConfig, create_grpc_client_endpoint};
 use ballista_executor::executor::Executor;
 use futures::StreamExt;
-use runtime_cluster::ExecutorOutboundBroadcaster;
 use runtime_proto::cluster_service_client::ClusterServiceClient;
 use runtime_proto::scheduler_control_message::Message as SchedulerMessage;
 use runtime_proto::{
@@ -303,7 +303,7 @@ fn spawn_control_stream(
                 });
             }
 
-            runtime_cluster::metrics::set_executor_scheduler_active_connection(
+            crate::metrics::set_executor_scheduler_active_connection(
                 &executor_id,
                 &scheduler_address,
                 true,
@@ -323,7 +323,7 @@ fn spawn_control_stream(
                         tracing::debug!(
                             "Control stream to {scheduler_address} cancelled"
                         );
-                        runtime_cluster::metrics::set_executor_scheduler_active_connection(
+                        crate::metrics::set_executor_scheduler_active_connection(
                             &executor_id,
                             &scheduler_address,
                             false,
@@ -374,12 +374,12 @@ fn spawn_control_stream(
             .await;
             tracing::debug!("Control stream to {scheduler_address} disconnected, will reconnect");
 
-            runtime_cluster::metrics::set_executor_scheduler_active_connection(
+            crate::metrics::set_executor_scheduler_active_connection(
                 &executor_id,
                 &scheduler_address,
                 false,
             );
-            runtime_cluster::metrics::record_executor_scheduler_connection_retry(
+            crate::metrics::record_executor_scheduler_connection_retry(
                 &executor_id,
                 &scheduler_address,
             );

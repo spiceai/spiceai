@@ -2510,7 +2510,7 @@ impl Runtime {
                 if runtime_status
                     .wait_for_dataset_ready(&dataset_table_ref)
                     .await
-                    == crate::status::WaitOutcome::ShuttingDown
+                    == runtime_status::WaitOutcome::ShuttingDown
                 {
                     return;
                 }
@@ -5663,7 +5663,7 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
             .status
             .get_dataset_status(&ds.name)
             .expect("the refused reload reports a status");
-        let crate::status::ComponentStatus::Error(Some(message)) = status else {
+        let runtime_status::ComponentStatus::Error(Some(message)) = status else {
             panic!("a refused reload must report an error status, got {status:?}");
         };
         assert!(

@@ -155,7 +155,10 @@ impl Runtime {
             .cloned()
             .map(|spicepod_view| {
                 ViewBuilder::try_from(spicepod_view)
-                    .map(|builder| builder.build_with(Arc::clone(&rt_ref), Arc::clone(app)))
+                    .map_err(crate::Error::from)
+                    .map(|builder| {
+                        View::new(builder.build(), Arc::clone(&rt_ref), Arc::clone(app))
+                    })
             })
             .zip(&app.views)
             .filter_map(|(view, spicepod_view)| match view {
@@ -495,13 +498,14 @@ impl Runtime {
         // Remove views that are no longer in the app
         for view in &current_app.views {
             if !new_app.views.iter().any(|v| v.name == view.name) {
-                let view_builder = match ViewBuilder::try_from(view.clone()) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        tracing::error!("Could not remove view {}: {e}", view.name);
-                        continue;
-                    }
-                };
+                let view_builder =
+                    match ViewBuilder::try_from(view.clone()).map_err(crate::Error::from) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::error!("Could not remove view {}: {e}", view.name);
+                            continue;
+                        }
+                    };
                 self.status
                     .update_view(&view_builder.name, status::ComponentStatus::Disabled);
                 Arc::clone(&self).remove_view(&view_builder.name).await;

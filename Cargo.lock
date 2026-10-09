@@ -17646,6 +17646,7 @@ dependencies = [
  "runtime-execution-plans",
  "runtime-metrics",
  "runtime-object-store",
+ "runtime-otel-push",
  "runtime-parameters",
  "runtime-parameters-typed",
  "runtime-proto",
@@ -17940,6 +17941,7 @@ name = "runtime-cluster"
 version = "2.4.0-unstable"
 dependencies = [
  "app",
+ "arc-swap",
  "arrow",
  "arrow-flight",
  "arrow-ipc",
@@ -17947,6 +17949,9 @@ dependencies = [
  "arrow_tools",
  "async-stream",
  "async-trait",
+ "ballista-core",
+ "ballista-executor",
+ "ballista-scheduler",
  "bytes",
  "dashmap",
  "data_components",
@@ -17964,20 +17969,26 @@ dependencies = [
  "parking_lot",
  "prost 0.14.3",
  "runtime-datafusion",
+ "runtime-metrics",
  "runtime-proto",
  "runtime-request-context",
  "runtime-table-partition",
+ "runtime-tls",
+ "rustls",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "snafu",
  "spicepod",
  "telemetry",
  "tokio",
  "tokio-stream",
+ "tokio-util",
  "tonic",
  "tracing",
  "util",
  "uuid 1.23.2",
+ "x509-certificate",
 ]
 
 [[package]]
@@ -18000,8 +18011,10 @@ dependencies = [
  "serde",
  "snafu",
  "spicepod",
+ "tempfile",
  "tracing",
  "util",
+ "yaml",
 ]
 
 [[package]]
@@ -18136,6 +18149,7 @@ dependencies = [
  "serde",
  "serde_json",
  "snafu",
+ "tempfile",
  "tokio",
  "tracing",
  "url",
@@ -18189,18 +18203,38 @@ dependencies = [
  "libnfs",
  "nix 0.30.1",
  "object_store 0.13.2",
+ "object_store_occ",
  "object_store_spawn",
  "reqwest 0.13.4",
+ "runtime-parameters",
+ "runtime-secrets",
+ "secrecy",
  "serde",
  "serde_json",
  "smb",
  "snafu",
+ "spicepod",
  "ssh2",
  "suppaftp",
+ "tempfile",
  "tokio",
  "tracing",
  "url",
  "util",
+]
+
+[[package]]
+name = "runtime-otel-push"
+version = "2.4.0-unstable"
+dependencies = [
+ "opentelemetry-otlp",
+ "opentelemetry_sdk",
+ "reqwest 0.13.4",
+ "snafu",
+ "spicepod",
+ "tokio",
+ "tonic",
+ "tracing",
 ]
 
 [[package]]
@@ -18386,6 +18420,7 @@ dependencies = [
 name = "runtime-secrets"
 version = "2.4.0-unstable"
 dependencies = [
+ "app",
  "async-trait",
  "aws-config",
  "aws-credential-types",

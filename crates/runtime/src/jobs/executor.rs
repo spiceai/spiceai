@@ -505,8 +505,8 @@ mod tests {
     use crate::dataaccelerator::AcceleratorEngineRegistry;
     use crate::datafusion::builder::DataFusionBuilder;
     use crate::jobs::PUBLIC_JOB_OWNER;
-    use crate::status::RuntimeStatus;
     use object_store::memory::InMemory;
+    use runtime_status::RuntimeStatus;
     use tokio::runtime::Handle;
 
     const OWNER: &str = "apikey:0123456789abcdef";

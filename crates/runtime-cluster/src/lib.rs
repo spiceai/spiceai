@@ -23,16 +23,20 @@ limitations under the License.
 
 pub mod cluster_state;
 pub mod context;
+pub mod control_stream_client;
 pub mod correlated;
 pub mod executor_registry;
 pub mod executor_selection;
 pub mod flight_config;
 pub mod metadata;
 pub mod metrics;
+pub mod metrics_collector;
 pub mod outbound_broadcaster;
 pub mod partition_load_tracker;
+pub mod pki;
 pub mod scheduler_task_config;
 pub mod service;
+pub mod shared_job_state;
 pub mod store;
 pub mod write_through;
 
@@ -40,6 +44,7 @@ pub use cluster_state::{
     ClusterState, ClusterStateStore, MutateError, MutateOk, MutationOutcome, PartitionScope,
     SchedulerEntry, SchedulerId,
 };
+pub use control_stream_client::ControlStreamManager;
 pub use executor_registry::{
     ExecutorRegistry, FederatedPartitionProvider, RegisteredHandles, TablePartitions,
 };

@@ -50,6 +50,7 @@ members = [
     "crates/podswatcher",
     "crates/cayenne",
     "crates/runtime-object-store",
+    "crates/runtime-otel-push",
     "crates/package",
     "crates/runtime",
     "crates/runtime-component",

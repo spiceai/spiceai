@@ -493,7 +493,7 @@ pub(crate) async fn build_results_cache_warmer(
         return ResultsCacheWarmer::new(default_warmup_store_path(), enabled).await;
     };
 
-    match crate::object_store_state::build_object_store(
+    match runtime_object_store::state::build_object_store(
         secrets,
         io_runtime,
         &state.location,

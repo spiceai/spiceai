@@ -19,8 +19,6 @@ use std::sync::{Arc, LazyLock};
 
 use aws_sdk_credential_bridge::object_store_builder::S3ObjectStoreBuilder;
 use object_store::ObjectStore;
-use runtime_object_store::registry::SpiceObjectStoreRegistry;
-use runtime_object_store::{build_azure_object_store, build_gcs_object_store};
 use runtime_parameters::{ParameterSpec, Parameters};
 use runtime_secrets::{Secrets, get_params_with_secrets};
 use secrecy::ExposeSecret;
@@ -29,6 +27,9 @@ use spicepod::param::Params;
 use tokio::runtime::Handle;
 use tokio::sync::RwLock;
 use url::Url;
+
+use crate::registry::SpiceObjectStoreRegistry;
+use crate::{build_azure_object_store, build_gcs_object_store};
 
 static S3_PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
     vec![
@@ -66,7 +67,7 @@ static GCS_PARAMETERS: LazyLock<Vec<ParameterSpec>> = LazyLock::new(|| {
 });
 
 #[derive(Debug, Snafu)]
-pub(crate) enum Error {
+pub enum Error {
     #[snafu(display("Failed to parse {usage} location {location}: {source}"))]
     InvalidStateLocation {
         usage: &'static str,
@@ -124,9 +125,17 @@ pub(crate) enum Error {
     },
 }
 
-pub(crate) type Result<T, E = Error> = std::result::Result<T, E>;
+pub type Result<T, E = Error> = std::result::Result<T, E>;
 
-pub(crate) async fn build_object_store(
+/// Builds the object store that holds runtime state (e.g. the cluster job store)
+/// at `state_location`, resolving any `params` through `secrets`. Returns the
+/// store and the path prefix inside it.
+///
+/// # Errors
+///
+/// Returns an error if `state_location` is not a valid URL, if a local directory
+/// cannot be created, or if the object store for the URL scheme cannot be built.
+pub async fn build_object_store(
     secrets: Arc<RwLock<Secrets>>,
     io_runtime: Handle,
     state_location: &str,
@@ -266,19 +275,40 @@ async fn build_gcs_parameters(
     )
     .await
     .map_err(|source| Error::GcsParameterValidation { usage, source })?;
-    // Same contract as the GCS data connector: `build_gcs_object_store` uses only one
-    // method, so a second one would be silently ignored.
-    data_connector_api::parameters::gcs::validate_auth(&params).map_err(|source| {
-        Error::GcsParameterValidation {
-            usage,
-            source: Box::new(source),
-        }
+    validate_gcs_auth(&params).map_err(|message| Error::GcsParameterValidation {
+        usage,
+        source: message.into(),
     })?;
     Ok(params
         .to_secret_map()
         .into_iter()
         .map(|(key, value)| (key, value.expose_secret().to_string()))
         .collect())
+}
+
+/// Same contract as the GCS data connector (`data_connector_api::parameters::gcs`, which
+/// this crate cannot depend on): `build_gcs_object_store` uses only one authentication
+/// method, so a second one would be silently ignored.
+fn validate_gcs_auth(params: &Parameters) -> Result<(), &'static str> {
+    let is_true = |key: &str| {
+        params
+            .get(key)
+            .expose()
+            .ok()
+            .is_some_and(|v| v.eq_ignore_ascii_case("true"))
+    };
+    let methods = [
+        params.get("service_account_path").expose().ok().is_some(),
+        params.get("service_account_key").expose().ok().is_some(),
+        is_true("skip_signature"),
+        is_true("application_default_credentials"),
+    ];
+    if methods.into_iter().filter(|&set| set).count() > 1 {
+        return Err(
+            "Multiple authentication methods were provided. Specify only one of the following: gcs_service_account_path, gcs_service_account_key, gcs_application_default_credentials, or gcs_skip_signature. For details, visit: https://spiceai.org/docs/components/data-connectors/gcs#auth",
+        );
+    }
+    Ok(())
 }
 
 async fn build_secret_resolved_parameters(

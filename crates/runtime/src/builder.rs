@@ -38,6 +38,8 @@ use crate::{
     status,
 };
 use app::App;
+#[cfg(not(windows))]
+use runtime_acceleration::CayenneAccelerationDemand;
 use runtime_acceleration::acceleration::{RefreshMode, unset_refresh_mode_for_connector};
 use runtime_metrics as metrics;
 use spicepod::component::caching::CacheKeyType;
@@ -51,6 +53,9 @@ use telemetry::timing::TimeMeasurement;
 use token_provider::registry::TokenProviderRegistry;
 use tokio::runtime::Handle;
 use tokio::sync::{Mutex, RwLock};
+
+// Re-exported so `runtime::builder::CayenneWorkload` keeps resolving for downstream users.
+pub use runtime_acceleration::CayenneWorkload;
 
 type DatafusionConfigurationCallback = fn(&mut DataFusion);
 
@@ -993,7 +998,7 @@ async fn build_http_rate_control_registry(
         return Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default());
     };
 
-    match crate::object_store_state::build_object_store(
+    match runtime_object_store::state::build_object_store(
         secrets,
         io_runtime,
         &state.location,
@@ -1208,60 +1213,6 @@ fn parse_usize_runtime_param(params: &HashMap<String, String>, key: &str) -> Opt
     }
 }
 
-/// What the Cayenne accelerations configured in a Spicepod will demand of the host,
-/// aggregated over every enabled one. Decides how much memory the runtime reserves
-/// outside the query pool and which dedicated thread pools it brings up.
-///
-/// Both flags are unions, so one CDC table in a pod of full-refresh tables still
-/// gets the full CDC-shaped reservation.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct CayenneWorkload {
-    /// Any enabled Cayenne acceleration at all.
-    configured: bool,
-    /// Any table on a profile that can hold rows in the off-pool in-memory CDC
-    /// tier. Gates the coordinated host-memory partition — the reduced query-pool
-    /// default and the global mem-tier byte budget — which exists solely to leave
-    /// room for that tier. A pod without one cannot fill it
-    /// (`cdc_durability` is forced to `file` off the small-write profile), so
-    /// fencing ~20% of host for it would shrink the query pool for nothing.
-    ///
-    /// Deliberately NOT narrowed to a file acceleration mode, unlike
-    /// `needs_compaction`: a `mode: memory` table holds its whole dataset in that
-    /// tier permanently, so it is the case that most needs the room reserved.
-    uses_cdc_tier: bool,
-    /// Any table that accumulates Vortex files for compaction to consolidate — a
-    /// file acceleration mode on a profile that is not a whole-table replace (see
-    /// `compacts_into_carved_pool`). Gates the dedicated compaction runtime and its
-    /// carved memory pool.
-    needs_compaction: bool,
-}
-
-impl CayenneWorkload {
-    #[must_use]
-    pub const fn is_configured(self) -> bool {
-        self.configured
-    }
-
-    #[must_use]
-    pub const fn uses_cdc_tier(self) -> bool {
-        self.uses_cdc_tier
-    }
-
-    #[must_use]
-    pub const fn needs_compaction(self) -> bool {
-        self.needs_compaction
-    }
-
-    /// Whether bringing up the dedicated compaction runtime is worthwhile. True
-    /// unless no configured Cayenne acceleration can produce files to compact — a
-    /// pod with no Cayenne at all still gets one, because a table created later by
-    /// DDL may compact and would otherwise fall back to the ambient runtime.
-    #[must_use]
-    pub const fn may_compact(self) -> bool {
-        !self.configured || self.needs_compaction
-    }
-}
-
 /// [`unset_refresh_mode_for_connector`] keyed by the raw Spicepod `from:` value rather
 /// than a parsed connector name.
 ///
@@ -1360,12 +1311,10 @@ fn cayenne_workload(app: Option<&Arc<app::App>>) -> CayenneWorkload {
         return CayenneWorkload::default();
     };
     cayenne_accelerations(app).fold(CayenneWorkload::default(), |workload, (accel, profile)| {
-        CayenneWorkload {
-            configured: true,
-            uses_cdc_tier: workload.uses_cdc_tier || profile.uses_cdc_tier,
-            needs_compaction: workload.needs_compaction
-                || compacts_into_carved_pool(&accel, profile),
-        }
+        workload.with_acceleration(CayenneAccelerationDemand {
+            uses_cdc_tier: profile.uses_cdc_tier,
+            needs_compaction: compacts_into_carved_pool(&accel, profile),
+        })
     })
 }
 

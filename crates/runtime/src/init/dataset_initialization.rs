@@ -358,7 +358,7 @@ fn report_deferred_failure(
 ) -> RuntimeError {
     runtime.status.update_dataset(
         &dataset.name,
-        crate::status::ComponentStatus::error_with_message(err.to_string()),
+        runtime_status::ComponentStatus::error_with_message(err.to_string()),
     );
     runtime_metrics::datasets::LOAD_ERROR.add(1, &[]);
     tracing::error!(
@@ -390,7 +390,7 @@ mod tests {
     use crate::dataconnector::{
         ConnectorComponent, DataConnector, DataConnectorError, DataConnectorResult,
     };
-    use crate::status::ComponentStatus;
+    use runtime_status::ComponentStatus;
 
     /// Where the deferred bring-up fails.
     #[derive(Clone, Copy)]

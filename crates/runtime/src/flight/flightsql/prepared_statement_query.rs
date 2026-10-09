@@ -1098,8 +1098,8 @@ mod tests {
     async fn test_prepared_statement_plan_cache_setup() {
         use crate::dataaccelerator::AcceleratorEngineRegistry;
         use crate::datafusion::builder::DataFusionBuilder;
-        use crate::status::RuntimeStatus;
         use cache::{Caching, SimpleCache};
+        use runtime_status::RuntimeStatus;
         use std::sync::Arc;
         use std::time::Duration;
 
@@ -1149,12 +1149,12 @@ mod tests {
         use crate::dataaccelerator::AcceleratorEngineRegistry;
         use crate::datafusion::builder::DataFusionBuilder;
         use crate::datafusion::query::builder::QueryBuilder;
-        use crate::status::RuntimeStatus;
         use arrow::array::Int64Array;
         use cache::{Caching, SimpleCache};
         use datafusion::common::ParamValues;
         use datafusion::scalar::ScalarValue;
         use futures::TryStreamExt;
+        use runtime_status::RuntimeStatus;
         use std::sync::Arc;
         use std::time::Duration;
 

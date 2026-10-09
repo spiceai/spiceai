@@ -276,7 +276,10 @@ runtime-datafusion-index = "foundation"
 runtime-tls = "foundation"
 spice-table = "foundation"
 runtime-metrics = "foundation"
-runtime-object-store = "foundation"
+# shared-utility, not foundation: `state` resolves the state store's params through
+# runtime-parameters and runtime-secrets (both shared-utility).
+runtime-object-store = "shared-utility"
+runtime-otel-push = "foundation"
 runtime-parameter-spec = "foundation"
 runtime-parameters-typed = "foundation"
 runtime-proto = "foundation"

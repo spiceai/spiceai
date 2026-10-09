@@ -1157,7 +1157,7 @@ pub(crate) async fn evaluate_table_readiness(datafusion: &DataFusion, table: &Ta
     // dataset registration can have created a canonical-key entry alongside
     // the registered bare key, and every resolve-equal entry must reach
     // `Ready` for `/v1/ready` to flip.
-    let matching: Vec<(TableReference, crate::status::ComponentStatus)> = datafusion
+    let matching: Vec<(TableReference, runtime_status::ComponentStatus)> = datafusion
         .runtime_status
         .get_dataset_statuses()
         .into_iter()
@@ -1169,7 +1169,7 @@ pub(crate) async fn evaluate_table_readiness(datafusion: &DataFusion, table: &Ta
         .collect();
     let pending: Vec<TableReference> = matching
         .iter()
-        .filter(|(_, status)| !matches!(status, crate::status::ComponentStatus::Ready))
+        .filter(|(_, status)| !matches!(status, runtime_status::ComponentStatus::Ready))
         .map(|(key, _)| key.clone())
         .collect();
 
@@ -1214,12 +1214,12 @@ pub(crate) async fn evaluate_table_readiness(datafusion: &DataFusion, table: &Ta
         if pending.is_empty() {
             datafusion
                 .runtime_status
-                .update_dataset(table, crate::status::ComponentStatus::Ready);
+                .update_dataset(table, runtime_status::ComponentStatus::Ready);
         } else {
             for key in pending {
                 datafusion
                     .runtime_status
-                    .update_dataset(&key, crate::status::ComponentStatus::Ready);
+                    .update_dataset(&key, runtime_status::ComponentStatus::Ready);
             }
         }
     }
@@ -1586,7 +1586,7 @@ mod tests {
         let runtime = crate::Runtime::builder().build().await;
         let datafusion = Arc::new(
             DataFusion::builder(
-                crate::status::RuntimeStatus::new(),
+                runtime_status::RuntimeStatus::new(),
                 runtime.accelerator_engine_registry(),
                 tokio::runtime::Handle::current(),
             )

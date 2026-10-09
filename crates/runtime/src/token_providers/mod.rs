@@ -15,4 +15,6 @@ limitations under the License.
 */
 
 pub mod databricks;
-pub mod github_app_token;
+// Lives in `token_provider`; re-exported so
+// `runtime::token_providers::github_app_token` still resolves.
+pub use token_provider::github_app_token;

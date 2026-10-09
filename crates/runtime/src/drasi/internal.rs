@@ -41,7 +41,7 @@ use runtime_query_engine::query_engine::UpdateType;
 use spicepod::drasi::{RuntimeDrasi, RuntimeDrasiTable};
 
 use crate::datafusion::SPICE_RUNTIME_SCHEMA;
-use crate::drasi::queue::{DEFAULT_QUEUE_DEPTH, DeliveryQueue, QueuedBatch};
+use runtime_drasi::queue::{DEFAULT_QUEUE_DEPTH, DeliveryQueue, QueuedBatch};
 
 /// The forwarders configured by `runtime.drasi`, keyed by table.
 #[derive(Debug)]

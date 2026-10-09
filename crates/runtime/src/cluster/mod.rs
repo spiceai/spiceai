@@ -22,7 +22,6 @@ use crate::cluster::partition::{
 };
 use crate::config::{ClusterConfig, ClusterRole};
 use crate::jobs::JobExecutor;
-use crate::status::ComponentStatus;
 use crate::{
     CLUSTER_INTERNAL_SERVER, CLUSTER_PARTITION_ASSIGNMENT_TASK, CLUSTER_SCHEDULER_REGISTRY,
     FailedToRegisterSchedulerSnafu, FailedToStartClusterExecutorSnafu,
@@ -65,6 +64,7 @@ use runtime_proto::{
     GetAppDefinitionRequest, GetDdlCatchupRequest, GetSchedulersRequest, TaskCancelInfo,
 };
 use runtime_secrets::Secrets;
+use runtime_status::ComponentStatus;
 use snafu::ResultExt;
 use std::collections::{HashMap, HashSet};
 use std::env;
@@ -596,28 +596,26 @@ fn update_scheduler_pollers(
 pub(crate) mod accelerated_partition_provider;
 pub(crate) use runtime_cluster::cluster_state;
 mod composite_flight_service;
-mod control_stream_client;
 pub mod datafusion;
 mod heartbeat;
-pub mod metrics_collector;
 pub mod partition;
-pub mod pki;
 mod reaper;
 pub(crate) mod scheduler_registry;
 mod servers;
 mod service;
-pub(crate) mod shared_job_state;
 
 use crate::cluster::partition::service::PartitionService;
 pub use accelerated_partition_provider::AcceleratedPartitionProvider;
 pub use cluster_state::{ClusterStateStore, SchedulerEntry};
-pub use control_stream_client::ControlStreamManager;
+pub use runtime_cluster::ControlStreamManager;
+// Moved to `runtime-cluster`; re-exported so `runtime::cluster::{metrics_collector, pki}` still resolve.
 pub use heartbeat::{CLOCK_SKEW_TOLERANCE_MS, SchedulerHeartbeat, SchedulerHeartbeatStore};
 pub use partition::{PartitionMetadata, PartitionStore, TablePartitionMetadata};
 pub use reaper::{Reaper, ReaperOutcome};
 pub use runtime_cluster::ExecutorOutboundBroadcaster;
 use runtime_cluster::store::{AccelerationsPartitions, CatalogPartitions};
 pub use runtime_cluster::{ExecutorRegistry, FederatedPartitionProvider, TablePartitions};
+pub use runtime_cluster::{metrics_collector, pki};
 pub use scheduler_registry::SchedulerPeers;
 pub use scheduler_registry::start_scheduler_registry;
 pub use servers::{start_executor_flight_server, start_internal_cluster_server};
@@ -636,7 +634,7 @@ pub use service::{ClusterServiceImpl, ExecutorControlStreamRegistry};
 ///
 /// * All three pieces (server cert, client verifier, outbound
 ///   `ClientTlsConfig`) live in a single
-///   [`crate::cluster::pki::ClusterPkiBundle`] backed by one
+///   [`pki::ClusterPkiBundle`] backed by one
 ///   `ArcSwap<ClusterPkiSnapshot>`. When any of CA / cert / key change
 ///   on disk we re-parse and validate the **whole** bundle; if anything
 ///   is invalid the previous snapshot is kept (last-known-good).
@@ -672,7 +670,7 @@ struct ClusterTlsConfigInner {
     /// Atomic bundle of (server cert+key, client verifier, outbound
     /// `ClientTlsConfig`). All three rotate together via a single
     /// `ArcSwap` swap inside the bundle.
-    bundle: Arc<crate::cluster::pki::ClusterPkiBundle>,
+    bundle: Arc<pki::ClusterPkiBundle>,
     /// Drop-guard for the watcher. In the centralized path the binary
     /// owns the [`runtime_tls::TlsControl`] for the whole process; this
     /// `Arc` is purely a safety net so the watcher dispatcher outlives
@@ -707,8 +705,8 @@ impl ClusterTlsConfig {
         // Build + register the atomic bundle. `try_new` performs the
         // initial parse + chain validation before returning, so any
         // bad starting state surfaces here as an `io::Error`.
-        let bundle = crate::cluster::pki::ClusterPkiBundle::try_new(
-            &crate::cluster::pki::ClusterPkiPaths {
+        let bundle = pki::ClusterPkiBundle::try_new(
+            &pki::ClusterPkiPaths {
                 ca: ca_path_buf.clone(),
                 cert: cert_path_buf.clone(),
                 key: key_path_buf.clone(),
@@ -769,7 +767,7 @@ impl ClusterTlsConfig {
     /// tests that introspect the bundle (e.g. fingerprint comparisons).
     #[must_use]
     #[doc(hidden)]
-    pub fn bundle_for_tests(&self) -> Arc<crate::cluster::pki::ClusterPkiBundle> {
+    pub fn bundle_for_tests(&self) -> Arc<pki::ClusterPkiBundle> {
         Arc::clone(&self.inner.bundle)
     }
 }
@@ -1599,7 +1597,7 @@ pub async fn initialize_cluster_executor(
 
     let partition_update_handler_rt = Arc::clone(&rt);
     let partition_update_handler: Option<
-        crate::cluster::control_stream_client::PartitionUpdateHandler,
+        runtime_cluster::control_stream_client::PartitionUpdateHandler,
     > = Some(Arc::new(move |new_partitions, removed_partitions| {
         let rt = Arc::clone(&partition_update_handler_rt);
         Box::pin(async move {
@@ -1611,7 +1609,7 @@ pub async fn initialize_cluster_executor(
 
     let refresh_dataset_handler_rt = Arc::clone(&rt);
     let refresh_dataset_handler: Option<
-        crate::cluster::control_stream_client::RefreshDatasetHandler,
+        runtime_cluster::control_stream_client::RefreshDatasetHandler,
     > = Some(Arc::new(move |dataset_name, overrides_json| {
         let rt = Arc::clone(&refresh_dataset_handler_rt);
         Box::pin(async move {
@@ -2198,7 +2196,7 @@ async fn create_scheduler_server(
                     .boxed()
                     .context(FailedToStartClusterSchedulerSnafu)?,
             );
-            Arc::new(shared_job_state::SharedJobState::new(
+            Arc::new(runtime_cluster::shared_job_state::SharedJobState::new(
                 metrics_node_id,
                 store,
                 base_prefix,

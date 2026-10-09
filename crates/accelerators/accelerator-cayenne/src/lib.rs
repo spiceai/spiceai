@@ -1004,7 +1004,7 @@ fn refresh_write_profile(
 /// `cdc_durability: memory`) are for. It is also exactly the set of tables that can
 /// reach the off-pool in-memory CDC tier, so the runtime builder gates the tier's
 /// aggregate byte budget — and the reduced query-pool default that leaves room for
-/// it — on a pod containing one (see `builder::CayenneWorkload`).
+/// it — on a pod containing one (see `runtime_acceleration::CayenneWorkload`).
 fn uses_small_write_refresh_profile(
     source: &dyn AccelerationSource,
     acceleration: &Acceleration,

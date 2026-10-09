@@ -25,14 +25,20 @@ http.workspace = true
 libnfs = { path = "../libnfs", optional = true }
 nix = { workspace = true, features = ["fs"], optional = true }
 object_store.workspace = true
+object_store_occ = { path = "../object_store_occ", optional = true }
 object_store_spawn = { path = "../object_store_spawn" }
 reqwest.workspace = true
+runtime-parameters = { path = "../runtime-parameters", optional = true }
+# Secret stores are opted into by the binary; this crate only needs the `Secrets` type.
+runtime-secrets = { path = "../runtime-secrets", default-features = false, optional = true }
+secrecy = { workspace = true, optional = true }
 serde.workspace = true
 smb = { path = "../smb", optional = true }
 snafu.workspace = true
+spicepod = { path = "../spicepod", optional = true }
 ssh2 = { workspace = true, optional = true }
 suppaftp = { workspace = true, optional = true }
-tokio.workspace = true
+tokio = { workspace = true, features = ["rt"] }
 tracing.workspace = true
 url.workspace = true
 util = { path = "../util", default-features = false }
@@ -40,13 +46,25 @@ util = { path = "../util", default-features = false }
 [dev-dependencies]
 axum.workspace = true
 insta = { workspace = true, features = ["json", "redactions"] }
+object_store_occ = { path = "../object_store_occ" }
 serde_json.workspace = true
+tempfile.workspace = true
 
 [features]
 ftp = ["dep:suppaftp", "dep:bb8"]
 nfs = ["dep:libnfs", "dep:nix"]
 sftp = ["dep:ssh2"]
 smb = ["dep:smb", "dep:bb8"]
+# The runtime state store (`state`), which resolves params through secrets. Only
+# `runtime` needs it, so other dependents skip the params/secrets/spicepod deps.
+state = [
+    "dep:object_store_occ",
+    "dep:runtime-parameters",
+    "dep:runtime-secrets",
+    "dep:secrecy",
+    "dep:spicepod",
+    "tokio/fs",
+]
 
 [lints]
 workspace = true

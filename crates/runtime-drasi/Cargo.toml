@@ -37,12 +37,14 @@ reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 snafu.workspace = true
-tokio.workspace = true
+# `fs` and `rt` back the on-disk dead-letter store; `sync` the delivery queue.
+tokio = { workspace = true, features = ["fs", "rt", "sync"] }
 tracing.workspace = true
 url.workspace = true
 util = { path = "../util" }
 
 [dev-dependencies]
+tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]

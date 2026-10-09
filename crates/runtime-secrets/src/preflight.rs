@@ -22,8 +22,8 @@ limitations under the License.
 //! store surfaces as one consolidated, root-caused report up front instead of
 //! as scattered per-component "missing required parameter" errors later.
 //!
-//! Driven from the start of [`Runtime::load_components`](crate::Runtime::load_components)
-//! so it sees the same stores a component will: the built-in stores the runtime
+//! Driven from the start of the runtime's `Runtime::load_components` so it
+//! sees the same stores a component will: the built-in stores the runtime
 //! registers on itself after it is built — Cloud Connect's delivered secrets,
 //! restored from their local cache — are in place by then, and a check that ran
 //! any earlier would report them all as missing.
@@ -35,8 +35,8 @@ limitations under the License.
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
+use crate::{RefStatus, Secrets, iter_secret_references};
 use app::App;
-use runtime_secrets::{RefStatus, Secrets, iter_secret_references};
 
 const DOCS_URL: &str = "https://spiceai.org/docs/components/secret-stores";
 
@@ -83,7 +83,7 @@ enum Outcome {
 /// On success: one `INFO` line (or nothing when there are no references). On
 /// problems: one `WARN` block listing each unresolved reference with its
 /// provenance and root cause. Never aborts; never logs secret values.
-pub(crate) async fn run(app: &App, secrets: &Secrets) {
+pub async fn run(app: &App, secrets: &Secrets) {
     match evaluate(app, secrets).await {
         Outcome::NoReferences => {}
         Outcome::AllResolved { total } => {
@@ -377,11 +377,11 @@ mod tests {
     }
 
     #[async_trait::async_trait]
-    impl runtime_secrets::SecretStore for FixedStore {
+    impl crate::SecretStore for FixedStore {
         async fn get_secret(
             &self,
             key: &str,
-        ) -> runtime_secrets::AnyErrorResult<Option<secrecy::SecretString>> {
+        ) -> crate::AnyErrorResult<Option<secrecy::SecretString>> {
             Ok((key == self.key).then(|| secrecy::SecretString::from("delivered")))
         }
     }

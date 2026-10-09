@@ -198,7 +198,7 @@ fn map_temporality(t: OtelTemporality) -> Temporality {
 /// # Example
 ///
 /// ```ignore
-/// use runtime::otel_push_exporter::{create_otel_periodic_reader, OtelExporterConfig, OtelTemporality};
+/// use runtime_otel_push::{create_otel_periodic_reader, OtelExporterConfig, OtelTemporality};
 /// use std::collections::HashMap;
 ///
 /// let config = OtelExporterConfig {

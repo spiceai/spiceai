@@ -159,7 +159,8 @@ runtime-tls = { path = "../runtime-tls" }
 runtime-execution-plans = { path = "../runtime-execution-plans" }
 runtime-table = { path = "../runtime-table" }
 runtime-resources = { path = "../runtime-resources" }
-runtime-object-store = { path = "../runtime-object-store" }
+runtime-object-store = { path = "../runtime-object-store", features = ["state"] }
+runtime-otel-push = { path = "../runtime-otel-push" }
 runtime-parameters = { path = "../runtime-parameters" }
 runtime-parameters-typed = { path = "../runtime-parameters-typed" }
 runtime-proto = { path = "../runtime-proto" }
