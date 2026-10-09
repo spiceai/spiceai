@@ -596,8 +596,9 @@ pub async fn build_changes_stream(
             declared_pks.clone()
         };
 
-        // The dataset load rejects a table without a key (see
-        // `missing_primary_key_message`); this covers a key dropped since then.
+        // The dataset load normally rejects a table without a key first (see
+        // `changes_dataset_lacks_primary_key`); the stream still never starts
+        // without one.
         if primary_keys.is_empty() {
             Err(StreamError::External(format!(
                 "postgres replication for dataset `{dataset_name}`: {missing_key_message}"
