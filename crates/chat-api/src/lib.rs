@@ -172,6 +172,45 @@ pub enum Error {
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// The kind of failure a provider's [`ApiError`] reports.
+///
+/// Providers put the kind in either field: `OpenAI` sends `type: invalid_request_error`
+/// with a more specific `code` such as `missing_required_parameter` or `invalid_api_key`,
+/// and Anthropic sends a `type` alone. `code` is the more specific of the two, so it is
+/// read first, and `type` only when `code` names no kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApiErrorKind {
+    /// The request was refused as invalid.
+    InvalidRequest,
+    /// The provider did not accept the model's credentials.
+    Authentication,
+    /// The credentials were accepted but may not do what was asked.
+    PermissionDenied,
+    /// The provider is throttling requests.
+    RateLimited,
+    /// The account has no quota left.
+    InsufficientQuota,
+}
+
+impl ApiErrorKind {
+    /// The kind `error` reports, or `None` when neither its `code` nor its `type` names one.
+    #[must_use]
+    pub fn of(error: &ApiError) -> Option<Self> {
+        Self::named(error.code.as_deref()).or_else(|| Self::named(error.r#type.as_deref()))
+    }
+
+    fn named(name: Option<&str>) -> Option<Self> {
+        match name? {
+            "invalid_request_error" => Some(Self::InvalidRequest),
+            "invalid_api_key" | "authentication_error" => Some(Self::Authentication),
+            "permission_error" => Some(Self::PermissionDenied),
+            "rate_limit_exceeded" | "rate_limit_error" => Some(Self::RateLimited),
+            "insufficient_quota" => Some(Self::InsufficientQuota),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Default)]
 pub struct QueryGenerationContext {
     pub failed_attempts: Vec<FailedAttempt>,

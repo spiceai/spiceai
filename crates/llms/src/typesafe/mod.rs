@@ -147,13 +147,7 @@ pub fn normalize_model_id(model_id: Option<&str>) -> String {
 #[async_trait]
 impl Evaluate for TypeSafe {
     async fn evaluate(&self, mut request: EvaluateRequest) -> Result<EvaluateResponse> {
-        if request.questions.is_empty() {
-            return InvalidRequestSnafu {
-                model: self.name.clone(),
-                message: "questions map must contain at least one question",
-            }
-            .fail();
-        }
+        evaluate_api::check_questions(&self.name, &request.questions)?;
 
         let _permit = self
             .rate_controller
@@ -192,7 +186,7 @@ impl Evaluate for TypeSafe {
 
         match status {
             StatusCode::OK => {
-                let parsed = serde_json::from_str::<EvaluateResponse>(&body).map_err(|e| {
+                let mut parsed = serde_json::from_str::<EvaluateResponse>(&body).map_err(|e| {
                     evaluate_api::Error::UnparseableResponse {
                         model: self.name.clone(),
                         response: format!("{e}; body={body}"),
@@ -201,6 +195,8 @@ impl Evaluate for TypeSafe {
                 // A 200 that drops, re-types, or answers outside its own options is a
                 // wrong result, not a success.
                 evaluate_api::check_answers(&self.name, &asked, &parsed)?;
+                // Responses name the model the caller asked for, as chat completions do.
+                parsed.model.clone_from(&self.name);
                 Ok(parsed)
             }
             StatusCode::UNAUTHORIZED => AuthenticationFailedSnafu {
@@ -361,7 +357,7 @@ mod tests {
             .mount(&server)
             .await;
 
-        let client = TypeSafe::try_new("jev", Some("jev"), "test-key")
+        let client = TypeSafe::try_new("triage", Some("jev"), "test-key")
             .expect("client")
             .with_base_url(server.uri());
 
@@ -394,14 +390,15 @@ mod tests {
 
         let resp = client
             .evaluate(EvaluateRequest {
-                model: "jev".into(), // spicepod name; provider replaces with jev-latest
+                model: "triage".into(), // spicepod name; provider replaces with jev-latest
                 state: EvaluateState::from("Help! My payouts have been failing for 3 days."),
                 questions,
             })
             .await
             .expect("evaluate succeeds");
 
-        assert_eq!(resp.model, "jev-1.13.0");
+        // The Spicepod name, not the `jev-1.13.0` the provider answered with.
+        assert_eq!(resp.model, "triage");
         assert!(matches!(
             resp.answers.get("is_urgent"),
             Some(Answer::Noul { noul }) if (*noul - 0.92).abs() < f64::EPSILON
@@ -910,9 +907,9 @@ mod tests {
         );
     }
 
-    /// Empty score criteria via the Rust API must not panic on `len - 1`.
+    /// A rubric with no levels is refused before the provider is called.
     #[tokio::test]
-    async fn evaluate_rejects_empty_score_criteria_without_panicking() {
+    async fn evaluate_refuses_a_score_without_levels_before_calling_the_provider() {
         let server = MockServer::start().await;
         systemone_returning(
             &server,
@@ -943,10 +940,14 @@ mod tests {
             })
             .await
             .expect_err("empty score criteria must fail closed");
-        assert!(
-            err.to_string()
-                .contains("score criteria must contain at least one level"),
-            "{err}"
+        assert_eq!(
+            err.to_string(),
+            "Invalid evaluation request for model 'jev': score question 'q' needs two to ten levels in `criteria`, but has 0"
+        );
+        assert_eq!(
+            server.received_requests().await.expect("requests").len(),
+            0,
+            "a question no model can answer must not reach the provider"
         );
     }
 

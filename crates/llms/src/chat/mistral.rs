@@ -958,7 +958,8 @@ const TOOL_CHOICE_DOCS: &str = "https://spiceai.org/docs/components/models/huggi
 
 /// The `tool_choice` to hand `mistral.rs` for `req`, or an invalid-argument error when the
 /// request asks for a constraint that cannot be enforced — including a tool call required of a
-/// request that offers no tools, which `mistral.rs` would otherwise answer in prose.
+/// request that offers no tools, which `mistral.rs` would otherwise answer in prose, and a tool
+/// the request does not offer, which `mistral.rs` would otherwise fail as an internal error.
 fn request_tool_choice(
     req: &CreateChatCompletionRequest,
 ) -> Result<Option<ToolChoice>, OpenAIError> {
@@ -981,6 +982,29 @@ fn request_tool_choice(
     if requires_call && req.tools.as_ref().is_none_or(Vec::is_empty) {
         return Err(OpenAIError::InvalidArgument(format!(
             "tool_choice requires a tool call, but the request lists no tools. Add the tools the model may call to 'tools', or use tool_choice 'auto'. See: {TOOL_CHOICE_DOCS}"
+        )));
+    }
+
+    let named: Vec<&str> = match &choice {
+        ToolChoice::Tool(tool) => vec![tool.function.name.as_str()],
+        ToolChoice::AllowedTools(allowed) => allowed
+            .tools
+            .iter()
+            .filter_map(|tool| match tool {
+                AllowedToolChoice::Function { name } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    let offered = |name: &str| {
+        req.tools.iter().flatten().any(
+            |tool| matches!(tool, ChatCompletionTools::Function(tool) if tool.function.name == name),
+        )
+    };
+    if let Some(name) = named.into_iter().find(|name| !offered(name)) {
+        return Err(OpenAIError::InvalidArgument(format!(
+            "tool_choice names tool '{name}', which the request does not list in 'tools'. Add '{name}' to 'tools', or name one of the tools the request lists. See: {TOOL_CHOICE_DOCS}"
         )));
     }
     Ok(Some(choice))
@@ -1006,9 +1030,8 @@ fn convert_tool_choice(x: &ChatCompletionToolChoiceOption) -> Result<ToolChoice,
     }
 }
 
-/// Maps an `allowed_tools` choice onto `mistral.rs`'s single-mode equivalent. `mistral.rs` takes
-/// one mode over one tool list, so a choice carrying several entries is refused unless they
-/// agree on the mode.
+/// Maps an `allowed_tools` choice onto `mistral.rs`'s equivalent: the same mode over the same
+/// tools, each of which must be a named function.
 fn convert_allowed_tools(
     choice: &ChatCompletionAllowedToolsChoice,
 ) -> Result<ToolChoice, OpenAIError> {
@@ -1018,36 +1041,26 @@ fn convert_allowed_tools(
         ))
     };
 
-    let mut mode = None;
-    let mut tools = Vec::new();
-    for entry in &choice.allowed_tools {
-        let entry_mode = match entry.mode {
-            ToolChoiceAllowedMode::Auto => AllowedToolsMode::Auto,
-            ToolChoiceAllowedMode::Required => AllowedToolsMode::Required,
-        };
-        if mode.is_some_and(|m| m != entry_mode) {
-            return Err(invalid(
-                "mixes 'auto' and 'required' modes, which locally hosted models cannot combine",
-            ));
-        }
-        mode = Some(entry_mode);
-
-        for tool in &entry.tools {
-            let Ok(ChatCompletionTools::Function(tool)) = ChatCompletionTools::deserialize(tool)
-            else {
-                return Err(invalid(
-                    "lists a tool that is not a named 'function' tool, the only kind locally hosted models can be restricted to",
-                ));
-            };
-            tools.push(AllowedToolChoice::Function {
-                name: tool.function.name,
-            });
-        }
-    }
-
-    let Some(mode) = mode else {
-        return Err(invalid("lists no tools"));
+    let allowed = &choice.allowed_tools;
+    let mode = match allowed.mode {
+        ToolChoiceAllowedMode::Auto => AllowedToolsMode::Auto,
+        ToolChoiceAllowedMode::Required => AllowedToolsMode::Required,
     };
+    let tools = allowed
+        .tools
+        .iter()
+        .map(|tool| match ChatCompletionTools::deserialize(tool) {
+            Ok(ChatCompletionTools::Function(tool)) => Ok(AllowedToolChoice::Function {
+                name: tool.function.name,
+            }),
+            _ => Err(invalid(
+                "lists a tool that is not a named 'function' tool, the only kind locally hosted models can be restricted to",
+            )),
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    if tools.is_empty() {
+        return Err(invalid("lists no tools"));
+    }
     Ok(ToolChoice::AllowedTools(AllowedToolsToolChoice {
         tp: AllowedToolsToolChoiceType::AllowedTools,
         mode,
@@ -1161,13 +1174,13 @@ mod tests {
     fn allowed_tools_keeps_its_mode_and_tools() {
         let converted = convert_tool_choice(&choice(serde_json::json!({
             "type": "allowed_tools",
-            "allowed_tools": [{
+            "allowed_tools": {
                 "mode": "required",
                 "tools": [
                     { "type": "function", "function": { "name": "get_weather" } },
                     { "type": "function", "function": { "name": "get_time" } }
                 ]
-            }]
+            }
         })))
         .expect("function tools with one mode are supported");
         let ToolChoice::AllowedTools(allowed) = converted else {
@@ -1187,26 +1200,69 @@ mod tests {
 
     #[test]
     fn allowed_tools_that_cannot_be_enforced_are_refused() {
-        let mixed = invalid_argument(convert_tool_choice(&choice(serde_json::json!({
-            "type": "allowed_tools",
-            "allowed_tools": [
-                { "mode": "auto", "tools": [{ "type": "function", "function": { "name": "a" } }] },
-                { "mode": "required", "tools": [{ "type": "function", "function": { "name": "b" } }] }
-            ]
-        }))));
-        assert!(mixed.contains("mixes 'auto' and 'required'"), "{mixed}");
-
         let hosted = invalid_argument(convert_tool_choice(&choice(serde_json::json!({
             "type": "allowed_tools",
-            "allowed_tools": [{ "mode": "auto", "tools": [{ "type": "web_search" }] }]
+            "allowed_tools": { "mode": "auto", "tools": [{ "type": "web_search" }] }
         }))));
-        assert!(hosted.contains("not a named 'function' tool"), "{hosted}");
+        assert_eq!(
+            hosted,
+            format!(
+                "tool_choice 'allowed_tools' lists a tool that is not a named 'function' tool, the only kind locally hosted models can be restricted to. See: {TOOL_CHOICE_DOCS}"
+            )
+        );
 
         let empty = invalid_argument(convert_tool_choice(&choice(serde_json::json!({
             "type": "allowed_tools",
-            "allowed_tools": []
+            "allowed_tools": { "mode": "auto", "tools": [] }
         }))));
-        assert!(empty.contains("lists no tools"), "{empty}");
+        assert_eq!(
+            empty,
+            format!("tool_choice 'allowed_tools' lists no tools. See: {TOOL_CHOICE_DOCS}")
+        );
+    }
+
+    /// `mistral.rs` fails a choice naming a tool the request does not offer as an internal
+    /// error; the caller named the tool, so it is refused as an invalid argument first.
+    #[test]
+    fn a_choice_naming_a_tool_the_request_does_not_offer_is_refused() {
+        let messages = serde_json::json!([{ "role": "user", "content": "hi" }]);
+        let tools = serde_json::json!([{ "type": "function", "function": { "name": "a" } }]);
+        for tool_choice in [
+            serde_json::json!({ "type": "function", "function": { "name": "nope" } }),
+            serde_json::json!({
+                "type": "allowed_tools",
+                "allowed_tools": {
+                    "mode": "required",
+                    "tools": [
+                        { "type": "function", "function": { "name": "a" } },
+                        { "type": "function", "function": { "name": "nope" } }
+                    ]
+                }
+            }),
+        ] {
+            let message = invalid_argument(request_tool_choice(&request(serde_json::json!({
+                "model": "m", "messages": messages, "tools": tools, "tool_choice": tool_choice
+            }))));
+            assert_eq!(
+                message,
+                format!(
+                    "tool_choice names tool 'nope', which the request does not list in 'tools'. Add 'nope' to 'tools', or name one of the tools the request lists. See: {TOOL_CHOICE_DOCS}"
+                ),
+                "{tool_choice}"
+            );
+        }
+
+        let offered = request_tool_choice(&request(serde_json::json!({
+            "model": "m",
+            "messages": messages,
+            "tools": tools,
+            "tool_choice": { "type": "function", "function": { "name": "a" } }
+        })))
+        .expect("a tool the request offers is supported");
+        let Some(ToolChoice::Tool(tool)) = offered else {
+            panic!("expected a forced tool, got {offered:?}");
+        };
+        assert_eq!(tool.function.name, "a");
     }
 
     fn request(json: serde_json::Value) -> CreateChatCompletionRequest {
@@ -1221,7 +1277,7 @@ mod tests {
             serde_json::json!("required"),
             serde_json::json!({
                 "type": "allowed_tools",
-                "allowed_tools": [{ "mode": "required", "tools": [{ "type": "function", "function": { "name": "a" } }] }]
+                "allowed_tools": { "mode": "required", "tools": [{ "type": "function", "function": { "name": "a" } }] }
             }),
         ] {
             let message = invalid_argument(request_tool_choice(&request(serde_json::json!({

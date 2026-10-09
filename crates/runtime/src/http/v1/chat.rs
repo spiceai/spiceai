@@ -46,7 +46,7 @@ use axum::{
 use event_stream::get_event_stream;
 use futures::StreamExt;
 use http::HeaderValue;
-use llms::chat::Chat;
+use llms::chat::{ApiErrorKind, Chat};
 use runtime_request_context::{AsyncMarker, RequestContext};
 use serde::Serialize;
 use tokio::{
@@ -294,6 +294,9 @@ pub(crate) fn create_working_stream_payload(
 }
 
 /// Create a SSE [`axum::response::Response`] from a [`ChatCompletionResponseStream`].
+///
+/// A stream that completes ends with `data: [DONE]`, the Chat Completions API's
+/// terminator; one that fails ends with the error event instead.
 fn create_sse_response(
     mut strm: ChatCompletionResponseStream,
     keep_alive_interval: Duration,
@@ -302,6 +305,7 @@ fn create_sse_response(
     Sse::new(Box::pin(stream! {
         let mut chat_output = String::new();
         let mut id: Option<String> = None;
+        let mut failed = false;
         while let Some(msg) = strm.next().instrument(span.clone()).await {
             match msg {
                 Ok(resp) => {
@@ -321,10 +325,14 @@ fn create_sse_response(
                 Err(e) => {
                     tracing::error!("Error encountered in chat completion stream: {e}");
                     yield Ok(to_openai_error_event(e.to_string()));
+                    failed = true;
                     break;
                 }
             }
         };
+        if !failed {
+            yield Ok(Event::default().data("[DONE]"));
+        }
         tracing::info!(target: "task_history", parent: &span, captured_output = %chat_output);
         if let Some(id) = id {
             tracing::info!(target: "task_history", parent: &span, id = %id, "labels");
@@ -396,12 +404,13 @@ pub fn openai_error_to_response(e: OpenAIError) -> Response {
                 "code": api_error.code
             });
 
-            let status_code = match api_error.code.as_deref() {
-                Some("invalid_request_error") => StatusCode::BAD_REQUEST,
-                Some("invalid_api_key") => StatusCode::UNAUTHORIZED,
-                Some("insufficient_quota") => StatusCode::PAYMENT_REQUIRED,
-                Some("rate_limit_exceeded") => StatusCode::TOO_MANY_REQUESTS,
-                _ => StatusCode::INTERNAL_SERVER_ERROR,
+            let status_code = match ApiErrorKind::of(&api_error) {
+                Some(ApiErrorKind::InvalidRequest) => StatusCode::BAD_REQUEST,
+                Some(ApiErrorKind::Authentication) => StatusCode::UNAUTHORIZED,
+                Some(ApiErrorKind::PermissionDenied) => StatusCode::FORBIDDEN,
+                Some(ApiErrorKind::InsufficientQuota) => StatusCode::PAYMENT_REQUIRED,
+                Some(ApiErrorKind::RateLimited) => StatusCode::TOO_MANY_REQUESTS,
+                None => StatusCode::INTERNAL_SERVER_ERROR,
             };
 
             (status_code, Json(error_response)).into_response()
@@ -430,7 +439,7 @@ mod tests {
     use tracing::{Level, span};
     use tracing_futures::Instrument;
 
-    use super::create_working_stream_payload;
+    use super::{StatusCode, create_working_stream_payload, openai_error_to_response};
     use async_trait::async_trait;
     use axum::{
         extract::{Extension, Json},
@@ -515,12 +524,19 @@ mod tests {
             .expect("Failed to collect SSE response from 'post'.");
 
         let body_str = String::from_utf8(body_bytes.to_bytes().to_vec()).expect("Invalid utf8");
-        body_str
+        let mut data: Vec<&str> = body_str
             .split("\n\n")
+            .filter_map(|e| e.strip_prefix("data: "))
+            .collect();
+        assert_eq!(
+            data.pop(),
+            Some("[DONE]"),
+            "a completed stream ends with the Chat Completions terminator: {body_str}"
+        );
+        data.into_iter()
             .filter_map(|e| {
                 let resp: CreateChatCompletionStreamResponse =
-                    serde_json::from_str(e.strip_prefix("data: ")?)
-                        .expect("Failed to deserialise SSE event");
+                    serde_json::from_str(e).expect("Failed to deserialise SSE event");
                 resp.choices
                     .first()
                     .expect("Expected a choice in SSE event")
@@ -529,6 +545,128 @@ mod tests {
                     .clone()
             })
             .collect()
+    }
+
+    /// A chat model whose stream fails after its first chunk.
+    pub struct FailingStreamChat;
+
+    #[async_trait]
+    impl Chat for FailingStreamChat {
+        fn as_sql(&self) -> Option<&dyn SqlGeneration> {
+            None
+        }
+
+        async fn chat_stream(
+            &self,
+            _req: CreateChatCompletionRequest,
+        ) -> Result<ChatCompletionResponseStream, OpenAIError> {
+            Ok(Box::pin(futures::stream::iter([
+                create_working_stream_payload("partial".to_string()),
+                Err(OpenAIError::InvalidArgument("the stream broke".to_string())),
+            ])))
+        }
+    }
+
+    /// A stream that fails ends with its error event, not with `[DONE]`, which would tell
+    /// the client the answer it has is complete.
+    #[tokio::test]
+    async fn a_failed_stream_ends_with_its_error_not_done() {
+        let mut store = LLMChatCompletionsModelStore::new();
+        store.insert("failing".to_string(), Arc::new(FailingStreamChat));
+        let req_payload: CreateChatCompletionRequest = serde_json::from_value(json!({
+            "model": "failing",
+            "stream": true,
+            "messages": [{"role": "user", "content": "hello"}]
+        }))
+        .expect("request payload");
+
+        let response = post(
+            Extension(Arc::new(RwLock::new(store))),
+            Extension(Arc::new(RwLock::new(HashMap::new()))),
+            Extension(RuntimeStatus::new()),
+            HeaderMap::new(),
+            Json(req_payload),
+        )
+        .await;
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("body")
+            .to_bytes();
+        let body = String::from_utf8(body.to_vec()).expect("utf8");
+        let events: Vec<&str> = body.split("\n\n").filter(|e| !e.is_empty()).collect();
+
+        assert_eq!(events.len(), 2, "{body}");
+        assert!(events[0].contains("\"partial\""), "{body}");
+        assert_eq!(
+            events[1],
+            "event: error\ndata: {\"type\":\"error\",\"error\":{\"message\":\"invalid args: the stream broke\"}}"
+        );
+    }
+
+    fn api_error(r#type: Option<&str>, code: Option<&str>) -> OpenAIError {
+        OpenAIError::ApiError(async_openai::error::ApiError {
+            message: "upstream".to_string(),
+            r#type: r#type.map(str::to_string),
+            param: None,
+            code: code.map(str::to_string),
+        })
+    }
+
+    // regression test for #14910: `OpenAI` puts `invalid_request_error` in `type`, and its
+    // 400 for a request it refused was returned as a 500.
+    #[test]
+    fn provider_errors_keep_their_status() {
+        for (error, status) in [
+            (
+                api_error(
+                    Some("invalid_request_error"),
+                    Some("missing_required_parameter"),
+                ),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                api_error(Some("invalid_request_error"), None),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                api_error(Some("invalid_request_error"), Some("invalid_api_key")),
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                api_error(Some("authentication_error"), None),
+                StatusCode::UNAUTHORIZED,
+            ),
+            (
+                api_error(Some("permission_error"), None),
+                StatusCode::FORBIDDEN,
+            ),
+            (
+                api_error(Some("insufficient_quota"), Some("insufficient_quota")),
+                StatusCode::PAYMENT_REQUIRED,
+            ),
+            (
+                api_error(Some("tokens"), Some("rate_limit_exceeded")),
+                StatusCode::TOO_MANY_REQUESTS,
+            ),
+            (
+                api_error(Some("rate_limit_error"), None),
+                StatusCode::TOO_MANY_REQUESTS,
+            ),
+            (
+                api_error(Some("server_error"), None),
+                StatusCode::INTERNAL_SERVER_ERROR,
+            ),
+            (api_error(None, None), StatusCode::INTERNAL_SERVER_ERROR),
+        ] {
+            let described = format!("{error:?}");
+            assert_eq!(
+                openai_error_to_response(error).status(),
+                status,
+                "{described}"
+            );
+        }
     }
 
     #[tokio::test]

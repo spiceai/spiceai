@@ -38,7 +38,9 @@ use snafu::Snafu;
 
 mod check;
 
-pub use check::{check_answers, is_probability, probability_sum_tolerance};
+pub use check::{
+    SCORE_LEVELS, check_answers, check_questions, is_probability, probability_sum_tolerance,
+};
 
 /// Name → evaluation model map. Holds System One providers (e.g. `TypeSafe` Jev).
 pub type EvaluateModelStore = std::collections::HashMap<String, Arc<dyn Evaluate>>;
@@ -167,13 +169,31 @@ impl From<String> for EntryType {
 ///
 /// Used for score rubric levels so the `OpenAPI` contract matches `TypeSafe`'s
 /// non-empty `list[str | object | array]` criteria shape.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, PartialEq, Serialize, JsonSchema)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 #[serde(untagged)]
 pub enum NonNullEntry {
     String(String),
     Array(Vec<Value>),
     Object(Map<String, Value>),
+}
+
+/// Written by hand so a level of the wrong kind is refused by saying which kinds a level
+/// may be, rather than that no variant of an untagged enum matched.
+impl<'de> Deserialize<'de> for NonNullEntry {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let kind = match Value::deserialize(deserializer)? {
+            Value::String(text) => return Ok(Self::String(text)),
+            Value::Array(items) => return Ok(Self::Array(items)),
+            Value::Object(fields) => return Ok(Self::Object(fields)),
+            Value::Null => "null",
+            Value::Bool(_) => "a boolean",
+            Value::Number(_) => "a number",
+        };
+        Err(serde::de::Error::custom(format!(
+            "a score level must be a string, an object, or an array, not {kind}"
+        )))
+    }
 }
 
 impl From<&str> for NonNullEntry {
@@ -289,10 +309,8 @@ pub enum Question {
     Score {
         #[serde(default, skip_serializing_if = "nullable_entry_is_absent")]
         instructions: NullableEntry,
-        /// Two to ten non-null rubric levels: `TypeSafe` documents score criteria as
-        /// "at least two levels and takes up to 10"
-        /// (<https://docs.typesafe.ai/primitives/score>).
-        #[serde(deserialize_with = "deserialize_score_criteria")]
+        /// Two to ten non-null rubric levels ([`SCORE_LEVELS`]). The count is checked by
+        /// [`check_questions`], with the other rules a question must meet.
         #[schemars(length(min = 2, max = 10))]
         #[cfg_attr(feature = "openapi", schema(min_items = 2, max_items = 10))]
         criteria: Vec<NonNullEntry>,
@@ -318,21 +336,6 @@ pub struct NoulCriteria {
         rename = "false"
     )]
     pub false_meaning: NullableEntry,
-}
-
-fn deserialize_score_criteria<'de, D>(
-    deserializer: D,
-) -> std::result::Result<Vec<NonNullEntry>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let criteria = Vec::<NonNullEntry>::deserialize(deserializer)?;
-    if !(2..=10).contains(&criteria.len()) {
-        return Err(serde::de::Error::custom(
-            "score criteria must contain between two and ten non-null levels",
-        ));
-    }
-    Ok(criteria)
 }
 
 /// A successful evaluation answers something; an empty `answers` map is a malformed
@@ -405,9 +408,8 @@ pub struct EvaluateRequest {
     pub model: String,
     /// State for the model to evaluate: string, object, or array.
     pub state: EvaluateState,
-    /// Questions keyed by caller-selected identifiers. At least one is required; the
-    /// `/v1/evaluate` handler enforces that so an empty map returns the endpoint's
-    /// documented 400 body rather than an extractor rejection.
+    /// Questions keyed by caller-selected identifiers. At least one is required, which
+    /// [`check_questions`] enforces.
     #[schemars(extend("minProperties" = 1))]
     #[cfg_attr(feature = "openapi", schema(schema_with = nonempty_question_map))]
     pub questions: BTreeMap<String, Question>,
@@ -450,7 +452,7 @@ pub enum Answer {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct EvaluateResponse {
-    /// Versioned model id that answered (e.g. `jev-1.13.0`), when the provider reports it.
+    /// The Spicepod model name the request named, as `/v1/chat/completions` reports it.
     pub model: String,
     #[serde(deserialize_with = "deserialize_nonempty_answers")]
     #[schemars(extend("minProperties" = 1))]
@@ -466,7 +468,9 @@ pub trait Evaluate: Send + Sync + Debug {
     /// Run an evaluation against `state` and `questions`.
     ///
     /// The runtime sets `request.model` to the Spicepod model *name*; providers
-    /// should substitute their upstream model id before calling the remote API.
+    /// should substitute their upstream model id before calling the remote API, and
+    /// report the Spicepod name back in [`EvaluateResponse::model`]. Every
+    /// implementation holds `request.questions` to [`check_questions`].
     async fn evaluate(&self, request: EvaluateRequest) -> Result<EvaluateResponse>;
 
     /// Checks the model can answer, e.g. by listing the provider's models.
@@ -638,25 +642,35 @@ mod tests {
     }
 
     #[test]
-    fn score_criteria_rejects_empty_and_null() {
-        let empty = serde_json::from_value::<Question>(json!({
-            "type": "score",
-            "criteria": []
-        }));
-        assert!(empty.is_err(), "empty score criteria must fail");
-
-        let with_null = serde_json::from_value::<Question>(json!({
-            "type": "score",
-            "criteria": [null]
-        }));
-        assert!(with_null.is_err(), "null score criteria items must fail");
+    fn score_levels_must_be_strings_objects_or_arrays() {
+        for (level, kind) in [(json!(null), "null"), (json!(3), "a number")] {
+            let error = serde_json::from_value::<Question>(json!({
+                "type": "score",
+                "criteria": ["low", level]
+            }))
+            .expect_err("a level that is not a string, object, or array must fail");
+            assert_eq!(
+                error.to_string(),
+                format!("a score level must be a string, an object, or an array, not {kind}")
+            );
+        }
 
         let ok: Question = serde_json::from_value(json!({
             "type": "score",
-            "criteria": ["low", {"label": "mid"}]
+            "criteria": ["low", {"label": "mid"}, ["high"]]
         }))
-        .expect("non-empty non-null");
-        assert!(matches!(ok, Question::Score { criteria, .. } if criteria.len() == 2));
+        .expect("string, object, and array levels");
+        let Question::Score { criteria, .. } = ok else {
+            panic!("expected a score question, got {ok:?}");
+        };
+        assert_eq!(
+            criteria,
+            vec![
+                NonNullEntry::String("low".to_string()),
+                NonNullEntry::Object(Map::from_iter([("label".to_string(), json!("mid"))])),
+                NonNullEntry::Array(vec![json!("high")]),
+            ]
+        );
     }
 
     #[test]
@@ -722,35 +736,60 @@ mod tests {
         );
     }
 
+    fn questions(entries: Value) -> BTreeMap<String, Question> {
+        serde_json::from_value(entries).expect("questions deserialize")
+    }
+
+    fn unanswerable(entries: Value) -> String {
+        match check_questions("jev", &questions(entries)) {
+            Err(Error::InvalidRequest { model, message }) => {
+                assert_eq!(model, "jev");
+                message
+            }
+            other => panic!("expected an invalid request, got {other:?}"),
+        }
+    }
+
     /// `TypeSafe` documents score criteria as two to ten levels.
     #[test]
-    fn score_criteria_requires_two_levels() {
-        const LEVELS_ERROR: &str =
-            "score criteria must contain between two and ten non-null levels";
+    fn check_questions_holds_score_rubrics_to_two_to_ten_levels() {
+        let levels = |n: usize| (0..n).map(|i| format!("level {i}")).collect::<Vec<_>>();
+        for n in [0, 1, 11] {
+            assert_eq!(
+                unanswerable(json!({"q": {"type": "score", "criteria": levels(n)}})),
+                format!("score question 'q' needs two to ten levels in `criteria`, but has {n}")
+            );
+        }
+        for n in [2, 10] {
+            check_questions(
+                "jev",
+                &questions(json!({"q": {"type": "score", "criteria": levels(n)}})),
+            )
+            .unwrap_or_else(|e| panic!("{n} levels are valid: {e}"));
+        }
+    }
 
-        let one = serde_json::from_value::<Question>(
-            json!({"type": "score", "instructions": "how bad?", "criteria": ["only"]}),
+    #[test]
+    fn check_questions_needs_a_question_and_a_choice_between_two_options() {
+        assert_eq!(
+            unanswerable(json!({})),
+            "`questions` must contain at least one question"
+        );
+        assert_eq!(
+            unanswerable(json!({
+                "a": {"type": "noul"},
+                "b": {"type": "choice", "criteria": {"only": "the one option"}}
+            })),
+            "choice question 'b' needs at least two options in `criteria`"
+        );
+        check_questions(
+            "jev",
+            &questions(json!({
+                "a": {"type": "noul"},
+                "b": {"type": "choice", "criteria": {"yes": null, "no": null}}
+            })),
         )
-        .expect_err("one level must be rejected");
-        assert_eq!(one.to_string(), LEVELS_ERROR);
-
-        serde_json::from_value::<Question>(
-            json!({"type": "score", "instructions": "how bad?", "criteria": ["calm", "angry"]}),
-        )
-        .expect("two levels are valid");
-
-        let ten: Vec<String> = (0..10).map(|i| format!("level {i}")).collect();
-        serde_json::from_value::<Question>(
-            json!({"type": "score", "instructions": "how bad?", "criteria": ten}),
-        )
-        .expect("ten levels are valid");
-
-        let eleven: Vec<String> = (0..11).map(|i| format!("level {i}")).collect();
-        let over = serde_json::from_value::<Question>(
-            json!({"type": "score", "instructions": "how bad?", "criteria": eleven}),
-        )
-        .expect_err("eleven levels must be rejected");
-        assert_eq!(over.to_string(), LEVELS_ERROR);
+        .expect("a noul and a two-option choice are answerable");
     }
 
     /// A provider reply with no answers is malformed, not a successful evaluation.

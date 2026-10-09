@@ -223,10 +223,9 @@ fn explain_rejected_sampling_control(
          See: {ANTHROPIC_DOCS}",
         cause = api_error.message,
     );
-    // The model refused what the caller asked for, so it is the caller's request that is invalid:
-    // `openai_error_to_response` reads `code` to pick the status, and without one the refusal
-    // reports as a `500`. `param` names the control for a caller that reads fields rather than
-    // prose.
+    // The model refused what the caller asked for, so it is the caller's request that is invalid,
+    // which `ApiErrorKind::of` reads from `code` before `type`. `param` names the control for a
+    // caller that reads fields rather than prose.
     api_error.param = Some(control.to_string());
     api_error.code = Some("invalid_request_error".to_string());
 
@@ -600,9 +599,8 @@ mod tests {
         );
     }
 
-    /// The explanation keeps the error kind Anthropic sent, and adds what the HTTP layer needs:
-    /// `openai_error_to_response` reports an `ApiError` without a `code` as a `500`, which would
-    /// present the caller's own invalid request as a server fault.
+    /// The explanation keeps the error kind Anthropic sent, and names it in `code` too, so the
+    /// HTTP layer reports the caller's own invalid request as a client error.
     #[test]
     fn a_rejected_control_reports_as_a_client_error() {
         let OpenAIError::ApiError(api_error) = explain_rejected_sampling_control(

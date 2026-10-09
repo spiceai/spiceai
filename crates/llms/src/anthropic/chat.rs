@@ -433,8 +433,8 @@ fn refuse_unsupported_logprobs(
              See: https://spiceai.org/docs/components/models/anthropic"
         ),
         // The caller sent something this provider cannot serve, so it is their request that is
-        // invalid. `openai_error_to_response` reads `code` to pick the status, and anything it
-        // does not recognize becomes a 500 — which would report a client error as a server fault.
+        // invalid: `ApiErrorKind::of` reads it as an invalid request, which the HTTP layer
+        // reports as a 400 rather than as a server fault.
         r#type: Some("invalid_request_error".to_string()),
         param: Some(param.to_string()),
         code: Some("invalid_request_error".to_string()),
@@ -714,9 +714,8 @@ mod tests {
             let refusal = refusal(&err);
 
             assert_eq!(refusal.param.as_deref(), Some(param));
-            // `openai_error_to_response` picks the HTTP status from `code`, and maps anything it
-            // does not recognize to 500. This is a client error, so it has to be the code that
-            // maps to 400.
+            // This is a client error, so both fields `ApiErrorKind::of` reads name an invalid
+            // request, which the HTTP layer reports as a 400.
             assert_eq!(refusal.code.as_deref(), Some("invalid_request_error"));
             assert_eq!(refusal.r#type.as_deref(), Some("invalid_request_error"));
 
