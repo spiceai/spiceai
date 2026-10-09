@@ -240,7 +240,7 @@ pub async fn archive_directories<W>(dirs: &[(PathBuf, String)], writer: W) -> Re
 where
     W: AsyncWrite + Unpin + Send,
 {
-    archive_directories_with_plan(dirs, writer, &[], &[]).await
+    archive_directories_with_plan(dirs, writer, &[], &[], &[]).await
 }
 
 /// Like [`archive_directories`], but allows excluding files (`skip_relative_paths`,
@@ -249,6 +249,10 @@ where
 ///
 /// `extras[i]` is added to the archive with `archive_path = extras[i].0` and
 /// `bytes = extras[i].1`. The bytes count toward the returned total.
+/// `optional_files[i]`, a `(source, archive_path)` pair, is archived only if
+/// the file still exists when the archive reaches it (see
+/// `DirectorySnapshotPlan::optional_files`). Sources outside every configured
+/// archive directory are omitted.
 ///
 /// # Errors
 ///
@@ -260,6 +264,7 @@ pub async fn archive_directories_with_plan<W>(
     writer: W,
     skip_relative_paths: &[PathBuf],
     extras: &[(String, Vec<u8>)],
+    optional_files: &[(PathBuf, String)],
 ) -> Result<u64>
 where
     W: AsyncWrite + Unpin + Send,
@@ -271,6 +276,7 @@ where
     let dirs = dirs.to_vec();
     let skip: HashSet<PathBuf> = skip_relative_paths.iter().cloned().collect();
     let extras = extras.to_vec();
+    let optional_files = optional_files.to_vec();
 
     // Use spawn_blocking since tar operations are synchronous
     let (total_bytes, tar_data) = spawn_blocking(move || {
@@ -313,6 +319,8 @@ where
                         source: e,
                     })?;
             }
+
+            append_optional_files(&mut archive, &optional_files, &dirs)?;
 
             // Append in-memory extras after the on-disk content.
             for (archive_path, bytes) in &extras {
@@ -365,11 +373,13 @@ pub async fn archive_directories_to_file_with_plan(
     destination: &Path,
     skip_relative_paths: &[PathBuf],
     extras: &[(String, Vec<u8>)],
+    optional_files: &[(PathBuf, String)],
 ) -> Result<u64> {
     let dirs = dirs.to_vec();
     let destination = destination.to_path_buf();
     let skip: HashSet<PathBuf> = skip_relative_paths.iter().cloned().collect();
     let extras = extras.to_vec();
+    let optional_files = optional_files.to_vec();
 
     tokio::task::spawn_blocking(move || {
         let file =
@@ -406,6 +416,8 @@ pub async fn archive_directories_to_file_with_plan(
                     source,
                 })?;
         }
+
+        append_optional_files(&mut archive, &optional_files, &dirs)?;
 
         for (archive_path, bytes) in &extras {
             let mut header = tar::Header::new_gnu();
@@ -1104,9 +1116,158 @@ fn extract_with_skip_existing_and_verify<R: std::io::Read>(
     Ok(())
 }
 
-/// Walks `dir_path` recursively and appends each file to `archive` under
-/// `archive_prefix`, skipping any file whose path *relative to `dir_path`*
-/// is contained in `skip_relative_paths`.
+/// Opens a file through directory handles, rejecting symbolic links in every
+/// component below a trusted archive root. Each opened directory pins the parent
+/// used by the next `openat`,
+/// so replacing a path component cannot redirect the traversal.
+#[cfg(unix)]
+fn open_no_follow(root: &Path, path: &Path) -> std::io::Result<Option<std::fs::File>> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd};
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut parent = match std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(root)
+    {
+        Ok(parent) => parent,
+        Err(error) if matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) => {
+            return Ok(None);
+        }
+        Err(error) => return Err(error),
+    };
+    let mut components = path.components().peekable();
+    while let Some(component) = components.next() {
+        let name = match component {
+            Component::CurDir => continue,
+            Component::Normal(name) => name,
+            Component::RootDir | Component::ParentDir | Component::Prefix(_) => return Ok(None),
+        };
+        let name = CString::new(name.as_bytes())
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
+        let flags = libc::O_RDONLY
+            | libc::O_NOFOLLOW
+            | libc::O_CLOEXEC
+            | if components.peek().is_some() {
+                libc::O_DIRECTORY
+            } else {
+                libc::O_NONBLOCK
+            };
+        // SAFETY: the parent descriptor and NUL-terminated name remain valid
+        // throughout the call. No mode argument is needed without O_CREAT.
+        let fd = unsafe { libc::openat(parent.as_raw_fd(), name.as_ptr(), flags) };
+        if fd < 0 {
+            let error = std::io::Error::last_os_error();
+            return match error.raw_os_error() {
+                Some(libc::ELOOP | libc::ENOTDIR) => Ok(None),
+                _ if components.peek().is_none() => {
+                    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+                    // SAFETY: the pinned parent descriptor, NUL-terminated name,
+                    // and output storage remain valid throughout the call.
+                    let result = unsafe {
+                        libc::fstatat(
+                            parent.as_raw_fd(),
+                            name.as_ptr(),
+                            metadata.as_mut_ptr(),
+                            libc::AT_SYMLINK_NOFOLLOW,
+                        )
+                    };
+                    // SAFETY: a successful fstatat initializes the stat output.
+                    if result == 0
+                        && unsafe { metadata.assume_init() }.st_mode & libc::S_IFMT != libc::S_IFREG
+                    {
+                        Ok(None)
+                    } else {
+                        Err(error)
+                    }
+                }
+                _ => Err(error),
+            };
+        }
+        // SAFETY: openat returned a new owned descriptor, transferred exactly
+        // once to File, whose drop closes it.
+        parent = unsafe { std::fs::File::from_raw_fd(fd) };
+    }
+    Ok(Some(parent))
+}
+
+/// Optional index runs are rebuildable. Without a race-free directory-relative
+/// open, omit them rather than following a link introduced between a path check
+/// and the open. Their restored registrations are healed by rebuilding the index.
+#[cfg(not(unix))]
+#[expect(
+    clippy::unnecessary_wraps,
+    reason = "Platform implementations share the Unix fallible-open interface"
+)]
+fn open_no_follow(_root: &Path, _path: &Path) -> std::io::Result<Option<std::fs::File>> {
+    Ok(None)
+}
+
+/// Appends each `(source, archive_path)` file that still exists. A file
+/// deleted before it is opened is left out; one deleted after is archived
+/// whole, from the handle opened before. A symbolic link or anything else
+/// that is not a regular file is left out, as the directory walk leaves it.
+fn append_optional_files<W: std::io::Write>(
+    archive: &mut tar::Builder<W>,
+    files: &[(PathBuf, String)],
+    dirs: &[(PathBuf, String)],
+) -> Result<()> {
+    for (source, archive_path) in files {
+        // Configured archive directories are trusted anchors; components below
+        // them must never follow links. Ancestors of the anchor may contain
+        // platform aliases such as macOS `/var`.
+        let Some(root) = dirs
+            .iter()
+            .map(|(path, _)| path.as_path())
+            .filter(|root| source.starts_with(root))
+            .max_by_key(|root| root.components().count())
+        else {
+            continue;
+        };
+        let Ok(relative) = source.strip_prefix(root) else {
+            continue;
+        };
+        let opened = match open_no_follow(root, relative) {
+            Ok(opened) => opened,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                tracing::debug!(
+                    "Leaving {} out of the archive: it was deleted before the archive reached it",
+                    source.display()
+                );
+                continue;
+            }
+            Err(err) => {
+                return Err(ArchiveError::CreateArchive {
+                    path: source.clone(),
+                    source: err,
+                });
+            }
+        };
+        let regular = match &opened {
+            Some(file) => file
+                .metadata()
+                .map_err(|err| ArchiveError::CreateArchive {
+                    path: source.clone(),
+                    source: err,
+                })?
+                .is_file(),
+            None => false,
+        };
+        let Some(mut file) = opened.filter(|_| regular) else {
+            tracing::debug!(
+                "Leaving {} out of the archive: it is not a regular file",
+                source.display()
+            );
+            continue;
+        };
+        archive
+            .append_file(archive_path, &mut file)
+            .map_err(|source| ArchiveError::WriteArchive { source })?;
+    }
+    Ok(())
+}
+
 fn add_directory_to_archive_filtered<W: std::io::Write>(
     archive: &mut tar::Builder<W>,
     dir_path: &Path,
@@ -1280,6 +1441,174 @@ mod tests {
         Ok(())
     }
 
+    /// Without a race-free open, snapshots retain their data files while
+    /// leaving rebuildable optional index files out.
+    #[cfg(not(unix))]
+    #[tokio::test]
+    async fn optional_files_are_omitted_without_a_race_free_open() -> Result<()> {
+        let fixture = TempDir::new().expect("fixture");
+        let data = fixture.path().join("data");
+        let index = data.join("_lookup_index");
+        std::fs::create_dir_all(&index).expect("index directory");
+        std::fs::write(data.join("rows.vortex"), b"table rows").expect("data file");
+        let run = index.join("key.run");
+        std::fs::write(&run, b"optional run").expect("index file");
+        let destination = fixture.path().join("snapshot.tar");
+        archive_directories_to_file_with_plan(
+            &[(data, "data/".to_string())],
+            &destination,
+            &[PathBuf::from("_lookup_index")],
+            &[],
+            &[(run, "data/_lookup_index/key.run".to_string())],
+        )
+        .await?;
+        let bytes = std::fs::read(destination).expect("archive");
+        let entries: Vec<_> = tar::Archive::new(bytes.as_slice())
+            .entries()
+            .expect("entries")
+            .map(|entry| entry.expect("entry").path().expect("path").into_owned())
+            .collect();
+        assert_eq!(entries, vec![PathBuf::from("data/rows.vortex")]);
+        assert!(
+            bytes
+                .windows(b"table rows".len())
+                .any(|window| window == b"table rows")
+        );
+        assert!(
+            !bytes
+                .windows(b"optional run".len())
+                .any(|window| window == b"optional run")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn optional_files_outside_configured_roots_are_omitted() -> Result<()> {
+        let tmp = TempDir::new().expect("fixture");
+        let root = std::fs::canonicalize(tmp.path()).expect("canonical root");
+        let data = root.join("data");
+        let sibling = root.join("data-other");
+        std::fs::create_dir(&data).expect("data directory");
+        std::fs::create_dir(&sibling).expect("sibling directory");
+        let outside = sibling.join("secret.run");
+        std::fs::write(&outside, b"OUTSIDE_ROOT").expect("outside fixture");
+        let files = vec![
+            (outside, "data/outside.run".to_string()),
+            (
+                data.join("../data-other/secret.run"),
+                "data/parent.run".to_string(),
+            ),
+        ];
+        for dirs in [vec![], vec![(data, "data/".to_string())]] {
+            let mut archive = tar::Builder::new(Vec::new());
+            append_optional_files(&mut archive, &files, &dirs)?;
+            let bytes = archive.into_inner().expect("finish archive");
+            assert_eq!(
+                tar::Archive::new(bytes.as_slice())
+                    .entries()
+                    .expect("entries")
+                    .count(),
+                0
+            );
+            assert!(
+                !bytes
+                    .windows(b"OUTSIDE_ROOT".len())
+                    .any(|bytes| bytes == b"OUTSIDE_ROOT")
+            );
+        }
+        Ok(())
+    }
+
+    /// An optional file is archived when it exists and left out when it does
+    /// not. One that is a symbolic link is left out too, as the directory walk
+    /// leaves out links: archiving its target would copy any file `spiced`
+    /// can read into the snapshot.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn optional_files_skip_missing_files_and_symbolic_links() -> Result<()> {
+        let test_dir = TempDir::new().expect("Failed to create temp dir");
+        let root = std::fs::canonicalize(test_dir.path()).expect("canonical fixture root");
+        let data_dir = root.join("data");
+        std::fs::create_dir_all(&data_dir).expect("create data dir");
+        let secret = root.join("secret.txt");
+        std::fs::write(&secret, b"SECRET_OUTSIDE_DATA_DIR").expect("write secret");
+        std::fs::write(data_dir.join("kept.run"), b"run bytes").expect("write run");
+        std::os::unix::fs::symlink(&secret, data_dir.join("linked.run")).expect("symlink");
+        std::os::unix::fs::symlink(test_dir.path(), data_dir.join("linked_parent"))
+            .expect("parent symlink");
+        let optional = vec![
+            (data_dir.join("kept.run"), "data/kept.run".to_string()),
+            (data_dir.join("missing.run"), "data/missing.run".to_string()),
+            (data_dir.join("linked.run"), "data/linked.run".to_string()),
+            (
+                data_dir.join("linked_parent/secret.txt"),
+                "data/parent.run".to_string(),
+            ),
+        ];
+        let archive_path = test_dir.path().join("snapshot.tar");
+        archive_directories_to_file_with_plan(
+            &[(data_dir.clone(), "data/".to_string())],
+            &archive_path,
+            &[
+                PathBuf::from("kept.run"),
+                PathBuf::from("linked.run"),
+                PathBuf::from("linked_parent"),
+            ],
+            &[],
+            &optional,
+        )
+        .await?;
+
+        // The configured root may have platform aliases above it, such as
+        // `/var` on macOS. Links below that root must still be rejected.
+        let raw_data_dir = test_dir.path().join("data");
+        let raw_optional: Vec<_> = optional
+            .iter()
+            .map(|(source, path)| {
+                (
+                    raw_data_dir.join(source.strip_prefix(&data_dir).expect("fixture child")),
+                    path.clone(),
+                )
+            })
+            .collect();
+        let mut anchored = tar::Builder::new(Vec::new());
+        append_optional_files(
+            &mut anchored,
+            &raw_optional,
+            &[(raw_data_dir, "data/".to_string())],
+        )?;
+        let anchored_bytes = anchored.into_inner().expect("finish anchored archive");
+        let anchored_entries: Vec<_> = tar::Archive::new(anchored_bytes.as_slice())
+            .entries()
+            .expect("entries")
+            .map(|entry| entry.expect("entry").path().expect("path").into_owned())
+            .collect();
+        assert_eq!(anchored_entries, vec![PathBuf::from("data/kept.run")]);
+
+        let bytes = std::fs::read(&archive_path).expect("read archive");
+        let mut entries: Vec<String> = tar::Archive::new(bytes.as_slice())
+            .entries()
+            .expect("entries")
+            .map(|entry| {
+                entry
+                    .expect("entry")
+                    .path()
+                    .expect("path")
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        entries.sort();
+        assert_eq!(entries, vec!["data/kept.run".to_string()]);
+        assert!(
+            !bytes
+                .windows(b"SECRET_OUTSIDE_DATA_DIR".len())
+                .any(|window| window == b"SECRET_OUTSIDE_DATA_DIR"),
+            "a linked file's target must not be archived"
+        );
+        Ok(())
+    }
+
     /// Regression: the streaming (never-fully-in-memory) archive/extract APIs
     /// used for large snapshots must round-trip directory contents and `extras`.
     #[tokio::test]
@@ -1294,7 +1623,7 @@ mod tests {
         let dirs = vec![(data_dir.clone(), "data/".to_string())];
         let extras = vec![("meta.json".to_string(), b"{\"v\":1}".to_vec())];
         let bytes_written =
-            archive_directories_to_file_with_plan(&dirs, &archive_path, &[], &extras).await?;
+            archive_directories_to_file_with_plan(&dirs, &archive_path, &[], &extras, &[]).await?;
         assert!(bytes_written > 0);
         assert!(archive_path.exists());
 
@@ -1554,6 +1883,7 @@ mod tests {
         archive_directories_to_file_with_plan(
             &[(data_dir, "data/".to_string())],
             &archive_path,
+            &[],
             &[],
             &[],
         )

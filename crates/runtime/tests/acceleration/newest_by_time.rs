@@ -26,6 +26,11 @@ limitations under the License.
 //!   that the files span several record batches;
 //! - an append refresh, where a late row older than the stored version (inside
 //!   `refresh_append_overlap`) must not replace it, and a newer row must;
+//! - an append refresh with `retention_sql`, which removes a key whose newest version
+//!   it matches, in the first load and in a later append;
+//! - an append that Cayenne does not take with row versions, so the refresh resolves
+//!   them itself: with `cayenne_pk_conflict_detection: none`, and after every row is
+//!   deleted while the table's files remain;
 //! - a NULL `time_column`, which is older than any time;
 //! - a `localpod` child of a file-mode Cayenne parent, which must keep the same
 //!   versions as its parent.
@@ -40,11 +45,12 @@ use std::time::Duration;
 use app::AppBuilder;
 use arrow::array::AsArray;
 use runtime::Runtime;
-use spicepod::acceleration::{Acceleration, Mode, RefreshMode};
+use spicepod::acceleration::{Acceleration, Mode, RefreshMode, WriteMode};
+use spicepod::component::access::AccessMode;
 use spicepod::component::dataset::Dataset;
 use spicepod::param::Params;
 
-use crate::acceleration::{count, trigger_refresh};
+use crate::acceleration::{row_count, trigger_refresh};
 use crate::configure_test_datafusion;
 use crate::utils::{
     run_query, runtime_ready_check_with_timeout_err, test_request_context, wait_until_true,
@@ -55,6 +61,11 @@ const TABLE: &str = "events";
 /// Keys that only fill record batches, so a key's versions land in different batches,
 /// and enough of them (well over Cayenne's 4 MiB write buffer) that a load streams.
 const FILLER_KEYS: i64 = 300_000;
+
+/// One row for each filler key.
+fn filler() -> impl Iterator<Item = (i64, &'static str, &'static str)> {
+    (0..FILLER_KEYS).map(|i| (1_000 + i, "2026-01-01T00:00:00", "filler"))
+}
 
 fn modes() -> [Mode; 2] {
     [Mode::Memory, Mode::File]
@@ -79,6 +90,18 @@ async fn load(
     accel_dir: &Path,
     mode: &Mode,
     refresh: RefreshMode,
+    label: &str,
+) -> (Arc<Runtime>, bool) {
+    load_with(source, accel_dir, mode, refresh, |_| {}, label).await
+}
+
+/// [`load`], with `configure` applied to the dataset first.
+async fn load_with(
+    source: &Path,
+    accel_dir: &Path,
+    mode: &Mode,
+    refresh: RefreshMode,
+    configure: impl FnOnce(&mut Dataset),
     label: &str,
 ) -> (Arc<Runtime>, bool) {
     let mut params = HashMap::new();
@@ -108,6 +131,7 @@ async fn load(
         primary_key: Some("id".to_string()),
         ..Acceleration::default()
     });
+    configure(&mut dataset);
 
     configure_test_datafusion();
     let app = AppBuilder::new(format!("newest_by_time_{label}"))
@@ -124,9 +148,22 @@ async fn load(
     (rt, ready)
 }
 
+/// The acceleration [`load_with`] gives every dataset.
+fn acceleration(dataset: &mut Dataset) -> &mut Acceleration {
+    dataset
+        .acceleration
+        .as_mut()
+        .expect("the dataset is accelerated")
+}
+
 /// Every stored `v` for `id`, so a duplicate key shows up as two values.
 async fn values_of(rt: &Arc<Runtime>, id: i64) -> Vec<String> {
-    run_query(rt, &format!("SELECT v FROM {TABLE} WHERE id = {id}"))
+    values_in(rt, TABLE, id).await
+}
+
+/// Every stored `v` for `id` in `table`.
+async fn values_in(rt: &Arc<Runtime>, table: &str, id: i64) -> Vec<String> {
+    run_query(rt, &format!("SELECT v FROM {table} WHERE id = {id}"))
         .await
         .expect("query a key")
         .iter()
@@ -140,9 +177,7 @@ async fn values_of(rt: &Arc<Runtime>, id: i64) -> Vec<String> {
 }
 
 async fn rows(rt: &Arc<Runtime>) -> i64 {
-    count(rt, &format!("SELECT COUNT(*) FROM {TABLE}"))
-        .await
-        .expect("count rows")
+    row_count(rt, TABLE).await.expect("count rows")
 }
 
 #[tokio::test]
@@ -164,7 +199,7 @@ async fn full_refresh_keeps_the_newest_version_of_each_key() {
                     (3, "2026-01-01T00:00:00", "id3-only"),
                     (5, "2026-01-04T00:00:00", "id5-tie-a"),
                 ];
-                a.extend((0..FILLER_KEYS).map(|i| (1_000 + i, "2026-01-01T00:00:00", "filler")));
+                a.extend(filler());
                 write(source.path(), "a.csv", &csv(&a));
                 write(
                     source.path(),
@@ -265,6 +300,222 @@ async fn append_refresh_keeps_a_stored_newer_version_and_takes_a_newer_one() {
         .await;
 }
 
+/// An append with `retention_sql` loads (regression test for #14876), and Cayenne
+/// deletes the rows it matches after each key's newest version is chosen: a key whose
+/// newest version matches is gone, and an older version of it does not take its place.
+#[tokio::test]
+async fn append_refresh_with_retention_sql_keeps_the_newest_version_of_each_key() {
+    test_request_context()
+        .scope(async {
+            for mode in modes() {
+                let label = format!("append_retention_{mode:?}");
+                let source = tempfile::tempdir().expect("source dir");
+                let accel = tempfile::tempdir().expect("acceleration dir");
+
+                let mut a = vec![
+                    (1, "2026-01-10T00:00:00", "id1-newest"),
+                    (2, "2026-01-05T00:00:00", "id2-older"),
+                    (3, "2026-01-01T00:00:00", "expired"),
+                    (7, "2026-01-02T00:00:00", "id7-older"),
+                ];
+                a.extend(filler());
+                write(source.path(), "a.csv", &csv(&a));
+                write(
+                    source.path(),
+                    "b.csv",
+                    &csv(&[
+                        (1, "2026-01-08T00:00:00", "id1-older"),
+                        (2, "2026-01-07T00:00:00", "id2-newest"),
+                        (7, "2026-01-09T00:00:00", "expired"),
+                    ]),
+                );
+
+                let (rt, ready) = load_with(
+                    source.path(),
+                    accel.path(),
+                    &mode,
+                    RefreshMode::Append,
+                    |dataset| {
+                        acceleration(dataset).retention_sql =
+                            Some(format!("DELETE FROM {TABLE} WHERE v = 'expired'"));
+                    },
+                    &label,
+                )
+                .await;
+                assert!(ready, "{label}: the dataset should load");
+                assert_eq!(values_of(&rt, 1).await, ["id1-newest"], "{label}: key 1");
+                assert_eq!(values_of(&rt, 2).await, ["id2-newest"], "{label}: key 2");
+                assert!(
+                    wait_until_true(Duration::from_mins(1), || async {
+                        values_of(&rt, 3).await.is_empty() && values_of(&rt, 7).await.is_empty()
+                    })
+                    .await,
+                    "{label}: retention never removed the expired keys: key 3 {:?}, key 7 {:?}",
+                    values_of(&rt, 3).await,
+                    values_of(&rt, 7).await
+                );
+                assert_eq!(rows(&rt).await, 2 + FILLER_KEYS, "{label}: initial load");
+
+                write(
+                    source.path(),
+                    "c.csv",
+                    &csv(&[
+                        (2, "2026-01-12T00:00:00", "expired"),
+                        (8, "2026-01-11T00:00:00", "new-key"),
+                    ]),
+                );
+                trigger_refresh(&rt, TABLE).await.expect("refresh");
+                assert!(
+                    wait_until_true(Duration::from_mins(1), || async {
+                        values_of(&rt, 8).await == ["new-key"] && values_of(&rt, 2).await.is_empty()
+                    })
+                    .await,
+                    "{label}: after the append, key 8 is {:?} and key 2 (newest version expired) is {:?}",
+                    values_of(&rt, 8).await,
+                    values_of(&rt, 2).await
+                );
+                assert_eq!(rows(&rt).await, 2 + FILLER_KEYS, "{label}: after the append");
+            }
+        })
+        .await;
+}
+
+/// With `cayenne_pk_conflict_detection: none` the table resolves no keys, so it does
+/// not take an append's first load with row versions and the refresh resolves them
+/// before writing: the dataset loads, and so does a later append (regression test for
+/// #14883). The source's keys are unique, as that setting requires.
+#[tokio::test]
+async fn an_append_with_pk_conflict_detection_none_loads() {
+    test_request_context()
+        .scope(async {
+            for mode in modes() {
+                let label = format!("append_pk_conflict_detection_none_{mode:?}");
+                let source = tempfile::tempdir().expect("source dir");
+                let accel = tempfile::tempdir().expect("acceleration dir");
+                write(
+                    source.path(),
+                    "a.csv",
+                    &csv(&[
+                        (1, "2026-01-10T00:00:00", "id1"),
+                        (2, "2026-01-05T00:00:00", "id2"),
+                    ]),
+                );
+                write(
+                    source.path(),
+                    "b.csv",
+                    &csv(&[(3, "2026-01-08T00:00:00", "id3")]),
+                );
+
+                let (rt, ready) = load_with(
+                    source.path(),
+                    accel.path(),
+                    &mode,
+                    RefreshMode::Append,
+                    |dataset| {
+                        let acceleration = acceleration(dataset);
+                        let mut params = acceleration
+                            .params
+                            .as_ref()
+                            .map(Params::as_string_map)
+                            .unwrap_or_default();
+                        params.insert(
+                            "cayenne_pk_conflict_detection".to_string(),
+                            "none".to_string(),
+                        );
+                        acceleration.params = Some(Params::from_string_map(params));
+                    },
+                    &label,
+                )
+                .await;
+                assert!(ready, "{label}: the dataset should load");
+                assert_eq!(values_of(&rt, 1).await, ["id1"], "{label}: key 1");
+                assert_eq!(values_of(&rt, 2).await, ["id2"], "{label}: key 2");
+                assert_eq!(values_of(&rt, 3).await, ["id3"], "{label}: key 3");
+                assert_eq!(rows(&rt).await, 3, "{label}: initial load");
+
+                write(
+                    source.path(),
+                    "c.csv",
+                    &csv(&[(4, "2026-01-11T00:00:00", "id4")]),
+                );
+                trigger_refresh(&rt, TABLE).await.expect("refresh");
+                assert!(
+                    wait_until_true(Duration::from_mins(1), || async {
+                        values_of(&rt, 4).await == ["id4"]
+                    })
+                    .await,
+                    "{label}: the append never loaded key 4: {:?}",
+                    values_of(&rt, 4).await
+                );
+                assert_eq!(rows(&rt).await, 4, "{label}: after the append");
+            }
+        })
+        .await;
+}
+
+/// Deleting every row leaves a file-mode table's files in place, so the table holds
+/// rows although none is visible, and it does not take an append with row versions.
+/// The next append, which has no high-water mark and reads the whole source, must be
+/// resolved by the refresh, or every refresh fails.
+#[tokio::test]
+async fn an_append_after_every_row_is_deleted_reloads_the_source() {
+    test_request_context()
+        .scope(async {
+            let label = "append_after_delete_File";
+            let source = tempfile::tempdir().expect("source dir");
+            let accel = tempfile::tempdir().expect("acceleration dir");
+            // Enough rows that the load is written to data files, not inline rows a
+            // delete would rewrite away.
+            let mut a = vec![(1, "2026-01-10T00:00:00", "id1")];
+            a.extend(filler());
+            write(source.path(), "a.csv", &csv(&a));
+
+            let (rt, ready) = load_with(
+                source.path(),
+                accel.path(),
+                &Mode::File,
+                RefreshMode::Append,
+                |dataset| {
+                    dataset.access = AccessMode::ReadWrite;
+                    acceleration(dataset).write_mode = WriteMode::Acceleration;
+                },
+                label,
+            )
+            .await;
+            assert!(ready, "{label}: the dataset should load");
+            assert_eq!(rows(&rt).await, 1 + FILLER_KEYS, "{label}: initial load");
+
+            // A predicate the primary-key fast path cannot turn into a key set, so the
+            // delete marks rows in the files rather than replacing them.
+            run_query(&rt, &format!("DELETE FROM {TABLE} WHERE id % 2 IN (0, 1)"))
+                .await
+                .expect("delete every row");
+            assert_eq!(rows(&rt).await, 0, "{label}: every row deleted");
+
+            write(
+                source.path(),
+                "b.csv",
+                &csv(&[(2, "2026-01-12T00:00:00", "id2")]),
+            );
+            trigger_refresh(&rt, TABLE).await.expect("refresh");
+            assert!(
+                wait_until_true(Duration::from_mins(1), || async {
+                    values_of(&rt, 2).await == ["id2"]
+                })
+                .await,
+                "{label}: the append never loaded key 2: {:?}",
+                values_of(&rt, 2).await
+            );
+            assert_eq!(values_of(&rt, 1).await, ["id1"], "{label}: key 1 reloaded");
+            assert_eq!(
+                rows(&rt).await,
+                2 + FILLER_KEYS,
+                "{label}: after the append"
+            );
+        })
+        .await;
+}
+
 #[tokio::test]
 async fn a_null_time_column_is_the_oldest_version() {
     test_request_context()
@@ -303,21 +554,46 @@ async fn a_null_time_column_is_the_oldest_version() {
         .await;
 }
 
-/// Every stored `v` for `id` in `table`.
-async fn values_in(rt: &Arc<Runtime>, table: &str, id: i64) -> Vec<String> {
-    run_query(rt, &format!("SELECT v FROM {table} WHERE id = {id}"))
-        .await
-        .expect("query a key")
-        .iter()
-        .flat_map(|batch| {
-            let values = batch.column(0).as_string::<i32>();
-            (0..batch.num_rows())
-                .map(|row| values.value(row).to_string())
-                .collect::<Vec<_>>()
+/// The same, in a write too large to buffer, so a file-mode refresh resolves its keys
+/// through the streaming path, which carries each surviving row's time, a NULL one
+/// included, in its own columns.
+#[tokio::test]
+async fn a_null_time_column_is_the_oldest_version_in_a_streamed_write() {
+    test_request_context()
+        .scope(async {
+            for mode in modes() {
+                let label = format!("null_streamed_{mode:?}");
+                let source = tempfile::tempdir().expect("source dir");
+                let accel = tempfile::tempdir().expect("acceleration dir");
+                let mut source_rows = vec![
+                    (1, "", "only-null"),
+                    (2, "2026-01-03T00:00:00", "timed"),
+                    (2, "", "null"),
+                    (3, "", "null"),
+                    (3, "2026-01-01T00:00:00", "timed"),
+                ];
+                source_rows.extend(filler());
+                write(source.path(), "a.csv", &csv(&source_rows));
+
+                let (rt, ready) = load(
+                    source.path(),
+                    accel.path(),
+                    &mode,
+                    RefreshMode::Full,
+                    &label,
+                )
+                .await;
+                assert!(ready, "{label}: a NULL time_column loads");
+                assert_eq!(values_of(&rt, 1).await, ["only-null"], "{label}: key 1");
+                assert_eq!(values_of(&rt, 2).await, ["timed"], "{label}: key 2");
+                assert_eq!(values_of(&rt, 3).await, ["timed"], "{label}: key 3");
+                assert_eq!(rows(&rt).await, 3 + FILLER_KEYS, "{label}: one row per key");
+            }
         })
-        .collect()
+        .await;
 }
 
+/// Every stored `v` for `id` in `table`.
 /// Refresh `table` and wait for the refresh to apply.
 async fn refresh_and_wait(rt: &Arc<Runtime>, table: &str) {
     let waiter = rt

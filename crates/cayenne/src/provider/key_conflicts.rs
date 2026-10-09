@@ -249,7 +249,11 @@ impl KeyResolver {
             digests.push(self.digests(&versioned.batch)?);
         }
         let rows: usize = digests.iter().map(Vec::len).sum();
-        let version = |(index, row): (usize, usize)| batches[index].times.value(row);
+        // A NULL time is `None`, older than any time.
+        let version = |(index, row): (usize, usize)| {
+            let times = &batches[index].times;
+            (!times.is_null(row)).then(|| times.value(row))
+        };
         let mut kept: HashMap<u128, (usize, usize), PrehashedBuildHasher> =
             HashMap::with_capacity_and_hasher(rows, PrehashedBuildHasher);
         let mut counts = [0_u64; SupersededReason::ALL.len()];
@@ -374,6 +378,24 @@ mod tests {
             .resolve_batch(&batch(&[(1, "a"), (2, "b"), (1, "c")]))
             .expect("resolved");
         assert_eq!(rows(&[resolved]), owned(&[(2, "b"), (1, "c")]));
+    }
+
+    /// A NULL time is older than [`i64::MIN`], the earliest time a version can hold,
+    /// so a later copy with a NULL time does not replace it.
+    #[test]
+    fn a_null_time_is_older_than_the_minimum_time() {
+        let versioned = |rows: &[(i64, &str)], time: Option<i64>| VersionedBatch {
+            batch: batch(rows),
+            times: std::iter::repeat_n(time, rows.len()).collect::<Int64Array>(),
+        };
+        let kept = resolver()
+            .resolve_by_version(vec![
+                versioned(&[(1, "min")], Some(i64::MIN)),
+                versioned(&[(1, "null")], None),
+            ])
+            .expect("resolves");
+        let batches: Vec<RecordBatch> = kept.into_iter().map(|v| v.batch).collect();
+        assert_eq!(rows(&batches), owned(&[(1, "min")]));
     }
 
     #[test]

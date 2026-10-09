@@ -960,22 +960,24 @@ impl Default for RuntimeBuilder {
 )]
 async fn build_http_rate_control_registry(
     source_rate_control: Option<&SpicepodSourceRateControl>,
-    _runtime_state: Option<&spicepod::component::runtime::RuntimeState>,
+    runtime_state: Option<&spicepod::component::runtime::RuntimeState>,
     secrets: Arc<RwLock<Secrets>>,
     io_runtime: Handle,
 ) -> Arc<dataconnector::http_rate_control::HttpRateControlRegistry> {
-    let _ = (&secrets, &io_runtime);
-    if source_rate_control
-        .and_then(|config| config.state_location.as_ref())
-        .is_some()
-    {
-        tracing::warn!(
-            "Persisted HTTP governor rate-control state requires a Spice.ai Enterprise build. Falling back to in-memory HTTP rate-control state."
+    let _ = (source_rate_control, &secrets, &io_runtime);
+    // `runtime.state` also serves the scheduler and results-cache warmup, so
+    // setting it is not a request for cluster rate control: no warning.
+    if runtime_state.is_some() {
+        tracing::debug!(
+            "Cluster HTTP rate control requires a Spice.ai Enterprise build. HTTP rate limits apply to each instance on its own."
         );
     }
     Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default())
 }
 
+/// Persists HTTP rate-control state at `runtime.state.location`, so instances
+/// that share that location share each origin's request budget. Without
+/// `runtime.state`, rate control stays in memory.
 #[cfg(feature = "rate-control")]
 async fn build_http_rate_control_registry(
     source_rate_control: Option<&SpicepodSourceRateControl>,
@@ -983,23 +985,19 @@ async fn build_http_rate_control_registry(
     secrets: Arc<RwLock<Secrets>>,
     io_runtime: Handle,
 ) -> Arc<dataconnector::http_rate_control::HttpRateControlRegistry> {
-    let Some((state_location, params, refresh_interval, config_path)) =
-        resolved_rate_control_persist(source_rate_control, runtime_state)
-    else {
+    let Some(state) = runtime_state else {
         return Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default());
     };
 
-    let Some(refresh_interval) =
-        parse_rate_control_refresh_interval(&refresh_interval, config_path)
-    else {
+    let Some(refresh_interval) = rate_control_refresh_interval(source_rate_control) else {
         return Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default());
     };
 
     match crate::object_store_state::build_object_store(
         secrets,
         io_runtime,
-        &state_location,
-        params.as_ref(),
+        &state.location,
+        state.params.as_ref(),
         "rate-control state",
     )
     .await
@@ -1007,7 +1005,7 @@ async fn build_http_rate_control_registry(
         Ok((store, base_prefix)) => {
             tracing::info!(
                 "Initialized persisted HTTP governor rate-control state with location: {}",
-                state_location
+                state.location
             );
             let registry = Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::with_persisted_governor_state(
                 store,
@@ -1026,60 +1024,29 @@ async fn build_http_rate_control_registry(
     }
 }
 
+/// `runtime.source_rate_control.refresh_interval`, or its default when the
+/// section is absent. Logs and returns `None` when the value is not a positive
+/// duration.
 #[cfg(feature = "rate-control")]
-fn resolved_rate_control_persist(
+fn rate_control_refresh_interval(
     source_rate_control: Option<&SpicepodSourceRateControl>,
-    runtime_state: Option<&spicepod::component::runtime::RuntimeState>,
-) -> Option<(
-    String,
-    Option<spicepod::param::Params>,
-    String,
-    &'static str,
-)> {
-    if let Some(config) = source_rate_control {
-        if let Some(location) = config.state_location.clone() {
-            return Some((
-                location,
-                config.params.clone(),
-                config.refresh_interval.clone(),
-                "runtime.source_rate_control",
-            ));
-        }
-        if let Some(state) = runtime_state {
-            return Some((
-                state.location.clone(),
-                config.params.clone().or_else(|| state.params.clone()),
-                config.refresh_interval.clone(),
-                "runtime.state",
-            ));
-        }
-        return None;
-    }
-    runtime_state.map(|state| {
-        (
-            state.location.clone(),
-            state.params.clone(),
-            spicepod::component::runtime::default_rate_control_refresh_interval(),
-            "runtime.state",
-        )
-    })
-}
-
-#[cfg(feature = "rate-control")]
-fn parse_rate_control_refresh_interval(
-    refresh_interval: &str,
-    config_path: &str,
 ) -> Option<Duration> {
-    match fundu::parse_duration(refresh_interval) {
+    let refresh_interval = source_rate_control.map_or_else(
+        spicepod::component::runtime::default_rate_control_refresh_interval,
+        |config| config.refresh_interval.clone(),
+    );
+    match fundu::parse_duration(&refresh_interval) {
         Ok(parsed_refresh_interval) if parsed_refresh_interval.is_zero() => {
             tracing::error!(
-                "Invalid {config_path}.refresh_interval '{refresh_interval}': value must be greater than 0"
+                "Invalid runtime.source_rate_control.refresh_interval '{refresh_interval}': value must be greater than 0"
             );
             None
         }
         Ok(parsed_refresh_interval) => Some(parsed_refresh_interval),
         Err(error) => {
-            tracing::error!("Invalid {config_path}.refresh_interval '{refresh_interval}': {error}");
+            tracing::error!(
+                "Invalid runtime.source_rate_control.refresh_interval '{refresh_interval}': {error}"
+            );
             None
         }
     }
@@ -2268,14 +2235,52 @@ mod test {
     #[cfg(not(windows))]
     #[test]
     fn a_cayenne_acceleration_reserves_its_write_path_state() {
-        let app = Arc::new(
+        const MIB: u64 = 1024 * 1024;
+        let inline_admission = u64::try_from(cayenne::metadata::DEFAULT_INLINE_MAX_BYTES)
+            .expect("the inline entry cap fits in u64")
+            + u64::try_from(cayenne::metadata::DEFAULT_INLINE_MAX_BUFFER_BYTES)
+                .expect("the inline buffer cap fits in u64");
+
+        // A full-refresh table (postgres leaves `refresh_mode` unset, which is
+        // `full`) is a whole-table replace: it reserves the inline-admission pair
+        // and no CDC write path.
+        let full = Arc::new(
             app::AppBuilder::new("test")
                 .with_dataset(dataset_with_cayenne("accelerated", None))
                 .build(),
         );
+        assert_cayenne_reservation(&full, inline_admission);
+
+        // A `changes` table also holds the CDC write path: the keyset cache (set
+        // explicitly to 64 MiB so the figure does not depend on the host), the
+        // default 128 MiB coalesce buffer and the default 8 MiB inline memtable.
+        let mut changes = dataset_with_cayenne("changes", None);
+        let acceleration = changes
+            .acceleration
+            .as_mut()
+            .expect("the dataset has a Cayenne acceleration");
+        acceleration.refresh_mode = Some(spicepod::acceleration::RefreshMode::Changes);
+        acceleration.params = Some(spicepod::param::Params::from_string_map(
+            [("cayenne_pk_keyset_cache_mb".to_string(), "64".to_string())]
+                .into_iter()
+                .collect(),
+        ));
+        let changes = Arc::new(app::AppBuilder::new("test").with_dataset(changes).build());
+        assert_cayenne_reservation(&changes, inline_admission + 64 * MIB + 128 * MIB + 8 * MIB);
+    }
+
+    /// Asserts the reservation for `app` is `write_path` plus the process-wide
+    /// segment cache. That cache is installed at most once per process, so the
+    /// estimate, which reads it between the two reads here, matches one of them.
+    #[cfg(not(windows))]
+    fn assert_cayenne_reservation(app: &Arc<app::App>, write_path: u64) {
+        let cache_before = vortex_datafusion::process_segment_cache_capacity_bytes().unwrap_or(0);
+        let estimate = estimate_cayenne_reservation_bytes(Some(app), &HashMap::new());
+        let cache_after = vortex_datafusion::process_segment_cache_capacity_bytes().unwrap_or(0);
         assert!(
-            estimate_cayenne_reservation_bytes(Some(&app), &HashMap::new()) > 0,
-            "a Cayenne table reserves against the query pool"
+            estimate == write_path + cache_before || estimate == write_path + cache_after,
+            "expected {write_path} bytes of write-path state plus the segment cache \
+             ({cache_before} or {cache_after} bytes), got {estimate}"
         );
     }
 

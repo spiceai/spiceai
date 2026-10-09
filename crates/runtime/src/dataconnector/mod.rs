@@ -56,6 +56,7 @@ pub const SCYLLADB_DATACONNECTOR: &str = "scylladb"; // const needs to be access
 /// The cargo feature that builds the `ScyllaDB` data connector into `spiced`.
 pub const SCYLLADB_FEATURE: &str = "scylladb";
 pub mod deferred;
+pub mod reconnecting;
 // ducklake: moved to crates/data-connectors/connector-ducklake
 // gcs: moved to crates/data-connectors/connector-gcs
 // glue: registration moved to crates/data-connectors/connector-glue; module kept for catalog connector

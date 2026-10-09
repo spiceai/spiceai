@@ -55,7 +55,6 @@ use futures::TryStreamExt;
 use object_store::client::{HttpError, HttpErrorKind};
 use object_store::{ObjectMeta, ObjectStore, ObjectStoreExt, path::Path};
 use snafu::prelude::*;
-use std::time::Duration;
 use url::Url;
 #[cfg(not(windows))]
 use {
@@ -96,22 +95,98 @@ const SCHEMA_SOURCE_PATH_FILE_SCAN_LIMIT: usize = 10_000;
 /// publish an incomplete schema for that full scan.
 const ORC_COLLECTION_SCHEMA_INFER_FILE_LIMIT: usize = 10_000;
 
+/// The listing options and file schema a dataset's listing table is built from, as
+/// [`ListingTableConnector::listing_table_template`] resolves them.
+///
+/// [`Self::build`] builds the table over any path from them, so a connector that reads a
+/// dataset from more than one location over its lifetime exposes the same schema at each.
 #[derive(Clone, Debug)]
-/// Wraps a `ListingTable` to short-circuit broad object-store listings when a
-/// query filters on listing metadata, and to apply format-selected Hive
+pub struct ListingTableTemplate {
+    options: ListingOptions,
+    /// The columns physically stored in the data files, without partition or metadata
+    /// columns.
+    schema: SchemaRef,
+    object_store: Arc<dyn ObjectStore>,
+    /// Listing extension from [`ListingTableConnector::get_file_format_and_extension`].
+    extension: String,
+}
+
+impl ListingTableTemplate {
+    /// The columns physically stored in the data files, without partition or metadata
+    /// columns.
+    #[must_use]
+    pub fn file_schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    /// Builds the dataset's table over `table_path`: a [`ListingTable`] with a
+    /// file-statistics cache, wrapped for `location` pruning and format-selected listing when
+    /// the dataset uses either.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the listing options do not fit the file schema, such as a metadata
+    /// column whose name a file column already uses.
+    pub fn build(&self, table_path: ListingTableUrl) -> DFResult<Arc<dyn TableProvider>> {
+        let table = Arc::new(self.listing_table(table_path.clone())?);
+        Ok(self.wrap(table, table_path))
+    }
+
+    fn listing_table(&self, table_path: ListingTableUrl) -> DFResult<ListingTable> {
+        let config = ListingTableConfig::new(table_path)
+            .with_listing_options(self.options.clone())
+            .with_schema(Arc::clone(&self.schema));
+
+        // Attach a file-statistics cache. With `collect_stat = true` (the
+        // DataFusion default), resolving a scan's statistics parses every
+        // file's Parquet footer; without a cache, `ListingTable` re-parses all
+        // footers on every plan. That makes stat-only queries (e.g. an
+        // unfiltered `COUNT(*)`, which the `AggregateStatistics` rule answers
+        // purely from statistics) scale linearly with file count on each query.
+        // The stock DataFusion `CREATE EXTERNAL TABLE` path wires this same
+        // cache; we mirror it so per-file footer stats are reused across
+        // queries. The cache invalidates per file on `ObjectMeta` change, so
+        // refreshing datasets still pick up new data.
+        Ok(ListingTable::try_new(config)?.with_cache(Some(Arc::new(
+            DefaultCache::<TableScopedPath, CachedFileMetadata>::new(
+                DEFAULT_FILE_STATISTICS_MEMORY_LIMIT,
+            )
+            .with_name("DefaultFileStatisticsCache"),
+        ))))
+    }
+
+    fn wrap(
+        &self,
+        table: Arc<ListingTable>,
+        table_path: ListingTableUrl,
+    ) -> Arc<dyn TableProvider> {
+        let has_location_metadata = table.options().metadata_cols.iter().any(|c| {
+            matches!(
+                c,
+                datafusion_datasource::metadata::MetadataColumn::Location(_)
+            )
+        });
+
+        if has_location_metadata || format_selected_data_suffix(&self.extension).is_some() {
+            Arc::new(LocationPruningListingTable::new(
+                table,
+                Arc::clone(&self.object_store),
+                table_path,
+                Arc::clone(&self.schema),
+                self.extension.as_str(),
+            ))
+        } else {
+            table
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+/// Wraps a `ListingTable` to short-circuit broad object-store listings when
+/// queries include `location` predicates, and to apply format-selected Hive
 /// listing (`*.orc` / `*.parquet`) so extensionless data objects are scanned
 /// without picking up job-marker files.
-///
-/// Two metadata fast-paths avoid opening files that a predicate already
-/// excludes from the object-store listing alone:
-/// - a `_location` predicate heads only the named objects (see
-///   [`extract_location_predicates`]);
-/// - a `_last_modified` bound (e.g. an `append` refresh's
-///   `_last_modified > <watermark>`) keeps only the objects whose
-///   [`ObjectMeta::last_modified`] satisfies the bound (see
-///   [`extract_last_modified_predicate`]), so a refresh with no new data does
-///   work proportional to new files rather than re-reading every object.
-struct MetadataPruningListingTable {
+struct LocationPruningListingTable {
     inner: Arc<ListingTable>,
     object_store: Arc<dyn ObjectStore>,
     table_path: ListingTableUrl,
@@ -127,7 +202,7 @@ struct MetadataPruningListingTable {
     listing_extension: String,
 }
 
-impl MetadataPruningListingTable {
+impl LocationPruningListingTable {
     fn new(
         inner: Arc<ListingTable>,
         object_store: Arc<dyn ObjectStore>,
@@ -240,49 +315,6 @@ impl MetadataPruningListingTable {
         );
 
         let files = self.format_selected_listing_files(state).await?;
-        self.scan_partitioned_files(state, files, projection, limit)
-            .await
-    }
-
-    /// Lists the objects under the table path and keeps only those whose
-    /// [`ObjectMeta::last_modified`] satisfies every `_last_modified` bound,
-    /// then scans the survivors.
-    ///
-    /// Each object's `_last_modified` value is a single timestamp known from
-    /// the listing (`meta.last_modified.timestamp_micros()`), so a bound prunes
-    /// the file exactly — an excluded object cannot contain a row that passes
-    /// the residual `FilterExec`. The comparison is done in nanoseconds to match
-    /// how `DataFusion` materializes the metadata column
-    /// (`Timestamp(Microsecond, "UTC")`, cast to nanoseconds by the refresh
-    /// predicate); scaling both sides by 1000 preserves the ordering.
-    async fn scan_last_modified_pruned(
-        &self,
-        state: &dyn Session,
-        bounds: &[LastModifiedBound],
-        projection: Option<&Vec<usize>>,
-        limit: Option<usize>,
-    ) -> DFResult<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
-        state.runtime_env().register_object_store(
-            self.object_store_url().as_ref(),
-            Arc::clone(&self.object_store),
-        );
-
-        let mut file_stream = self
-            .table_path
-            .list_all_files(state, self.object_store.as_ref(), "")
-            .await?;
-
-        let mut files: Vec<PartitionedFile> = Vec::new();
-        while let Some(meta) = file_stream.try_next().await? {
-            if !listed_object_is_data_file(&meta, &self.listing_extension) {
-                continue;
-            }
-            if !last_modified_meta_passes(&meta, bounds) {
-                continue;
-            }
-            files.push(self.partitioned_file_for_meta(meta)?);
-        }
-
         self.scan_partitioned_files(state, files, projection, limit)
             .await
     }
@@ -428,7 +460,7 @@ fn hive_partition_value_type_error(
 
 #[deny(clippy::missing_trait_methods)]
 #[async_trait]
-impl TableProvider for MetadataPruningListingTable {
+impl TableProvider for LocationPruningListingTable {
     fn schema(&self) -> Arc<Schema> {
         self.inner.schema()
     }
@@ -453,26 +485,44 @@ impl TableProvider for MetadataPruningListingTable {
                 filters.len()
             ]);
         }
-        // When `scan` takes the `_location` fast path or prunes the listing by
-        // `_last_modified`, every predicate stays a residual `FilterExec` above
-        // the pruned scan. Both paths only choose which objects to open: they
-        // apply no other predicate, and the inner listing reports a partition
-        // predicate `Exact`, which would drop it from the plan and return rows
-        // the query excluded. `Inexact` keeps the row-level filter so every
-        // predicate is re-enforced, while the prune still removes the files
-        // that cannot match. `scan` receives `&[Expr]`, so mirror the same
-        // predicate detection here over the borrowed slice this method is
-        // given.
-        let owned_filters: Vec<datafusion_expr::Expr> = filters.iter().copied().cloned().collect();
-        if extract_location_predicates(&owned_filters).is_some()
-            || extract_last_modified_predicate(&owned_filters).is_some()
-        {
-            return Ok(vec![
-                datafusion_expr::TableProviderFilterPushDown::Inexact;
-                filters.len()
-            ]);
-        }
-        self.inner.supports_filters_pushdown(filters)
+
+        let inner_results = self.inner.supports_filters_pushdown(filters)?;
+
+        // Names of the configured metadata columns other than `_location` (i.e.
+        // `_last_modified`, `_size`) — the ones the head()-based fast path prunes on.
+        let options = self.inner.options();
+        let non_location_metadata: Vec<&str> = options
+            .metadata_cols
+            .iter()
+            .map(datafusion_datasource::metadata::MetadataColumn::name)
+            .filter(|name| *name != "_location")
+            .collect();
+
+        // `scan` applies exactly two kinds of metadata predicate before opening a file, so
+        // only those may be reported `Exact` (which drops the `FilterExec` above the scan):
+        //   - `_location`: the fast path head()s exactly those keys;
+        //   - `_last_modified`/`_size`: the fast path evaluates them against each head()ed
+        //     `ObjectMeta`, and the fall-through path prunes on `inner`'s listing.
+        // Everything else (partition and data columns, or a single predicate mixing
+        // `_location` with another metadata column) is forced `Inexact` so DataFusion keeps
+        // re-applying it above the scan.
+        Ok(filters
+            .iter()
+            .zip(inner_results)
+            .map(|(filter, inner_result)| {
+                let refs = filter.column_refs();
+                let location_only = refs.iter().all(|c| c.name == "_location");
+                let non_location_metadata_only = !refs.is_empty()
+                    && refs
+                        .iter()
+                        .all(|c| non_location_metadata.contains(&c.name.as_str()));
+                if location_only || non_location_metadata_only {
+                    inner_result
+                } else {
+                    datafusion_expr::TableProviderFilterPushDown::Inexact
+                }
+            })
+            .collect())
     }
 
     fn constraints(&self) -> Option<&Constraints> {
@@ -486,23 +536,22 @@ impl TableProvider for MetadataPruningListingTable {
         filters: &[datafusion_expr::Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        // The planner hands a pushed-down conjunction it has proven unsatisfiable to
+        // `scan` as a `false` (or NULL) literal: `_location = 'a' AND _location = 'b'`
+        // arrives as `[false]`. No row passes it, so answer with an empty scan instead
+        // of listing the whole prefix only to prune every file.
+        if filters.iter().any(|filter| {
+            matches!(
+                filter,
+                datafusion_expr::Expr::Literal(ScalarValue::Boolean(None | Some(false)), _)
+            )
+        }) {
+            return self
+                .scan_partitioned_files(state, Vec::new(), projection, limit)
+                .await;
+        }
+
         let Some(locations) = extract_location_predicates(filters) else {
-            // No `_location` predicate. Prune the listing by any `_last_modified`
-            // bound before opening files, so an `append` refresh that added no
-            // new objects never re-reads (and, for `jsonl.gz`, re-decompresses)
-            // the whole source. Correctness is preserved by the residual
-            // `FilterExec` this table reports via `supports_filters_pushdown`.
-            if self.inner.options().metadata_cols.iter().any(|column| {
-                matches!(
-                    column,
-                    datafusion_datasource::metadata::MetadataColumn::LastModified
-                )
-            }) && let Some(bounds) = extract_last_modified_predicate(filters)
-            {
-                return self
-                    .scan_last_modified_pruned(state, &bounds, projection, limit)
-                    .await;
-            }
             if self.uses_format_selected_listing() {
                 return self
                     .scan_format_selected_listing(state, projection, limit)
@@ -518,10 +567,28 @@ impl TableProvider for MetadataPruningListingTable {
             Arc::clone(&self.object_store),
         );
 
-        // A combined `_location = x AND _last_modified > w` heads each named
-        // object anyway, so drop the ones the mtime bound excludes before they
-        // are opened.
-        let last_modified_bounds = extract_last_modified_predicate(filters);
+        // Metadata predicates (`_location`, `_last_modified`, `_size`) are computable from each
+        // object's `ObjectMeta`, so evaluate them against the head()ed metadata and skip a file
+        // before opening it (e.g. `_location = X AND _last_modified > W` head()s X and never
+        // GETs it when its mtime fails the bound). `supports_filters_pushdown` reports these
+        // `Exact`, so every one must be enforced here.
+        //
+        // `locations` is only a candidate set: it unions the values of every conjunct, which
+        // is a superset of the true matches (`_location = 'A' AND _location = 'B'` heads both
+        // and keeps neither). `_location` predicates that the extractor does not understand,
+        // such as `LIKE`, are likewise enforced by this check.
+        let metadata_cols = &self.inner.options().metadata_cols;
+        let metadata_filters: Vec<datafusion_expr::Expr> = filters
+            .iter()
+            .filter(|f| {
+                let refs = f.column_refs();
+                !refs.is_empty()
+                    && refs
+                        .iter()
+                        .all(|c| metadata_cols.iter().any(|m| m.name() == c.name))
+            })
+            .cloned()
+            .collect();
 
         let mut files: Vec<PartitionedFile> = Vec::with_capacity(locations.len());
 
@@ -568,11 +635,17 @@ impl TableProvider for MetadataPruningListingTable {
                 continue;
             }
 
-            if let Some(bounds) = last_modified_bounds.as_deref()
-                && !last_modified_meta_passes(&meta, bounds)
-            {
+            // Prune by the metadata predicates before opening the object; a file that
+            // fails one is never GETed.
+            let Some(meta) = datafusion::datasource::listing::helpers::filter_by_metadata(
+                meta,
+                &metadata_filters,
+                metadata_cols,
+                state.execution_props(),
+            )?
+            else {
                 continue;
-            }
+            };
 
             files.push(self.partitioned_file_for_meta(meta)?);
         }
@@ -756,238 +829,16 @@ fn extract_location_predicates(filters: &[datafusion_expr::Expr]) -> Option<Vec<
         return None;
     }
 
+    // Drop repeated literals (order preserved) so a file is never scanned twice.
+    let mut seen = std::collections::HashSet::new();
+    values.retain(|v| seen.insert(v.clone()));
+
     if values.is_empty() {
         None
     } else {
         Some(values)
     }
 }
-
-/// A single comparison against the `_last_modified` metadata column, with the
-/// threshold held as a [`Duration`] since the Unix epoch. An object is kept when
-/// its last-modified time satisfies the comparison.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct LastModifiedBound {
-    op: datafusion_expr::Operator,
-    threshold: Duration,
-}
-
-/// True when a cast target keeps the `_last_modified` value exactly.
-///
-/// The metadata column is `Timestamp(Microsecond, "UTC")`, and pruning compares
-/// in nanoseconds. A cast to microseconds or nanoseconds preserves that value
-/// (identity or an exact `* 1000`), so pruning stays equivalent to the row
-/// predicate. A coarser target (`Second`, `Millisecond`) or a non-timestamp
-/// target truncates the value, which would let, for example,
-/// `CAST(_last_modified AS Timestamp(Second)) = 200s` prune an object at 200.5s
-/// whose row still matches — so such casts are not prunable.
-fn cast_preserves_last_modified_precision(data_type: &DataType) -> bool {
-    use arrow_schema::TimeUnit;
-    matches!(
-        data_type,
-        DataType::Timestamp(TimeUnit::Microsecond | TimeUnit::Nanosecond, _)
-    )
-}
-
-/// True when `expr` is the `_last_modified` column, possibly wrapped in a
-/// precision-preserving cast. An `append` refresh emits
-/// `CAST(_last_modified AS Timestamp(ns, tz)) > …`; `DataFusion`'s
-/// `unwrap_cast_in_comparison` rule may instead present the bare column with a
-/// cast literal, so both forms are accepted. A coarsening cast is rejected (see
-/// [`cast_preserves_last_modified_precision`]) so it cannot build a prunable
-/// bound; the residual filter still enforces it.
-fn is_last_modified_ref(expr: &Expr) -> bool {
-    match expr {
-        Expr::Column(column) => column.name == "_last_modified",
-        Expr::Cast(Cast { expr, field }) | Expr::TryCast(TryCast { expr, field }) => {
-            cast_preserves_last_modified_precision(field.data_type()) && is_last_modified_ref(expr)
-        }
-        _ => false,
-    }
-}
-
-/// True when any subexpression references the `_last_modified` column. Used to
-/// refuse pruning when the column appears under `OR`/`NOT`, where a single
-/// disjunct is not a necessary condition and pruning on it would drop objects
-/// whose rows must still be scanned.
-fn references_last_modified(expr: &datafusion_expr::Expr) -> bool {
-    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
-    let mut found = false;
-    // `apply` visits `expr` and every descendant; `is_last_modified_ref` also
-    // matches a cast wrapping the column, so either the cast or the bare column
-    // node trips the flag.
-    let _ = expr.apply(|node| {
-        if is_last_modified_ref(node) {
-            found = true;
-            Ok(TreeNodeRecursion::Stop)
-        } else {
-            Ok(TreeNodeRecursion::Continue)
-        }
-    });
-    found
-}
-
-// Flip a comparison so the `_last_modified` reference is on the left, e.g.
-// `<literal> > _last_modified` becomes `_last_modified < <literal>`.
-fn flip(op: Operator) -> Operator {
-    match op {
-        Operator::Gt => Operator::Lt,
-        Operator::GtEq => Operator::LtEq,
-        Operator::Lt => Operator::Gt,
-        Operator::LtEq => Operator::GtEq,
-        other => other,
-    }
-}
-
-use datafusion_expr::{Between, Cast, Expr, Operator, TryCast};
-
-/// Reads a timestamp literal as a [`Duration`] since the Unix epoch, using the
-/// constructor for its precision so the value is exact.
-///
-/// Returns `None` for a NULL, a non-timestamp literal, or a pre-epoch (negative)
-/// value that a `Duration` cannot represent — in each case the caller declines
-/// to prune rather than risk dropping matching objects.
-fn literal_duration(expr: &Expr) -> Option<Duration> {
-    match expr {
-        Expr::Literal(ScalarValue::TimestampNanosecond(Some(v), _), _) => {
-            Some(Duration::from_nanos(u64::try_from(*v).ok()?))
-        }
-        Expr::Literal(ScalarValue::TimestampMicrosecond(Some(v), _), _) => {
-            Some(Duration::from_micros(u64::try_from(*v).ok()?))
-        }
-        Expr::Literal(ScalarValue::TimestampMillisecond(Some(v), _), _) => {
-            Some(Duration::from_millis(u64::try_from(*v).ok()?))
-        }
-        Expr::Literal(ScalarValue::TimestampSecond(Some(v), _), _) => {
-            Some(Duration::from_secs(u64::try_from(*v).ok()?))
-        }
-        _ => None,
-    }
-}
-
-/// Returns the bounds contributed by `expr` and whether pruning stays safe.
-fn collect_last_modified_bounds(expr: &Expr) -> (Vec<LastModifiedBound>, bool) {
-    match expr {
-        Expr::BinaryExpr(binary) => match binary.op {
-            Operator::Gt | Operator::GtEq | Operator::Lt | Operator::LtEq | Operator::Eq => {
-                if is_last_modified_ref(&binary.left) {
-                    return match literal_duration(&binary.right) {
-                        Some(threshold) => (
-                            vec![LastModifiedBound {
-                                op: binary.op,
-                                threshold,
-                            }],
-                            true,
-                        ),
-                        None => (Vec::new(), false),
-                    };
-                }
-                if is_last_modified_ref(&binary.right) {
-                    return match literal_duration(&binary.left) {
-                        Some(threshold) => (
-                            vec![LastModifiedBound {
-                                op: flip(binary.op),
-                                threshold,
-                            }],
-                            true,
-                        ),
-                        None => (Vec::new(), false),
-                    };
-                }
-                (Vec::new(), true)
-            }
-            Operator::And => {
-                let (mut lvals, lsafe) = collect_last_modified_bounds(&binary.left);
-                let (rvals, rsafe) = collect_last_modified_bounds(&binary.right);
-                lvals.extend(rvals);
-                (lvals, lsafe && rsafe)
-            }
-            Operator::Or => {
-                if references_last_modified(&binary.left) || references_last_modified(&binary.right)
-                {
-                    (Vec::new(), false)
-                } else {
-                    (Vec::new(), true)
-                }
-            }
-            _ => (Vec::new(), !references_last_modified(expr)),
-        },
-        Expr::Between(Between {
-            expr,
-            negated,
-            low,
-            high,
-        }) if is_last_modified_ref(expr) => {
-            match (*negated, literal_duration(low), literal_duration(high)) {
-                (false, Some(low), Some(high)) => (
-                    vec![
-                        LastModifiedBound {
-                            op: Operator::GtEq,
-                            threshold: low,
-                        },
-                        LastModifiedBound {
-                            op: Operator::LtEq,
-                            threshold: high,
-                        },
-                    ],
-                    true,
-                ),
-                _ => (Vec::new(), false),
-            }
-        }
-        Expr::Not(inner) => (Vec::new(), !references_last_modified(inner)),
-        other => (Vec::new(), !references_last_modified(other)),
-    }
-}
-
-/// Extracts conjunctive `_last_modified` bounds usable to prune the object-store
-/// listing before any file is opened.
-///
-/// Only a purely conjunctive form is safe: each top-level filter is an implicit
-/// `AND`, and pruning on any conjunct is a necessary condition for a row to
-/// pass. If `_last_modified` appears under `OR` or `NOT`, or a comparison
-/// against it uses a non-timestamp literal, this returns `None` so the caller
-/// falls back to a full listing.
-fn extract_last_modified_predicate(
-    filters: &[datafusion_expr::Expr],
-) -> Option<Vec<LastModifiedBound>> {
-    let mut bounds = Vec::new();
-    let mut safe = true;
-    for filter in filters {
-        let (vals, is_safe) = collect_last_modified_bounds(filter);
-        bounds.extend(vals);
-        safe &= is_safe;
-    }
-
-    if !safe || bounds.is_empty() {
-        None
-    } else {
-        Some(bounds)
-    }
-}
-
-/// True when an object's last-modified time satisfies every bound.
-///
-/// The object's mtime is taken as a [`Duration`] since the Unix epoch and
-/// compared against each threshold. Both sides are exact, so the comparison
-/// matches the row predicate. A pre-epoch (negative) mtime cannot be a
-/// `Duration`, so it is never pruned.
-fn last_modified_meta_passes(meta: &ObjectMeta, bounds: &[LastModifiedBound]) -> bool {
-    let Ok(micros) = u64::try_from(meta.last_modified.timestamp_micros()) else {
-        return true;
-    };
-    let file = Duration::from_micros(micros);
-    bounds.iter().all(|bound| match bound.op {
-        Operator::Gt => file > bound.threshold,
-        Operator::GtEq => file >= bound.threshold,
-        Operator::Lt => file < bound.threshold,
-        Operator::LtEq => file <= bound.threshold,
-        Operator::Eq => file == bound.threshold,
-        // `extract_last_modified_predicate` only produces the operators above.
-        _ => true,
-    })
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ObjectVersionType {
     Version,
@@ -1727,6 +1578,69 @@ pub trait ListingTableConnector: DataConnector {
     where
         Self: Display,
     {
+        let template = self
+            .listing_table_template(dataset, url, extension, file_format)
+            .await?;
+
+        // This shouldn't error because `listing_table_template` already parsed the same URL.
+        let table_path =
+            ListingTableUrl::parse(url.clone())
+                .boxed()
+                .context(crate::InternalSnafu {
+                    dataconnector: format!("{self}"),
+                    connector_component: ConnectorComponent::from(dataset),
+                    code: "LTC-RP-LTUP".to_string(), // ListingTableConnector-ReadProvider-ListingTableUrlParse
+                })?;
+
+        // This shouldn't error because we're passing the schema and options correctly.
+        let table_arc = Arc::new(template.listing_table(table_path.clone()).boxed().context(
+            crate::InternalSnafu {
+                dataconnector: format!("{self}"),
+                connector_component: ConnectorComponent::from(dataset),
+                code: "LTC-RP-LTTN".to_string(), // ListingTableConnector-ReadProvider-ListingTableTryNew
+            },
+        )?);
+
+        // For S3 single-file datasets with acceleration enabled, wrap with a caching layer
+        // that checks ETag/Version ID to skip unnecessary re-fetches when file hasn't changed.
+        if self.supports_single_file_version_cache()
+            && refresh_skip_enabled(dataset)
+            && !table_path.is_collection()
+            && dataset.acceleration.is_some()
+            && let Some(cached_table) =
+                data_components::s3_single_file_cached::S3SingleFileCached::try_new(
+                    Arc::clone(&table_arc),
+                    Arc::clone(&template.object_store),
+                    dataset.name.to_string(),
+                )
+        {
+            tracing::debug!(
+                "Enabled single-file ETag/Version caching for {}",
+                dataset.name
+            );
+            return Ok(Arc::new(cached_table));
+        }
+
+        Ok(template.wrap(table_arc, table_path))
+    }
+
+    /// Resolves the listing options and schema [`Self::create_listing_table`] builds the
+    /// dataset's table from, without building it.
+    ///
+    /// A connector whose files are read from a location that changes over the dataset's
+    /// lifetime — a path pinned to a source revision — resolves this once and builds the table
+    /// at each location with [`ListingTableTemplate::build`], so the dataset keeps the schema
+    /// it registered with.
+    async fn listing_table_template(
+        &self,
+        dataset: &DatasetSpec,
+        url: &Url,
+        extension: &str,
+        file_format: Arc<dyn FileFormat>,
+    ) -> DataConnectorResult<ListingTableTemplate>
+    where
+        Self: Display,
+    {
         // This shouldn't error because we've already validated the URL in `get_object_store_url`.
         let table_path =
             ListingTableUrl::parse(url.clone())
@@ -1915,91 +1829,12 @@ pub trait ListingTableConnector: DataConnector {
             expanded_schema
         };
 
-        // Keep a reference to the file schema for MetadataPruningListingTable
-        let file_schema = Arc::clone(&final_schema);
-
-        let config = ListingTableConfig::new(table_path.clone())
-            .with_listing_options(options)
-            .with_schema(final_schema);
-
-        // This shouldn't error because we're passing the schema and options correctly.
-        //
-        // Attach a file-statistics cache. With `collect_stat = true` (the
-        // DataFusion default), resolving a scan's statistics parses every
-        // file's Parquet footer; without a cache, `ListingTable` re-parses all
-        // footers on every plan. That makes stat-only queries (e.g. an
-        // unfiltered `COUNT(*)`, which the `AggregateStatistics` rule answers
-        // purely from statistics) scale linearly with file count on each query.
-        // The stock DataFusion `CREATE EXTERNAL TABLE` path wires this same
-        // cache; we mirror it so per-file footer stats are reused across
-        // queries. The cache invalidates per file on `ObjectMeta` change, so
-        // refreshing datasets still pick up new data.
-        let table = ListingTable::try_new(config)
-            .boxed()
-            .context(crate::InternalSnafu {
-                dataconnector: format!("{self}"),
-                connector_component: ConnectorComponent::from(dataset),
-                code: "LTC-RP-LTTN".to_string(), // ListingTableConnector-ReadProvider-ListingTableTryNew
-            })?
-            .with_cache(Some(Arc::new(
-                DefaultCache::<TableScopedPath, CachedFileMetadata>::new(
-                    DEFAULT_FILE_STATISTICS_MEMORY_LIMIT,
-                )
-                .with_name("DefaultFileStatisticsCache"),
-            )));
-
-        // For S3 single-file datasets with acceleration enabled, wrap with a caching layer
-        // that checks ETag/Version ID to skip unnecessary re-fetches when file hasn't changed.
-        let table_arc = Arc::new(table);
-        if self.supports_single_file_version_cache()
-            && refresh_skip_enabled(dataset)
-            && !table_path.is_collection()
-            && dataset.acceleration.is_some()
-            && let Some(cached_table) =
-                data_components::s3_single_file_cached::S3SingleFileCached::try_new(
-                    Arc::clone(&table_arc),
-                    Arc::clone(&object_store),
-                    dataset.name.to_string(),
-                )
-        {
-            tracing::debug!(
-                "Enabled single-file ETag/Version caching for {}",
-                dataset.name
-            );
-            return Ok(Arc::new(cached_table));
-        }
-
-        let has_location_metadata = table_arc.options().metadata_cols.iter().any(|c| {
-            matches!(
-                c,
-                datafusion_datasource::metadata::MetadataColumn::Location(_)
-            )
-        });
-
-        // A `_last_modified` column lets an `append` refresh prune the listing by
-        // object mtime, so wrap even when `_location` is not enabled.
-        let has_last_modified_metadata = table_arc.options().metadata_cols.iter().any(|c| {
-            matches!(
-                c,
-                datafusion_datasource::metadata::MetadataColumn::LastModified
-            )
-        });
-
-        if has_location_metadata
-            || has_last_modified_metadata
-            || format_selected_data_suffix(extension).is_some()
-        {
-            let wrapped = MetadataPruningListingTable::new(
-                table_arc,
-                Arc::clone(&object_store),
-                table_path,
-                file_schema,
-                extension,
-            );
-            Ok(Arc::new(wrapped))
-        } else {
-            Ok(table_arc)
-        }
+        Ok(ListingTableTemplate {
+            options,
+            schema: final_schema,
+            object_store,
+            extension: extension.to_string(),
+        })
     }
 
     /// Drops partition columns from `schema` that the files already carry, so a
@@ -3690,7 +3525,7 @@ mod tests {
         )
         .expect("listing table");
 
-        let provider = MetadataPruningListingTable::new(
+        let provider = LocationPruningListingTable::new(
             Arc::new(listing),
             ctx.runtime_env()
                 .object_store(&table_path)
@@ -3891,7 +3726,7 @@ mod tests {
         ctx: &SessionContext,
         store: Arc<dyn ObjectStore>,
         partition_cols: Vec<(String, DataType)>,
-    ) -> MetadataPruningListingTable {
+    ) -> LocationPruningListingTable {
         let table_path = ListingTableUrl::parse("s3://bucket/table/").expect("listing url");
         ctx.runtime_env()
             .register_object_store(table_path.object_store().as_ref(), Arc::clone(&store));
@@ -3906,7 +3741,7 @@ mod tests {
                 .with_schema(Arc::clone(&file_schema)),
         )
         .expect("listing table");
-        MetadataPruningListingTable::new(Arc::new(listing), store, table_path, file_schema, "*.orc")
+        LocationPruningListingTable::new(Arc::new(listing), store, table_path, file_schema, "*.orc")
     }
 
     #[test]
@@ -4326,7 +4161,7 @@ mod tests {
         )
         .expect("create listing table");
 
-        let provider = MetadataPruningListingTable::new(
+        let provider = LocationPruningListingTable::new(
             Arc::new(listing),
             ctx.runtime_env()
                 .object_store(&table_path)
@@ -4370,325 +4205,74 @@ mod tests {
         );
     }
 
-    /// 200 seconds after the Unix epoch, expressed in nanoseconds, as an
-    /// `append`-refresh watermark literal carries.
-    fn watermark_ts_ns(secs: i64) -> datafusion_expr::Expr {
-        datafusion_expr::lit(ScalarValue::TimestampNanosecond(
-            Some(secs * 1_000_000_000),
-            Some("UTC".into()),
-        ))
-    }
-
-    fn cast_last_modified_to_ns() -> datafusion_expr::Expr {
-        datafusion_expr::Expr::Cast(datafusion_expr::Cast::new(
-            Box::new(datafusion_expr::col("_last_modified")),
-            DataType::Timestamp(arrow_schema::TimeUnit::Nanosecond, Some("UTC".into())),
-        ))
-    }
-
-    #[test]
-    fn extract_last_modified_predicate_matches_bare_and_cast_forms() {
-        use datafusion_expr::Operator;
-
-        // Bare column, as `unwrap_cast_in_comparison` may leave it.
-        let bare = extract_last_modified_predicate(&[
-            datafusion_expr::col("_last_modified").gt(watermark_ts_ns(200))
-        ])
-        .expect("bare `_last_modified >` is prunable");
-        assert_eq!(bare.len(), 1);
-        assert_eq!(bare[0].op, Operator::Gt);
-        assert_eq!(bare[0].threshold, Duration::from_secs(200));
-
-        // Cast form, as the refresh predicate emits it verbatim.
-        let cast =
-            extract_last_modified_predicate(&[cast_last_modified_to_ns().gt(watermark_ts_ns(200))])
-                .expect("cast-wrapped `_last_modified >` is prunable");
-        assert_eq!(cast[0].op, Operator::Gt);
-        assert_eq!(cast[0].threshold, Duration::from_secs(200));
-
-        // Literal on the left flips the operator.
-        let flipped = extract_last_modified_predicate(&[
-            watermark_ts_ns(200).lt(datafusion_expr::col("_last_modified"))
-        ])
-        .expect("`literal < _last_modified` is prunable");
-        assert_eq!(flipped[0].op, Operator::Gt);
-
-        // `>=`, as a day-granular high-water mark uses.
-        let gte = extract_last_modified_predicate(&[
-            datafusion_expr::col("_last_modified").gt_eq(watermark_ts_ns(200))
-        ])
-        .expect("`_last_modified >=` is prunable");
-        assert_eq!(gte[0].op, Operator::GtEq);
-    }
-
-    #[test]
-    fn extract_last_modified_predicate_refuses_disjunction_and_negation() {
-        // A single disjunct of an `OR` is not a necessary condition, so pruning
-        // on it would drop objects whose rows must still be scanned.
-        assert!(
-            extract_last_modified_predicate(&[datafusion_expr::col("_last_modified")
-                .gt(watermark_ts_ns(200))
-                .or(datafusion_expr::col("value").eq(datafusion_expr::lit(1)))])
-            .is_none(),
-            "`_last_modified` under OR must not prune"
-        );
-
-        assert!(
-            extract_last_modified_predicate(&[datafusion_expr::Expr::Not(Box::new(
-                datafusion_expr::col("_last_modified").gt(watermark_ts_ns(200))
-            ))])
-            .is_none(),
-            "`_last_modified` under NOT must not prune"
-        );
-
-        // A comparison against something other than a timestamp literal cannot
-        // be evaluated from the listing alone.
-        assert!(
-            extract_last_modified_predicate(&[
-                datafusion_expr::col("_last_modified").gt(datafusion_expr::col("other"))
-            ])
-            .is_none(),
-            "`_last_modified` vs a non-literal must not prune"
-        );
-
-        // No `_last_modified` predicate at all: nothing to prune on.
-        assert!(
-            extract_last_modified_predicate(&[
-                datafusion_expr::col("value").eq(datafusion_expr::lit(1))
-            ])
-            .is_none()
-        );
-    }
-
-    #[test]
-    fn extract_last_modified_predicate_keeps_other_conjuncts_prunable() {
-        // Pruning on any conjunct of a top-level AND is safe; the other conjunct
-        // is left to the residual `FilterExec`.
-        let bounds = extract_last_modified_predicate(&[
-            datafusion_expr::col("_last_modified").gt(watermark_ts_ns(200)),
-            datafusion_expr::col("value").eq(datafusion_expr::lit(1)),
-        ])
-        .expect("the `_last_modified` conjunct is still prunable");
-        assert_eq!(bounds.len(), 1);
-    }
-
-    #[test]
-    fn last_modified_meta_passes_compares_as_duration() {
-        use datafusion_expr::Operator;
-
-        // 200s watermark; an object at 200s does not pass strict `>` but a later
-        // one does. The mtime is taken as a Duration since the epoch.
-        let bound = LastModifiedBound {
-            op: Operator::Gt,
-            threshold: Duration::from_secs(200),
-        };
-        assert!(!last_modified_meta_passes(
-            &create_meta("f", 200, 1),
-            &[bound]
-        ));
-        assert!(last_modified_meta_passes(
-            &create_meta("f", 201, 1),
-            &[bound]
-        ));
-
-        // A microsecond above the watermark passes even though the second-level
-        // mtime rounds down — proving the comparison is not truncated to seconds.
-        let sub_second = ObjectMeta {
-            location: Path::from("f"),
-            last_modified: Utc
-                .timestamp_opt(200, 1_000)
-                .single()
-                .expect("valid timestamp"),
-            size: 1,
-            e_tag: None,
-            version: None,
-        };
-        assert!(last_modified_meta_passes(&sub_second, &[bound]));
-    }
-
-    #[test]
-    fn extract_last_modified_predicate_rejects_coarsening_cast() {
-        fn cast_last_modified_to(unit: arrow_schema::TimeUnit) -> datafusion_expr::Expr {
-            datafusion_expr::Expr::Cast(datafusion_expr::Cast::new(
-                Box::new(datafusion_expr::col("_last_modified")),
-                DataType::Timestamp(unit, Some("UTC".into())),
-            ))
-        }
-
-        // A coarsening cast (`Second`) truncates the microsecond metadata value,
-        // so `CAST(_last_modified AS Timestamp(Second)) = 200s` matches an object
-        // at 200.5s that a nanosecond prune would drop. It must not build a
-        // bound — the residual filter enforces it instead.
-        assert!(
-            extract_last_modified_predicate(&[cast_last_modified_to(
-                arrow_schema::TimeUnit::Second
-            )
-            .eq(datafusion_expr::lit(ScalarValue::TimestampSecond(
-                Some(200),
-                Some("UTC".into())
-            )))])
-            .is_none(),
-            "a Second-precision cast must not prune"
-        );
-        assert!(
-            extract_last_modified_predicate(&[cast_last_modified_to(
-                arrow_schema::TimeUnit::Millisecond
-            )
-            .gt(watermark_ts_ns(200))])
-            .is_none(),
-            "a Millisecond-precision cast must not prune"
-        );
-
-        // Microsecond/nanosecond casts keep the value exactly and stay prunable.
-        assert!(
-            extract_last_modified_predicate(&[cast_last_modified_to(
-                arrow_schema::TimeUnit::Microsecond
-            )
-            .gt(watermark_ts_ns(200))])
-            .is_some(),
-            "a Microsecond-precision cast preserves the value and is prunable"
-        );
-        assert!(
-            extract_last_modified_predicate(&[cast_last_modified_to(
-                arrow_schema::TimeUnit::Nanosecond
-            )
-            .gt(watermark_ts_ns(200))])
-            .is_some(),
-            "a Nanosecond-precision cast preserves the value and is prunable"
-        );
-    }
-
-    /// Reproduces issue #14264: an `append` refresh over an object-store source
-    /// filters on `_last_modified > <watermark>`. An object whose mtime is below
-    /// the watermark must be pruned from the listing and never opened, so a
-    /// stale corrupt object cannot fail the refresh. On the pre-fix path every
-    /// object is listed and opened before the row filter runs, so the corrupt
-    /// object errors the scan.
     #[tokio::test]
-    async fn append_refresh_prunes_stale_objects_without_opening_them() {
-        use datafusion::parquet::arrow::ArrowWriter;
-
-        let dir = tempfile::tempdir().expect("tempdir");
-
-        // Valid, newest object (mtime 300s): the only row a `> 200s` filter keeps.
-        let file_schema = Arc::new(Schema::new(vec![Field::new("value", DataType::Utf8, true)]));
-        let batch = RecordBatch::try_new(
-            Arc::clone(&file_schema),
-            vec![Arc::new(arrow::array::StringArray::from(vec!["new"]))],
-        )
-        .expect("valid batch");
-        let valid_path = dir.path().join("new.parquet");
-        let mut writer = ArrowWriter::try_new(
-            std::fs::File::create(&valid_path).expect("create parquet"),
-            Arc::clone(&file_schema),
-            None,
-        )
-        .expect("parquet writer");
-        writer.write(&batch).expect("write parquet");
-        writer.close().expect("close parquet");
-        std::fs::File::options()
-            .write(true)
-            .open(&valid_path)
-            .expect("open new.parquet")
-            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_mins(5))
-            .expect("set new mtime");
-
-        // Corrupt, stale object (mtime 100s, below the watermark). A `.parquet`
-        // name so it is listed, but not valid Parquet, so opening it errors.
-        let corrupt_path = dir.path().join("old_corrupt.parquet");
-        std::fs::write(&corrupt_path, b"NOT A PARQUET FILE").expect("write corrupt object");
-        std::fs::File::options()
-            .write(true)
-            .open(&corrupt_path)
-            .expect("open old_corrupt.parquet")
-            .set_modified(std::time::UNIX_EPOCH + std::time::Duration::from_secs(100))
-            .expect("set corrupt mtime");
-
-        let table_url = format!("file://{}/", dir.path().display());
-        let mut params = HashMap::new();
-        params.insert("file_format".to_string(), "parquet".to_string());
-        let (connector, mut dataset) = setup_connector(table_url.clone(), params);
-        dataset.metadata = HashMap::from([(
-            MetadataColumn::LastModified.name().to_string(),
-            "enabled".to_string(),
-        )]);
-
-        let url = Url::parse(&table_url).expect("table url");
-        let (Some(file_format), extension) = connector
-            .get_file_format_and_extension(&dataset)
-            .await
-            .expect("parquet listing format")
-        else {
-            panic!("expected a parquet file format");
-        };
-
-        let provider = connector
-            .create_listing_table(&dataset, &url, &extension, file_format)
-            .await
-            .expect("create_listing_table production path");
-
-        let query_ctx = SessionContext::new();
-        query_ctx
-            .register_table("appended", provider)
-            .expect("register listing table");
-
-        // The corrupt object really does break an unpruned read, so the filtered
-        // success below can only be the prune skipping it.
-        let unfiltered = query_ctx
-            .sql("SELECT value FROM appended")
-            .await
-            .expect("plan full read")
-            .collect()
-            .await;
-        assert!(
-            unfiltered.is_err(),
-            "the corrupt object must break a full read, else this test cannot prove pruning"
+    async fn test_location_pushdown_stays_inexact_for_other_metadata_filters() {
+        use datafusion_expr::{col, lit};
+        // `scan`'s head()-based fast path only ever applies the `_location`
+        // predicates it can extract — it never evaluates any other filter. A
+        // `_last_modified` predicate combined with a `_location` predicate must
+        // stay `Inexact` so DataFusion keeps re-applying it above the scan;
+        // otherwise the fast path silently drops it (regression test for
+        // spiceai#14264: mixed `_location` + metadata-column predicates
+        // returning wrong rows once the metadata predicate is reported `Exact`
+        // with no residual filter re-applying it).
+        let ctx = SessionContext::new();
+        let no_list_store = Arc::new(NoListObjectStore::new(create_meta(
+            "prefix/file.parquet",
+            100,
+            128,
+        )));
+        let store_url = Url::parse("s3://bucket").expect("store url");
+        ctx.runtime_env().register_object_store(
+            &store_url,
+            Arc::clone(&no_list_store) as Arc<dyn ObjectStore>,
         );
 
-        // 200s watermark, at the column's exact type — the corrupt 100s object
-        // is below it and must be pruned.
-        let watermark = datafusion_expr::lit(ScalarValue::TimestampMicrosecond(
-            Some(200_000_000),
-            Some("UTC".into()),
+        let table_path =
+            ListingTableUrl::parse("s3://bucket/prefix/").expect("to parse listing table url");
+        let file_format = Arc::new(ParquetFormat::default());
+        let options = ListingOptions::new(file_format)
+            .with_file_extension(".parquet")
+            .with_table_partition_cols(vec![]);
+
+        let file_schema = Arc::new(Schema::new(vec![
+            Field::new("value", arrow_schema::DataType::Utf8, true),
+            MetadataColumn::Location(Some("s3://bucket/".into())).field(),
+            MetadataColumn::LastModified.field(),
+        ]));
+
+        let listing = ListingTable::try_new(
+            ListingTableConfig::new(table_path.clone())
+                .with_listing_options(options)
+                .with_schema(Arc::clone(&file_schema)),
+        )
+        .expect("create listing table");
+
+        let provider = LocationPruningListingTable::new(
+            Arc::new(listing),
+            ctx.runtime_env()
+                .object_store(&table_path)
+                .expect("object store"),
+            table_path,
+            file_schema,
+            ".parquet",
+        );
+
+        let location_filter = col("_location").eq(lit("s3://bucket/prefix/file.parquet"));
+        let last_modified_filter = col("_last_modified").gt(lit(
+            ScalarValue::TimestampMicrosecond(Some(0), Some("UTC".into())),
         ));
-        let batches = query_ctx
-            .table("appended")
-            .await
-            .expect("open table")
-            .filter(datafusion_expr::col("_last_modified").gt(watermark))
-            .expect("apply `_last_modified >` filter")
-            .collect()
-            .await
-            .expect("prune must skip the corrupt object below the watermark");
 
-        let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        let pushdown = provider
+            .supports_filters_pushdown(&[&location_filter, &last_modified_filter])
+            .expect("supports_filters_pushdown");
+
         assert_eq!(
-            rows, 1,
-            "only the newest object's row is above the watermark"
+            pushdown[1],
+            datafusion_expr::TableProviderFilterPushDown::Inexact,
+            "a filter on any column other than _location must stay Inexact, since \
+             the location fast path never evaluates it"
         );
-        let value_col = batches[0].column_by_name("value").expect("value column");
-        let value = if let Some(arr) = value_col
-            .as_any()
-            .downcast_ref::<arrow::array::StringArray>()
-        {
-            arr.value(0).to_string()
-        } else if let Some(arr) = value_col
-            .as_any()
-            .downcast_ref::<arrow::array::StringViewArray>()
-        {
-            arr.value(0).to_string()
-        } else if let Some(arr) = value_col
-            .as_any()
-            .downcast_ref::<arrow::array::LargeStringArray>()
-        {
-            arr.value(0).to_string()
-        } else {
-            panic!(
-                "value decoded as {}, expected Utf8, Utf8View, or LargeUtf8",
-                value_col.data_type()
-            );
-        };
-        assert_eq!(value, "new");
     }
 
     /// A partition directory holding only an empty file contributes no row, so
@@ -5004,7 +4588,7 @@ mod tests {
         )
         .expect("create listing table");
 
-        let provider = MetadataPruningListingTable::new(
+        let provider = LocationPruningListingTable::new(
             Arc::new(listing),
             ctx.runtime_env()
                 .object_store(&table_path)
@@ -5113,7 +4697,7 @@ mod tests {
         )
         .expect("create listing table");
 
-        let provider = MetadataPruningListingTable::new(
+        let provider = LocationPruningListingTable::new(
             Arc::new(listing),
             ctx.runtime_env()
                 .object_store(&table_path)
@@ -5229,141 +4813,61 @@ mod tests {
         );
     }
 
-    /// The `_location` fast path in `scan` applies only `_location` and
-    /// `_last_modified`, so every other predicate in the same query must stay a
-    /// residual filter. The inner listing reports a partition predicate `Exact`,
-    /// which would otherwise drop it from the plan and return rows the query
-    /// excluded; `_size` and data-column predicates are covered here too so the
-    /// guard still holds if the inner listing starts reporting them `Exact`.
-    #[tokio::test]
-    async fn location_fast_path_keeps_other_predicates_as_residual_filters() {
-        use datafusion::parquet::arrow::ArrowWriter;
-        use tempfile::TempDir;
-
-        let temp_dir = TempDir::new().expect("create temp dir");
-        let partition_dir = temp_dir.path().join("day=2025-01-01");
-        std::fs::create_dir_all(&partition_dir).expect("create partition dir");
-
-        let file_schema = Arc::new(Schema::new(vec![Field::new(
-            "id",
-            arrow_schema::DataType::Int64,
-            true,
-        )]));
-        let batch = RecordBatch::try_new(
-            Arc::clone(&file_schema),
-            vec![Arc::new(arrow::array::Int64Array::from(vec![1, 2, 3]))],
-        )
-        .expect("create batch");
-        let parquet_path = partition_dir.join("data.parquet");
-        let file = std::fs::File::create(&parquet_path).expect("create parquet file");
-        let mut writer =
-            ArrowWriter::try_new(file, Arc::clone(&file_schema), None).expect("create writer");
-        writer.write(&batch).expect("write batch");
-        writer.close().expect("close writer");
-        let file_size = std::fs::metadata(&parquet_path)
-            .expect("parquet file metadata")
-            .len();
-
-        let ctx = SessionContext::new();
-        // `Url::from_directory_path` spells the file URL the way the running
-        // platform needs (`file:///tmp/x/` on Unix, `file:///C:/...` on Windows);
-        // formatting the path by hand yields `file://C:/...`, whose `C:` parses
-        // as the URL host, so the listing matches nothing.
-        let store_url = Url::from_directory_path(temp_dir.path()).expect("directory url");
-        let table_url = store_url.to_string();
-        let table_path = ListingTableUrl::parse(&table_url).expect("parse listing url");
-        ctx.runtime_env().register_object_store(
-            &store_url,
-            Arc::new(object_store::local::LocalFileSystem::new()),
-        );
-
-        // The object path is absolute, so `_location` is the store root plus it.
-        let options = ListingOptions::new(Arc::new(ParquetFormat::default()))
-            .with_file_extension(".parquet")
-            .with_table_partition_cols(vec![("day".to_string(), arrow_schema::DataType::Utf8)])
-            .with_metadata_cols(vec![
-                datafusion_datasource::metadata::MetadataColumn::Location(Some("file:///".into())),
-                datafusion_datasource::metadata::MetadataColumn::Size,
-            ]);
-        let listing = ListingTable::try_new(
-            ListingTableConfig::new(table_path.clone())
-                .with_listing_options(options)
-                .with_schema(Arc::clone(&file_schema)),
-        )
-        .expect("create listing table");
-        let provider = MetadataPruningListingTable::new(
-            Arc::new(listing),
-            ctx.runtime_env()
-                .object_store(&table_path)
-                .expect("object store"),
-            table_path,
-            file_schema,
-            ".parquet",
-        );
-        ctx.register_table("t", Arc::new(provider))
-            .expect("register table");
-
-        let location = Url::from_file_path(&parquet_path)
-            .expect("file url")
-            .to_string();
-        let count = async |predicate: String| -> usize {
-            let sql = format!("SELECT id FROM t WHERE _location = '{location}' AND {predicate}");
-            ctx.sql(&sql)
-                .await
-                .expect("plan query")
-                .collect()
-                .await
-                .expect("collect query")
-                .iter()
-                .map(RecordBatch::num_rows)
-                .sum()
-        };
-
-        assert_eq!(count(format!("_size = {file_size}")).await, 3);
-        assert_eq!(
-            count(format!("_size = {}", file_size + 1)).await,
-            0,
-            "a `_size` predicate the file does not satisfy must remove its rows"
-        );
-        assert_eq!(count("day = '2025-01-01'".to_string()).await, 3);
-        assert_eq!(
-            count("day = '2099-12-31'".to_string()).await,
-            0,
-            "a partition predicate the file does not satisfy must remove its rows"
-        );
-        assert_eq!(
-            count("id > 1".to_string()).await,
-            2,
-            "a data-column predicate must still filter rows"
-        );
-    }
-
     #[tokio::test]
     async fn test_listing_table_metadata_columns_are_applied() {
-        let mut dataset = DatasetSpec::new("s3://bucket/prefix/", TableReference::bare("test"));
-        dataset.metadata = HashMap::from([(
-            MetadataColumn::Location(None).name().to_string(),
-            "enabled".to_string(),
-        )]);
+        use datafusion_datasource::metadata::MetadataColumn as ListingMetadataColumn;
 
-        let options =
-            ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension(".parquet");
+        let table_url = Url::parse("s3://bucket/prefix/").expect("parse table url");
         let schema = Schema::new(vec![Field::new(
             "compression",
             arrow_schema::DataType::Utf8,
             true,
         )]);
+        let listing_options = || {
+            ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension(".parquet")
+        };
 
-        let result = add_metadata_columns_if_required(
-            options,
-            &Url::parse("s3://bucket/prefix/").expect("parse table url"),
-            &schema,
-            &dataset,
+        let mut dataset = DatasetSpec::new("s3://bucket/prefix/", TableReference::bare("test"));
+        dataset.metadata = HashMap::from([(
+            MetadataColumn::Location(None).name().to_string(),
+            "enabled".to_string(),
+        )]);
+        let result =
+            add_metadata_columns_if_required(listing_options(), &table_url, &schema, &dataset);
+        // `_location` values are built from the bucket-level prefix, not the
+        // table path.
+        assert_eq!(
+            result.metadata_cols,
+            vec![ListingMetadataColumn::Location(Some(Arc::from(
+                "s3://bucket/"
+            )))]
         );
 
-        assert!(
-            !result.metadata_cols.is_empty(),
-            "metadata columns should be set on listing options"
+        // Every enabled column is forwarded as its DataFusion counterpart, in
+        // a fixed order.
+        dataset.metadata = HashMap::from([
+            (
+                MetadataColumn::LastModified.name().to_string(),
+                "enabled".to_string(),
+            ),
+            (
+                MetadataColumn::Location(None).name().to_string(),
+                "enabled".to_string(),
+            ),
+            (
+                MetadataColumn::Size.name().to_string(),
+                "enabled".to_string(),
+            ),
+        ]);
+        let result =
+            add_metadata_columns_if_required(listing_options(), &table_url, &schema, &dataset);
+        assert_eq!(
+            result.metadata_cols,
+            vec![
+                ListingMetadataColumn::LastModified,
+                ListingMetadataColumn::Location(Some(Arc::from("s3://bucket/"))),
+                ListingMetadataColumn::Size,
+            ]
         );
     }
 
@@ -5391,7 +4895,24 @@ mod tests {
         )
         .await;
 
-        result.expect_err("should error on no matching extension");
+        let err = result.expect_err("should error on no matching extension");
+        let DataConnectorError::InvalidConfigurationNoSource {
+            dataconnector,
+            message,
+            ..
+        } = &err
+        else {
+            panic!("an extension mismatch must be a configuration error, got: {err:?}");
+        };
+        assert_eq!(dataconnector, "TestListingConnector");
+        assert_eq!(
+            message,
+            "Failed to find any files matching the extension '.csv'. Is your `file_format` parameter correct? Spice found the following file extensions: '.parquet'. For details, visit: https://spiceai.org/docs/components/data-connectors#object-store-file-formats"
+        );
+        assert!(
+            !err.is_retriable(),
+            "files that are present but none match `file_format` is a permanent configuration error, not a wait-for-data retry"
+        );
     }
 
     #[tokio::test]
@@ -6326,6 +5847,451 @@ mod tests {
             options: object_store::CopyOptions,
         ) -> object_store::Result<()> {
             self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// Regression matrix for the object-store request pattern of the `_location`
+    /// fast path and the metadata-column prune (spiceai/spiceai#14264):
+    ///
+    /// | # | predicate                                  | LIST | opens the file? | residual `FilterExec` |
+    /// |---|--------------------------------------------|------|-----------------|---------------------|
+    /// | 1 | `_location = X`                            | no   | yes             | no                  |
+    /// | 2 | `_location = X AND _last_modified > W`     | no   | only if it passes W | no              |
+    /// | 3 | `_location = X AND other_col = 'foo'`      | no   | yes             | yes (`other_col`)   |
+    /// | 4 | `_last_modified > W`                       | yes  | survivors only  | no                  |
+    /// | 5 | `_last_modified > W AND other_col = 'foo'` | yes  | survivors only  | yes (`other_col`)   |
+    ///
+    /// Asserted at plan time (`create_physical_plan`, as the other fast-path tests do):
+    /// a pruned scan becomes an `EmptyExec` (the object is never opened), and a `_size`/
+    /// `_last_modified`/`_location` predicate carries no residual `FilterExec` while a data
+    /// column does. `MatrixStore` panics if the fast path ever lists.
+    mod metadata_prune_matrix {
+        use super::*;
+        use datafusion::physical_plan::displayable;
+        use datafusion_datasource::metadata::MetadataColumn as DfMeta;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// Serves a fixed set of controlled `ObjectMeta` and counts list/head requests.
+        /// With `forbid_list`, any listing panics — proving the `_location` fast path
+        /// never lists. Only `HEAD`s occur during `create_physical_plan`; an actual
+        /// object read (a non-head GET) is an execution-time step the plan-level tests
+        /// never trigger, so it is refused here.
+        #[derive(Debug)]
+        struct MatrixStore {
+            metas: Vec<ObjectMeta>,
+            forbid_list: bool,
+            list_calls: AtomicUsize,
+            head_calls: AtomicUsize,
+        }
+
+        impl MatrixStore {
+            fn new(metas: Vec<ObjectMeta>, forbid_list: bool) -> Arc<Self> {
+                Arc::new(Self {
+                    metas,
+                    forbid_list,
+                    list_calls: AtomicUsize::new(0),
+                    head_calls: AtomicUsize::new(0),
+                })
+            }
+            fn lists(&self) -> usize {
+                self.list_calls.load(Ordering::SeqCst)
+            }
+            fn heads(&self) -> usize {
+                self.head_calls.load(Ordering::SeqCst)
+            }
+        }
+
+        impl std::fmt::Display for MatrixStore {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "MatrixStore")
+            }
+        }
+
+        #[async_trait]
+        impl ObjectStore for MatrixStore {
+            fn list(
+                &self,
+                prefix: Option<&Path>,
+            ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+                assert!(
+                    !self.forbid_list,
+                    "list must not be called on the _location fast path"
+                );
+                self.list_calls.fetch_add(1, Ordering::SeqCst);
+                let prefix = prefix.cloned();
+                #[expect(
+                    clippy::needless_collect,
+                    reason = "the returned stream is 'static and cannot borrow self"
+                )]
+                let metas: Vec<_> = self
+                    .metas
+                    .iter()
+                    .filter(|m| {
+                        prefix
+                            .as_ref()
+                            .is_none_or(|p| m.location.as_ref().starts_with(p.as_ref()))
+                    })
+                    .cloned()
+                    .collect();
+                stream::iter(metas.into_iter().map(Ok)).boxed()
+            }
+
+            async fn put_opts(
+                &self,
+                _location: &Path,
+                _payload: object_store::PutPayload,
+                _opts: object_store::PutOptions,
+            ) -> object_store::Result<object_store::PutResult> {
+                unimplemented!()
+            }
+
+            async fn put_multipart_opts(
+                &self,
+                _location: &Path,
+                _opts: object_store::PutMultipartOptions,
+            ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+                unimplemented!()
+            }
+
+            async fn get_opts(
+                &self,
+                location: &Path,
+                options: object_store::GetOptions,
+            ) -> object_store::Result<object_store::GetResult> {
+                if !options.head {
+                    return Err(object_store::Error::NotImplemented {
+                        operation: "non-head get".to_string(),
+                        implementer: "MatrixStore".to_string(),
+                    });
+                }
+                self.head_calls.fetch_add(1, Ordering::SeqCst);
+                let meta = self
+                    .metas
+                    .iter()
+                    .find(|m| &m.location == location)
+                    .cloned()
+                    .expect("head() for a controlled object");
+                Ok(object_store::GetResult {
+                    payload: object_store::GetResultPayload::Stream(Box::pin(
+                        futures::stream::empty(),
+                    )),
+                    attributes: object_store::Attributes::default(),
+                    range: 0..0,
+                    meta,
+                })
+            }
+
+            fn delete_stream(
+                &self,
+                _locations: BoxStream<'static, object_store::Result<Path>>,
+            ) -> BoxStream<'static, object_store::Result<Path>> {
+                unimplemented!()
+            }
+
+            async fn list_with_delimiter(
+                &self,
+                _prefix: Option<&Path>,
+            ) -> object_store::Result<object_store::ListResult> {
+                unimplemented!()
+            }
+
+            async fn copy_opts(
+                &self,
+                _from: &Path,
+                _to: &Path,
+                _options: object_store::CopyOptions,
+            ) -> object_store::Result<()> {
+                unimplemented!()
+            }
+        }
+
+        const OLD_LOC: &str = "s3://bucket/prefix/old.csv";
+
+        // `old.csv` mtime = 2001-09-09; `new.csv` mtime = 2033-05-18.
+        fn old_meta() -> ObjectMeta {
+            create_meta("prefix/old.csv", 1_000_000_000, 10)
+        }
+        fn new_meta() -> ObjectMeta {
+            create_meta("prefix/new.csv", 2_000_000_000, 20)
+        }
+
+        fn provider(ctx: &SessionContext, store: &Arc<MatrixStore>) -> LocationPruningListingTable {
+            let store_url = Url::parse("s3://bucket").expect("store url");
+            ctx.runtime_env()
+                .register_object_store(&store_url, Arc::clone(store) as Arc<dyn ObjectStore>);
+
+            let table_path = ListingTableUrl::parse("s3://bucket/prefix/").expect("listing url");
+            let file_schema = Arc::new(Schema::new(vec![Field::new(
+                "other_col",
+                DataType::Utf8,
+                true,
+            )]));
+            let options =
+                ListingOptions::new(Arc::new(CsvFormat::default()) as Arc<dyn FileFormat>)
+                    .with_file_extension(".csv")
+                    .with_table_partition_cols(vec![])
+                    .with_metadata_cols(vec![
+                        DfMeta::Location(Some("s3://bucket/".into())),
+                        DfMeta::LastModified,
+                        DfMeta::Size,
+                    ]);
+            let listing = ListingTable::try_new(
+                ListingTableConfig::new(table_path.clone())
+                    .with_listing_options(options)
+                    .with_schema(Arc::clone(&file_schema)),
+            )
+            .expect("listing table");
+            LocationPruningListingTable::new(
+                Arc::new(listing),
+                Arc::clone(store) as Arc<dyn ObjectStore>,
+                table_path,
+                file_schema,
+                ".csv",
+            )
+        }
+
+        /// Plan `sql` against a freshly registered provider and return the indented
+        /// physical plan string.
+        async fn plan_of(store: Arc<MatrixStore>, sql: &str) -> String {
+            let ctx = SessionContext::new_with_config(
+                datafusion::prelude::SessionConfig::new().with_collect_statistics(false),
+            );
+            ctx.register_table("t", Arc::new(provider(&ctx, &store)))
+                .expect("register table");
+            let plan = ctx
+                .sql(sql)
+                .await
+                .expect("build logical plan")
+                .create_physical_plan()
+                .await
+                .expect("build physical plan");
+            displayable(plan.as_ref()).indent(true).to_string()
+        }
+
+        // Case 1: `_location = X` — no LIST, opens the object, no residual filter.
+        #[tokio::test]
+        async fn case1_location_only_skips_listing_and_scans() {
+            let store = MatrixStore::new(vec![old_meta()], true);
+            let plan = plan_of(
+                Arc::clone(&store),
+                &format!("SELECT other_col FROM t WHERE _location = '{OLD_LOC}'"),
+            )
+            .await;
+            assert_eq!(store.lists(), 0, "fast path must not LIST");
+            assert!(store.heads() >= 1, "fast path HEADs the object");
+            assert!(
+                !plan.contains("EmptyExec"),
+                "the object is scanned, not pruned"
+            );
+            assert!(
+                !plan.contains("FilterExec"),
+                "a pure _location scan needs no residual filter"
+            );
+        }
+
+        // Case 2: `_location = X AND _last_modified > W` — no LIST; the object is pruned
+        // on its HEADed ObjectMeta (EmptyExec) when it fails W, and scanned when it passes.
+        #[tokio::test]
+        async fn case2_location_and_last_modified_prunes_before_opening() {
+            // old.csv (2001) fails `> 2020` → pruned to EmptyExec, never opened.
+            let store = MatrixStore::new(vec![old_meta()], true);
+            let plan = plan_of(
+                Arc::clone(&store),
+                &format!(
+                    "SELECT other_col FROM t \
+                     WHERE _location = '{OLD_LOC}' AND _last_modified > TIMESTAMP '2020-01-01T00:00:00Z'"
+                ),
+            )
+            .await;
+            assert_eq!(store.lists(), 0, "fast path must not LIST");
+            assert!(
+                store.heads() >= 1,
+                "the object is HEADed before it is pruned"
+            );
+            assert!(
+                plan.contains("EmptyExec"),
+                "a stale object is pruned before it is opened"
+            );
+            assert!(
+                !plan.contains("FilterExec"),
+                "_last_modified is applied by the prune, not a residual filter"
+            );
+        }
+
+        #[tokio::test]
+        async fn case2_location_and_last_modified_scans_when_it_passes() {
+            // old.csv (2001) passes `> 1990` → kept and scanned.
+            let store = MatrixStore::new(vec![old_meta()], true);
+            let plan = plan_of(
+                Arc::clone(&store),
+                &format!(
+                    "SELECT other_col FROM t \
+                     WHERE _location = '{OLD_LOC}' AND _last_modified > TIMESTAMP '1990-01-01T00:00:00Z'"
+                ),
+            )
+            .await;
+            assert_eq!(store.lists(), 0, "fast path must not LIST");
+            assert!(!plan.contains("EmptyExec"), "a passing object is scanned");
+            assert!(
+                !plan.contains("FilterExec"),
+                "_last_modified is applied by the prune, not a residual filter"
+            );
+        }
+
+        const NEW_LOC: &str = "s3://bucket/prefix/new.csv";
+
+        // Conjoined `_location` equalities naming different objects match nothing. The
+        // planner folds them to `false` before `scan`, which answers without listing.
+        #[tokio::test]
+        async fn case2b_conflicting_location_equalities_match_nothing() {
+            let store = MatrixStore::new(vec![old_meta(), new_meta()], true);
+            let plan = plan_of(
+                Arc::clone(&store),
+                &format!(
+                    "SELECT other_col FROM t WHERE _location = '{OLD_LOC}' AND _location = '{NEW_LOC}'"
+                ),
+            )
+            .await;
+            assert_eq!(store.lists(), 0, "fast path must not LIST");
+            assert_eq!(
+                store.heads(),
+                0,
+                "an unsatisfiable predicate opens no object"
+            );
+            assert!(
+                plan.contains("EmptyExec"),
+                "no object satisfies both equalities: {plan}"
+            );
+            assert!(!plan.contains("FilterExec"), "{plan}");
+        }
+
+        // An equality plus a `_location` predicate the extractor ignores (`LIKE`) must
+        // still enforce the `LIKE`.
+        #[tokio::test]
+        async fn case2c_location_equality_and_like_enforces_the_like() {
+            let store = MatrixStore::new(vec![old_meta()], true);
+            let plan = plan_of(
+                Arc::clone(&store),
+                &format!(
+                    "SELECT other_col FROM t WHERE _location = '{OLD_LOC}' AND _location LIKE '%/new.csv'"
+                ),
+            )
+            .await;
+            assert!(
+                plan.contains("EmptyExec"),
+                "the LIKE excludes old.csv: {plan}"
+            );
+            assert!(!plan.contains("FilterExec"), "{plan}");
+        }
+
+        // Overlapping `IN` lists keep only the shared object. The planner intersects the
+        // lists before `scan`, so only that object is head()ed.
+        #[tokio::test]
+        async fn case2d_overlapping_location_in_lists_keep_the_intersection() {
+            let store = MatrixStore::new(vec![old_meta(), new_meta()], true);
+            let plan = plan_of(
+                Arc::clone(&store),
+                &format!(
+                    "SELECT other_col FROM t WHERE _location IN ('{OLD_LOC}', '{NEW_LOC}') \
+                     AND _location IN ('{NEW_LOC}')"
+                ),
+            )
+            .await;
+            assert!(!plan.contains("EmptyExec"), "new.csv matches: {plan}");
+            assert!(plan.contains("new.csv"), "{plan}");
+            assert!(!plan.contains("old.csv"), "old.csv is pruned: {plan}");
+            assert_eq!(store.heads(), 1, "only the shared candidate is head()ed");
+        }
+
+        // Repeated literals must not scan the same object twice.
+        #[tokio::test]
+        async fn case2e_repeated_location_literals_head_the_object_once() {
+            for predicate in [
+                format!("_location = '{NEW_LOC}' AND _location = '{NEW_LOC}'"),
+                format!("_location IN ('{NEW_LOC}', '{NEW_LOC}')"),
+            ] {
+                let store = MatrixStore::new(vec![new_meta()], true);
+                let plan = plan_of(
+                    Arc::clone(&store),
+                    &format!("SELECT other_col FROM t WHERE {predicate}"),
+                )
+                .await;
+                assert!(!plan.contains("EmptyExec"), "new.csv matches: {plan}");
+                assert_eq!(store.heads(), 1, "`{predicate}` heads new.csv once");
+            }
+        }
+
+        // Case 3: `_location = X AND other_col = 'foo'` — no LIST, scans, and the data
+        // column stays a residual FilterExec above the scan.
+        #[tokio::test]
+        async fn case3_location_and_data_column_post_filters() {
+            let store = MatrixStore::new(vec![old_meta()], true);
+            let plan = plan_of(
+                Arc::clone(&store),
+                &format!(
+                    "SELECT other_col FROM t WHERE _location = '{OLD_LOC}' AND other_col = 'foo'"
+                ),
+            )
+            .await;
+            assert_eq!(store.lists(), 0, "fast path must not LIST");
+            assert!(!plan.contains("EmptyExec"), "the object is scanned");
+            assert!(
+                plan.contains("FilterExec"),
+                "a data column is applied as a residual filter"
+            );
+        }
+
+        // Case 4: `_last_modified > W` (no _location) — LISTs, prunes the listing on
+        // ObjectMeta, no residual filter.
+        #[tokio::test]
+        async fn case4_last_modified_only_lists_and_prunes() {
+            let store = MatrixStore::new(vec![old_meta(), new_meta()], false);
+            let plan = plan_of(
+                Arc::clone(&store),
+                "SELECT other_col FROM t WHERE _last_modified > TIMESTAMP '2020-01-01T00:00:00Z'",
+            )
+            .await;
+            assert!(store.lists() >= 1, "no _location predicate → must LIST");
+            // new.csv (2033) survives, old.csv (2001) is pruned; the scan is non-empty.
+            assert!(!plan.contains("EmptyExec"), "a surviving object is scanned");
+            assert!(
+                !plan.contains("FilterExec"),
+                "_last_modified is applied by the listing prune"
+            );
+        }
+
+        #[tokio::test]
+        async fn case4_last_modified_prunes_all_to_empty() {
+            let store = MatrixStore::new(vec![old_meta(), new_meta()], false);
+            let plan = plan_of(
+                Arc::clone(&store),
+                "SELECT other_col FROM t WHERE _last_modified > TIMESTAMP '2099-01-01T00:00:00Z'",
+            )
+            .await;
+            assert!(store.lists() >= 1, "no _location predicate → must LIST");
+            assert!(
+                plan.contains("EmptyExec"),
+                "both objects are pruned by the listing prune"
+            );
+        }
+
+        // Case 5: `_last_modified > W AND other_col = 'foo'` — LISTs, prunes the listing,
+        // and the data column stays a residual FilterExec.
+        #[tokio::test]
+        async fn case5_last_modified_and_data_column_lists_prunes_and_post_filters() {
+            let store = MatrixStore::new(vec![old_meta(), new_meta()], false);
+            let plan = plan_of(
+                Arc::clone(&store),
+                "SELECT other_col FROM t \
+                 WHERE _last_modified > TIMESTAMP '2020-01-01T00:00:00Z' AND other_col = 'foo'",
+            )
+            .await;
+            assert!(store.lists() >= 1, "no _location predicate → must LIST");
+            assert!(!plan.contains("EmptyExec"), "a surviving object is scanned");
+            assert!(
+                plan.contains("FilterExec"),
+                "a data column is applied as a residual filter"
+            );
         }
     }
 }

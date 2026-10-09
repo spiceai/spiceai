@@ -817,7 +817,6 @@ async fn test_tool_use(
         return;
     };
 
-    // JSON Parse the function arguments to ensure robust to ordering.
     let tool_calls = resp
         .choices
         .first()
@@ -833,10 +832,35 @@ async fn test_tool_use(
         ChatCompletionMessageToolCalls::Custom(_) => panic!("unexpected custom tool call"),
     };
 
-    let args: serde_json::Value = serde_json::from_str(function.arguments.as_str())
-        .expect("failed to parse tool call arguments");
+    // The arguments are model-written, so check them against the tool's schema rather than one
+    // model's wording: providers differ on `"Boston"` vs `"Boston, MA"` and on which unit to pick.
+    let args: WeatherArgs = serde_json::from_str(&function.arguments).unwrap_or_else(|e| {
+        panic!(
+            "tool_use/{model_name}: arguments {:?} do not match the get_current_weather schema: {e}",
+            function.arguments
+        )
+    });
+    assert!(
+        args.location.to_lowercase().contains("boston"),
+        "tool_use/{model_name}: location {:?} does not name the city asked about",
+        args.location
+    );
+}
 
-    insta::assert_json_snapshot!(format!("tool_use_{model_name}_valid_function_args"), args);
+/// The parameters `test_tool_use` declares for `get_current_weather`. Deserializing into this is
+/// the schema check: both fields are required, and `unit` must be one of its enum values.
+#[derive(Debug, serde::Deserialize)]
+struct WeatherArgs {
+    location: String,
+    #[serde(rename = "unit")]
+    _unit: TemperatureUnit,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+enum TemperatureUnit {
+    Celsius,
+    Fahrenheit,
 }
 
 /// The creation lock fixture `name` resolves to.
@@ -1023,15 +1047,10 @@ async fn default_anthropic_model_accepts_forwarded_sampling_controls() {
     let model = create::create_anthropic(None)
         .unwrap_or_else(|e| panic!("failed to build the default Anthropic model: {e}"));
 
-    // Every control `crates/llms/src/anthropic/chat.rs` forwards to Anthropic: `temperature` and
-    // `top_p` pass through, and `top_logprobs` becomes Anthropic's `top_k`. That last translation
-    // is between unrelated parameters and is itself a defect (#13581) — this asserts only that the
-    // default model accepts what the converter currently sends, not that it should send it.
-    for (control, value) in [
-        ("temperature", json!(0.5)),
-        ("top_p", json!(0.9)),
-        ("top_logprobs", json!(5)),
-    ] {
+    // Every control `crates/llms/src/anthropic/chat.rs` forwards to Anthropic. `top_logprobs` is
+    // not one: the adapter refuses it before any request is sent (#13581), so it is covered by that
+    // file's unit tests rather than here.
+    for (control, value) in [("temperature", json!(0.5)), ("top_p", json!(0.9))] {
         let req: CreateChatCompletionRequest = serde_json::from_value(json!({
             "model": "not_needed",
             "messages": [{"role": "user", "content": "Say Hello"}],

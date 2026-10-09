@@ -40,7 +40,7 @@ use crate::component::dataset::{
         waiting_for_snapshot_message,
     },
 };
-use crate::dataaccelerator::{BootstrapStatus, acceleration_file_path};
+use crate::dataaccelerator::acceleration_file_path;
 use crate::dataconnector::snapshot_source::{
     projected_publisher_message, publisher_column_projection,
 };
@@ -151,7 +151,7 @@ impl Runtime {
         pending: &Arc<Dataset>,
         load_semaphore: &Arc<Semaphore>,
         load: &DatasetLoad,
-    ) -> Option<(Arc<Dataset>, BootstrapStatus)> {
+    ) -> Option<(Arc<Dataset>, crate::datafusion::AcceleratorBootstrap)> {
         let name = pending.name.clone();
         let resolution = self.snapshot_sources().begin_resolution(&name);
         let stopped =

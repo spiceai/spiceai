@@ -396,8 +396,9 @@ pub fn spawn_snapshot_interval_task(
 
 /// Creates a callback that triggers snapshot creation after a specified number of batch updates.
 ///
-/// If `runtime_status` is provided, batch counting will only start after the dataset
-/// is ready. This prevents counting batches during the initial load/bootstrap phase.
+/// Batch counting starts after runtime readiness and the initial snapshot attempt.
+/// The returned task belongs to the table generation and must be stopped and joined
+/// before its storage can be removed or rebound.
 #[expect(clippy::too_many_arguments)]
 pub fn create_periodic_snapshot_callback(
     batches: i64,
@@ -412,7 +413,7 @@ pub fn create_periodic_snapshot_callback(
     last_updated_at: Arc<AtomicI64>,
     accelerator: Option<Arc<dyn TableProvider>>,
     refresh: Arc<RwLock<Refresh>>,
-) -> Option<SnapshotCallback> {
+) -> Option<(tokio::task::JoinHandle<()>, SnapshotCallback)> {
     match (checkpointer, snapshot_manager) {
         (Some(checkpointer), Some(snapshot_manager)) => {
             let dataset_name = dataset_name.clone();
@@ -439,7 +440,7 @@ pub fn create_periodic_snapshot_callback(
             let accelerator_write_mutex_clone = Arc::clone(&accelerator_write_mutex);
             let accelerator_clone = accelerator.clone();
             let refresh_clone = Arc::clone(&refresh);
-            tokio::spawn(async move {
+            let initial_snapshot = tokio::spawn(async move {
                 if runtime_status.wait_for_ready().await == WaitOutcome::ShuttingDown {
                     return;
                 }
@@ -519,7 +520,7 @@ pub fn create_periodic_snapshot_callback(
             })
                 as Box<dyn FnMut() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>));
 
-            Some(callback)
+            Some((initial_snapshot, callback))
         }
         _ => None,
     }

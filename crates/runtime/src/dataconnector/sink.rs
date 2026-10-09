@@ -69,6 +69,17 @@ fn placeholder_schema() -> SchemaRef {
 /// non-file accelerator — so the caller falls back to [`placeholder_schema`], preserving the
 /// pre-acceleration behavior.
 pub(crate) async fn accelerated_checkpoint_schema(dataset: &Dataset) -> Option<SchemaRef> {
+    recorded_checkpoint_schema(dataset)
+        .await
+        .map(runtime_table::accelerated::checkpoint_primary_key::without_acceleration_primary_key)
+}
+
+/// The acceleration checkpoint's schema as stored, including the primary key it
+/// records for registering without the source (see
+/// `runtime_table::accelerated::checkpoint_primary_key`). Everything that registers
+/// a table from the checkpoint schema uses [`accelerated_checkpoint_schema`], which
+/// leaves that key out.
+pub(crate) async fn recorded_checkpoint_schema(dataset: &Dataset) -> Option<SchemaRef> {
     if !dataset.is_file_accelerated() {
         return None;
     }

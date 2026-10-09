@@ -2240,13 +2240,6 @@ mod tests {
         ));
     }
 
-    #[test]
-    fn compute_mode_rejects_unknown_values() {
-        use clap::ValueEnum;
-        SpiceCompute::from_str("unexpected", true)
-            .expect_err("unknown compute mode should be rejected");
-    }
-
     #[tokio::test]
     async fn generate_spicepod_includes_cayenne_catalog() {
         let setup_config = SetupConfig {

@@ -88,6 +88,7 @@ impl ListModels for XaiModelLister {
 mod tests {
     use super::*;
     use crate::provider::ListModelsError;
+    use async_openai::config::Config;
 
     #[test]
     fn test_from_params_missing_key() {
@@ -103,7 +104,20 @@ mod tests {
     fn test_from_params_with_key() {
         let mut params = HashMap::new();
         params.insert("xai_api_key".to_string(), SecretString::from("test-key"));
-        let result = XaiModelLister::from_params(&params);
-        result.expect("should succeed");
+        let lister = XaiModelLister::from_params(&params).expect("should succeed");
+        let config = lister.client.config();
+        assert_eq!(config.api_base(), "https://api.x.ai/v1");
+        assert_eq!(config.api_key().expose_secret(), "test-key");
+
+        // An explicit base replaces the default host.
+        params.insert(
+            "xai_api_base".to_string(),
+            SecretString::from("https://xai.example.com/v1"),
+        );
+        let lister =
+            XaiModelLister::from_params(&params).expect("should succeed with a custom base");
+        let config = lister.client.config();
+        assert_eq!(config.api_base(), "https://xai.example.com/v1");
+        assert_eq!(config.api_key().expose_secret(), "test-key");
     }
 }

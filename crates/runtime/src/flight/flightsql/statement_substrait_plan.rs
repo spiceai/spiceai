@@ -271,6 +271,140 @@ mod tests {
         Ok(())
     }
 
+    /// Guards the spiceai/datafusion patch that reads a Substrait string field
+    /// over a string column of any width (`docs/dev/fork_patches.md`). Spice
+    /// serves a file dataset's strings as `LargeUtf8`, and a producer other than
+    /// `DataFusion` declares them `string` or `varchar` with no width; without the
+    /// patch, `decode_plan` refuses every such plan, because the declared `Utf8`
+    /// field differs from the table's `LargeUtf8` column.
+    #[tokio::test]
+    async fn decode_plan_reads_a_large_string_column_a_plan_declares_as_string()
+    -> Result<(), anyhow::Error> {
+        use arrow::array::{ArrayRef, Int32Array, LargeStringArray, RecordBatch, StringArray};
+        use arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::datasource::MemTable;
+        use datafusion::prelude::SessionContext;
+        use datafusion_substrait::{
+            logical_plan::producer::to_substrait_plan,
+            substrait::proto::{
+                ReadRel, Rel,
+                plan_rel::RelType as PlanRelType,
+                rel::RelType,
+                r#type::{Kind, VarChar},
+            },
+        };
+
+        fn region(names: ArrayRef) -> Result<Arc<MemTable>, anyhow::Error> {
+            let schema = Arc::new(Schema::new(vec![
+                Field::new("r_regionkey", DataType::Int32, false),
+                Field::new("r_name", names.data_type().clone(), false),
+            ]));
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(Int32Array::from(vec![0, 1, 3])), names],
+            )?;
+            Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
+        }
+
+        fn read_rel(rel: &mut Rel) -> Option<&mut ReadRel> {
+            match rel.rel_type.as_mut()? {
+                RelType::Read(read) => Some(read),
+                RelType::Project(project) => read_rel(project.input.as_mut()?),
+                RelType::Filter(filter) => read_rel(filter.input.as_mut()?),
+                _ => None,
+            }
+        }
+
+        // The producer's catalog declares `r_name` as `Utf8`, which DataFusion
+        // writes as a Substrait `string` with no width.
+        let producer = SessionContext::new();
+        producer.register_table(
+            "region",
+            region(Arc::new(StringArray::from(vec![
+                "AFRICA", "AMERICA", "EUROPE",
+            ])))?,
+        )?;
+        let plan = producer
+            .sql("SELECT r_name FROM region WHERE r_regionkey = 3")
+            .await?
+            .into_optimized_plan()?;
+        let as_string = *to_substrait_plan(&plan, &producer.state())?;
+
+        // The same plan as Isthmus writes it: `r_name` declared `varchar(25)`.
+        let mut as_varchar = as_string.clone();
+        let Some(PlanRelType::Root(root)) = as_varchar.relations[0].rel_type.as_mut() else {
+            panic!("expected a root relation");
+        };
+        let read = root
+            .input
+            .as_mut()
+            .and_then(read_rel)
+            .expect("the plan reads region");
+        let schema = read.base_schema.as_mut().expect("a read has a base schema");
+        let r_name = schema
+            .names
+            .iter()
+            .position(|name| name == "r_name")
+            .expect("the base schema names r_name");
+        let r_name_type = &mut schema
+            .r#struct
+            .as_mut()
+            .expect("the base schema has a struct")
+            .types[r_name];
+        let Some(Kind::String(string)) = r_name_type.kind.as_ref() else {
+            panic!("expected r_name as a Substrait string, got {r_name_type:?}");
+        };
+        r_name_type.kind = Some(Kind::Varchar(VarChar {
+            length: 25,
+            type_variation_reference: 0,
+            nullability: string.nullability,
+        }));
+
+        // Spice serves the same table with `LargeUtf8` strings.
+        let df = Arc::new(
+            DataFusion::builder(
+                crate::status::RuntimeStatus::new(),
+                Arc::new(crate::dataaccelerator::AcceleratorEngineRegistry::default()),
+                tokio::runtime::Handle::current(),
+            )
+            .build(),
+        );
+        df.ctx.register_table(
+            "region",
+            region(Arc::new(LargeStringArray::from(vec![
+                "AFRICA", "AMERICA", "EUROPE",
+            ])))?,
+        )?;
+
+        let expected = RecordBatch::try_from_iter([(
+            "r_name",
+            Arc::new(LargeStringArray::from(vec!["EUROPE"])) as ArrayRef,
+        )])?;
+        for (declared, proto) in [("string", as_string), ("varchar", as_varchar)] {
+            let (decoded, _) = decode_plan(
+                &cmd(Some(SubstraitPlan {
+                    plan: Bytes::from(proto.encode_to_vec()),
+                    version: "0.62.0".to_string(),
+                })),
+                &df,
+            )
+            .await
+            .map_err(|status| anyhow::anyhow!("r_name declared {declared}: {status}"))?;
+            let batches = df
+                .ctx
+                .execute_logical_plan(decoded)
+                .await?
+                .collect()
+                .await?;
+            assert_eq!(
+                batches,
+                vec![expected.clone()],
+                "r_name declared {declared}"
+            );
+        }
+        Ok(())
+    }
+
     #[test]
     fn decode_plan_proto_missing_plan_returns_invalid_argument() {
         let err = decode_plan_proto(&cmd(None)).expect_err("missing plan must error");

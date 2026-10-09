@@ -77,12 +77,26 @@ struct ComponentState {
     notifier: Option<watch::Sender<ComponentStatus>>,
 }
 
+/// When a dataset was last refreshed and when its next scheduled refresh is due.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct DatasetFreshness {
+    /// When the last successful refresh completed.
+    pub last_refresh: Option<std::time::SystemTime>,
+    /// When the next scheduled refresh is due; stays at that time, in the past,
+    /// until a refresh succeeds.
+    pub next_refresh: Option<std::time::SystemTime>,
+}
+
 #[derive(Clone, Debug)]
 pub struct RuntimeStatus {
     /// Stores the current status of all components with optional notifiers.
     statuses: Arc<RwLock<HashMap<String, ComponentState>>>,
     /// Tracks components that have been in the Ready state at least once.
     ever_ready_components: Arc<RwLock<HashSet<String>>>,
+    /// When each dataset was last refreshed and is next due, by dataset name.
+    dataset_freshness: Arc<RwLock<HashMap<String, DatasetFreshness>>>,
+    /// The parent refresher that schedules each synchronized dataset.
+    dataset_refresh_sources: Arc<RwLock<HashMap<TableReference, TableReference>>>,
     /// Tracks if the runtime is in the process of shutting down.
     is_shutdown: Arc<AtomicBool>,
     /// Controls how runtime readiness is computed.
@@ -102,6 +116,8 @@ impl Default for RuntimeStatus {
         Self {
             statuses: Arc::new(RwLock::new(HashMap::new())),
             ever_ready_components: Arc::new(RwLock::new(HashSet::new())),
+            dataset_freshness: Arc::new(RwLock::new(HashMap::new())),
+            dataset_refresh_sources: Arc::new(RwLock::new(HashMap::new())),
             is_shutdown: Arc::new(AtomicBool::new(false)),
             ready_state: Arc::new(RwLock::new(RuntimeReadyState::default())),
             shutdown_token: CancellationToken::new(),
@@ -171,6 +187,90 @@ impl RuntimeStatus {
         self.update_component_status(&format!("catalog:{catalog_name}"), status);
         runtime_metrics::catalogs::STATUS
             .record(metric_value, &[KeyValue::new("catalog", catalog_name)]);
+    }
+
+    /// Records when `dataset`'s last successful refresh completed.
+    pub fn record_dataset_last_refresh(&self, dataset: &TableReference, at: std::time::SystemTime) {
+        self.dataset_freshness
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(dataset.to_string())
+            .or_default()
+            .last_refresh = Some(at);
+    }
+
+    /// Records when `dataset`'s next scheduled refresh is due.
+    pub fn record_dataset_next_refresh(&self, dataset: &TableReference, at: std::time::SystemTime) {
+        self.dataset_freshness
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(dataset.to_string())
+            .or_default()
+            .next_refresh = Some(at);
+    }
+
+    /// Forgets when `dataset`'s next refresh is due, for a refresh that has run
+    /// without one being scheduled after it.
+    pub fn clear_dataset_next_refresh(&self, dataset: &TableReference) {
+        if let Some(freshness) = self
+            .dataset_freshness
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get_mut(&dataset.to_string())
+        {
+            freshness.next_refresh = None;
+        }
+    }
+
+    /// Associates a synchronized dataset with the refresher that schedules it.
+    pub fn record_dataset_refresh_source(&self, child: &TableReference, parent: &TableReference) {
+        self.dataset_refresh_sources
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(child.clone(), parent.clone());
+    }
+
+    /// Resolves the active scheduler through synchronized parents. A cycle has
+    /// no authoritative scheduler and returns `None`.
+    #[must_use]
+    pub fn dataset_refresh_source(&self, dataset: &TableReference) -> Option<TableReference> {
+        let sources = self
+            .dataset_refresh_sources
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut source = dataset.clone();
+        for _ in 0..=sources.len() {
+            let Some(parent) = sources.get(&source) else {
+                return Some(source);
+            };
+            source = parent.clone();
+        }
+        None
+    }
+
+    /// Forgets `dataset`'s refresh times, when it is unloaded, so a dataset later
+    /// registered under the same name starts from its own.
+    pub fn remove_dataset_freshness(&self, dataset: &TableReference) {
+        self.dataset_refresh_sources
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(dataset);
+        self.dataset_freshness
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(&dataset.to_string());
+    }
+
+    /// When `dataset` was last refreshed and when its next scheduled refresh is due,
+    /// as far as recorded.
+    #[must_use]
+    pub fn dataset_freshness(&self, dataset: &TableReference) -> DatasetFreshness {
+        self.dataset_freshness
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&dataset.to_string())
+            .copied()
+            .unwrap_or_default()
     }
 
     pub fn update_dataset(&self, dataset: &TableReference, status: ComponentStatus) {
@@ -775,6 +875,11 @@ mod tests {
     /// waits never returned at all, so any finite bound fails on the old code.
     const SHUTDOWN_WAIT_BOUND: Duration = Duration::from_secs(5);
 
+    /// How long a parked waiter gets to observe the status update that wakes it.
+    /// Only an upper bound on a wake-up that should be immediate: it turns a
+    /// missed notification into a failure instead of a hung test.
+    const WAKE_BOUND: Duration = Duration::from_secs(5);
+
     #[test]
     fn test_get_component_status() {
         let status = RuntimeStatus::new();
@@ -936,6 +1041,30 @@ mod tests {
         );
     }
 
+    /// Spawns `wait_for_dataset_ready` and lets it run until it parks.
+    ///
+    /// The `#[tokio::test]` runtime is current-thread, so `yield_now` polls the
+    /// spawned waiter once before this returns: it subscribes, checks the status,
+    /// and either parks on the change notification or has already finished.
+    async fn spawn_parked_waiter(
+        status: &Arc<RuntimeStatus>,
+        dataset: &TableReference,
+    ) -> tokio::task::JoinHandle<WaitOutcome> {
+        let status = Arc::clone(status);
+        let dataset = dataset.clone();
+        let waiter = tokio::spawn(async move { status.wait_for_dataset_ready(&dataset).await });
+        tokio::task::yield_now().await;
+        waiter
+    }
+
+    /// The outcome of a waiter that the last status update should have woken.
+    async fn woken_outcome(waiter: tokio::task::JoinHandle<WaitOutcome>) -> WaitOutcome {
+        tokio::time::timeout(WAKE_BOUND, waiter)
+            .await
+            .expect("the status update should wake the waiter")
+            .expect("waiter task should not panic")
+    }
+
     #[tokio::test]
     async fn test_wait_for_dataset_ready_becomes_ready() {
         let status = RuntimeStatus::new();
@@ -944,19 +1073,14 @@ mod tests {
         // Set dataset to initializing
         status.update_dataset(&dataset, ComponentStatus::Initializing);
 
-        // Spawn a task to set the dataset ready after a short delay
-        let status_clone = Arc::clone(&status);
-        let dataset_clone = dataset.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            status_clone.update_dataset(&dataset_clone, ComponentStatus::Ready);
-        });
-
-        // Wait for ready
-        assert_eq!(
-            status.wait_for_dataset_ready(&dataset).await,
-            WaitOutcome::Reached
+        let waiter = spawn_parked_waiter(&status, &dataset).await;
+        assert!(
+            !waiter.is_finished(),
+            "the wait must block while the dataset is Initializing"
         );
+
+        status.update_dataset(&dataset, ComponentStatus::Ready);
+        assert_eq!(woken_outcome(waiter).await, WaitOutcome::Reached);
     }
 
     #[tokio::test]
@@ -964,19 +1088,16 @@ mod tests {
         let status = RuntimeStatus::new();
         let dataset = TableReference::bare("test_dataset");
 
-        // Dataset not registered - should start with Initializing and wait
-        // Spawn a task to register and set ready after a delay
-        let status_clone = Arc::clone(&status);
-        let dataset_clone = dataset.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            status_clone.update_dataset(&dataset_clone, ComponentStatus::Ready);
-        });
-
-        assert_eq!(
-            status.wait_for_dataset_ready(&dataset).await,
-            WaitOutcome::Reached
+        // Dataset not registered: the waiter subscribes to it as Initializing and
+        // parks until the dataset is registered as Ready.
+        let waiter = spawn_parked_waiter(&status, &dataset).await;
+        assert!(
+            !waiter.is_finished(),
+            "the wait must block while the dataset is not registered"
         );
+
+        status.update_dataset(&dataset, ComponentStatus::Ready);
+        assert_eq!(woken_outcome(waiter).await, WaitOutcome::Reached);
     }
 
     #[tokio::test]
@@ -986,33 +1107,25 @@ mod tests {
 
         status.update_dataset(&dataset, ComponentStatus::Initializing);
 
-        // Create multiple waiters
-        let status1 = Arc::clone(&status);
-        let status2 = Arc::clone(&status);
-        let dataset1 = dataset.clone();
-        let dataset2 = dataset.clone();
-
-        let handle1 = tokio::spawn(async move { status1.wait_for_dataset_ready(&dataset1).await });
-
-        let handle2 = tokio::spawn(async move { status2.wait_for_dataset_ready(&dataset2).await });
-
-        // Give tasks time to start waiting
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        // Both waiters are parked subscribers before the update, so it is the
+        // update that wakes them, not an already-Ready status.
+        let handle1 = spawn_parked_waiter(&status, &dataset).await;
+        let handle2 = spawn_parked_waiter(&status, &dataset).await;
+        assert!(
+            !handle1.is_finished() && !handle2.is_finished(),
+            "both waiters must be parked while the dataset is Initializing"
+        );
 
         // Set ready - both should wake up
         status.update_dataset(&dataset, ComponentStatus::Ready);
 
-        assert_eq!(
-            handle1.await.expect("task 1 should complete"),
-            WaitOutcome::Reached
-        );
-        assert_eq!(
-            handle2.await.expect("task 2 should complete"),
-            WaitOutcome::Reached
-        );
+        assert_eq!(woken_outcome(handle1).await, WaitOutcome::Reached);
+        assert_eq!(woken_outcome(handle2).await, WaitOutcome::Reached);
     }
 
-    #[tokio::test]
+    /// The wait has no deadline of its own: an hour on the (paused) clock with no
+    /// status change leaves it parked, and only the update releases it.
+    #[tokio::test(start_paused = true)]
     async fn test_wait_for_dataset_ready_waits_indefinitely() {
         let status = RuntimeStatus::new();
         let dataset = TableReference::bare("test_dataset");
@@ -1020,19 +1133,15 @@ mod tests {
         // Set dataset to initializing
         status.update_dataset(&dataset, ComponentStatus::Initializing);
 
-        // Spawn a task to set the dataset ready after a short delay
-        let status_clone = Arc::clone(&status);
-        let dataset_clone = dataset.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(50)).await;
-            status_clone.update_dataset(&dataset_clone, ComponentStatus::Ready);
-        });
-
-        // Wait indefinitely
-        assert_eq!(
-            status.wait_for_dataset_ready(&dataset).await,
-            WaitOutcome::Reached
+        let waiter = spawn_parked_waiter(&status, &dataset).await;
+        tokio::time::advance(Duration::from_hours(1)).await;
+        assert!(
+            !waiter.is_finished(),
+            "the wait must not give up while the runtime is running"
         );
+
+        status.update_dataset(&dataset, ComponentStatus::Ready);
+        assert_eq!(woken_outcome(waiter).await, WaitOutcome::Reached);
     }
 
     /// A component wait must return once shutdown starts, even though the
@@ -1301,23 +1410,15 @@ mod tests {
         status.hold_dataset_ready();
         status.update_dataset(&dataset, ComponentStatus::Ready);
 
-        let waiter = {
-            let status = Arc::clone(&status);
-            let dataset = dataset.clone();
-            tokio::spawn(async move { status.wait_for_dataset_ready(&dataset).await })
-        };
-
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // The waiter has been polled once against the held Ready before this check.
+        let waiter = spawn_parked_waiter(&status, &dataset).await;
         assert!(
             !waiter.is_finished(),
             "wait_for_dataset_ready must not observe a held Ready"
         );
 
         status.release_dataset_ready();
-        assert_eq!(
-            waiter.await.expect("waiter task should not panic"),
-            WaitOutcome::Reached
-        );
+        assert_eq!(woken_outcome(waiter).await, WaitOutcome::Reached);
     }
 
     #[test]

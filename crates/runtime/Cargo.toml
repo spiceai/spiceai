@@ -474,3 +474,10 @@ workspace = true
 name = "result_correctness"
 path = "tests/result_correctness.rs"
 required-features = ["duckdb", "sqlite"]
+
+# A binary of its own so `make nextest` can run it without loading `integration`,
+# which on macOS is too large for dyld to map the shared cache beside it.
+[[test]]
+name = "rate_control"
+path = "tests/rate_control.rs"
+required-features = ["rate-control"]

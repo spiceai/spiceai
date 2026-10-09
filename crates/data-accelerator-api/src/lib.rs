@@ -368,6 +368,12 @@ pub enum Error {
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 
+    /// The engine rejected the acceleration settings while creating the table.
+    #[snafu(display("Acceleration creation failed: {source}"))]
+    EngineRejectedConfiguration {
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
+
     // Worded as the cause clause it appears as: the messages that embed it supply the
     // impact and where to report it. Reaching this means a caller paired an engine's
     // registration with another engine's settings, which every path here chooses by engine.
@@ -394,6 +400,17 @@ pub enum FilePathError {
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
+
+impl Error {
+    /// Whether creating the table again with the same settings could succeed.
+    #[must_use]
+    pub fn is_retriable(&self) -> bool {
+        !matches!(
+            self,
+            Self::InvalidConfiguration { .. } | Self::EngineRejectedConfiguration { .. }
+        )
+    }
+}
 
 impl AcceleratorEngineRegistry {
     /// Builds the accelerator [`TableProvider`] for a dataset from its acceleration settings.
@@ -567,7 +584,13 @@ impl AcceleratorEngineRegistry {
                 Some(ctx.runtime_env()),
             )
             .await
-            .context(AccelerationCreationFailedSnafu)?;
+            .map_err(|source| {
+                if accelerator.rejects_configuration(source.as_ref()) {
+                    Error::EngineRejectedConfiguration { source }
+                } else {
+                    Error::AccelerationCreationFailed { source }
+                }
+            })?;
 
         Ok(table_provider)
     }
@@ -601,6 +624,18 @@ pub trait DataAccelerator: Send + Sync {
         partition_by: Vec<PartitionedBy>,
         runtime_env: Option<Arc<RuntimeEnv>>,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>>;
+
+    /// Whether `error`, returned by [`Self::create_external_table`], rejects the
+    /// acceleration settings, so creating the table again with them cannot succeed.
+    fn rejects_configuration(
+        &self,
+        error: &(dyn std::error::Error + Send + Sync + 'static),
+    ) -> bool {
+        matches!(
+            error.downcast_ref::<Error>(),
+            Some(Error::InvalidConfiguration { .. })
+        )
+    }
 
     /// The name of the accelerator
     fn name(&self) -> &'static str;
@@ -640,6 +675,18 @@ pub trait DataAccelerator: Send + Sync {
         } else {
             AccelerationLayout::default()
         }
+    }
+
+    /// Validate initialization without changing storage or starting background work.
+    ///
+    /// The runtime calls this while the installed generation can still write. Engines
+    /// must also validate inside [`Self::init`] because filesystem state can change
+    /// between validation and initialization. Decorators must forward this method.
+    async fn validate_init(
+        &self,
+        _source: &dyn AccelerationSource,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        Ok(())
     }
 
     /// Initialize the accelerator for a component

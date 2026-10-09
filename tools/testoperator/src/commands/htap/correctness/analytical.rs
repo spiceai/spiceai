@@ -779,6 +779,7 @@ fn print_windowed_table(batch: &RecordBatch, lo: usize, hi: usize) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::test_support::printed_by;
     use arrow::array::StringArray;
 
     fn result(name: &str, outcome: Outcome) -> AnalyticalQueryResult {
@@ -966,39 +967,129 @@ mod tests {
         .expect("valid batch")
     }
 
+    /// The window `print_windowed_table` renders for all five rows of
+    /// `ctx_batch()`, absolute row index first.
+    const FIVE_ROW_TABLE: &str = concat!(
+        "      +-----+----+---------+\n",
+        "      | row | id | city    |\n",
+        "      +-----+----+---------+\n",
+        "      | 0   | 0  | Berlin  |\n",
+        "      | 1   | 1  |         |\n",
+        "      | 2   | 2  | Munich  |\n",
+        "      | 3   | 3  | Hamburg |\n",
+        "      | 4   | 4  | Cologne |\n",
+        "      +-----+----+---------+\n",
+    );
+
+    /// The window for the first two rows of `ctx_batch()`.
+    const TWO_ROW_TABLE: &str = concat!(
+        "      +-----+----+--------+\n",
+        "      | row | id | city   |\n",
+        "      +-----+----+--------+\n",
+        "      | 0   | 0  | Berlin |\n",
+        "      | 1   | 1  |        |\n",
+        "      +-----+----+--------+\n",
+    );
+
+    const REFERENCE_LABEL: &str = "    reference (source of truth, Postgres):\n";
+    const SPICE_LABEL: &str = "    spice (Spice):\n";
+
     #[test]
     fn mismatch_context_clamps_window_to_bounds() {
-        // Must not panic when the mismatch sits at row 0 (lo underflow) or beyond
-        // the end; the window is clamped to the rows present.
-        let batch = ctx_batch();
-        print_mismatch_context("chbench_q10", &batch, &batch, 0, Some("city"));
-        print_mismatch_context("chbench_q10", &batch, &batch, 999, Some("city"));
-        // Empty batches print nothing rather than underflowing `total - 1`.
-        let empty = RecordBatch::new_empty(batch.schema());
-        print_mismatch_context("chbench_q10", &empty, &empty, 0, None);
+        // A mismatch at row 0 (lo would underflow) and one far past the end both
+        // clamp to the five rows present; an empty pair prints nothing rather
+        // than underflowing `total - 1`.
+        let printed = printed_by(
+            concat!(module_path!(), "::mismatch_context_clamps_window_to_bounds"),
+            || {
+                let batch = ctx_batch();
+                print_mismatch_context("chbench_q10", &batch, &batch, 0, Some("city"));
+                print_mismatch_context("chbench_q10", &batch, &batch, 999, Some("city"));
+                println!("-- empty pair --");
+                let empty = RecordBatch::new_empty(batch.schema());
+                print_mismatch_context("chbench_q10", &empty, &empty, 0, None);
+            },
+        );
+        let expected = [
+            "    ── chbench_q10 mismatch context: rows 0..=4 of 5 (0-based, lex-sorted), mismatch at row 0, diverging column 'city' ──\n",
+            REFERENCE_LABEL,
+            FIVE_ROW_TABLE,
+            SPICE_LABEL,
+            FIVE_ROW_TABLE,
+            "    ── chbench_q10 mismatch context: rows 0..=4 of 5 (0-based, lex-sorted), mismatch at row 4, diverging column 'city' ──\n",
+            REFERENCE_LABEL,
+            FIVE_ROW_TABLE,
+            SPICE_LABEL,
+            FIVE_ROW_TABLE,
+            "-- empty pair --\n",
+        ]
+        .concat();
+        assert_eq!(printed, expected);
     }
 
     #[test]
     fn mismatch_context_handles_row_count_divergence() {
         // The RowCountMismatch path centers on min(expected, actual) rows, which
-        // sits at (or past) the shorter side's end — must not panic and must
-        // clamp each side to its own length.
-        let full = ctx_batch(); // 5 rows
-        let short = full.slice(0, 2); // 2 rows
-        let boundary = full.num_rows().min(short.num_rows()); // 2
-        print_mismatch_context("chbench_q10", &full, &short, boundary, None);
-        print_mismatch_context("chbench_q10", &short, &full, boundary, None);
+        // sits at (or past) the shorter side's end: the window spans the longer
+        // side, and each side prints only the rows it has.
+        let printed = printed_by(
+            concat!(
+                module_path!(),
+                "::mismatch_context_handles_row_count_divergence"
+            ),
+            || {
+                let full = ctx_batch(); // 5 rows
+                let short = full.slice(0, 2); // 2 rows
+                let boundary = full.num_rows().min(short.num_rows()); // 2
+                print_mismatch_context("chbench_q10", &full, &short, boundary, None);
+                print_mismatch_context("chbench_q10", &short, &full, boundary, None);
+            },
+        );
+        let header = "    ── chbench_q10 mismatch context: rows 0..=4 of 5 (0-based, lex-sorted), mismatch at row 2 ──\n";
+        let expected = [
+            header,
+            REFERENCE_LABEL,
+            FIVE_ROW_TABLE,
+            SPICE_LABEL,
+            TWO_ROW_TABLE,
+            header,
+            REFERENCE_LABEL,
+            TWO_ROW_TABLE,
+            SPICE_LABEL,
+            FIVE_ROW_TABLE,
+        ]
+        .concat();
+        assert_eq!(printed, expected);
     }
 
     #[test]
     fn windowed_table_handles_unequal_side_lengths() {
-        // The shorter side of a row-count divergence must not panic: a window
-        // past its end prints "<no rows in window>", a partial window is clamped.
-        let full = ctx_batch(); // 5 rows
-        let short = full.slice(0, 2); // 2 rows
-        print_windowed_table(&full, 0, 4);
-        print_windowed_table(&short, 0, 4); // hi clamped to row 1
-        print_windowed_table(&short, 3, 4); // lo past end → no rows
+        // The shorter side of a row-count divergence: a partial window is clamped
+        // to its last row, and a window past its end prints "<no rows in window>".
+        let printed = printed_by(
+            concat!(
+                module_path!(),
+                "::windowed_table_handles_unequal_side_lengths"
+            ),
+            || {
+                let full = ctx_batch(); // 5 rows
+                let short = full.slice(0, 2); // 2 rows
+                print_windowed_table(&full, 0, 4);
+                println!("-- short, 0..=4 --");
+                print_windowed_table(&short, 0, 4);
+                println!("-- short, 3..=4 --");
+                print_windowed_table(&short, 3, 4);
+            },
+        );
+        let expected = [
+            FIVE_ROW_TABLE,
+            "-- short, 0..=4 --\n",
+            TWO_ROW_TABLE,
+            "-- short, 3..=4 --\n",
+            "      <no rows in window>\n",
+        ]
+        .concat();
+        assert_eq!(printed, expected);
     }
 
     #[test]

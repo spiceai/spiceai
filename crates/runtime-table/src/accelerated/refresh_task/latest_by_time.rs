@@ -150,7 +150,7 @@ impl Superseded {
     /// Count `version`, which lost to `winner`.
     fn count(&mut self, version: Kept, winner: Kept) {
         use util::session_state::SupersededReason;
-        match SupersededReason::of_version(version.time, winner.time) {
+        match SupersededReason::of_version(version.time(), winner.time()) {
             SupersededReason::Older => self.counts.older += 1,
             SupersededReason::Arrival => self.counts.arrival += 1,
         }
@@ -160,37 +160,61 @@ impl Superseded {
 /// The version of a key kept so far.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Kept {
-    /// The greatest `time_column` kept, in UTC nanoseconds; a NULL time is
-    /// [`i64::MIN`].
+    /// The greatest `time_column` kept, in UTC nanoseconds, when [`TIMED`] is set in
+    /// `hash`; read it through [`Kept::time`].
     time: i64,
     /// A hash of the kept row's contents: an equal time and hash mean the same row
-    /// read again. Content hashes have their lowest bit clear; it is set when this
-    /// refresh received the row, rather than finding it stored.
+    /// read again. Content hashes have their lowest two bits clear: [`RECEIVED`] is set
+    /// when this refresh received the row, rather than finding it stored, and
+    /// [`TIMED`] when its time is not NULL.
     hash: u64,
 }
 
+/// The [`Kept::hash`] bit set when this refresh received the row.
+const RECEIVED: u64 = 1;
+/// The [`Kept::hash`] bit set when the row's time is not NULL.
+const TIMED: u64 = 2;
+
 impl Kept {
+    /// A version with `time` (`None` for NULL) and content `hash`.
+    fn new(time: Option<i64>, hash: u64) -> Self {
+        Self {
+            time: time.unwrap_or_default(),
+            hash: if time.is_some() {
+                hash | TIMED
+            } else {
+                hash & !TIMED
+            },
+        }
+    }
+
+    /// The version's time, `None` for NULL: compared as `Option`, a NULL time is older
+    /// than any time, [`i64::MIN`] included.
+    fn time(self) -> Option<i64> {
+        (self.hash & TIMED != 0).then_some(self.time)
+    }
+
     /// Whether this refresh received the row (and so wrote it).
     fn received(self) -> bool {
-        self.hash & 1 == 1
+        self.hash & RECEIVED != 0
     }
 
     /// Whether this version and `other` are the same row: the same time and contents.
     fn same_row(self, other: Self) -> bool {
-        self.time == other.time && self.hash & !1 == other.hash & !1
+        self.time() == other.time() && self.hash & !RECEIVED == other.hash & !RECEIVED
     }
 
     /// Whether this version, arriving after `other`, replaces it: a later time, or the
     /// same time and different contents.
     fn beats(self, other: Self) -> bool {
-        self.time > other.time || (self.time == other.time && !self.same_row(other))
+        self.time() > other.time() || (self.time() == other.time() && !self.same_row(other))
     }
 
     /// This version, marked as received by this refresh.
     fn as_received(self) -> Self {
         Self {
             time: self.time,
-            hash: self.hash | 1,
+            hash: self.hash | RECEIVED,
         }
     }
 }
@@ -397,14 +421,7 @@ impl LatestByTime {
         let times = time_nanos(&column, self.reader.time_format)?;
         let hashes = self.reader.content_hashes(stored)?;
         for (row, key) in keys.into_iter().enumerate() {
-            let version = Kept {
-                time: if times.is_null(row) {
-                    i64::MIN
-                } else {
-                    times.value(row)
-                },
-                hash: hashes[row],
-            };
+            let version = Kept::new(time_at(&times, row), hashes[row]);
             match latest.entry(key) {
                 Entry::Occupied(mut entry) => {
                     if version.beats(*entry.get()) {
@@ -536,11 +553,7 @@ impl LatestByTime {
         let mut keep = vec![false; num_rows];
         let mut superseded = Superseded::default();
         for (row, keep_row) in keep.iter_mut().enumerate() {
-            let version = Kept {
-                time: times.value(row),
-                hash: hashes[row],
-            }
-            .as_received();
+            let version = Kept::new(time_at(&times, row), hashes[row]).as_received();
             match self.latest.entry(keys[row]) {
                 Entry::Occupied(mut entry) => {
                     let kept = entry.get_mut();
@@ -717,10 +730,10 @@ impl VersionReader {
             .collect::<Result<Vec<ArrayRef>, DataFusionError>>()?;
         let mut hashes = vec![0_u64; batch.num_rows()];
         create_hashes(&columns, &RandomState::default(), &mut hashes)?;
-        // The lowest bit is the selector's own mark (see `Kept`), so it is left out of
-        // every content hash.
+        // The lowest two bits are the selector's own marks (see `Kept`), so they are
+        // left out of every content hash.
         for hash in &mut hashes {
-            *hash &= !1;
+            *hash &= !(RECEIVED | TIMED);
         }
         Ok(hashes)
     }
@@ -737,12 +750,12 @@ impl VersionReader {
             })
     }
 
-    /// The time column as UTC nanoseconds, interpreted per `time_format`, a NULL time as
-    /// [`i64::MIN`], older than any time. Values without a zone are read as UTC; strings
-    /// are parsed, so offsets compare by instant.
+    /// The time column as UTC nanoseconds, interpreted per `time_format`; a NULL time
+    /// stays NULL ([`time_at`] reads it as older than any time). Values without a zone
+    /// are read as UTC; strings are parsed, so offsets compare by instant.
     fn times(&self, batch: &RecordBatch) -> Result<Int64Array, DataFusionError> {
         let column = self.time_column_of(batch)?;
-        let times = time_nanos(&column, self.time_format).map_err(|_| {
+        time_nanos(&column, self.time_format).map_err(|_| {
             let unreadable = unreadable_times(&column, self.time_format);
             not_applied(&format!(
                 "'time_column' '{}' has {unreadable} {} that cannot be read as '{}', so this refresh was not applied and the previous data is still served. Correct the source values or set 'time_format' to match them.",
@@ -750,16 +763,14 @@ impl VersionReader {
                 plural(unreadable, "value", "values"),
                 time_format_name(self.time_format),
             ))
-        })?;
-        Ok(if times.null_count() == 0 {
-            times
-        } else {
-            times
-                .iter()
-                .map(|time| Some(time.unwrap_or(i64::MIN)))
-                .collect()
         })
     }
+}
+
+/// The time `times` holds for `row`, `None` for NULL: compared as `Option`, a NULL
+/// time is older than any time, [`i64::MIN`] included.
+fn time_at(times: &Int64Array, row: usize) -> Option<i64> {
+    (!times.is_null(row)).then(|| times.value(row))
 }
 
 impl util::session_state::RowVersions for VersionReader {
@@ -1016,7 +1027,7 @@ impl DeferredRows {
         fields.extend([
             Arc::new(Field::new(KEY_HI, DataType::UInt64, false)),
             Arc::new(Field::new(KEY_LO, DataType::UInt64, false)),
-            Arc::new(Field::new(TIME, DataType::Int64, false)),
+            Arc::new(Field::new(TIME, DataType::Int64, true)),
             Arc::new(Field::new(SEQ, DataType::UInt64, false)),
             Arc::new(Field::new(HASH, DataType::UInt64, false)),
         ]);
@@ -1155,11 +1166,7 @@ impl DeferredResolver {
         let mut out = Vec::new();
         for row in 0..batch.num_rows() {
             let key = (u128::from(hi.value(row)) << 64) | u128::from(lo.value(row));
-            let version = Kept {
-                time: times.value(row),
-                hash: hashes.value(row),
-            }
-            .as_received();
+            let version = Kept::new(time_at(times, row), hashes.value(row)).as_received();
             match self.group.as_mut() {
                 Some(group) if group.key == key => {
                     if version.beats(group.best_version) {
@@ -1580,6 +1587,58 @@ mod tests {
             .await
             .expect("selects");
         assert_eq!(values(&second), ["earliest"]);
+    }
+
+    /// A NULL time is older than the earliest time a `unix_nanos` column can hold,
+    /// [`i64::MIN`], so a later NULL row never replaces it, within a batch or across
+    /// batches.
+    #[tokio::test]
+    async fn a_null_time_is_older_than_the_minimum_time() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("at", DataType::Int64, true),
+            Field::new("v", DataType::Utf8, false),
+        ]));
+        let rows = |rows: &[(i64, Option<i64>, &str)]| {
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from_iter_values(rows.iter().map(|r| r.0))),
+                    Arc::new(rows.iter().map(|r| r.1).collect::<Int64Array>()),
+                    Arc::new(StringArray::from_iter_values(rows.iter().map(|r| r.2))),
+                ],
+            )
+            .expect("valid batch")
+        };
+        let selector = || {
+            LatestByTime::try_new(
+                "events",
+                &schema,
+                vec!["id".to_string()],
+                "at".to_string(),
+                Some(TimeFormat::UnixNanos),
+            )
+            .expect("valid selector")
+        };
+
+        let mut across = selector();
+        let first = across
+            .select(&rows(&[(1, Some(i64::MIN), "min")]))
+            .await
+            .expect("selects");
+        assert_eq!(values(&first), ["min"]);
+        let second = across
+            .select(&rows(&[(1, None, "null")]))
+            .await
+            .expect("selects");
+        assert!(values(&second).is_empty(), "{:?}", values(&second));
+
+        let mut within = selector();
+        let both = within
+            .select(&rows(&[(1, Some(i64::MIN), "min"), (1, None, "null")]))
+            .await
+            .expect("selects");
+        assert_eq!(values(&both), ["min"]);
     }
 
     #[test]

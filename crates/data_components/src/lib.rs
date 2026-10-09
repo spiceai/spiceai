@@ -248,11 +248,13 @@ impl TableLayer for MetadataEnrichedTableProvider {
         // Exhaustive on purpose: a wildcard would answer a future walk kind
         // for this layer without anyone deciding what it should say.
         match walk {
+            // Table and column descriptions change no row, column, or type.
             LayerWalk::Read
             | LayerWalk::CdcDetection
             | LayerWalk::Source
             | LayerWalk::RetentionDelete
-            | LayerWalk::Index => Some(below),
+            | LayerWalk::Index
+            | LayerWalk::Passthrough => Some(below),
             LayerWalk::Write => None,
         }
     }

@@ -2031,13 +2031,21 @@ mod tests {
             .await
             .expect("cache access should succeed");
 
-        assert!(
-            provider
-                .get_raw_key(&key)
-                .await
-                .expect("cache access should succeed")
-                .is_some(),
-            "an entry for an uninvalidated table must remain cached"
+        let served = provider
+            .get_raw_key(&key)
+            .await
+            .expect("cache access should succeed")
+            .expect("an entry for an uninvalidated table must remain cached");
+        // The served entry is the one stored, with the read start it was stored with:
+        // the `orders` invalidation, later than that read start, must not touch it.
+        assert_eq!(
+            *served.input_tables,
+            HashSet::from([TableReference::bare("customer")]),
+            "the served entry must be the result stored for `customer`"
+        );
+        assert_eq!(
+            served.read_started_at, read_started_at,
+            "the served entry must carry the read start it was stored with"
         );
     }
 

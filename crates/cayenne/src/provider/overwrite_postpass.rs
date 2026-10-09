@@ -54,7 +54,9 @@ use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
-use arrow::array::{ArrayRef, AsArray, BooleanArray, RecordBatch, UInt32Array, UInt64Array};
+use arrow::array::{
+    Array as _, ArrayRef, AsArray, BooleanArray, RecordBatch, UInt32Array, UInt64Array,
+};
 use arrow::compute::filter_record_batch;
 use arrow::datatypes::{DataType, Field, FieldRef, Schema, SchemaRef, UInt32Type, UInt64Type};
 use datafusion::catalog::streaming::StreamingTable;
@@ -495,7 +497,7 @@ pub(crate) fn with_versions(schema: &SchemaRef, arrival: &str, version: &str) ->
         .iter()
         .cloned()
         .collect();
-    fields.push(Arc::new(Field::new(version, DataType::Int64, false)));
+    fields.push(Arc::new(Field::new(version, DataType::Int64, true)));
     Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()))
 }
 
@@ -514,15 +516,16 @@ impl CopyOrder {
     }
 }
 
-/// The time one order value holds.
-fn order_time(bytes: &[u8]) -> i64 {
+/// The time one order value holds, `None` for a NULL time.
+fn order_time(bytes: &[u8]) -> Option<i64> {
     let mut time = [0_u8; 8];
-    time.copy_from_slice(&bytes[..8]);
-    (u64::from_be_bytes(time) ^ (1 << 63)).cast_signed()
+    time.copy_from_slice(&bytes[1..9]);
+    (bytes[0] == 1).then(|| (u64::from_be_bytes(time) ^ (1 << 63)).cast_signed())
 }
 
-/// One value per row that orders like its `(time, arrival)`: the time with its sign
-/// bit flipped, then the arrival ordinal, both big-endian.
+/// One value per row that orders like its `(time, arrival)`: a byte that is `0` for a
+/// NULL time and `1` otherwise, so NULL sorts below every time, then the time with its
+/// sign bit flipped and the arrival ordinal, both big-endian.
 fn order_bytes(
     times: &ArrayRef,
     arrivals: &ArrayRef,
@@ -536,11 +539,15 @@ fn order_bytes(
     let arrivals = arrivals
         .as_primitive_opt::<UInt32Type>()
         .ok_or_else(|| missing("arrival"))?;
-    let mut builder = arrow::array::BinaryBuilder::with_capacity(times.len(), times.len() * 12);
-    for (time, arrival) in times.values().iter().zip(arrivals.values().iter()) {
-        let mut bytes = [0_u8; 12];
-        bytes[..8].copy_from_slice(&(time.cast_unsigned() ^ (1 << 63)).to_be_bytes());
-        bytes[8..].copy_from_slice(&arrival.to_be_bytes());
+    let mut builder = arrow::array::BinaryBuilder::with_capacity(times.len(), times.len() * 13);
+    for (row, arrival) in arrivals.values().iter().enumerate() {
+        let mut bytes = [0_u8; 13];
+        if !times.is_null(row) {
+            bytes[0] = 1;
+            bytes[1..9]
+                .copy_from_slice(&(times.value(row).cast_unsigned() ^ (1 << 63)).to_be_bytes());
+        }
+        bytes[9..].copy_from_slice(&arrival.to_be_bytes());
         builder.append_value(bytes);
     }
     Ok(builder.finish())
@@ -639,10 +646,11 @@ impl ArrivalStream {
         let mut columns = versioned.batch.columns().to_vec();
         columns.push(Arc::new(versioned.times));
         let mut fields: Vec<FieldRef> = versioned.batch.schema().fields().iter().cloned().collect();
+        // A NULL time stays NULL (older than any time), so the column is nullable.
         fields.push(Arc::new(Field::new(
             VERSION_TIME_COLUMN,
             DataType::Int64,
-            false,
+            true,
         )));
         Ok(RecordBatch::try_new(
             Arc::new(Schema::new(fields)),
@@ -1078,7 +1086,7 @@ impl CayenneTableProvider {
             stored_fields.push(Arc::new(Field::new(
                 ORDER_TIME_COLUMN,
                 DataType::Int64,
-                false,
+                true,
             )));
         }
         fields.push(Arc::new(Field::new(
@@ -1545,6 +1553,27 @@ pub(crate) fn key_column_names(schema: &Schema, indices: &[usize]) -> Vec<String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A NULL time orders below [`i64::MIN`], whatever the arrival, and an order value
+    /// gives back the time it was built from.
+    #[test]
+    fn a_null_time_orders_below_the_minimum_time() {
+        let times: ArrayRef = Arc::new(arrow::array::Int64Array::from(vec![
+            None,
+            Some(i64::MIN),
+            Some(0),
+        ]));
+        let arrivals: ArrayRef = Arc::new(UInt32Array::from(vec![9, 0, 0]));
+        let order = order_bytes(&times, &arrivals).expect("order values");
+        assert!(order.value(0) < order.value(1), "NULL sorts below i64::MIN");
+        assert!(order.value(1) < order.value(2));
+        assert_eq!(
+            (0..3)
+                .map(|row| order_time(order.value(row)))
+                .collect::<Vec<_>>(),
+            [None, Some(i64::MIN), Some(0)]
+        );
+    }
 
     /// A retry after the query ran out of memory waits until the failed
     /// attempt's tasks have released theirs, so it starts with the pool free.

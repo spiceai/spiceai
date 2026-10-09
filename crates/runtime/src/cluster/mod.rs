@@ -2856,25 +2856,58 @@ mod tests {
 
     #[test]
     fn cluster_tls_config_accepts_valid_node_certificate() {
+        use rcgen::{
+            CertificateParams, DistinguishedName, DnType, ExtendedKeyUsagePurpose, IsCa, Issuer,
+            KeyPair, KeyUsagePurpose, SanType,
+        };
+
         install_crypto_provider();
         let temp_dir = TempDir::new().expect("temp dir should create");
-        let ca_key = generate_key();
-        let ca_cert = create_signed_certificate("Spice Test CA", "Spice Test CA", &ca_key, &ca_key);
 
-        let node_key = generate_key();
-        let node_cert =
-            create_signed_certificate("Spice Test Node", "Spice Test CA", &node_key, &ca_key);
+        // A real handshake needs certificates webpki accepts: a CA with basic
+        // constraints and a node certificate carrying a SAN and both TLS usages,
+        // since a cluster node is both server and client.
+        let mut ca_dn = DistinguishedName::new();
+        ca_dn.push(DnType::CommonName, "Spice Test CA");
+        let mut ca_params = CertificateParams::default();
+        ca_params.distinguished_name = ca_dn;
+        ca_params.is_ca = IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![
+            KeyUsagePurpose::DigitalSignature,
+            KeyUsagePurpose::KeyCertSign,
+            KeyUsagePurpose::CrlSign,
+        ];
+        let ca_key = KeyPair::generate().expect("ca keypair");
+        let ca_cert = ca_params.self_signed(&ca_key).expect("self-signed CA");
+        let ca_issuer = Issuer::new(ca_params, ca_key);
+
+        let mut node_dn = DistinguishedName::new();
+        node_dn.push(DnType::CommonName, "Spice Test Node");
+        let mut node_params = CertificateParams::default();
+        node_params.distinguished_name = node_dn;
+        node_params
+            .subject_alt_names
+            .push(SanType::DnsName("spice-node".try_into().expect("dns name")));
+        node_params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
+        node_params.extended_key_usages = vec![
+            ExtendedKeyUsagePurpose::ServerAuth,
+            ExtendedKeyUsagePurpose::ClientAuth,
+        ];
+        let node_key = KeyPair::generate().expect("node keypair");
+        let node_cert = node_params
+            .signed_by(&node_key, &ca_issuer)
+            .expect("node certificate signed by the CA");
 
         let ca_path = temp_dir.path().join("ca.pem");
         let node_cert_path = temp_dir.path().join("node.pem");
         let node_key_path = temp_dir.path().join("node.key");
 
-        write_cert(&ca_path, &ca_cert);
-        write_cert(&node_cert_path, &node_cert);
-        write_key(&node_key_path, &node_key);
+        std::fs::write(&ca_path, ca_cert.pem()).expect("CA certificate should write");
+        std::fs::write(&node_cert_path, node_cert.pem()).expect("node certificate should write");
+        std::fs::write(&node_key_path, node_key.serialize_pem()).expect("node key should write");
 
         let control = runtime_tls::TlsControl::new().expect("watcher");
-        ClusterTlsConfig::try_new(
+        let config = ClusterTlsConfig::try_new(
             ca_path.to_str().expect("ca path should be utf8"),
             node_cert_path
                 .to_str()
@@ -2885,6 +2918,140 @@ mod tests {
             &control,
         )
         .expect("valid certificates should be accepted");
+
+        let server_config = config.server_config();
+        assert_eq!(server_config.alpn_protocols, vec![b"h2".to_vec()]);
+
+        // Acceptance must yield a working mTLS server: a client presenting the
+        // CA-signed node identity completes a handshake against it, negotiates
+        // h2, and is seen with exactly that certificate.
+        let node_cert_der = rustls::pki_types::CertificateDer::from(node_cert.der().to_vec());
+        let node_key_der = rustls::pki_types::PrivateKeyDer::Pkcs8(node_key.serialize_der().into());
+        let mut client_config = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(std::sync::Arc::new(PinnedServerCertificate(
+                node_cert_der.clone(),
+            )))
+            .with_client_auth_cert(vec![node_cert_der.clone()], node_key_der)
+            .expect("the node identity is a valid client certificate");
+        client_config.alpn_protocols = vec![b"h2".to_vec()];
+        let mut client = rustls::ClientConnection::new(
+            std::sync::Arc::new(client_config),
+            rustls::pki_types::ServerName::try_from("spice-node").expect("valid server name"),
+        )
+        .expect("client connection");
+        let mut server = rustls::ServerConnection::new(server_config).expect("server connection");
+
+        complete_handshake(&mut client, &mut server);
+
+        assert_eq!(server.alpn_protocol(), Some(&b"h2"[..]));
+        assert_eq!(
+            server.peer_certificates().map(|certs| certs
+                .iter()
+                .map(|cert| cert.as_ref().to_vec())
+                .collect::<Vec<_>>()),
+            Some(vec![node_cert_der.as_ref().to_vec()]),
+            "the server must accept and record the CA-signed client certificate"
+        );
+    }
+
+    /// Trusts exactly one server certificate, the node's own. The test checks
+    /// the server half of the handshake, so the client pins what it expects the
+    /// server to present instead of validating a hostname the test PKI lacks.
+    #[derive(Debug)]
+    struct PinnedServerCertificate(rustls::pki_types::CertificateDer<'static>);
+
+    impl rustls::client::danger::ServerCertVerifier for PinnedServerCertificate {
+        fn verify_server_cert(
+            &self,
+            end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            if end_entity.as_ref() == self.0.as_ref() {
+                Ok(rustls::client::danger::ServerCertVerified::assertion())
+            } else {
+                Err(rustls::Error::General(
+                    "the server presented an unexpected certificate".to_string(),
+                ))
+            }
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls12_signature(
+                message,
+                cert,
+                dss,
+                &rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms,
+            )
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls13_signature(
+                message,
+                cert,
+                dss,
+                &rustls::crypto::aws_lc_rs::default_provider().signature_verification_algorithms,
+            )
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            rustls::crypto::aws_lc_rs::default_provider()
+                .signature_verification_algorithms
+                .supported_schemes()
+        }
+    }
+
+    /// Runs a TLS handshake between `client` and `server` in memory, failing if
+    /// either side rejects the other's flight or it does not finish.
+    fn complete_handshake(
+        client: &mut rustls::ClientConnection,
+        server: &mut rustls::ServerConnection,
+    ) {
+        for _ in 0..16 {
+            if !client.is_handshaking() && !server.is_handshaking() {
+                return;
+            }
+            let mut flight = Vec::new();
+            client
+                .write_tls(&mut flight)
+                .expect("the client writes its flight");
+            let mut pending = flight.as_slice();
+            while !pending.is_empty() {
+                server
+                    .read_tls(&mut pending)
+                    .expect("the server reads the client's flight");
+                server
+                    .process_new_packets()
+                    .expect("the server accepts the client's flight");
+            }
+            let mut flight = Vec::new();
+            server
+                .write_tls(&mut flight)
+                .expect("the server writes its flight");
+            let mut pending = flight.as_slice();
+            while !pending.is_empty() {
+                client
+                    .read_tls(&mut pending)
+                    .expect("the client reads the server's flight");
+                client
+                    .process_new_packets()
+                    .expect("the client accepts the server's flight");
+            }
+        }
+        panic!("the TLS handshake did not complete");
     }
 
     #[test]

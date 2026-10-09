@@ -17,14 +17,17 @@ limitations under the License.
 use std::sync::Arc;
 use std::time::SystemTime;
 
-#[cfg(feature = "duckdb")]
+#[cfg(any(feature = "duckdb", not(target_os = "windows")))]
 use arrow::array::{Array, Int32Array, StringArray};
+#[cfg(not(target_os = "windows"))]
+use common::make_mongodb_cayenne_change_stream_dataset;
 use common::{get_mongodb_client, make_mongodb_dataset, start_mongodb_docker_container};
+#[cfg(any(feature = "duckdb", not(target_os = "windows")))]
+use common::{get_mongodb_replica_set_client, start_mongodb_replica_set_docker_container};
 #[cfg(feature = "duckdb")]
 use common::{
-    get_mongodb_replica_set_client, make_mongodb_change_stream_dataset,
-    make_mongodb_change_stream_dataset_inferred, make_mongodb_inference_dataset,
-    make_mongodb_widen_dataset, start_mongodb_replica_set_docker_container,
+    make_mongodb_change_stream_dataset, make_mongodb_change_stream_dataset_inferred,
+    make_mongodb_inference_dataset, make_mongodb_widen_dataset,
 };
 #[cfg(feature = "duckdb")]
 use datafusion::assert_batches_eq;
@@ -34,7 +37,7 @@ use chrono::{DateTime, Utc};
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 
 use crate::init_tracing;
-#[cfg(feature = "duckdb")]
+#[cfg(any(feature = "duckdb", not(target_os = "windows")))]
 use crate::utils::wait_until_true;
 use crate::utils::{register_test_connectors, run_query, test_request_context};
 
@@ -152,7 +155,7 @@ async fn init_mongodb_inventory_db(port: u16) -> Result<(), anyhow::Error> {
 }
 
 #[instrument]
-#[cfg(feature = "duckdb")]
+#[cfg(any(feature = "duckdb", not(target_os = "windows")))]
 async fn init_mongodb_change_stream_db(port: u16) -> Result<(), anyhow::Error> {
     tracing::debug!("INIT CHANGE STREAM DB: test");
     let client = get_mongodb_replica_set_client(port).await?;
@@ -175,7 +178,7 @@ async fn init_mongodb_change_stream_db(port: u16) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-#[cfg(feature = "duckdb")]
+#[cfg(any(feature = "duckdb", not(target_os = "windows")))]
 async fn change_stream_rows(rt: &Arc<Runtime>) -> Result<Vec<(i32, String)>, anyhow::Error> {
     let batches = run_query(rt, "SELECT _id, name FROM change_stream_users ORDER BY _id").await?;
     let mut rows = Vec::new();
@@ -514,6 +517,30 @@ async fn mongodb_schema_inference_loads_and_queries() -> Result<(), anyhow::Erro
 #[cfg(feature = "duckdb")]
 #[tokio::test(flavor = "multi_thread")]
 async fn mongodb_change_streams_apply_insert_update_delete() -> Result<(), anyhow::Error> {
+    assert_change_streams_apply_insert_update_delete(
+        "mongodb_change_streams_apply_insert_update_delete",
+        make_mongodb_change_stream_dataset,
+    )
+    .await
+}
+
+/// Cayenne applies Change Streams with `primary_key: _id` and no `on_conflict`: it keeps
+/// one row per primary key on its own.
+#[cfg(not(target_os = "windows"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn mongodb_change_streams_cayenne_primary_key_only() -> Result<(), anyhow::Error> {
+    assert_change_streams_apply_insert_update_delete(
+        "mongodb_change_streams_cayenne_primary_key_only",
+        make_mongodb_cayenne_change_stream_dataset,
+    )
+    .await
+}
+
+#[cfg(any(feature = "duckdb", not(target_os = "windows")))]
+async fn assert_change_streams_apply_insert_update_delete(
+    app_name: &str,
+    make_dataset: fn(&str, &str, u16) -> spicepod::component::dataset::Dataset,
+) -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some(
         "integration=debug,runtime=debug,connector_mongodb=debug,data_components=debug,info",
     ));
@@ -532,8 +559,8 @@ async fn mongodb_change_streams_apply_insert_update_delete() -> Result<(), anyho
             })
             .await?;
 
-            let app = AppBuilder::new("mongodb_change_streams_apply_insert_update_delete")
-                .with_dataset(make_mongodb_change_stream_dataset(
+            let app = AppBuilder::new(app_name)
+                .with_dataset(make_dataset(
                     "change_stream_users",
                     "change_stream_users",
                     port,

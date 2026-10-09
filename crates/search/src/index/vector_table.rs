@@ -490,7 +490,12 @@ impl TableLayer for VectorScanTableProvider {
         // for this layer without anyone deciding what it should say.
         match walk {
             LayerWalk::Read | LayerWalk::Source | LayerWalk::Index => Some(below),
-            LayerWalk::CdcDetection | LayerWalk::Write | LayerWalk::RetentionDelete => None,
+            // The vector-index columns it merges in are not in the table
+            // beneath, so that table cannot stand in for this one.
+            LayerWalk::CdcDetection
+            | LayerWalk::Write
+            | LayerWalk::RetentionDelete
+            | LayerWalk::Passthrough => None,
         }
     }
 

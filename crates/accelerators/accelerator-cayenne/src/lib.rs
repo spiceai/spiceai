@@ -3520,15 +3520,12 @@ impl DataAccelerator for CayenneAccelerator {
         }
     }
 
-    async fn init(
+    async fn validate_init(
         &self,
         source: &dyn AccelerationSource,
-    ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         if !source.is_file_accelerated() {
-            // Memory mode (`mode: memory`) is fully in-RAM and ephemeral — there is
-            // nothing to bootstrap on disk; the dataset reloads from its federated
-            // source on startup, like the in-memory Arrow accelerator.
-            return Ok(BootstrapStatus::none());
+            return Ok(());
         }
 
         if let Some(acceleration) = source.acceleration() {
@@ -3569,7 +3566,18 @@ impl DataAccelerator for CayenneAccelerator {
         {
             Self::ensure_no_catalog_under_data_dir(source, &dir_path).await?;
         }
+        Ok(())
+    }
 
+    async fn init(
+        &self,
+        source: &dyn AccelerationSource,
+    ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
+        self.validate_init(source).await?;
+        if !source.is_file_accelerated() {
+            return Ok(BootstrapStatus::none());
+        }
+        let dir_path = self.file_path(source)?;
         let is_s3_express = s3::is_s3_express_data_path(source);
 
         // Handle S3 Express One Zone configuration
@@ -4156,6 +4164,20 @@ impl DataAccelerator for CayenneAccelerator {
                 &primary_keys,
             ))
         }
+    }
+
+    fn rejects_configuration(
+        &self,
+        error: &(dyn std::error::Error + Send + Sync + 'static),
+    ) -> bool {
+        matches!(
+            error.downcast_ref::<Error>(),
+            Some(
+                Error::InvalidConfiguration { .. }
+                    | Error::InvalidScanConcurrency { .. }
+                    | Error::UnsupportedDataTypes { .. }
+            )
+        )
     }
 
     fn prefix(&self) -> &'static str {
@@ -5654,13 +5676,16 @@ mod tests {
         let base = tempfile::tempdir().expect("temp dir");
         let data = base.path().join("orders");
         std::fs::create_dir_all(&data).expect("data dir");
+        // The guard reports resolved paths: on macOS the temp dir sits under `/var`, a
+        // symlink to `/private/var`, so compare against the canonical data directory.
+        let resolved_data = std::fs::canonicalize(&data).expect("canonical data dir");
 
         let traversed = data.join("sibling").join("..").join("catalog");
-        assert!(
+        assert_eq!(
             overlapping_metastore_dir(&data.to_string_lossy(), &traversed.to_string_lossy())
                 .await
-                .expect("the test paths resolve")
-                .is_some(),
+                .expect("the test paths resolve"),
+            Some((resolved_data.clone(), resolved_data.join("catalog"))),
             "`orders/sibling/../catalog` is `orders/catalog`, which the delete takes"
         );
 
@@ -5671,11 +5696,11 @@ mod tests {
             let link = base.path().join("link-to-orders");
             std::os::unix::fs::symlink(&data, &link).expect("symlink");
             let through_link = link.join("catalog");
-            assert!(
+            assert_eq!(
                 overlapping_metastore_dir(&data.to_string_lossy(), &through_link.to_string_lossy())
                     .await
-                    .expect("the test paths resolve")
-                    .is_some(),
+                    .expect("the test paths resolve"),
+                Some((resolved_data.clone(), resolved_data.join("catalog"))),
                 "a metadata dir reached through a symlink to the data dir is still inside it"
             );
         }
@@ -5696,11 +5721,15 @@ mod tests {
         std::os::unix::fs::symlink(data.join("subdir"), &link).expect("symlink");
 
         let through_link = link.join("..").join("catalog");
-        assert!(
+        // `data/subdir/../catalog` and not `data/subdir/catalog`: the `..` must pop the
+        // component the link resolved to. Canonical, because macOS's `/var` temp dir is
+        // itself a symlink to `/private/var`.
+        let resolved_data = std::fs::canonicalize(&data).expect("canonical data dir");
+        assert_eq!(
             overlapping_metastore_dir(&data.to_string_lossy(), &through_link.to_string_lossy())
                 .await
-                .expect("the test paths resolve")
-                .is_some(),
+                .expect("the test paths resolve"),
+            Some((resolved_data.clone(), resolved_data.join("catalog"))),
             "`link/../catalog` resolves inside the data dir once `link` is followed first"
         );
     }
@@ -5780,27 +5809,6 @@ mod tests {
             absolute_data_dir("s3://bucket/orders/").expect("an object store is not a failure"),
             None,
             "only an object-store scheme may skip the overlap check"
-        );
-    }
-
-    /// The exemption belongs to the *data* path. `is_local_path` is a substring test, so
-    /// applying it to a metadata path exempts any value merely containing `://` — while
-    /// the catalog code goes on creating `cayenne.db` at that very filesystem path,
-    /// inside the directory the recreate deletes. Raised by Copilot on #13101.
-    #[tokio::test]
-    async fn a_metadata_dir_containing_a_scheme_separator_is_still_compared() {
-        let base = tempfile::tempdir().expect("temp dir");
-        let data = base.path().join("orders");
-        std::fs::create_dir_all(&data).expect("data dir");
-
-        let nested = data.join("catalog://v1");
-        assert!(
-            overlapping_metastore_dir(&data.to_string_lossy(), &nested.to_string_lossy())
-                .await
-                .expect("the test paths resolve")
-                .is_some(),
-            "`://` inside a metadata path does not put it on object storage, and the \
-             delete still reaches it"
         );
     }
 

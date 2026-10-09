@@ -1481,6 +1481,13 @@ mod tests {
         )
         .expect("failed to create table");
 
+        // A freshly built table carries no constraints; the primary key below is the only one.
+        assert_eq!(
+            table.constraints(),
+            Some(&Constraints::default()),
+            "a new table must start without constraints"
+        );
+
         // Add primary key constraint
         let constraints = Constraints::new_unverified(vec![Constraint::PrimaryKey(vec![0])]);
         let table = table
@@ -1488,7 +1495,18 @@ mod tests {
             .await
             .expect("failed to add constraints");
 
-        assert!(table.constraints().is_some());
+        assert_eq!(
+            table.constraints(),
+            Some(&Constraints::new_unverified(vec![Constraint::PrimaryKey(
+                vec![0]
+            )])),
+            "the primary key constraint must be applied to the table"
+        );
+        assert_eq!(
+            table.index().map(|index| index.len()),
+            Some(300),
+            "adding the constraint must keep the primary key index over every row"
+        );
     }
 
     /// Test that `Unique` constraints are filtered out and don't cause errors.
@@ -1547,8 +1565,14 @@ mod tests {
             .await
             .expect("failed to add constraints");
 
-        // The table should have constraints (the PrimaryKey was preserved)
-        assert!(table.constraints().is_some());
+        // Exactly the PrimaryKey reaches the table: it is preserved and the Unique is dropped.
+        assert_eq!(
+            table.constraints(),
+            Some(&Constraints::new_unverified(vec![Constraint::PrimaryKey(
+                vec![0]
+            )])),
+            "only the primary key constraint may be applied; the unique constraint must be filtered out"
+        );
     }
 
     #[tokio::test]
@@ -2309,15 +2333,34 @@ mod tests {
         )
         .expect("failed to create table");
 
-        // Test direct lookup for each key
-        for name in &names {
-            let result = table.get_by_key(&(*name).to_string()).await;
-            assert!(
-                result.is_ok(),
-                "Lookup should not error for unicode key: {name:?}"
+        // Each key must resolve to its own row: `get_by_key` does not re-check the key after the
+        // hash lookup, so the stored name and id are what prove no two keys were mixed up.
+        for (name, expected_id) in names.iter().zip(&ids) {
+            let batch = table
+                .get_by_key(&(*name).to_string())
+                .await
+                .unwrap_or_else(|e| panic!("lookup for unicode key {name:?} failed: {e}"))
+                .unwrap_or_else(|| panic!("unicode key {name:?} should be found"));
+            assert_eq!(
+                batch.num_rows(),
+                1,
+                "lookup for {name:?} must return exactly one row"
             );
-            let batch = result.expect("lookup failed");
-            assert!(batch.is_some(), "Unicode key {name:?} should be found");
+            let found_name = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .expect("name column is Utf8");
+            let found_id = batch
+                .column(1)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("id column is Int64");
+            assert_eq!(
+                (found_name.value(0), found_id.value(0)),
+                (*name, *expected_id),
+                "lookup for {name:?} returned the wrong row"
+            );
         }
     }
 
@@ -2428,16 +2471,22 @@ mod tests {
         )
         .expect("failed to create batch");
 
-        // Creating indexed table with duplicates should fail
-        let result = create_test_indexed_table_force_index(
+        // The production constructor must refuse the repeated key 2 rather than index one of its
+        // two rows and hide the other from point lookups.
+        let err = IndexedMemTable::try_new_with_parallelism(
             schema,
             vec![vec![batch]],
             vec!["id".to_string()],
-        );
-
+            Some(1),
+        )
+        .expect_err("duplicate primary keys should be rejected for data integrity");
         assert!(
-            result.is_err(),
-            "Duplicate primary keys should be rejected for data integrity"
+            matches!(
+                &err,
+                DataFusionError::Execution(message)
+                    if message == "Failed to build hash index: Duplicate key detected"
+            ),
+            "the repeated key must be reported as a duplicate key, got: {err:?}"
         );
     }
 
@@ -2522,7 +2571,7 @@ mod tests {
     }
 
     /// Test concurrent reads don't cause data races.
-    #[tokio::test]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn test_data_correctness_concurrent_reads() {
         let batch = create_large_test_batch(1000);
         let schema = batch.schema();
@@ -2532,20 +2581,39 @@ mod tests {
                 .expect("failed to create table"),
         );
 
-        // Spawn multiple concurrent lookups
+        // Ten tasks on a multi-threaded runtime look up disjoint key ranges in parallel; every
+        // lookup must return that key's own row.
         let mut handles = Vec::new();
-        for i in 0..10 {
+        for task in 0..10_i64 {
             let table_clone = Arc::clone(&table);
             handles.push(tokio::spawn(async move {
-                for key in (i * 100)..(i * 100 + 100) {
-                    let result = table_clone
-                        .get_by_key(&i64::from(key))
+                for key in (task * 100)..(task * 100 + 100) {
+                    let row = table_clone
+                        .get_by_key(&key)
                         .await
-                        .expect("lookup failed");
-
-                    if key < 1000 {
-                        assert!(result.is_some(), "Key {key} should exist");
-                    }
+                        .expect("lookup failed")
+                        .unwrap_or_else(|| panic!("key {key} should exist"));
+                    assert_eq!(
+                        row.num_rows(),
+                        1,
+                        "key {key} must resolve to exactly one row"
+                    );
+                    let id = row
+                        .column(0)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("id column is Int64");
+                    let name = row
+                        .column(1)
+                        .as_any()
+                        .downcast_ref::<StringArray>()
+                        .expect("name column is Utf8");
+                    let expected_name = format!("name_{key}");
+                    assert_eq!(
+                        (id.value(0), name.value(0)),
+                        (key, expected_name.as_str()),
+                        "key {key} returned the wrong row"
+                    );
                 }
             }));
         }

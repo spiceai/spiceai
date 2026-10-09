@@ -250,7 +250,9 @@ impl Display for StorageProfile {
 pub enum RefreshOnStartup {
     /// Always start a new refresh when Spice starts.
     Always,
-    /// Only start a refresh if an existing acceleration is not available.
+    /// Keep the refresh schedule across restarts: refresh at startup only when there
+    /// is no existing acceleration, or when `refresh_check_interval` has elapsed since
+    /// its last refresh.
     #[default]
     Auto,
 }

@@ -25,13 +25,17 @@ limitations under the License.
 //! aggregate of the rows that scan would read.
 
 use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
-use std::collections::hash_map::Entry;
 use std::sync::Arc;
 
-use arrow::array::{Array, ArrayRef, BooleanArray, RecordBatch, new_empty_array};
+use arrow::array::{
+    Array, ArrayRef, BooleanArray, RecordBatch, RecordBatchOptions, new_empty_array, new_null_array,
+};
 use arrow::datatypes::Decimal128Type;
-use arrow_schema::{DECIMAL128_MAX_PRECISION, DECIMAL128_MAX_SCALE, DataType, FieldRef, SchemaRef};
+use arrow_schema::{
+    DECIMAL128_MAX_PRECISION, DECIMAL128_MAX_SCALE, DataType, FieldRef, Schema, SchemaRef,
+};
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode};
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::error::Result as DataFusionResult;
@@ -42,10 +46,15 @@ use datafusion_common::{DataFusionError, ScalarValue};
 use datafusion_execution::{SendableRecordBatchStream, TaskContext};
 use datafusion_functions_aggregate_common::utils::DecimalAverager;
 use datafusion_physical_expr::expressions::{CastExpr, Column, Literal};
+use datafusion_physical_expr::utils::collect_columns;
 use datafusion_physical_expr::{Distribution, OrderingRequirements};
 use datafusion_physical_expr::{DynamicFilterTracking, PhysicalExpr, split_conjunction};
 use datafusion_physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties};
+use hash_index::PrehashedBuildHasher;
 use parking_lot::RwLock;
+
+use crate::provider::pk_index::pk_digest_bytes;
+use crate::row_converter::{RowConverter, SortField};
 
 /// A Cayenne-maintained aggregate view declaration.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -115,13 +124,12 @@ pub enum MaintainedAggregateFunction {
 }
 
 /// Shared maintained aggregate state for a single Cayenne table.
-#[derive(Debug)]
 pub struct MaintainedAggregateRegistry {
     state: RwLock<RegistryState>,
     /// Upper bound on approximate resident BYTES retained across all views:
-    /// per-PK contributions plus distinct `MIN`/`MAX` multiset values. When the
-    /// total would exceed this, the registry fails safe to `Stale` and clears all
-    /// retained state.
+    /// the per-PK retraction records plus distinct `MIN`/`MAX` multiset values.
+    /// When the total would exceed this, the registry fails safe to `Stale` and
+    /// clears all retained state.
     ///
     /// Bytes, not entries: entry width varies by orders of magnitude with key and
     /// aggregate-input types, so a count cap bounds memory only for one schema
@@ -131,6 +139,27 @@ pub struct MaintainedAggregateRegistry {
     /// Whether a per-PK index is maintained (a non-empty PK was configured), so
     /// UPDATE/DELETE can be retracted incrementally rather than marking stale.
     has_pk_index: bool,
+    /// Whether no views are configured. Fixed at construction and read without
+    /// the state lock: the write path and every scan ask it, and they must not
+    /// queue behind the applier holding the lock to fold a delta.
+    no_views: bool,
+    /// The table schema the views resolve their columns against.
+    schema: SchemaRef,
+}
+
+/// A summary, never the retained state. Every Cayenne scan plan carries the
+/// registry, and plans are formatted with `Debug` on ordinary planning paths:
+/// `DataFusion`'s physical planner formats each extension node it plans (a
+/// materialized CTE wraps a scan) to build an error context, whether or not
+/// planning fails. Printing the retraction index, one entry per maintained row,
+/// would cost seconds and gigabytes on every such plan.
+impl std::fmt::Debug for MaintainedAggregateRegistry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MaintainedAggregateRegistry")
+            .field("has_pk_index", &self.has_pk_index)
+            .field("max_index_bytes", &self.max_index_bytes)
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Debug)]
@@ -138,6 +167,15 @@ struct RegistryState {
     epoch: u64,
     status: RegistryStatus,
     views: Vec<MaintainedAggregateView>,
+    /// What each primary key's current row contributed, shared by every view;
+    /// `None` when no primary key is configured.
+    index: Option<RetractionIndex>,
+    /// The rebuild in progress, if any: the epoch of the snapshot it reads and
+    /// the deltas of later epochs, held to be applied on top of it.
+    rebuild: Option<PendingRebuild>,
+    /// Deltas at or below this epoch are already in the state the last rebuild
+    /// installed, so they are skipped rather than applied twice.
+    rebuilt_through: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -146,95 +184,771 @@ enum RegistryStatus {
     Stale,
 }
 
+/// A rebuild in progress. Every delta after `hold_from` is held here, in epoch
+/// order, because the rebuild reads a snapshot taken after it started: the held
+/// deltas the snapshot already contains are dropped when the rebuild is
+/// installed, and the rest are applied on top of it.
+#[derive(Debug)]
+struct PendingRebuild {
+    hold_from: u64,
+    deltas: Vec<(u64, PendingDelta)>,
+    /// Memory the held deltas reference.
+    bytes: usize,
+}
+
+#[derive(Debug)]
+enum PendingDelta {
+    Upserts(Vec<RecordBatch>),
+    Deletes(RecordBatch),
+}
+
+impl PendingDelta {
+    fn memory_size(&self) -> usize {
+        match self {
+            Self::Upserts(batches) => batches
+                .iter()
+                .map(RecordBatch::get_array_memory_size)
+                .fold(0, usize::saturating_add),
+            Self::Deletes(batch) => batch.get_array_memory_size(),
+        }
+    }
+}
+
 #[derive(Debug)]
 struct MaintainedAggregateView {
     spec: ResolvedAggregateSpec,
     /// Optional row predicate over the input schema. When set, only rows the
-    /// predicate selects are folded into `groups`/`pk_index`; a non-matching row
-    /// is treated exactly as an absent row (not indexed, not accumulated), so all
-    /// retraction logic is reused unchanged. See [`MaintainedAggregateSpec::filter`].
+    /// predicate selects are folded into the groups and given a retraction
+    /// record; a non-matching row is treated exactly as an absent row (not
+    /// indexed, not accumulated), so all retraction logic is reused unchanged.
+    /// See [`MaintainedAggregateSpec::filter`].
     filter: Option<Arc<dyn PhysicalExpr>>,
     /// `filter` as the conjunct set a query's predicate is matched against:
     /// empty when the view has no filter, `None` when the filter is volatile, so
     /// the view describes rows no query can reproduce and never serves.
     filter_conjuncts: Option<PredicateConjuncts>,
-    groups: HashMap<Vec<ScalarValue>, GroupAccumulator>,
-    /// Primary-key column indices in the input batch. Empty means no per-PK
-    /// index is maintained, so retraction is unavailable and the legacy
-    /// insert-only / mark-stale-on-delete behavior applies.
-    pk_columns: Vec<usize>,
-    /// Per-PK contribution index: `pk -> (group key, captured per-aggregate
-    /// inputs)`. Lets an UPDATE/DELETE retract the exact old contribution in
-    /// O(1) WITHOUT a CDC before-image (the old value is read from the index,
-    /// keyed by the primary key every CDC source delivers). Empty when
-    /// `pk_columns` is empty.
-    pk_index: HashMap<Vec<ScalarValue>, RowEntry>,
+    groups: GroupTable,
     /// Exact number of distinct ordered-multiset nodes retained by this view.
     /// Updated on every `MIN`/`MAX` insert/retract so cap checks stay O(1)
     /// regardless of group cardinality.
     retained_multiset_entries: usize,
-    /// Approximate resident bytes held by `pk_index`, maintained incrementally
-    /// on every insert/retract. Tracked rather than computed because summing the
-    /// map would be O(live rows) on every CDC batch.
-    approx_pk_index_bytes: usize,
 }
 
 /// Approximate resident bytes one `MIN`/`MAX` ordered-multiset node costs: the
 /// retained `ScalarValue`, its occurrence counter, and the node's container
-/// overhead. Deliberately a flat estimate — the nodes are small and uniform,
-/// unlike PK entries whose width varies with the key and captured inputs.
+/// overhead. Deliberately a flat estimate — the nodes are small and uniform.
 const APPROX_MULTISET_NODE_BYTES: usize = std::mem::size_of::<ScalarValue>() + 32;
 
-/// Approximate resident bytes one `pk_index` entry costs: the key scalars, the
-/// stored `RowEntry` (its group key and captured aggregate inputs), and the
-/// `HashMap` slot overhead. Charges every component the map actually holds — an
-/// estimate that drops one bounds the index at a fraction of its real size.
-fn approx_pk_index_entry_bytes(pk: &[ScalarValue], entry: &RowEntry) -> usize {
-    /// Allocator-dependent per-slot control/allocation overhead; kept next to the
-    /// estimate it belongs to, as in `provider::pk_index`.
-    const HASHMAP_ENTRY_OVERHEAD_BYTES: usize = 16;
+/// The groups of one view, each under a stable id so a retraction record can
+/// name its group in four bytes. A group that loses its last row is removed
+/// (SQL `GROUP BY` emits no row for an empty group) and its id is reused.
+#[derive(Debug, Default)]
+struct GroupTable {
+    ids: HashMap<Vec<ScalarValue>, u32>,
+    slots: Vec<Option<(Vec<ScalarValue>, GroupAccumulator)>>,
+    free: Vec<u32>,
+}
 
-    let pk_bytes = pk
-        .iter()
-        .fold(0_usize, |total, scalar| total.saturating_add(scalar.size()));
-    let group_key_bytes = entry
-        .group_key
-        .iter()
-        .fold(0_usize, |total, scalar| total.saturating_add(scalar.size()));
-    let input_bytes = entry.inputs.iter().fold(0_usize, |total, input| {
-        total.saturating_add(input.as_ref().map_or(
-            std::mem::size_of::<Option<ScalarValue>>(),
-            ScalarValue::size,
+impl GroupTable {
+    /// The id of the group keyed `key`, creating it when absent.
+    fn id_for(
+        &mut self,
+        key: Vec<ScalarValue>,
+        spec: &ResolvedAggregateSpec,
+    ) -> DataFusionResult<u32> {
+        if let Some(&id) = self.ids.get(&key) {
+            return Ok(id);
+        }
+        let group = Some((key.clone(), GroupAccumulator::try_new(spec)?));
+        let id = if let Some(id) = self.free.pop() {
+            self.slots[id as usize] = group;
+            id
+        } else {
+            let id = u32::try_from(self.slots.len()).map_err(|_| index_entry_overflow())?;
+            self.slots.push(group);
+            id
+        };
+        self.ids.insert(key, id);
+        Ok(id)
+    }
+
+    fn get_mut(&mut self, id: u32) -> Option<&mut GroupAccumulator> {
+        self.slots
+            .get_mut(id as usize)?
+            .as_mut()
+            .map(|(_, accumulator)| accumulator)
+    }
+
+    fn remove(&mut self, id: u32) {
+        if let Some(slot) = self.slots.get_mut(id as usize)
+            && let Some((key, _)) = slot.take()
+        {
+            self.ids.remove(&key);
+            self.free.push(id);
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&[ScalarValue], &GroupAccumulator)> {
+        self.slots
+            .iter()
+            .flatten()
+            .map(|(key, accumulator)| (key.as_slice(), accumulator))
+    }
+}
+
+/// A primary key's identity in the [`RetractionIndex`]: the [`pk_digest_bytes`]
+/// of its row-encoded columns — the identity Cayenne's upsert path already gives
+/// a key — held as two words so a map entry stays 8-byte aligned (a `u128` key
+/// pads each entry to 32 bytes).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PkKey([u64; 2]);
+
+impl PkKey {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "splits the 128-bit digest into its two halves"
+    )]
+    fn of(encoded: &[u8]) -> Self {
+        let digest = pk_digest_bytes(encoded);
+        Self([digest as u64, (digest >> 64) as u64])
+    }
+}
+
+/// The digest is uniformly distributed, so one half is a full-quality hash for
+/// [`PrehashedBuildHasher`]; equality still compares both halves.
+impl std::hash::Hash for PkKey {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        state.write_u64(self.0[0]);
+    }
+}
+
+/// Where each part of a retraction record lives. A record is `stride` words:
+/// flag words (one membership bit per view, then one non-null bit per stored
+/// column), the group the row joined in each view (two `u32` per word), then
+/// each stored column's value words.
+#[derive(Debug, Clone)]
+struct RecordLayout {
+    stride: usize,
+    view_count: usize,
+    group_words: usize,
+    columns: Vec<StoredColumn>,
+    /// Per view, per aggregate: the stored column feeding it, `None` for
+    /// `COUNT(*)`.
+    view_inputs: Vec<Vec<Option<usize>>>,
+}
+
+/// One table column whose value a retraction needs.
+#[derive(Debug, Clone)]
+struct StoredColumn {
+    /// Position in the table schema.
+    index: usize,
+    data_type: DataType,
+    /// First value word in the record, and how many there are: none when only
+    /// whether the value was null matters (`COUNT(column)`).
+    word: usize,
+    words: usize,
+}
+
+impl RecordLayout {
+    fn try_new(views: &[MaintainedAggregateView]) -> DataFusionResult<Self> {
+        let mut columns: Vec<StoredColumn> = Vec::new();
+        let mut view_inputs = Vec::with_capacity(views.len());
+        for view in views {
+            let mut inputs = Vec::with_capacity(view.spec.aggregates.len());
+            for aggregate in &view.spec.aggregates {
+                let Some(column) = &aggregate.column else {
+                    inputs.push(None);
+                    continue;
+                };
+                let words = match aggregate.function {
+                    MaintainedAggregateFunction::Count => 0,
+                    MaintainedAggregateFunction::Sum
+                    | MaintainedAggregateFunction::Avg
+                    | MaintainedAggregateFunction::Min
+                    | MaintainedAggregateFunction::Max => value_words(&column.data_type)
+                        .ok_or_else(|| {
+                            DataFusionError::Plan(format!(
+                                "{:?} maintained aggregate does not support column type {}",
+                                aggregate.function, column.data_type
+                            ))
+                        })?,
+                };
+                let position = if let Some(position) = columns
+                    .iter()
+                    .position(|stored| stored.index == column.index)
+                {
+                    columns[position].words = columns[position].words.max(words);
+                    position
+                } else {
+                    columns.push(StoredColumn {
+                        index: column.index,
+                        data_type: column.data_type.clone(),
+                        word: 0,
+                        words,
+                    });
+                    columns.len() - 1
+                };
+                inputs.push(Some(position));
+            }
+            view_inputs.push(inputs);
+        }
+        let flag_words = (views.len() + columns.len()).div_ceil(64).max(1);
+        let mut next = flag_words + views.len().div_ceil(2);
+        for column in &mut columns {
+            column.word = next;
+            next += column.words;
+        }
+        Ok(Self {
+            stride: next,
+            view_count: views.len(),
+            group_words: flag_words,
+            columns,
+            view_inputs,
+        })
+    }
+
+    fn bit(record: &[u64], bit: usize) -> bool {
+        (record[bit / 64] >> (bit % 64)) & 1 == 1
+    }
+
+    fn set_bit(record: &mut [u64], bit: usize) {
+        record[bit / 64] |= 1 << (bit % 64);
+    }
+
+    fn is_member(record: &[u64], view: usize) -> bool {
+        Self::bit(record, view)
+    }
+
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "each half of the word holds one u32 group id"
+    )]
+    fn group(&self, record: &[u64], view: usize) -> u32 {
+        (record[self.group_words + view / 2] >> ((view % 2) * 32)) as u32
+    }
+
+    /// Records that the row joined `group` in `view`.
+    fn join(&self, record: &mut [u64], view: usize, group: u32) {
+        Self::set_bit(record, view);
+        record[self.group_words + view / 2] |= u64::from(group) << ((view % 2) * 32);
+    }
+
+    /// Stores the row's value of every stored column.
+    fn write_values(
+        &self,
+        record: &mut [u64],
+        batch: &RecordBatch,
+        row: usize,
+    ) -> DataFusionResult<()> {
+        for (position, column) in self.columns.iter().enumerate() {
+            let array = batch.column(column.index);
+            if array.is_null(row) {
+                continue;
+            }
+            Self::set_bit(record, self.view_count + position);
+            if column.words > 0 {
+                let words = encode_value(&ScalarValue::try_from_array(array, row)?)?;
+                record[column.word..column.word + column.words]
+                    .copy_from_slice(&words[..column.words]);
+            }
+        }
+        Ok(())
+    }
+
+    /// The input `view`'s aggregates captured from the row, in the shape
+    /// [`GroupAccumulator::retract_row`] takes: `None` for `COUNT(*)` and for a
+    /// null value.
+    fn inputs(&self, record: &[u64], view: usize) -> DataFusionResult<Vec<Option<ScalarValue>>> {
+        self.view_inputs[view]
+            .iter()
+            .map(|input| {
+                let Some(position) = *input else {
+                    return Ok(None);
+                };
+                if !Self::bit(record, self.view_count + position) {
+                    return Ok(None);
+                }
+                let column = &self.columns[position];
+                if column.words == 0 {
+                    // Only `COUNT(column)` reads this column, and it needs only
+                    // to know the value was not null.
+                    return Ok(Some(ScalarValue::Boolean(Some(true))));
+                }
+                decode_value(
+                    &record[column.word..column.word + column.words],
+                    &column.data_type,
+                )
+                .map(Some)
+            })
+            .collect()
+    }
+}
+
+/// Value words a column of `data_type` needs to rebuild the exact
+/// [`ScalarValue`] it contributed: one for every type up to 64 bits wide,
+/// including a `Decimal128` whose precision keeps it within `i64`, and two for
+/// a wider `Decimal128`. `None` for a type no maintained `SUM`/`AVG`/`MIN`/`MAX`
+/// accepts.
+fn value_words(data_type: &DataType) -> Option<usize> {
+    match data_type {
+        DataType::Int8
+        | DataType::Int16
+        | DataType::Int32
+        | DataType::Int64
+        | DataType::UInt8
+        | DataType::UInt16
+        | DataType::UInt32
+        | DataType::UInt64
+        | DataType::Float32
+        | DataType::Float64
+        | DataType::Date32
+        | DataType::Date64
+        | DataType::Timestamp(_, _) => Some(1),
+        // 10^18 - 1 < 2^63, so a value of precision 18 or less fits in an i64.
+        DataType::Decimal128(precision, _) => Some(if *precision <= 18 { 1 } else { 2 }),
+        _ => None,
+    }
+}
+
+/// The backing integer (or float bits) of a non-null aggregate input, as the
+/// two words of its two's-complement `i128`. A one-word column keeps the low
+/// word, which [`decode_value`] sign- or zero-extends by the column's type.
+fn encode_value(scalar: &ScalarValue) -> DataFusionResult<[u64; 2]> {
+    let wide = match scalar {
+        ScalarValue::Int8(Some(value)) => i128::from(*value),
+        ScalarValue::Int16(Some(value)) => i128::from(*value),
+        ScalarValue::Int32(Some(value)) | ScalarValue::Date32(Some(value)) => i128::from(*value),
+        ScalarValue::Int64(Some(value))
+        | ScalarValue::Date64(Some(value))
+        | ScalarValue::TimestampSecond(Some(value), _)
+        | ScalarValue::TimestampMillisecond(Some(value), _)
+        | ScalarValue::TimestampMicrosecond(Some(value), _)
+        | ScalarValue::TimestampNanosecond(Some(value), _) => i128::from(*value),
+        ScalarValue::UInt8(Some(value)) => i128::from(*value),
+        ScalarValue::UInt16(Some(value)) => i128::from(*value),
+        ScalarValue::UInt32(Some(value)) => i128::from(*value),
+        ScalarValue::UInt64(Some(value)) => i128::from(*value),
+        ScalarValue::Float32(Some(value)) => i128::from(value.to_bits()),
+        ScalarValue::Float64(Some(value)) => i128::from(value.to_bits()),
+        ScalarValue::Decimal128(Some(value), _, _) => *value,
+        other => return Err(type_mismatch("a maintained aggregate input", other)),
+    };
+    let bits = wide.cast_unsigned();
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "splits the 128 bits into their two words"
+    )]
+    Ok([bits as u64, (bits >> 64) as u64])
+}
+
+/// The [`ScalarValue`] of type `data_type` that [`encode_value`] stored in
+/// `words`.
+fn decode_value(words: &[u64], data_type: &DataType) -> DataFusionResult<ScalarValue> {
+    let low = words[0];
+    let wide = match words.get(1) {
+        Some(high) => ((u128::from(*high) << 64) | u128::from(low)).cast_signed(),
+        None => i128::from(low.cast_signed()),
+    };
+    let out_of_range = |_| {
+        DataFusionError::Internal(format!(
+            "maintained aggregate retraction record holds a value outside {data_type}"
         ))
-    });
-
-    // `size_of::<RowEntry>()` covers the value's own inline width, including the
-    // `Vec` headers of its group key and inputs. The *key* needs the same
-    // treatment: `pk_bytes` sums only the scalars behind the pointer, so without
-    // this the map's `Vec<ScalarValue>` header goes uncharged and every entry is
-    // undercounted by a fixed amount — a systematic bias in the one direction
-    // that matters, since it lets the index sit over budget while reporting
-    // itself under.
-    pk_bytes
-        .saturating_add(std::mem::size_of::<Vec<ScalarValue>>())
-        .saturating_add(group_key_bytes)
-        .saturating_add(input_bytes)
-        .saturating_add(std::mem::size_of::<RowEntry>())
-        .saturating_add(HASHMAP_ENTRY_OVERHEAD_BYTES)
+    };
+    let timestamp = |unit: &arrow_schema::TimeUnit, tz: &Option<Arc<str>>| {
+        let value = Some(i64::try_from(wide).map_err(out_of_range)?);
+        Ok::<_, DataFusionError>(match unit {
+            arrow_schema::TimeUnit::Second => ScalarValue::TimestampSecond(value, tz.clone()),
+            arrow_schema::TimeUnit::Millisecond => {
+                ScalarValue::TimestampMillisecond(value, tz.clone())
+            }
+            arrow_schema::TimeUnit::Microsecond => {
+                ScalarValue::TimestampMicrosecond(value, tz.clone())
+            }
+            arrow_schema::TimeUnit::Nanosecond => {
+                ScalarValue::TimestampNanosecond(value, tz.clone())
+            }
+        })
+    };
+    Ok(match data_type {
+        DataType::Int8 => ScalarValue::Int8(Some(i8::try_from(wide).map_err(out_of_range)?)),
+        DataType::Int16 => ScalarValue::Int16(Some(i16::try_from(wide).map_err(out_of_range)?)),
+        DataType::Int32 => ScalarValue::Int32(Some(i32::try_from(wide).map_err(out_of_range)?)),
+        DataType::Int64 => ScalarValue::Int64(Some(i64::try_from(wide).map_err(out_of_range)?)),
+        DataType::UInt8 => ScalarValue::UInt8(Some(u8::try_from(low).map_err(out_of_range)?)),
+        DataType::UInt16 => ScalarValue::UInt16(Some(u16::try_from(low).map_err(out_of_range)?)),
+        DataType::UInt32 => ScalarValue::UInt32(Some(u32::try_from(low).map_err(out_of_range)?)),
+        DataType::UInt64 => ScalarValue::UInt64(Some(low)),
+        DataType::Float32 => ScalarValue::Float32(Some(f32::from_bits(
+            u32::try_from(low).map_err(out_of_range)?,
+        ))),
+        DataType::Float64 => ScalarValue::Float64(Some(f64::from_bits(low))),
+        DataType::Date32 => ScalarValue::Date32(Some(i32::try_from(wide).map_err(out_of_range)?)),
+        DataType::Date64 => ScalarValue::Date64(Some(i64::try_from(wide).map_err(out_of_range)?)),
+        DataType::Timestamp(unit, tz) => timestamp(unit, tz)?,
+        DataType::Decimal128(precision, scale) => {
+            ScalarValue::Decimal128(Some(wide), *precision, *scale)
+        }
+        other => {
+            return Err(DataFusionError::Internal(format!(
+                "maintained aggregate retraction record cannot hold a {other} value"
+            )));
+        }
+    })
 }
 
-/// One row's retraction record: which group it joined and the per-aggregate
-/// input scalars it contributed (so a retraction subtracts exactly).
+/// Per primary key, what its current row contributed to every view, so an
+/// UPDATE or DELETE retracts exactly that without a CDC before-image: the old
+/// values are read from here, keyed by the primary key every CDC source
+/// delivers. One record per key serves every view on the table, so the key and
+/// the values two views share are held once.
+///
+/// Records are fixed-width words in one vector, addressed by a slot the key
+/// maps to. That keeps a row of the CH-benCH `order_line` views (one grouped
+/// and one global aggregate over two columns) at four words plus its map
+/// entry, which is what lets a maintained aggregate cover a table of tens of
+/// millions of rows within its budget.
 #[derive(Debug)]
-struct RowEntry {
-    group_key: Vec<ScalarValue>,
-    inputs: Vec<Option<ScalarValue>>,
+struct RetractionIndex {
+    /// Table-schema positions of the primary-key columns, in key order.
+    pk_columns: Vec<usize>,
+    pk_fields: Vec<SortField>,
+    /// Encodes a batch's primary-key columns for [`PkKey::of`].
+    converter: RowConverter,
+    layout: RecordLayout,
+    slots: HashMap<PkKey, u32, PrehashedBuildHasher>,
+    records: Vec<u64>,
+    /// The most recently released slot. A released record's first word holds
+    /// the next released slot plus one (zero ends the chain), so reusing slots
+    /// needs no allocation of its own.
+    free_head: Option<u32>,
 }
 
-type RetiredViewState = (
-    HashMap<Vec<ScalarValue>, GroupAccumulator>,
-    HashMap<Vec<ScalarValue>, RowEntry>,
-);
+impl RetractionIndex {
+    fn try_new(
+        pk_columns: &[usize],
+        schema: &SchemaRef,
+        views: &[MaintainedAggregateView],
+    ) -> DataFusionResult<Self> {
+        let pk_fields = pk_columns
+            .iter()
+            .map(|&index| SortField::new(schema.field(index).data_type().clone()))
+            .collect::<Vec<_>>();
+        Ok(Self {
+            pk_columns: pk_columns.to_vec(),
+            converter: RowConverter::new(pk_fields.clone())
+                .map_err(|source| DataFusionError::ArrowError(Box::new(source), None))?,
+            pk_fields,
+            layout: RecordLayout::try_new(views)?,
+            slots: HashMap::default(),
+            records: Vec::new(),
+            free_head: None,
+        })
+    }
+
+    /// An empty index with the same key and layout.
+    fn empty_like(&self) -> DataFusionResult<Self> {
+        Ok(Self {
+            pk_columns: self.pk_columns.clone(),
+            converter: RowConverter::new(self.pk_fields.clone())
+                .map_err(|source| DataFusionError::ArrowError(Box::new(source), None))?,
+            pk_fields: self.pk_fields.clone(),
+            layout: self.layout.clone(),
+            slots: HashMap::default(),
+            records: Vec::new(),
+            free_head: None,
+        })
+    }
+
+    /// The key of each row of `pk_columns`, which are the primary-key columns
+    /// in key order.
+    fn keys(&self, pk_columns: &[ArrayRef]) -> DataFusionResult<Vec<PkKey>> {
+        let rows = self
+            .converter
+            .convert_columns(pk_columns)
+            .map_err(|source| DataFusionError::ArrowError(Box::new(source), None))?;
+        Ok(rows.iter().map(|row| PkKey::of(row.as_ref())).collect())
+    }
+
+    fn len(&self) -> usize {
+        self.slots.len()
+    }
+
+    /// Bytes the index holds: its allocated capacity rather than its live
+    /// entries, since a map or vector keeps its high-water capacity after
+    /// removals and that memory is what the budget must cover.
+    fn approx_bytes(&self) -> usize {
+        // A map of capacity `c` has about `c * 8 / 7` buckets, each holding an
+        // entry and a control byte.
+        let buckets = self.slots.capacity().saturating_mul(8) / 7;
+        buckets
+            .saturating_mul(std::mem::size_of::<(PkKey, u32)>() + 1)
+            .saturating_add(
+                self.records
+                    .capacity()
+                    .saturating_mul(std::mem::size_of::<u64>()),
+            )
+    }
+
+    /// Releases every record and the memory behind them.
+    fn reset(&mut self) {
+        drop(self.take_storage());
+    }
+
+    /// Moves the records out, leaving the index empty, so a caller can free
+    /// them off the current thread.
+    fn take_storage(&mut self) -> RetiredIndex {
+        self.free_head = None;
+        (
+            std::mem::take(&mut self.slots),
+            std::mem::take(&mut self.records),
+        )
+    }
+
+    fn record(&self, slot: u32) -> &[u64] {
+        let start = slot as usize * self.layout.stride;
+        &self.records[start..start + self.layout.stride]
+    }
+
+    fn record_mut(&mut self, slot: u32) -> &mut [u64] {
+        let start = slot as usize * self.layout.stride;
+        &mut self.records[start..start + self.layout.stride]
+    }
+
+    /// A zeroed record's slot, reusing a released one when there is one.
+    fn allocate(&mut self) -> DataFusionResult<u32> {
+        if let Some(slot) = self.free_head {
+            let record = self.record_mut(slot);
+            let next = record[0];
+            record.fill(0);
+            self.free_head = next
+                .checked_sub(1)
+                .map(|next| u32::try_from(next).map_err(|_| index_entry_overflow()))
+                .transpose()?;
+            return Ok(slot);
+        }
+        let slot = u32::try_from(self.records.len() / self.layout.stride)
+            .map_err(|_| index_entry_overflow())?;
+        self.records
+            .resize(self.records.len() + self.layout.stride, 0);
+        Ok(slot)
+    }
+
+    fn release(&mut self, slot: u32) {
+        let next = self.free_head.map_or(0, |next| u64::from(next) + 1);
+        self.record_mut(slot)[0] = next;
+        self.free_head = Some(slot);
+    }
+}
+
+/// An index's storage moved out to be freed off the current thread.
+type RetiredIndex = (HashMap<PkKey, u32, PrehashedBuildHasher>, Vec<u64>);
+
+/// Takes `key`'s record out of `index` and subtracts what its row contributed
+/// from every view it joined. Idempotent: a key with no record contributed
+/// nothing, so there is nothing to retract.
+fn retract_key(
+    views: &mut [MaintainedAggregateView],
+    index: &mut RetractionIndex,
+    key: PkKey,
+) -> DataFusionResult<()> {
+    let Some(slot) = index.slots.remove(&key) else {
+        return Ok(());
+    };
+    let record = index.record(slot);
+    for (view_index, view) in views.iter_mut().enumerate() {
+        if RecordLayout::is_member(record, view_index) {
+            let inputs = index.layout.inputs(record, view_index)?;
+            view.retract(index.layout.group(record, view_index), &inputs)?;
+        }
+    }
+    index.release(slot);
+    Ok(())
+}
+
+/// Folds `batch`'s rows into `views`. With a retraction index every row is an
+/// upsert: a key that already has a record is an UPDATE, so its old
+/// contribution is retracted first — even when the new row matches no view's
+/// filter, so a row updated out of a filter drops its old contribution. A row
+/// that matches no filter contributes nothing and gets no record, exactly like
+/// an absent row.
+fn apply_upserts(
+    views: &mut [MaintainedAggregateView],
+    index: Option<&mut RetractionIndex>,
+    batch: &RecordBatch,
+) -> DataFusionResult<()> {
+    let rows = batch.num_rows();
+    if rows == 0 {
+        return Ok(());
+    }
+    // `None` mask => every row contributes (an unfiltered view).
+    let masks = views
+        .iter()
+        .map(|view| view.evaluate_filter_mask(batch))
+        .collect::<DataFusionResult<Vec<_>>>()?;
+    let matches = |view: usize, row: usize| {
+        masks[view]
+            .as_ref()
+            .is_none_or(|mask| mask.is_valid(row) && mask.value(row))
+    };
+
+    let Some(index) = index else {
+        for (view_index, view) in views.iter_mut().enumerate() {
+            for row in 0..rows {
+                if matches(view_index, row) {
+                    view.insert_row(batch, row)?;
+                }
+            }
+        }
+        return Ok(());
+    };
+
+    let pk_columns = index
+        .pk_columns
+        .iter()
+        .map(|&column| Arc::clone(batch.column(column)))
+        .collect::<Vec<_>>();
+    let keys = index.keys(&pk_columns)?;
+    for (row, key) in keys.into_iter().enumerate() {
+        retract_key(views, index, key)?;
+        if !(0..views.len()).any(|view_index| matches(view_index, row)) {
+            continue;
+        }
+        let slot = index.allocate()?;
+        let RetractionIndex {
+            layout, records, ..
+        } = &mut *index;
+        let start = slot as usize * layout.stride;
+        let record = &mut records[start..start + layout.stride];
+        layout.write_values(record, batch, row)?;
+        for (view_index, view) in views.iter_mut().enumerate() {
+            if matches(view_index, row) {
+                let group = view.insert_row(batch, row)?;
+                layout.join(record, view_index, group);
+            }
+        }
+        index.slots.insert(key, slot);
+    }
+    Ok(())
+}
+
+/// Retracts every row of `pk_batch`, whose columns are the primary-key columns
+/// in key order.
+fn apply_deletes(
+    views: &mut [MaintainedAggregateView],
+    index: &mut RetractionIndex,
+    pk_batch: &RecordBatch,
+) -> DataFusionResult<()> {
+    for key in index.keys(pk_batch.columns())? {
+        retract_key(views, index, key)?;
+    }
+    Ok(())
+}
+
+/// A rebuild of a registry's views from a snapshot of the table, folded
+/// without holding the registry's lock and installed by
+/// [`MaintainedAggregateRegistry::finish_rebuild`]. Started by
+/// [`MaintainedAggregateRegistry::begin_rebuild`].
+#[derive(Debug)]
+pub struct MaintainedAggregateRebuilder {
+    hold_from: u64,
+    snapshot_epoch: Option<u64>,
+    views: Vec<MaintainedAggregateView>,
+    index: Option<RetractionIndex>,
+    max_index_bytes: usize,
+    schema: SchemaRef,
+}
+
+impl MaintainedAggregateRebuilder {
+    /// The epoch of the snapshot being read once it is known, else the epoch
+    /// the registry started holding deltas after.
+    #[must_use]
+    pub fn epoch(&self) -> u64 {
+        self.snapshot_epoch.unwrap_or(self.hold_from)
+    }
+
+    /// Records the epoch of the snapshot the rebuild reads. Returns `false` when
+    /// the snapshot predates the epoch the registry started holding deltas
+    /// after: the deltas in between were dropped, so the rebuild cannot be
+    /// completed and must be abandoned.
+    #[must_use]
+    pub fn set_snapshot_epoch(&mut self, epoch: u64) -> bool {
+        if epoch < self.hold_from {
+            return false;
+        }
+        self.snapshot_epoch = Some(epoch);
+        true
+    }
+
+    /// Folds a batch of the snapshot that holds only the table columns at
+    /// `columns` (table positions, in the batch's column order) — what a scan
+    /// projected to [`MaintainedAggregateRegistry::rebuild_columns`] returns.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when a maintained accumulator overflows, Arrow scalar
+    /// extraction fails, or the rebuilt state exceeds the byte budget.
+    pub fn apply_projected(
+        &mut self,
+        batch: &RecordBatch,
+        columns: &[usize],
+    ) -> DataFusionResult<()> {
+        // The views read columns by table position, so the batch is laid out
+        // in the table schema, with the columns no view reads left null.
+        let rows = batch.num_rows();
+        let mut fields = self
+            .schema
+            .fields()
+            .iter()
+            .map(|field| Arc::new(field.as_ref().clone().with_nullable(true)))
+            .collect::<Vec<FieldRef>>();
+        let mut arrays = self
+            .schema
+            .fields()
+            .iter()
+            .map(|field| new_null_array(field.data_type(), rows))
+            .collect::<Vec<ArrayRef>>();
+        for (position, &column) in columns.iter().enumerate() {
+            let read = batch.column(position);
+            let read_field = &batch.schema_ref().fields()[position];
+            // A table with `force_view_read_schema` scans a stored `Utf8`
+            // column as `Utf8View` (`viewify_read_schema`). The views and the
+            // retraction index hold the stored types, so such a column is
+            // folded back to `Utf8`; any other difference from the stored type
+            // reaches them unchanged and is refused there.
+            if read.data_type() == &DataType::Utf8View
+                && self.schema.field(column).data_type() == &DataType::Utf8
+            {
+                arrays[column] = arrow::compute::cast(read, &DataType::Utf8)
+                    .map_err(|source| DataFusionError::ArrowError(Box::new(source), None))?;
+                fields[column] =
+                    Arc::new(read_field.as_ref().clone().with_data_type(DataType::Utf8));
+            } else {
+                arrays[column] = Arc::clone(read);
+                fields[column] = Arc::clone(read_field);
+            }
+        }
+        let widened = RecordBatch::try_new_with_options(
+            Arc::new(Schema::new(fields)),
+            arrays,
+            &RecordBatchOptions::new().with_row_count(Some(rows)),
+        )
+        .map_err(|source| DataFusionError::ArrowError(Box::new(source), None))?;
+        apply_upserts(&mut self.views, self.index.as_mut(), &widened)?;
+        let retained = retained_bytes(&self.views, self.index.as_ref());
+        if retained > self.max_index_bytes {
+            return Err(index_cap_exceeded(
+                retained_entries(&self.views, self.index.as_ref()),
+                retained,
+                self.max_index_bytes,
+            ));
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedAggregateSpec {
@@ -401,9 +1115,10 @@ enum AggregateAccumulator {
 /// [`scalar_for_field`] requires the output scalar to match the column type
 /// exactly.
 ///
-/// Memory bound: [`MaintainedAggregateView::index_len`] counts each distinct
-/// multiset node in addition to any per-PK contribution record. The exact count
-/// is maintained incrementally, so cap checks do not scan every group. The
+/// Memory bound: each view counts its distinct multiset nodes
+/// (`retained_multiset_entries`), and the registry charges them alongside the
+/// per-PK retraction records. The exact count is maintained incrementally, so
+/// cap checks do not scan every group. The
 /// runtime additionally rejects user-configured `MIN`/`MAX` without a primary
 /// key because retraction cannot be supported there.
 #[derive(Debug, Clone, Default)]
@@ -726,24 +1441,32 @@ impl MaintainedAggregateRegistry {
         let has_pk_index = !pk_columns.is_empty();
         let views = specs
             .iter()
-            .map(|spec| MaintainedAggregateView::try_new(spec, schema, pk_columns.to_vec()))
+            .map(|spec| MaintainedAggregateView::try_new(spec, schema))
             .collect::<DataFusionResult<Vec<_>>>()?;
+        let index = has_pk_index
+            .then(|| RetractionIndex::try_new(pk_columns, schema, &views))
+            .transpose()?;
 
         Ok(Self {
             state: RwLock::new(RegistryState {
                 epoch: 0,
                 status: RegistryStatus::Fresh,
                 views,
+                index,
+                rebuild: None,
+                rebuilt_through: 0,
             }),
             max_index_bytes,
             has_pk_index,
+            no_views: specs.is_empty(),
+            schema: Arc::clone(schema),
         })
     }
 
     /// Returns true when no maintained aggregate views are configured.
     #[must_use]
     pub fn is_empty(&self) -> bool {
-        self.state.read().views.is_empty()
+        self.no_views
     }
 
     /// Whether this registry maintains a per-PK index and can therefore retract
@@ -782,30 +1505,37 @@ impl MaintainedAggregateRegistry {
     #[must_use]
     pub fn retained_bytes_and_budget(&self) -> (usize, usize) {
         (
-            retained_index_bytes(&self.state.read().views),
+            retained_index_bytes(&self.state.read()),
             self.max_index_bytes,
         )
     }
 
     /// Mark all maintained aggregate views stale at `epoch` and detach their
-    /// retained state immediately. When called from a `Tokio` runtime, destruction
-    /// of the detached maps runs on the blocking pool so a large stale view does
-    /// not stall an async visibility fence.
+    /// retained state immediately, abandoning any rebuild in progress. When
+    /// called from a `Tokio` runtime, destruction of the detached state runs on
+    /// the blocking pool so a large stale view does not stall an async
+    /// visibility fence.
     pub fn mark_stale(&self, epoch: u64) {
         let retired = {
             let mut state = self.state.write();
+            let state = &mut *state;
             state.epoch = epoch;
             state.status = RegistryStatus::Stale;
-            state
+            state.rebuild = None;
+            let groups = state
                 .views
                 .iter_mut()
-                .map(MaintainedAggregateView::take_retained_state)
-                .collect::<Vec<_>>()
+                .map(MaintainedAggregateView::take_groups)
+                .collect::<Vec<_>>();
+            let index = state.index.as_mut().map(RetractionIndex::take_storage);
+            (groups, index)
         };
 
-        if retired
-            .iter()
-            .all(|(groups, pk_index)| groups.is_empty() && pk_index.is_empty())
+        let (groups, index) = &retired;
+        if groups.iter().all(GroupTable::is_empty)
+            && index
+                .as_ref()
+                .is_none_or(|(slots, records)| slots.capacity() == 0 && records.capacity() == 0)
         {
             return;
         }
@@ -832,35 +1562,27 @@ impl MaintainedAggregateRegistry {
         batches: &[RecordBatch],
     ) -> DataFusionResult<()> {
         let mut state = self.state.write();
+        let state = &mut *state;
 
         // Async write-path maintenance must apply deltas in strict
         // visibility-epoch order; an out-of-order/skipped epoch or an
         // already-stale registry short-circuits (see `begin_maintenance_pass`).
-        if !begin_maintenance_pass(&mut state, epoch) {
-            return Ok(());
+        match begin_maintenance_pass(state, epoch) {
+            Pass::Skip => return Ok(()),
+            Pass::Hold => {
+                hold_delta(
+                    state,
+                    epoch,
+                    PendingDelta::Upserts(batches.to_vec()),
+                    self.max_held_bytes(),
+                );
+                return Ok(());
+            }
+            Pass::Apply => {}
         }
 
-        let mut failure: Option<DataFusionError> = None;
-        'outer: for batch in batches {
-            for view in &mut state.views {
-                if let Err(error) = view.apply_insert_batch(batch) {
-                    failure = Some(error);
-                    break 'outer;
-                }
-            }
-            // Check after every Arrow batch so a multi-batch CDC envelope cannot
-            // accumulate unbounded retained state before the final cap check.
-            if retained_index_bytes(&state.views) > self.max_index_bytes {
-                failure = Some(index_cap_exceeded(
-                    retained_index_entries(&state.views),
-                    retained_index_bytes(&state.views),
-                    self.max_index_bytes,
-                ));
-                break 'outer;
-            }
-        }
-
-        finalize_maintenance_pass(&mut state, self.max_index_bytes, failure)
+        let failure = apply_upsert_batches(state, batches, self.max_index_bytes).err();
+        finalize_maintenance_pass(state, self.max_index_bytes, failure)
     }
 
     /// Retract delete rows whose primary-key columns are supplied directly as
@@ -876,20 +1598,24 @@ impl MaintainedAggregateRegistry {
     /// and returns `Ok`.
     pub fn apply_pk_deletes(&self, epoch: u64, pk_batch: &RecordBatch) -> DataFusionResult<()> {
         let mut state = self.state.write();
+        let state = &mut *state;
 
-        if !begin_maintenance_pass(&mut state, epoch) {
-            return Ok(());
-        }
-
-        let mut failure: Option<DataFusionError> = None;
-        for view in &mut state.views {
-            if let Err(error) = view.retract_pk_batch(pk_batch) {
-                failure = Some(error);
-                break;
+        match begin_maintenance_pass(state, epoch) {
+            Pass::Skip => return Ok(()),
+            Pass::Hold => {
+                hold_delta(
+                    state,
+                    epoch,
+                    PendingDelta::Deletes(pk_batch.clone()),
+                    self.max_held_bytes(),
+                );
+                return Ok(());
             }
+            Pass::Apply => {}
         }
 
-        finalize_maintenance_pass(&mut state, self.max_index_bytes, failure)
+        let failure = apply_delete_batch(state, pk_batch).err();
+        finalize_maintenance_pass(state, self.max_index_bytes, failure)
     }
 
     /// Rebuild every view from a complete table snapshot. Bounds memory: the
@@ -908,32 +1634,183 @@ impl MaintainedAggregateRegistry {
         batches: &[RecordBatch],
     ) -> DataFusionResult<()> {
         let mut state = self.state.write();
+        let state = &mut *state;
         state.epoch = epoch;
         state.status = RegistryStatus::Fresh;
-        for view in &mut state.views {
-            view.clear();
+        state.rebuild = None;
+        reset_retained_state(state);
+        let failure = apply_upsert_batches(state, batches, self.max_index_bytes).err();
+        finalize_maintenance_pass(state, self.max_index_bytes, failure)
+    }
+
+    /// The table columns a rebuild reads, by table position ascending: the
+    /// primary key and every column a view groups by, aggregates, or filters on.
+    #[must_use]
+    pub fn rebuild_columns(&self) -> Vec<usize> {
+        let state = self.state.read();
+        let mut columns = BTreeSet::new();
+        if let Some(index) = &state.index {
+            columns.extend(index.pk_columns.iter().copied());
         }
-        let mut failure: Option<DataFusionError> = None;
-        'outer: for batch in batches {
-            for view in &mut state.views {
-                if let Err(error) = view.apply_insert_batch(batch) {
-                    failure = Some(error);
-                    break 'outer;
+        for view in &state.views {
+            columns.extend(view.spec.group_by.iter().map(|column| column.index));
+            columns.extend(
+                view.spec
+                    .aggregates
+                    .iter()
+                    .filter_map(|aggregate| aggregate.column.as_ref().map(|column| column.index)),
+            );
+            if let Some(filter) = &view.filter {
+                columns.extend(collect_columns(filter).iter().map(Column::index));
+            }
+        }
+        // `COUNT(*)` alone reads no column, but the scan must still return the
+        // rows it counts.
+        if columns.is_empty() && !self.schema.fields().is_empty() {
+            columns.insert(0);
+        }
+        columns.into_iter().collect()
+    }
+
+    /// Starts rebuilding the views. From here until the rebuild is installed by
+    /// [`Self::finish_rebuild`], the registry is stale and holds the delta of
+    /// every epoch after `hold_from`, so that whatever epoch the rebuild's
+    /// snapshot turns out to be at (see
+    /// [`MaintainedAggregateRebuilder::set_snapshot_epoch`]), the writes after it
+    /// are applied on top — writes that land while the rebuild reads the table do
+    /// not undo it.
+    ///
+    /// `hold_from` must be the table's epoch at a moment no write can publish a
+    /// new one (the provider's `write_lock`), and the snapshot must be taken
+    /// after this call, so no delta after the snapshot can arrive unheld.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the primary-key encoder cannot be built.
+    pub fn begin_rebuild(&self, hold_from: u64) -> DataFusionResult<MaintainedAggregateRebuilder> {
+        let mut state = self.state.write();
+        let state = &mut *state;
+        let views = state
+            .views
+            .iter()
+            .map(MaintainedAggregateView::empty_like)
+            .collect();
+        let index = state
+            .index
+            .as_ref()
+            .map(RetractionIndex::empty_like)
+            .transpose()?;
+        state.status = RegistryStatus::Stale;
+        reset_retained_state(state);
+        // The table is at `hold_from`. Queued deltas at or below it are in the
+        // snapshot; advance so the first held delta is `hold_from + 1` even
+        // when those queued deltas have not drained yet.
+        state.epoch = state.epoch.max(hold_from);
+        state.rebuild = Some(PendingRebuild {
+            hold_from,
+            deltas: Vec::new(),
+            bytes: 0,
+        });
+        Ok(MaintainedAggregateRebuilder {
+            hold_from,
+            snapshot_epoch: None,
+            views,
+            index,
+            max_index_bytes: self.max_index_bytes,
+            schema: Arc::clone(&self.schema),
+        })
+    }
+
+    /// Whether `rebuilder` is still the rebuild in progress. A stale mark, an
+    /// epoch gap, or more held deltas than the budget allows abandons it.
+    #[must_use]
+    pub fn rebuild_is_current(&self, rebuilder: &MaintainedAggregateRebuilder) -> bool {
+        self.state
+            .read()
+            .rebuild
+            .as_ref()
+            .is_some_and(|rebuild| rebuild.hold_from == rebuilder.hold_from)
+    }
+
+    /// Abandons `rebuilder` and drops the deltas held for it; the registry stays
+    /// stale.
+    pub fn abandon_rebuild(&self, rebuilder: &MaintainedAggregateRebuilder) {
+        let mut state = self.state.write();
+        if state
+            .rebuild
+            .as_ref()
+            .is_some_and(|rebuild| rebuild.hold_from == rebuilder.hold_from)
+        {
+            state.rebuild = None;
+        }
+    }
+
+    /// Installs a rebuild that has read its whole snapshot and applies the held
+    /// deltas the snapshot does not contain. Returns `Ok(false)` when the rebuild
+    /// was abandoned in the meantime or never learned its snapshot's epoch; the
+    /// registry then stays stale for a later attempt.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error (after clearing the indexes and marking the registry
+    /// stale) when a held delta fails to apply or the result exceeds the byte
+    /// budget.
+    pub fn finish_rebuild(
+        &self,
+        rebuilder: MaintainedAggregateRebuilder,
+    ) -> DataFusionResult<bool> {
+        let mut state = self.state.write();
+        let state = &mut *state;
+        let Some(snapshot_epoch) = rebuilder.snapshot_epoch else {
+            if state
+                .rebuild
+                .as_ref()
+                .is_some_and(|rebuild| rebuild.hold_from == rebuilder.hold_from)
+            {
+                state.rebuild = None;
+            }
+            return Ok(false);
+        };
+        let Some(rebuild) = state
+            .rebuild
+            .take_if(|rebuild| rebuild.hold_from == rebuilder.hold_from)
+        else {
+            return Ok(false);
+        };
+        state.views = rebuilder.views;
+        state.index = rebuilder.index;
+        state.status = RegistryStatus::Fresh;
+        // Deltas of the snapshot's own epochs may still be queued behind the
+        // ones already taken in; they are in the snapshot, so they are skipped.
+        // Every later delta was held, so applying them in order brings the views
+        // to the registry's epoch.
+        state.epoch = state.epoch.max(snapshot_epoch);
+        state.rebuilt_through = state.rebuilt_through.max(snapshot_epoch);
+        let mut failure = None;
+        for (epoch, delta) in rebuild.deltas {
+            if epoch <= snapshot_epoch {
+                continue;
+            }
+            let applied = match delta {
+                PendingDelta::Upserts(batches) => {
+                    apply_upsert_batches(state, &batches, self.max_index_bytes)
                 }
-            }
-            // Bail incrementally so a table larger than the cap fails safe to
-            // stale before the retained indexes grow unbounded (rather than only
-            // after the full rebuild, which could OOM first).
-            if retained_index_bytes(&state.views) > self.max_index_bytes {
-                failure = Some(index_cap_exceeded(
-                    retained_index_entries(&state.views),
-                    retained_index_bytes(&state.views),
-                    self.max_index_bytes,
-                ));
-                break 'outer;
+                PendingDelta::Deletes(pk_batch) => apply_delete_batch(state, &pk_batch),
+            };
+            if let Err(error) = applied {
+                failure = Some(error);
+                break;
             }
         }
-        finalize_maintenance_pass(&mut state, self.max_index_bytes, failure)
+        finalize_maintenance_pass(state, self.max_index_bytes, failure)?;
+        Ok(true)
+    }
+
+    /// The most memory the deltas held for a rebuild may reference before the
+    /// rebuild is abandoned: a quarter of the index budget, so the held deltas
+    /// and the index being rebuilt fit together.
+    fn max_held_bytes(&self) -> usize {
+        self.max_index_bytes / 4
     }
 
     /// Materialize a maintained aggregate batch matching `aggregate`, if fresh.
@@ -1064,11 +1941,7 @@ impl MaintainedAggregateRegistry {
 }
 
 impl MaintainedAggregateView {
-    fn try_new(
-        spec: &MaintainedAggregateSpec,
-        schema: &SchemaRef,
-        pk_columns: Vec<usize>,
-    ) -> DataFusionResult<Self> {
+    fn try_new(spec: &MaintainedAggregateSpec, schema: &SchemaRef) -> DataFusionResult<Self> {
         // A filter is a `WHERE` condition, so it must evaluate to Boolean.
         // Validate at construction so a non-Boolean predicate fails fast here with
         // a clear error, rather than later in `evaluate_filter_mask` with an
@@ -1090,12 +1963,20 @@ impl MaintainedAggregateView {
             spec: ResolvedAggregateSpec::try_new(spec, schema)?,
             filter: spec.filter.clone(),
             filter_conjuncts,
-            groups: HashMap::new(),
-            pk_columns,
-            pk_index: HashMap::new(),
+            groups: GroupTable::default(),
             retained_multiset_entries: 0,
-            approx_pk_index_bytes: 0,
         })
+    }
+
+    /// The same view with no rows folded in.
+    fn empty_like(&self) -> Self {
+        Self {
+            spec: self.spec.clone(),
+            filter: self.filter.clone(),
+            filter_conjuncts: self.filter_conjuncts.clone(),
+            groups: GroupTable::default(),
+            retained_multiset_entries: 0,
+        }
     }
 
     /// Evaluate the view's row predicate over `batch`, returning a per-row
@@ -1122,63 +2003,57 @@ impl MaintainedAggregateView {
         Ok(Some(mask.clone()))
     }
 
-    /// Fold one row into its group, creating the group accumulator on first use.
-    fn insert_into_group(
-        &mut self,
-        group_key: Vec<ScalarValue>,
-        batch: &RecordBatch,
-        row: usize,
-    ) -> DataFusionResult<()> {
-        let group = match self.groups.entry(group_key) {
-            Entry::Occupied(entry) => entry.into_mut(),
-            Entry::Vacant(entry) => entry.insert(GroupAccumulator::try_new(&self.spec)?),
-        };
+    /// Folds `row` into its group, creating the group on first use, and returns
+    /// the group's id.
+    fn insert_row(&mut self, batch: &RecordBatch, row: usize) -> DataFusionResult<u32> {
+        let key = Self::scalar_key(batch, row, self.spec.group_by.iter().map(|c| c.index))?;
+        let id = self.groups.id_for(key, &self.spec)?;
+        let group = self.groups.get_mut(id).ok_or_else(index_entry_overflow)?;
         let retained_entries_added = group.apply_insert_row(batch, row)?;
         self.retained_multiset_entries = self
             .retained_multiset_entries
             .checked_add(retained_entries_added)
             .ok_or_else(index_entry_overflow)?;
+        Ok(id)
+    }
+
+    /// Subtracts a row's `inputs` from the group `id`, dropping the group when
+    /// it becomes empty. A group that does not exist means the retraction
+    /// record and the views disagree, which fails safe to stale.
+    fn retract(&mut self, id: u32, inputs: &[Option<ScalarValue>]) -> DataFusionResult<()> {
+        let group = self.groups.get_mut(id).ok_or_else(retract_underflow)?;
+        let (group_is_empty, retained_entries_removed) = group.retract_row(inputs)?;
+        self.retained_multiset_entries = self
+            .retained_multiset_entries
+            .checked_sub(retained_entries_removed)
+            .ok_or_else(retract_underflow)?;
+        if group_is_empty {
+            self.groups.remove(id);
+        }
         Ok(())
     }
 
+    /// Drops every group, releasing their memory.
     fn clear(&mut self) {
-        self.groups.clear();
-        self.pk_index.clear();
+        self.groups = GroupTable::default();
         self.retained_multiset_entries = 0;
-        self.approx_pk_index_bytes = 0;
     }
 
-    fn take_retained_state(&mut self) -> RetiredViewState {
+    /// Moves the groups out, leaving the view empty, so a caller can free them
+    /// off the current thread.
+    fn take_groups(&mut self) -> GroupTable {
         self.retained_multiset_entries = 0;
-        self.approx_pk_index_bytes = 0;
-        (
-            std::mem::take(&mut self.groups),
-            std::mem::take(&mut self.pk_index),
-        )
+        std::mem::take(&mut self.groups)
     }
 
-    fn index_len(&self) -> usize {
-        self.pk_index
-            .len()
-            .saturating_add(self.retained_multiset_entries)
+    /// Approximate resident bytes of the view's `MIN`/`MAX` multiset nodes, the
+    /// part of its retained state that grows with rows rather than groups.
+    fn approx_multiset_bytes(&self) -> usize {
+        self.retained_multiset_entries
+            .saturating_mul(APPROX_MULTISET_NODE_BYTES)
     }
 
-    /// Approximate resident bytes this view retains for cap accounting: the
-    /// per-PK index (tracked incrementally, since walking it would be O(rows) on
-    /// every batch) plus the `MIN`/`MAX` multiset nodes.
-    ///
-    /// The estimate is charged against `runtime.query.memory_limit`, so it must
-    /// not under-count — an estimate that drops a component bounds the index at a
-    /// fraction of its believed size. Mirrors
-    /// `crate::provider::pk_index::approx_pk_keyset_entry_bytes`.
-    fn approx_index_bytes(&self) -> usize {
-        self.approx_pk_index_bytes.saturating_add(
-            self.retained_multiset_entries
-                .saturating_mul(APPROX_MULTISET_NODE_BYTES),
-        )
-    }
-
-    /// Build a key (group key or PK) from the given column indices at `row`.
+    /// Build a group key from the given column indices at `row`.
     fn scalar_key(
         batch: &RecordBatch,
         row: usize,
@@ -1187,134 +2062,6 @@ impl MaintainedAggregateView {
         indices
             .map(|index| ScalarValue::try_from_array(batch.column(index), row))
             .collect()
-    }
-
-    /// Capture each aggregate's input scalar at `row` for the per-PK index
-    /// (`None` for `COUNT(*)`, which has no input column).
-    fn capture_inputs(
-        &self,
-        batch: &RecordBatch,
-        row: usize,
-    ) -> DataFusionResult<Vec<Option<ScalarValue>>> {
-        self.spec
-            .aggregates
-            .iter()
-            .map(|aggregate| match &aggregate.column {
-                None => Ok(None),
-                Some(column) => {
-                    let scalar = ScalarValue::try_from_array(batch.column(column.index), row)?;
-                    // A NULL aggregate input contributes nothing; store `None`
-                    // rather than a typed-NULL scalar (smaller, and retraction
-                    // treats both identically as "contributed nothing").
-                    Ok((!scalar.is_null()).then_some(scalar))
-                }
-            })
-            .collect()
-    }
-
-    /// Subtract a stored row's contribution from its group, dropping the group
-    /// when it becomes empty.
-    fn retract_entry(&mut self, entry: &RowEntry) -> DataFusionResult<()> {
-        let Some(group) = self.groups.get_mut(&entry.group_key) else {
-            return Err(retract_underflow());
-        };
-        let (group_is_empty, retained_entries_removed) = group.retract_row(&entry.inputs)?;
-        self.retained_multiset_entries = self
-            .retained_multiset_entries
-            .checked_sub(retained_entries_removed)
-            .ok_or_else(retract_underflow)?;
-        if group_is_empty {
-            self.groups.remove(&entry.group_key);
-        }
-        Ok(())
-    }
-
-    /// Retract the row currently indexed at `pk`, if any. Idempotent: a PK not
-    /// in the index contributed nothing, so retraction is a no-op.
-    fn retract_pk(&mut self, pk: &[ScalarValue]) -> DataFusionResult<()> {
-        if let Some(entry) = self.pk_index.remove(pk) {
-            self.approx_pk_index_bytes = self
-                .approx_pk_index_bytes
-                .saturating_sub(approx_pk_index_entry_bytes(pk, &entry));
-            self.retract_entry(&entry)?;
-        }
-        Ok(())
-    }
-
-    /// Retract every row of `pk_batch`, whose columns ARE this view's primary-key
-    /// columns in `pk_columns` order (positions `0..num_columns`). Mirrors the
-    /// keys built by [`Self::apply_insert_batch`] (PK scalars in `pk_columns`
-    /// order), so the caller must project the CDC delete batch to exactly those
-    /// columns, by name, in that order — independent of its source-schema layout.
-    /// Requires a PK index.
-    fn retract_pk_batch(&mut self, pk_batch: &RecordBatch) -> DataFusionResult<()> {
-        if self.pk_columns.is_empty() {
-            return Err(DataFusionError::Internal(
-                "maintained aggregate retraction requires a configured primary key".to_string(),
-            ));
-        }
-        for row in 0..pk_batch.num_rows() {
-            let pk = Self::scalar_key(pk_batch, row, 0..pk_batch.num_columns())?;
-            self.retract_pk(&pk)?;
-        }
-        Ok(())
-    }
-
-    fn apply_insert_batch(&mut self, batch: &RecordBatch) -> DataFusionResult<()> {
-        if batch.num_rows() == 0 {
-            return Ok(());
-        }
-
-        // `None` mask => every row contributes (unfiltered view, original path).
-        let mask = self.evaluate_filter_mask(batch)?;
-        let indexed = !self.pk_columns.is_empty();
-        for row in 0..batch.num_rows() {
-            let matches = mask
-                .as_ref()
-                .is_none_or(|mask| mask.is_valid(row) && mask.value(row));
-
-            // Indexed views: an upsert whose PK is already indexed is an UPDATE,
-            // so retract the prior contribution first. This runs even when the new
-            // row no longer matches the filter, so a row updated OUT of the
-            // predicate correctly drops its old contribution. `None` for
-            // insert-only (no PK) views, which never retract.
-            let pk = if indexed {
-                let pk = Self::scalar_key(batch, row, self.pk_columns.iter().copied())?;
-                if let Some(old) = self.pk_index.remove(&pk) {
-                    self.approx_pk_index_bytes = self
-                        .approx_pk_index_bytes
-                        .saturating_sub(approx_pk_index_entry_bytes(&pk, &old));
-                    self.retract_entry(&old)?;
-                }
-                Some(pk)
-            } else {
-                None
-            };
-
-            // A non-matching row contributes nothing and is left unindexed —
-            // identical to an absent row, so a later DELETE/UPDATE retraction is a
-            // correct no-op or re-add (its prior contribution was retracted above).
-            if !matches {
-                continue;
-            }
-
-            let group_key =
-                Self::scalar_key(batch, row, self.spec.group_by.iter().map(|c| c.index))?;
-            if let Some(pk) = pk {
-                let inputs = self.capture_inputs(batch, row)?;
-                let entry = RowEntry {
-                    group_key: group_key.clone(),
-                    inputs,
-                };
-                self.approx_pk_index_bytes = self
-                    .approx_pk_index_bytes
-                    .saturating_add(approx_pk_index_entry_bytes(&pk, &entry));
-                self.pk_index.insert(pk, entry);
-            }
-            self.insert_into_group(group_key, batch, row)?;
-        }
-
-        Ok(())
     }
 
     fn matches_query(&self, query: &QueryAggregateSpec) -> bool {
@@ -1362,10 +2109,7 @@ impl MaintainedAggregateView {
                 default_global = GroupAccumulator::try_new(&self.spec)?;
                 vec![(&[][..], &default_global)]
             } else {
-                self.groups
-                    .iter()
-                    .map(|(key, acc)| (key.as_slice(), acc))
-                    .collect()
+                self.groups.iter().collect()
             };
 
         let output_columns = schema
@@ -2458,23 +3202,110 @@ fn scalar_for_field(
     )))
 }
 
-/// Enforce the strict per-epoch ordering at the start of a mutating pass.
-/// Returns `true` to proceed, `false` (after updating `state`) to short-circuit:
-/// an out-of-order/skipped epoch clears the indexes and marks the registry stale
-/// — freeing the now-unservable index for the rest of the table lifetime, since
-/// it will not serve again until a rebuild — and an already-stale or empty
-/// registry simply returns. Shared by `apply_insert_batches`/`apply_pk_deletes`.
-fn begin_maintenance_pass(state: &mut RegistryState, epoch: u64) -> bool {
+/// What a maintenance pass does with the delta of its epoch.
+enum Pass {
+    /// Apply it to the fresh views.
+    Apply,
+    /// Drop it: the registry is stale, or the delta is already in the
+    /// snapshot a rebuild reads or installed.
+    Skip,
+    /// Hold it for the rebuild in progress, whose snapshot predates it.
+    Hold,
+}
+
+/// Admit the delta of `epoch`. Deltas must arrive in strict visibility-epoch
+/// order: a skipped or out-of-order epoch would leave the views missing or
+/// double-counting a write, so it marks the registry stale, clears it, and
+/// abandons any rebuild.
+///
+/// A rebuild in progress is the exception for epochs at or below its
+/// `hold_from`: those writes are already in the snapshot it reads — including
+/// deltas still queued when a full apply queue called `mark_stale` at
+/// `hold_from`. They are skipped without treating the jump as a gap, so later
+/// epochs stay held.
+fn begin_maintenance_pass(state: &mut RegistryState, epoch: u64) -> Pass {
+    if epoch <= state.rebuilt_through {
+        return Pass::Skip;
+    }
+    if let Some(rebuild) = &state.rebuild
+        && epoch <= rebuild.hold_from
+    {
+        if epoch == state.epoch.saturating_add(1) {
+            state.epoch = epoch;
+        }
+        return Pass::Skip;
+    }
     if epoch != state.epoch.saturating_add(1) {
         state.epoch = state.epoch.max(epoch);
         state.status = RegistryStatus::Stale;
-        for view in &mut state.views {
-            view.clear();
-        }
-        return false;
+        state.rebuild = None;
+        reset_retained_state(state);
+        return Pass::Skip;
     }
     state.epoch = epoch;
-    !(state.status == RegistryStatus::Stale || state.views.is_empty())
+    if state.rebuild.is_some() {
+        Pass::Hold
+    } else if state.status == RegistryStatus::Stale || state.views.is_empty() {
+        Pass::Skip
+    } else {
+        Pass::Apply
+    }
+}
+
+/// Holds `delta` for the rebuild in progress. A rebuild whose held deltas
+/// would reference more than `max_held_bytes` is abandoned, releasing them; the
+/// registry stays stale and a later rebuild tries again.
+fn hold_delta(state: &mut RegistryState, epoch: u64, delta: PendingDelta, max_held_bytes: usize) {
+    let Some(rebuild) = &mut state.rebuild else {
+        return;
+    };
+    rebuild.bytes = rebuild.bytes.saturating_add(delta.memory_size());
+    if rebuild.bytes > max_held_bytes {
+        state.rebuild = None;
+        return;
+    }
+    rebuild.deltas.push((epoch, delta));
+}
+
+/// Applies `batches` as upserts, checking the byte budget after every batch so
+/// a multi-batch CDC envelope (or a rebuild) cannot accumulate unbounded
+/// retained state before the final check.
+fn apply_upsert_batches(
+    state: &mut RegistryState,
+    batches: &[RecordBatch],
+    max_index_bytes: usize,
+) -> DataFusionResult<()> {
+    for batch in batches {
+        apply_upserts(&mut state.views, state.index.as_mut(), batch)?;
+        let retained = retained_index_bytes(state);
+        if retained > max_index_bytes {
+            return Err(index_cap_exceeded(
+                retained_index_entries(state),
+                retained,
+                max_index_bytes,
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn apply_delete_batch(state: &mut RegistryState, pk_batch: &RecordBatch) -> DataFusionResult<()> {
+    let Some(index) = state.index.as_mut() else {
+        return Err(DataFusionError::Internal(
+            "maintained aggregate retraction requires a configured primary key".to_string(),
+        ));
+    };
+    apply_deletes(&mut state.views, index, pk_batch)
+}
+
+/// Clears every view and the retraction index, releasing their memory.
+fn reset_retained_state(state: &mut RegistryState) {
+    for view in &mut state.views {
+        view.clear();
+    }
+    if let Some(index) = &mut state.index {
+        index.reset();
+    }
 }
 
 /// Finalize a maintenance pass: if `failure` is set, or the retained indexes now
@@ -2487,16 +3318,15 @@ fn finalize_maintenance_pass(
     max_index_bytes: usize,
     failure: Option<DataFusionError>,
 ) -> DataFusionResult<()> {
-    let retained_bytes = retained_index_bytes(&state.views);
+    let retained_bytes = retained_index_bytes(state);
     let over_cap = retained_bytes > max_index_bytes;
     if failure.is_some() || over_cap {
         // Capture the size of what is being discarded BEFORE clearing, so the
         // error names what the index actually cost.
-        let retained_entries = retained_index_entries(&state.views);
-        for view in &mut state.views {
-            view.clear();
-        }
+        let retained_entries = retained_index_entries(state);
+        reset_retained_state(state);
         state.status = RegistryStatus::Stale;
+        state.rebuild = None;
         return Err(failure.unwrap_or_else(|| {
             index_cap_exceeded(retained_entries, retained_bytes, max_index_bytes)
         }));
@@ -2504,22 +3334,32 @@ fn finalize_maintenance_pass(
     Ok(())
 }
 
-/// Total approximate resident bytes retained across every view — the quantity
-/// the cap bounds. O(views), not O(rows): each view tracks its own total
-/// incrementally.
-fn retained_index_bytes(views: &[MaintainedAggregateView]) -> usize {
-    views.iter().fold(0_usize, |total, view| {
-        total.saturating_add(view.approx_index_bytes())
-    })
+/// Total approximate resident bytes retained by the registry — the quantity
+/// the cap bounds. O(views), not O(rows).
+fn retained_index_bytes(state: &RegistryState) -> usize {
+    retained_bytes(&state.views, state.index.as_ref())
 }
 
-/// Total retained index entries across every view. Reported alongside the byte
-/// total when the cap trips, so an operator can see both what was retained and
-/// what it cost.
-fn retained_index_entries(views: &[MaintainedAggregateView]) -> usize {
-    views.iter().fold(0_usize, |total, view| {
-        total.saturating_add(view.index_len())
-    })
+/// Total retained index entries: one per primary-key record plus each
+/// `MIN`/`MAX` multiset node. Reported alongside the byte total when the cap
+/// trips, so an operator can see both what was retained and what it cost.
+fn retained_index_entries(state: &RegistryState) -> usize {
+    retained_entries(&state.views, state.index.as_ref())
+}
+
+fn retained_bytes(views: &[MaintainedAggregateView], index: Option<&RetractionIndex>) -> usize {
+    views.iter().fold(
+        index.map_or(0, RetractionIndex::approx_bytes),
+        |total, view| total.saturating_add(view.approx_multiset_bytes()),
+    )
+}
+
+fn retained_entries(views: &[MaintainedAggregateView], index: Option<&RetractionIndex>) -> usize {
+    views
+        .iter()
+        .fold(index.map_or(0, RetractionIndex::len), |total, view| {
+            total.saturating_add(view.retained_multiset_entries)
+        })
 }
 
 /// A retained-entry counter overflowed `usize`. Distinct from
@@ -2806,7 +3646,7 @@ mod tests {
             "stale registry must release group state"
         );
         assert!(
-            state.views[0].pk_index.is_empty(),
+            state.index.as_ref().is_none_or(|index| index.len() == 0),
             "stale registry must release PK contributions"
         );
         assert_eq!(state.views[0].retained_multiset_entries, 0);
@@ -2969,8 +3809,17 @@ mod tests {
             }],
         };
 
-        MaintainedAggregateRegistry::try_new(&[spec], &schema)
+        let err = MaintainedAggregateRegistry::try_new(&[spec], &schema)
             .expect_err("unsupported group key type should be rejected");
+        // The group-key type guard is what refused it, not a column-resolution failure.
+        assert!(
+            matches!(
+                &err,
+                DataFusionError::Plan(message) if message
+                    == "Maintained aggregate GROUP BY column 'group_key' uses unsupported type Float64"
+            ),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -3087,6 +3936,412 @@ mod tests {
         }
     }
 
+    /// A retraction rebuilds each input from the words its record holds, and the
+    /// accumulators subtract exactly what they added only if that is the same
+    /// scalar, of the same type, that the row contributed.
+    #[test]
+    fn a_stored_input_decodes_to_the_scalar_it_was() -> DataFusionResult<()> {
+        let utc: Option<Arc<str>> = Some(Arc::from("UTC"));
+        for scalar in [
+            ScalarValue::Int8(Some(i8::MIN)),
+            ScalarValue::Int16(Some(-1)),
+            ScalarValue::Int32(Some(i32::MIN)),
+            ScalarValue::Int64(Some(i64::MIN)),
+            ScalarValue::Int64(Some(i64::MAX)),
+            ScalarValue::UInt8(Some(u8::MAX)),
+            ScalarValue::UInt16(Some(u16::MAX)),
+            ScalarValue::UInt32(Some(u32::MAX)),
+            ScalarValue::UInt64(Some(u64::MAX)),
+            ScalarValue::Float32(Some(-2.25)),
+            ScalarValue::Float32(Some(f32::MAX)),
+            ScalarValue::Float64(Some(-1.5e300)),
+            ScalarValue::Decimal128(Some(-999_999), 6, 2),
+            ScalarValue::Decimal128(Some(-999_999_999_999_999_999), 18, 0),
+            ScalarValue::Decimal128(Some(-(10_i128.pow(37))), 38, 0),
+            ScalarValue::Decimal128(Some(i128::MAX), 38, 10),
+            ScalarValue::Date32(Some(-1)),
+            ScalarValue::Date64(Some(1_700_000_000_000)),
+            ScalarValue::TimestampSecond(Some(-5), None),
+            ScalarValue::TimestampMillisecond(Some(1), utc.clone()),
+            ScalarValue::TimestampMicrosecond(Some(-1_167_696_000_000_000), utc),
+            ScalarValue::TimestampNanosecond(Some(i64::MAX), None),
+        ] {
+            let data_type = scalar.data_type();
+            let words = value_words(&data_type).expect("every aggregate input type is storable");
+            let encoded = encode_value(&scalar)?;
+            let decoded = decode_value(&encoded[..words], &data_type)?;
+            assert_eq!(
+                decoded, scalar,
+                "{data_type} must decode to the stored value"
+            );
+            assert_eq!(decoded.data_type(), data_type);
+        }
+        Ok(())
+    }
+
+    /// `SUM(i) GROUP BY name WHERE i > 0`.
+    fn positive_sum_i_spec() -> DataFusionResult<MaintainedAggregateSpec> {
+        let schema = schema();
+        Ok(MaintainedAggregateSpec {
+            filter: Some(datafusion_physical_expr::expressions::binary(
+                col("i", schema.as_ref())?,
+                datafusion::logical_expr::Operator::Gt,
+                lit(0_i64),
+                schema.as_ref(),
+            )?),
+            ..sum_i_spec()
+        })
+    }
+
+    fn global_count_spec() -> MaintainedAggregateSpec {
+        MaintainedAggregateSpec {
+            filter: None,
+            group_by: vec![],
+            aggregates: vec![MaintainedAggregateExpr {
+                function: MaintainedAggregateFunction::Count,
+                column: None,
+            }],
+        }
+    }
+
+    /// The served `(name, SUM(i))` rows of `positive_sum_i_spec`, and the
+    /// served `COUNT(*)` of `global_count_spec`.
+    fn shared_record_views(
+        registry: &MaintainedAggregateRegistry,
+    ) -> DataFusionResult<(BTreeMap<String, i64>, i64)> {
+        let epoch = registry.state.read().epoch;
+        let sums = registry
+            .batch_for_spec(
+                &positive_sum_i_spec()?,
+                epoch,
+                Arc::new(Schema::new(vec![
+                    Field::new("name", DataType::Utf8, true),
+                    Field::new("sum(i)", DataType::Int64, true),
+                ])),
+            )?
+            .expect("the filtered view serves");
+        let names = as_string_array(sums.column(0))?;
+        let values = as_int64_array(sums.column(1))?;
+        let sums = (0..sums.num_rows())
+            .map(|row| (names.value(row).to_string(), values.value(row)))
+            .collect();
+        let count = registry
+            .batch_for_spec(
+                &global_count_spec(),
+                epoch,
+                Arc::new(Schema::new(vec![Field::new(
+                    "count(*)",
+                    DataType::Int64,
+                    false,
+                )])),
+            )?
+            .expect("the unfiltered view serves");
+        Ok((sums, as_int64_array(count.column(0))?.value(0)))
+    }
+
+    /// Two views share one record per key. A row can belong to one view and not
+    /// the other, and an update can move it between them: each view must
+    /// retract only what the row gave it.
+    #[test]
+    fn views_sharing_a_record_retract_only_their_own_contribution() -> DataFusionResult<()> {
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[positive_sum_i_spec()?, global_count_spec()],
+            &schema(),
+            &[2],
+            usize::MAX,
+        )?;
+
+        registry.apply_insert_batches(
+            1,
+            &[group_batch(&[("a", 1, 10), ("a", 2, 20), ("b", 3, -5)])],
+        )?;
+        assert_eq!(
+            shared_record_views(&registry)?,
+            (BTreeMap::from([("a".to_string(), 30)]), 3)
+        );
+
+        // pk 2 leaves the filter and pk 3 enters it; the count is unchanged.
+        registry.apply_insert_batches(2, &[group_batch(&[("a", 2, -1), ("b", 3, 7)])])?;
+        assert_eq!(
+            shared_record_views(&registry)?,
+            (
+                BTreeMap::from([("a".to_string(), 10), ("b".to_string(), 7)]),
+                3
+            )
+        );
+
+        // Deleting pk 1 empties group `a` of the filtered view.
+        registry.apply_pk_deletes(3, &group_batch(&[("", 1, 0)]).project(&[2])?)?;
+        assert_eq!(
+            shared_record_views(&registry)?,
+            (BTreeMap::from([("b".to_string(), 7)]), 2)
+        );
+        assert_eq!(retained_index_entries(&registry.state.read()), 2);
+        Ok(())
+    }
+
+    /// A rebuild starts holding deltas, then reads a snapshot of the table while
+    /// writes keep landing. Installing it applies the held deltas after the
+    /// snapshot's epoch and drops those the snapshot already contains; the deltas
+    /// of epochs before the hold, which can still be queued behind the rebuild,
+    /// are skipped rather than counted twice.
+    #[test]
+    fn a_rebuild_takes_in_the_writes_made_while_it_reads() -> DataFusionResult<()> {
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[sum_i_spec()],
+            &schema(),
+            &[2],
+            usize::MAX,
+        )?;
+        registry.apply_insert_batches(1, &[group_batch(&[("a", 1, 10)])])?;
+
+        // Holding starts after epoch 1. Epochs 2 and 3 land before the snapshot
+        // is taken (so it contains them), epochs 4 and 5 after it.
+        let mut rebuilder = registry.begin_rebuild(1)?;
+        assert!(
+            registry.is_stale(),
+            "a registry being rebuilt does not serve"
+        );
+        registry.apply_insert_batches(2, &[group_batch(&[("a", 2, 20)])])?;
+        registry.apply_insert_batches(3, &[group_batch(&[("b", 3, 5)])])?;
+        assert!(rebuilder.set_snapshot_epoch(3));
+        let snapshot = group_batch(&[("a", 1, 10), ("a", 2, 20), ("b", 3, 5)]);
+        rebuilder.apply_projected(&snapshot, &[0, 1, 2, 3])?;
+        registry.apply_insert_batches(4, &[group_batch(&[("a", 1, 100)])])?;
+        registry.apply_pk_deletes(5, &group_batch(&[("", 2, 0)]).project(&[2])?)?;
+        assert!(registry.rebuild_is_current(&rebuilder));
+
+        assert!(registry.finish_rebuild(rebuilder)?, "the rebuild installs");
+        assert!(!registry.is_stale());
+        assert_eq!(registry.epoch_for_test(), 5);
+        assert_eq!(
+            sum_i_by_name(&registry)?,
+            BTreeMap::from([("a".to_string(), 100), ("b".to_string(), 5)]),
+            "the rebuilt views include the writes after the snapshot, once each"
+        );
+
+        // Deltas keep applying after it.
+        registry.apply_insert_batches(6, &[group_batch(&[("b", 4, 1)])])?;
+        assert_eq!(
+            sum_i_by_name(&registry)?,
+            BTreeMap::from([("a".to_string(), 100), ("b".to_string(), 6)])
+        );
+        Ok(())
+    }
+
+    /// A rebuild installed before the applier reached its snapshot's epoch: the
+    /// deltas of those epochs are already in the snapshot and must not be
+    /// applied again.
+    #[test]
+    fn deltas_the_installed_snapshot_already_holds_are_skipped() -> DataFusionResult<()> {
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[sum_i_spec()],
+            &schema(),
+            &[2],
+            usize::MAX,
+        )?;
+        let mut rebuilder = registry.begin_rebuild(2)?;
+        assert!(rebuilder.set_snapshot_epoch(2));
+        rebuilder.apply_projected(&group_batch(&[("a", 1, 10), ("a", 2, 20)]), &[0, 1, 2, 3])?;
+        assert!(registry.finish_rebuild(rebuilder)?);
+        assert_eq!(registry.epoch_for_test(), 2);
+
+        // The queued deltas of epochs 1 and 2 arrive after the install.
+        registry.apply_insert_batches(1, &[group_batch(&[("a", 1, 10)])])?;
+        registry.apply_insert_batches(2, &[group_batch(&[("a", 2, 20)])])?;
+        registry.apply_insert_batches(3, &[group_batch(&[("a", 3, 1)])])?;
+
+        assert!(!registry.is_stale(), "a skipped delta is not an epoch gap");
+        assert_eq!(
+            sum_i_by_name(&registry)?,
+            BTreeMap::from([("a".to_string(), 31)])
+        );
+        Ok(())
+    }
+
+    /// A full apply queue can `mark_stale(N)` while N-1 is still queued
+    /// (`feed_staged_ivm_under_fence`). The rebuild that recovers starts holding
+    /// at N; the queued earlier delta is already in that snapshot and must not
+    /// be treated as an epoch gap that abandons the rebuild and drops later
+    /// writes.
+    #[test]
+    fn a_queued_delta_behind_a_stale_mark_does_not_abandon_the_rebuild() -> DataFusionResult<()> {
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[sum_i_spec()],
+            &schema(),
+            &[2],
+            usize::MAX,
+        )?;
+        registry.apply_insert_batches(1, &[group_batch(&[("a", 1, 10)])])?;
+        registry.mark_stale(10);
+        let mut rebuilder = registry.begin_rebuild(10)?;
+        assert!(
+            registry.rebuild_is_current(&rebuilder),
+            "begin_rebuild must leave a current rebuild"
+        );
+
+        registry.apply_insert_batches(9, &[group_batch(&[("a", 2, 20)])])?;
+        assert!(
+            registry.rebuild_is_current(&rebuilder),
+            "a queued delta at or below hold_from must not abandon the rebuild"
+        );
+
+        registry.apply_insert_batches(11, &[group_batch(&[("b", 3, 5)])])?;
+        assert!(
+            registry.rebuild_is_current(&rebuilder),
+            "the first epoch after hold_from must be held for the rebuild"
+        );
+
+        assert!(rebuilder.set_snapshot_epoch(10));
+        rebuilder.apply_projected(&group_batch(&[("a", 1, 10), ("a", 2, 20)]), &[0, 1, 2, 3])?;
+        assert!(registry.finish_rebuild(rebuilder)?, "the rebuild installs");
+        assert!(!registry.is_stale());
+        assert_eq!(registry.epoch_for_test(), 11);
+        assert_eq!(
+            sum_i_by_name(&registry)?,
+            BTreeMap::from([("a".to_string(), 30), ("b".to_string(), 5)]),
+            "the rebuilt views include the write held after the snapshot"
+        );
+        Ok(())
+    }
+
+    /// Epochs assigned and queued before `begin_rebuild`, with no stale mark
+    /// jumping the registry epoch, must still leave later holds dense: skip
+    /// them as already in the snapshot, then hold the first epoch after
+    /// `hold_from`.
+    #[test]
+    fn queued_deltas_before_hold_from_keep_later_holds_dense() -> DataFusionResult<()> {
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[sum_i_spec()],
+            &schema(),
+            &[2],
+            usize::MAX,
+        )?;
+        registry.apply_insert_batches(1, &[group_batch(&[("a", 1, 10)])])?;
+        let mut rebuilder = registry.begin_rebuild(3)?;
+        registry.apply_insert_batches(2, &[group_batch(&[("a", 2, 20)])])?;
+        registry.apply_insert_batches(3, &[group_batch(&[("b", 3, 5)])])?;
+        registry.apply_insert_batches(4, &[group_batch(&[("b", 4, 1)])])?;
+        assert!(
+            registry.rebuild_is_current(&rebuilder),
+            "queued deltas at or below hold_from must not abandon a later hold"
+        );
+
+        assert!(rebuilder.set_snapshot_epoch(3));
+        rebuilder.apply_projected(
+            &group_batch(&[("a", 1, 10), ("a", 2, 20), ("b", 3, 5)]),
+            &[0, 1, 2, 3],
+        )?;
+        assert!(registry.finish_rebuild(rebuilder)?, "the rebuild installs");
+        assert!(!registry.is_stale());
+        assert_eq!(registry.epoch_for_test(), 4);
+        assert_eq!(
+            sum_i_by_name(&registry)?,
+            BTreeMap::from([("a".to_string(), 30), ("b".to_string(), 6)]),
+            "the rebuilt views include the write held after the snapshot"
+        );
+        Ok(())
+    }
+
+    /// A stale mark, an epoch gap, held deltas over budget, or a snapshot older
+    /// than the hold abandon the rebuild: it installs nothing and the registry
+    /// stays stale.
+    #[test]
+    fn an_abandoned_rebuild_installs_nothing() -> DataFusionResult<()> {
+        // Marked stale while it reads.
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[sum_i_spec()],
+            &schema(),
+            &[2],
+            usize::MAX,
+        )?;
+        let mut rebuilder = registry.begin_rebuild(0)?;
+        assert!(rebuilder.set_snapshot_epoch(0));
+        registry.mark_stale(1);
+        assert!(!registry.rebuild_is_current(&rebuilder));
+        assert!(!registry.finish_rebuild(rebuilder)?);
+        assert!(registry.is_stale());
+
+        // A delta skipped an epoch.
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[sum_i_spec()],
+            &schema(),
+            &[2],
+            usize::MAX,
+        )?;
+        let mut rebuilder = registry.begin_rebuild(0)?;
+        assert!(rebuilder.set_snapshot_epoch(0));
+        registry.apply_insert_batches(2, &[group_batch(&[("a", 1, 10)])])?;
+        assert!(!registry.finish_rebuild(rebuilder)?);
+        assert!(registry.is_stale());
+
+        // More held deltas than a quarter of the budget.
+        let budget = group_batch(&[("a", 1, 10)]).get_array_memory_size() * 2;
+        let registry =
+            MaintainedAggregateRegistry::try_new_with_pk(&[sum_i_spec()], &schema(), &[2], budget)?;
+        let mut rebuilder = registry.begin_rebuild(0)?;
+        assert!(rebuilder.set_snapshot_epoch(0));
+        registry.apply_insert_batches(1, &[group_batch(&[("a", 1, 10)])])?;
+        assert!(!registry.rebuild_is_current(&rebuilder));
+        assert!(!registry.finish_rebuild(rebuilder)?);
+        assert!(registry.is_stale());
+
+        // A snapshot older than the hold: the deltas in between were dropped
+        // before the hold began, so the rebuild cannot be completed.
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[sum_i_spec()],
+            &schema(),
+            &[2],
+            usize::MAX,
+        )?;
+        let mut rebuilder = registry.begin_rebuild(3)?;
+        assert!(!rebuilder.set_snapshot_epoch(2));
+        assert!(
+            !registry.finish_rebuild(rebuilder)?,
+            "a rebuild without a usable snapshot epoch installs nothing"
+        );
+        assert!(registry.is_stale());
+        Ok(())
+    }
+
+    /// A scan plan carries its table's registry and gets formatted with `Debug`
+    /// while planning, so the format must not grow with the retained rows.
+    #[test]
+    fn debug_formatting_does_not_print_retained_rows() -> DataFusionResult<()> {
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[sum_i_spec()],
+            &schema(),
+            &[2],
+            usize::MAX,
+        )?;
+        let rows = (0..10_000_u64)
+            .map(|pk| ("a", pk, 1_i64))
+            .collect::<Vec<_>>();
+        registry.apply_insert_batches(1, &[group_batch(&rows)])?;
+
+        let formatted = format!("{registry:?}");
+        assert!(
+            formatted.len() < 256,
+            "the registry's Debug must be a summary, but it is {} bytes",
+            formatted.len()
+        );
+        Ok(())
+    }
+
+    /// A rebuild scans only the columns the views read.
+    #[test]
+    fn a_rebuild_reads_the_key_and_the_columns_the_views_use() -> DataFusionResult<()> {
+        let registry = MaintainedAggregateRegistry::try_new_with_pk(
+            &[positive_sum_i_spec()?, global_count_spec()],
+            &schema(),
+            &[2],
+            usize::MAX,
+        )?;
+        // name (group), i (sum and filter), u (key); never f.
+        assert_eq!(registry.rebuild_columns(), vec![0, 1, 2]);
+        Ok(())
+    }
+
     fn sum_i_by_name(
         registry: &MaintainedAggregateRegistry,
     ) -> DataFusionResult<BTreeMap<String, i64>> {
@@ -3132,11 +4387,13 @@ mod tests {
         Ok(())
     }
 
-    /// Byte accounting must be symmetric: a retraction has to release exactly what
-    /// its insert charged, or a steady-state upsert workload leaks budget until it
-    /// trips the cap and disables the view for no reason.
+    /// The budget is charged for the memory the index holds, which a retraction
+    /// keeps for reuse rather than returning, so churn must not grow the charge:
+    /// retracting every row and indexing as many again lands where the first load
+    /// did. A charge that grew with churn would leak budget until a steady-state
+    /// upsert workload tripped the cap and disabled the view for no reason.
     #[test]
-    fn retained_index_bytes_return_to_zero_after_full_retraction() -> DataFusionResult<()> {
+    fn retained_index_bytes_hold_steady_across_retract_and_reload() -> DataFusionResult<()> {
         let registry = MaintainedAggregateRegistry::try_new_with_pk(
             &[sum_i_spec()],
             &schema(),
@@ -3144,6 +4401,7 @@ mod tests {
             usize::MAX,
         )?;
         let (empty_bytes, _) = registry.retained_bytes_and_budget();
+        assert_eq!(empty_bytes, 0, "an empty index holds no memory");
 
         registry.apply_insert_batches(
             1,
@@ -3155,15 +4413,24 @@ mod tests {
             "indexing rows must charge bytes (was {loaded_bytes}, empty {empty_bytes})"
         );
 
-        // Retract every indexed row.
+        // Retract every indexed row, then index three other keys.
         registry.apply_pk_deletes(
             2,
             &group_batch(&[("", 1, 0), ("", 2, 0), ("", 3, 0)]).project(&[2])?,
         )?;
         let (drained_bytes, _) = registry.retained_bytes_and_budget();
+        assert!(
+            drained_bytes <= loaded_bytes,
+            "retracting rows must not charge more ({drained_bytes} > {loaded_bytes})"
+        );
+        registry.apply_insert_batches(
+            3,
+            &[group_batch(&[("a", 4, 10), ("a", 5, 20), ("b", 6, 5)])],
+        )?;
+        let (reloaded_bytes, _) = registry.retained_bytes_and_budget();
         assert_eq!(
-            drained_bytes, empty_bytes,
-            "retracting every row must release exactly what indexing charged"
+            reloaded_bytes, loaded_bytes,
+            "re-indexing as many rows must reuse what the retractions released"
         );
         Ok(())
     }
@@ -3405,7 +4672,7 @@ mod tests {
         // Two rows retain two PK contribution records plus two `MIN` and two
         // `MAX` multiset nodes: six entries, all charged.
         assert_eq!(
-            unbounded.state.read().views[0].index_len(),
+            retained_index_entries(&unbounded.state.read()),
             6,
             "two rows retain 2 PK records + 2 MIN + 2 MAX multiset nodes"
         );
