@@ -1271,13 +1271,15 @@ pub struct TuningTargets {
 }
 
 impl TuningTargets {
-    /// Whether any setpoint that declares a target is set. The convergence window only
-    /// paces the loop, so it does not count.
+    /// Whether any `runtime.params.target_*` key is set. Every one of them, the
+    /// pacing-only convergence window included, is inert while adaptive tuning is
+    /// disabled, so this decides whether that is reported.
     #[must_use]
-    pub fn any_target(&self) -> bool {
+    pub fn any_set(&self) -> bool {
         self.replication_lag_secs.is_some()
             || self.freshness_secs.is_some()
             || self.query_latency_ms.is_some()
+            || self.convergence_window_secs.is_some()
             || self.qph.is_some()
     }
 }
@@ -1573,5 +1575,27 @@ mod tests {
                 "default_for({engine}) must produce the {engine} variant"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tuning_targets_tests {
+    use super::TuningTargets;
+
+    #[test]
+    fn convergence_window_alone_counts_as_set() {
+        let targets = TuningTargets {
+            convergence_window_secs: Some(120.0),
+            ..TuningTargets::default()
+        };
+        assert!(
+            targets.any_set(),
+            "a lone `target_convergence_window` is inert while adaptive tuning is disabled, so it must be reported"
+        );
+    }
+
+    #[test]
+    fn nothing_set_is_not_reported() {
+        assert!(!TuningTargets::default().any_set());
     }
 }

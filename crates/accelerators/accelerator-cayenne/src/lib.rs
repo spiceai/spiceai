@@ -2266,7 +2266,7 @@ impl CayenneAccelerator {
             config.goal_query_latency_ms = targets.query_latency_ms;
             config.goal_convergence_window_secs = targets.convergence_window_secs;
             config.goal_qph = targets.qph;
-            let any_target = targets.any_target();
+            let any_target = targets.any_set();
             // A target never switches the mode: `adaptive` is a preview feature and
             // is entered only by asking for it, so a target configured while the
             // loop is off is reported as ignored (below, under the newly-resolved

@@ -295,7 +295,7 @@ impl CayenneCatalogConnector {
         };
 
         // A target steers the closed loop and never turns it on.
-        if outcome.targets.any_target() && outcome.seeds.is_none() {
+        if outcome.targets.any_set() && outcome.seeds.is_none() {
             tracing::warn!(
                 "`runtime.params.target_*` is set but `runtime.params.adaptive_tuning` is `disabled`, so catalog '{}' ignores the targets. Set `runtime.params.adaptive_tuning` to `enabled` to enable target-seeking. See: https://spiceai.org/docs/reference/spicepod/runtime",
                 catalog_name.unwrap_or_default()
