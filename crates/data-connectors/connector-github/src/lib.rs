@@ -144,7 +144,8 @@ async fn get_github_auth_rate_control(auth_context: String) -> GitHubAuthRateCon
 
     // GitHub GraphQL secondary limit is 2000 points/minute at 1 point per
     // non-mutation query. Target 90% fill so 10% remains as buffer.
-    // Equal 1-point costs make the shared governor FIFO fair across tables.
+    // The controller admits queries in arrival order, so tables sharing the
+    // quota are served fairly.
     let controller = RateControllerBuilder::new()
         .with_weighted_quota(rate_limit::graphql_secondary_quota())
         .with_jitter(JitterConfig::new(
