@@ -55,7 +55,7 @@ On managed Postgres services:
 | Azure Database    | Under **Replication**, set *Replication support* to `LOGICAL`.        |
 | Supabase / Neon   | Logical replication is enabled by default.                            |
 
-### 2. The source table must have a primary key
+### 2. Every row needs a primary key
 
 Spice applies each `UPDATE` and `DELETE` to the row with the same primary key, so the key columns must be in every event:
 
