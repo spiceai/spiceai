@@ -304,6 +304,31 @@ impl BenchArgs {
             .collect())
     }
 
+    /// Refuse the settings only the bench workflow declares inputs for, on an
+    /// entry dispatched to `workflow`: GitHub refuses a dispatch carrying an
+    /// input its workflow does not declare.
+    ///
+    /// # Errors
+    ///
+    /// When the entry sets `postgres_version`, `layout` or `layouts`.
+    pub fn ensure_only_bench_settings_unset(&self, workflow: &str) -> anyhow::Result<()> {
+        let set: Vec<&str> = [
+            ("postgres_version", self.postgres_version.is_some()),
+            ("layout", self.layout.is_some()),
+            ("layouts", !self.layouts.is_empty()),
+        ]
+        .into_iter()
+        .filter_map(|(setting, is_set)| is_set.then_some(setting))
+        .collect();
+        anyhow::ensure!(
+            set.is_empty(),
+            "a {workflow} test sets `{}`, which only the bench workflow takes; remove {}, or run the entry as a bench test",
+            set.join("`, `"),
+            if set.len() == 1 { "it" } else { "them" }
+        );
+        Ok(())
+    }
+
     fn postgres_versions(&self) -> anyhow::Result<Vec<Option<String>>> {
         let Some(requested) = self.postgres_version.as_deref() else {
             return Ok(vec![None]);
@@ -716,6 +741,49 @@ pub struct WorkflowArgs<T: Serialize> {
 mod tests {
     use super::*;
     use test_framework::queries::QuerySet;
+
+    /// Only the bench workflow declares `postgres_version` and `layout` inputs,
+    /// so a load or throughput entry that sets them is refused before dispatch
+    /// rather than sending an input GitHub would reject.
+    #[test]
+    fn load_and_throughput_entries_refuse_the_bench_only_settings() {
+        let yaml = "
+tests:
+  load:
+    spicepod_path: accelerated/file[parquet]-arrow.yaml
+    query_set: tpch
+    runner_type: spiceai-dev-large-runners
+    layout: primary_key
+  throughput:
+    - spicepod_path: accelerated/file[parquet]-arrow.yaml
+      query_set: tpch
+      runner_type: spiceai-dev-large-runners
+      postgres_version: '17'
+      layouts: [primary_key, indexes]
+    - spicepod_path: accelerated/file[parquet]-arrow.yaml
+      query_set: tpch
+      runner_type: spiceai-dev-large-runners
+";
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
+        assert_eq!(
+            test_file.tests.load[0]
+                .bench_args
+                .ensure_only_bench_settings_unset("load")
+                .expect_err("a load test cannot take a layout")
+                .to_string(),
+            "a load test sets `layout`, which only the bench workflow takes; remove it, or run the entry as a bench test"
+        );
+        assert_eq!(
+            test_file.tests.throughput[0]
+                .ensure_only_bench_settings_unset("throughput")
+                .expect_err("a throughput test cannot take a version or layouts")
+                .to_string(),
+            "a throughput test sets `postgres_version`, `layouts`, which only the bench workflow takes; remove them, or run the entry as a bench test"
+        );
+        test_file.tests.throughput[1]
+            .ensure_only_bench_settings_unset("throughput")
+            .expect("an entry without them dispatches");
+    }
 
     /// An HTAP entry's versions are its spicepod's source's: `MySQL` for a
     /// `mysql*` spicepod, as the HTAP workflow reads it, `PostgreSQL` otherwise.
