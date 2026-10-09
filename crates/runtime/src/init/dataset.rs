@@ -3279,16 +3279,15 @@ fn deprecated_on_conflict_warning(
     acceleration: &Acceleration,
     refresh_mode: RefreshMode,
 ) -> String {
-    // File mode keeps CDC acceleration durable across restarts.
-    let mode = if matches!(acceleration.mode, Mode::Memory | Mode::FileCreate)
+    let persistence = if matches!(acceleration.mode, Mode::Memory | Mode::FileCreate)
         && refresh_mode == RefreshMode::Changes
     {
-        " with `mode: file`"
+        " Set `mode: file` to preserve CDC data across restarts and resume replication."
     } else {
         ""
     };
     format!(
-        "Dataset '{dataset_name}' sets `acceleration.on_conflict`, which is deprecated and removed in 3.0. Use `engine: cayenne`{mode} to keep one row per primary key without it."
+        "Dataset '{dataset_name}' sets `acceleration.on_conflict`, which is deprecated and removed in 3.0. Use `engine: cayenne` to keep one row per primary key without it.{persistence}"
     )
 }
 
@@ -3917,7 +3916,7 @@ mod tests {
                 acceleration.refresh_mode = refresh_mode;
                 assert_eq!(
                     deprecated_on_conflict_warning("orders", &acceleration, RefreshMode::Changes),
-                    "Dataset 'orders' sets `acceleration.on_conflict`, which is deprecated and removed in 3.0. Use `engine: cayenne` with `mode: file` to keep one row per primary key without it."
+                    "Dataset 'orders' sets `acceleration.on_conflict`, which is deprecated and removed in 3.0. Use `engine: cayenne` to keep one row per primary key without it. Set `mode: file` to preserve CDC data across restarts and resume replication."
                 );
             }
         }
