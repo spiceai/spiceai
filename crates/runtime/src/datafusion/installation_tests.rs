@@ -647,9 +647,9 @@ async fn transient_build_failure_loads_on_retry() {
     .expect("the retry must finish");
 }
 
-/// A build that fails after it may have started work, here a caching child whose
-/// parent stops taking children, keeps the dataset's generation fenced, because
-/// nothing proves that work stopped.
+/// A builder failure raised where the builder may already have started work keeps
+/// the dataset's generation fenced, because nothing proves that work stopped. Here
+/// a caching child fails to initialize because its parent refuses new children.
 #[tokio::test]
 async fn build_failure_after_ingestion_starts_keeps_the_generation_fenced() {
     tokio::time::timeout(Duration::from_secs(30), async {
