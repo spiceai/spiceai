@@ -1882,7 +1882,8 @@ fn pacing_interval(window: Duration, granted: u64) -> Duration {
     let interval = if granted == 0 {
         window
     } else {
-        window / u32::try_from(granted).unwrap_or(u32::MAX)
+        let nanos = window.as_nanos() / u128::from(granted);
+        Duration::from_nanos(u64::try_from(nanos).unwrap_or(u64::MAX))
     };
     interval.max(Duration::from_nanos(1))
 }
@@ -1996,41 +1997,27 @@ mod tests {
     /// `schema_version` as well when an older reader would misread that change.
     #[test]
     fn persisted_state_json_is_stable() {
-        assert_snapshot!(canonical_json(&wire_format_fixture()), @r###"
-        {
-          "limiters": {
-            "requests_per_second:burst=10:replenish_ns=100000000": {
-              "burst_per_window": 10,
-              "windows": {
-                "1700000000": {
-                  "budget_remaining": 1,
-                  "leases": {
-                    "replica-a": {
-                      "attempted": 12,
-                      "consumed": 5,
-                      "expires_at_unix_ms": 1700000001000,
-                      "failed": 1,
-                      "granted": 7,
-                      "ok": 3,
-                      "updated_at_unix_ms": 1700000001500
-                    },
-                    "replica-b": {
-                      "attempted": 0,
-                      "consumed": 0,
-                      "expires_at_unix_ms": 1700000001000,
-                      "granted": 2,
-                      "updated_at_unix_ms": 1700000000500
-                    }
-                  }
-                }
-              }
-            }
-          },
-          "schema_version": 3,
-          "updated_at_unix_ms": 1700000000500,
-          "window_ms": 1000
-        }
-        "###);
+        assert_snapshot!(
+            "persisted_state_json_is_stable",
+            canonical_json(&wire_format_fixture())
+        );
+    }
+
+    /// A grant wider than `u32` must still divide the whole window: narrowing
+    /// it would widen the spacing and pace a replica below its lease.
+    #[test]
+    fn pacing_interval_divides_by_the_full_grant() {
+        let window = Duration::from_secs(10);
+        assert_eq!(
+            pacing_interval(window, 10_000_000_000),
+            Duration::from_nanos(1)
+        );
+        assert_eq!(
+            pacing_interval(window, u64::from(u32::MAX) + 1),
+            Duration::from_nanos(2)
+        );
+        assert_eq!(pacing_interval(window, 4), Duration::from_millis(2500));
+        assert_eq!(pacing_interval(window, 0), window);
     }
 
     #[test]
