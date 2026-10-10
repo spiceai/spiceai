@@ -1,5 +1,5 @@
 name: htap benchmark tests
-run-name: CH-BenCHmark - ${{ github.event.inputs.spicepod_path }} - SF${{ github.event.inputs.scale_factor }} - ${{ github.event.inputs.duration }}s
+run-name: CH-BenCHmark - ${{ github.event.inputs.spicepod_path }} - SF${{ github.event.inputs.scale_factor }} - ${{ github.event.inputs.duration }}s${{ github.event.inputs.source_version != '' && format(' - source {0}', github.event.inputs.source_version) || '' }}${{ github.event.inputs.layout != '' && format(' - layout {0}', github.event.inputs.layout) || '' }}
 
 on:
   workflow_dispatch:
@@ -72,6 +72,16 @@ on:
         required: false
         default: ''
         type: string
+      source_version:
+        description: 'Source database release line, one of its versions in test/source_versions.json; empty = PostgreSQL 16 or MySQL 8.4. Only for runners that start the source in Docker: the in-cluster sources on spiceai-dev-xlarge-runners have fixed versions.'
+        required: false
+        default: ''
+        type: string
+      layout:
+        description: 'Acceleration layout to configure on every accelerated dataset (testoperator --layout): features from indexes, sort, cluster, time_column, partition, joined by commas; empty = the spicepod as written'
+        required: false
+        default: ''
+        type: string
 
 # Serialize ALL SF100 + SF1000 CH-benCHmark runs across every variant (sqlite/turso cdc-tuned,
 # adaptive, duckdb): they share ONE concurrency group keyed only by scale factor, so
@@ -121,6 +131,16 @@ jobs:
           esac
           echo "SOURCE_TYPE=${SOURCE_TYPE}" >> $GITHUB_OUTPUT
           echo "Derived source_type=${SOURCE_TYPE} from spicepod $(basename "${SPICEPOD_PATH}")"
+
+      # Refuse a version the run could not honour rather than report results for a
+      # different server than the one asked for.
+      - name: Check the source version can be honoured
+        if: github.event.inputs.source_version != '' && github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners'
+        env:
+          SOURCE_VERSION: ${{ github.event.inputs.source_version }}
+        run: |
+          echo "::error::source_version=${SOURCE_VERSION} needs a runner that starts the source in Docker; the in-cluster sources on spiceai-dev-xlarge-runners have fixed versions. Pick another runner_type, or leave source_version empty."
+          exit 1
 
       - name: Validate spicepod file exists
         run: |
@@ -220,6 +240,8 @@ jobs:
       - name: Setup CH-benCH PostgreSQL
         if: steps.set_spicepod_path.outputs.SOURCE_TYPE != 'mysql' && github.event.inputs.runner_type != 'spiceai-dev-xlarge-runners'
         uses: ./.github/actions/setup-chbench-postgres
+        with:
+          version: ${{ github.event.inputs.source_version || '16' }}
 
       # MySQL source: on spiceai-dev-xlarge-runners a dedicated in-cluster MySQL
       # pod is used (chbench-mysql.dataplatform.svc.cluster.local, like Postgres),
@@ -227,6 +249,8 @@ jobs:
       - name: Setup CH-benCH MySQL
         if: steps.set_spicepod_path.outputs.SOURCE_TYPE == 'mysql' && github.event.inputs.runner_type != 'spiceai-dev-xlarge-runners'
         uses: ./.github/actions/setup-chbench-mysql
+        with:
+          version: ${{ github.event.inputs.source_version || '8.4' }}
 
       # The xlarge PG pod is long-lived, so cache a pristine seed as a Postgres
       # template database and restore chbench from it (FILE_COPY, seconds) instead
@@ -378,6 +402,7 @@ jobs:
             ${{ steps.set_spicepod_path.outputs.SOURCE_TYPE == 'mysql' && '--analytic-gate-concurrency 16' || '' }} \
             --disable-progress-bars \
             --metrics \
+            ${LAYOUT:+--layout "$LAYOUT"} \
             --metrics-dump "${GITHUB_WORKSPACE}/htap-metrics.json" \
             --summary-out "${GITHUB_WORKSPACE}/htap-summary.md" 2>&1 | tee "${GITHUB_WORKSPACE}/htap-run.log"
           # ${PIPESTATUS[0]} is testoperator's real exit (not tee's), so a failed
@@ -392,6 +417,7 @@ jobs:
           [ -n "$DIAG_PIDS" ] && kill $DIAG_PIDS 2>/dev/null || true
           exit $testop_exit
         env:
+          LAYOUT: ${{ github.event.inputs.layout }}
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           # Dedicated in-cluster PG pod on xlarge; per-run docker container (loopback) elsewhere.

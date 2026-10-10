@@ -71,6 +71,14 @@ jobs:
       # Always treat a manual workflow_dispatch run as having relevant changes so the
       # tests run even when no relevant files changed.
       relevant_changes: ${{ steps.check.outputs.relevant_changes == 'true' || github.event_name == 'workflow_dispatch' }}
+      # Whether `source-versions` runs: on every manual run (integration_nightly.yml
+      # dispatches one each night), and on a push to trunk or a release branch
+      # that touches what can behave differently on another release line of a
+      # federated source database. Not in the merge queue, where it would hold a
+      # runner per release line for a check that gates nothing; the push run
+      # after the merge reports the same commit.
+      source_changes: ${{ (github.event_name == 'push' && steps.check_sources.outputs.relevant_changes == 'true') || github.event_name == 'workflow_dispatch' }}
+      source_versions_matrix: ${{ steps.source_versions.outputs.matrix }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -80,6 +88,61 @@ jobs:
       - name: Check for code changes
         id: check
         uses: ./.github/actions/check-code-changes
+
+      - name: Check for federated source changes
+        id: check_sources
+        if: github.event_name == 'push'
+        uses: ./.github/actions/check-code-changes
+        with:
+          # The connectors, the test helpers that start the source containers, and
+          # the version list itself. Dependency bumps (database drivers, and the
+          # DataFusion forks whose SQL unparser writes what is pushed down) are
+          # left to the nightly run: one in six trunk commits touches Cargo.lock.
+          filters: |
+            code_changes:
+              - 'test/source_versions.json'
+              - 'crates/test-framework/src/source_versions.rs'
+              - '.github/workflows/integration.yml'
+              - 'crates/data-connectors/connector-postgres/**'
+              - 'crates/data-connectors/connector-postgres-common/**'
+              - 'crates/data-connectors/connector-mysql/**'
+              - 'crates/data-connectors/connector-mongodb/**'
+              - 'crates/data_components/src/postgres/**'
+              - 'crates/data_components/src/postgres_replication/**'
+              - 'crates/data_components/src/mysql/**'
+              - 'crates/data_components/src/mysql_replication/**'
+              - 'crates/runtime/src/catalogconnector/postgres.rs'
+              - 'crates/runtime/src/catalogconnector/postgres_accelerated.rs'
+              - 'crates/runtime/src/catalogconnector/mysql.rs'
+              - 'crates/accelerators/accelerator-postgres/**'
+              - 'crates/vendor/pgwire-replication/**'
+              - 'crates/runtime/tests/docker/**'
+              # Every test module the source-versions filters below select.
+              - 'crates/runtime/tests/postgres/**'
+              - 'crates/runtime/tests/schema_evolution/**'
+              - 'crates/runtime/tests/retention/**'
+              - 'crates/runtime/tests/tpcds_postgres/**'
+              - 'crates/runtime/tests/hashicorp_vault/**'
+              - 'crates/runtime/tests/acceleration/refresh/**'
+              - 'crates/runtime/tests/acceleration/checkpoint_postgres.rs'
+              - 'crates/runtime/tests/acceleration/on_conflict.rs'
+              - 'crates/runtime/tests/acceleration/query_push_down.rs'
+              - 'crates/runtime/tests/mysql/**'
+              - 'crates/runtime/tests/rehydration/**'
+              - 'crates/runtime/tests/refresh_retry/mysql.rs'
+              - 'crates/runtime/tests/mongo/**'
+
+      # Every listed release line except each source's newest, which the
+      # partitions below already run as the default.
+      - name: List federated source versions
+        id: source_versions
+        run: |
+          set -euo pipefail
+          matrix="$(jq -c '[to_entries[] | select(.key != "description") | .key as $source | .value.versions[:-1][] | {source: $source, version: .version, end_of_life: .end_of_life}]' test/source_versions.json)"
+          today="$(date -u +%F)"
+          jq -r --arg today "$today" 'to_entries[] | select(.key != "description") | .key as $source | .value.versions[] | select(.end_of_life <= $today) | "::warning title=Unsupported source version::\($source) \(.version) reached end of life on \(.end_of_life); remove it from test/source_versions.json"' test/source_versions.json
+          echo "matrix=${matrix}" >> "$GITHUB_OUTPUT"
+          echo "Source versions beyond each default: ${matrix}"
 
   build:
     name: Build Test Binary
@@ -344,9 +407,10 @@ jobs:
       - name: Pull database images
         if: needs.check_changes.outputs.relevant_changes == 'true'
         run: |
-          docker pull docker.io/library/postgres:latest
-          docker pull docker.io/library/mysql:latest
-          docker pull docker.io/library/mongo:latest
+          # Each source's default release line (the newest in test/source_versions.json).
+          for image in $(jq -r 'to_entries[] | select(.key != "description") | "\(.value.image):\(.value.versions[-1].version)"' test/source_versions.json); do
+            docker pull "${image}"
+          done
           docker pull docker.io/gvenzl/oracle-free:latest
 
       - name: Set up Spice.ai API Key
@@ -478,6 +542,114 @@ jobs:
           name: integration-snapshots-part-${{ matrix.label }}
           path: integration-snapshots-part-${{ matrix.label }}.tar.gz
           retention-days: 1
+
+  # The tests that start a federated source database, run again on every other
+  # supported release line of that database. The partitions above run each
+  # source's newest line (test/source_versions.json); this job reuses their test
+  # archive with `SPICE_TEST_<SOURCE>_VERSION` set, so nothing is rebuilt. When it
+  # runs is `source_changes` in `check_changes`.
+  source-versions:
+    name: Integration Tests (${{ matrix.source }} ${{ matrix.version }})
+    needs: [build, check_changes]
+    if: ${{ github.event_name != 'pull_request' && needs.check_changes.outputs.relevant_changes == 'true' && needs.check_changes.outputs.source_changes == 'true' && needs.check_changes.outputs.source_versions_matrix != '[]' }}
+    runs-on: spiceai-dev-runners
+    # The largest leg, PostgreSQL, ran its 85 tests in 4.3 minutes locally (six
+    # threads, PostgreSQL 14, 2026-10-08), against 13.1 minutes at most for a
+    # whole partition in CI; the bound leaves a cold runner room for the archive
+    # download and the image pull.
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJSON(needs.check_changes.outputs.source_versions_matrix) }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+          fetch-depth: 1
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      # The archive links the Oracle client library, as in the partitions.
+      - name: Install Oracle ODPI-C
+        uses: ./.github/actions/setup-oracle-odpi
+
+      - name: Set up MinIO client
+        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        uses: ./.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Download test archive from local MinIO
+        if: env.HAS_TEST_MINIO_SECRET == 'true'
+        env:
+          MINIO_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
+        run: |
+          set -euo pipefail
+          : "${MINIO_ENDPOINT:?TEST_MINIO_ENDPOINT is required to download integration test archive}"
+          mkdir -p ./integration_tests
+          mc cp "spice-minio/${INTEGRATION_TESTS_ARCHIVE_S3_URI#s3://}" ./integration_tests/integration_tests.tar.zst
+
+      - name: Download test archive
+        if: env.HAS_TEST_MINIO_SECRET != 'true'
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: integration-tests-archive
+          path: ./integration_tests
+
+      - name: Set up Nextest
+        uses: ./.github/actions/setup-nextest
+
+      - name: Login to DockerHub
+        if: github.repository == 'spiceai/spiceai'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Pull ${{ matrix.source }} ${{ matrix.version }}
+        env:
+          SOURCE: ${{ matrix.source }}
+          VERSION: ${{ matrix.version }}
+        run: |
+          set -euo pipefail
+          image="$(jq -r --arg source "${SOURCE}" '.[$source].image' test/source_versions.json)"
+          docker pull "${image}:${VERSION}"
+
+      - name: Run ${{ matrix.source }} ${{ matrix.version }} tests
+        timeout-minutes: 45
+        env:
+          AWS_EC2_METADATA_DISABLED: true
+          SOURCE: ${{ matrix.source }}
+          VERSION: ${{ matrix.version }}
+        run: |
+          set -euo pipefail
+          # The test modules that start each source's container. A new module that
+          # starts one belongs here too, or this job never runs it on older lines.
+          # `retention::test_retention_sql` reads a Spice Cloud dataset, not a
+          # source container, so it runs once, in the partitions, with their key.
+          case "${SOURCE}" in
+            postgres)
+              export SPICE_TEST_POSTGRES_VERSION="${VERSION}"
+              filter='(test(/^(postgres|schema_evolution|retention|tpcds_postgres|hashicorp_vault)::/) | test(/^acceleration::(refresh|checkpoint_postgres|on_conflict|query_push_down)::/)) - test(=retention::test_retention_sql)'
+              ;;
+            mysql)
+              export SPICE_TEST_MYSQL_VERSION="${VERSION}"
+              filter='test(/^(mysql|rehydration)::/) | test(/^refresh_retry::mysql::/)'
+              ;;
+            mongodb)
+              export SPICE_TEST_MONGODB_VERSION="${VERSION}"
+              filter='test(/^mongo::/)'
+              ;;
+            *)
+              echo "::error::No test filter for source '${SOURCE}'; add one to this step"
+              exit 1
+              ;;
+          esac
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_tests/integration_tests.tar.zst -E "binary_id(=runtime::integration) & (${filter})"
 
   # Preserve the required check names and make the isolated GitHub lane part
   # of each result. A failed dependency must produce a failure, not a skipped

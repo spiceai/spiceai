@@ -1,17 +1,38 @@
 name: Setup CH-benCH PostgreSQL
 description: 'Starts a PostgreSQL container configured for CH-benCH benchmarking'
 
+inputs:
+  version:
+    description: >-
+      PostgreSQL release line to start; one of the `postgres` versions in
+      test/source_versions.json. Defaults to the line the CH-benCH baselines
+      were measured on.
+    required: false
+    default: '16'
+
 runs:
   using: 'composite'
   steps:
+    - name: Check the PostgreSQL version is supported
+      shell: bash
+      env:
+        VERSION: ${{ inputs.version }}
+      run: |
+        if ! jq -e --arg v "${VERSION}" '.postgres.versions | map(.version) | index($v)' test/source_versions.json > /dev/null; then
+          echo "::error::PostgreSQL ${VERSION} is not a supported version; use one of: $(jq -r '[.postgres.versions[].version] | join(", ")' test/source_versions.json)"
+          exit 1
+        fi
+
     - name: Start PostgreSQL for CH-benCH
       shell: bash
+      env:
+        IMAGE: postgres:${{ inputs.version }}
       run: |
         docker run -d --name chbench-pg \
           -e POSTGRES_USER=bench -e POSTGRES_PASSWORD=bench -e POSTGRES_DB=chbench \
           -p 5432:5432 \
           --shm-size=4g \
-          postgres:16 \
+          "${IMAGE}" \
           -c max_connections=200 \
           -c wal_level=logical \
           -c synchronous_commit=off \
@@ -26,8 +47,12 @@ runs:
     - name: Wait for CH-benCH PostgreSQL
       shell: bash
       run: |
+        # Probe over TCP, as the CH-benCH clients connect. The image's entrypoint
+        # first runs a temporary server on the Unix socket only, then stops it and
+        # starts the real one, so a Unix-socket probe can pass before the server
+        # the clients reach is listening.
         for _ in {1..30}; do
-          if docker exec chbench-pg pg_isready -U bench > /dev/null 2>&1; then
+          if docker exec chbench-pg pg_isready -h 127.0.0.1 -U bench > /dev/null 2>&1; then
             echo "PostgreSQL is ready"
             exit 0
           fi

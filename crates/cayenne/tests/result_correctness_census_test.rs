@@ -101,6 +101,57 @@ const LANE_LOAD_MODES: &[(&str, &str, &[&str])] = &[
 /// Every (suite, engine) lane not named in `LANE_LOAD_MODES` loads one way.
 const DEFAULT_LOAD_MODES: &[&str] = &["full"];
 
+/// Layouts each engine's lane loads Cayenne under per suite, besides Cayenne's
+/// default (`support::CayenneLayout`, on the keys in `test_framework::layout`).
+/// The same query compared under another layout exercises another write and
+/// scan path: a keyed table, secondary indexes, a sort or clustering order.
+///
+/// **Maintained by hand against the test binaries** (`support::with_layouts`
+/// calls), like `LANE_LOAD_MODES`. The DuckDB lane runs Cayenne's default only.
+const LANE_LAYOUTS: &[(&str, &str, &[&str])] = &[
+    (
+        "tpch",
+        "sqlite",
+        &["primary_key,indexes,sort", "primary_key,cluster"],
+    ),
+    (
+        "tpcds",
+        "sqlite",
+        &["primary_key,indexes,sort", "primary_key,cluster"],
+    ),
+    ("clickbench", "sqlite", &["indexes,sort", "cluster"]),
+    (
+        "tpch",
+        "chdb",
+        &["primary_key,indexes,sort", "primary_key,cluster"],
+    ),
+    (
+        "tpcds",
+        "chdb",
+        &["primary_key,indexes,sort", "primary_key,cluster"],
+    ),
+    ("clickbench", "chdb", &["indexes,sort", "cluster"]),
+    (
+        "chbench",
+        "chdb",
+        &["primary_key,indexes,sort", "primary_key,cluster"],
+    ),
+];
+
+/// The layouts a lane loads under: Cayenne's default, then `LANE_LAYOUTS`'.
+fn layouts_for(suite: &str, engine: &str) -> Vec<&'static str> {
+    std::iter::once("default")
+        .chain(
+            LANE_LAYOUTS
+                .iter()
+                .find(|(s, e, _)| *s == suite && *e == engine)
+                .map_or(&[][..], |(_, _, layouts)| *layouts)
+                .iter()
+                .copied(),
+        )
+        .collect()
+}
+
 fn load_modes_for(suite: &str, engine: &str) -> &'static [&'static str] {
     LANE_LOAD_MODES
         .iter()
@@ -263,6 +314,37 @@ fn print_comparison_cell_census() {
     println!("| **total** | | **{flat_cells_total}** | **{mode_cells_total}** |");
     println!(
         "\n> Load modes come from a hand-maintained table in this file, not the\n> inventory. Only CH-benCHmark runs full/append/changes today, on the DuckDB\n> and chDB lanes; every other lane loads one way, so the two totals differ\n> only by those two.\n"
+    );
+
+    // Layout is a third dimension the inventory does not model.
+    println!("\n### Layout cells\n");
+    println!("| suite | layouts | query x engine | query x engine x layout |");
+    println!("|---|---|---|---|");
+    let mut layout_cells_total = 0usize;
+    for (suite, engines) in &by_suite {
+        let mut flat = 0usize;
+        let mut with_layouts = 0usize;
+        let mut described = Vec::new();
+        for engine in ENGINES {
+            let compared = engines.get(engine).map_or(0, |c| c.compared);
+            let layouts = layouts_for(suite, engine);
+            flat += compared;
+            with_layouts += compared * layouts.len();
+            if layouts.len() > 1 {
+                described.push(format!("{engine} {}", layouts.join(" / ")));
+            }
+        }
+        layout_cells_total += with_layouts;
+        let layouts = if described.is_empty() {
+            "default".to_string()
+        } else {
+            described.join("; ")
+        };
+        println!("| {suite} | {layouts} | {flat} | {with_layouts} |");
+    }
+    println!("| **total** | | **{flat_cells_total}** | **{layout_cells_total}** |");
+    println!(
+        "\n> Layouts come from a hand-maintained table in this file. The SQLite and\n> chDB lanes reload TPC-H, TPC-DS and ClickBench, and the chDB lane CH-benCH,\n> under two layouts besides Cayenne's default; every other lane uses the default.\n"
     );
 
     // Row order is a third thing a cell can check. Content compared as a multiset

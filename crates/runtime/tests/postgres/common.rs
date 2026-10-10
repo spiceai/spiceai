@@ -24,10 +24,18 @@ use secrecy::SecretString;
 use tokio_postgres::NoTls;
 use tracing::instrument;
 
+use test_framework::source_versions::{Source, source_image};
+
 use crate::docker::{ContainerRunnerBuilder, RunningContainer, wait_for_tcp_port};
 
 pub const PG_PASSWORD: &str = "runtime-integration-test-pw";
-const PG_IMAGE: &str = "docker.io/library/postgres:latest";
+
+/// The container health check. Over TCP, because the image's entrypoint first
+/// runs a temporary server for its init scripts that listens only on the Unix
+/// socket and reports ready, then shuts it down and starts the real one: a
+/// socket probe can pass in that gap, while a test connecting over the published
+/// port reaches nothing yet and sees "connection closed".
+const PG_READY_PROBE: &str = "pg_isready -h 127.0.0.1 -U postgres";
 const PG_DOCKER_CONTAINER: &str = "runtime-integration-test-postgres";
 const PG_CONTAINER_START_TIMEOUT: Duration = Duration::from_mins(3);
 const PG_HOST_PORT_READY_TIMEOUT: Duration = Duration::from_mins(1);
@@ -75,14 +83,11 @@ pub async fn connect(port: u16) -> Result<tokio_postgres::Client, anyhow::Error>
 #[instrument]
 pub async fn start_postgres_docker_container() -> Result<RunningContainer, anyhow::Error> {
     let running_container = ContainerRunnerBuilder::new(PG_DOCKER_CONTAINER)
-        .image(PG_IMAGE.to_string())
+        .image(source_image(Source::Postgres)?)
         .publish_port(5432)
         .add_env_var("POSTGRES_PASSWORD", PG_PASSWORD)
         .healthcheck(HealthConfig {
-            test: Some(vec![
-                "CMD-SHELL".to_string(),
-                "pg_isready -U postgres".to_string(),
-            ]),
+            test: Some(vec!["CMD-SHELL".to_string(), PG_READY_PROBE.to_string()]),
             interval: Some(1_000_000_000), // 1s
             timeout: Some(5_000_000_000),  // 5s
             retries: Some(60),
@@ -109,7 +114,7 @@ pub async fn start_postgres_docker_container() -> Result<RunningContainer, anyho
 pub async fn start_postgres_docker_container_with_logical_wal()
 -> Result<RunningContainer, anyhow::Error> {
     let running_container = ContainerRunnerBuilder::new(&format!("{PG_DOCKER_CONTAINER}-repl"))
-        .image(PG_IMAGE.to_string())
+        .image(source_image(Source::Postgres)?)
         .publish_port(5432)
         .add_env_var("POSTGRES_PASSWORD", PG_PASSWORD)
         .command([
@@ -122,10 +127,7 @@ pub async fn start_postgres_docker_container_with_logical_wal()
             "max_wal_senders=10",
         ])
         .healthcheck(HealthConfig {
-            test: Some(vec![
-                "CMD-SHELL".to_string(),
-                "pg_isready -U postgres".to_string(),
-            ]),
+            test: Some(vec!["CMD-SHELL".to_string(), PG_READY_PROBE.to_string()]),
             interval: Some(1_000_000_000),
             timeout: Some(5_000_000_000),
             retries: Some(60),

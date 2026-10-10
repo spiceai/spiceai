@@ -1,0 +1,35 @@
+# CH-benCH SF1 under acceleration layouts (testoperator --layout, keys from
+# test_framework::layout). The HTAP run checks each layout against the
+# PostgreSQL source after the CDC stream drains; the bench run validates the
+# full-refresh pod against its unaccelerated __test_reference.* clones. These
+# pods declare every primary key already, so no layout adds one; the sorted,
+# timed and partitioned columns include o_carrier_id and ol_delivery_d, which
+# the OLTP workload moves from NULL to a value.
+schedule: weekly
+tests:
+  htap:
+    spicepod_path: accelerated/postgres-cayenne[file].yaml
+    runner_type: spiceai-dev-large-runners
+    scale_factor: 1
+    duration: 1800
+    ready_wait: 60
+    rate: 5000
+    layouts:
+      - indexes
+      - sort
+      - cluster
+      - time_column
+      - partition
+      - indexes,sort,time_column
+      - indexes,cluster,time_column,partition
+  bench:
+    spicepod_path: accelerated/postgres-cayenne[file]-full-refresh.yaml
+    query_set: chbench
+    runner_type: spiceai-dev-large-runners
+    scale_factor: 1
+    ready_wait: 300
+    validate_results: true
+    layouts:
+      - indexes,sort,time_column
+      - cluster,partition
+      - indexes,cluster,time_column,partition

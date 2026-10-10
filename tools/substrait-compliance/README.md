@@ -1,10 +1,11 @@
 # Substrait compliance harness
 
 Measures [IBM/substrait-compliance](https://github.com/IBM/substrait-compliance)
-TPC-H pass rate against the Spice `DataFusion` fork (Mode A) and sketches the
-product path through FlightSQL `CommandStatementSubstraitPlan` (Mode B).
-Mode A runs the suite's 22 plans over its own SF 0.01 data, or at any
-`--scale-factor` over tables the harness generates; CI runs SF 1.
+TPC-H pass rate against the Spice `DataFusion` fork (Mode A) and through the
+product path, `spiced`'s FlightSQL `CommandStatementSubstraitPlan` endpoint over
+accelerated datasets (Mode B). Mode A runs the suite's 22 plans over its own
+SF 0.01 data, or at any `--scale-factor` over tables the harness generates; CI
+runs SF 1. Mode B serves generated tables through `spiced`.
 
 This is a **DataFusion consumer baseline**. CI (every merge-queue entry,
 pushes, and nightly) is report-only on pass rate: it does not fail the
@@ -65,11 +66,20 @@ Single query: add `--query q01`. On Apple Silicon an SF 1 run takes about
 11 s in a debug build (5 s to generate, 6 s for the 22 queries) and peaks at
 3.1 GB RSS.
 
-Mode B (encodes the FlightSQL command; does not contact `spiced`). Each
-mode defaults to its own report paths, `results/<mode>-tpch.{json,csv}`:
+Mode B, against a `spiced` binary. Each mode defaults to its own report paths,
+`results/<mode>-tpch.{json,csv}`:
 
 ```bash
-cargo run -p spice-substrait-compliance -- --mode mode-b
+cargo run -p spice-substrait-compliance -- --mode mode-b --scale-factor 1 \
+  --spiced-path ~/.spice/bin/spiced \
+  --acceleration-engine cayenne --acceleration-mode file --iterations 3
+
+# Every layout of one engine, held to Mode A and then to the default layout,
+# as CI runs it:
+tools/substrait-compliance/scripts/run-mode-b.sh \
+  target/debug/spice-substrait-compliance ~/.spice/bin/spiced \
+  cayenne file tools/substrait-compliance/results/mode-b \
+  primary_key indexes primary_key,indexes
 ```
 
 ## Mode A
@@ -144,21 +154,35 @@ queries that read no generated text equals the SF 1 answers in
 `crates/test-framework/src/queries/validation/tpch`, and q02, q10, q13, q15
 and q20 equal the TPC's published SF 1 answers (`dbgen/answers`).
 
-## Mode B (stub)
+## Mode B
 
-Product path for any CI we keep long-term.
+The product path. The harness generates the TPC-H tables with `tpchgen`
+(`--scale-factor` is required), writes them as parquet, and starts `spiced` on a
+Spicepod that serves each one as a dataset: accelerated with
+`--acceleration-engine` (`cayenne`, `duckdb`, `arrow`, `sqlite`, …) in
+`--acceleration-mode` (`file` or `memory`), or federated from the parquet files
+with `--acceleration-engine none`. `--layout` applies an acceleration layout to
+every dataset, the same as `testoperator --layout`: features from
+`primary_key`, `indexes`, `sort`, `cluster`, `time_column` and `partition`,
+joined by commas, keyed from `crates/test-framework/src/layout/tpch.rs`. A
+federated run refuses `--acceleration-mode` and `--layout`, which it could not
+apply.
 
-1. Start `spiced` with a Spicepod that mounts the IBM CSVs as datasets
-   whose names match the plans (`LINEITEM`, …).
-2. Wrap plan bytes in `arrow_flight::sql::CommandStatementSubstraitPlan`
-   (`mode_b::command_statement_substrait_plan`).
-3. `GetFlightInfo(FlightDescriptor::new_cmd(cmd.as_any().encode_to_vec()))`.
-4. `DoGet` the ticket; compare batches with `compare.rs`.
+Each plan goes to `spiced` as a FlightSQL `CommandStatementSubstraitPlan`
+(`GetFlightInfo`, then `DoGet` for each endpoint;
+`crates/runtime/src/flight/flightsql/statement_substrait_plan.rs` serves it),
+and the rows are compared with the same goldens as Mode A. Spice registers
+datasets under lowercase names and the suite's Isthmus plans read uppercase
+ones, so the harness lowercases each plan's read names (`src/plan_names.rs`)
+and writes the tables' columns in lowercase; nothing else in the plan changes.
 
-Server: `crates/runtime/src/flight/flightsql/statement_substrait_plan.rs`.
-
-Open work: catalog mapping from `spice.public.lineitem` onto unqualified
-Isthmus names; `spiced` bring-up in this harness; auth.
+`--iterations N` runs every plan N times and compares each execution, so an
+answer that changes once a cache or an index is warm fails the case.
+`--baseline <report.json>` fails the run (exit 1) when a case that passed in
+that report does not pass here, and refuses a baseline that passed none of the
+selected cases, which would compare nothing. `scripts/run-mode-b.sh` chains the
+two baselines for one engine: Mode A over the same tables, then the default
+layout, then each layout against the default.
 
 ## CI
 
@@ -171,6 +195,14 @@ workspace. Per-query FAIL/ERROR exit 0; a harness/build crash fails the job
 (no `continue-on-error`). Uploads the JSON and CSV reports as an artifact.
 The job is not in `REQUIRED_CHECKS`, so the queue does not wait on it. Do
 not gate merge on pass rate until a threshold is set from this baseline.
+
+The same workflow runs Mode B nightly and on `workflow_dispatch`, one job per
+acceleration engine (Cayenne file and memory, DuckDB file and memory, Arrow,
+SQLite, and federated parquet), against the newest trunk `spiced` that
+`setup-spiced` finds. Each job runs `scripts/run-mode-b.sh` with the layouts
+that engine's TPC-H SF 1 testoperator runs take, three executions per plan, and
+fails when a case regresses against its baseline. The jobs run one at a time,
+since each starts `spiced` on its default ports.
 
 ## License
 
