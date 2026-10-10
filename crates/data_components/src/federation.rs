@@ -372,9 +372,10 @@ mod tests {
             .lines()
             .find(|line| line.contains("SqlExec") || line.contains("VirtualExecutionPlan"))
             .unwrap_or_else(|| panic!("expected a remote scan in:\n{rendered}"));
-        line.split_once("sql=")
-            .map(|(_, sql)| sql.trim().to_string())
-            .unwrap_or_else(|| panic!("expected the scan to render its SQL: {line}"))
+        line.split_once("sql=").map_or_else(
+            || panic!("expected the scan to render its SQL: {line}"),
+            |(_, sql)| sql.trim().to_string(),
+        )
     }
 
     /// Regression test for the filter half of #13664: a Spice-only function in a
