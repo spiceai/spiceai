@@ -16,17 +16,19 @@ limitations under the License.
 
 use std::{collections::HashMap, collections::HashSet, sync::Arc};
 
+use tokio_util::sync::CancellationToken;
+
 use crate::{
     AcceleratorEngineNotAvailableSnafu, AcceleratorInitializationFailedSnafu, LogErrors, Result,
     Runtime, UnableToAttachViewSnafu,
     component::view::{View, ViewBuilder},
-    datafusion::DeferredRefreshOutcome,
+    datafusion::{DeferredRefreshOutcome, resolve_table_reference},
     secrets::Secrets,
     status, view,
 };
 use app::App;
 use datafusion::{
-    common::TableReference,
+    common::{ResolvedTableReference, TableReference},
     sql::{parser::DFParser, sqlparser::dialect::PostgreSqlDialect},
 };
 #[cfg(feature = "duckdb")]
@@ -101,7 +103,22 @@ fn order_views_by_dependencies(validated_views: &[ValidatedView]) -> Option<Vec<
 }
 
 impl Runtime {
-    pub(crate) fn load_views(self: Arc<Self>, app: &Arc<App>) {
+    /// Loads the startup views. Each view is registered as soon as the datasets
+    /// and views it reads from have finished loading, so a dataset that keeps
+    /// failing holds back only the views that depend on it.
+    ///
+    /// `dataset_done` maps each startup dataset whose load is running to a token
+    /// cancelled when that load ends. A dependency that is a dataset without an
+    /// entry (it failed accelerator initialization, or is chained deeper behind
+    /// another dataset) is conservatively waited for by waiting on every startup
+    /// dataset, which is what all views did before.
+    ///
+    /// Returns the tasks loading the views.
+    pub(crate) fn load_views(
+        self: Arc<Self>,
+        app: &Arc<App>,
+        dataset_done: &HashMap<ResolvedTableReference, CancellationToken>,
+    ) -> Vec<tokio::task::JoinHandle<()>> {
         // `LogErrors(false)`: `load_datasets` is this function's only caller and it has
         // already validated the same views with `LogErrors(true)` before its snapshot
         // checks, so reporting again here only prints each view's load error, and each
@@ -117,14 +134,90 @@ impl Runtime {
                     .collect()
             });
 
+        let dependencies: HashMap<ResolvedTableReference, Vec<ResolvedTableReference>> =
+            validated_views
+                .iter()
+                .map(|vv| {
+                    (
+                        resolve_table_reference(vv.view.name.clone()),
+                        vv.dependencies
+                            .iter()
+                            .cloned()
+                            .map(resolve_table_reference)
+                            .collect(),
+                    )
+                })
+                .collect();
+        let dataset_names: HashSet<ResolvedTableReference> = app
+            .datasets
+            .iter()
+            .filter_map(|ds| {
+                crate::component::dataset::Dataset::parse_table_reference(&ds.name).ok()
+            })
+            .map(resolve_table_reference)
+            .collect();
+
+        let mut view_done: HashMap<ResolvedTableReference, CancellationToken> = HashMap::new();
+        let mut tasks = Vec::new();
+
         for view in views_in_dependency_order {
-            let runtime = Arc::clone(&self);
-            let secrets = runtime.secrets();
-            if let Err(e) = runtime.load_view(&view, secrets) {
-                let view_name = &view.name;
-                tracing::error!("Unable to load view {view_name}: {e}");
+            let resolved = resolve_table_reference(view.name.clone());
+            let mut waits: Vec<(String, CancellationToken)> = Vec::new();
+            let mut wait_for_all = false;
+            for dep in dependencies.get(&resolved).into_iter().flatten() {
+                if let Some(token) = view_done.get(dep).or_else(|| dataset_done.get(dep)) {
+                    waits.push((dep.to_string(), token.clone()));
+                } else if dataset_names.contains(dep) {
+                    wait_for_all = true;
+                }
             }
+            if wait_for_all {
+                waits.extend(
+                    dataset_done
+                        .iter()
+                        .map(|(name, token)| (name.to_string(), token.clone())),
+                );
+            }
+
+            let done = CancellationToken::new();
+            view_done.insert(resolved, done.clone());
+
+            let runtime = Arc::clone(&self);
+            tasks.push(tokio::spawn(async move {
+                let _done = done.drop_guard();
+                let pending: Vec<String> = waits
+                    .iter()
+                    .filter(|(_, token)| !token.is_cancelled())
+                    .map(|(name, _)| name.clone())
+                    .sorted()
+                    .dedup()
+                    .collect();
+                if !pending.is_empty() {
+                    let view_name = &view.name;
+                    tracing::info!(
+                        "View {view_name} is waiting for its dependencies to load: {}",
+                        pending.join(", ")
+                    );
+                    runtime
+                        .status
+                        .update_view(&view.name, status::ComponentStatus::Initializing);
+                    let shutdown = runtime.status.shutdown_token();
+                    tokio::select! {
+                        () = futures::future::join_all(
+                            waits.iter().map(|(_, token)| token.cancelled()),
+                        ) => {}
+                        () = shutdown.cancelled() => return,
+                    }
+                }
+                let secrets = runtime.secrets();
+                if let Err(e) = runtime.load_view(&view, secrets) {
+                    let view_name = &view.name;
+                    tracing::error!("Unable to load view {view_name}: {e}");
+                }
+            }));
         }
+
+        tasks
     }
 
     /// Returns a list of valid views from the given App, with SQL validated and dependencies extracted.

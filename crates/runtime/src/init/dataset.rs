@@ -77,6 +77,7 @@ use runtime_metrics::{self as metrics, components::register_component_metric};
 use runtime_table::accelerated::checkpoint_primary_key::records_acceleration_primary_key;
 use snafu::prelude::*;
 use tokio::sync::Semaphore;
+use tokio_util::sync::CancellationToken;
 use util::{RetryError, fibonacci_backoff::FibonacciBackoffBuilder, retry};
 use util::{error_spaced, warn_spaced};
 
@@ -394,11 +395,23 @@ impl Runtime {
         // Each `localpod` dataset loads after the dataset it reads from, and a `localpod`
         // dataset reading from another `localpod` dataset loads after that one, so every chain
         // hangs off the load of a non-`localpod` dataset.
+        // Startup datasets chained behind a parent's load, with the parent they
+        // finish with, and the done-token of each such parent.
+        let mut localpod_children: Vec<(ResolvedTableReference, ResolvedTableReference)> =
+            Vec::new();
+        let mut parent_tokens: HashMap<ResolvedTableReference, CancellationToken> = HashMap::new();
         let roots: Vec<_> = localpod_by_parent
             .extract_if(|parent, _| dataset_futures.contains_key(parent))
             .collect();
         for (parent, children) in roots {
             let parent_background = background_roots.contains(&parent);
+            if !parent_background {
+                parent_tokens.entry(parent.clone()).or_default();
+                for (ds, _) in &children {
+                    localpod_children
+                        .push((resolve_table_reference(ds.name.clone()), parent.clone()));
+                }
+            }
             // Signalled once the parent's load ends, however it ends, so a chain running in
             // the background starts only after its parent.
             let parent_done = tokio_util::sync::CancellationToken::new();
@@ -465,13 +478,32 @@ impl Runtime {
         let mut spawned_tasks = vec![];
         let dispatched = dataset_futures.len() + background_chains.len();
 
+        // Signalled when a startup dataset's load task ends, however it ends, so
+        // each view waits only on the datasets it reads from rather than on every
+        // dataset in the Spicepod: one dataset still retrying must not keep views
+        // over healthy datasets from registering.
+        let mut dataset_done: HashMap<ResolvedTableReference, CancellationToken> = HashMap::new();
+        for (child, parent) in &localpod_children {
+            if let Some(token) = parent_tokens.get(parent) {
+                dataset_done.insert(child.clone(), token.clone());
+            }
+        }
         for (resolved, (ds, dataset_load_future)) in dataset_futures {
+            let background = background_roots.contains(&resolved);
+            let done = if background {
+                None
+            } else {
+                let token = parent_tokens.get(&resolved).cloned().unwrap_or_default();
+                dataset_done.insert(resolved.clone(), token.clone());
+                Some(token)
+            };
             let handle = tokio::spawn(async move {
+                let _done = done.map(CancellationToken::drop_guard);
                 tracing::info!("Dataset {ds} initializing...");
                 dataset_load_future.await;
             });
             // A reader's first publication is independent of component startup.
-            if !background_roots.contains(&resolved) {
+            if !background {
                 spawned_tasks.push(handle);
             }
         }
@@ -529,10 +561,13 @@ impl Runtime {
             });
         }
 
-        let _ = join_all(spawned_tasks).await;
+        // Views are loaded as soon as the datasets each one reads from have loaded,
+        // not after every dataset has: a dataset that keeps failing must only hold
+        // back the views that depend on it.
+        let view_tasks = Arc::clone(&self).load_views(&app, &dataset_done);
 
-        // After all datasets have loaded, load the views.
-        Arc::clone(&self).load_views(&app);
+        let _ = join_all(spawned_tasks).await;
+        let _ = join_all(view_tasks).await;
     }
 
     /// Returns a list of valid datasets from the given App, skipping any that fail to parse and logging an error for them.
