@@ -27,11 +27,11 @@ limitations under the License.
 //! earlier version a durable write inlined into the metastore while other keys
 //! sat in the mem tier: that spill flushes both.
 //!
-//! Its own test binary with a single test: the budget is process-global, so
-//! every backend and case runs in sequence rather than on parallel test
-//! threads.
+//! One test rather than one per backend and case: the budget is process-global,
+//! so they run in sequence. It needs a process of its own, which nextest gives
+//! every test (see `common::require_process_per_test`).
 
-mod common;
+use crate::common;
 
 use std::ops::RangeInclusive;
 use std::sync::Arc;
@@ -53,6 +53,9 @@ type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
 // race on the process-global budget.
 #[test]
 fn budget_fallback_upsert_supersedes_mem_tier_rows() -> Result<(), String> {
+    common::require_process_per_test(
+        "this test replaces Cayenne's process-global memory-tier budget",
+    );
     common::run_with_backend_blocking(
         common::BackendType::Sqlite,
         budget_fallback_upsert_supersedes_mem_tier_rows_impl,

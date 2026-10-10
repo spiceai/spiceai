@@ -28,7 +28,7 @@ limitations under the License.
 //! answers are re-checked too: a pruner that skips too much is worse than one
 //! that skips nothing.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 

@@ -42,7 +42,7 @@ limitations under the License.
 
 #![allow(clippy::expect_used)]
 
-mod common;
+use crate::common;
 
 // `SplitMix64` so the generated data is identical across arms and across runs.
 use common::lookup_index::SplitMix64;

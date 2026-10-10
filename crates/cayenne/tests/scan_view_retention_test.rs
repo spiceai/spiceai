@@ -16,7 +16,7 @@ limitations under the License.
 
 //! Scan-view selection while file-based retention holds the listing fence.
 
-mod common;
+use crate::common;
 
 use std::fmt;
 use std::sync::Arc;

@@ -25,7 +25,7 @@ limitations under the License.
 
 #![expect(clippy::expect_used, reason = "tests use expect for assertion context")]
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 

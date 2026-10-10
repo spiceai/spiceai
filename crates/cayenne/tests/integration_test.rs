@@ -18,7 +18,7 @@ limitations under the License.
 
 //! Simple integration test for Cayenne with Vortex
 
-mod common;
+use crate::common;
 
 use arrow::array::{Array, Int64Array, StringArray};
 

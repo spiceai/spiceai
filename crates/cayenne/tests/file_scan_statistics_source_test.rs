@@ -26,7 +26,7 @@ limitations under the License.
 //! decided by which source happened to serve — which changes across a restart and
 //! across concurrent scans of one plan (regression test for #13829).
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 
