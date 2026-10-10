@@ -6490,8 +6490,7 @@ impl CayenneTableProvider {
     /// write phase that outlives the GC grace could have its not-yet-committed
     /// objects swept (`NotFound` at commit).
     pub async fn run_cold_tier_gc_tick(&self) {
-        if self.is_maintenance_closed() || !self.table_metadata.vortex_config.cold_tier_enabled()
-        {
+        if self.is_maintenance_closed() || !self.table_metadata.vortex_config.cold_tier_enabled() {
             return;
         }
         let Some(cold_location) = self.table_metadata.vortex_config.cold_tier_location.clone()
@@ -43732,8 +43731,11 @@ mod tests {
         {
             let _no_merge = provider.compaction_lock.write().await;
             for i in 0..3i64 {
-                insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[i], &[i * 10]))
-                    .await;
+                insert_batch(
+                    &provider,
+                    id_value_batch(Arc::clone(&schema), &[i], &[i * 10]),
+                )
+                .await;
             }
             provider
                 .flush_pending_maintenance()
@@ -43897,7 +43899,9 @@ mod tests {
             let _pass = rewriting.compaction_lock.write().await;
             rewriting.rewrite_current_snapshot_for_compaction().await
         });
-        parked_rx.await.expect("the rewrite parks before its commit");
+        parked_rx
+            .await
+            .expect("the rewrite parks before its commit");
 
         let quiescing = provider.clone_for_write();
         let mut quiesce = Box::pin(async move { quiescing.quiesce().await });
@@ -58636,7 +58640,10 @@ mod tests {
             .await;
             install_int64_deletes(&provider, &[(0, 15)]);
             assert!(
-                provider.run_compaction_trigger().await.expect("trigger runs"),
+                provider
+                    .run_compaction_trigger()
+                    .await
+                    .expect("trigger runs"),
                 "trigger {trigger}: the bake reports work"
             );
             let left = provider.protected_snapshots.load_full().len();
@@ -58650,7 +58657,12 @@ mod tests {
                 0,
                 "trigger {trigger}: the bake pruned the tombstone its prefix applied"
             );
-            let pairs = collect_id_value_pairs(&ctx, &provider, &format!("bake_bounds_protected_{trigger}")).await;
+            let pairs = collect_id_value_pairs(
+                &ctx,
+                &provider,
+                &format!("bake_bounds_protected_{trigger}"),
+            )
+            .await;
             assert!(
                 !pairs.iter().any(|(id, _)| *id == 0),
                 "trigger {trigger}: key 0 stays deleted after the bake, got {pairs:?}"

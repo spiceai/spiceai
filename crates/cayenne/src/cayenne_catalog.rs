@@ -1004,11 +1004,9 @@ impl CayenneCatalog {
                     params: vec![],
                 })
                 .await?;
-            let registered = usize::try_from(i64::from_value(metastore_value_at(
-                &count_values,
-                0,
-            )?)?)
-            .unwrap_or(0);
+            let registered =
+                usize::try_from(i64::from_value(metastore_value_at(&count_values, 0)?)?)
+                    .unwrap_or(0);
             if registered != folded {
                 return Err(CatalogError::ProtectedSnapshotsReplaced {
                     table_id: table_id.to_string(),

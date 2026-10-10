@@ -178,18 +178,19 @@ async fn drain_quiesces_the_cayenne_accelerators_maintenance() {
         ) as Arc<dyn MetadataCatalog>;
         catalog.init().await.expect("catalog initialized");
         let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
-        let cayenne = CayenneTableProviderBuilder::new(catalog, SessionContext::new().runtime_env())
-            .create(CreateTableOptions {
-                table_name: "drain_cayenne".to_string(),
-                schema: Arc::clone(&schema),
-                primary_key: vec![],
-                on_conflict: None,
-                base_path: temp_dir.path().join("data").display().to_string(),
-                partition_column: None,
-                vortex_config: VortexConfig::default(),
-            })
-            .await
-            .expect("Cayenne table");
+        let cayenne =
+            CayenneTableProviderBuilder::new(catalog, SessionContext::new().runtime_env())
+                .create(CreateTableOptions {
+                    table_name: "drain_cayenne".to_string(),
+                    schema: Arc::clone(&schema),
+                    primary_key: vec![],
+                    on_conflict: None,
+                    base_path: temp_dir.path().join("data").display().to_string(),
+                    partition_column: None,
+                    vortex_config: VortexConfig::default(),
+                })
+                .await
+                .expect("Cayenne table");
         let observer = cayenne.clone_for_write_operations();
         let accelerator: Arc<dyn TableProvider> = Arc::new(cayenne);
         let source = Arc::new(
