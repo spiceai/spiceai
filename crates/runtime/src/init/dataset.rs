@@ -1547,7 +1547,7 @@ impl Runtime {
                 let warning = if acceleration.engine == Engine::Cayenne {
                     cayenne_on_conflict_warning(&dataset_name, acceleration, rule)
                 } else {
-                    deprecated_on_conflict_warning(&dataset_name)
+                    deprecated_on_conflict_warning(&dataset_name, acceleration, refresh_mode)
                 };
                 tracing::warn!("{warning}");
             }
@@ -3274,9 +3274,20 @@ fn cayenne_on_conflict_warning(
 }
 
 /// The warning for a dataset on another accelerator that sets `on_conflict`.
-fn deprecated_on_conflict_warning(dataset_name: &str) -> String {
+fn deprecated_on_conflict_warning(
+    dataset_name: &str,
+    acceleration: &Acceleration,
+    refresh_mode: RefreshMode,
+) -> String {
+    let persistence = if matches!(acceleration.mode, Mode::Memory | Mode::FileCreate)
+        && refresh_mode == RefreshMode::Changes
+    {
+        " Set `mode: file` to preserve CDC data across restarts and resume replication."
+    } else {
+        ""
+    };
     format!(
-        "Dataset '{dataset_name}' sets `acceleration.on_conflict`, which is deprecated and removed in 3.0. Use `engine: cayenne` to keep one row per primary key without it."
+        "Dataset '{dataset_name}' sets `acceleration.on_conflict`, which is deprecated and removed in 3.0. Use `engine: cayenne` to keep one row per primary key without it.{persistence}"
     )
 }
 
@@ -3876,10 +3887,48 @@ mod tests {
 
         #[test]
         fn other_engines_are_told_on_conflict_is_removed_in_3_0() {
-            assert_eq!(
-                deprecated_on_conflict_warning("orders"),
-                "Dataset 'orders' sets `acceleration.on_conflict`, which is deprecated and removed in 3.0. Use `engine: cayenne` to keep one row per primary key without it."
-            );
+            for engine in ["arrow", "duckdb"] {
+                let mut acceleration = acceleration(engine, Some("upsert"));
+                for (mode, refresh_mode) in [
+                    (Mode::File, None),
+                    (Mode::File, Some(RefreshMode::Changes)),
+                    (Mode::FileUpdate, None),
+                    (Mode::FileUpdate, Some(RefreshMode::Changes)),
+                    (Mode::Memory, None),
+                    (Mode::Memory, Some(RefreshMode::Full)),
+                    (Mode::Memory, Some(RefreshMode::Append)),
+                ] {
+                    acceleration.mode = mode;
+                    acceleration.refresh_mode = refresh_mode;
+                    assert_eq!(
+                        deprecated_on_conflict_warning(
+                            "orders",
+                            &acceleration,
+                            refresh_mode.unwrap_or(RefreshMode::Full),
+                        ),
+                        "Dataset 'orders' sets `acceleration.on_conflict`, which is deprecated and removed in 3.0. Use `engine: cayenne` to keep one row per primary key without it."
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn changes_recommend_persistent_cayenne() {
+            let mut acceleration = acceleration("duckdb", Some("upsert"));
+            assert_eq!(acceleration.mode, Mode::Memory);
+            for (mode, refresh_mode) in [
+                (Mode::Memory, None),
+                (Mode::Memory, Some(RefreshMode::Changes)),
+                (Mode::FileCreate, None),
+                (Mode::FileCreate, Some(RefreshMode::Changes)),
+            ] {
+                acceleration.mode = mode;
+                acceleration.refresh_mode = refresh_mode;
+                assert_eq!(
+                    deprecated_on_conflict_warning("orders", &acceleration, RefreshMode::Changes),
+                    "Dataset 'orders' sets `acceleration.on_conflict`, which is deprecated and removed in 3.0. Use `engine: cayenne` to keep one row per primary key without it. Set `mode: file` to preserve CDC data across restarts and resume replication."
+                );
+            }
         }
     }
 
