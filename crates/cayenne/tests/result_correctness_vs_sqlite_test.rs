@@ -35,8 +35,7 @@
 #![allow(clippy::format_push_string)]
 #![allow(clippy::map_unwrap_or)]
 
-#[path = "correctness/support/mod.rs"]
-mod support;
+use crate::support;
 
 use std::path::PathBuf;
 

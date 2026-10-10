@@ -32,7 +32,7 @@ limitations under the License.
 //! as oversized, and one partition gives both join inputs the same partition
 //! count, which the rewrite requires.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 

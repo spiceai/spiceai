@@ -24,7 +24,7 @@ limitations under the License.
 //! accurate — both surfaced via `CayenneTableProvider::optimizer_table_statistics()`
 //! and `DataFusion`'s `TableProvider::statistics()` optimizer metadata hook.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 

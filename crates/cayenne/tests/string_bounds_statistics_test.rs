@@ -28,7 +28,7 @@ limitations under the License.
 //! the column. A query that filters without projecting it, such as `COUNT(*)`,
 //! plans regardless.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 

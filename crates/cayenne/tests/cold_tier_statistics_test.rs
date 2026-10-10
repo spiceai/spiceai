@@ -22,7 +22,7 @@ limitations under the License.
 //! answer, not a bad plan. These tests pin `TableProvider::statistics` to the
 //! count a real scan returns, on both sides of a promotion.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 

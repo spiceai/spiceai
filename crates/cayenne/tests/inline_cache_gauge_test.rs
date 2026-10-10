@@ -36,6 +36,10 @@ limitations under the License.
 #![cfg(not(windows))]
 #![allow(clippy::expect_used)]
 
+#[expect(
+    dead_code,
+    reason = "shared helpers for every Cayenne test binary; this one uses only some"
+)]
 mod common;
 
 use std::alloc::{GlobalAlloc, Layout, System};

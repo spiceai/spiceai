@@ -30,7 +30,7 @@ limitations under the License.
 
 #![allow(clippy::expect_used)]
 
-mod common;
+use crate::common;
 
 use arrow::datatypes::{DataType, Field, Schema};
 use cayenne::metadata::{CreateTableOptions, DeleteFile, DeletionType, PartitionMetadata};

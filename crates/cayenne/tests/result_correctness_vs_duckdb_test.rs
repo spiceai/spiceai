@@ -43,8 +43,7 @@
 #![allow(clippy::clone_on_ref_ptr)]
 #![allow(clippy::used_underscore_binding)]
 
-#[path = "correctness/support/mod.rs"]
-mod support;
+use crate::support;
 
 use std::path::{Path, PathBuf};
 

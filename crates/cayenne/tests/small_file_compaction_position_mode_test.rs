@@ -23,7 +23,7 @@ limitations under the License.
 
 #![expect(clippy::expect_used, reason = "test code")]
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 use std::time::Duration;

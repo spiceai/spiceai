@@ -22,7 +22,7 @@ limitations under the License.
 //! These tests work at the API level by calling `delete_from()` directly,
 //! rather than using SQL DELETE statements (which require runtime-level integration).
 
-mod common;
+use crate::common;
 
 use arrow::datatypes::{DataType, Field, Schema};
 

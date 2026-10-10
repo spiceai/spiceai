@@ -29,7 +29,7 @@ limitations under the License.
 //! - Data isolation across nested partitions
 //! - Metadata persistence with composite partition keys
 
-mod common;
+use crate::common;
 
 use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
