@@ -69,6 +69,8 @@ on_zero_results: return_empty
 
 An empty result is a legitimate fact: an order may not exist, a tenant may have no sales, or a filter may match nothing. Conversely, a partial result is not necessarily empty. A recent-only aggregate can produce a nonempty answer while omitting older rows. Zero-result fallback must not be treated as a general completeness guarantee for arbitrary analytical queries.
 
+Do not combine `on_zero_results: use_source` with `retention_sql` or `retention_period` as a way to hide soft-deleted or expired source rows. After retention removes a row from the accelerator, a point lookup for that key is an empty accelerated result, so fallback would otherwise re-read the still-present source row and serve it. Spice applies the inverse of the retention predicate to the fallback scan so an evicted row stays gone: the source evaluates the parts it can push down, and Spice applies the inverse to the rows the source returns. If the inverse cannot be planned against the source's columns, the dataset is refused at load.
+
 Test the exact query shapes the application uses: a point lookup, a filtered list, an aggregate over no rows, and an aggregate over a partially covered interval. Record the plan and source activity so you know which path served each response.
 
 ## 9.7 Measure freshness with a sentinel
