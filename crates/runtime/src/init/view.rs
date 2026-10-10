@@ -237,8 +237,10 @@ impl Runtime {
             let done = view_done.get(&resolved).cloned().unwrap_or_default();
 
             let runtime = Arc::clone(&self);
+            let view_load = self.view_loads.begin(&view.name);
             tasks.push(tokio::spawn(async move {
                 let done = done.drop_guard();
+                let superseded = view_load.token();
                 let pending: Vec<String> = waits
                     .iter()
                     .filter(|(_, token)| !token.is_cancelled())
@@ -261,10 +263,16 @@ impl Runtime {
                             waits.iter().map(|(_, token)| token.cancelled()),
                         ) => {}
                         () = shutdown.cancelled() => return,
+                        () = superseded.cancelled() => return,
                     }
                 }
+                if superseded.is_cancelled() {
+                    return;
+                }
                 let secrets = runtime.secrets();
-                if let Err(e) = runtime.load_view_signalling(&view, secrets, Some(done)) {
+                if let Err(e) =
+                    runtime.load_view_signalling(&view, secrets, Some(done), Some(view_load))
+                {
                     let view_name = &view.name;
                     tracing::error!("Unable to load view {view_name}: {e}");
                 }
@@ -500,7 +508,7 @@ impl Runtime {
     }
 
     fn load_view(self: Arc<Self>, view: &Arc<View>, secrets: Arc<RwLock<Secrets>>) -> Result<()> {
-        self.load_view_signalling(view, secrets, None)
+        self.load_view_signalling(view, secrets, None, None)
     }
 
     /// Like [`Self::load_view`], holding `registered` until the view's registration
@@ -511,6 +519,7 @@ impl Runtime {
         view: &Arc<View>,
         secrets: Arc<RwLock<Secrets>>,
         registered: Option<tokio_util::sync::DropGuard>,
+        startup_load: Option<crate::init::view_loads::ViewLoad>,
     ) -> Result<()> {
         let df = Arc::clone(&self.df);
         let register_task = df
@@ -529,7 +538,25 @@ impl Runtime {
 
         tokio::task::spawn(async move {
             let view_name = view.name.clone();
-            let notifier = register_task.await;
+            // A startup registration superseded by a Spicepod change is aborted
+            // before it can register the replaced definition.
+            let superseded = startup_load
+                .as_ref()
+                .map(crate::init::view_loads::ViewLoad::token);
+            let mut register_task = register_task;
+            let notifier = match superseded {
+                Some(superseded) => tokio::select! {
+                    notifier = &mut register_task => notifier,
+                    () = superseded.cancelled() => {
+                        register_task.abort();
+                        let _ = register_task.await;
+                        tracing::debug!("Startup registration of view '{view_name}' superseded by a Spicepod change.");
+                        return;
+                    }
+                },
+                None => register_task.await,
+            };
+            drop(startup_load);
             drop(registered);
             match notifier {
                 Ok(Some((instance, completion))) => {
@@ -652,6 +679,19 @@ impl Runtime {
             })
             .collect_vec();
 
+        // Stop startup registrations still waiting for views this change replaces
+        // or removes, so they cannot register the old definition afterwards.
+        for name in &views_that_changed {
+            self.view_loads.supersede(name);
+        }
+        for view in &current_app.views {
+            if !new_app.views.iter().any(|v| v.name == view.name)
+                && let Ok(builder) = ViewBuilder::try_from(view.clone())
+            {
+                self.view_loads.supersede(&builder.name);
+            }
+        }
+
         // Remove views that are no longer in the app
         for view in &current_app.views {
             if !new_app.views.iter().any(|v| v.name == view.name) {
@@ -701,6 +741,9 @@ impl Runtime {
         };
 
         for view_name in affected_views_in_order_of_dependencies {
+            // An unchanged view re-applied because a dependency changed is
+            // registered here, so its startup registration must not also run.
+            self.view_loads.supersede(&view_name);
             if let Some(validated_view) =
                 validated_views.iter().find(|vv| vv.view.name == view_name)
             {
