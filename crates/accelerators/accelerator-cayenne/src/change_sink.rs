@@ -20,7 +20,7 @@ limitations under the License.
 mod tests;
 
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use arrow::datatypes::SchemaRef;
 use arrow_tools::record_batch::try_cast_to;
@@ -71,15 +71,16 @@ pub fn provider_schema_evolution(table: &Arc<dyn TableProvider>) -> SchemaEvolut
 
 /// Stop the background maintenance of every Cayenne instance `table` serves
 /// from — the provider itself, each partition of a partitioned table, and the
-/// table an upsert-dedup wrapper writes to — and wait for maintenance they
-/// already started. See `CayenneTableProvider::quiesce`.
-pub async fn quiesce_table_maintenance(table: &Arc<dyn TableProvider>) {
+/// table an upsert-dedup wrapper writes to — and wait, at most `max_wait`, for
+/// maintenance they already started. See `CayenneTableProvider::quiesce`.
+pub async fn quiesce_table_maintenance(table: &Arc<dyn TableProvider>, max_wait: Duration) {
+    let mut instances = Vec::new();
     let mut pending = vec![Arc::clone(table)];
     while let Some(provider) = pending.pop() {
         if let Some(cayenne) =
             find_concrete::<CayenneTableProvider>(provider.as_ref(), LayerWalk::Write)
         {
-            cayenne.quiesce().await;
+            instances.push(cayenne.clone_for_write_operations());
         } else if let Some(partitioned) =
             find_concrete::<PartitionTableProvider>(provider.as_ref(), LayerWalk::Write)
         {
@@ -90,6 +91,12 @@ pub async fn quiesce_table_maintenance(table: &Arc<dyn TableProvider>) {
             pending.push(Arc::clone(dedup.inner()));
         }
     }
+    futures::future::join_all(instances.iter().map(|cayenne| async move {
+        // Past the bound the instance still starts nothing new, and the catalog
+        // refuses a compaction commit whose folded snapshots changed under it.
+        let _ = tokio::time::timeout(max_wait, cayenne.quiesce()).await;
+    }))
+    .await;
 }
 
 struct StorageFenceObserver {

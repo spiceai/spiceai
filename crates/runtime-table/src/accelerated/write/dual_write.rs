@@ -546,29 +546,23 @@ pub fn extract_cayenne_write_target(
 ///
 /// Called when a dataset generation is drained for replacement or removal: the
 /// replacement opens the same table on the same catalog, and nothing in memory
-/// serializes the two instances' maintenance (#11581). The wait is bounded by
-/// `max_wait` per instance so one stuck pass cannot hold the reload; past it the
+/// serializes the two instances' maintenance (#11581). Every instance is
+/// quiesced at once and the wait is bounded by `max_wait`, so neither one stuck
+/// pass nor a table with many partitions can hold the reload; past it an
 /// instance is still closed to new maintenance, and the catalog refuses a
 /// compaction commit whose folded snapshots the replacement changed.
 pub async fn quiesce_cayenne_maintenance(
     table_provider: &Arc<dyn TableProvider>,
     max_wait: std::time::Duration,
 ) {
+    let mut instances = Vec::new();
     let mut pending = vec![Arc::clone(table_provider)];
     while let Some(provider) = pending.pop() {
         if let Some(cayenne) = spice_table::find_concrete::<CayenneTableProvider>(
             provider.as_ref(),
             spice_table::LayerWalk::Write,
         ) {
-            if tokio::time::timeout(max_wait, cayenne.quiesce())
-                .await
-                .is_err()
-            {
-                tracing::debug!(
-                    table = cayenne.table_name(),
-                    "Stopped waiting for the table's in-flight maintenance to finish; it starts no new maintenance"
-                );
-            }
+            instances.push(cayenne.clone_for_write_operations());
         } else if let Some(partitioned) = spice_table::find_concrete::<PartitionTableProvider>(
             provider.as_ref(),
             spice_table::LayerWalk::Write,
@@ -583,6 +577,18 @@ pub async fn quiesce_cayenne_maintenance(
             pending.push(Arc::clone(upsert_dedup.inner()));
         }
     }
+    futures::future::join_all(instances.iter().map(|cayenne| async move {
+        if tokio::time::timeout(max_wait, cayenne.quiesce())
+            .await
+            .is_err()
+        {
+            tracing::debug!(
+                table = cayenne.table_name(),
+                "Stopped waiting for the table's in-flight maintenance to finish; it starts no new maintenance"
+            );
+        }
+    }))
+    .await;
 }
 
 fn spawn_staged_append(
