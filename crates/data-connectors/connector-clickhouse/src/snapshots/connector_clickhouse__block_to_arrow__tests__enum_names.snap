@@ -1,0 +1,11 @@
+---
+source: crates/data-connectors/connector-clickhouse/src/block_to_arrow.rs
+expression: converted(&block)
+---
++---+
+| e |
++---+
+| a |
+| b |
+| a |
++---+

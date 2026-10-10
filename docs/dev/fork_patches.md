@@ -113,7 +113,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [candle-index-select-cu](#candle-and-its-kernel-crates) | `75fc0b689b33a327907d36dd479f7d242640ca71` | `master` |
 | [candle-layer-norm](#candle-and-its-kernel-crates) | `dfdbfbb953ceeb0366e5e3b69f2933204309d3dd` | `main` |
 | [candle-rotary](#candle-and-its-kernel-crates) | `e12f91a6c8beec5373ccec91a5ccad80619cf065` | `main` |
-| [clickhouse-rs](#clickhouse-rs) | `7e98394f44cfa33919ebc5a92c06d5bddba708bf` | tag `0.2.2` |
+| [clickhouse-rs](#clickhouse-rs) | `d93e350575d4be2f56f37d513bfbfc672d128528` | `async-await` |
 | [datafusion](#datafusion) | `7bf101c408b422ed11692518d1dcbcbc109c94db` | `spiceai-55` |
 | [datafusion-ballista](#datafusion-ballista) | `a7c4c58502a16e2181a26fdb8e937ee005807e5e` | `spiceai-55` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `2fc46179fa45b764e8c2996bf04aa58fc652d069` | `spiceai-55` |
@@ -505,13 +505,16 @@ Upstream [64bit/async-openai](https://github.com/64bit/async-openai).
 
 ## clickhouse-rs
 
-Upstream [gengteng/clickhouse-rs](https://github.com/gengteng/clickhouse-rs), pinned
-by tag `0.2.2`.
+Upstream [gengteng/clickhouse-rs](https://github.com/gengteng/clickhouse-rs), branch
+`async-await`.
 
 | Patch | What breaks if it is lost | Loss | Guard |
 |---|---|---|---|
-| `Date32` support — `DateConverter for i32`, `Value`/`ValueRef::Date32`, `FromSql for NaiveDate` (fork commit `7e98394f`, which is the pinned revision itself) | ClickHouse `Date32` columns (dates outside 1970–2149) fail to decode | build (variant) + silent (range) | `crates/data-connectors/connector-clickhouse/src/block_to_arrow.rs::a_date32_value_decodes_the_dates_a_date_column_cannot_hold` for the decode `block_to_arrow` calls and for `Date32` still reporting `SqlType::Date`, which is what selects that arm. The wire half is only reachable against a server — `column::factory`'s `"Date32"` arm is fed from the `pub(crate)` `Block::load`, and `Block::add_column` over `NaiveDate` builds the 16-bit column — so the `Date32` column in `test/scripts/setup-data-clickhouse.sql` guards it end-to-end in the ClickHouse quickstart job |
+| `Date32` support — `DateConverter for i32`, `Value`/`ValueRef::Date32`, `FromSql for NaiveDate` (fork commit `7e98394f`) | ClickHouse `Date32` columns (dates outside 1970–2149) fail to decode | build (variant) + silent (range) | `crates/data-connectors/connector-clickhouse/src/block_to_arrow.rs::a_date32_value_decodes_the_dates_a_date_column_cannot_hold` for the decode `block_to_arrow` calls and for `Date32` still reporting `SqlType::Date`, which is what selects that arm. The wire half is only reachable against a server — `column::factory`'s `"Date32"` arm is fed from the `pub(crate)` `Block::load`, and `Block::add_column` over `NaiveDate` builds the 16-bit column — so the `Date32` column in `test/scripts/setup-data-clickhouse.sql` guards it end-to-end in the ClickHouse quickstart job |
 | `ConnectionError::NoPacketReceived` | A dropped connection surfaces as a less specific error | build | compile-guarded |
+| `LowCardinality(Nullable(T))` decoding — the dictionary is read as plain `T`, with key 0 as NULL | Reading the column misreads the stream: the query fails with a garbage compression method or the process aborts on a huge allocation | silent (crash) | `crates/runtime/tests/clickhouse/mod.rs::clickhouse_reads_every_mapped_type_federated_and_accelerated`, which reads a `LowCardinality(Nullable(String))` column holding a NULL from a real server and asserts every row; only a server produces this wire layout |
+| `Tuple` columns — `SqlType`/`Value`/`ValueRef::Tuple` and `TupleColumnData` | ClickHouse `Tuple` columns fail to decode (`Unsupported column type`) | build (variant) | compile-guarded by `crates/data-connectors/connector-clickhouse/src/block_to_arrow.rs`; `crates/runtime/tests/clickhouse/mod.rs::clickhouse_reads_every_mapped_type_federated_and_accelerated` reads named and unnamed tuples from a real server |
+| `ValueRef::Map` holds its entries as a `Vec` in server order | Map entries lose their order and duplicate keys, and a key type the driver cannot hash (`Date`, `UUID`, `Enum`) panics while decoding | silent (wrong values) + crash | `crates/runtime/tests/clickhouse/mod.rs::clickhouse_reads_every_mapped_type_federated_and_accelerated` reads `{'b': 2, 'a': 1, 'b': 3}` from a real server and asserts all three entries in that order; decoding through a map keyed by entry collapses the duplicate key and fails it on every run |
 
 ## rusqlite and tokio-rusqlite
 
