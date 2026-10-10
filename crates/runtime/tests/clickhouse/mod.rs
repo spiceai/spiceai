@@ -120,6 +120,19 @@ async fn start_clickhouse_docker_container() -> Result<RunningContainer, anyhow:
         .await
 }
 
+/// Each column's name and Arrow type, one per line.
+fn column_types(batches: &[RecordBatch]) -> Result<String, String> {
+    Ok(batches
+        .first()
+        .ok_or("the query returned no batch")?
+        .schema()
+        .fields()
+        .iter()
+        .map(|field| format!("{}: {}", field.name(), field.data_type()))
+        .collect::<Vec<_>>()
+        .join("\n"))
+}
+
 async fn query(rt: &Runtime, sql: &str) -> Result<Vec<RecordBatch>, String> {
     rt.datafusion()
         .query_builder(sql)
@@ -186,15 +199,7 @@ async fn clickhouse_reads_every_mapped_type_federated_and_accelerated() -> Resul
             // NULL is spelled out so it cannot be mistaken for an empty string or list.
             let with_nulls = FormatOptions::default().with_null("NULL");
             let federated = query(&rt, "SELECT * FROM types ORDER BY id").await?;
-            let schema = federated
-                .first()
-                .ok_or("the federated query returned no batch")?
-                .schema()
-                .fields()
-                .iter()
-                .map(|field| format!("{}: {}", field.name(), field.data_type()))
-                .collect::<Vec<_>>()
-                .join("\n");
+            let schema = column_types(&federated)?;
             insta::assert_snapshot!("clickhouse_types_schema", schema);
             let federated = arrow::util::pretty::pretty_format_batches_with_options(&federated, &with_nulls)
                 .map_err(|e| e.to_string())?
@@ -202,8 +207,9 @@ async fn clickhouse_reads_every_mapped_type_federated_and_accelerated() -> Resul
             insta::assert_snapshot!("clickhouse_types_rows", federated);
 
             // The accelerated copy was loaded through the same conversion and is read
-            // back from the accelerator, so it must hold exactly the federated rows.
+            // back from the accelerator, so it must hold exactly the federated types and rows.
             let accelerated = query(&rt, "SELECT * FROM types_accelerated ORDER BY id").await?;
+            assert_eq!(column_types(&accelerated)?, schema);
             let accelerated = arrow::util::pretty::pretty_format_batches_with_options(&accelerated, &with_nulls)
                 .map_err(|e| e.to_string())?
                 .to_string();
