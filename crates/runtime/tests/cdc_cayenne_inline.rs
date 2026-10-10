@@ -192,7 +192,8 @@ async fn make_refresh_task(
     table_name: &str,
 ) -> runtime::accelerated::refresh_task::RefreshTask {
     let federated = Arc::new(FederatedTable::new_unchecked(Arc::clone(&accelerator)));
-    let binding = ChangeSinkContext::new(TableReference::bare(table_name), Arc::clone(&accelerator));
+    let binding =
+        ChangeSinkContext::new(TableReference::bare(table_name), Arc::clone(&accelerator));
     let write_lock = Arc::clone(&binding.write_lock);
     let sink = CayenneAccelerator::new()
         .change_sink(binding, &Handle::current(), 2)
@@ -240,7 +241,8 @@ async fn cdc_into_cayenne_data_inlining_e2e() {
     let task = make_refresh_task(
         Arc::clone(&table) as Arc<dyn TableProvider>,
         "cdc_inline_e2e",
-    ).await;
+    )
+    .await;
     let commits = Arc::new(TokioMutex::new(Vec::new()));
     let stream = make_n_envelopes(N, &commits);
 

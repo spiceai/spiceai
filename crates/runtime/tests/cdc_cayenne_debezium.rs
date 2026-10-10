@@ -251,7 +251,8 @@ async fn make_refresh_task(
     table_name: &str,
 ) -> runtime::accelerated::refresh_task::RefreshTask {
     let federated = Arc::new(FederatedTable::new_unchecked(Arc::clone(&accelerator)));
-    let binding = ChangeSinkContext::new(TableReference::bare(table_name), Arc::clone(&accelerator));
+    let binding =
+        ChangeSinkContext::new(TableReference::bare(table_name), Arc::clone(&accelerator));
     let write_lock = Arc::clone(&binding.write_lock);
     let sink = CayenneAccelerator::new()
         .change_sink(binding, &Handle::current(), 2)
@@ -542,7 +543,8 @@ async fn debezium_json_nesting_folds_into_catch_all() {
     let task = make_refresh_task(
         Arc::clone(&table) as Arc<dyn TableProvider>,
         "dbz_json_nest",
-    ).await;
+    )
+    .await;
     let refresh = Arc::new(RwLock::new(Refresh::default()));
     task.start_changes_stream(
         refresh,
