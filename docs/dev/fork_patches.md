@@ -76,8 +76,8 @@ comment, not a test in the fork.
 that does not exist, which is worse than a **GAP** — a gap is at least on the
 list below. `kind(=lib)` sweeps up every unit test, so the exposure is the
 integration-test targets, which `NEXTEST_FILTER` has to name one at a time;
-`--all --tests` compiles them either way, so an unnamed binary is built and then
-skipped. Guards were found running nowhere for that reason, in integration-test
+the gate builds only the targets it selects, so an unnamed binary is neither
+built nor run, and nothing fails. Guards were found running nowhere for that reason, in integration-test
 targets now named there: `adbc_cancellation` for the two `arrow-adbc`
 cancellation rows (fork PRs #4 and #65, which share one test), and `cpu_budget`
 for vortex's `set_available_parallelism`. (`json_semantics` is named there too; it

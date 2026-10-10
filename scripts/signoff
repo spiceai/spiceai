@@ -817,7 +817,7 @@ post_pending_status() {
 # sync with `rustAffecting` in .github/workflows/pr.yml and covered by the
 # check-code-changes filter; `scripts/check_rust_gate_paths.py` enforces both,
 # and docs/dev/ci_signoff.md explains why each path is here.
-RUST_AFFECTING_PATH_PATTERN='(^(crates|bin|tools|vendor)/|\.(rs|snap|proto)$|(^|/)Cargo\.(toml|lock)$|(^|/)rust-toolchain(\.toml)?$|(^|/)\.cargo/|(^|/)\.?(clippy|rustfmt)\.toml$|(^|/)nextest\.toml$|(^|/)layers\.toml$|^scripts/(test_)?check_(crate_layers|table_layers|rust_gate_paths|module_reachability|fork_patches|bench_mysql_load_nulls)\.py$|^scripts/(test_)?rust_guard_common\.py$|^docs/dev/fork_patches\.md$|^(Makefile|version\.txt)$|^test/tpc-bench/(Makefile|mysql-null-spec\.awk)$|^test/tls/|^test/spicepods/tpch/sf1/accelerated/postgres\[catalog\]\[changes\]\.yaml$)'
+RUST_AFFECTING_PATH_PATTERN='(^(crates|bin|tools|vendor)/|\.(rs|snap|proto)$|(^|/)Cargo\.(toml|lock)$|(^|/)rust-toolchain(\.toml)?$|(^|/)\.cargo/|(^|/)\.?(clippy|rustfmt)\.toml$|(^|/)nextest\.toml$|(^|/)layers\.toml$|^scripts/(test_)?check_(crate_layers|table_layers|rust_gate_paths|module_reachability|fork_patches|bench_mysql_load_nulls)\.py$|^scripts/(test_)?rust_guard_common\.py$|^scripts/(test_)?nextest_build_targets\.py$|^docs/dev/fork_patches\.md$|^(Makefile|version\.txt)$|^test/tpc-bench/(Makefile|mysql-null-spec\.awk)$|^test/tls/|^test/spicepods/tpch/sf1/accelerated/postgres\[catalog\]\[changes\]\.yaml$)'
 
 # True when the branch delta vs trunk can affect Rust lint/build/tests.
 # Prints nothing. Exit 0 = has Rust-affecting changes (or unknown — run checks).
@@ -2049,7 +2049,7 @@ run_checks() {
   # the full gate; empty values leave the Makefile on its workspace defaults.
   run_make_step lint-rust PACKAGES= FEATURES= || return $?
 
-  # No separate CLI build: `nextest`'s `--tests` build already emits the `spice`
+  # No separate CLI build: `nextest`'s build already emits the `spice`
   # binary, because cargo builds a package's bins alongside that package's
   # integration tests. A `cargo build -p spice` on top of that only re-resolved
   # the graph at a selection no other phase shares, to relink a binary that was

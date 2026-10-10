@@ -108,12 +108,14 @@ endif
 # (spiceai/spiceai#12337). One selection resolves once, and a nextest filterset
 # decides which of the built tests actually run.
 #
-# `--tests` rather than `--lib` is what brings cayenne's integration tests and
-# the `metrics` binary into that one selection. It builds every test target
-# in the workspace, including ones the filterset never runs. Naming just the
-# wanted targets with `--test <glob>` would build fewer, but a new test file that
-# didn't match the glob would silently stop being covered — cayenne already has
-# a test target that doesn't follow the `*_test` convention its other 55 do.
+# Integration-test targets are named one by one (`--test <name>`) rather than
+# with `--tests`, which builds and links every test target in the workspace,
+# including the dozens the filterset never runs. The names are not kept by hand:
+# `scripts/nextest_build_targets.py` derives them from the filterset itself, so a
+# new test file the filterset selects (any new cayenne test, for example) is
+# built without an edit here. That script builds a target whenever the filterset
+# cannot rule it out before the build, and falls back to `--tests` when it cannot
+# evaluate something, so it can widen the build but never drop a selected test.
 #
 # `metrics` is a `tests/` binary rather than a `--lib` test because it needs its
 # own process to control the OTel meter-provider install order. Every metrics
@@ -123,7 +125,7 @@ endif
 # `kind(=proc-macro)` is the other half of what `--lib` used to select: nextest
 # labels a proc-macro crate's unit tests `proc-macro`, not `lib`, so leaving it
 # out would silently drop runtime-parameters-derive's tests from the gate.
-# `--tests` also builds every bin target as a unit-test harness, and
+# `--bins` builds every bin target as a unit-test harness, and
 # `kind(=bin)` below runs them: the `spice` CLI's `main.rs` tests (argument
 # normalization, `--cloud`/`--cloud-region` validation, machine-mode output)
 # live only there, and a filterset that selects no bin target leaves them
@@ -176,8 +178,8 @@ endif
 #
 # Scoped to `cayenne` deliberately. `runtime/duckdb,runtime/sqlite` would also
 # unlock runtime's accelerator-parity binary, but the feature flows through the
-# whole `--all --tests` build: every one of runtime's integration test binaries
-# relinks with them, and those link at hundreds of megabytes each. That is a
+# whole `--all` build: every runtime test binary the gate builds relinks with
+# them, and those link at hundreds of megabytes each. That is a
 # large, permanent cost on every sign-off and merge-queue run to gain two
 # micro-shape comparisons — the thinnest of the five lanes. It belongs in the
 # integration workflow, which already builds with `duckdb,sqlite`.
@@ -216,8 +218,8 @@ print-rust-gate-features:
 # rows, and `cpu_budget` the guard for vortex's `set_available_parallelism` —
 # six ledger rows across the three. Each is self-contained — a fake
 # in-process ADBC driver, a spicepod written to a temp dir, arrow built in
-# memory — needing no credentials and no service, and `--all --tests` compiles
-# all three whether or not they are selected, so leaving them out saved only the
+# memory — needing no credentials and no service. The gate then built every test
+# target whether or not it was selected, so leaving them out saved only the
 # seconds of running them and cost the coverage the ledger claimed.
 # `runtime`'s `rate_control` binary holds the HTTP rate-control tests, which are
 # self-contained and gate the parameter validation and shared-origin rules.
@@ -242,11 +244,16 @@ endif
 ifneq (,$(findstring -E,$(NEXTEST_FLAG))$(findstring --filterset,$(NEXTEST_FLAG)))
 $(error NEXTEST_FLAG carries a nextest filterset — pass it as NEXTEST_FILTER_EXTRA instead, which intersects the gate's own filterset rather than being unioned with it)
 endif
+# Prints the cargo target flags (`--lib --bins --test …`) for the targets the
+# filterset can select; see the `--test <name>` note above. Shared by `nextest`
+# and `verify-cli` so both build the same graph.
+_NEXTEST_TARGETS_CMD = $(PYTHON) scripts/nextest_build_targets.py --filter '$(_NEXTEST_FILTER)' -- $(NEXTEST_SELECTION) $(NEXTEST_FLAG)
 .PHONY: nextest
 nextest:
 	@echo 'note: the chDB result-correctness lane is not in this run (it needs libchdb; CI runs it in correctness_chdb.yml).' >&2
 	@echo '      to run it here: cargo test -p cayenne --features result-correctness-chdb --test result_correctness_vs_chdb_test' >&2
-	@cargo nextest run $(NEXTEST_SELECTION) --tests $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG) -E '$(_NEXTEST_FILTER)'
+	@targets="$$($(_NEXTEST_TARGETS_CMD))" || exit $$?; \
+	cargo nextest run $(NEXTEST_SELECTION) $$targets $(NEXTEST_CARGO_PROFILE) $(NEXTEST_FLAG) -E '$(_NEXTEST_FILTER)'
 
 # Unit tests for named packages — the fail-fast pre-check scripts/signoff runs on
 # the crates a branch touched, before the full workspace gate. Same lib-only
@@ -257,9 +264,9 @@ nextest:
 # unit tests (29 workspace libraries have none). nextest exits 4 on "no tests to
 # run" by default, which would abort the sign-off for a branch that only touched
 # one of them; the full `nextest` run still gates the workspace.
-# The gate does not build the `spice` CLI on its own, because `nextest`'s `--tests`
-# build already emits it: cargo builds a package's bins alongside that package's
-# integration tests, and `spice` has three. A CLI link error therefore fails
+# The gate does not build the `spice` CLI on its own, because `nextest`'s build
+# already emits it: cargo builds a package's bins alongside that package's
+# integration tests, and the gate selects two of `spice`'s. A CLI link error therefore fails
 # `nextest` itself, and a separate `cargo build -p spice` only re-resolved the
 # whole graph at a selection no other phase in the gate shares.
 #
@@ -274,7 +281,8 @@ nextest:
 verify-cli:
 	@out="$(TARGET_DIR)/verify-cli-artifacts.json"; \
 	mkdir -p "$(TARGET_DIR)"; \
-	cargo test --no-run --message-format json $(CARGO_PROFILE) --tests \
+	targets="$$($(_NEXTEST_TARGETS_CMD))" || exit $$?; \
+	cargo test --no-run --message-format json $(CARGO_PROFILE) $$targets \
 	  $(NEXTEST_SELECTION) $(NEXTEST_FLAG) > "$$out" || exit $$?; \
 	$(PYTHON) scripts/verify_cli_build.py "$$out" version.txt
 
@@ -385,6 +393,8 @@ lint-rust:
 	## Its parser is exercised first, together with the transform itself: nothing else in CI executes that sed program, and a guard matching no loader would report success
 	$(PYTHON) scripts/test_check_bench_mysql_load_nulls.py
 	$(PYTHON) scripts/check_bench_mysql_load_nulls.py
+	## Nextest build-target generator (fast, no compile): it decides which test binaries `nextest` builds, so a parser regression would drop selected tests from the build
+	$(PYTHON) scripts/test_nextest_build_targets.py
 	## All except metal, cuda, nfs (nfs requires system libnfs library)
 	CLIPPY_CONF_DIR=".ci" cargo clippy $(CARGO_PROFILE) --keep-going $(_LINT_TARGET_FLAGS) $(_FEATURES_FLAGS) $(_LINT_WORKSPACE_FLAGS) -- \
 		-Dwarnings \
