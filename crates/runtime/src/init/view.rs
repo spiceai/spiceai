@@ -16,17 +16,19 @@ limitations under the License.
 
 use std::{collections::HashMap, collections::HashSet, sync::Arc};
 
+use tokio_util::sync::CancellationToken;
+
 use crate::{
     AcceleratorEngineNotAvailableSnafu, AcceleratorInitializationFailedSnafu, LogErrors, Result,
     Runtime, UnableToAttachViewSnafu,
     component::view::{View, ViewBuilder},
-    datafusion::DeferredRefreshOutcome,
+    datafusion::{DeferredRefreshOutcome, resolve_table_reference},
     secrets::Secrets,
     status, view,
 };
 use app::App;
 use datafusion::{
-    common::TableReference,
+    common::{ResolvedTableReference, TableReference},
     sql::{parser::DFParser, sqlparser::dialect::PostgreSqlDialect},
 };
 #[cfg(feature = "duckdb")]
@@ -100,8 +102,62 @@ fn order_views_by_dependencies(validated_views: &[ValidatedView]) -> Option<Vec<
     }
 }
 
+/// Whether the view dependency graph (edges between views only, self-references
+/// ignored) contains a cycle.
+fn has_view_cycle(
+    dependencies: &HashMap<ResolvedTableReference, Vec<ResolvedTableReference>>,
+) -> bool {
+    let mut remaining: HashMap<&ResolvedTableReference, usize> = dependencies
+        .iter()
+        .map(|(view, deps)| {
+            let n = deps
+                .iter()
+                .filter(|d| *d != view && dependencies.contains_key(*d))
+                .collect::<HashSet<_>>()
+                .len();
+            (view, n)
+        })
+        .collect();
+    let mut ready: Vec<&ResolvedTableReference> = remaining
+        .iter()
+        .filter(|(_, n)| **n == 0)
+        .map(|(v, _)| *v)
+        .collect();
+    let mut visited = 0;
+    while let Some(done) = ready.pop() {
+        visited += 1;
+        for (view, deps) in dependencies {
+            if view != done
+                && deps.iter().collect::<HashSet<_>>().contains(done)
+                && let Some(n) = remaining.get_mut(view)
+            {
+                *n -= 1;
+                if *n == 0 {
+                    ready.push(view);
+                }
+            }
+        }
+    }
+    visited < dependencies.len()
+}
+
 impl Runtime {
-    pub(crate) fn load_views(self: Arc<Self>, app: &Arc<App>) {
+    /// Loads the startup views. Each view is registered as soon as the datasets
+    /// and views it reads from have finished loading, so a dataset that keeps
+    /// failing holds back only the views that depend on it.
+    ///
+    /// `dataset_done` maps each startup dataset whose load is running to a token
+    /// cancelled when that load ends. A dependency that is a dataset without an
+    /// entry (it failed accelerator initialization, or is chained deeper behind
+    /// another dataset) is conservatively waited for by waiting on every startup
+    /// dataset, which is what all views did before.
+    ///
+    /// Returns the tasks loading the views.
+    pub(crate) fn load_views(
+        self: Arc<Self>,
+        app: &Arc<App>,
+        dataset_done: &HashMap<ResolvedTableReference, CancellationToken>,
+    ) -> Vec<tokio::task::JoinHandle<()>> {
         // `LogErrors(false)`: `load_datasets` is this function's only caller and it has
         // already validated the same views with `LogErrors(true)` before its snapshot
         // checks, so reporting again here only prints each view's load error, and each
@@ -117,14 +173,113 @@ impl Runtime {
                     .collect()
             });
 
+        let dependencies: HashMap<ResolvedTableReference, Vec<ResolvedTableReference>> =
+            validated_views
+                .iter()
+                .map(|vv| {
+                    (
+                        resolve_table_reference(vv.view.name.clone()),
+                        vv.dependencies
+                            .iter()
+                            .cloned()
+                            .map(resolve_table_reference)
+                            .collect(),
+                    )
+                })
+                .collect();
+        // Waiting on another view is only safe when the views, compared by resolved
+        // name, form no cycle: otherwise each view in the cycle waits on the other.
+        let wait_on_views = !has_view_cycle(&dependencies);
+        let dataset_names: HashSet<ResolvedTableReference> = app
+            .datasets
+            .iter()
+            .filter_map(|ds| {
+                crate::component::dataset::Dataset::parse_table_reference(&ds.name).ok()
+            })
+            .map(resolve_table_reference)
+            .collect();
+
+        // Created for every view up front and compared by resolved name, so a view
+        // that reads `public.v1` waits on `v1` whatever order they are spawned in.
+        let view_done: HashMap<ResolvedTableReference, CancellationToken> = validated_views
+            .iter()
+            .map(|vv| {
+                (
+                    resolve_table_reference(vv.view.name.clone()),
+                    CancellationToken::new(),
+                )
+            })
+            .collect();
+        let mut tasks = Vec::new();
+
         for view in views_in_dependency_order {
-            let runtime = Arc::clone(&self);
-            let secrets = runtime.secrets();
-            if let Err(e) = runtime.load_view(&view, secrets) {
-                let view_name = &view.name;
-                tracing::error!("Unable to load view {view_name}: {e}");
+            let resolved = resolve_table_reference(view.name.clone());
+            let mut waits: Vec<(String, CancellationToken)> = Vec::new();
+            let mut wait_for_all = false;
+            for dep in dependencies.get(&resolved).into_iter().flatten() {
+                let view_token = view_done
+                    .get(dep)
+                    .filter(|_| wait_on_views && dep != &resolved);
+                if let Some(token) = view_token.or_else(|| dataset_done.get(dep)) {
+                    waits.push((dep.to_string(), token.clone()));
+                } else if dataset_names.contains(dep) {
+                    wait_for_all = true;
+                }
             }
+            if wait_for_all {
+                waits.extend(
+                    dataset_done
+                        .iter()
+                        .map(|(name, token)| (name.to_string(), token.clone())),
+                );
+            }
+
+            let done = view_done.get(&resolved).cloned().unwrap_or_default();
+
+            let runtime = Arc::clone(&self);
+            let view_load = self.view_loads.begin(&view.name);
+            tasks.push(tokio::spawn(async move {
+                let done = done.drop_guard();
+                let superseded = view_load.token();
+                let pending: Vec<String> = waits
+                    .iter()
+                    .filter(|(_, token)| !token.is_cancelled())
+                    .map(|(name, _)| name.clone())
+                    .sorted()
+                    .dedup()
+                    .collect();
+                if !pending.is_empty() {
+                    let view_name = &view.name;
+                    tracing::info!(
+                        "View {view_name} is waiting for its dependencies to load: {}",
+                        pending.join(", ")
+                    );
+                    runtime
+                        .status
+                        .update_view(&view.name, status::ComponentStatus::Initializing);
+                    let shutdown = runtime.status.shutdown_token();
+                    tokio::select! {
+                        _ = futures::future::join_all(
+                            waits.iter().map(|(_, token)| token.cancelled()),
+                        ) => {}
+                        () = shutdown.cancelled() => return,
+                        () = superseded.cancelled() => return,
+                    }
+                }
+                if superseded.is_cancelled() {
+                    return;
+                }
+                let secrets = runtime.secrets();
+                if let Err(e) =
+                    runtime.load_view_signalling(&view, secrets, Some(done), Some(view_load))
+                {
+                    let view_name = &view.name;
+                    tracing::error!("Unable to load view {view_name}: {e}");
+                }
+            }));
         }
+
+        tasks
     }
 
     /// Returns a list of valid views from the given App, with SQL validated and dependencies extracted.
@@ -353,6 +508,19 @@ impl Runtime {
     }
 
     fn load_view(self: Arc<Self>, view: &Arc<View>, secrets: Arc<RwLock<Secrets>>) -> Result<()> {
+        self.load_view_signalling(view, secrets, None, None)
+    }
+
+    /// Like [`Self::load_view`], holding `registered` until the view's registration
+    /// task ends (registered or failed), so views depending on it wait for that
+    /// rather than for the task to be spawned.
+    fn load_view_signalling(
+        self: Arc<Self>,
+        view: &Arc<View>,
+        secrets: Arc<RwLock<Secrets>>,
+        registered: Option<tokio_util::sync::DropGuard>,
+        startup_load: Option<crate::init::view_loads::ViewLoad>,
+    ) -> Result<()> {
         let df = Arc::clone(&self.df);
         let register_task = df
             .register_view(Arc::clone(view), secrets)
@@ -370,7 +538,26 @@ impl Runtime {
 
         tokio::task::spawn(async move {
             let view_name = view.name.clone();
-            let notifier = register_task.await;
+            // A startup registration superseded by a Spicepod change is aborted
+            // before it can register the replaced definition.
+            let superseded = startup_load
+                .as_ref()
+                .map(crate::init::view_loads::ViewLoad::token);
+            let mut register_task = register_task;
+            let notifier = match superseded {
+                Some(superseded) => tokio::select! {
+                    notifier = &mut register_task => notifier,
+                    () = superseded.cancelled() => {
+                        register_task.abort();
+                        let _ = register_task.await;
+                        tracing::debug!("Startup registration of view '{view_name}' superseded by a Spicepod change.");
+                        return;
+                    }
+                },
+                None => register_task.await,
+            };
+            drop(startup_load);
+            drop(registered);
             match notifier {
                 Ok(Some((instance, completion))) => {
                     // `instance` was captured where the view was registered, so
@@ -492,6 +679,19 @@ impl Runtime {
             })
             .collect_vec();
 
+        // Stop startup registrations still waiting for views this change replaces
+        // or removes, so they cannot register the old definition afterwards.
+        for name in &views_that_changed {
+            self.view_loads.supersede(name).await;
+        }
+        for view in &current_app.views {
+            if !new_app.views.iter().any(|v| v.name == view.name)
+                && let Ok(builder) = ViewBuilder::try_from(view.clone())
+            {
+                self.view_loads.supersede(&builder.name).await;
+            }
+        }
+
         // Remove views that are no longer in the app
         for view in &current_app.views {
             if !new_app.views.iter().any(|v| v.name == view.name) {
@@ -541,6 +741,9 @@ impl Runtime {
         };
 
         for view_name in affected_views_in_order_of_dependencies {
+            // An unchanged view re-applied because a dependency changed is
+            // registered here, so its startup registration must not also run.
+            self.view_loads.supersede(&view_name).await;
             if let Some(validated_view) =
                 validated_views.iter().find(|vv| vv.view.name == view_name)
             {
@@ -561,5 +764,33 @@ impl Runtime {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod view_cycle_tests {
+    use super::*;
+
+    fn r(name: &str) -> ResolvedTableReference {
+        resolve_table_reference(TableReference::parse_str(name))
+    }
+
+    #[test]
+    fn detects_cycle_through_qualified_names() {
+        let deps = HashMap::from([
+            (r("a"), vec![r("public.b")]),
+            (r("b"), vec![r("spice.public.a")]),
+        ]);
+        assert!(has_view_cycle(&deps));
+    }
+
+    #[test]
+    fn chain_and_self_reference_are_not_cycles() {
+        let deps = HashMap::from([
+            (r("a"), vec![r("orders"), r("a")]),
+            (r("b"), vec![r("public.a"), r("a")]),
+            (r("c"), vec![r("b")]),
+        ]);
+        assert!(!has_view_cycle(&deps));
     }
 }
