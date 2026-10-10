@@ -228,8 +228,13 @@ pub(crate) enum PkDeletionStrategyWithCache {
         deletion_snapshot: Arc<ArcSwap<Int64PkDeletionSnapshot>>,
         /// Per-file position deletes for rows whose `(file, position)` is known
         /// (`deletion_mode: position`). Pushed into the Vortex scan alongside the
-        /// above-scan key filter for the remaining (unlocated) rows. Empty and
-        /// unused under `deletion_mode: key`.
+        /// above-scan key filter for the remaining (unlocated) rows.
+        ///
+        /// A key-mode table never WRITES one of these, but this cache is not
+        /// therefore always empty there: a table that ran under `position` before
+        /// its mode resolved to `key` keeps its durable vectors, which load here
+        /// on reopen and are still applied. That is a compatibility path, not
+        /// dead state — dropping it resurrects every row they mask.
         position_deletions: Arc<ArcSwap<PositionBitmap>>,
     },
     /// Composite/non-integer primary key deletion tracking using serialized row keys.

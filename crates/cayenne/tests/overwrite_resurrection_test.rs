@@ -56,7 +56,7 @@ type TestResult<T> = Result<T, Box<dyn std::error::Error>>;
 enum Mode {
     /// Explicit `deletion_mode: key` — the deletion index is authoritative.
     Key,
-    /// Default (`auto` resolves to position even for PK tables).
+    /// Explicit `deletion_mode: position` (merge-on-read position deletes).
     Position,
 }
 
@@ -79,7 +79,10 @@ fn config(mode: Mode) -> VortexConfig {
             deletion_mode: DeletionMode::Key,
             ..base
         },
-        Mode::Position => base,
+        Mode::Position => VortexConfig {
+            deletion_mode: DeletionMode::Position,
+            ..base
+        },
     }
 }
 
