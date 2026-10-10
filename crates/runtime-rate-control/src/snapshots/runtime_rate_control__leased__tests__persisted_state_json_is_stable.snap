@@ -1,0 +1,37 @@
+---
+source: crates/runtime-rate-control/src/leased.rs
+expression: canonical_json(&wire_format_fixture())
+---
+{
+  "limiters": {
+    "requests_per_second:burst=10:replenish_ns=100000000": {
+      "burst_per_window": 10,
+      "windows": {
+        "1700000000": {
+          "budget_remaining": 1,
+          "leases": {
+            "replica-a": {
+              "attempted": 12,
+              "consumed": 5,
+              "expires_at_unix_ms": 1700000001000,
+              "failed": 1,
+              "granted": 7,
+              "ok": 3,
+              "updated_at_unix_ms": 1700000001500
+            },
+            "replica-b": {
+              "attempted": 0,
+              "consumed": 0,
+              "expires_at_unix_ms": 1700000001000,
+              "granted": 2,
+              "updated_at_unix_ms": 1700000000500
+            }
+          }
+        }
+      }
+    }
+  },
+  "schema_version": 3,
+  "updated_at_unix_ms": 1700000000500,
+  "window_ms": 1000
+}
