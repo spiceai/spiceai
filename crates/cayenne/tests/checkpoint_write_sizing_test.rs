@@ -40,7 +40,7 @@ limitations under the License.
 
 #![allow(clippy::expect_used, clippy::cast_precision_loss)]
 
-mod common;
+use crate::common;
 
 use std::collections::HashSet;
 use std::io::Cursor;

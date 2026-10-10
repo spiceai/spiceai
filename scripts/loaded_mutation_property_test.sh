@@ -17,8 +17,8 @@
 # Usage:
 #   scripts/loaded_mutation_property_test.sh [TEST_FILTER] [ITERATIONS]
 #
-#   TEST_FILTER   nextest filter (default: empty = the whole
-#                 mutation_property_test binary, so all convergence tests contend
+#   TEST_FILTER   nextest filter within the module (default: empty = the whole
+#                 mutation_property_test module, so all convergence tests contend
 #                 with each other like CI). Pass e.g.
 #                 prop_sequential_key_impl_sqlite (fails fastest) or
 #                 prop_concurrent_mixed_key_sqlite to target one test.
@@ -30,8 +30,9 @@
 #                 oversubscribe).
 #   OPS_SCALE     CAYENNE_PROPTEST_OPS_SCALE (default: 2; longer op histories
 #                 widen race windows).
-#   TEST_PKG / TEST_BIN  override the crate/binary (default: cayenne /
-#                 mutation_property_test).
+#   TEST_PKG / TEST_BIN / TEST_MODULE  override the crate, test binary and
+#                 module (default: cayenne / integration / mutation_property_test;
+#                 TEST_MODULE='' selects the whole binary).
 #
 # `-e` so an early failure (e.g. the build step) fast-fails before spawning CPU
 # hogs; the reproduction check below runs the tests inside an `if ! ...` guard,
@@ -46,7 +47,11 @@ FILTER="${1:-}"
 ITERATIONS="${2:-10}"
 OPS_SCALE="${OPS_SCALE:-2}"
 TEST_PKG="${TEST_PKG:-cayenne}"
-TEST_BIN="${TEST_BIN:-mutation_property_test}"
+TEST_BIN="${TEST_BIN:-integration}"
+TEST_MODULE="${TEST_MODULE-mutation_property_test}"
+# nextest matches a positional filter as a substring of the full test name, and
+# every test in the module is named `<module>::<test>`.
+SELECTION="${TEST_MODULE:+${TEST_MODULE}::}${FILTER}"
 
 ncpu="$(getconf _NPROCESSORS_ONLN 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 8)"
 NHOGS="${NHOGS:-$(( ncpu < 16 ? ncpu : 16 ))}"
@@ -57,14 +62,14 @@ run_tests() {
   env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER CC=cc CXX=c++ \
     SCCACHE_DIR="${SCCACHE_DIR:-$HOME/.cache/sccache}" \
     RUST_BACKTRACE=1 CAYENNE_PROPTEST_OPS_SCALE="$OPS_SCALE" \
-    cargo nextest run -p "$TEST_PKG" --test "$TEST_BIN" ${FILTER:+"$FILTER"} \
+    cargo nextest run -p "$TEST_PKG" --test "$TEST_BIN" ${SELECTION:+"$SELECTION"} \
     --retries 0 --no-fail-fast
 }
 
 echo ">> Building $TEST_PKG::$TEST_BIN ..."
 env -u RUSTC_WRAPPER -u RUSTC_WORKSPACE_WRAPPER CC=cc CXX=c++ \
   SCCACHE_DIR="${SCCACHE_DIR:-$HOME/.cache/sccache}" \
-  cargo nextest run -p "$TEST_PKG" --test "$TEST_BIN" ${FILTER:+"$FILTER"} --no-run
+  cargo nextest run -p "$TEST_PKG" --test "$TEST_BIN" ${SELECTION:+"$SELECTION"} --no-run
 
 echo ">> Spawning $NHOGS CPU hog(s) to induce contention (${ncpu} cores)..."
 HOGS=()
@@ -72,11 +77,11 @@ for _ in $(seq 1 "$NHOGS"); do yes > /dev/null & HOGS+=($!); done
 cleanup() { kill "${HOGS[@]}" 2>/dev/null || true; }
 trap cleanup EXIT INT TERM
 
-echo ">> Running '${FILTER:-<all>}' x${ITERATIONS}, retries disabled, OPS_SCALE=$OPS_SCALE ..."
+echo ">> Running '${SELECTION:-<all>}' x${ITERATIONS}, retries disabled, OPS_SCALE=$OPS_SCALE ..."
 for i in $(seq 1 "$ITERATIONS"); do
   echo "=== iteration $i/$ITERATIONS ==="
   if ! run_tests; then
-    echo ">>> FAILED on iteration $i (filter='${FILTER:-<all>}')"
+    echo ">>> FAILED on iteration $i (filter='${SELECTION:-<all>}')"
     exit 1
   fi
 done
