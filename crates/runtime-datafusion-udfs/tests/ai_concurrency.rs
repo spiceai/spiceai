@@ -310,3 +310,62 @@ async fn test_no_rate_controller_still_executes() {
     }
     assert_eq!(count, 5, "All 5 rows should produce responses");
 }
+
+/// regression test: `DataFusion` hands an async function whole input batches (8192 rows
+/// by default), and `ai` rejects any call over 1000 rows, so `ai` over a table of more
+/// than 1000 rows in one partition failed with "ai batch size (2500) exceeds maximum
+/// allowed (1000)".
+#[tokio::test]
+async fn more_rows_than_one_call_takes_are_all_answered() {
+    let model: Arc<dyn Chat> = Arc::new(ConcurrencyTrackingChat {
+        name: "bulk-model".to_string(),
+        concurrent: Arc::new(AtomicUsize::new(0)),
+        max_concurrent: Arc::new(AtomicUsize::new(0)),
+        delay: Duration::ZERO,
+    });
+    let mut model_store: ChatModelStore = HashMap::new();
+    model_store.insert("bulk-model".to_string(), model);
+
+    // One partition, so the whole table reaches `ai` as one batch.
+    let ctx = SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+    ctx.register_udf(
+        Ai::new(
+            Arc::new(RwLock::new(model_store)),
+            Arc::new(RwLock::new(HashMap::new())),
+            RuntimeStatus::new(),
+        )
+        .into_async_udf()
+        .into_scalar_udf(),
+    );
+    let questions: Vec<String> = (0..2_500).map(|i| format!("Question {i}")).collect();
+    let batch = RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new(
+            "question",
+            DataType::Utf8,
+            false,
+        )])),
+        vec![Arc::new(StringArray::from(questions))],
+    )
+    .expect("should create RecordBatch");
+    ctx.register_batch("prompts", batch)
+        .expect("should register table");
+
+    let results = ctx
+        .sql(
+            "SELECT count(*) AS answered FROM \
+             (SELECT ai(question, 'bulk-model') AS response FROM prompts) \
+             WHERE response = 'Response from bulk-model'",
+        )
+        .await
+        .expect("should plan")
+        .collect()
+        .await
+        .expect("every row should be answered");
+    let answered = results[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<arrow::array::Int64Array>()
+        .expect("count is Int64")
+        .value(0);
+    assert_eq!(answered, 2_500);
+}
