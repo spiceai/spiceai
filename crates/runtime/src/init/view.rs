@@ -102,6 +102,45 @@ fn order_views_by_dependencies(validated_views: &[ValidatedView]) -> Option<Vec<
     }
 }
 
+/// Whether the view dependency graph (edges between views only, self-references
+/// ignored) contains a cycle.
+fn has_view_cycle(
+    dependencies: &HashMap<ResolvedTableReference, Vec<ResolvedTableReference>>,
+) -> bool {
+    let mut remaining: HashMap<&ResolvedTableReference, usize> = dependencies
+        .iter()
+        .map(|(view, deps)| {
+            let n = deps
+                .iter()
+                .filter(|d| *d != view && dependencies.contains_key(*d))
+                .collect::<HashSet<_>>()
+                .len();
+            (view, n)
+        })
+        .collect();
+    let mut ready: Vec<&ResolvedTableReference> = remaining
+        .iter()
+        .filter(|(_, n)| **n == 0)
+        .map(|(v, _)| *v)
+        .collect();
+    let mut visited = 0;
+    while let Some(done) = ready.pop() {
+        visited += 1;
+        for (view, deps) in dependencies {
+            if view != done
+                && deps.iter().collect::<HashSet<_>>().contains(done)
+                && let Some(n) = remaining.get_mut(view)
+            {
+                *n -= 1;
+                if *n == 0 {
+                    ready.push(view);
+                }
+            }
+        }
+    }
+    visited < dependencies.len()
+}
+
 impl Runtime {
     /// Loads the startup views. Each view is registered as soon as the datasets
     /// and views it reads from have finished loading, so a dataset that keeps
@@ -126,15 +165,13 @@ impl Runtime {
         let validated_views = Arc::clone(&self).get_valid_views(app, LogErrors(false));
 
         // Determine the dependency order for views based on their SQL dependencies
-        let ordered = order_views_by_dependencies(&validated_views);
-        // Waiting on another view is only safe when the views form no cycle.
-        let wait_on_views = ordered.is_some();
-        let views_in_dependency_order = ordered.unwrap_or_else(|| {
-            validated_views
-                .iter()
-                .map(|vv| Arc::clone(&vv.view))
-                .collect()
-        });
+        let views_in_dependency_order = order_views_by_dependencies(&validated_views)
+            .unwrap_or_else(|| {
+                validated_views
+                    .iter()
+                    .map(|vv| Arc::clone(&vv.view))
+                    .collect()
+            });
 
         let dependencies: HashMap<ResolvedTableReference, Vec<ResolvedTableReference>> =
             validated_views
@@ -150,6 +187,9 @@ impl Runtime {
                     )
                 })
                 .collect();
+        // Waiting on another view is only safe when the views, compared by resolved
+        // name, form no cycle: otherwise each view in the cycle waits on the other.
+        let wait_on_views = !has_view_cycle(&dependencies);
         let dataset_names: HashSet<ResolvedTableReference> = app
             .datasets
             .iter()
@@ -668,5 +708,33 @@ impl Runtime {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod view_cycle_tests {
+    use super::*;
+
+    fn r(name: &str) -> ResolvedTableReference {
+        resolve_table_reference(TableReference::parse_str(name))
+    }
+
+    #[test]
+    fn detects_cycle_through_qualified_names() {
+        let deps = HashMap::from([
+            (r("a"), vec![r("public.b")]),
+            (r("b"), vec![r("spice.public.a")]),
+        ]);
+        assert!(has_view_cycle(&deps));
+    }
+
+    #[test]
+    fn chain_and_self_reference_are_not_cycles() {
+        let deps = HashMap::from([
+            (r("a"), vec![r("orders"), r("a")]),
+            (r("b"), vec![r("public.a"), r("a")]),
+            (r("c"), vec![r("b")]),
+        ]);
+        assert!(!has_view_cycle(&deps));
     }
 }
