@@ -171,20 +171,19 @@ def check_revisions() -> None:
     spiced keeps retrying a dataset whose files it cannot list, so without this a revision
     gone from the Hub shows up only as a runtime that never becomes ready.
     """
-    pinned: dict[str, set[str]] = {}
+    pins = set()
     for location, *_rest in CASES.values():
         repo, _, rest = location.removeprefix("hf://datasets/").partition("@")
-        pinned.setdefault(repo, set()).add(rest.split("/", 1)[0])
+        if not rest.startswith("~"):
+            pins.add((repo, rest.split("/", 1)[0]))
     gone = []
-    for repo, revisions in sorted(pinned.items()):
-        for revision in sorted(revisions - {"~parquet"}):
-            try:
-                hub_get(f"{repo}/revision/{revision}")
-            except HTTPError as error:
-                gone.append(f"{repo}@{revision} (HTTP {error.code})")
+    for repo, revision in sorted(pins):
+        try:
+            hub_get(f"{repo}/revision/{revision}")
+        except HTTPError as error:
+            gone.append(f"{repo}@{revision} (HTTP {error.code})")
     assert not gone, "Pinned Hub revisions no longer resolve; repin them: " + ", ".join(gone)
-    refs = hub_get("stanfordnlp/imdb/refs")
-    main = next(branch["targetCommit"] for branch in refs["branches"] if branch["name"] == "main")
+    main = hub_get("stanfordnlp/imdb/revision/main")["sha"]
     pinned_main = IMDB.rpartition("@")[2]
     assert main == pinned_main, (
         f"stanfordnlp/imdb main moved from {pinned_main} to {main}, so its `@~parquet` conversion "
@@ -192,10 +191,10 @@ def check_revisions() -> None:
     )
 
 
-def print_log_tail(path: Path, lines: int = 200) -> None:
+def print_log_tail(path: Path) -> None:
     """Print the end of the runtime log, since pull request and merge-queue runs keep no artifacts."""
     with contextlib.suppress(OSError):
-        tail = path.read_text(errors="replace").splitlines()[-lines:]
+        tail = path.read_text(errors="replace").splitlines()[-200:]
         print(f"::group::Last {len(tail)} lines of {path.name}", flush=True)
         print("\n".join(tail), flush=True)
         print("::endgroup::", flush=True)
