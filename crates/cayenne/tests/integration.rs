@@ -161,7 +161,9 @@ fn every_test_file_is_compiled() {
             !root
                 .lines()
                 .any(|line| line.trim() == format!("mod {stem};"))
-                && !manifest.contains(&format!("path = \"tests/{stem}.rs\""))
+                && !manifest
+                    .lines()
+                    .any(|line| line.trim() == format!("path = \"tests/{stem}.rs\""))
         })
         .collect();
     missing.sort();
