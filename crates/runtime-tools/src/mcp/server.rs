@@ -660,6 +660,12 @@ fn missing_principal_refusal(tool_name: &str) -> String {
     )
 }
 
+fn unknown_tool_refusal(tool_name: &str) -> String {
+    format!(
+        "Unknown tool: '{tool_name}'. This runtime exposes no tool with that name, so nothing ran. Call `tools/list` for the tools it exposes. See https://spiceai.org/docs/features/large-language-models/mcp"
+    )
+}
+
 impl RuntimeServer {
     async fn call_tool_with_auth(
         &self,
@@ -702,9 +708,10 @@ impl RuntimeServer {
                 ));
             }
             ResolveOutcome::Missing => {
-                return Err(McpError::method_not_found::<
-                    rmcp::model::CallToolRequestMethod,
-                >());
+                return Err(McpError::invalid_params(
+                    unknown_tool_refusal(&tool_name),
+                    None,
+                ));
             }
         };
 
@@ -3727,6 +3734,98 @@ mod tests {
             tool.forwarded.load(std::sync::atomic::Ordering::SeqCst),
             0,
             "oversized requestState must not reach call_tool_once"
+        );
+    }
+
+    #[tokio::test]
+    async fn unknown_tool_call_is_invalid_params_naming_the_tool() {
+        let mut tools = HashMap::new();
+        tools.insert(
+            "ask".to_string(),
+            Tooling::Tool(Arc::new(StubTool("ask")) as Arc<dyn SpiceModelTool>),
+        );
+        let server = RuntimeServer::new(Arc::new(RwLock::new(tools)));
+        let service = rmcp::transport::streamable_http_server::StreamableHttpService::new(
+            move || Ok(server.clone()),
+            Arc::new(
+                rmcp::transport::streamable_http_server::session::local::LocalSessionManager::default(),
+            ),
+            rmcp::transport::streamable_http_server::StreamableHttpServerConfig::default()
+                .with_legacy_session_mode(true)
+                .disable_allowed_hosts()
+                .with_json_response(true),
+        );
+
+        let body = json!({
+            "jsonrpc": "2.0",
+            "id": 6,
+            "method": "tools/call",
+            "params": {
+                "name": "no_such_tool",
+                "arguments": {},
+                "_meta": {
+                    "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+                    "io.modelcontextprotocol/clientInfo": {
+                        "name": "runtime-tools-test",
+                        "version": "0.0.0"
+                    },
+                    "io.modelcontextprotocol/clientCapabilities": {}
+                }
+            }
+        });
+        let request = http::Request::builder()
+            .method("POST")
+            .uri("/")
+            .header("host", "localhost")
+            .header("content-type", "application/json")
+            .header("accept", "application/json, text/event-stream")
+            .header("mcp-protocol-version", "2026-07-28")
+            .header("mcp-method", "tools/call")
+            .header("mcp-name", "no_such_tool")
+            .body(http_body_util::Full::new(bytes::Bytes::from(
+                body.to_string(),
+            )))
+            .expect("valid unknown-tool tools/call request");
+        let response = service.handle(authenticated(request)).await;
+        let status = response.status();
+        let collected = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("response body");
+        let bytes = collected.to_bytes();
+        let json_str = std::str::from_utf8(&bytes).unwrap_or("<non-utf8>");
+        let json_payload = json_str
+            .lines()
+            .find_map(|line| line.strip_prefix("data: "))
+            .unwrap_or(json_str);
+        let json: Value = serde_json::from_str(json_payload)
+            .unwrap_or_else(|e| panic!("JSON-RPC body ({status}): {e}: {json_str:?}"));
+        assert_eq!(
+            json.pointer("/error/code").and_then(Value::as_i64),
+            Some(-32602),
+            "an unknown tool must be invalid_params, not method_not_found, got {status} {json}"
+        );
+        assert_ne!(
+            status,
+            http::StatusCode::NOT_FOUND,
+            "an unknown tool must not be reported as a missing `tools/call` method: {json}"
+        );
+        let message = json
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert_eq!(
+            message,
+            unknown_tool_refusal("no_such_tool"),
+            "error must name the rejected tool: {message}"
+        );
+    }
+
+    #[test]
+    fn unknown_tool_refusal_names_the_tool_and_how_to_list_tools() {
+        let message = unknown_tool_refusal("no_such_tool");
+        assert_eq!(
+            message,
+            "Unknown tool: 'no_such_tool'. This runtime exposes no tool with that name, so nothing ran. Call `tools/list` for the tools it exposes. See https://spiceai.org/docs/features/large-language-models/mcp"
         );
     }
 
