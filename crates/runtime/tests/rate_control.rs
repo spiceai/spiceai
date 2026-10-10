@@ -84,21 +84,39 @@ fn state_url(state_dir: &Path) -> String {
         .to_string()
 }
 
-/// Two saturated replicas sharing one cluster budget should not exceed it.
-///
-/// This is the regression test for the previous "max-merge" implementation
-/// which silently allowed N×budget combined throughput.
-#[tokio::test]
-async fn cluster_lease_caps_combined_throughput_under_saturation() {
+/// What two replicas driven as hard as they can acquired from one cluster
+/// budget.
+struct SaturatedRun {
+    count_a: u64,
+    count_b: u64,
+    elapsed: Duration,
+}
+
+impl SaturatedRun {
+    fn observed_rps(&self) -> f64 {
+        let combined = u32::try_from(self.count_a + self.count_b)
+            .expect("combined acquisition count should fit in u32");
+        f64::from(combined) / self.elapsed.as_secs_f64()
+    }
+}
+
+/// Start two runtimes that share one `file://` state location with a 1s
+/// window, give each a controller for the same origin with its own config, and
+/// drive both as hard as they can for `warmup` and then `measure`, counting
+/// only the permits acquired during `measure`.
+async fn drive_two_saturated_replicas(
+    config_a: &HttpRateControlConfig,
+    config_b: &HttpRateControlConfig,
+    warmup: Duration,
+    measure: Duration,
+) -> SaturatedRun {
     let temp_dir = tempfile::tempdir().expect("create temp dir");
     let state_dir = temp_dir.path().join("rate-control-state");
     let state_location = state_url(&state_dir);
 
-    // Window = 1s (refresh_interval), cluster budget = 10 RPS.
+    // Window = 1s (refresh_interval).
     let refresh_interval = "1s";
-    let cluster_rps: u32 = 10;
     let origin_url = Url::parse(ORIGIN_URL).expect("origin URL parse");
-    let config = rps_config(cluster_rps);
 
     let app_a = app_with_file_rate_control(&state_location, refresh_interval);
     let app_b = app_with_file_rate_control(&state_location, refresh_interval);
@@ -113,7 +131,7 @@ async fn cluster_lease_caps_combined_throughput_under_saturation() {
         .http_rate_control_registry()
         .shared_rate_controller_for_component(
             &origin_url,
-            &config,
+            config_a,
             dataset_a.app.name.as_str(),
             &ConnectorComponent::from(&dataset_a),
             "https",
@@ -124,7 +142,7 @@ async fn cluster_lease_caps_combined_throughput_under_saturation() {
         .http_rate_control_registry()
         .shared_rate_controller_for_component(
             &origin_url,
-            &config,
+            config_b,
             dataset_b.app.name.as_str(),
             &ConnectorComponent::from(&dataset_b),
             "https",
@@ -135,15 +153,13 @@ async fn cluster_lease_caps_combined_throughput_under_saturation() {
     let ctrl_a = shared_a.controller.expect("a enabled");
     let ctrl_b = shared_b.controller.expect("b enabled");
 
-    // Drive both replicas as hard as we can for `duration`. Count the total
-    // number of permits each acquires.
-    let duration = Duration::from_secs(5);
-    let started = tokio::time::Instant::now();
-
+    // Count the permits each replica acquires once the warmup is over.
+    let measure_from = tokio::time::Instant::now() + warmup;
+    let measure_until = measure_from + measure;
     let driver = |ctrl: Arc<runtime_rate_control::RateController>| async move {
         let mut count: u64 = 0;
-        while started.elapsed() < duration {
-            if ctrl.acquire().await.is_ok() {
+        while tokio::time::Instant::now() < measure_until {
+            if ctrl.acquire().await.is_ok() && tokio::time::Instant::now() >= measure_from {
                 count += 1;
             }
         }
@@ -151,11 +167,31 @@ async fn cluster_lease_caps_combined_throughput_under_saturation() {
     };
 
     let (count_a, count_b) = tokio::join!(driver(Arc::clone(&ctrl_a)), driver(Arc::clone(&ctrl_b)));
-    let combined = count_a + count_b;
-    let elapsed = started.elapsed();
-    let observed_rps =
-        f64::from(u32::try_from(combined).expect("combined acquisition count should fit in u32"))
-            / elapsed.as_secs_f64();
+    SaturatedRun {
+        count_a,
+        count_b,
+        elapsed: measure_from.elapsed(),
+    }
+}
+
+/// Two saturated replicas sharing one cluster budget should not exceed it.
+///
+/// This is the regression test for the previous "max-merge" implementation
+/// which silently allowed N×budget combined throughput.
+#[tokio::test]
+async fn cluster_lease_caps_combined_throughput_under_saturation() {
+    // Cluster budget = 10 RPS.
+    let cluster_rps: u32 = 10;
+    let config = rps_config(cluster_rps);
+    let run =
+        drive_two_saturated_replicas(&config, &config, Duration::ZERO, Duration::from_secs(5))
+            .await;
+    let observed_rps = run.observed_rps();
+    let SaturatedRun {
+        count_a,
+        count_b,
+        elapsed,
+    } = run;
 
     // Allow up to one extra window of burst above the steady-state cap (10 RPS):
     // worst-case overshoot per window = burst_per_window = 10. With ~5 windows
@@ -172,6 +208,46 @@ async fn cluster_lease_caps_combined_throughput_under_saturation() {
     assert!(
         observed_rps >= f64::from(cluster_rps) * 0.7,
         "combined observed {observed_rps:.1} RPS below 70% of cap {cluster_rps} (a={count_a} b={count_b})"
+    );
+}
+
+/// Two saturated replicas that set different `requests_per_second_limit`
+/// values for one origin are held together to the lower one.
+///
+/// Regression test for #14913: each value leased under its own key in the
+/// shared state, so the replicas sent the sum of both limits — 30 RPS here.
+#[tokio::test]
+async fn replicas_with_different_limits_are_held_to_the_lowest() {
+    let (lower, higher) = (10_u32, 20_u32);
+    // Grants are first-write-wins, so the replica at 20 keeps whatever it
+    // leased before it first saw the one at 10: up to three windows when the
+    // two replicas' first refreshes straddle a window boundary. The warmup
+    // covers them; the measurement is of the steady state.
+    let run = drive_two_saturated_replicas(
+        &rps_config(lower),
+        &rps_config(higher),
+        Duration::from_secs(3),
+        Duration::from_secs(5),
+    )
+    .await;
+    let observed_rps = run.observed_rps();
+    let SaturatedRun {
+        count_a,
+        count_b,
+        elapsed,
+    } = run;
+
+    // The measurement can straddle one window more than it spans; half a
+    // window of slack above the lower limit allows for that and stays below
+    // what the higher limit alone would admit.
+    let max_allowed = f64::from(lower) * 1.5;
+    assert!(
+        observed_rps <= max_allowed,
+        "replicas at {lower} and {higher} RPS sent {observed_rps:.1} RPS combined, above {max_allowed:.1} (a={count_a} b={count_b} elapsed={elapsed:?})"
+    );
+    assert!(
+        observed_rps >= f64::from(lower) * 0.7,
+        "replicas at {lower} and {higher} RPS sent {observed_rps:.1} RPS combined, below 70% of {lower} (a={count_a} b={count_b})"
     );
 }
 
