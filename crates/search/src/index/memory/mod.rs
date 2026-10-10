@@ -400,7 +400,7 @@ impl Index for MemoryVectorIndex {
             // be staged too and the `on_write_complete` that follows it would publish that
             // staged set as the whole index — dropping every row the abandoned window had
             // not re-sent. Discarding is a no-op in the usual case of no window open.
-            WriteWindow::Append => store.abandon_replace_window(),
+            WriteWindow::Append | WriteWindow::Rebuild => store.abandon_replace_window(),
         }
         Ok(())
     }

@@ -38,6 +38,8 @@ use serde_json::{Value, json};
 mod ai_udf;
 mod bedrock;
 mod embedding;
+#[cfg(feature = "duckdb")]
+mod fts_restart;
 pub(crate) mod hf;
 #[cfg(feature = "duckdb")]
 mod hnsw_index;
