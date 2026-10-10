@@ -174,7 +174,7 @@ cargo test -p cayenne --features result-correctness-chdb \
 cargo test -p cayenne --test result_correctness_vs_sqlite_test -- --test-threads=1
 
 # Spice DuckDB / SQLite accelerators ↔ standalone oracles
-cargo test -p runtime --features duckdb,sqlite --test result_correctness -- --nocapture
+cargo test -p runtime --features duckdb,sqlite --test integration result_correctness:: -- --nocapture
 ```
 
 ## What the gate runs

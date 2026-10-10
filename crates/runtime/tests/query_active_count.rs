@@ -33,8 +33,9 @@ limitations under the License.
 //!
 //! Regression test for <https://github.com/spiceai/spiceai/issues/12883>.
 //!
-//! This lives in its own test binary because the meter install is global: the
-//! instrument is a `LazyLock` over `global::meter(..)`, so it binds to whichever
+//! It needs a process of its own, which nextest gives every test (see
+//! `utils::require_process_per_test`): the meter install is global, the
+//! instrument is a `LazyLock` over `global::meter(..)` that binds to whichever
 //! provider is installed when it is first touched, and a count assertion is only
 //! stable when no other test is recording on the same series.
 
@@ -109,6 +110,9 @@ fn query_active_count(registry: &prometheus::Registry) -> f64 {
 
 #[test]
 fn query_active_count_returns_to_baseline_whatever_order_queries_finish_in() {
+    crate::utils::require_process_per_test(
+        "this test installs the process-global OpenTelemetry meter provider and reads exact counts from it",
+    );
     let registry = &*PROMETHEUS;
     let context = Arc::new(RequestContext::builder(Protocol::Http).build());
 

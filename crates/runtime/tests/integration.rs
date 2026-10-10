@@ -136,9 +136,12 @@ mod iceberg;
 mod iceberg_api;
 mod json;
 
+#[cfg(not(windows))]
+mod cdc_cayenne;
 #[cfg(feature = "debezium")]
 mod cdc_ingest;
 mod cluster_tls_reload;
+mod initial_load_supersede;
 #[cfg(feature = "kafka")]
 mod kafka;
 mod metadata;
@@ -164,10 +167,15 @@ mod postgres;
 mod prepared_statements;
 #[cfg(any(feature = "mongodb", feature = "dynamodb", feature = "cosmosdb"))]
 mod pushdown_roundtrip;
+mod query_active_count;
+mod query_panic_is_an_error;
 mod ready_state;
 mod refresh_retry;
 mod refresh_sql;
 mod refresh_worker_panic;
+mod reload_start_time_only;
+#[cfg(all(feature = "duckdb", feature = "sqlite"))]
+mod result_correctness;
 mod results_cache;
 mod results_cache_warmup;
 #[cfg(all(unix, feature = "duckdb", feature = "postgres"))]
@@ -438,4 +446,38 @@ where
     }
 
     Ok(())
+}
+
+/// `autotests = false` means cargo compiles only the test targets `Cargo.toml`
+/// names, so a new `tests/<name>.rs` that is neither a module here nor its own
+/// `[[test]]` would build nothing and its tests would never run, silently.
+#[test]
+fn every_test_file_is_compiled() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let root = std::fs::read_to_string(dir.join("tests/integration.rs"))
+        .expect("tests/integration.rs should be readable");
+    let manifest =
+        std::fs::read_to_string(dir.join("Cargo.toml")).expect("Cargo.toml should be readable");
+    let mut missing: Vec<String> = std::fs::read_dir(dir.join("tests"))
+        .expect("tests/ should be readable")
+        .map(|entry| entry.expect("tests/ entry should be readable").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+        .filter_map(|path| Some(path.file_stem()?.to_str()?.to_string()))
+        .filter(|stem| stem != "integration")
+        .filter(|stem| {
+            !root
+                .lines()
+                .any(|line| line.trim() == format!("mod {stem};"))
+                && !manifest
+                    .lines()
+                    .any(|line| line.trim() == format!("path = \"tests/{stem}.rs\""))
+        })
+        .collect();
+    missing.sort();
+    assert!(
+        missing.is_empty(),
+        "these files in crates/runtime/tests are not compiled into any test binary: \
+         {missing:?}. Add `mod <name>;` to tests/integration.rs, or a `[[test]]` \
+         entry in crates/runtime/Cargo.toml if the file needs its own process"
+    );
 }
