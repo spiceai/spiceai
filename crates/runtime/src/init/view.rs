@@ -238,7 +238,7 @@ impl Runtime {
 
             let runtime = Arc::clone(&self);
             tasks.push(tokio::spawn(async move {
-                let _done = done.drop_guard();
+                let done = done.drop_guard();
                 let pending: Vec<String> = waits
                     .iter()
                     .filter(|(_, token)| !token.is_cancelled())
@@ -264,7 +264,7 @@ impl Runtime {
                     }
                 }
                 let secrets = runtime.secrets();
-                if let Err(e) = runtime.load_view(&view, secrets) {
+                if let Err(e) = runtime.load_view_signalling(&view, secrets, Some(done)) {
                     let view_name = &view.name;
                     tracing::error!("Unable to load view {view_name}: {e}");
                 }
@@ -500,6 +500,18 @@ impl Runtime {
     }
 
     fn load_view(self: Arc<Self>, view: &Arc<View>, secrets: Arc<RwLock<Secrets>>) -> Result<()> {
+        self.load_view_signalling(view, secrets, None)
+    }
+
+    /// Like [`Self::load_view`], holding `registered` until the view's registration
+    /// task ends (registered or failed), so views depending on it wait for that
+    /// rather than for the task to be spawned.
+    fn load_view_signalling(
+        self: Arc<Self>,
+        view: &Arc<View>,
+        secrets: Arc<RwLock<Secrets>>,
+        registered: Option<tokio_util::sync::DropGuard>,
+    ) -> Result<()> {
         let df = Arc::clone(&self.df);
         let register_task = df
             .register_view(Arc::clone(view), secrets)
@@ -518,6 +530,7 @@ impl Runtime {
         tokio::task::spawn(async move {
             let view_name = view.name.clone();
             let notifier = register_task.await;
+            drop(registered);
             match notifier {
                 Ok(Some((instance, completion))) => {
                     // `instance` was captured where the view was registered, so
