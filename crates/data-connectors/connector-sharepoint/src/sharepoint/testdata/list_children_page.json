@@ -1,0 +1,143 @@
+{
+  "@odata.context": "https://graph.microsoft.com/v1.0/$metadata#users('AdeleV%40contoso.com')/drive/root/children",
+  "value": [
+    {
+      "createdBy": {
+        "application": {
+          "id": "cc15fd57-2c6c-4117-a88c-83b1d56b4bbe",
+          "displayName": "Microsoft Teams Services"
+        },
+        "user": {
+          "email": "AdeleV@contoso.com",
+          "id": "87d349ed-44d7-43e1-9a83-5f2406dee5bd",
+          "displayName": "Adele Vance"
+        }
+      },
+      "createdDateTime": "2020-08-21T12:25:29Z",
+      "eTag": "\"{A218B307-2295-4A5D-8D78-F15C499CF513},1\"",
+      "id": "01BYE5RZ4HWMMKFFJCLVFI26HRLREZZ5IT",
+      "lastModifiedBy": {
+        "application": {
+          "id": "cc15fd57-2c6c-4117-a88c-83b1d56b4bbe",
+          "displayName": "Microsoft Teams Services"
+        },
+        "user": {
+          "email": "AdeleV@contoso.com",
+          "id": "87d349ed-44d7-43e1-9a83-5f2406dee5bd",
+          "displayName": "Adele Vance"
+        }
+      },
+      "lastModifiedDateTime": "2020-08-21T12:25:29Z",
+      "name": "General",
+      "parentReference": {
+        "driveType": "documentLibrary",
+        "driveId": "b!-RIj2DuyvEyV1T4NlOaMHk8XkS_I8MdFlUCq1BlcjgmhRfAj3-Z8RY2VpuvV_tpd",
+        "id": "01BYE5RZ56Y2GOVW7725BZO354PWSELRRZ",
+        "name": "Shared Documents",
+        "path": "/drive/root:",
+        "siteId": "6bdd4d33-4fd9-44e6-8bf8-8b605bca02f5"
+      },
+      "webUrl": "https://contoso.sharepoint.com/sites/Marketing/Shared%20Documents/General",
+      "fileSystemInfo": {
+        "createdDateTime": "2020-08-21T12:25:29Z",
+        "lastModifiedDateTime": "2020-08-21T12:25:29Z"
+      },
+      "folder": {
+        "childCount": 2
+      },
+      "isAuthoritative": false,
+      "shared": {
+        "scope": "users"
+      },
+      "size": 5814
+    },
+    {
+      "@microsoft.graph.downloadUrlNoAuth": "https://contoso.sharepoint.com/sites/Marketing/_layouts/15/download.aspx?UniqueId=15e70678-2538-429b-895f-404c4dfbff59&Translate=false&ApiVersion=2.0",
+      "createdBy": {
+        "user": {
+          "email": "AdeleV@contoso.com",
+          "id": "87d349ed-44d7-43e1-9a83-5f2406dee5bd",
+          "displayName": "Adele Vance"
+        }
+      },
+      "createdDateTime": "2022-06-03T00:53:29Z",
+      "eTag": "\"{15E70678-2538-429B-895F-404C4DFBFF59},2\"",
+      "id": "01BYE5RZYA3TRKOBFTNBISX2AJRG7X72Z",
+      "lastModifiedBy": {
+        "user": {
+          "email": "AdeleV@contoso.com",
+          "id": "87d349ed-44d7-43e1-9a83-5f2406dee5bd",
+          "displayName": "Adele Vance"
+        }
+      },
+      "lastModifiedDateTime": "2022-01-18T23:45:01Z",
+      "name": "Quarterly report.pdf",
+      "parentReference": {
+        "driveType": "documentLibrary",
+        "driveId": "b!-RIj2DuyvEyV1T4NlOaMHk8XkS_I8MdFlUCq1BlcjgmhRfAj3-Z8RY2VpuvV_tpd",
+        "id": "01BYE5RZ56Y2GOVW7725BZO354PWSELRRZ",
+        "name": "Shared Documents",
+        "path": "/drive/root:",
+        "siteId": "6bdd4d33-4fd9-44e6-8bf8-8b605bca02f5"
+      },
+      "webUrl": "https://contoso.sharepoint.com/sites/Marketing/Shared%20Documents/Quarterly%20report.pdf",
+      "cTag": "\"c:{15E70678-2538-429B-895F-404C4DFBFF59},2\"",
+      "file": {
+        "fileExtension": ".pdf",
+        "hashes": {
+          "quickXorHash": "+iGtxBEC8MlL7z6JJcFus381YAQ="
+        },
+        "mimeType": "application/pdf"
+      },
+      "fileSystemInfo": {
+        "createdDateTime": "2022-06-03T00:53:29Z",
+        "lastModifiedDateTime": "2022-01-18T23:45:01Z"
+      },
+      "isAuthoritative": false,
+      "size": 82726
+    },
+    {
+      "@microsoft.graph.downloadUrlNoAuth": "https://contoso.sharepoint.com/sites/Marketing/_layouts/15/download.aspx?UniqueId=4d0f5e7a-6c1b-4b8e-9e2a-3f7c1d2b8a90&Translate=false&ApiVersion=2.0",
+      "createdBy": {
+        "application": {
+          "id": "cc15fd57-2c6c-4117-a88c-83b1d56b4bbe",
+          "displayName": "Microsoft Teams Services"
+        }
+      },
+      "createdDateTime": "2023-03-14T09:30:00Z",
+      "eTag": "\"{4D0F5E7A-6C1B-4B8E-9E2A-3F7C1D2B8A90},2\"",
+      "id": "01BYE5RZ2RBIL4DGKMYNE3SCQF4WMZ3XMF",
+      "lastModifiedBy": {
+        "application": {
+          "id": "cc15fd57-2c6c-4117-a88c-83b1d56b4bbe",
+          "displayName": "Microsoft Teams Services"
+        }
+      },
+      "lastModifiedDateTime": "2023-03-14T09:30:00Z",
+      "name": "export.csv",
+      "parentReference": {
+        "driveType": "documentLibrary",
+        "driveId": "b!-RIj2DuyvEyV1T4NlOaMHk8XkS_I8MdFlUCq1BlcjgmhRfAj3-Z8RY2VpuvV_tpd",
+        "id": "01BYE5RZ56Y2GOVW7725BZO354PWSELRRZ",
+        "name": "Shared Documents",
+        "path": "/drive/root:",
+        "siteId": "6bdd4d33-4fd9-44e6-8bf8-8b605bca02f5"
+      },
+      "webUrl": "https://contoso.sharepoint.com/sites/Marketing/Shared%20Documents/export.csv",
+      "cTag": "\"c:{4D0F5E7A-6C1B-4B8E-9E2A-3F7C1D2B8A90},2\"",
+      "file": {
+        "fileExtension": ".csv",
+        "hashes": {
+          "quickXorHash": "+iGtxBEC8MlL7z6JJcFus381YAQ="
+        },
+        "mimeType": "text/csv"
+      },
+      "fileSystemInfo": {
+        "createdDateTime": "2023-03-14T09:30:00Z",
+        "lastModifiedDateTime": "2023-03-14T09:30:00Z"
+      },
+      "isAuthoritative": false,
+      "size": 1024
+    }
+  ]
+}

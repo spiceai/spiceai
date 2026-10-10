@@ -270,6 +270,10 @@ pub enum AcceleratedTableBuilderError {
     #[snafu(transparent)]
     AcceleratedTableError { source: Error },
 
+    /// Raised after the builder started producers or accepted writes.
+    #[snafu(display("{source}"))]
+    FailedAfterStart { source: Error },
+
     #[snafu(display(
         "Failed to accelerate dataset {dataset_name}: durable write-back delivers each committed row to the source keyed on the primary key, and only a single-column key can be delivered on, but this dataset's accelerator resolved a {pk_columns}-column key. Declare a single-column 'acceleration.primary_key', or use a different 'acceleration.write_mode'. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
     ))]
@@ -289,6 +293,15 @@ pub enum AcceleratedTableBuilderError {
 }
 
 pub type AcceleratedTableBuilderResult<T> = std::result::Result<T, AcceleratedTableBuilderError>;
+
+impl AcceleratedTableBuilderError {
+    /// Whether [`Builder::build`] may have started producers or accepted writes
+    /// before failing. A rejected setting fails before anything starts.
+    #[must_use]
+    pub fn may_have_started_ingestion(&self) -> bool {
+        matches!(self, Self::FailedAfterStart { .. })
+    }
+}
 
 // An accelerated table consists of a federated table and a local accelerator.
 //
@@ -1197,7 +1210,9 @@ impl Builder {
                 synchronize_with
                     .prepare_cache_child(child)
                     .await
-                    .map_err(|source| Error::FailedToWriteData { source })?,
+                    .map_err(|source| AcceleratedTableBuilderError::FailedAfterStart {
+                        source: Error::FailedToWriteData { source },
+                    })?,
             )
         } else {
             None
@@ -1229,7 +1244,12 @@ impl Builder {
                 (None, None)
             } else {
                 (
-                    refresher.start(acceleration_refresh_mode).await?,
+                    refresher
+                        .start(acceleration_refresh_mode)
+                        .await
+                        .map_err(|source| AcceleratedTableBuilderError::FailedAfterStart {
+                            source,
+                        })?,
                     refresh_trigger,
                 )
             };
@@ -1413,9 +1433,11 @@ impl Builder {
             user_facing_schema: self.user_facing_schema,
         };
         if let Some(prepared_child) = prepared_child {
-            let rows = prepared_child
-                .publish()
-                .map_err(|source| Error::FailedToWriteData { source })?;
+            let rows = prepared_child.publish().map_err(|source| {
+                AcceleratedTableBuilderError::FailedAfterStart {
+                    source: Error::FailedToWriteData { source },
+                }
+            })?;
             if let Some(synchronize_with) = &table.synchronized_with {
                 if rows > 0 {
                     tracing::info!(
@@ -1920,6 +1942,30 @@ impl AcceleratedTable {
             }
         }
 
+        // An explicit-empty request body is a POST whose response the cache
+        // stores exactly as it stores a GET's, so the cache cannot answer it
+        // without risking the other method's response. Ask the source, as the
+        // unaccelerated dataset does, and cache nothing.
+        if is_caching_mode && caching::sends_explicit_empty_request_body(filters) {
+            // Every source column, aligned by name: `projection` indexes this
+            // layer's schema, which need not match the source's.
+            let federated_provider = self.federated.table_provider().await;
+            let plan = federated_provider.scan(state, None, filters, limit).await?;
+            return Ok(Arc::new(SchemaCastScanExec::new(
+                plan,
+                self.scan_output_schema(projection),
+            )));
+        }
+
+        // A GET lookup must not match the POST entries cached for the same
+        // path. Without filters the scan lists the whole cache and makes no
+        // request, so nothing is pinned.
+        let identity_filters: Vec<Expr> = if is_caching_mode && !filters.is_empty() {
+            caching::request_identity_filters(filters, &self.accelerator.schema())
+        } else {
+            Vec::new()
+        };
+
         // For caching mode, scope the accelerator scan to the current
         // request's namespace by appending a `__spice_cache_namespace = $ns_id`
         // predicate. The federated source still receives only the user's
@@ -1956,6 +2002,7 @@ impl AcceleratedTable {
         if let Some(nf) = namespace_filter {
             storage_filters.push(nf);
         }
+        storage_filters.extend(identity_filters);
         let scan_filters: &[Expr] = if is_caching_mode {
             &storage_filters
         } else {
@@ -2102,24 +2149,32 @@ impl AcceleratedTable {
             }
         };
 
-        // Compute the target schema based on user's original projection.
-        // SchemaCastScanExec strips extra columns (like _fetched_at added for caching)
-        // and casts types. The schema should match what the user requested.
-        //
-        // Drop the extended-inference hints (`spice.inferred_*`) from this physical
-        // scan-output schema. They stay on the logical `TableProvider::schema()`
-        // chain — so `MetadataEnrichedTableProvider` still surfaces the inferred
-        // row-count/byte-size as table statistics and an accelerator keeps its
-        // tuning warm-start — but their values vary per table, and DataFusion
-        // builds a join's output schema by merging its inputs' schema-level
-        // metadata in input order. Leaving them here lets `join_selection`'s
-        // build/probe swap flip the surviving values, so the rule's output schema
-        // no longer equals its input and the physical-optimizer schema invariant
-        // fails. See `data_components::inferred_schema`.
+        Ok(Arc::new(SchemaCastScanExec::new(
+            plan,
+            self.scan_output_schema(projection),
+        )))
+    }
+
+    /// The schema a scan of this layer returns for the user's original
+    /// projection. `SchemaCastScanExec` aligns a plan to it, stripping extra
+    /// columns (like `_fetched_at` added for caching) and casting types, so
+    /// the output matches what the user requested.
+    ///
+    /// Drop the extended-inference hints (`spice.inferred_*`) from this physical
+    /// scan-output schema. They stay on the logical `TableProvider::schema()`
+    /// chain — so `MetadataEnrichedTableProvider` still surfaces the inferred
+    /// row-count/byte-size as table statistics and an accelerator keeps its
+    /// tuning warm-start — but their values vary per table, and `DataFusion`
+    /// builds a join's output schema by merging its inputs' schema-level
+    /// metadata in input order. Leaving them here lets `join_selection`'s
+    /// build/probe swap flip the surviving values, so the rule's output schema
+    /// no longer equals its input and the physical-optimizer schema invariant
+    /// fails. See `data_components::inferred_schema`.
+    fn scan_output_schema(&self, projection: Option<&Vec<usize>>) -> SchemaRef {
         let full_schema = self.schema();
         let mut metadata = full_schema.metadata().clone();
         data_components::inferred_schema::strip_inferred_metadata(&mut metadata);
-        let target_schema = match projection {
+        match projection {
             Some(indices) => {
                 let projected_fields: Vec<_> = indices
                     .iter()
@@ -2131,9 +2186,7 @@ impl AcceleratedTable {
                 full_schema.fields().clone(),
                 metadata,
             )),
-        };
-
-        Ok(Arc::new(SchemaCastScanExec::new(plan, target_schema)))
+        }
     }
 }
 
