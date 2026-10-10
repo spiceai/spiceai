@@ -3,7 +3,10 @@
 # SPDX-License-Identifier: Apache-2.0
 """Query live Hugging Face Hub datasets through spiced and diff every answer.
 
-Each dataset is pinned to an immutable commit, so its expected answer cannot drift. The
+Each dataset is pinned to an immutable commit, so its expected answer cannot drift. The one
+exception is imdb's `refs/convert/parquet` branch, which no pin survives: it is read through
+`@~parquet`, and its answer stays fixed as long as the `main` commit it converts is the pinned
+one, which `check_revisions` asserts before spiced starts. The
 answers were recorded with DuckDB's own `hf://` reader, which shares no code with Spice. When
 `duckdb` is on PATH (or `--duckdb` names it) the script derives them again live, and both
 Spice's and DuckDB's answers must equal the recorded ones.
@@ -34,9 +37,11 @@ IMDB = "hf://datasets/stanfordnlp/imdb@e6281661ce1c48d982bc483cf8a173c1bbeb5d31"
 GSM8K = "hf://datasets/openai/gsm8k@740312add88f781978c0658806c59bc2815b9866"
 SCIFACT = "hf://datasets/mteb/scifact@cf10ab6856b15b0e670ef8ae5dae4e266c12d035"
 IRIS = "hf://datasets/scikit-learn/iris@0bda0ce801be0fa2f464ff845a9d5ceae99aad7d"
-# The commit of imdb's `refs/convert/parquet`, the branch `@~parquet` names: pinned, since the
-# Hub may regenerate the conversion. The alias itself is covered by the parser's unit tests.
-IMDB_CONVERTED = "hf://datasets/stanfordnlp/imdb@0b525c3ee2447b87002590030af0cdeaf509422a"
+# imdb's `refs/convert/parquet`, the branch `@~parquet` names. The Hub regenerates it as a new
+# single-commit history and deletes the commit it replaces, so a pin of it eventually 404s.
+# The conversion is derived from `main`, so its answers hold while `main` is IMDB's commit.
+IMDB_CONVERTED = "hf://datasets/stanfordnlp/imdb@~parquet"
+HUB_API = "https://huggingface.co/api/datasets"
 
 # name -> (from, Spice SQL, DuckDB SQL over the same files, recorded answer). The answers
 # are integers so the engines cannot disagree on formatting.
@@ -152,8 +157,53 @@ def row_hash(rows: list[dict]) -> str:
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 
+def hub_get(path: str):
+    headers = {"Accept": "application/json"}
+    if token := os.environ.get("HF_TOKEN"):
+        headers["Authorization"] = f"Bearer {token}"
+    with urlopen(Request(f"{HUB_API}/{path}", headers=headers), timeout=60) as response:
+        return json.loads(response.read().decode())
+
+
+def check_revisions() -> None:
+    """Fail in seconds, naming the dataset, when a pinned revision no longer holds.
+
+    spiced keeps retrying a dataset whose files it cannot list, so without this a revision
+    gone from the Hub shows up only as a runtime that never becomes ready.
+    """
+    pinned: dict[str, set[str]] = {}
+    for location, *_rest in CASES.values():
+        repo, _, rest = location.removeprefix("hf://datasets/").partition("@")
+        pinned.setdefault(repo, set()).add(rest.split("/", 1)[0])
+    gone = []
+    for repo, revisions in sorted(pinned.items()):
+        for revision in sorted(revisions - {"~parquet"}):
+            try:
+                hub_get(f"{repo}/revision/{revision}")
+            except HTTPError as error:
+                gone.append(f"{repo}@{revision} (HTTP {error.code})")
+    assert not gone, "Pinned Hub revisions no longer resolve; repin them: " + ", ".join(gone)
+    refs = hub_get("stanfordnlp/imdb/refs")
+    main = next(branch["targetCommit"] for branch in refs["branches"] if branch["name"] == "main")
+    pinned_main = IMDB.rpartition("@")[2]
+    assert main == pinned_main, (
+        f"stanfordnlp/imdb main moved from {pinned_main} to {main}, so its `@~parquet` conversion "
+        "may no longer match the recorded imdb_converted answer; repin IMDB and re-record it with DuckDB"
+    )
+
+
+def print_log_tail(path: Path, lines: int = 200) -> None:
+    """Print the end of the runtime log, since pull request and merge-queue runs keep no artifacts."""
+    with contextlib.suppress(OSError):
+        tail = path.read_text(errors="replace").splitlines()[-lines:]
+        print(f"::group::Last {len(tail)} lines of {path.name}", flush=True)
+        print("\n".join(tail), flush=True)
+        print("::endgroup::", flush=True)
+
+
 def run(spiced: Path, directory: Path, timeout: float, duckdb: str | None) -> None:
     directory.mkdir(parents=True, exist_ok=True)
+    check_revisions()
     http_port, flight_port = ports()
     endpoint = f"http://127.0.0.1:{http_port}"
     datasets = []
@@ -185,6 +235,7 @@ def run(spiced: Path, directory: Path, timeout: float, duckdb: str | None) -> No
     )
     results = []
     process = None
+    passed = False
     try:
         with (directory / "spice.log").open("w") as log:
             process = subprocess.Popen(
@@ -262,6 +313,7 @@ def run(spiced: Path, directory: Path, timeout: float, duckdb: str | None) -> No
                 + (", diffed against DuckDB" if duckdb else ", against recorded DuckDB answers"),
                 flush=True,
             )
+            passed = True
     finally:
         if process is not None and process.poll() is None:
             os.killpg(process.pid, signal.SIGTERM)
@@ -271,6 +323,8 @@ def run(spiced: Path, directory: Path, timeout: float, duckdb: str | None) -> No
                 os.killpg(process.pid, signal.SIGKILL)
                 process.wait(timeout=5)
         (directory / "results.json").write_text(json.dumps(results, indent=2))
+        if not passed:
+            print_log_tail(directory / "spice.log")
         print(f"Artifacts: {directory}", flush=True)
 
 
