@@ -56,19 +56,12 @@ fn build_provider(
 }
 
 /// Integration test that fetches real data from httpbin.org
-/// A session whose plans do not depend on the machine: DataFusion's default
-/// `target_partitions` is the number of CPU cores, and it appears in every
-/// `RepartitionExec` the snapshots record.
-fn session() -> SessionContext {
-    SessionContext::new_with_config(SessionConfig::new().with_target_partitions(16))
-}
-
 #[tokio::test]
 async fn test_http_provider_with_real_endpoint() {
     let provider = build_provider("https://httpbin.org", "json", &["/json"], false, false);
 
     // Create a DataFusion context
-    let ctx = session();
+    let ctx = SessionContext::new();
     ctx.register_table("httpbin", Arc::new(provider))
         .expect("Failed to register table");
 
@@ -121,7 +114,7 @@ async fn test_http_provider_with_real_endpoint() {
 async fn test_http_provider_with_request_query_params() {
     let provider = build_provider("https://httpbin.org", "json", &["/get"], true, false);
 
-    let ctx = session();
+    let ctx = SessionContext::new();
     ctx.register_table("httpbin", Arc::new(provider))
         .expect("Failed to register table");
 
@@ -178,7 +171,7 @@ async fn test_http_provider_with_request_query_params() {
 async fn test_http_provider_without_filters() {
     let provider = build_provider("https://httpbin.org/get", "json", &[], false, false);
 
-    let ctx = session();
+    let ctx = SessionContext::new();
     ctx.register_table("httpbin", Arc::new(provider))
         .expect("Failed to register table");
 
@@ -206,7 +199,7 @@ async fn test_http_provider_with_base_request_path() {
         false,
     );
 
-    let ctx = session();
+    let ctx = SessionContext::new();
     ctx.register_table("httpbin", Arc::new(provider))
         .expect("Failed to register table");
 
@@ -249,7 +242,7 @@ async fn test_tvmaze_single_object() {
         false,
     );
 
-    let ctx = session();
+    let ctx = SessionContext::new();
     ctx.register_table("tvmaze", Arc::new(provider))
         .expect("Failed to register table");
 
@@ -322,7 +315,7 @@ async fn test_tvmaze_multi_object() {
         false,
     );
 
-    let ctx = session();
+    let ctx = SessionContext::new();
     ctx.register_table("tvmaze", Arc::new(provider))
         .expect("Failed to register table");
 
@@ -407,9 +400,8 @@ async fn test_tvmaze_multi_object() {
 }
 
 /// Integration test with `TVMaze` API - Combined OR filter
-/// An OR across `request_path` and `request_query` would have the connector
-/// issue combined HTTP requests instead of separate ones, so it is refused at
-/// planning with an error that names the alternatives (#10625).
+/// Tests multiple endpoints in a single query using OR
+/// Expected: Returns rows from both endpoints combined
 #[tokio::test]
 async fn test_tvmaze_combined_or_filter() {
     let provider = build_provider(
@@ -420,7 +412,7 @@ async fn test_tvmaze_combined_or_filter() {
         false,
     );
 
-    let ctx = session();
+    let ctx = SessionContext::new();
     ctx.register_table("tvmaze", Arc::new(provider))
         .expect("Failed to register table");
 
@@ -446,19 +438,38 @@ async fn test_tvmaze_combined_or_filter() {
         insta::assert_snapshot!("tvmaze_combined_or_filter_explain", explain_plan);
     });
 
-    let err = ctx
-        .sql(query)
-        .await
-        .expect("Failed to create dataframe")
-        .collect()
-        .await
-        .expect_err("an OR across HTTP filter columns must be refused");
-    let message = err.to_string();
+    // Query combining single object and array endpoints
+    // Note: We only filter on request_path for the single object, not on request_query
+    let df = ctx.sql(query).await.expect("Failed to create dataframe");
+
+    let results = df.collect().await.expect("Failed to execute query");
+
+    assert!(!results.is_empty(), "Should have results");
+
+    // Collect paths to verify we got both endpoints
+    let mut has_show = false;
+    let mut has_search = false;
+
+    for batch in &results {
+        let path_col = batch.column(0);
+        let path_array = path_col
+            .as_any()
+            .downcast_ref::<arrow::array::StringArray>()
+            .expect("request_path should be StringArray");
+
+        for i in 0..batch.num_rows() {
+            match path_array.value(i) {
+                "/shows/169" => has_show = true,
+                "/search/people" => has_search = true,
+                _ => panic!("Unexpected path value: {}", path_array.value(i)),
+            }
+        }
+    }
+
+    assert!(has_show, "Should have results from /shows/169 endpoint");
     assert!(
-        message.contains(
-            "OR across different HTTP filter columns (request_path, request_query) is not supported"
-        ),
-        "unexpected error: {message}"
+        has_search,
+        "Should have results from /search/people endpoint"
     );
 }
 
@@ -475,7 +486,7 @@ async fn test_tvmaze_in_list_request_paths() {
         false,
     );
 
-    let ctx = session();
+    let ctx = SessionContext::new();
     ctx.register_table("tvmaze", Arc::new(provider))
         .expect("Failed to register table");
 
@@ -554,7 +565,7 @@ async fn test_tvmaze_in_list_request_paths() {
 async fn test_http_post_with_json_request_body() {
     let provider = build_provider("https://httpbin.org", "json", &["/post"], false, true);
 
-    let ctx = session();
+    let ctx = SessionContext::new();
     ctx.register_table("httpbin", Arc::new(provider))
         .expect("Failed to register table");
 
@@ -603,7 +614,7 @@ async fn test_http_post_with_custom_content_type() {
     let provider = build_provider("https://httpbin.org", "json", &["/post"], false, true)
         .with_content_type(Some("application/x-www-form-urlencoded".to_string()));
 
-    let ctx = session();
+    let ctx = SessionContext::new();
     ctx.register_table("httpbin", Arc::new(provider))
         .expect("Failed to register table");
 
@@ -648,7 +659,7 @@ async fn test_http_post_with_custom_content_type() {
 async fn test_http_post_multiple_bodies() {
     let provider = build_provider("https://httpbin.org", "json", &["/post"], false, true);
 
-    let ctx = session();
+    let ctx = SessionContext::new();
     ctx.register_table("httpbin", Arc::new(provider))
         .expect("Failed to register table");
 
@@ -703,7 +714,7 @@ async fn test_http_post_multiple_bodies() {
 async fn test_http_post_or_expression() {
     let provider = build_provider("https://httpbin.org", "json", &["/post"], false, true);
 
-    let ctx = session();
+    let ctx = SessionContext::new();
     ctx.register_table("httpbin", Arc::new(provider))
         .expect("Failed to register table");
 
@@ -732,7 +743,7 @@ async fn test_http_with_retries() {
     let provider =
         build_provider("https://httpbin.org", "json", &["/json"], false, false).with_max_retries(5);
 
-    let ctx = session();
+    let ctx = SessionContext::new();
     ctx.register_table("httpbin", Arc::new(provider))
         .expect("Failed to register table");
 
@@ -758,7 +769,7 @@ async fn test_csv_static_file() {
             .expect("valid URL");
     let provider = build_provider(base_url.as_str(), "csv", &[], false, false);
 
-    let ctx = session();
+    let ctx = SessionContext::new();
     ctx.register_table("iris", Arc::new(provider))
         .expect("Failed to register table");
 
@@ -801,7 +812,7 @@ async fn test_csv_column_selection() {
             .expect("valid URL");
     let provider = build_provider(base_url.as_str(), "csv", &[], false, false);
 
-    let ctx = session();
+    let ctx = SessionContext::new();
     ctx.register_table("iris", Arc::new(provider))
         .expect("Failed to register table");
 
@@ -839,7 +850,7 @@ async fn test_auto_detect_csv() {
             .expect("valid URL");
     let provider = build_provider(base_url.as_str(), "auto", &[], false, false);
 
-    let ctx = session();
+    let ctx = SessionContext::new();
     ctx.register_table("tips", Arc::new(provider))
         .expect("Failed to register table");
 
@@ -877,7 +888,7 @@ async fn test_auto_detect_json() {
         false,
     );
 
-    let ctx = session();
+    let ctx = SessionContext::new();
     ctx.register_table("tvmaze", Arc::new(provider))
         .expect("Failed to register table");
 
@@ -901,7 +912,7 @@ async fn test_ndjson_format() {
     // and treat it as NDJSON for format testing
     let provider = build_provider("https://httpbin.org", "ndjson", &["/json"], false, false);
 
-    let ctx = session();
+    let ctx = SessionContext::new();
     ctx.register_table("httpbin", Arc::new(provider))
         .expect("Failed to register table");
 
@@ -929,7 +940,7 @@ async fn test_csv_with_dynamic_filter() {
         false,
     );
 
-    let ctx = session();
+    let ctx = SessionContext::new();
     ctx.register_table("datasets", Arc::new(provider))
         .expect("Failed to register table");
 
@@ -962,7 +973,7 @@ async fn test_csv_multiple_files_in_clause() {
         false,
     );
 
-    let ctx = session();
+    let ctx = SessionContext::new();
     ctx.register_table("datasets", Arc::new(provider))
         .expect("Failed to register table");
 
@@ -1012,7 +1023,7 @@ async fn test_mixed_format_csv_json_or() {
         false,
     );
 
-    let ctx = session();
+    let ctx = SessionContext::new();
     ctx.register_table("data", Arc::new(provider))
         .expect("Failed to register table");
 
@@ -1039,7 +1050,7 @@ async fn test_glob_pattern_wildcard_explain() {
         false,
     );
 
-    let ctx = session();
+    let ctx = SessionContext::new();
     ctx.register_table("tvmaze", Arc::new(provider))
         .expect("Failed to register table");
 
@@ -1075,7 +1086,7 @@ async fn test_glob_pattern_double_wildcard_explain() {
         false,
     );
 
-    let ctx = session();
+    let ctx = SessionContext::new();
     ctx.register_table("api", Arc::new(provider))
         .expect("Failed to register table");
 
@@ -1111,7 +1122,7 @@ async fn test_glob_pattern_character_class_explain() {
         false,
     );
 
-    let ctx = session();
+    let ctx = SessionContext::new();
     ctx.register_table("api", Arc::new(provider))
         .expect("Failed to register table");
 
