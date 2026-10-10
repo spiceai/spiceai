@@ -6743,6 +6743,11 @@ impl CayenneTableProvider {
         if self.snapshot_cleanup_scheduled.swap(true, Ordering::AcqRel) {
             return;
         }
+        if !self.maintenance_still_admitted() {
+            self.snapshot_cleanup_scheduled
+                .store(false, Ordering::Release);
+            return;
+        }
 
         let table = self.clone_for_write();
         tokio::spawn(async move {
@@ -6820,6 +6825,12 @@ impl CayenneTableProvider {
     /// never propagated — a failed sweep costs disk, not correctness, and the
     /// next commit retries it.
     async fn run_old_snapshot_cleanup(&self) {
+        // The re-arm timer sleeps and then runs this directly, so a sweep can
+        // start after `quiesce` returned; this instance's pins do not cover its
+        // replacement's scans, so it must not judge any directory unused then.
+        if !self.maintenance_still_admitted() {
+            return;
+        }
         let (protected_snapshot_ids, in_use_snapshot_ids) = self.snapshot_cleanup_pins();
         let pins = SnapshotSweepPins {
             current_snapshot_id: self.get_current_snapshot_id(),
@@ -6881,6 +6892,11 @@ impl CayenneTableProvider {
             return;
         }
         if self.snapshot_cleanup_rearmed.swap(true, Ordering::AcqRel) {
+            return;
+        }
+        if !self.maintenance_still_admitted() {
+            self.snapshot_cleanup_rearmed
+                .store(false, Ordering::Release);
             return;
         }
         let table = self.clone_for_write();
@@ -19914,6 +19930,9 @@ impl CayenneTableProvider {
             );
             return Ok(false);
         };
+        if !self.maintenance_still_admitted() {
+            return Ok(false);
+        }
 
         // Position-delete-mode tables: serialize against writers + visibility
         // flips for the whole pass, identical to the protected-snapshot subset
@@ -20559,6 +20578,11 @@ impl CayenneTableProvider {
         {
             return;
         }
+        if !self.maintenance_still_admitted() {
+            self.post_write_compaction_state
+                .store(COALESCED_TASK_IDLE, Ordering::Release);
+            return;
+        }
 
         let table = self.clone_for_write();
         // Run the compaction pass (size-tiered protected-snapshot merge and/or
@@ -20646,6 +20670,11 @@ impl CayenneTableProvider {
             );
             return;
         }
+        if !self.maintenance_still_admitted() {
+            self.orphan_dv_sweep_state
+                .store(COALESCED_TASK_IDLE, Ordering::Release);
+            return;
+        }
 
         let table = self.clone_for_write();
         super::compaction::spawn_compaction(async move {
@@ -20697,6 +20726,22 @@ impl CayenneTableProvider {
         self.maintenance_closed.load(Ordering::Acquire)
     }
 
+    /// The re-check every maintenance path makes once it has claimed its task or
+    /// taken `compaction_lock`, and before it touches anything.
+    ///
+    /// The entry check alone leaves a window: a path can read "open", stall, and
+    /// claim after [`Self::quiesce`] closed the instance and saw every task idle.
+    /// Re-checking after the claim closes it. The `SeqCst` fence here pairs with
+    /// the one in `quiesce`, so of a claim and a close racing each other at least
+    /// one side sees the other: either this sees the close and backs out, or the
+    /// drain sees the claim and waits for the task. A path under `compaction_lock`
+    /// is ordered by the lock as well — the drain's final barrier takes it after
+    /// the close.
+    fn maintenance_still_admitted(&self) -> bool {
+        std::sync::atomic::fence(Ordering::SeqCst);
+        !self.maintenance_closed.load(Ordering::SeqCst)
+    }
+
     /// Take this instance out of maintenance for good, then wait for the
     /// maintenance it already started to finish.
     ///
@@ -20715,7 +20760,10 @@ impl CayenneTableProvider {
     /// stops. Idempotent. Callers must not hold `write_lock` or
     /// `compaction_lock`.
     pub async fn quiesce(&self) {
-        let already_closed = self.maintenance_closed.swap(true, Ordering::AcqRel);
+        let already_closed = self.maintenance_closed.swap(true, Ordering::SeqCst);
+        // Pairs with `maintenance_still_admitted`: a task claimed after this point
+        // sees the close; one claimed before it is visible to the drain below.
+        std::sync::atomic::fence(Ordering::SeqCst);
         if let Err(error) = self.drain_in_flight_maintenance().await {
             // The flag is set and every wait in the drain still ran, so nothing
             // is running or will start; only a queued retention/statistics pass
@@ -21351,6 +21399,11 @@ impl CayenneTableProvider {
         {
             return;
         }
+        if !self.maintenance_still_admitted() {
+            self.inline_checkpoint_scheduled
+                .store(false, Ordering::Release);
+            return;
+        }
 
         let table = self.clone_for_write();
         tokio::spawn(async move {
@@ -21760,7 +21813,11 @@ impl CayenneTableProvider {
         // manifest off the publish fence cannot resurrect or vanish a row.
         if state.refresh_listing || had_stats || retention_deleted > 0 {
             if let Ok(_compaction_guard) = self.compaction_lock.try_write() {
-                self.rebuild_live_snapshot_manifests().await;
+                // A quiesced instance's view of the live set may already be
+                // behind its replacement's, so it writes no manifest rows.
+                if self.maintenance_still_admitted() {
+                    self.rebuild_live_snapshot_manifests().await;
+                }
             } else {
                 tracing::trace!(
                     table = self.table_metadata.table_name.as_str(),
@@ -24767,6 +24824,9 @@ impl CayenneTableProvider {
         // it uses `try_write` on `compaction_lock`; if promotion owns the compaction
         // lock it skips and drops `write_lock`, so no cycle can form.
         let _compaction_guard = self.compaction_lock.write().await;
+        if !self.maintenance_still_admitted() {
+            return Ok(false);
+        }
 
         // Trigger: warm tier large/numerous enough to graduate.
         let current_snapshot_id = self.get_current_snapshot_id();
@@ -25347,6 +25407,9 @@ impl CayenneTableProvider {
             );
             return Ok(false);
         };
+        if !self.maintenance_still_admitted() {
+            return Ok(false);
+        }
 
         let compaction_start = std::time::Instant::now();
 
@@ -26298,6 +26361,9 @@ impl CayenneTableProvider {
             );
             return Ok(false);
         };
+        if !self.maintenance_still_admitted() {
+            return Ok(false);
+        }
 
         let compaction_start = std::time::Instant::now();
         let keep_recent = self.bake_keep_recent_snapshots();
