@@ -23,9 +23,9 @@ limitations under the License.
 //! survives `build_app`, and that a dedicated runtime really comes up with the
 //! derived worker count rather than inheriting tokio's own default.
 //!
-//! The process-wide budget is a `OnceLock`, so exactly one test in this binary
-//! may install one. The others assert on `build_app` alone, which never touches
-//! it.
+//! The process-wide budget is a `OnceLock`, so a test that installs one needs a
+//! process of its own (see `crate::require_process_per_test`). The others assert
+//! on `build_app` alone, which never touches it.
 
 use std::path::{Path, PathBuf};
 
@@ -63,6 +63,9 @@ fn configured_cores(app: Option<&app::App>) -> Option<String> {
 /// workers and each dedicated runtime for 1, on a host with any number of cores.
 #[test]
 fn spicepod_cores_size_the_runtime_pools() {
+    crate::require_process_per_test(
+        "this test installs the process-wide CPU budget, which cannot be undone",
+    );
     let dir = tempfile::tempdir().expect("creates a temp dir");
     let args = spiced::Args::parse_from([
         "spiced",
@@ -147,6 +150,7 @@ fn cluster_executor_keeps_the_cpu_section_from_its_spicepod() {
 /// rather than silently clamping to something the operator did not ask for.
 #[test]
 fn invalid_cores_fails_startup() {
+    crate::require_process_per_test("this test calls the process-wide CPU budget install");
     let dir = tempfile::tempdir().expect("creates a temp dir");
     let args = spiced::Args::parse_from([
         "spiced",

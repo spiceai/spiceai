@@ -6,6 +6,7 @@ license-file.workspace = true
 name = "spiced"
 repository.workspace = true
 rust-version.workspace = true
+autotests = false
 version.workspace = true
 
 [dependencies]
@@ -227,3 +228,8 @@ vortex = ["runtime/vortex"]
 
 [lints]
 workspace = true
+
+# Integration tests are modules of `integration` (`tests/integration.rs`).
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
