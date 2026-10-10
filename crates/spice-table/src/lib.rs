@@ -114,10 +114,29 @@ pub trait Index: Debug + Send + Sync + 'static {
     /// Columns that are required for the index to be computed.
     fn required_columns(&self) -> Vec<String>;
 
-    /// Compute the index - if the index data is represented in the batch itself (i.e. a vector
-    /// "*_embedding" column) then modify the provided batches to include the computed column.
+    /// (Re)index a batch of rows: if the index data lives in the batch itself (e.g. a vector
+    /// `*_embedding` column) modify the batch to include the computed column, and write the rows
+    /// into any store the index keeps of its own.
+    ///
+    /// This is the write primitive shared by every path that adds rows — full refresh, append,
+    /// and a CDC upsert — so its single embedding computation fans out to both the returned
+    /// augmentation column and the index's own store; it is never computed twice. It carries no
+    /// operation information: callers hand it only the rows that should be (re)indexed (a refresh
+    /// is all rows; a CDC batch is the upsert rows).
     async fn compute_index(&self, batches: Vec<RecordBatch>) -> Result<Vec<RecordBatch>> {
         Ok(batches)
+    }
+
+    /// Remove every entry from this index's own store (a CDC truncate).
+    ///
+    /// Default is a no-op — correct for a co-located index, whose entries are cleared when the
+    /// accelerator truncates the table. An external-store index (in-memory vectors, S3 Vectors,
+    /// Elasticsearch) overrides this to empty its store, so a truncated table does not keep
+    /// serving rows that no longer exist.
+    ///
+    /// Wrapper implementations MUST forward this to the index they wrap.
+    async fn truncate(&self) -> Result<()> {
+        Ok(())
     }
 
     /// Called before data is written via the `TableSink` path (full refresh or append).
