@@ -12807,32 +12807,44 @@ impl CayenneTableProvider {
         Ok(())
     }
 
-    /// Whether this table holds no rows at all, by observing every place a row
-    /// can sit: a staged append's private directory, a registered protected
+    /// Whether this table holds any rows, by observing every place a row can
+    /// sit: a staged append's private directory, a registered protected
     /// snapshot, the in-memory CDC tier, the inline tier, any snapshot's data
     /// files and the cold tier. The in-flight staged-append check precedes the
     /// protected-snapshot read for the reason `pk_caches_absent_and_memory_empty`
     /// gives.
     ///
-    /// A `true` licenses replacing the table outright, so the caller must hold
-    /// the write lock from this check until that replace commits; anything that
-    /// cannot be read answers `false`, which costs only the slower append.
-    pub(crate) async fn holds_no_rows(&self) -> bool {
+    /// # Errors
+    ///
+    /// Returns an error if the catalog cannot list the table's files.
+    pub async fn holds_rows(&self) -> CatalogResult<bool> {
         if self.has_inflight_staging_appends()
             || !self.protected_snapshots.load().is_empty()
             || !self.mem_tier.is_empty()
             || self.inlined_row_count.load(Ordering::Acquire) != 0
         {
-            return false;
+            return Ok(true);
         }
         let table_id = &self.table_metadata.table_id;
-        matches!(
-            self.catalog.get_all_snapshot_files(table_id).await,
-            Ok(files) if files.is_empty()
-        ) && matches!(
-            self.catalog.list_cold_tier_files(table_id).await,
-            Ok(files) if files.is_empty()
-        )
+        Ok(!self
+            .catalog
+            .get_all_snapshot_files(table_id)
+            .await?
+            .is_empty()
+            || !self
+                .catalog
+                .list_cold_tier_files(table_id)
+                .await?
+                .is_empty())
+    }
+
+    /// Whether this table holds no rows at all; see [`Self::holds_rows`].
+    ///
+    /// A `true` licenses replacing the table outright, so the caller must hold
+    /// the write lock from this check until that replace commits; anything that
+    /// cannot be read answers `false`, which costs only the slower append.
+    pub(crate) async fn holds_no_rows(&self) -> bool {
+        matches!(self.holds_rows().await, Ok(false))
     }
 
     /// Whether an append into this table, once it holds no rows, is written as one
