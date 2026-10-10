@@ -837,6 +837,16 @@ mod tests {
         status::RuntimeStatus,
     };
 
+    /// A query the results cache refuses (e.g. one calling `random()` or
+    /// `now()`) reports `CacheDisabled`, which must emit no `X-Cache` or
+    /// `Results-Cache-Status` header rather than a misleading HIT/MISS.
+    #[test]
+    fn disabled_results_cache_emits_no_cache_status_headers() {
+        assert!(status_to_x_cache_value(CacheStatus::CacheDisabled).is_none());
+        assert!(CacheStatus::CacheDisabled.to_header_string().is_none());
+        assert_eq!(CacheStatus::CacheHit.to_header_string(), Some("HIT"));
+    }
+
     /// `/v1/sql` must let clients distinguish outcomes by status code: a
     /// `runtime.query.timeout` expiry maps to 504 Gateway Timeout, a
     /// client-initiated cancel to 499, and both classifications must hold for

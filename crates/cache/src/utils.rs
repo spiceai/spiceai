@@ -807,7 +807,7 @@ pub(crate) mod tests {
             .expect("table_names should match expected for JOIN with subquery in FROM clause");
     }
 
-    fn create_session_context() -> SessionContext {
+    pub(crate) fn create_session_context() -> SessionContext {
         let config = SessionConfig::new().with_information_schema(true);
         let ctx = SessionContext::new_with_config(config);
         register_tables(&ctx);
