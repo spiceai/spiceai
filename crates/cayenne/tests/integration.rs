@@ -22,6 +22,11 @@ limitations under the License.
 //! allocator, and they measure process-wide live bytes. So does the `chDB`
 //! result-correctness lane, because `chDB` and `DuckDB` cannot both run in one
 //! process and the `DuckDB` lanes are modules here.
+//!
+//! nextest runs every test in a process of its own, so a test here may change
+//! process-global state as long as it calls `common::require_process_per_test`
+//! first; under plain `cargo test` that call fails the test before it changes
+//! anything its neighbours would see.
 
 #[macro_use]
 mod common;

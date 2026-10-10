@@ -127,6 +127,22 @@ pub fn single_batch_stream(batch: RecordBatch) -> SendableRecordBatchStream {
 /// reserved rather than memory committed.
 pub const TEST_STACK_SIZE: usize = 16 * 1024 * 1024;
 
+/// Fails the calling test unless it runs in a process of its own.
+///
+/// nextest runs every test in its own process; plain `cargo test` runs a
+/// binary's tests on threads of one process. A test that changes process-global
+/// state calls this before changing it, so under `cargo test` it fails with
+/// instructions instead of changing the state every neighbouring test runs under.
+/// `why` names that state.
+pub fn require_process_per_test(why: &str) {
+    assert!(
+        std::env::var("NEXTEST_EXECUTION_MODE").as_deref() == Ok("process-per-test"),
+        "{why}, so it must run in a process of its own. Run it with \
+         `cargo nextest run -p cayenne --test integration <test name>`: plain \
+         `cargo test` runs every test in the binary on threads of one process"
+    );
+}
+
 /// Run a test with all available backends
 #[macro_export]
 macro_rules! test_with_backends {

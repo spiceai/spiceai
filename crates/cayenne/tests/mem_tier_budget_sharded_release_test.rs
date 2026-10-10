@@ -32,8 +32,9 @@ limitations under the License.
 //! so it appends no segment at all — nothing records the bytes reserved for it,
 //! and the apply itself must hand them back.
 //!
-//! Its own test binary with a single test: the budget is process-global, so
-//! the cases run in sequence rather than on parallel test threads.
+//! One test rather than one per case: the budget is process-global, so they run
+//! in sequence. It needs a process of its own, which nextest gives every test
+//! (see `common::require_process_per_test`).
 
 use crate::common;
 
@@ -68,6 +69,9 @@ const OTHER_TABLES_BYTES: u64 = 4 << 20;
 
 #[test]
 fn a_sharded_checkpoint_releases_exactly_what_its_applies_reserved() -> Result<(), String> {
+    common::require_process_per_test(
+        "this test replaces Cayenne's process-global memory-tier budget",
+    );
     common::run_with_backend_blocking(common::BackendType::Sqlite, |fixture| async move {
         // Run every case before asserting, so one failure does not hide another.
         let mut got = Vec::new();
