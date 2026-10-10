@@ -363,6 +363,10 @@ impl DataConnectorFactory for MySQLFactory {
             // locally instead of pushing them into the SQL sent to MySQL, where
             // those functions don't exist and the query would fail with an
             // "unknown function" error. See issue #10703.
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "installs `deny_spice_functions_for_mysql_table_providers()` on the next line"
+            )]
             let mysql_factory = MySQLTableFactory::new(Arc::clone(&pool))
                 .with_function_support(deny_spice_functions_for_mysql_table_providers());
 

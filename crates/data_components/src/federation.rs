@@ -113,13 +113,27 @@ impl<T: 'static, P: 'static> SQLExecutor for DenyFunctionsSqlExecutor<T, P> {
 /// `function_support` deny-list (e.g. `json_get_str`) falls back to local
 /// `DataFusion` evaluation instead of being unparsed into the remote engine's
 /// SQL.
+///
+/// The same policy is installed on the `SqlTable` itself, which is why the table
+/// is taken by value. The executor's policy only decides whether a *plan*
+/// federates, and a filtered scan never reaches that decision: the filter is
+/// pushed into the scan first, through the adaptor's `supports_filters_pushdown`,
+/// which asks the `SqlTable` — and the `SqlTable` then unparses it into the
+/// `WHERE` clause it sends. Without its own copy of the policy, `WHERE
+/// json_get_str(payload, 'k') = 'x'` reached the remote engine even though the
+/// same call in a projection stayed local (#13664). A table that already
+/// carries a policy keeps it when `function_support` is `None`.
 #[must_use]
 pub fn create_spice_federated_table_provider<T: 'static, P: 'static>(
-    table: Arc<SqlTable<T, P>>,
+    table: SqlTable<T, P>,
     schema: SchemaRef,
     table_reference: TableReference,
     function_support: Option<FunctionSupport>,
 ) -> FederatedTableProviderAdaptor {
+    let table = Arc::new(match &function_support {
+        Some(policy) => table.with_function_support(Some(policy.clone())),
+        None => table,
+    });
     let executor: Arc<dyn SQLExecutor> = Arc::new(DenyFunctionsSqlExecutor::new(
         Arc::clone(&table),
         function_support,
@@ -209,19 +223,21 @@ mod tests {
     }
 
     fn test_sql_table() -> Arc<SqlTable<(), &'static dyn ToString>> {
+        Arc::new(owned_test_sql_table())
+    }
+
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test fixture over a mock pool: each test chooses the policy it exercises"
+    )]
+    fn owned_test_sql_table() -> SqlTable<(), &'static dyn ToString> {
         let pool: Arc<dyn DbConnectionPool<(), &'static dyn ToString> + Send + Sync> =
             Arc::new(MockPool {});
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int32, false),
             Field::new("val", DataType::Utf8, true),
         ]));
-        Arc::new(SqlTable::new_with_schema(
-            "test",
-            &pool,
-            schema,
-            TableReference::bare("t"),
-            None,
-        ))
+        SqlTable::new_with_schema("test", &pool, schema, TableReference::bare("t"), None)
     }
 
     fn stub_udf(name: &str) -> Arc<ScalarUDF> {
@@ -329,10 +345,10 @@ mod tests {
     fn create_spice_federated_table_provider_wires_deny_list() {
         // Regression test for #10703: building the federated adaptor must route
         // logical optimization through the deny-list wrapper.
-        let table = test_sql_table();
+        let table = owned_test_sql_table();
         let schema = table.schema();
         let adaptor = create_spice_federated_table_provider(
-            Arc::clone(&table),
+            table,
             Arc::clone(&schema),
             TableReference::bare("t"),
             Some(deny_support(&["json_get_str"])),
@@ -344,6 +360,105 @@ mod tests {
 
         // Federation source schema must match the SqlTable schema verbatim.
         assert_eq!(adaptor.source.schema().as_ref(), schema.as_ref());
+    }
+
+    /// The SQL `plan`'s only remote node would send: a `SqlExec` when the scan
+    /// serves the table itself, a `VirtualExecutionPlan` when the plan federated.
+    fn pushed_sql(plan: &Arc<dyn ExecutionPlan>) -> String {
+        let rendered = datafusion::physical_plan::displayable(plan.as_ref())
+            .indent(true)
+            .to_string();
+        let line = rendered
+            .lines()
+            .find(|line| line.contains("SqlExec") || line.contains("VirtualExecutionPlan"))
+            .unwrap_or_else(|| panic!("expected a remote scan in:\n{rendered}"));
+        line.split_once("sql=")
+            .map(|(_, sql)| sql.trim().to_string())
+            .unwrap_or_else(|| panic!("expected the scan to render its SQL: {line}"))
+    }
+
+    /// Regression test for the filter half of #13664: a Spice-only function in a
+    /// `WHERE` clause must be evaluated locally, not unparsed into the SQL the
+    /// remote scan sends.
+    ///
+    /// The executor's deny-list only decides whether a *plan* federates, and a
+    /// filtered scan never reaches that decision: the federation analyzer's
+    /// filter pushdown moves the predicate into the scan first, through the
+    /// adaptor's `supports_filters_pushdown`, which asks the wrapped `SqlTable`.
+    /// A `SqlTable` built without its own copy of the policy answers `Exact` for
+    /// anything the dialect can spell, so the remote engine was sent `WHERE
+    /// json_get_str(...) = 'x'` and failed with an unknown-function error — on
+    /// every `PostgreSQL`, Snowflake and `ClickHouse` table built through this
+    /// helper. A built-in the remote engine does have keeps pushing down.
+    #[tokio::test]
+    async fn a_denied_function_in_a_where_clause_is_not_pushed_into_the_scan() {
+        use datafusion::execution::session_state::SessionStateBuilder;
+        use datafusion::functions::string::expr_fn::upper;
+        use datafusion::logical_expr::TableProviderFilterPushDown;
+        use datafusion_federation::FederatedQueryPlanner;
+
+        let table = owned_test_sql_table();
+        let schema = table.schema();
+        let provider = Arc::new(create_spice_federated_table_provider(
+            table,
+            schema,
+            TableReference::bare("t"),
+            Some(deny_support(&["json_get_str"])),
+        ));
+
+        let denied = Expr::ScalarFunction(ScalarFunction::new_udf(
+            stub_udf("json_get_str"),
+            vec![col("val")],
+        ))
+        .eq(lit("x"));
+        let allowed = upper(col("val")).eq(lit("X"));
+        assert_eq!(
+            provider
+                .supports_filters_pushdown(&[&denied, &allowed])
+                .expect("pushdown verdicts"),
+            vec![
+                TableProviderFilterPushDown::Unsupported,
+                TableProviderFilterPushDown::Exact
+            ],
+            "the deny-listed call must stay local; the built-in must still push down"
+        );
+
+        let state = SessionStateBuilder::new()
+            .with_default_features()
+            .with_analyzer_rule(Arc::new(FederationAnalyzerRule::new()))
+            .with_query_planner(Arc::new(FederatedQueryPlanner::new()))
+            .build();
+        let ctx = SessionContext::new_with_state(state);
+        ctx.register_udf(stub_udf("json_get_str").as_ref().clone());
+        ctx.register_table("t", provider)
+            .expect("register the federated table");
+
+        let denied_plan = ctx
+            .sql("SELECT id FROM t WHERE json_get_str(val) = 'x'")
+            .await
+            .expect("plan the denied query")
+            .create_physical_plan()
+            .await
+            .expect("physical plan for the denied query");
+        assert_eq!(
+            pushed_sql(&denied_plan),
+            "SELECT id, val FROM t",
+            "the remote scan must not be asked to evaluate json_get_str: it returns `val` and \
+             the filter runs locally"
+        );
+
+        let allowed_plan = ctx
+            .sql("SELECT id FROM t WHERE upper(val) = 'X'")
+            .await
+            .expect("plan the control query")
+            .create_physical_plan()
+            .await
+            .expect("physical plan for the control query");
+        assert_eq!(
+            pushed_sql(&allowed_plan),
+            "SELECT t.id FROM t WHERE (upper(t.val) = 'X')",
+            "a built-in the remote engine has must keep pushing down"
+        );
     }
 
     /// Unparse a plan the way a federated connector would, and demand it
@@ -3252,7 +3367,7 @@ mod tests {
         ]));
         Arc::new(DefaultTableSource::new(Arc::new(
             create_spice_federated_table_provider(
-                test_sql_table(),
+                owned_test_sql_table(),
                 schema,
                 TableReference::bare("t"),
                 None,

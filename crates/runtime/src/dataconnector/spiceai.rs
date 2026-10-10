@@ -451,6 +451,10 @@ impl DataConnectorFactory for SpiceAIFactory {
 
             flight_client = configure_max_message_size(flight_client, &context.app())?;
 
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "the remote is a Spice runtime, which has the built-in Spice functions (`json_get_str` and the rest), so pushing them lets the remote evaluate them; a user-registered UDF exists only on the runtime that registered it and is the known exception (#14224)"
+            )]
             let flight_factory = FlightFactory::new(
                 "spice.ai",
                 flight_client,

@@ -112,9 +112,12 @@ impl DuckDB {
                 ),
         ));
 
-        Ok(Self::with_spice_deny_list(
-            DuckDBTableFactory::new(pool).with_dialect(new_duckdb_dialect()),
-        ))
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "`with_spice_deny_list` installs the DuckDB deny-list on the factory it is handed"
+        )]
+        let factory = DuckDBTableFactory::new(pool).with_dialect(new_duckdb_dialect());
+        Ok(Self::with_spice_deny_list(factory))
     }
 
     /// Creates a file-based `DuckDB` table factory.
@@ -137,9 +140,12 @@ impl DuckDB {
                 ),
         ));
 
-        Ok(Self::with_spice_deny_list(
-            DuckDBTableFactory::new(pool).with_dialect(new_duckdb_dialect()),
-        ))
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "`with_spice_deny_list` installs the DuckDB deny-list on the factory it is handed"
+        )]
+        let factory = DuckDBTableFactory::new(pool).with_dialect(new_duckdb_dialect());
+        Ok(Self::with_spice_deny_list(factory))
     }
 }
 

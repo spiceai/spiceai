@@ -169,7 +169,7 @@ impl FederatedPostgresTableFactory {
         table: SqlTable<T, P>,
         table_reference: TableReference,
     ) -> Arc<dyn TableProvider + 'static> {
-        let table = Arc::new(table.with_dialect(Arc::new(PostgreSqlDialect {})));
+        let table = table.with_dialect(Arc::new(PostgreSqlDialect {}));
         let schema = table.schema();
         Arc::new(create_spice_federated_table_provider(
             table,
@@ -186,6 +186,10 @@ impl Read for FederatedPostgresTableFactory {
         &self,
         table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "`finish` routes it through `create_spice_federated_table_provider` with the catalog's deny-list"
+        )]
         let table = SqlTable::new(
             "postgres",
             &self.pool,
@@ -203,6 +207,10 @@ impl Read for FederatedPostgresTableFactory {
         table_reference: TableReference,
         schema: SchemaRef,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "`finish` routes it through `create_spice_federated_table_provider` with the catalog's deny-list"
+        )]
         let table = SqlTable::new_with_schema(
             "postgres",
             &self.pool,

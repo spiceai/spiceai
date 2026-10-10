@@ -270,6 +270,10 @@ fn create_ducklake_factory(
     // here, so carving it out changes nothing about it, whereas on the catalog it
     // currently errors and carving it out would newly return a different number
     // (#13728). Fix only what is broken on each path; #13728 settles the rest.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "installs `deny_spice_functions_for_duckdb_table_providers()` below"
+    )]
     let factory = DuckDBTableFactory::new(Arc::clone(&pool))
         .with_dialect(new_duckdb_dialect())
         .with_function_support(deny_spice_functions_for_duckdb_table_providers());
