@@ -14,14 +14,14 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Every Cayenne integration test, linked into one binary.
+//! Cayenne integration tests that share the default allocator, linked once.
 //!
 //! Each `tests/<name>.rs` is a module here rather than its own test target, so
-//! the crate's dependencies are linked once instead of once per file. Files that
-//! install a `#[global_allocator]` stay separate targets: a process has one
-//! allocator, and they measure process-wide live bytes. So does the `chDB`
-//! result-correctness lane, because `chDB` and `DuckDB` cannot both run in one
-//! process and the `DuckDB` lanes are modules here.
+//! the crate's dependencies are linked once instead of once per file. Tests that
+//! measure process-wide live bytes share the `isolated` target and its counting
+//! global allocator. The `chDB` result-correctness lane stays separate because
+//! `chDB` and `DuckDB` cannot both run in one process; the `DuckDB` lanes are
+//! modules here.
 //!
 //! nextest runs every test in a process of its own, so a test here may change
 //! process-global state as long as it calls `common::require_process_per_test`
@@ -142,35 +142,46 @@ mod vortex_task_cancellation;
 mod write_back_pk_shapes_test;
 
 /// `autotests = false` means cargo compiles only the test targets `Cargo.toml`
-/// names, so a new `tests/<name>.rs` that is neither a module here nor its own
+/// names, so a new `tests/<name>.rs` that is neither a module of a target nor its own
 /// `[[test]]` would build nothing and its tests would never run, silently.
 #[test]
 fn every_test_file_is_compiled() {
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
-    let root = std::fs::read_to_string(dir.join("tests/integration.rs"))
-        .expect("tests/integration.rs should be readable");
     let manifest =
         std::fs::read_to_string(dir.join("Cargo.toml")).expect("Cargo.toml should be readable");
+    let target_paths: Vec<&str> = manifest
+        .lines()
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix("path = \"tests/")
+                .and_then(|path| path.strip_suffix(".rs\""))
+        })
+        .collect();
+    let roots: Vec<String> = target_paths
+        .iter()
+        .map(|stem| {
+            std::fs::read_to_string(dir.join(format!("tests/{stem}.rs")))
+                .expect("test target root should be readable")
+        })
+        .collect();
     let mut missing: Vec<String> = std::fs::read_dir(dir.join("tests"))
         .expect("tests/ should be readable")
         .map(|entry| entry.expect("tests/ entry should be readable").path())
         .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
         .filter_map(|path| Some(path.file_stem()?.to_str()?.to_string()))
-        .filter(|stem| stem != "integration")
         .filter(|stem| {
-            !root
-                .lines()
-                .any(|line| line.trim() == format!("mod {stem};"))
-                && !manifest
-                    .lines()
-                    .any(|line| line.trim() == format!("path = \"tests/{stem}.rs\""))
+            !target_paths.contains(&stem.as_str())
+                && !roots.iter().any(|root| {
+                    root.lines()
+                        .any(|line| line.trim() == format!("mod {stem};"))
+                })
         })
         .collect();
     missing.sort();
     assert!(
         missing.is_empty(),
         "these files in crates/cayenne/tests are not compiled into any test binary: \
-         {missing:?}. Add `mod <name>;` to tests/integration.rs, or a `[[test]]` \
-         entry in crates/cayenne/Cargo.toml if the file needs its own process"
+         {missing:?}. Add `mod <name>;` to tests/integration.rs or tests/isolated.rs, or a `[[test]]` \
+         entry in crates/cayenne/Cargo.toml if the file needs its own binary"
     );
 }
