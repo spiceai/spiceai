@@ -158,8 +158,8 @@ endif
 # checks the diagnostic emitted by the pinned storage dependency as well as the
 # formatter's unit tests; `build_logging` and `cpu_budget` start `spiced` or
 # build its runtime with no external service. `cloud_connect_bootstrap` is left
-# out: its enrollment request to the test's HTTPS mock fails on macOS, where the
-# gate runs.
+# out: spiced's enrollment client does not trust the test's HTTPS mock, on Linux
+# or macOS, because nothing gives it the test's certificate authority.
 #
 # `llms`'s `anthropic_stream_errors` and `list_models_errors` are selected by
 # name for the same reason: each stands a local one-shot HTTP server up on an
