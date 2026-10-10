@@ -1,0 +1,42 @@
+[package]
+name = "runtime-decide"
+description = "SQL decision functions — ai_if, ai_probability, ai_classify, ai_score and ai_decide — over the System One evaluation contract, and the planner rules that keep their model calls cheap."
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+arrow.workspace = true
+arrow-json.workspace = true
+async-trait.workspace = true
+datafusion.workspace = true
+evaluate-api = { path = "../evaluate-api" }
+futures.workspace = true
+linkme.workspace = true
+runtime-request-context = { path = "../runtime-request-context" }
+runtime-status = { path = "../runtime-status" }
+runtime-udfs-api = { path = "../runtime-udfs-api" }
+serde.workspace = true
+# Labels keep the order they were written in.
+serde_json = { workspace = true, features = ["preserve_order"] }
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+criterion = { version = "0.7", features = ["html_reports"] }
+insta.workspace = true
+
+[[bench]]
+name = "planning"
+harness = false
+
+[[bench]]
+name = "execution"
+harness = false
+
+[lints]
+workspace = true

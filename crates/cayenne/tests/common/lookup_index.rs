@@ -82,6 +82,8 @@ pub struct TableSpec<'a> {
     pub indexes: &'a [&'a [&'a str]],
     pub config: VortexConfig,
     pub upsert_key: Option<&'a str>,
+    /// `None` keeps the builder's default, persisted as at runtime; a test of
+    /// an unpersisted index sets `Disabled`.
     pub persistence: Option<IndexPersistence>,
 }
 

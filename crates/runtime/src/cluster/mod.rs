@@ -2356,22 +2356,21 @@ impl runtime_secrets::ClusterSecretExpander for ClusterSecretExpanderImpl {
         &self,
         executor_id: &str,
         key: &str,
-    ) -> Result<secrecy::SecretString, String> {
+    ) -> Result<Option<secrecy::SecretString>, String> {
         let request = runtime_proto::ExpandSecretRequest {
             executor_id: executor_id.to_string(),
             key: key.to_string(),
         };
 
-        let response = self
-            .client
-            .clone()
-            .expand_secret(request)
-            .await
-            .map_err(|status| format!("Failed to expand secret from scheduler: {status}"))?;
-
-        // Wrap at the earliest point we own the plaintext so downstream code
-        // cannot accidentally stash it in a non-zeroizing buffer.
-        Ok(secrecy::SecretString::from(response.into_inner().value))
+        match self.client.clone().expand_secret(request).await {
+            // Wrap at the earliest point we own the plaintext so downstream code
+            // cannot accidentally stash it in a non-zeroizing buffer.
+            Ok(response) => Ok(Some(secrecy::SecretString::from(
+                response.into_inner().value,
+            ))),
+            Err(status) if status.code() == tonic::Code::NotFound => Ok(None),
+            Err(status) => Err(format!("Failed to expand secret from scheduler: {status}")),
+        }
     }
 }
 

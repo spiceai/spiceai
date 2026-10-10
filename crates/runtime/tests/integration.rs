@@ -23,10 +23,10 @@ use arrow::{array::RecordBatch, util::display::FormatOptions};
 #[cfg(feature = "mysql")]
 use datafusion::parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder;
 use futures::TryStreamExt;
-#[cfg(feature = "postgres-accel")]
+#[cfg(feature = "postgres")]
 use std::sync::Arc;
 
-#[cfg(feature = "postgres-accel")]
+#[cfg(feature = "postgres")]
 use crate::utils::TEST_REQUEST_CONTEXT;
 
 use runtime::Runtime;
@@ -254,7 +254,7 @@ fn pin_test_cpu_budget() {
         Err(e) => panic!("{TEST_CPU_CORES} must be a valid CPU quantity: {e}"),
     }
 }
-#[cfg(feature = "postgres-accel")]
+#[cfg(feature = "postgres")]
 fn configure_test_datafusion_request_context() {
     match DEFAULT_DATAFUSION_CONFIG.write() {
         Ok(mut config) => config.set_extension(Arc::clone(&TEST_REQUEST_CONTEXT)),

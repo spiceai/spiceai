@@ -180,7 +180,7 @@ impl TaskHistoryExporter {
         matches!(
             task,
             "ai_chat"
-                | "ai_evaluate"
+                | "ai_decision"
                 | "ai_completion"
                 | "responses"
                 | "text_embed"
@@ -658,7 +658,7 @@ mod tests {
         assert!(!super::filter_event_keys("prompt"));
         assert!(!super::filter_event_keys("metadata"));
     }
-    /// `ai_evaluate` carries the caller's `state` in its `input`, so it must be
+    /// `ai_decision` carries the caller's `input` in its `input`, so it must be
     /// redacted and truncated like every other inference task.
     #[test]
     fn process_context_payload_redacts_evaluation_context() {
@@ -666,7 +666,7 @@ mod tests {
         assert_eq!(
             TaskHistoryExporter::process_context_payload(
                 &TaskHistoryCapturedContext::Redacted,
-                "ai_evaluate",
+                "ai_decision",
                 payload,
             ),
             Arc::<str>::from(REDACTED_TASK_HISTORY_VALUE),

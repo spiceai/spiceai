@@ -63,6 +63,7 @@ async fn metadata_predicate_prunes_the_listing_before_opening_files() {
         &[], // unpartitioned
         &[filter],
         &[MetadataColumn::Size],
+        None, // every listed object is a data file
     )
     .await
     .expect("metadata pruning failed")

@@ -26,13 +26,10 @@ use graph_rs_sdk::{
 
 use http::Response;
 
-use super::{
-    drive_items::{DriveItem, DriveItemResponse},
-    error::Error,
-};
+use super::{drive_items::DriveItem, error::Error};
 
-type DriveItemResponseResult =
-    Result<Response<Result<DriveItemResponse, ErrorMessage>>, GraphFailure>;
+/// A page of drive items, left as JSON for [`super::drive_items::parse_drive_item_page`].
+type DriveItemPageResult = Result<Response<Result<serde_json::Value, ErrorMessage>>, GraphFailure>;
 
 /// Represents all the ways a Sharepoint [Drive](https://learn.microsoft.com/en-us/graph/api/resources/drive?view=graph-rest-1.0) can be identified.
 #[derive(Default, Debug, Clone, PartialEq)]
@@ -303,11 +300,11 @@ impl SharepointClient {
         }
     }
 
-    /// Streams [`DriveItemResponse`] from the Microsoft Graph API for the [`SharepointListExec`]'s selected drive and drive item.
+    /// Streams pages of drive items from the Microsoft Graph API for the [`SharepointListExec`]'s selected drive and drive item.
     pub(crate) fn stream_drive_items(
         self: Arc<Self>,
         limit: Option<usize>,
-    ) -> Result<impl Stream<Item = DriveItemResponseResult>, Box<GraphFailure>> {
+    ) -> Result<impl Stream<Item = DriveItemPageResult>, Box<GraphFailure>> {
         // Request docs: `<https://learn.microsoft.com/en-us/graph/api/driveitem-get?view=graph-rest-1.0&tabs=http#http-request>`
         let mut req = match self.drive_client() {
             DriveApi::Id(client) => match &self.drive_item {
@@ -338,7 +335,9 @@ impl SharepointClient {
         // req.order_by() // `ORDER BY <expr>`
         // req.expand() // To include file content
 
-        req.paging().stream::<DriveItemResponse>().map_err(Box::new)
+        // `serde_json::Value`, not a typed page: the SDK replaces a typed page's deserialization
+        // error with an empty `ErrorMessage`.
+        req.paging().stream::<serde_json::Value>().map_err(Box::new)
     }
 
     /// Returns the underlying content of a drive item.
@@ -359,13 +358,18 @@ impl SharepointClient {
     }
 
     /// Downloads the file content for each drive item. Assumes that each field in `items` is in the `drive`.
+    /// A folder has no content, so its entry is `None`.
     pub(crate) async fn get_file_content(
         &self,
         items: &[DriveItem],
         formatter: Option<Arc<dyn DocumentParser>>,
-    ) -> Result<Vec<String>, Error> {
-        let mut content: Vec<String> = Vec::with_capacity(items.len());
+    ) -> Result<Vec<Option<String>>, Error> {
+        let mut content: Vec<Option<String>> = Vec::with_capacity(items.len());
         for item in items {
+            if item.is_folder() {
+                content.push(None);
+                continue;
+            }
             let raw = self
                 .get_drive_item_content(&item.id)
                 .await
@@ -379,9 +383,9 @@ impl SharepointClient {
                 let processed = doc
                     .as_flat_utf8()
                     .map_err(|e| Error::DocumentParsing { source: e })?;
-                content.push(processed);
+                content.push(Some(processed));
             } else {
-                content.push(String::from_utf8_lossy(&raw).to_string());
+                content.push(Some(String::from_utf8_lossy(&raw).to_string()));
             }
         }
         Ok(content)
@@ -507,5 +511,46 @@ fn process_list_objs(
             std::io::ErrorKind::InvalidData,
             "Unexpected response from list operation in Microsoft Graph",
         ))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::sharepoint::drive_items::{
+        drive_items_to_record_batch,
+        tests::{format_columns, recorded_drive_items},
+    };
+
+    use super::*;
+
+    #[tokio::test]
+    async fn folders_have_no_content() {
+        // Content is fetched only for files, so this client never sends a request.
+        let client = SharepointClient::new(
+            Arc::new(GraphClient::new("unused-test-token")),
+            "sharepoint:me/root",
+        )
+        .await
+        .expect("client for 'me/root' should build without a request");
+        let folders: Vec<DriveItem> = recorded_drive_items()
+            .into_iter()
+            .filter(DriveItem::is_folder)
+            .collect();
+
+        let content = client
+            .get_file_content(&folders, None)
+            .await
+            .expect("folders should not be downloaded");
+        let batch = drive_items_to_record_batch(&folders, Some(content))
+            .expect("drive items should convert to a record batch");
+
+        assert_eq!(
+            format_columns(&batch, &["name", "content"]),
+            "+---------+---------+\n\
+             | name    | content |\n\
+             +---------+---------+\n\
+             | General | NULL    |\n\
+             +---------+---------+"
+        );
     }
 }

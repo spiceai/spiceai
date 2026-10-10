@@ -143,7 +143,8 @@ pub(crate) enum Delta {
     Text { text: String },
     #[serde(rename = "input_json_delta")]
     InputJson { partial_json: String },
-    /// Sent when extended thinking is enabled. `OpenAI`'s format has no equivalent, so it is dropped.
+    /// A thinking block streams as `thinking_delta`s followed by one `signature_delta`. Models that
+    /// think by default send them even though the request never sets `thinking`.
     #[serde(rename = "thinking_delta")]
     Thinking { thinking: String },
     #[serde(rename = "signature_delta")]
@@ -151,13 +152,15 @@ pub(crate) enum Delta {
 }
 
 impl Delta {
+    /// The `OpenAI` delta for this packet, or `None` for a thinking block's deltas: thinking is not
+    /// exposed to the caller, as on the non-streaming path, so they produce no chunk.
     pub fn into_completion(
         self,
         role: Option<&MessageRole>,
         tool_content: Option<&ContentBlockToolUse>,
-    ) -> ChatCompletionStreamResponseDelta {
+    ) -> Option<ChatCompletionStreamResponseDelta> {
         match (self, tool_content) {
-            (Delta::Text { text }, _) => ChatCompletionStreamResponseDelta {
+            (Delta::Text { text }, _) => Some(ChatCompletionStreamResponseDelta {
                 content: Some(text),
                 function_call: None,
                 tool_calls: None,
@@ -167,13 +170,13 @@ impl Delta {
                     Some(MessageRole::User) => Some(Role::User),
                     None => None,
                 },
-            },
+            }),
             (
                 Delta::InputJson { partial_json },
                 Some(ContentBlockToolUse {
                     id, name: _name, ..
                 }),
-            ) => ChatCompletionStreamResponseDelta {
+            ) => Some(ChatCompletionStreamResponseDelta {
                 content: None,
                 function_call: None,
                 tool_calls: Some(vec![ChatCompletionMessageToolCallChunk {
@@ -191,26 +194,24 @@ impl Delta {
                     Some(MessageRole::User) => Some(Role::User),
                     None => None,
                 },
-            },
+            }),
 
-            // A tool delta without its block should never happen, and thinking has no OpenAI
-            // equivalent. Both become an 'empty' response.
-            (
-                Delta::InputJson { partial_json: _ }
-                | Delta::Thinking { thinking: _ }
-                | Delta::Signature { signature: _ },
-                _,
-            ) => ChatCompletionStreamResponseDelta {
-                content: None,
-                function_call: None,
-                tool_calls: None,
-                refusal: None,
-                role: match role {
-                    Some(MessageRole::Assistant) => Some(Role::Assistant),
-                    Some(MessageRole::User) => Some(Role::User),
-                    None => None,
-                },
-            },
+            // This should never happen, but we need to handle it as an 'empty' response.
+            (Delta::InputJson { partial_json: _ }, None) => {
+                Some(ChatCompletionStreamResponseDelta {
+                    content: None,
+                    function_call: None,
+                    tool_calls: None,
+                    refusal: None,
+                    role: match role {
+                        Some(MessageRole::Assistant) => Some(Role::Assistant),
+                        Some(MessageRole::User) => Some(Role::User),
+                        None => None,
+                    },
+                })
+            }
+
+            (Delta::Thinking { .. } | Delta::Signature { .. }, _) => None,
         }
     }
 }
@@ -312,6 +313,12 @@ pub fn transform_stream(
                         let tool_idx = *state.tool_id_to_tool_delta_idx.get(&index).unwrap_or(&0);
                         state.tool_id_to_tool_delta_idx.insert(index, tool_idx + 1);
 
+                        // A thinking block's deltas have no `OpenAI` counterpart and yield no chunk.
+                        let delta = delta.into_completion(
+                            state.role.as_ref(),
+                            state.tool_id_to_content_block.get(&index),
+                        )?;
+
                         Some(create_anthropic_stream_response(
                             &state.id.clone().unwrap_or_default(),
                             &state.model.clone().unwrap_or_default(),
@@ -320,10 +327,7 @@ pub fn transform_stream(
                                 index: 0,
                                 logprobs: None,
                                 finish_reason: None,
-                                delta: delta.into_completion(
-                                    state.role.as_ref(),
-                                    state.tool_id_to_content_block.get(&index),
-                                ),
+                                delta,
                             }),
                         ))
                     }
@@ -633,7 +637,7 @@ mod tests {
     }
 
     #[test]
-    fn thinking_deltas_deserialize_and_yield_no_content() {
+    fn thinking_deltas_deserialize_and_yield_no_chunk() {
         for payload in [
             r#"{"type":"content_block_delta","index":0,"delta":{"type":"thinking_delta","thinking":""}}"#,
             r#"{"type":"content_block_delta","index":0,"delta":{"type":"signature_delta","signature":"abc"}}"#,
@@ -644,8 +648,7 @@ mod tests {
                 panic!("expected a content block delta");
             };
             let out = delta.into_completion(Some(&MessageRole::Assistant), None);
-            assert!(out.content.is_none());
-            assert!(out.tool_calls.is_none());
+            assert!(out.is_none(), "{payload} must yield no chunk: {out:?}");
         }
     }
 

@@ -115,6 +115,10 @@ impl EvictionListener for NoopListener {
 /// (Moka-like): eviction heuristics tolerate lost promotions under overload.
 const TOUCH_DRAIN_THRESHOLD: usize = 64;
 const TOUCH_BUFFER_CAP: usize = 1024;
+/// Most expired entries [`ShardedCache::run_pending_tasks`] removes per hold of
+/// a shard lock. Expiry costs one step per expired entry, so this bounds how
+/// long a reader of that shard can wait when a large cohort expires at once.
+const EXPIRE_BATCH: usize = 1024;
 /// Region order the guaranteed-progress fallback reclaims from: coldest main
 /// space first, then new admissions, and only then the protected segment.
 const FALLBACK_EVICT_ORDER: [shard::Region; 3] = [
@@ -676,21 +680,29 @@ impl<V: Clone + Send + Sync + 'static, L: EvictionListener> ShardedCache<V, L> {
             self.drain_touches_blocking(shard_idx);
         }
         for shard_idx in 0..NUM_SHARDS {
-            let mut shard = self.shards[shard_idx].0.lock();
+            // One cutoff per shard, so entries inserted while this loop yields
+            // the lock between batches cannot keep it going.
             let now = Instant::now();
-            let before_window = shard.window_weight();
-            let before_protected = shard.protected_weight();
-            let (expired, weight) = shard.expire_older_than(now, self.ttl);
-            self.sub_weight(weight);
-            self.sync_segment_weights_after_removal(
-                before_window,
-                shard.window_weight(),
-                before_protected,
-                shard.protected_weight(),
-            );
-            drop(shard);
-            for _ in expired {
-                L::on_evict(EvictionReason::Expired);
+            loop {
+                let mut shard = self.shards[shard_idx].0.lock();
+                let before_window = shard.window_weight();
+                let before_protected = shard.protected_weight();
+                let (expired, weight, more) =
+                    shard.expire_older_than_at_most(now, self.ttl, EXPIRE_BATCH);
+                self.sub_weight(weight);
+                self.sync_segment_weights_after_removal(
+                    before_window,
+                    shard.window_weight(),
+                    before_protected,
+                    shard.protected_weight(),
+                );
+                drop(shard);
+                for _ in expired {
+                    L::on_evict(EvictionReason::Expired);
+                }
+                if !more {
+                    break;
+                }
             }
         }
         self.evict_to_limit(0, None);
@@ -2847,6 +2859,99 @@ mod tests {
         );
         assert_eq!(cache.protected_weight_for_test(), 0);
         assert_eq!(cache.len(), 0);
+    }
+
+    struct ExpiryCountingListener;
+    static EXPIRED_EVICTIONS: AtomicU64 = AtomicU64::new(0);
+
+    impl EvictionListener for ExpiryCountingListener {
+        fn on_evict(reason: EvictionReason) {
+            if reason == EvictionReason::Expired {
+                EXPIRED_EVICTIONS.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// More expired entries on one shard than one lock hold removes: a single
+    /// `run_pending_tasks` must still reclaim all of them, and only them.
+    #[test]
+    fn run_pending_tasks_expires_a_shard_past_one_batch() {
+        let cache: ShardedCache<TestValue, ExpiryCountingListener> =
+            ShardedCache::new(1 << 40, Duration::from_mins(1), EvictionPolicy::Lru);
+        let stale = u64::try_from(2 * EXPIRE_BATCH + 7).expect("fits u64");
+        // Multiples of NUM_SHARDS all land on shard 0.
+        let shard_key = |i: u64| i * NUM_SHARDS as u64;
+        for i in 0..stale {
+            cache.insert(shard_key(i), TestValue::with_size("old", 3), 3);
+        }
+        for i in 0..stale {
+            assert!(
+                cache.rewind_ttl_for_test(shard_key(i), Duration::from_mins(2)),
+                "the resident must be present to be aged past its deadline"
+            );
+        }
+        for i in stale..stale + 5 {
+            cache.insert(shard_key(i), TestValue::with_size("new", 2), 2);
+        }
+        let before = EXPIRED_EVICTIONS.load(Ordering::Relaxed);
+
+        cache.run_pending_tasks();
+
+        assert_eq!(EXPIRED_EVICTIONS.load(Ordering::Relaxed) - before, stale);
+        assert_eq!(cache.len(), 5);
+        assert_eq!(cache.weighted_size(), 10);
+        let mut left = cache.iter_keys();
+        left.sort_unstable();
+        assert_eq!(left, (stale..stale + 5).map(shard_key).collect::<Vec<_>>());
+    }
+
+    /// Refills shard 0 of [`REFILLED`] with one new entry per expiry it hears
+    /// about, so the shard being swept never runs out of expired entries.
+    struct RefillingListener;
+    static REFILLED: std::sync::OnceLock<ShardedCache<TestValue, RefillingListener>> =
+        std::sync::OnceLock::new();
+    static REFILL_EXPIRED: AtomicU64 = AtomicU64::new(0);
+    static REFILL_NEXT_KEY: AtomicU64 = AtomicU64::new(1 << 32);
+    /// Bounds the refills so a pass that never stops still ends the test.
+    const REFILL_CAP: u64 = 100_000;
+
+    impl EvictionListener for RefillingListener {
+        fn on_evict(reason: EvictionReason) {
+            if reason != EvictionReason::Expired {
+                return;
+            }
+            if REFILL_EXPIRED.fetch_add(1, Ordering::Relaxed) >= REFILL_CAP {
+                return;
+            }
+            let key = REFILL_NEXT_KEY.fetch_add(NUM_SHARDS as u64, Ordering::Relaxed);
+            if let Some(cache) = REFILLED.get() {
+                cache.insert(key, TestValue::with_size("refill", 1), 1);
+            }
+        }
+    }
+
+    /// A pass reclaims what had expired when it reached the shard, not what
+    /// was inserted while it ran. Under a zero TTL every entry is expired on
+    /// insert, so without that cutoff a shard refilled between batches would
+    /// keep one `run_pending_tasks` call going for as long as the refills do.
+    #[test]
+    fn run_pending_tasks_stops_at_entries_inserted_during_the_pass() {
+        let cache = REFILLED
+            .get_or_init(|| ShardedCache::new(1 << 40, Duration::ZERO, EvictionPolicy::Lru));
+        let initial = u64::try_from(2 * EXPIRE_BATCH + 7).expect("fits u64");
+        // Multiples of NUM_SHARDS all land on shard 0.
+        for i in 0..initial {
+            cache.insert(i * NUM_SHARDS as u64, TestValue::with_size("old", 1), 1);
+        }
+
+        cache.run_pending_tasks();
+
+        assert_eq!(
+            REFILL_EXPIRED.load(Ordering::Relaxed),
+            initial,
+            "one pass must reclaim exactly the entries present when it started"
+        );
+        assert_eq!(cache.len(), usize::try_from(initial).expect("fits usize"));
     }
 
     #[test]

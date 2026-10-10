@@ -56,10 +56,17 @@ pub struct SecondaryIndex {
     pub name: String,
     /// Column names that form the index key.
     pub columns: Vec<String>,
-    /// Whether this index enforces uniqueness.
+    /// Whether the index was declared `unique`. Not enforced: the index serves
+    /// lookups the same way either, and a repeated key disables it (see
+    /// [`SecondaryIndex::is_usable`]) rather than being rejected.
     pub unique: bool,
-    /// The hash index itself.
+    /// The hash index itself. It holds one row per key, so it is only probed
+    /// while [`SecondaryIndex::is_usable`].
     pub index: Arc<HashIndex>,
+    /// Cleared when a rebuild finds a repeated key, so a lookup scans the table
+    /// instead of answering with one of the key's rows; set again by a rebuild
+    /// that finds the keys distinct.
+    usable: Arc<AtomicBool>,
 }
 
 impl SecondaryIndex {
@@ -71,7 +78,14 @@ impl SecondaryIndex {
             columns,
             unique,
             index,
+            usable: Arc::new(AtomicBool::new(true)),
         }
+    }
+
+    /// Whether lookups may use this index: the last rebuild found every key in one row.
+    #[must_use]
+    pub fn is_usable(&self) -> bool {
+        self.usable.load(Ordering::Acquire)
     }
 
     /// Returns the column names this index is built on.
@@ -79,6 +93,36 @@ impl SecondaryIndex {
     pub fn columns(&self) -> &[String] {
         &self.columns
     }
+}
+
+const HASH_INDEX_DOCS: &str = "https://spiceai.org/docs/features/data-acceleration/hash-index";
+
+/// The warning a dataset gets when a rebuild cannot use one of its secondary indexes.
+fn index_unusable_warning(dataset: &str, columns: &[String], cause: &dyn fmt::Display) -> String {
+    format!(
+        "Dataset '{dataset}' (arrow): the index on ({}) cannot be used, so lookups on it read the whole table until a refresh changes the data. Cause: {cause}. See: {HASH_INDEX_DOCS}",
+        columns.join(", ")
+    )
+}
+
+/// The warning an Arrow acceleration gets when it declares a `unique` index.
+///
+/// Arrow treats a `unique` index like `enabled`: it does not reject a repeated row on
+/// write, and an index over repeated values stops serving lookups. Said at registration,
+/// as Cayenne does, rather than left for a slow lookup to say.
+#[must_use]
+pub fn unique_index_warning(dataset: &str) -> String {
+    format!(
+        "Dataset '{dataset}' (arrow): a `unique` entry in `indexes` does not constrain writes, so duplicate rows are not rejected. A single-column entry speeds up lookups while its values are distinct, and while a value repeats, lookups on it read the whole table; a compound entry is not used for lookups. Set `primary_key` with `on_conflict` to deduplicate on a column set. See: {HASH_INDEX_DOCS}"
+    )
+}
+
+/// The notice a dataset gets when a rebuild makes a disabled secondary index usable again.
+fn index_usable_again_notice(dataset: &str, columns: &[String]) -> String {
+    format!(
+        "Dataset '{dataset}' (arrow): the index on ({}) serves lookups again",
+        columns.join(", ")
+    )
 }
 
 /// A `MemTable` enhanced with a SIMD-optimized hash index for fast point lookups.
@@ -97,6 +141,8 @@ pub struct IndexedMemTable {
     primary_key_columns: Vec<String>,
     /// Secondary indexes on non-primary key columns.
     secondary_indexes: Vec<SecondaryIndex>,
+    /// Names the table in log messages about its indexes.
+    table_name: Option<String>,
     /// Whether the hash index(es) may be stale relative to the underlying data.
     ///
     /// Set conservatively at plan time by any DML entry point
@@ -117,6 +163,7 @@ impl Debug for IndexedMemTable {
             .field("indexed", &self.index.is_some())
             .field("primary_key_columns", &self.primary_key_columns)
             .field("secondary_indexes_count", &self.secondary_indexes.len())
+            .field("table_name", &self.table_name)
             .field("dirty", &self.is_dirty())
             .finish()
     }
@@ -195,8 +242,16 @@ impl IndexedMemTable {
             index,
             primary_key_columns,
             secondary_indexes: Vec::new(),
+            table_name: None,
             dirty: AtomicBool::new(false),
         })
+    }
+
+    /// Names the table in log messages about its indexes.
+    #[must_use]
+    pub fn with_table_name(mut self, table_name: impl Into<String>) -> Self {
+        self.table_name = Some(table_name.into());
+        self
     }
 
     /// Returns true if the index may be stale relative to the underlying data.
@@ -365,14 +420,53 @@ impl IndexedMemTable {
             })?;
         }
 
-        // Rebuild secondary indexes
+        // A secondary index holds one row per key, so it is rebuilt strictly: data
+        // with a repeated key leaves it unusable, and lookups on it scan the table
+        // until a rebuild finds the keys distinct again. Logged on each change of
+        // state only, since the rebuild runs after every refresh.
+        let dataset = self.table_name.as_deref().unwrap_or("<unnamed>");
         for secondary in &self.secondary_indexes {
-            secondary.index.rebuild(&partitions).map_err(|e| {
-                DataFusionError::Execution(format!(
-                    "Failed to rebuild secondary index '{}': {e}",
-                    secondary.name
-                ))
-            })?;
+            // A compound index is built but never probed (see `find_secondary_index_match`),
+            // so a repeated key costs it nothing and warrants no warning.
+            if secondary.columns.len() != 1 {
+                secondary.index.rebuild(&partitions).map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "Failed to rebuild secondary index '{}': {e}",
+                        secondary.name
+                    ))
+                })?;
+                continue;
+            }
+            let was_usable = secondary.is_usable();
+            match secondary.index.rebuild_strict(&partitions) {
+                Ok(()) => {
+                    secondary.usable.store(true, Ordering::Release);
+                    if !was_usable {
+                        tracing::info!(
+                            "{}",
+                            index_usable_again_notice(dataset, &secondary.columns)
+                        );
+                    }
+                }
+                Err(
+                    cause @ (hash_index::Error::DuplicateKey
+                    | hash_index::Error::HashCollision { .. }),
+                ) => {
+                    secondary.usable.store(false, Ordering::Release);
+                    if was_usable {
+                        tracing::warn!(
+                            "{}",
+                            index_unusable_warning(dataset, &secondary.columns, &cause)
+                        );
+                    }
+                }
+                Err(e) => {
+                    return Err(DataFusionError::Execution(format!(
+                        "Failed to rebuild secondary index '{}': {e}",
+                        secondary.name
+                    )));
+                }
+            }
         }
 
         Ok(())
@@ -436,8 +530,9 @@ impl IndexedMemTable {
 
     /// Finds a secondary index that can be used for the given filters.
     ///
-    /// Returns the matching secondary index and the key value if a single-column
-    /// secondary index matches an equality predicate in the filters.
+    /// Returns the matching secondary index and the key value if a usable (see
+    /// [`SecondaryIndex::is_usable`]) single-column secondary index matches an
+    /// equality predicate in the filters.
     ///
     /// # Limitations
     ///
@@ -452,7 +547,7 @@ impl IndexedMemTable {
         for secondary in &self.secondary_indexes {
             // Only support single-column secondary indexes for now.
             // Multi-column secondary indexes are built but not used for optimization yet.
-            if secondary.columns.len() != 1 {
+            if secondary.columns.len() != 1 || !secondary.is_usable() {
                 continue;
             }
 
@@ -743,74 +838,67 @@ impl TableProvider for IndexedMemTable {
             )));
         }
 
-        // Check if we can use a secondary index for lookup
-        // Note: Secondary indexes with unique=true work like primary key lookups (single result)
-        // Non-unique secondary indexes still provide fast lookup but may have collisions
+        // A usable secondary index holds one row per key (a repeated key disables it
+        // at rebuild), so this is the same single-row probe as the primary key's.
+        // `find_secondary_index_match` returns only usable single-column indexes.
         if let (true, Some((secondary, key_value))) =
             (index_usable, self.find_secondary_index_match(filters))
         {
             tracing::debug!(
                 secondary_index_name = %secondary.name,
                 secondary_columns = ?secondary.columns,
-                secondary_unique = secondary.unique,
                 "Found secondary index match"
             );
-            // Only use indexed lookup for unique secondary indexes
-            // Non-unique indexes would need multi-value support which hash-index doesn't provide yet
-            // Also verify this is a single-column index since verification below only checks first column
-            if secondary.unique && secondary.columns.len() == 1 {
-                let hash = key_value.hash();
-                let index_columns = secondary.columns.clone();
+            let hash = key_value.hash();
+            let index_columns = secondary.columns.clone();
 
-                if let Some(location) = secondary.index.get_by_hash(hash) {
-                    if let Some(batch) = self.get_row_at_location(location).await? {
-                        // Verify the actual key matches (handle hash collisions)
-                        // SAFETY: We already verified secondary.columns.len() == 1 above
-                        let index_column = &secondary.columns[0];
-                        if key_value.matches_batch(&batch, index_column) {
-                            let result_batch = if let Some(proj) = projection {
-                                batch.project(proj)?
-                            } else {
-                                batch
-                            };
+            if let Some(location) = secondary.index.get_by_hash(hash) {
+                if let Some(batch) = self.get_row_at_location(location).await? {
+                    // Verify the actual key matches (handle hash collisions)
+                    // `find_secondary_index_match` returns only single-column indexes.
+                    let index_column = &secondary.columns[0];
+                    if key_value.matches_batch(&batch, index_column) {
+                        let result_batch = if let Some(proj) = projection {
+                            batch.project(proj)?
+                        } else {
+                            batch
+                        };
 
-                            let schema = result_batch.schema();
-                            let stream = futures::stream::once(async move { Ok(result_batch) });
-                            let stream = RecordBatchStreamAdapter::new(Arc::clone(&schema), stream);
+                        let schema = result_batch.schema();
+                        let stream = futures::stream::once(async move { Ok(result_batch) });
+                        let stream = RecordBatchStreamAdapter::new(Arc::clone(&schema), stream);
 
-                            return Ok(Arc::new(IndexedLookupExec::new(
-                                schema,
-                                Box::pin(stream),
-                                index_columns,
-                                true,
-                            )));
-                        }
-                        // Hash collision - fall through to return empty
-                        tracing::debug!(
-                            hash = hash,
-                            index_name = %secondary.name,
-                            "Hash collision detected during secondary index lookup"
-                        );
+                        return Ok(Arc::new(IndexedLookupExec::new(
+                            schema,
+                            Box::pin(stream),
+                            index_columns,
+                            true,
+                        )));
                     }
+                    // Hash collision - fall through to return empty
+                    tracing::debug!(
+                        hash = hash,
+                        index_name = %secondary.name,
+                        "Hash collision detected during secondary index lookup"
+                    );
                 }
-
-                // Key not found - return empty result
-                let schema = if let Some(proj) = projection {
-                    Arc::new(self.schema().project(proj)?)
-                } else {
-                    self.schema()
-                };
-                let stream = futures::stream::empty();
-                let stream = RecordBatchStreamAdapter::new(Arc::clone(&schema), stream);
-
-                return Ok(Arc::new(IndexedLookupExec::new(
-                    schema,
-                    Box::pin(stream),
-                    index_columns,
-                    false,
-                )));
             }
-            // Non-unique secondary indexes fall through to full table scan
+
+            // Key not found - return empty result
+            let schema = if let Some(proj) = projection {
+                Arc::new(self.schema().project(proj)?)
+            } else {
+                self.schema()
+            };
+            let stream = futures::stream::empty();
+            let stream = RecordBatchStreamAdapter::new(Arc::clone(&schema), stream);
+
+            return Ok(Arc::new(IndexedLookupExec::new(
+                schema,
+                Box::pin(stream),
+                index_columns,
+                false,
+            )));
         }
 
         // Fall back to regular MemTable scan
@@ -1214,6 +1302,7 @@ mod tests {
             index,
             primary_key_columns,
             secondary_indexes: Vec::new(),
+            table_name: None,
             dirty: AtomicBool::new(false),
         })
     }
@@ -3799,5 +3888,29 @@ mod tests {
             .await
             .expect("maintenance failed");
         assert!(!table.is_dirty());
+    }
+
+    /// A log line a user acts on names the dataset, links the docs, and stays on one line.
+    #[test]
+    fn index_messages_name_the_dataset_and_link_the_docs() {
+        let columns = vec!["sender_id".to_string()];
+        let warning = index_unusable_warning("senders", &columns, &hash_index::Error::DuplicateKey);
+        assert!(warning.contains("'senders'"), "{warning}");
+        assert!(warning.contains("(sender_id)"), "{warning}");
+        assert!(warning.contains("Duplicate key"), "{warning}");
+        assert!(warning.contains("https://spiceai.org/docs"), "{warning}");
+        assert!(!warning.contains('\n'), "{warning}");
+
+        let notice = index_usable_again_notice("senders", &columns);
+        assert!(
+            notice.contains("'senders'") && notice.contains("(sender_id)"),
+            "{notice}"
+        );
+        assert!(!notice.contains('\n'), "{notice}");
+
+        let warning = unique_index_warning("senders");
+        assert!(warning.contains("'senders'"), "{warning}");
+        assert!(warning.contains("https://spiceai.org/docs"), "{warning}");
+        assert!(!warning.contains('\n'), "{warning}");
     }
 }

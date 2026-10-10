@@ -1,0 +1,20 @@
+---
+source: crates/runtime-decide/tests/decisions.rs
+expression: plan
+---
++---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| plan_type     | plan                                                                                                                                                                                                        |
++---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+
+| logical_plan  | Projection: tickets.id                                                                                                                                                                                      |
+|               |   Filter: get_field(__decide_1, Utf8("ai_if_0"), Utf8("probability")) > Float64(0.5) AND get_field(__decide_1, Utf8("ai_if_1"), Utf8("probability")) > Float64(0.5)                                         |
+|               |     Projection: tickets.id, ai_decide(tickets.body, Utf8("{"ai_if_0":{"type":"noul","instructions":"refund"},"ai_if_1":{"type":"noul","instructions":"billing"}}"), Utf8(NULL), Utf8("fail")) AS __decide_1 |
+|               |       Filter: tickets.status = Utf8("open")                                                                                                                                                                 |
+|               |         TableScan: tickets projection=[id, status, body]                                                                                                                                                    |
+| physical_plan | FilterExec: get_field(__decide_1@1, ai_if_0, probability) > 0.5 AND get_field(__decide_1@1, ai_if_1, probability) > 0.5, projection=[id@0]                                                                  |
+|               |   ProjectionExec: expr=[id@0 as id, __async_fn_0@3 as __decide_1]                                                                                                                                           |
+|               |     AsyncFuncExec: async_expr=[async_expr(name=__async_fn_0, expr=ai_decide(body@2, {"ai_if_0":{"type":"noul","instructions":"refund"},"ai_if_1":{"type":"noul","instructions":"billing"}}, NULL, fail))]   |
+|               |       RepartitionExec: partitioning=RoundRobinBatch(4), input_partitions=1                                                                                                                                  |
+|               |         FilterExec: status@1 = open                                                                                                                                                                         |
+|               |           DataSourceExec: partitions=1, partition_sizes=[1]                                                                                                                                                 |
+|               |                                                                                                                                                                                                             |
++---------------+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------+

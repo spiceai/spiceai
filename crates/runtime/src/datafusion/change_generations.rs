@@ -287,9 +287,10 @@ impl GenerationPermit {
     /// before being polled here.
     ///
     /// Cancellation before delivery drains the result instead of installing it.
-    /// Failed/panicked construction stays fenced because no complete owner was
-    /// returned to prove cleanup. Perform side-effect-free validation before
-    /// calling this method. A stuck constructor retains the permit; later
+    /// A constructor that returns an error must leave nothing running that can
+    /// touch the storage; its error releases the slot so a later attempt can
+    /// construct again. A panicked constructor stays fenced because nothing
+    /// proves its cleanup. A stuck constructor retains the permit; later
     /// lifecycle operations wait rather than replacing its storage.
     pub(crate) async fn construct<T, F>(
         mut self,
@@ -323,7 +324,7 @@ impl GenerationPermit {
                     })
                 }
                 Err(error) => {
-                    *self.state = State::Fenced(format!("construction failed: {error}"));
+                    *self.state = State::Vacant;
                     Err(error)
                 }
             };
@@ -728,22 +729,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn constructor_failure_and_panic_leave_a_fence() {
-        for panic in [false, true] {
-            let registry = ChangeGenerations::default();
-            let result = registry
-                .acquire(&name(), WAIT)
-                .await
-                .expect("permit")
-                .construct::<(), _>(&Handle::current(), async move {
-                    assert!(!panic, "constructor panic");
-                    Err(DataFusionError::Execution("constructor failure".into()))
-                })
-                .await;
-            assert!(result.is_err());
-            for _ in 0..2 {
-                assert!(registry.acquire(&name(), WAIT).await.is_err());
-            }
+    async fn constructor_failure_releases_the_generation() {
+        let registry = ChangeGenerations::default();
+        let result = registry
+            .acquire(&name(), WAIT)
+            .await
+            .expect("permit")
+            .construct::<(), _>(&Handle::current(), async {
+                Err(DataFusionError::Execution("constructor failure".into()))
+            })
+            .await;
+        assert!(result.is_err());
+        let stopped = Arc::new(AtomicBool::new(false));
+        prepare(&registry, Arc::clone(&stopped), Publication::Ready)
+            .await
+            .installed();
+        drop(registry.acquire(&name(), WAIT).await.expect("drained"));
+        assert!(stopped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn constructor_panic_leaves_a_fence() {
+        let registry = ChangeGenerations::default();
+        let result = registry
+            .acquire(&name(), WAIT)
+            .await
+            .expect("permit")
+            .construct::<(), _>(&Handle::current(), async { panic!("constructor panic") })
+            .await;
+        assert!(result.is_err());
+        for _ in 0..2 {
+            assert!(registry.acquire(&name(), WAIT).await.is_err());
         }
     }
 }

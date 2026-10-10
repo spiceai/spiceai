@@ -258,7 +258,8 @@ async fn indexes_follow_each_registration_not_the_stored_table() {
 
 /// A runtime join lookup queues the same paced read-back build as a literal
 /// lookup. Its first execution scans; a later execution uses the published
-/// index without requiring a literal query to prime it.
+/// index without requiring a literal query to prime it. The test disables
+/// persistence, so the reopened table has no persisted index to load.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_dynamic_lookup_rebuilds_the_index_after_reopen() {
     const ROWS: usize = 4_000;
@@ -267,12 +268,13 @@ async fn a_dynamic_lookup_rebuilds_the_index_after_reopen() {
         .expect("fixture");
     let env = Arc::new(RuntimeEnv::default());
     let name = "dynamic_rebuild";
+    let spec = || TableSpec::new(name, schema(), &[&KEY]).persistence(IndexPersistence::Disabled);
 
-    let initial = open(&fixture, Arc::clone(&env), name, &[&KEY]).await;
+    let initial = open_table(&fixture, Arc::clone(&env), spec()).await;
     overwrite(&initial, vec![rows(0, ROWS)]).await;
     drop(initial);
 
-    let reopened = open(&fixture, env, name, &[&KEY]).await;
+    let reopened = open_table(&fixture, env, spec()).await;
     reopened.init_scan_view_cache();
     assert_eq!(counters(&reopened).index_bytes, 0);
 
@@ -1211,6 +1213,38 @@ async fn a_reopened_table_loads_its_persisted_runs() {
     assert!(
         verification.files == 0 && verification.uncovered_files > 0,
         "without persisted runs a reopened table starts uncovered: {verification:?}"
+    );
+}
+
+/// A table opened with no persistence override persists its index runs, and
+/// reopening it loads them: the default, not a test setting, is exercised.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_table_persists_its_index_by_default() {
+    const ROWS: usize = 5_000;
+    let fixture = common::TestFixture::new(common::BackendType::Sqlite)
+        .await
+        .expect("fixture");
+    let env = Arc::new(RuntimeEnv::default());
+    let name = "persisted_by_default";
+
+    let table = open(&fixture, Arc::clone(&env), name, &[&KEY]).await;
+    overwrite(&table, vec![rows(0, ROWS)]).await;
+    wait_for_persisted_runs(&fixture, name, 1).await;
+    drop(table);
+
+    let reopened = open(&fixture, env, name, &[&KEY]).await;
+    let verification = reopened
+        .verify_lookup_index_against_read_back()
+        .await
+        .expect("verify");
+    assert!(verification.agrees(), "{verification:?}");
+    assert_eq!(
+        (
+            verification.uncovered_files,
+            counters(&reopened).builds_started
+        ),
+        (0, 0),
+        "a reopened table must load its index by default: {verification:?}"
     );
 }
 
