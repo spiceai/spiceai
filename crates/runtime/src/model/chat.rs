@@ -352,11 +352,14 @@ fn anthropic(
         }),
     };
 
-    let anthropic = Anthropic::new(auth, model_id, api_base, None).map_err(|_| {
-        LlmError::FailedToLoadModel {
+    let anthropic = Anthropic::new(auth, model_id, api_base, None)
+        .map_err(|_| LlmError::FailedToLoadModel {
             source: format!("Unknown anthropic model: {:?}", model_id.clone()).into(),
-        }
-    })?;
+        })?
+        .with_workspace_id(params.workspace_id.as_deref())
+        .map_err(|e| LlmError::FailedToLoadModel {
+            source: format!("Invalid `anthropic_workspace_id`: {e}").into(),
+        })?;
 
     Ok(Arc::new(anthropic) as Arc<dyn Chat>)
 }

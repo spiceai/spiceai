@@ -32,6 +32,8 @@ pub struct AnthropicModelParams {
     pub api_key: Option<SecretString>,
     /// The Anthropic Auth Token.
     pub auth_token: Option<SecretString>,
+    /// The Anthropic workspace ID, sent as the `anthropic-workspace-id` header. Required when the API key is not scoped to a workspace.
+    pub workspace_id: Option<String>,
     /// Anthropic usage tier (1-4). Used for rate limit defaults.
     pub usage_tier: Option<String>,
 }
