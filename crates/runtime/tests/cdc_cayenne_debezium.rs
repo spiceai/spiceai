@@ -49,7 +49,9 @@ limitations under the License.
 // integration test is a separate binary that links independently, and the linker drops an
 // unreferenced slice static, so a binary exercising Cayenne must name the crate itself.
 #[cfg(not(windows))]
-use accelerator_cayenne as _;
+use accelerator_cayenne::CayenneAccelerator;
+use data_accelerator_api::DataAccelerator;
+use runtime_acceleration::change_sink::ChangeSinkContext;
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -241,11 +243,21 @@ async fn setup_keyed_cayenne_with_schema(
 
 /// Build a [`RefreshTask`] whose accelerator and (unused) federated source both
 /// point at the given Cayenne table.
-fn make_refresh_task(
+/// Build the refresh task with the change sink a Cayenne dataset gets in
+/// production, so the apply goes through Cayenne's deferred-durability path
+/// rather than the generic provider sink.
+async fn make_refresh_task(
     accelerator: Arc<dyn TableProvider>,
     table_name: &str,
 ) -> runtime::accelerated::refresh_task::RefreshTask {
     let federated = Arc::new(FederatedTable::new_unchecked(Arc::clone(&accelerator)));
+    let binding = ChangeSinkContext::new(TableReference::bare(table_name), Arc::clone(&accelerator));
+    let write_lock = Arc::clone(&binding.write_lock);
+    let sink = CayenneAccelerator::new()
+        .change_sink(binding, &Handle::current(), 2)
+        .await
+        .expect("bind Cayenne change sink")
+        .expect("Cayenne provides a change sink");
     RefreshTaskBuilder::new(
         RuntimeStatus::new(),
         TableReference::bare(table_name),
@@ -253,8 +265,9 @@ fn make_refresh_task(
         None,
         accelerator,
         Handle::current(),
-        Arc::new(tokio::sync::Mutex::new(())),
+        write_lock,
     )
+    .with_change_sink(Some(sink))
     .build()
 }
 
@@ -265,7 +278,7 @@ async fn apply_stream(
     table_name: &str,
     ops: &[Op<'_>],
 ) -> Vec<i64> {
-    let task = make_refresh_task(Arc::clone(table) as Arc<dyn TableProvider>, table_name);
+    let task = make_refresh_task(Arc::clone(table) as Arc<dyn TableProvider>, table_name).await;
     let commits = Arc::new(TokioMutex::new(Vec::new()));
     let stream = stream_of(ops, &commits);
     let refresh = Arc::new(RwLock::new(Refresh::default()));
@@ -529,7 +542,7 @@ async fn debezium_json_nesting_folds_into_catch_all() {
     let task = make_refresh_task(
         Arc::clone(&table) as Arc<dyn TableProvider>,
         "dbz_json_nest",
-    );
+    ).await;
     let refresh = Arc::new(RwLock::new(Refresh::default()));
     task.start_changes_stream(
         refresh,
