@@ -48,6 +48,7 @@ use datafusion_table_providers::util::{
 test_with_backends!(position_mode_deletion_index_reaches_bounded_steady_state);
 test_with_backends!(key_mode_deletion_index_still_reclaims);
 test_with_backends!(default_mode_deletion_index_reclaims_through_the_bake);
+test_with_backends!(small_write_profile_deletion_index_reclaims_through_the_bake);
 
 /// Rows per upsert round. Above `INLINE_MAX_ROWS` so each round writes a Vortex
 /// file rather than landing in the inline memtable.
@@ -120,6 +121,15 @@ async fn build_table(
     schema: &Arc<Schema>,
     deletion_mode: DeletionMode,
 ) -> Result<Arc<CayenneTableProvider>, Box<dyn std::error::Error>> {
+    build_table_with_config(fixture, name, schema, reclaim_config(deletion_mode)).await
+}
+
+async fn build_table_with_config(
+    fixture: &common::TestFixture,
+    name: &str,
+    schema: &Arc<Schema>,
+    vortex_config: VortexConfig,
+) -> Result<Arc<CayenneTableProvider>, Box<dyn std::error::Error>> {
     let options = CreateTableOptions {
         table_name: name.to_string(),
         schema: Arc::clone(schema),
@@ -129,7 +139,7 @@ async fn build_table(
         ]))),
         base_path: fixture.data_path.to_string_lossy().to_string(),
         partition_column: None,
-        vortex_config: reclaim_config(deletion_mode),
+        vortex_config,
     };
 
     let catalog: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
@@ -329,6 +339,56 @@ async fn default_mode_deletion_index_reclaims_through_the_bake(
         count_rows(&table, "auto_reclaim").await,
         ROUNDS * ROWS_PER_ROUND,
         "default-mode reclamation changed the visible row set"
+    );
+
+    Ok(())
+}
+
+/// The default mode under the protected-snapshot merge trigger the accelerator
+/// gives every `refresh_mode: append` and `changes` table (its small-write
+/// profile merges at 4). The seq-prefix bake needs the snapshots it leaves
+/// unbaked plus two more, and the merge folds the protected set as soon as 4
+/// accumulate — so with the bake's floor at 5 the merge always got there first,
+/// the bake never found a candidate, and the deletion index grew for the life of
+/// the table even though `auto` now resolves to `key`.
+async fn small_write_profile_deletion_index_reclaims_through_the_bake(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = pk_schema();
+    let table = build_table_with_config(
+        &fixture,
+        "small_write_reclaim",
+        &schema,
+        VortexConfig {
+            compaction_trigger_protected_snapshots: 4,
+            ..reclaim_config(DeletionMode::Auto)
+        },
+    )
+    .await?;
+
+    let observed = drive_rounds(&table, &schema).await?;
+
+    let rows_per_round = usize::try_from(ROWS_PER_ROUND).expect("row count fits in usize");
+    let unbounded = usize::try_from(ROUNDS).expect("round count fits in usize") * rows_per_round;
+    let peak = observed.iter().copied().max().unwrap_or(0);
+    assert!(
+        peak < unbounded,
+        "the bake never reclaimed a small-write-profile table's deletion index: peak {peak}, observations {observed:?}"
+    );
+    assert!(
+        observed.iter().any(|len| *len >= RECLAIM_TRIGGER)
+            || observed.windows(2).any(|pair| pair[1] < pair[0]),
+        "the index never crossed the reclaim trigger and never shrank, so this test proved nothing: {observed:?}"
+    );
+    assert_eq!(
+        table.last_small_file_compact_path(),
+        LastSmallFileCompactPath::None,
+        "reclaimed by a full rewrite rather than the bake: {observed:?}"
+    );
+    assert_eq!(
+        count_rows(&table, "small_write_reclaim").await,
+        ROUNDS * ROWS_PER_ROUND,
+        "reclamation changed the visible row set"
     );
 
     Ok(())

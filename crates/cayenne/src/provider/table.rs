@@ -3408,8 +3408,10 @@ fn protected_merge_input_budget_for_pool(
 /// every pass would re-merge hot deltas for no index shrink (write-amp with no
 /// read win). Keeping a small tail unbaked means each bake consolidates only the
 /// settled older prefix; the cutoff `T` is the highest `max_sequence` among the
-/// snapshots OLDER than this tail. With fewer than `K + 1` protected snapshots
-/// there is no settled prefix and the bake is a no-op.
+/// snapshots OLDER than this tail. The bake needs `K + 2` protected snapshots
+/// to merge a settled prefix, so `K` is capped per table to keep that floor at
+/// or below the size-tier merge's trigger — see
+/// [`CayenneTableProvider::bake_keep_recent_snapshots`].
 const BAKE_KEEP_RECENT_SNAPSHOTS: usize = 3;
 
 /// Default deletion-index size (count of live PK tombstones, `delete_len()`) at
@@ -4001,7 +4003,7 @@ enum OrphanDvSweepPass {
 /// Conservative per-table fraction so several tables can coexist under the shared
 /// pool. NOTE: this bounds memory only when the bake CAN drain (a clean older
 /// seq-prefix exists). The structural no-clean-prefix case (deletes confined to the
-/// kept-recent snapshots, or fewer than `BAKE_KEEP_RECENT_SNAPSHOTS + 2` protected
+/// kept-recent snapshots, or fewer than `bake_keep_recent_snapshots() + 2` protected
 /// snapshots) still needs bounded ingest back-pressure — a documented follow-up.
 /// The fraction is also PER-TABLE against the process-wide pool, so it does not
 /// bound the AGGREGATE: N tables each parked just under the fraction can still
@@ -26033,12 +26035,12 @@ impl CayenneTableProvider {
     ///
     /// Protected-snapshot ids are `UUIDv7` (lexical == creation order); under CDC
     /// append, creation order tracks commit sequence. We keep the newest
-    /// [`BAKE_KEEP_RECENT_SNAPSHOTS`] (`K`) snapshots UNBAKED so the active delete
-    /// stream is not re-merged every pass, and consider the older prefix. `T` is
-    /// the highest per-file `max_sequence` over that older prefix's manifests, so
-    /// every selected snapshot trivially has all files `max_sequence <= T`. With
-    /// fewer than `K + 2` protected snapshots there is no merge-worthy settled
-    /// prefix and this is a no-op.
+    /// [`Self::bake_keep_recent_snapshots`] (`K`) snapshots UNBAKED so the active
+    /// delete stream is not re-merged every pass, and consider the older prefix.
+    /// `T` is the highest per-file `max_sequence` over that older prefix's
+    /// manifests, so every selected snapshot trivially has all files
+    /// `max_sequence <= T`. With fewer than `K + 2` protected snapshots there is
+    /// no merge-worthy settled prefix and this is a no-op.
     ///
     /// ## Clean-prefix invariant (resurrect-rows-critical)
     ///
@@ -26195,6 +26197,30 @@ impl CayenneTableProvider {
         Box::pin(self.bake_seq_prefix_protected_snapshots_inner()).await
     }
 
+    /// How many of the newest protected snapshots the seq-prefix bake leaves
+    /// unbaked: [`BAKE_KEEP_RECENT_SNAPSHOTS`], capped at two below the size-tier
+    /// merge's trigger.
+    ///
+    /// The two passes draw on the same protected snapshots, and the bake needs
+    /// `keep + 2` of them to merge a settled prefix while the size-tier merge
+    /// folds them as soon as `compaction_trigger_protected_snapshots` accumulate.
+    /// A floor above that trigger means the merge always gets there first: the
+    /// protected set cycles below the floor, the bake never finds a candidate,
+    /// and the key deletion index it exists to prune grows for the life of the
+    /// table. That is the steady state of every `refresh_mode: append` or
+    /// `changes` table at a moderate write rate, whose small-write profile merges
+    /// at 4 against an uncapped floor of 5. Capped, the bake — which runs first in
+    /// a compaction trigger — takes the oldest snapshots the moment the merge
+    /// would, and leaves the merge too few to run.
+    fn bake_keep_recent_snapshots(&self) -> usize {
+        BAKE_KEEP_RECENT_SNAPSHOTS.min(
+            self.context
+                .compaction_trigger_protected_snapshots()
+                .max(2)
+                .saturating_sub(2),
+        )
+    }
+
     async fn bake_seq_prefix_protected_snapshots_inner(&self) -> Result<bool> {
         // GATE: key-delete tables only. Position deletes are file-scoped (the
         // prune is a no-op for them) and their subset compaction must serialize
@@ -26232,6 +26258,7 @@ impl CayenneTableProvider {
         };
 
         let compaction_start = std::time::Instant::now();
+        let keep_recent = self.bake_keep_recent_snapshots();
 
         // --- Phase 1: short fence read — coherent input set. ---
         // Capture the protected set, each input's deletion threshold, the live
@@ -26256,7 +26283,7 @@ impl CayenneTableProvider {
             let snapshot_at_capture = self.get_current_snapshot_id();
             let protected = self.protected_snapshots.load_full();
             // Need at least K newest-to-keep + 2 to merge an older prefix.
-            if protected.len() < BAKE_KEEP_RECENT_SNAPSHOTS + 2 {
+            if protected.len() < keep_recent + 2 {
                 maintenance_metrics::track_compaction(
                     table_name,
                     CompactionKind::Bake,
@@ -26290,7 +26317,7 @@ impl CayenneTableProvider {
 
         // --- Seq-prefix selection (replaces size-tier selection). ---
         // Candidate prefix = all but the newest K (creation-/sequence-ordered).
-        let split = ordered_ids.len() - BAKE_KEEP_RECENT_SNAPSHOTS;
+        let split = ordered_ids.len() - keep_recent;
         let candidate_ids = &ordered_ids[..split];
         let mut selected: Vec<(String, i64)> = Vec::with_capacity(candidate_ids.len());
         let mut cutoff: i64 = i64::MIN;
@@ -26399,7 +26426,7 @@ impl CayenneTableProvider {
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
                 candidates = candidate_ids.len(),
-                keep_recent = BAKE_KEEP_RECENT_SNAPSHOTS,
+                keep_recent,
                 stopped_early = stopped_early.unwrap_or("none"),
                 max_pass_bytes = max_pass_bytes.unwrap_or(u64::MAX),
                 "Skipping seq-prefix bake: fewer than two older snapshots fit the pass memory \
@@ -26417,7 +26444,7 @@ impl CayenneTableProvider {
             table = self.table_metadata.table_name.as_str(),
             input_count = selected.len(),
             candidates = candidate_ids.len(),
-            keep_recent = BAKE_KEEP_RECENT_SNAPSHOTS,
+            keep_recent,
             prefix_cutoff,
             fence_max_delete_seq,
             deletion_index_len = deletion_snapshot.delete_len(),
