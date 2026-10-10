@@ -349,9 +349,9 @@ fn partition_only_file_scan(plan: &Arc<dyn ExecutionPlan>) -> Option<&FileScanCo
     // DataFusion folds a projection above a scan into the scan, aliases
     // included, so a field named after a partition column can carry a data
     // column's values (`SELECT value AS p` over a table partitioned by `p`), or
-    // a value computed from the partition column (`p - 1 AS p`). The field names
-    // cannot tell those apart from the column itself; the projected expressions
-    // can.
+    // a value computed from the partition column (`p || '0' AS p`). The field
+    // names cannot tell those apart from the column itself; the projected
+    // expressions can.
     if !projects_only_plain_columns(config) {
         return None;
     }

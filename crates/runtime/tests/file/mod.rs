@@ -259,6 +259,89 @@ async fn file_connector_partition_only_scan_reads_an_aliased_data_column()
         .await
 }
 
+/// The computed counterpart of
+/// `file_connector_partition_only_scan_reads_an_aliased_data_column`: a value
+/// computed from the partition column and aliased back to its name
+/// (`SELECT p || '0' AS p`) is folded into the scan as a field named `p` whose
+/// expression is not a column at all. The listing holds only the bare partition
+/// values, so the partition-only rewrite must read the files instead.
+#[tokio::test]
+async fn file_connector_partition_only_scan_reads_a_computed_partition_alias()
+-> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async {
+            let (_dir, dataset) = hive_partitioned_dataset()?;
+            let app = AppBuilder::new("file_connector")
+                .with_dataset(dataset)
+                .build();
+
+            configure_test_datafusion();
+            let mut rt = Runtime::builder().with_app(app).build().await;
+            let cloned_rt = Arc::new(rt.clone());
+
+            tokio::select! {
+                () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+                    return Err(anyhow::anyhow!("Timed out waiting for datasets to load"));
+                }
+                () = cloned_rt.load_components() => {}
+            }
+
+            // Hive partition values are strings (`p` in '1'..='3'), so the
+            // arithmetic form casts before subtracting.
+            for (query, projection, expected) in [
+                (
+                    "SELECT DISTINCT p FROM (SELECT p || '0' AS p FROM hivepart) s ORDER BY p",
+                    "p@2 || 0 as p",
+                    ["10", "20", "30"],
+                ),
+                (
+                    "SELECT p FROM (SELECT CAST(p AS BIGINT) - 1 AS p FROM hivepart) s GROUP BY p ORDER BY p",
+                    "CAST(p@2 AS Int64) - 1 as p",
+                    ["0", "1", "2"],
+                ),
+            ] {
+                // The scan computes the field it names `p`; it must still read
+                // the files.
+                let scan_reads_files = (
+                    "DataSourceExec",
+                    Box::new(move |plan: &str| {
+                        plan.contains("file_groups") && plan.contains(projection)
+                    }) as Box<dyn Fn(&str) -> bool + 'static>,
+                );
+                run_query_and_check_results_with_plan_checks(
+                    &mut rt,
+                    query,
+                    vec![scan_reads_files],
+                    Some(|result_batches: Vec<arrow::array::RecordBatch>| {
+                        let got: Vec<String> = result_batches
+                            .iter()
+                            .flat_map(|batch| {
+                                (0..batch.num_rows()).map(|row| {
+                                    arrow::util::display::array_value_to_string(
+                                        batch.column(0),
+                                        row,
+                                    )
+                                    .expect("value renders")
+                                })
+                            })
+                            .collect();
+                        assert_eq!(
+                            got, expected,
+                            "{query} must return the computed values, not the partition values"
+                        );
+                    }),
+                )
+                .await
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            }
+
+            Ok(())
+        })
+        .await
+}
+
 /// Lay out a hive-partitioned newline-delimited JSON dataset with three
 /// non-empty partitions (`p=1`, `p=2`, `p=3`) and one **empty-file** partition
 /// (`p=4`, a zero-row file). JSON carries no exact per-file row count, so the
