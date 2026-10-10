@@ -150,6 +150,7 @@ pub(crate) mod secrets {
 }
 pub mod cluster;
 mod secrets_preflight;
+mod server_timing;
 pub mod spice_metrics;
 pub mod status;
 pub mod task_history;
