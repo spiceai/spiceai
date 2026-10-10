@@ -71,6 +71,9 @@ use super::pk_index::{
 };
 use super::pk_validation::null_primary_key_message;
 use super::protected_merge_claims::{ProtectedMergeClaimGuard, ProtectedMergeClaims};
+use super::scan_file_statistics::{
+    ScanFileStatisticsCounters, ScanFileStatisticsFlights, ScanFileStatisticsKey,
+};
 use super::streaming::StreamingExec;
 use crate::bounded_fifo::BoundedFifoSet;
 use crate::catalog::{CatalogError, CatalogResult, MetadataCatalog, SnapshotSequenceCommit};
@@ -1859,6 +1862,12 @@ pub struct CayenneTableProvider {
     /// replaces the per-scan `ListingTable` cache while preserving repeated
     /// scan behavior when `collect_statistics` asks us to read Vortex footers.
     scan_file_statistics: Arc<FileStatisticsCache>,
+    /// Collections of per-file statistics currently in flight, so concurrent cold
+    /// misses on one file share one catalog read, footer read and upsert, plus the
+    /// generation that fences a collection a cache clear overtook out of
+    /// [`Self::scan_file_statistics`]. Shared by `clone_for_write` copies, like the
+    /// cache it fills.
+    scan_file_statistics_flights: Arc<ScanFileStatisticsFlights>,
     /// Unpruned snapshot directory listing (paths + footer stats) for the
     /// current file set. Keyed by snapshot id, [`Self::current_dir_generation`],
     /// and [`Self::listing_cache_epoch`] so a publish that adds files cannot
@@ -3461,6 +3470,21 @@ impl MemTierCheckpointGuards {
 struct PositionRewriteGuards {
     _write: tokio::sync::OwnedMutexGuard<()>,
     _visibility: tokio::sync::OwnedMutexGuard<()>,
+}
+
+/// The arguments of one per-file statistics collection
+/// ([`CayenneTableProvider::collect_scan_file_statistics`]): the file and how to
+/// read it, the schema the statistics are computed in, and the cache generation
+/// the collection started in.
+struct ScanFileStatisticsRequest<'a> {
+    state: &'a dyn Session,
+    snapshot_id: &'a str,
+    store: &'a Arc<dyn ObjectStore>,
+    format: &'a dyn FileFormat,
+    part_file: &'a PartitionedFile,
+    table_schema: &'a SchemaRef,
+    schema_fingerprint: &'a Arc<SchemaFingerprint>,
+    generation: u64,
 }
 
 /// Outcome of a best-effort [`CayenneTableProvider::try_checkpoint_mem_tier`].
@@ -9590,6 +9614,7 @@ impl CayenneTableProvider {
                 )
                 .with_name("DefaultFileStatisticsCache"),
             ),
+            scan_file_statistics_flights: Arc::default(),
             cached_snapshot_listing: Arc::new(ArcSwapOption::empty()),
             listing_cache_epoch: Arc::new(AtomicU64::new(0)),
             table_statistics: Arc::new(RwLock::new(CachedTableStatistics {
@@ -11821,6 +11846,7 @@ impl CayenneTableProvider {
             listing_table: Arc::clone(&self.listing_table),
             listing_fence: Arc::clone(&self.listing_fence),
             scan_file_statistics: Arc::clone(&self.scan_file_statistics),
+            scan_file_statistics_flights: Arc::clone(&self.scan_file_statistics_flights),
             cached_snapshot_listing: Arc::clone(&self.cached_snapshot_listing),
             listing_cache_epoch: Arc::clone(&self.listing_cache_epoch),
             table_statistics: Arc::clone(&self.table_statistics),
@@ -12346,7 +12372,11 @@ impl CayenneTableProvider {
     }
 
     pub(crate) fn clear_scan_file_statistics_cache(&self) {
-        self.scan_file_statistics.clear();
+        // Advancing the generation with the cache emptied keeps a collection that
+        // started before this clear — and may have read the deletions it is
+        // invalidating — from publishing into the cache afterwards.
+        self.scan_file_statistics_flights
+            .invalidate(|| self.scan_file_statistics.clear());
         self.drop_cached_snapshot_listing();
     }
 
@@ -36955,12 +36985,72 @@ impl CayenneTableProvider {
         // The statistics below are computed against the table schema, so a cached
         // entry is valid only for the schema it was computed with.
         let schema_fingerprint = Arc::new(SchemaFingerprint::from_schema(table_schema));
-        if let Some(cached) = self.scan_file_statistics.get(&TableScopedPath {
-            table: None,
-            path: part_file.object_meta.location.clone(),
-        }) && cached.is_valid_for(&part_file.object_meta, &schema_fingerprint)
+        if let Some(statistics) = self.cached_scan_file_statistics(part_file, &schema_fingerprint) {
+            return Ok(statistics);
+        }
+
+        // Cold misses on one file that overlap — a self-join or a CTE read twice in
+        // one plan, or concurrent queries — share one collection: one catalog read,
+        // at most one footer read and one upsert, and the same answer for all of
+        // them. The generation is part of the identity, so a scan that starts after
+        // a cache clear never waits on a collection that started before it.
+        let generation = self.scan_file_statistics_flights.generation();
+        let flight = self
+            .scan_file_statistics_flights
+            .join(ScanFileStatisticsKey::new(
+                snapshot_id,
+                &part_file.object_meta,
+                &schema_fingerprint,
+                generation,
+            ));
+        let request = ScanFileStatisticsRequest {
+            state,
+            snapshot_id,
+            store,
+            format,
+            part_file,
+            table_schema,
+            schema_fingerprint: &schema_fingerprint,
+            generation,
+        };
+        flight
+            .cell()
+            .get_or_try_init(|| self.collect_scan_file_statistics_once(&request))
+            .await
+            .map(Arc::clone)
+    }
+
+    /// This file's statistics from [`Self::scan_file_statistics`], if a valid entry
+    /// for this schema is cached.
+    fn cached_scan_file_statistics(
+        &self,
+        part_file: &PartitionedFile,
+        schema_fingerprint: &Arc<SchemaFingerprint>,
+    ) -> Option<Arc<Statistics>> {
+        self.scan_file_statistics
+            .get(&TableScopedPath {
+                table: None,
+                path: part_file.object_meta.location.clone(),
+            })
+            .filter(|cached| cached.is_valid_for(&part_file.object_meta, schema_fingerprint))
+            .map(|cached| cached.statistics)
+    }
+
+    /// One collection of a file's statistics: its persisted row when that is
+    /// fresh, else its footer, which then rewrites the row. Reached only through
+    /// [`Self::collect_scan_file_statistics`], which runs one per file at a time.
+    async fn collect_scan_file_statistics_once(
+        &self,
+        request: &ScanFileStatisticsRequest<'_>,
+    ) -> datafusion_common::Result<Arc<Statistics>> {
+        let part_file = request.part_file;
+        let table_schema = request.table_schema;
+        // A collection of this file may have finished, filling the cache, between
+        // this caller's own cache check and its registering this collection.
+        if let Some(statistics) =
+            self.cached_scan_file_statistics(part_file, request.schema_fingerprint)
         {
-            return Ok(cached.statistics);
+            return Ok(statistics);
         }
 
         let file_path = part_file.object_meta.location.to_string();
@@ -36974,7 +37064,7 @@ impl CayenneTableProvider {
                 self.catalog
                     .get_snapshot_file_statistics(
                         &self.table_metadata.table_id,
-                        snapshot_id,
+                        request.snapshot_id,
                         &file_path,
                     )
                     .await
@@ -37003,27 +37093,19 @@ impl CayenneTableProvider {
             // held by `scan_file_statistics`.
             && crate::stats::blob_carries_per_column_byte_sizes(&restored.statistics)
         {
+            self.scan_file_statistics_flights.record_persisted_hit();
             let statistics = restored.statistics;
-            self.scan_file_statistics.put(
-                &TableScopedPath {
-                    table: None,
-                    path: part_file.object_meta.location.clone(),
-                },
-                CachedFileMetadata::new(
-                    part_file.object_meta.clone(),
-                    Arc::clone(&schema_fingerprint),
-                    Arc::clone(&statistics),
-                    None,
-                ),
-            );
+            self.publish_scan_file_statistics(request, &statistics);
             return Ok(statistics);
         }
 
+        self.scan_file_statistics_flights.record_footer_read();
         let statistics = Arc::new(
-            format
+            request
+                .format
                 .infer_stats(
-                    state,
-                    store,
+                    request.state,
+                    request.store,
                     Arc::clone(table_schema),
                     &part_file.object_meta,
                 )
@@ -37047,41 +37129,75 @@ impl CayenneTableProvider {
                 }
             }
             let _guard = self.table_statistics_persistence_lock.lock().await;
+            // The footer statistics are adjusted for the file's position deletes as
+            // they stood at the read. A cache clear since then means that state may
+            // have changed, so persisting this answer would hand it to the next
+            // collection; leave the row for a collection that starts after the
+            // clear to read and persist.
             if table_schema.as_ref() == self.table_schema().as_ref()
-                && let Err(error) = self
+                && self
+                    .scan_file_statistics_flights
+                    .is_current(request.generation)
+            {
+                match self
                     .catalog
                     .upsert_snapshot_file_statistics(&SnapshotFileStatistics {
                         table_id: self.table_metadata.table_id.clone(),
-                        snapshot_id: snapshot_id.to_string(),
+                        snapshot_id: request.snapshot_id.to_string(),
                         file_path,
                         file_size_bytes,
                         num_rows,
                         statistics_blob: blob,
                     })
                     .await
-            {
-                tracing::debug!(
-                    table = %self.table_metadata.table_name,
-                    error = %error,
-                    "Failed to persist per-file snapshot statistics; continuing with footer stats"
-                );
+                {
+                    Ok(()) => self.scan_file_statistics_flights.record_persisted_upsert(),
+                    Err(error) => tracing::debug!(
+                        table = %self.table_metadata.table_name,
+                        error = %error,
+                        "Failed to persist per-file snapshot statistics; continuing with footer stats"
+                    ),
+                }
             }
         }
 
-        self.scan_file_statistics.put(
-            &TableScopedPath {
-                table: None,
-                path: part_file.object_meta.location.clone(),
-            },
-            CachedFileMetadata::new(
-                part_file.object_meta.clone(),
-                schema_fingerprint,
-                Arc::clone(&statistics),
-                None,
-            ),
-        );
-
+        self.publish_scan_file_statistics(request, &statistics);
         Ok(statistics)
+    }
+
+    /// Cache a collected file's statistics, unless a cache clear began after the
+    /// collection did: the clear may have invalidated the deletions they were
+    /// adjusted for, and the collections that start after it compute afresh.
+    fn publish_scan_file_statistics(
+        &self,
+        request: &ScanFileStatisticsRequest<'_>,
+        statistics: &Arc<Statistics>,
+    ) {
+        self.scan_file_statistics_flights
+            .publish_if_current(request.generation, || {
+                self.scan_file_statistics.put(
+                    &TableScopedPath {
+                        table: None,
+                        path: request.part_file.object_meta.location.clone(),
+                    },
+                    CachedFileMetadata::new(
+                        request.part_file.object_meta.clone(),
+                        Arc::clone(request.schema_fingerprint),
+                        Arc::clone(statistics),
+                        None,
+                    ),
+                );
+            });
+    }
+
+    /// Per-file statistics collection accounting for this table: footer reads,
+    /// persisted-row hits and writes, and callers that joined a collection already
+    /// in flight. Exposed so tests can assert concurrent cold scans shared their
+    /// work.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn scan_file_statistics_counters(&self) -> ScanFileStatisticsCounters {
+        self.scan_file_statistics_flights.counters()
     }
 
     async fn collect_scan_files_with_limit(
