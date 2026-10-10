@@ -253,10 +253,15 @@ pub fn deny_spice_functions_for_bigquery_table_providers() -> FunctionSupport {
 /// A cast from a fractional value into an integer stays local too: `BigQuery`
 /// documents that it rounds one where `DataFusion` truncates
 /// ([`crate::dialect::integer_cast_is_renderable`]).
+///
+/// So does a cast `BigQuery` renders at a lower precision than `DataFusion`
+/// evaluates it — text into a nanosecond timestamp, or a decimal scale past
+/// `BIGNUMERIC` ([`crate::dialect::bigquery_cast_is_renderable`]).
 #[must_use]
 pub fn bigquery_can_evaluate_expression(expr: &Expr, schema: Option<&DFSchema>) -> bool {
     !matches!(expr, Expr::Like(like) if like.case_insensitive)
         && crate::dialect::integer_cast_is_renderable(expr, schema)
+        && crate::dialect::bigquery_cast_is_renderable(expr, schema)
 }
 
 /// The per-expression gate for an engine reached through a generic driver,
@@ -2080,5 +2085,60 @@ mod tests {
             ],
             &batches
         );
+    }
+
+    /// Regression test for #13887, through the `BigQuery` policy: a plan
+    /// casting text into a nanosecond timestamp, in a projection or a filter,
+    /// stays local, while the same cast into a microsecond timestamp — the
+    /// precision `BigQuery`'s own `TIMESTAMP` holds — federates as before.
+    #[test]
+    fn a_text_cast_into_a_nanosecond_timestamp_is_not_federated_to_bigquery() {
+        use arrow::datatypes::TimeUnit;
+        use datafusion::prelude::cast;
+        let support = deny_spice_functions_for_bigquery_table_providers();
+        let text_and_id = || {
+            vec![
+                Field::new("s", DataType::Utf8, true),
+                Field::new("id", DataType::Int64, true),
+            ]
+        };
+        let nanos = DataType::Timestamp(TimeUnit::Nanosecond, None);
+        let micros = DataType::Timestamp(TimeUnit::Microsecond, None);
+        let nanosecond_instant = lit(ScalarValue::TimestampNanosecond(
+            Some(1_768_473_000_390_436_170),
+            None,
+        ));
+        let microsecond_instant = lit(ScalarValue::TimestampMicrosecond(
+            Some(1_768_473_000_390_436),
+            None,
+        ));
+        for plan in [
+            plan_projecting(cast(col("s"), nanos.clone())),
+            plan_over(
+                text_and_id(),
+                Some(cast(col("s"), nanos).gt(nanosecond_instant)),
+                col("id"),
+            ),
+        ] {
+            assert!(
+                contains_unsupported_functions(&plan, &support)
+                    .expect("the support check must not error"),
+                "the BigQuery policy must keep this plan local:\n{plan}"
+            );
+        }
+        for plan in [
+            plan_projecting(cast(col("s"), micros.clone())),
+            plan_over(
+                text_and_id(),
+                Some(cast(col("s"), micros).gt(microsecond_instant)),
+                col("id"),
+            ),
+        ] {
+            assert!(
+                !contains_unsupported_functions(&plan, &support)
+                    .expect("the support check must not error"),
+                "the BigQuery policy must still federate:\n{plan}"
+            );
+        }
     }
 }
