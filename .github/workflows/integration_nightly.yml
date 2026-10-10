@@ -1,0 +1,38 @@
+---
+name: integration tests (nightly)
+
+# Runs the integration suite on trunk every night through a manual dispatch of
+# integration.yml. A manual run treats every change as relevant, so it also runs
+# `source-versions`: the tests that start a federated source database, on every
+# supported release line in test/source_versions.json, not only on the newest
+# one that push and merge-queue runs use. A dispatch rather than a `schedule:`
+# trigger on integration.yml itself, so that workflow's merge-queue behaviour is
+# unchanged.
+
+on:
+  schedule:
+    - cron: '0 11 * * *'
+  workflow_dispatch:
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  dispatch:
+    name: Dispatch integration tests on trunk
+    runs-on: spiceai-dev-runners
+    # One API call; a minute is generous even for a slow runner checkout.
+    timeout-minutes: 5
+    steps:
+      - name: Dispatch integration.yml
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          curl -fsSL -X POST \
+            -H "Authorization: Bearer ${GH_TOKEN}" \
+            -H "Accept: application/vnd.github+json" \
+            "${GITHUB_API_URL}/repos/${GITHUB_REPOSITORY}/actions/workflows/integration.yml/dispatches" \
+            -d '{"ref":"trunk"}'
+          echo "Dispatched integration.yml on trunk"
