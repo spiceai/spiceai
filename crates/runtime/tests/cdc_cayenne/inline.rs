@@ -24,17 +24,13 @@ limitations under the License.
 //! in stream order, and (c) small bursts are stored as inlined data in the
 //! Cayenne metastore (i.e. the data-inlining path was hit, not the file path).
 
-#![cfg(not(windows))]
-#![recursion_limit = "256"]
 #![allow(clippy::expect_used)]
 
 // Accelerator engines are their own crates and self-register through a linkme slice. Each
 // integration test is a separate binary that links independently, and the linker drops an
 // unreferenced slice static, so a binary exercising Cayenne must name the crate itself.
 #[cfg(not(windows))]
-use accelerator_cayenne::CayenneAccelerator;
-use data_accelerator_api::DataAccelerator;
-use runtime_acceleration::change_sink::ChangeSinkContext;
+use super::make_refresh_task;
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -49,18 +45,13 @@ use data_components::cdc::{
     ChangeBatch, ChangeEnvelope, ChangesStream, CommitChange, CommitError, StreamError,
     changes_schema,
 };
-use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
 use datafusion::physical_plan::collect;
 use datafusion::prelude::SessionContext;
 use futures::StreamExt;
 use futures::stream as fstream;
 use runtime::accelerated::refresh::Refresh;
-use runtime::accelerated::refresh_task::RefreshTaskBuilder;
-use runtime::federated::FederatedTable;
-use runtime::status::RuntimeStatus;
 use tempfile::TempDir;
-use tokio::runtime::Handle;
 use tokio::sync::{Mutex as TokioMutex, RwLock};
 
 /// Schema used by all rows in this test: a numeric primary key and a string column.
@@ -181,37 +172,6 @@ async fn setup_cayenne(
     (temp, catalog, Arc::new(table), schema)
 }
 
-/// Build a `RefreshTask` whose accelerator and federated source both point at
-/// the given Cayenne table. The federated reference is unused by the changes
-/// path but `RefreshTaskBuilder` requires one.
-/// Build the refresh task with the change sink a Cayenne dataset gets in
-/// production, so the apply goes through Cayenne's deferred-durability path
-/// rather than the generic provider sink.
-async fn make_refresh_task(
-    accelerator: Arc<dyn TableProvider>,
-    table_name: &str,
-) -> runtime::accelerated::refresh_task::RefreshTask {
-    let federated = Arc::new(FederatedTable::new_unchecked(Arc::clone(&accelerator)));
-    let binding = ChangeSinkContext::new(TableReference::bare(table_name), Arc::clone(&accelerator));
-    let write_lock = Arc::clone(&binding.write_lock);
-    let sink = CayenneAccelerator::new()
-        .change_sink(binding, &Handle::current(), 2)
-        .await
-        .expect("bind Cayenne change sink")
-        .expect("Cayenne provides a change sink");
-    RefreshTaskBuilder::new(
-        RuntimeStatus::new(),
-        TableReference::bare(table_name),
-        federated,
-        None,
-        accelerator,
-        Handle::current(),
-        write_lock,
-    )
-    .with_change_sink(Some(sink))
-    .build()
-}
-
 /// Count the rows currently visible via `TableProvider::scan`.
 async fn count_rows(provider: &Arc<CayenneTableProvider>) -> usize {
     let ctx = SessionContext::new();
@@ -240,7 +200,8 @@ async fn cdc_into_cayenne_data_inlining_e2e() {
     let task = make_refresh_task(
         Arc::clone(&table) as Arc<dyn TableProvider>,
         "cdc_inline_e2e",
-    ).await;
+    )
+    .await;
     let commits = Arc::new(TokioMutex::new(Vec::new()));
     let stream = make_n_envelopes(N, &commits);
 

@@ -288,11 +288,11 @@ nextest-packages:
 test-integration:
 	# Test if .env file exists, and login to Spice if not
 	@test -f .env || (`spice login`)
-	@cargo test -p runtime --test integration --features postgres,mysql,delta_lake,duckdb,sqlite,turso -- --nocapture
+	@cargo nextest run -p runtime --test integration --features postgres,mysql,delta_lake,duckdb,sqlite,turso --no-capture
 
 .PHONY: test-integration-without-spiceai-dataset
 test-integration-without-spiceai-dataset:
-	@cargo test -p runtime --test integration --features postgres,mysql,delta_lake,duckdb,sqlite,turso -- --nocapture --skip spiceai_integration_test
+	@cargo nextest run -p runtime --test integration --features postgres,mysql,delta_lake,duckdb,sqlite,turso --no-capture -E 'not test(spiceai_integration_test)'
 
 .PHONY: test-integration-models
 test-integration-models:

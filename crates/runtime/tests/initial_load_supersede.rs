@@ -23,8 +23,6 @@ limitations under the License.
 //! rather than letting it keep registering datasets from the configuration it
 //! is restarting away from.
 
-#![recursion_limit = "256"]
-
 use std::sync::Arc;
 use std::time::Duration;
 
