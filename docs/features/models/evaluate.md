@@ -9,6 +9,8 @@
 | System One model | `typesafe:jev` | Calibrated by the model. See [TypeSafe models](typesafe.md). |
 | Any chat model | `openai:gpt-4o-mini`, `anthropic:claude-haiku-4-5`, `bedrock:…`, `huggingface:…` | The model's own estimates. They are not calibrated: a chat model's `0.9` is not a 90% likelihood the way a System One model's is. |
 
+The response's `model` is the name the request used. Every error returns `{"error": "<message>"}`: HTTP 400 for a body that is not an evaluation request or a question no model can answer (no questions, a `choice` with fewer than two options, a `score` with fewer than two or more than ten levels), 415 for a body sent without `Content-Type: application/json`, 404 for a model that is not defined in the Spicepod or that failed to load, and 401, 403, 429 or 503 when the model's provider refuses the call for that reason.
+
 ## Evaluating with a chat model
 
 Every chat model answers `/v1/evaluate` with no extra configuration:

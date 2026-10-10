@@ -455,3 +455,118 @@ mod authorization_header_tests {
         );
     }
 }
+
+/// Guards the `async-openai` fork patch that models `tool_choice` `allowed_tools` as
+/// the single `{mode, tools}` object the Chat Completions API defines.
+///
+/// Upstream models it as a list. A request in `OpenAI`'s shape then fails to
+/// deserialize, so `/v1/chat/completions` refuses it with a 422, and the list shape it
+/// does accept reaches `OpenAI` as a list, which `OpenAI` refuses with a 400. The
+/// request is read in `OpenAI`'s shape and sent through a client built the way the
+/// runtime builds one, and the body the endpoint receives must carry the same object.
+#[cfg(test)]
+#[expect(
+    clippy::expect_used,
+    reason = "a failed set-up in a test should name itself and stop"
+)]
+mod allowed_tools_wire_tests {
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
+    use std::sync::mpsc;
+    use std::time::Duration;
+
+    use async_openai::types::chat::CreateChatCompletionRequest;
+
+    use super::{ChatBackend, new_openai_client_with_chat_backend};
+    use crate::chat::Chat as _;
+
+    /// Stand a one-shot HTTP server up and hand back its base URL together with a
+    /// channel carrying the body of the request it receives.
+    fn capture_one_request_body() -> (String, mpsc::Receiver<Vec<u8>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind a local port");
+        let port = listener
+            .local_addr()
+            .expect("read the bound address")
+            .port();
+        let (tx, rx) = mpsc::channel();
+
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut head = Vec::new();
+            let mut byte = [0_u8; 1];
+            while stream.read(&mut byte).unwrap_or(0) == 1 {
+                head.push(byte[0]);
+                if head.ends_with(b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let content_length = String::from_utf8_lossy(&head)
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())
+                        .flatten()
+                })
+                .unwrap_or(0);
+            let mut body = vec![0_u8; content_length];
+            let _ = stream.read_exact(&mut body);
+            let _ = tx.send(body);
+
+            // Any answer will do: the request that arrived is the observation.
+            let reply = "{}";
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                reply.len()
+            );
+            let _ = stream.write_all(response.as_bytes());
+            let _ = stream.flush();
+        });
+
+        (format!("http://127.0.0.1:{port}/v1"), rx)
+    }
+
+    #[tokio::test]
+    async fn an_allowed_tools_choice_reaches_the_provider_as_one_object() {
+        let tool_choice = serde_json::json!({
+            "type": "allowed_tools",
+            "allowed_tools": {
+                "mode": "required",
+                "tools": [{ "type": "function", "function": { "name": "get_weather" } }]
+            }
+        });
+        let request: CreateChatCompletionRequest = serde_json::from_value(serde_json::json!({
+            "model": "gpt-4o-mini",
+            "messages": [{ "role": "user", "content": "What is the weather in Paris?" }],
+            "tools": [{
+                "type": "function",
+                "function": { "name": "get_weather", "parameters": { "type": "object" } }
+            }],
+            "tool_choice": tool_choice
+        }))
+        .expect("a request in OpenAI's allowed_tools shape deserializes");
+
+        let (api_base, rx) = capture_one_request_body();
+        let client = new_openai_client_with_chat_backend(
+            "gpt-4o-mini".to_string(),
+            Some(&api_base),
+            Some("sk-test"),
+            None,
+            None,
+            None,
+            ChatBackend::ChatCompletions,
+        );
+        // The reply is not a chat completion, so this fails; the request it sent
+        // first is what the assertion reads.
+        let _ = tokio::time::timeout(Duration::from_secs(20), client.chat_request(request)).await;
+        let body = rx
+            .recv_timeout(Duration::from_secs(20))
+            .expect("the endpoint received a request");
+        let sent: serde_json::Value =
+            serde_json::from_slice(&body).expect("the request body is JSON");
+
+        assert_eq!(sent["tool_choice"], tool_choice, "{sent}");
+    }
+}

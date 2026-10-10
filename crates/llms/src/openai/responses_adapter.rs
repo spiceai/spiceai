@@ -483,39 +483,29 @@ fn response_tool_choice_from_chat_tool_choice(
                 name: custom.custom.name,
             },
         )),
-        ChatCompletionToolChoiceOption::AllowedTools(allowed_tools) => {
-            let tools = allowed_tools
-                .allowed_tools
+        ChatCompletionToolChoiceOption::AllowedTools(choice) => {
+            let allowed = choice.allowed_tools;
+            let tools = allowed
+                .tools
                 .into_iter()
-                .flat_map(|allowed| {
-                    allowed
-                        .tools
-                        .into_iter()
-                        .map(move |tool| (allowed.mode.clone(), tool))
-                })
-                .map(|(mode, tool)| {
+                .map(|tool| {
                     let chat_tool = serde_json::from_value::<ChatCompletionTools>(tool)
                         .map_err(|e| invalid_conversion("allowed tool", e))?;
                     let response_tool = response_tool_from_chat_tool(chat_tool)?;
-                    let tool_value = serde_json::to_value(response_tool)
-                        .map_err(|e| invalid_conversion("allowed tool", e))?;
-                    Ok((mode, tool_value))
+                    serde_json::to_value(response_tool)
+                        .map_err(|e| invalid_conversion("allowed tool", e))
                 })
                 .collect::<Result<Vec<_>, OpenAIError>>()?;
 
-            let mode = tools
-                .first()
-                .map_or(ChatToolChoiceAllowedMode::Auto, |(mode, _)| mode.clone());
-
             Ok(ResponsesToolChoiceParam::AllowedTools(
                 ResponsesToolChoiceAllowed {
-                    mode: match mode {
+                    mode: match allowed.mode {
                         ChatToolChoiceAllowedMode::Auto => ResponsesToolChoiceAllowedMode::Auto,
                         ChatToolChoiceAllowedMode::Required => {
                             ResponsesToolChoiceAllowedMode::Required
                         }
                     },
-                    tools: tools.into_iter().map(|(_, tool)| tool).collect(),
+                    tools,
                 },
             ))
         }

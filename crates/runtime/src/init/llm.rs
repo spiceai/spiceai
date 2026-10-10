@@ -77,14 +77,36 @@ impl Runtime {
         if let Some(model) = &responses_model
             && let Err(e) = model.health().await
         {
-            tracing::warn!(
-                "Failed to load Responses API endpoint for model '{}': {e}. Verify the Spicepod configuration and try again.",
-                m.name.clone()
-            );
+            tracing::warn!("{}", responses_unavailable_warning(&m.name, &e));
             responses_model = None;
             responses_support = ResponsesApiSupport::Unavailable;
         }
 
         Ok((completions_model, responses_model, responses_support))
+    }
+}
+
+/// The warning for a model whose Responses API endpoint failed its health check. The
+/// cause already says how to fix it, so the warning names the model and what is lost.
+fn responses_unavailable_warning(model: &str, cause: &llms::responses::Error) -> String {
+    format!(
+        "Failed to load the Responses API endpoint for model '{model}', so the model is not available on `/v1/responses`. Cause: {cause}"
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::responses_unavailable_warning;
+
+    // regression test for #14910: the cause's fix sentence was followed by a second one.
+    #[test]
+    fn responses_unavailable_warning_states_the_fix_once() {
+        let cause = llms::responses::Error::HealthCheckError {
+            source: "404 Not Found".into(),
+        };
+        assert_eq!(
+            responses_unavailable_warning("mock_ok", &cause),
+            "Failed to load the Responses API endpoint for model 'mock_ok', so the model is not available on `/v1/responses`. Cause: Failed to invoke the model: 404 Not Found. Verify the model configuration and try again."
+        );
     }
 }

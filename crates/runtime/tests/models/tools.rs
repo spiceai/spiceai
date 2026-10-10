@@ -1192,16 +1192,18 @@ params:
         parse_jsonrpc_body(&body)
     }
 
-    /// Asserts that a `tools/call` was refused with `message`: a JSON-RPC
-    /// internal error carrying the tool's error.
+    /// Asserts that a `tools/call` was refused with `message`: a tool result
+    /// marked `isError` carrying the tool's error.
     fn assert_read_only_rejection(response: &Value, message: &str) {
         assert_eq!(
-            response.pointer("/error/code").and_then(Value::as_i64),
-            Some(-32603),
+            response.pointer("/result/isError").and_then(Value::as_bool),
+            Some(true),
             "a read-only API key's write must be refused: {response}"
         );
         assert_eq!(
-            response.pointer("/error/message").and_then(Value::as_str),
+            response
+                .pointer("/result/content/0/text")
+                .and_then(Value::as_str),
             Some(message),
             "unexpected refusal: {response}"
         );
