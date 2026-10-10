@@ -20717,8 +20717,9 @@ impl CayenneTableProvider {
     pub async fn quiesce(&self) {
         let already_closed = self.maintenance_closed.swap(true, Ordering::AcqRel);
         if let Err(error) = self.drain_in_flight_maintenance().await {
-            // The flag is set, so nothing new starts; only the wait for queued
-            // retention/statistics bookkeeping failed.
+            // The flag is set and every wait in the drain still ran, so nothing
+            // is running or will start; only a queued retention/statistics pass
+            // failed.
             tracing::debug!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
@@ -20753,9 +20754,15 @@ impl CayenneTableProvider {
     /// in-process reopen behave like a clean restart.
     #[doc(hidden)]
     pub async fn drain_in_flight_maintenance(&self) -> CatalogResult<()> {
+        // A failed flush is reported only after every wait below: returning
+        // early would leave a detached pass running behind a caller that
+        // believes the instance is quiet — the overlap `quiesce` exists to stop.
+        let mut flush_error = None;
         loop {
             // Retention / stats / listing-refresh loop (has its own barrier).
-            self.flush_pending_maintenance().await?;
+            if let Err(error) = self.flush_pending_maintenance().await {
+                flush_error.get_or_insert(error);
+            }
             // Fire-and-forget compaction / orphan-DV sweep / inline checkpoint
             // each mark themselves scheduled BEFORE spawning and clear that mark
             // when done, so spin until all are clear — no scheduled-or-running
@@ -20782,7 +20789,7 @@ impl CayenneTableProvider {
         // lock without one of the flags above; once held, nothing is mid-flight.
         // Released immediately — the caller is about to drop/replace this instance.
         drop(self.compaction_lock.write().await);
-        Ok(())
+        flush_error.map_or(Ok(()), Err)
     }
 
     /// Surviving-sequence floor for orphaned-DV cleanup: the minimum data sequence
