@@ -2557,9 +2557,6 @@ mod tests {
         struct TempTable(EmptyTable);
         #[async_trait::async_trait]
         impl datafusion::catalog::TableProvider for TempTable {
-            fn as_any(&self) -> &dyn std::any::Any {
-                self
-            }
             fn schema(&self) -> arrow::datatypes::SchemaRef {
                 self.0.schema()
             }
