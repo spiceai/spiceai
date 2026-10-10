@@ -991,9 +991,10 @@ impl CayenneCatalog {
             // concurrent writer swapped one for a merged snapshot (or removed it)
             // after the rewrite captured its fence, the snapshot that replaced it
             // would stay registered beside the output and its rows would be read
-            // twice. A second provider instance for the same table is how that
-            // happens: its `compaction_lock` is its own, so nothing in memory
-            // serializes its protected-snapshot merge against this rewrite.
+            // twice. A second provider instance for the same table is one way that
+            // happens — its `compaction_lock` is its own, so nothing in memory
+            // serializes its protected-snapshot merge against this rewrite — and
+            // a retention delete that empties a protected snapshot is another.
             let folded = protected_snapshot_ids_to_clear.len();
             let count_values = txn
                 .query_row_values(QueryRowParams {

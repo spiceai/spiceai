@@ -23726,8 +23726,9 @@ impl CayenneTableProvider {
                 } = &e
                 {
                     // Another writer merged or removed protected snapshots this
-                    // rewrite folded — a second provider instance for the table,
-                    // whose `compaction_lock` does not serialize against ours.
+                    // rewrite folded — e.g. a second provider instance for the
+                    // table, whose `compaction_lock` does not serialize against
+                    // ours.
                     // The output holds their rows, so committing it would leave
                     // the replacement registered beside it and every row in it
                     // read twice. Discard and retry against the new roster.
