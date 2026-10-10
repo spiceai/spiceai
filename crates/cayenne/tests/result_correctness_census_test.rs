@@ -69,8 +69,7 @@
 #![allow(clippy::doc_markdown)]
 #![allow(clippy::cast_precision_loss)]
 
-#[path = "correctness/support/mod.rs"]
-mod support;
+use crate::support;
 
 use std::collections::BTreeMap;
 
