@@ -77,6 +77,7 @@ pub(super) fn responses_request_from_chat_completion_request(
             .map(|effort| Reasoning {
                 effort: Some(effort),
                 summary: None,
+                context: None,
             }),
         metadata: req
             .metadata
@@ -243,6 +244,7 @@ fn input_items_from_assistant_message(
         items.push(InputItem::Item(Item::FunctionCall(FunctionToolCall {
             call_id: function_call.name.clone(),
             name: function_call.name,
+            namespace: None,
             arguments: function_call.arguments,
             id: None,
             status: Some(OutputStatus::Completed),
@@ -260,6 +262,7 @@ fn input_item_from_chat_tool_call(
             Ok(InputItem::Item(Item::FunctionCall(FunctionToolCall {
                 call_id: function_call.id,
                 name: function_call.function.name,
+                namespace: None,
                 arguments: function_call.function.arguments,
                 id: None,
                 status: Some(OutputStatus::Completed),
@@ -318,6 +321,7 @@ fn easy_message(role: ResponsesRole, content: EasyInputContent) -> InputItem {
         r#type: MessageType::Message,
         role,
         content,
+        phase: None,
     })
 }
 
@@ -453,11 +457,13 @@ fn response_tool_from_chat_tool(tool: ChatCompletionTools) -> Result<ResponsesTo
             parameters: function_tool.function.parameters,
             strict: function_tool.function.strict,
             description: function_tool.function.description,
+            defer_loading: None,
         })),
         ChatCompletionTools::Custom(custom_tool) => Ok(ResponsesTool::Custom(CustomToolParam {
             name: custom_tool.custom.name,
             description: custom_tool.custom.description,
             format: convert_json(custom_tool.custom.format, "custom tool format")?,
+            defer_loading: None,
         })),
     }
 }
@@ -483,39 +489,29 @@ fn response_tool_choice_from_chat_tool_choice(
                 name: custom.custom.name,
             },
         )),
-        ChatCompletionToolChoiceOption::AllowedTools(allowed_tools) => {
-            let tools = allowed_tools
-                .allowed_tools
+        ChatCompletionToolChoiceOption::AllowedTools(choice) => {
+            let allowed = choice.allowed_tools;
+            let tools = allowed
+                .tools
                 .into_iter()
-                .flat_map(|allowed| {
-                    allowed
-                        .tools
-                        .into_iter()
-                        .map(move |tool| (allowed.mode.clone(), tool))
-                })
-                .map(|(mode, tool)| {
+                .map(|tool| {
                     let chat_tool = serde_json::from_value::<ChatCompletionTools>(tool)
                         .map_err(|e| invalid_conversion("allowed tool", e))?;
                     let response_tool = response_tool_from_chat_tool(chat_tool)?;
-                    let tool_value = serde_json::to_value(response_tool)
-                        .map_err(|e| invalid_conversion("allowed tool", e))?;
-                    Ok((mode, tool_value))
+                    serde_json::to_value(response_tool)
+                        .map_err(|e| invalid_conversion("allowed tool", e))
                 })
                 .collect::<Result<Vec<_>, OpenAIError>>()?;
 
-            let mode = tools
-                .first()
-                .map_or(ChatToolChoiceAllowedMode::Auto, |(mode, _)| mode.clone());
-
             Ok(ResponsesToolChoiceParam::AllowedTools(
                 ResponsesToolChoiceAllowed {
-                    mode: match mode {
+                    mode: match allowed.mode {
                         ChatToolChoiceAllowedMode::Auto => ResponsesToolChoiceAllowedMode::Auto,
                         ChatToolChoiceAllowedMode::Required => {
                             ResponsesToolChoiceAllowedMode::Required
                         }
                     },
-                    tools: tools.into_iter().map(|(_, tool)| tool).collect(),
+                    tools,
                 },
             ))
         }
@@ -1267,6 +1263,54 @@ mod tests {
             "a `type` no variant names has to be refused: if it deserializes, the field is \
              being ignored rather than defaulted, and the two assertions above cannot tell \
              those apart",
+        );
+    }
+
+    /// A Responses client continuing a conversation replays its earlier turns as input: an
+    /// assistant message without the `status` or `annotations` the API returned it with, and
+    /// message ids and a reasoning `context` the request has to keep. Codex clients also send
+    /// `client_metadata` and an `additional_tools` input item. `/v1/responses` decodes the
+    /// body and encodes it again for the provider, so the request has to decode — or it is
+    /// refused with 422 — and come back out unchanged, or the provider sees a different
+    /// request from the one the client sent.
+    #[test]
+    fn a_replayed_conversation_round_trips_through_a_responses_request() {
+        let body = json!({
+            "model": "m",
+            "reasoning": { "effort": "medium", "context": "all_turns" },
+            "client_metadata": {
+                "x-codex-installation-id": "installation",
+                "session_id": "session",
+                "turn_id": "turn"
+            },
+            "input": [
+                {
+                    "type": "additional_tools",
+                    "role": "developer",
+                    "tools": [{ "type": "function", "name": "shell" }],
+                    "tool_search_mode": "enabled"
+                },
+                {
+                    "type": "message",
+                    "id": "msg_user",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": "hi" }]
+                },
+                {
+                    "type": "message",
+                    "id": "msg_assistant",
+                    "role": "assistant",
+                    "content": [{ "type": "output_text", "text": "hello" }]
+                }
+            ]
+        });
+
+        let request: CreateResponse = serde_json::from_value(body.clone())
+            .expect("a replayed conversation from a Responses client deserializes");
+        assert_eq!(
+            serde_json::to_value(&request).expect("serialize"),
+            body,
+            "re-encoding a replayed conversation must not add, drop, or change a field"
         );
     }
 }

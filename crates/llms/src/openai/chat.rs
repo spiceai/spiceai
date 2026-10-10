@@ -179,3 +179,62 @@ impl<C: Config + Send + Sync + Clone> Openai<C> {
         responses_adapter::chat_completion_response_from_response(response, outer_model)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use async_openai::types::chat::{
+        CreateChatCompletionResponse, CreateChatCompletionStreamResponse, ServiceTierResponse,
+    };
+    use serde_json::json;
+
+    /// A provider reports the tier that served a request in `service_tier`, and adds tiers on
+    /// its side. A tier the client does not name has to come through verbatim: refused, it
+    /// fails the whole reply, so a model answered on a new tier cannot answer at all.
+    #[test]
+    fn a_reply_naming_an_unknown_service_tier_keeps_it_verbatim() {
+        let response: CreateChatCompletionResponse = serde_json::from_value(json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "m",
+            "service_tier": "fast",
+            "choices": []
+        }))
+        .expect("a reply naming an unknown service tier deserializes");
+        assert_eq!(
+            response.service_tier,
+            Some(ServiceTierResponse::Other("fast".to_string()))
+        );
+        assert_eq!(
+            serde_json::to_value(&response).expect("serialize")["service_tier"],
+            json!("fast")
+        );
+
+        let chunk: CreateChatCompletionStreamResponse = serde_json::from_value(json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion.chunk",
+            "created": 0,
+            "model": "m",
+            "service_tier": "fast",
+            "choices": []
+        }))
+        .expect("a streamed chunk naming an unknown service tier deserializes");
+        assert_eq!(
+            chunk.service_tier,
+            Some(ServiceTierResponse::Other("fast".to_string()))
+        );
+
+        // The control: a tier the client names still decodes to its own variant, so the
+        // assertions above are not passing on a field that swallows every value as a string.
+        let named: CreateChatCompletionResponse = serde_json::from_value(json!({
+            "id": "chatcmpl-1",
+            "object": "chat.completion",
+            "created": 0,
+            "model": "m",
+            "service_tier": "priority",
+            "choices": []
+        }))
+        .expect("a reply naming a known service tier deserializes");
+        assert_eq!(named.service_tier, Some(ServiceTierResponse::Priority));
+    }
+}

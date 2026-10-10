@@ -382,7 +382,7 @@ impl BedrockConverse {
                 json_schema:
                     ResponseFormatJsonSchema {
                         name,
-                        schema: Some(schema),
+                        schema,
                         description,
                         strict: _,
                     },
