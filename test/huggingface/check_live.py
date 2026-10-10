@@ -22,9 +22,11 @@ from __future__ import annotations
 import argparse
 import contextlib
 import hashlib
+import http.client
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import signal
 import socket
@@ -42,6 +44,8 @@ IRIS = "hf://datasets/scikit-learn/iris@0bda0ce801be0fa2f464ff845a9d5ceae99aad7d
 # The conversion is derived from `main`, so its answers hold while `main` is IMDB's commit.
 IMDB_CONVERTED = "hf://datasets/stanfordnlp/imdb@~parquet"
 HUB_API = "https://huggingface.co/api/datasets"
+# How long a Hub API call keeps retrying while the Hub is unavailable or limiting requests.
+HUB_RETRY_SECONDS = 120
 
 # name -> (from, Spice SQL, DuckDB SQL over the same files, recorded answer). The answers
 # are integers so the engines cannot disagree on formatting.
@@ -158,18 +162,49 @@ def row_hash(rows: list[dict]) -> str:
 
 
 def hub_get(path: str):
+    """GETs a Hub API path, retrying for up to `HUB_RETRY_SECONDS` while the Hub is unreachable,
+    answers 5xx or limits requests (waiting for its rate-limit window when it names one).
+
+    Any other HTTP error, such as a 404 for a revision that is gone, is raised at once: it is an
+    answer about the dataset, not about the Hub.
+    """
     headers = {"Accept": "application/json"}
     if token := os.environ.get("HF_TOKEN"):
         headers["Authorization"] = f"Bearer {token}"
-    with urlopen(Request(f"{HUB_API}/{path}", headers=headers), timeout=60) as response:
-        return json.loads(response.read().decode())
+    deadline = time.monotonic() + HUB_RETRY_SECONDS
+    backoff = 1.0
+    while True:
+        try:
+            with urlopen(Request(f"{HUB_API}/{path}", headers=headers), timeout=60) as response:
+                return json.loads(response.read().decode())
+        except HTTPError as error:
+            if error.code != 429 and error.code < 500:
+                raise
+            failure, wait = error, max(backoff, rate_limit_reset(error.headers))
+        except (URLError, TimeoutError, ConnectionError, http.client.HTTPException) as error:
+            failure, wait = error, backoff
+        if time.monotonic() + wait > deadline:
+            raise failure
+        print(f"Retrying {path} in {wait:.0f}s after: {failure}", flush=True)
+        time.sleep(wait)
+        backoff = min(backoff * 2, 16)
+
+
+def rate_limit_reset(headers) -> float:
+    """Seconds until the Hub's rate-limit window resets, from `RateLimit` (`"api";r=0;t=55`)
+    or `Retry-After`; 0 when it names none."""
+    if match := re.search(r"\bt=(\d+)", headers.get("RateLimit") or ""):
+        return float(match.group(1))
+    with contextlib.suppress(TypeError, ValueError):
+        return float(headers.get("Retry-After"))
+    return 0.0
 
 
 def check_revisions() -> None:
     """Fail in seconds, naming the dataset, when a pinned revision no longer holds.
 
-    spiced keeps retrying a dataset whose files it cannot list, so without this a revision
-    gone from the Hub shows up only as a runtime that never becomes ready.
+    spiced refuses a dataset whose revision is gone, and a refused dataset keeps the runtime
+    from ever reporting ready; this names the revision before spiced starts.
     """
     pins = set()
     for location, *_rest in CASES.values():
@@ -183,10 +218,14 @@ def check_revisions() -> None:
         except HTTPError as error:
             if error.code != 404:
                 raise AssertionError(
-                    f"The Hub answered HTTP {error.code} for {repo}@{revision}; "
+                    f"The Hub answered HTTP {error.code} for {repo}@{revision} for {HUB_RETRY_SECONDS}s; "
                     "it is unavailable or limiting requests, so this says nothing about the pin"
                 ) from error
             gone.append(f"{repo}@{revision}")
+        except (URLError, TimeoutError, ConnectionError, http.client.HTTPException) as error:
+            raise AssertionError(
+                f"The Hub could not be reached for {HUB_RETRY_SECONDS}s ({error}), so nothing was tested"
+            ) from error
     assert not gone, "Pinned Hub revisions are gone (HTTP 404); repin them: " + ", ".join(gone)
     main = hub_get("stanfordnlp/imdb/revision/main")["sha"]
     pinned_main = IMDB.rpartition("@")[2]
@@ -194,6 +233,34 @@ def check_revisions() -> None:
         f"stanfordnlp/imdb main moved from {pinned_main} to {main}, so its `@~parquet` conversion "
         "may no longer match the recorded imdb_converted answer; repin IMDB and re-record it with DuckDB"
     )
+
+
+def dataset_statuses(endpoint: str) -> dict[str, tuple[str, str]]:
+    """Each dataset's status and error message, as spiced reports them."""
+    req = Request(f"{endpoint}/v1/datasets?status=true", headers={"Accept": "application/json"})
+    with urlopen(req, timeout=5) as response:
+        return {
+            dataset["name"]: (dataset.get("status", ""), dataset.get("error_message", ""))
+            for dataset in json.loads(response.read().decode())
+        }
+
+
+def given_up(statuses: dict[str, tuple[str, str]], log: Path) -> dict[str, str]:
+    """The datasets spiced has stopped retrying, with their errors.
+
+    spiced logs a dataset failure it will retry at WARN, and one it will not retry at ERROR, so
+    a dataset in `Error` that an ERROR line names will never become ready. Waiting out the
+    timeout for it would only delay the failure.
+    """
+    failed = {name: message for name, (status, message) in statuses.items() if status == "Error"}
+    if not failed:
+        return {}
+    errors = [line for line in log.read_text(errors="replace").splitlines() if " ERROR " in line]
+    return {
+        name: message
+        for name, message in failed.items()
+        if any(re.search(rf"\b{re.escape(name)}\b", line) for line in errors)
+    }
 
 
 def print_log_tail(path: Path) -> None:
@@ -249,8 +316,10 @@ def run(spiced: Path, directory: Path, timeout: float, duckdb: str | None) -> No
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
-            deadline = time.monotonic() + timeout
+            started = time.monotonic()
+            deadline = started + timeout
             last = "runtime has not answered"
+            statuses: dict[str, tuple[str, str]] = {}
             while time.monotonic() < deadline:
                 if process.poll() is not None:
                     raise AssertionError(f"spiced exited with status {process.returncode}")
@@ -262,9 +331,27 @@ def run(spiced: Path, directory: Path, timeout: float, duckdb: str | None) -> No
                     last = error.read().decode()
                 except (URLError, TimeoutError, ConnectionError) as error:
                     last = str(error)
+                # Report each dataset's progress, so a slow start shows what it waits for.
+                with contextlib.suppress(HTTPError, URLError, TimeoutError, ConnectionError, ValueError):
+                    current = dataset_statuses(endpoint)
+                    for name, status in sorted(current.items()):
+                        if statuses.get(name) != status:
+                            detail = f": {status[1]}" if status[1] else ""
+                            print(f"{time.monotonic() - started:6.1f}s {name} {status[0]}{detail}", flush=True)
+                    statuses = current
+                if failed := given_up(statuses, directory / "spice.log"):
+                    raise AssertionError(
+                        f"spiced stopped retrying {len(failed)} dataset(s), so it will never be ready:\n"
+                        + "\n".join(f"  {name}: {message}" for name, message in sorted(failed.items()))
+                    )
                 time.sleep(0.25)  # Poll the actual readiness condition until its deadline.
             else:
-                raise AssertionError(f"Runtime did not become ready within {timeout}s: {last}")
+                waiting = "\n".join(
+                    f"  {name}: {status}" + (f" ({message})" if message else "")
+                    for name, (status, message) in sorted(statuses.items())
+                    if status != "Ready"
+                )
+                raise AssertionError(f"Runtime did not become ready within {timeout}s ({last}):\n{waiting}")
 
             def sql(query: str) -> list[dict]:
                 started = time.monotonic()
