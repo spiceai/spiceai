@@ -1495,6 +1495,7 @@ impl AcceleratedTable {
                     .then(|| self.synchronized_with.clone())
                     .flatten();
                 let claims = Arc::clone(&self.in_flight_revalidations);
+                let accelerator = Arc::clone(&self.accelerator);
                 let (sender, receiver) = tokio::sync::watch::channel(None);
                 self.io_runtime.spawn(async move {
                     let mut producer_failure = None;
@@ -1528,6 +1529,12 @@ impl AcceleratedTable {
                         Some(publication) => publication.wait().await,
                         None => Ok(()),
                     };
+                    // The accelerator's own background maintenance — compaction,
+                    // sweeps, checkpoints — is not a change producer, so nothing
+                    // above stops it, and the generation that replaces this one
+                    // opens the same storage. Stop it once ingest has drained, so
+                    // the two instances never maintain one table at once (#11581).
+                    write::dual_write::quiesce_cayenne_maintenance(&accelerator).await;
                     // Initialization owns the registry write guard. The admission
                     // fence prevents a later initializer from attaching a child.
                     drop(children.write().await);

@@ -98,6 +98,10 @@ impl CatalogConnector for MySQLCatalog {
         // emits the canonical name (issue #13794). The dataset connector installs
         // the same list; `mysql_btrim_evaluates_locally_on_both_registration_paths`
         // covers both call sites.
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "installs `deny_spice_functions_for_mysql_table_providers()` on the next line"
+        )]
         let table_factory = Arc::new(
             MySQLTableFactory::new(Arc::clone(&pool))
                 .with_function_support(deny_spice_functions_for_mysql_table_providers()),

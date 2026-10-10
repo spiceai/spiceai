@@ -23,7 +23,7 @@ use tonic::{Request, Response, Status};
 
 use crate::{
     datafusion::request_context_extension::get_current_datafusion,
-    flight::{metrics, traced_ticket, util::trace_id_app_metadata},
+    flight::{metrics, server_timing, traced_ticket, util::trace_id_app_metadata},
     task_history::correlation,
 };
 use runtime_request_context::{AsyncMarker, RequestContext};
@@ -39,12 +39,15 @@ pub(crate) async fn handle(
     // query — and the client reads it off the `FlightInfo`. Doing it here
     // rather than in each handler is what makes that true of every command
     // rather than of the ones someone remembered.
-    let trace_id =
-        correlation::publish_trace_id(&RequestContext::current(AsyncMarker::new().await));
+    let request_context = RequestContext::current(AsyncMarker::new().await);
+    let trace_id = correlation::publish_trace_id(&request_context);
 
-    dispatch(request)
+    let response = dispatch(request)
         .await
-        .map(|response| response.map(|info| trace(info, &trace_id)))
+        .map(|response| response.map(|info| trace(info, &trace_id)))?;
+    // After `trace`: the `DoGet` presents the wrapped ticket, so that is the key.
+    server_timing::remember_get_flight_info(&request_context, response.get_ref()).await;
+    Ok(response)
 }
 
 /// Puts `trace_id` where a client can read it: in `app_metadata`, and on every
@@ -66,6 +69,7 @@ fn trace(info: FlightInfo, trace_id: &str) -> FlightInfo {
 
 async fn dispatch(request: Request<FlightDescriptor>) -> Result<Response<FlightInfo>, Status> {
     let Ok(message) = Any::decode(&*request.get_ref().cmd) else {
+        server_timing::time_get_flight_info().await;
         return get_flight_info_simple(request).await;
     };
 
@@ -81,9 +85,11 @@ async fn dispatch(request: Request<FlightDescriptor>) -> Result<Response<FlightI
 
     match command {
         Command::CommandStatementQuery(token) => {
+            server_timing::time_get_flight_info().await;
             flightsql::statement_query::get_flight_info(token, request).await
         }
         Command::CommandPreparedStatementQuery(handle) => {
+            server_timing::time_get_flight_info().await;
             flightsql::prepared_statement_query::get_flight_info(handle, request).await
         }
         Command::CommandPreparedStatementUpdate(handle) => {
@@ -133,6 +139,7 @@ async fn dispatch(request: Request<FlightDescriptor>) -> Result<Response<FlightI
             Ok(Response::new(info))
         }
         Command::CommandStatementSubstraitPlan(cmd) => {
+            server_timing::time_get_flight_info().await;
             flightsql::statement_substrait_plan::get_flight_info(cmd, request).await
         }
         Command::CommandGetCrossReference(cmd) => {

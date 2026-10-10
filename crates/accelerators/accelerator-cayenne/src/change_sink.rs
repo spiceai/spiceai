@@ -29,6 +29,7 @@ use async_trait::async_trait;
 use cayenne::{CayenneTableProvider, RebuildableWrite, SlotAdvancer};
 use data_accelerator_api::upsert_dedup::UpsertDedupTableProvider;
 use data_components::cdc::ChangeBatch as CdcBatch;
+use data_components::poly::PolyTableProvider;
 use datafusion::datasource::TableProvider;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::SessionContext;
@@ -67,6 +68,36 @@ pub fn provider_schema_evolution(table: &Arc<dyn TableProvider>) -> SchemaEvolut
         return provider_schema_evolution(dedup.inner());
     }
     SchemaEvolutionSupport::Restart
+}
+
+/// Stop the background maintenance of every Cayenne instance `table` serves
+/// from — the provider itself, each partition of a partitioned table, and the
+/// table a poly or upsert-dedup wrapper writes to — and wait for maintenance
+/// they already started. See `CayenneTableProvider::quiesce`. The same walk as
+/// the runtime's generation drain (`quiesce_cayenne_maintenance`).
+pub async fn quiesce_table_maintenance(table: &Arc<dyn TableProvider>) {
+    let mut instances = Vec::new();
+    let mut pending = vec![Arc::clone(table)];
+    while let Some(provider) = pending.pop() {
+        if let Some(cayenne) =
+            find_concrete::<CayenneTableProvider>(provider.as_ref(), LayerWalk::Write)
+        {
+            instances.push(cayenne.clone_for_write_operations());
+        } else if let Some(partitioned) =
+            find_concrete::<PartitionTableProvider>(provider.as_ref(), LayerWalk::Write)
+        {
+            pending.extend(partitioned.partition_table_providers().await);
+        } else if let Some(poly) =
+            spice_table::find_layer::<PolyTableProvider>(provider.as_ref(), LayerWalk::Write)
+        {
+            pending.push(poly.writer());
+        } else if let Some(dedup) =
+            find_concrete::<UpsertDedupTableProvider>(provider.as_ref(), LayerWalk::Write)
+        {
+            pending.push(Arc::clone(dedup.inner()));
+        }
+    }
+    futures::future::join_all(instances.iter().map(CayenneTableProvider::quiesce)).await;
 }
 
 struct StorageFenceObserver {

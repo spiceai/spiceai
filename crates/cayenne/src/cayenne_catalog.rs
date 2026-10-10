@@ -985,6 +985,36 @@ impl CayenneCatalog {
                 .map(|id| sql_text_literal(id))
                 .collect::<Vec<_>>()
                 .join(", ");
+            // CAS guard, the counterpart of `swap_protected_snapshots_in_txn`'s:
+            // every protected snapshot this rewrite folded must still be
+            // registered. The rewrite's output already holds their rows, so if a
+            // concurrent writer swapped one for a merged snapshot (or removed it)
+            // after the rewrite captured its fence, the snapshot that replaced it
+            // would stay registered beside the output and its rows would be read
+            // twice. A second provider instance for the same table is one way that
+            // happens — its `compaction_lock` is its own, so nothing in memory
+            // serializes its protected-snapshot merge against this rewrite — and
+            // a retention delete that empties a protected snapshot is another.
+            let folded = protected_snapshot_ids_to_clear.len();
+            let count_values = txn
+                .query_row_values(QueryRowParams {
+                    sql: &format!(
+                        "SELECT COUNT(*) FROM cayenne_snapshot_sequence \
+                         WHERE table_id = {table_id_literal} AND snapshot_id IN ({id_list})"
+                    ),
+                    params: vec![],
+                })
+                .await?;
+            let registered =
+                usize::try_from(i64::from_value(metastore_value_at(&count_values, 0)?)?)
+                    .unwrap_or(0);
+            if registered != folded {
+                return Err(CatalogError::ProtectedSnapshotsReplaced {
+                    table_id: table_id.to_string(),
+                    folded,
+                    missing: folded.saturating_sub(registered),
+                });
+            }
             format!(
                 "DELETE FROM cayenne_snapshot_sequence \
                  WHERE table_id = {table_id_literal} AND snapshot_id IN ({id_list}); "

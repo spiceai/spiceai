@@ -907,18 +907,35 @@ async fn a_mid_stream_pool_refusal_is_counted_as_resources_exhausted() {
     );
 }
 
-/// Every `flight_requests` increment recorded so far, summed across label sets.
+/// Whether a series was recorded for a request whose user agent carries `token`.
+///
+/// Each test that counts a delta on this binary's shared registry sends its own
+/// user agent and reads only its own series, so a sibling running in the same
+/// process cannot move its count.
+fn sent_by(metric: &prometheus::proto::Metric, token: &str) -> bool {
+    metric
+        .get_label()
+        .iter()
+        .any(|label| label.name() == "user_agent" && label.value().contains(token))
+}
+
+/// The user agent `each_flight_rpc_records_exactly_one_request` sends.
+const FLIGHT_RPC_COUNT_USER_AGENT: &str = "flight-rpc-count-test/1.0";
+
+/// Every `flight_requests` increment the client with user agent `token` caused,
+/// summed across label sets.
 ///
 /// Summed rather than read per-series because a sample's labels depend on where
 /// it is recorded: the handler that knows the command adds a `command` label the
 /// `FlightService` impl cannot. A per-series read would pass a duplicate off as a
 /// relabelling.
-fn flight_requests_total(registry: &prometheus::Registry) -> f64 {
+fn flight_requests_total(registry: &prometheus::Registry, token: &str) -> f64 {
     registry
         .gather()
         .iter()
         .filter(|family| family.name() == "flight_requests")
         .flat_map(prometheus::proto::MetricFamily::get_metric)
+        .filter(|metric| sent_by(metric, token))
         .map(|metric| metric.get_counter().value())
         .sum()
 }
@@ -928,7 +945,7 @@ fn flight_requests_total(registry: &prometheus::Registry) -> f64 {
 /// `#[track_caller]` so a failure names the RPC rather than this line.
 #[track_caller]
 fn assert_recorded_once(registry: &prometheus::Registry, before: f64, rpc: &str) {
-    let recorded = flight_requests_total(registry) - before;
+    let recorded = flight_requests_total(registry, FLIGHT_RPC_COUNT_USER_AGENT) - before;
     assert!(
         (recorded - 1.0).abs() < f64::EPSILON,
         "{rpc} must record exactly one flight_requests increment, recorded {recorded}"
@@ -940,6 +957,13 @@ fn assert_recorded_once(registry: &prometheus::Registry, before: f64, rpc: &str)
 /// No dataset is needed: every RPC below either fails before planning or runs a
 /// literal query, and a dataset load would only add series to the registry.
 async fn start_flight_server() -> Result<Channel, anyhow::Error> {
+    let (_http_port, channel) = start_servers(FLIGHT_RPC_COUNT_USER_AGENT).await?;
+    Ok(channel)
+}
+
+/// Starts a runtime with no datasets and returns its HTTP port and a channel to
+/// its Flight server that sends `user_agent`.
+async fn start_servers(user_agent: &str) -> Result<(u16, Channel), anyhow::Error> {
     // Both listeners are bound before either is dropped, so the two ports are
     // guaranteed to differ — freeing the first before binding the second would let
     // the OS hand back the same ephemeral port.
@@ -964,11 +988,12 @@ async fn start_flight_server() -> Result<Channel, anyhow::Error> {
 
     // Poll for the bind rather than sleeping: the server binds asynchronously and a
     // connection refused before it does is not a failure.
-    let endpoint = Channel::from_shared(format!("http://127.0.0.1:{flight_port}"))?;
+    let endpoint =
+        Channel::from_shared(format!("http://127.0.0.1:{flight_port}"))?.user_agent(user_agent)?;
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     loop {
         match endpoint.clone().connect().await {
-            Ok(channel) => return Ok(channel),
+            Ok(channel) => return Ok((http_port, channel)),
             Err(e) if std::time::Instant::now() >= deadline => {
                 return Err(anyhow::anyhow!(
                     "Flight server did not accept a connection on port {flight_port} within 30s: {e}"
@@ -998,8 +1023,8 @@ async fn start_flight_server() -> Result<Channel, anyhow::Error> {
 ///
 /// Regression test for <https://github.com/spiceai/spiceai/issues/12844>.
 ///
-/// The delta assertions are safe on this binary's shared registry because no
-/// sibling test here emits `flight_requests`.
+/// The delta assertions are safe on this binary's shared registry because they
+/// count only the series this test's own user agent produced.
 #[tokio::test]
 async fn each_flight_rpc_records_exactly_one_request() -> Result<(), anyhow::Error> {
     let registry = &*PROMETHEUS;
@@ -1008,7 +1033,7 @@ async fn each_flight_rpc_records_exactly_one_request() -> Result<(), anyhow::Err
 
     // One increment, under one method name: the service impl labelled this
     // `do_handshake` while the handler labels it `handshake`.
-    let before = flight_requests_total(registry);
+    let before = flight_requests_total(registry, FLIGHT_RPC_COUNT_USER_AGENT);
     client
         .handshake("flight_request_metrics")
         .await
@@ -1019,7 +1044,7 @@ async fn each_flight_rpc_records_exactly_one_request() -> Result<(), anyhow::Err
     // stream is drained because the handler's measurement spans the drain; the
     // counter increments before it, so this pins the ordering the histogram
     // depends on.
-    let before = flight_requests_total(registry);
+    let before = flight_requests_total(registry, FLIGHT_RPC_COUNT_USER_AGENT);
     let stream = client
         .do_get(Ticket::new("SELECT 1"))
         .await
@@ -1031,14 +1056,14 @@ async fn each_flight_rpc_records_exactly_one_request() -> Result<(), anyhow::Err
     assert_eq!(batches.len(), 1, "SELECT 1 returns a single batch");
     assert_recorded_once(registry, before, "do_get");
 
-    let before = flight_requests_total(registry);
+    let before = flight_requests_total(registry, FLIGHT_RPC_COUNT_USER_AGENT);
     client
         .get_schema(FlightDescriptor::new_cmd("SELECT 1"))
         .await
         .map_err(|e| anyhow::anyhow!("get_schema: {e}"))?;
     assert_recorded_once(registry, before, "get_schema");
 
-    let before = flight_requests_total(registry);
+    let before = flight_requests_total(registry, FLIGHT_RPC_COUNT_USER_AGENT);
     let actions: Vec<_> = client
         .list_actions()
         .await
@@ -1055,7 +1080,7 @@ async fn each_flight_rpc_records_exactly_one_request() -> Result<(), anyhow::Err
     // A rejection reached before any command-specific handler runs must still be
     // counted. These are the paths that recorded nothing, so a re-dropped future
     // reads as zero here rather than as a duplicate.
-    let before = flight_requests_total(registry);
+    let before = flight_requests_total(registry, FLIGHT_RPC_COUNT_USER_AGENT);
     let empty = futures::stream::empty::<arrow_flight::error::Result<arrow_flight::FlightData>>();
     let refused = async { client.do_put(empty).await?.try_collect::<Vec<_>>().await }
         .await
@@ -1526,4 +1551,183 @@ async fn a_cayenne_statement_reports_the_rows_it_supersedes() {
         ),
         Some(1.0)
     );
+}
+
+/// The milliseconds in a `Server-Timing` value, which must be `total;dur=<ms>`.
+#[track_caller]
+fn server_timing_total(value: &str) -> f64 {
+    value
+        .strip_prefix("total;dur=")
+        .and_then(|duration| duration.parse::<f64>().ok())
+        .unwrap_or_else(|| panic!("expected `total;dur=<ms>`, got `{value}`"))
+}
+
+/// The `(count, sum)` of histogram `name` over the series the user agent
+/// carrying `token` produced whose labels include every pair in `labels`.
+fn histogram_sent_by(
+    registry: &prometheus::Registry,
+    name: &str,
+    token: &str,
+    labels: &[(&str, &str)],
+) -> (u64, f64) {
+    registry
+        .gather()
+        .iter()
+        .filter(|family| family.name() == name)
+        .flat_map(prometheus::proto::MetricFamily::get_metric)
+        .filter(|metric| sent_by(metric, token))
+        .filter(|metric| {
+            labels.iter().all(|(name, value)| {
+                metric
+                    .get_label()
+                    .iter()
+                    .any(|label| label.name() == *name && label.value() == *value)
+            })
+        })
+        .fold((0, 0.0), |(count, sum), metric| {
+            let histogram = metric.get_histogram();
+            (
+                count + histogram.get_sample_count(),
+                sum + histogram.get_sample_sum(),
+            )
+        })
+}
+
+/// The largest difference rounding a sample to the field's three decimals makes.
+const SERVER_TIMING_ROUNDING_MS: f64 = 0.0005 + 1e-9;
+
+/// `Server-Timing` reports durations the runtime already recorded, never a
+/// second clock, so the field and the dashboards agree: the head of a buffered
+/// `/v1/sql` response carries its `http_requests_duration_ms` sample, a
+/// streamed one's trailer its `http_responses_duration_ms` sample, and a Flight
+/// query's `DoGet` trailer the `flight_request_duration_ms` samples of its
+/// `GetFlightInfo` and `DoGet` added together.
+///
+/// Each request sends its own user agent and only its own series are read, so
+/// siblings on this binary's shared registry cannot move the counts.
+#[tokio::test]
+async fn server_timing_reports_the_recorded_duration_samples() -> Result<(), anyhow::Error> {
+    const BUFFERED: &str = "server-timing-buffered/1.0";
+    const STREAMED: &str = "server-timing-streamed/1.0";
+    const FLIGHT: &str = "server-timing-flight/1.0";
+
+    let registry = &*PROMETHEUS;
+    let (http_port, channel) = start_servers(FLIGHT).await?;
+    let sql = "SELECT 1 AS n";
+
+    // A buffered format: the head carries the response-head sample.
+    let response = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{http_port}/v1/sql"))
+        .header("user-agent", BUFFERED)
+        .header("accept", "text/csv")
+        .body(sql)
+        .send()
+        .await?;
+    let header = response
+        .headers()
+        .get("server-timing")
+        .ok_or_else(|| anyhow::anyhow!("a buffered response must carry `Server-Timing`"))?
+        .to_str()?
+        .to_string();
+    response.bytes().await?;
+    let (count, sample) = histogram_sent_by(
+        registry,
+        "http_requests_duration_ms",
+        BUFFERED,
+        &[("path", "/v1/sql")],
+    );
+    assert_eq!(
+        count, 1,
+        "one request, one http_requests_duration_ms sample"
+    );
+    let reported = server_timing_total(&header);
+    assert!(
+        (reported - sample).abs() <= SERVER_TIMING_ROUNDING_MS,
+        "the header reports {reported} ms but http_requests_duration_ms recorded {sample} ms"
+    );
+
+    // The streamed JSON body: the trailer carries the end-of-body sample.
+    let mut stream = tokio::net::TcpStream::connect(("127.0.0.1", http_port)).await?;
+    tokio::io::AsyncWriteExt::write_all(
+        &mut stream,
+        format!(
+            "POST /v1/sql HTTP/1.1\r\nHost: 127.0.0.1:{http_port}\r\nUser-Agent: {STREAMED}\r\nContent-Type: text/plain\r\nTE: trailers\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{sql}",
+            sql.len()
+        )
+        .as_bytes(),
+    )
+    .await?;
+    let mut raw = String::new();
+    tokio::io::AsyncReadExt::read_to_string(&mut stream, &mut raw).await?;
+    let trailer = raw
+        .rsplit("\r\n0\r\n")
+        .next()
+        .and_then(|trailers| {
+            trailers
+                .lines()
+                .find_map(|line| line.strip_prefix("server-timing: "))
+        })
+        .ok_or_else(|| anyhow::anyhow!("no `server-timing` trailer in `{raw}`"))?
+        .to_string();
+    let (count, sample) = histogram_sent_by(
+        registry,
+        "http_responses_duration_ms",
+        STREAMED,
+        &[("path", "/v1/sql"), ("outcome", "complete")],
+    );
+    assert_eq!(
+        count, 1,
+        "one response, one http_responses_duration_ms sample"
+    );
+    let reported = server_timing_total(&trailer);
+    assert!(
+        (reported - sample).abs() <= SERVER_TIMING_ROUNDING_MS,
+        "the trailer reports {reported} ms but http_responses_duration_ms recorded {sample} ms"
+    );
+
+    // A Flight query: the DoGet trailer adds the GetFlightInfo sample to its own.
+    let mut client = FlightClient::new(channel);
+    let info = client
+        .get_flight_info(FlightDescriptor::new_cmd(sql.to_string()))
+        .await?;
+    let ticket = info
+        .endpoint
+        .first()
+        .and_then(|endpoint| endpoint.ticket.clone())
+        .ok_or_else(|| anyhow::anyhow!("GetFlightInfo returned no ticket"))?;
+    let mut results = client.do_get(ticket).await?;
+    while results.try_next().await?.is_some() {}
+    let trailer = results
+        .trailers()
+        .and_then(|trailers| {
+            trailers
+                .get("server-timing")
+                .and_then(|value| value.to_str().ok().map(str::to_string))
+        })
+        .ok_or_else(|| anyhow::anyhow!("a query DoGet must end with a `server-timing` trailer"))?;
+    let (planned, get_flight_info) = histogram_sent_by(
+        registry,
+        "flight_request_duration_ms",
+        FLIGHT,
+        &[("method", "get_flight_info")],
+    );
+    let (ran, do_get) = histogram_sent_by(
+        registry,
+        "flight_request_duration_ms",
+        FLIGHT,
+        &[("method", "do_get")],
+    );
+    assert_eq!((planned, ran), (1, 1), "one sample for each RPC");
+    let reported = server_timing_total(&trailer);
+    assert!(
+        (reported - (get_flight_info + do_get)).abs() <= SERVER_TIMING_ROUNDING_MS,
+        "the trailer reports {reported} ms but GetFlightInfo recorded {get_flight_info} ms and \
+         DoGet {do_get} ms"
+    );
+    assert!(
+        reported > do_get,
+        "the trailer must include the GetFlightInfo time, not only DoGet's {do_get} ms"
+    );
+
+    Ok(())
 }

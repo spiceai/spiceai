@@ -198,6 +198,10 @@ impl CatalogConnector for SnowflakeCatalog {
 /// This mirrors the Snowflake *dataset* connector's
 /// `build_snowflake_table_factory`; see issues #10703 and #13664.
 #[must_use]
+#[expect(
+    clippy::disallowed_methods,
+    reason = "installs `deny_spice_specific_functions()` with `with_function_support`"
+)]
 fn build_table_factory(
     pool: Arc<dyn DbConnectionPool<Arc<SnowflakeApi>, &'static dyn Sync> + Send + Sync>,
 ) -> SnowflakeTableFactory {

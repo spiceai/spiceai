@@ -539,6 +539,46 @@ pub fn extract_cayenne_write_target(
     None
 }
 
+/// Stop the background maintenance of every Cayenne instance `table_provider`
+/// serves from — the provider itself, each partition of a partitioned table, and
+/// what a poly or upsert-dedup wrapper writes to — and wait for maintenance they
+/// already started.
+///
+/// Called when a dataset generation is drained for replacement or removal: the
+/// replacement opens the same table on the same catalog, and nothing in memory
+/// serializes the two instances' maintenance (#11581). Every instance is
+/// quiesced at once, and the wait is not bounded: a drain publishes completion
+/// only once the work it drains has ended, and a pass still running when the
+/// replacement starts is exactly the overlap this exists to prevent.
+pub async fn quiesce_cayenne_maintenance(table_provider: &Arc<dyn TableProvider>) {
+    let mut instances = Vec::new();
+    let mut pending = vec![Arc::clone(table_provider)];
+    while let Some(provider) = pending.pop() {
+        if let Some(cayenne) = spice_table::find_concrete::<CayenneTableProvider>(
+            provider.as_ref(),
+            spice_table::LayerWalk::Write,
+        ) {
+            instances.push(cayenne.clone_for_write_operations());
+        } else if let Some(partitioned) = spice_table::find_concrete::<PartitionTableProvider>(
+            provider.as_ref(),
+            spice_table::LayerWalk::Write,
+        ) {
+            pending.extend(partitioned.partition_table_providers().await);
+        } else if let Some(poly) = spice_table::find_layer::<PolyTableProvider>(
+            provider.as_ref(),
+            spice_table::LayerWalk::Write,
+        ) {
+            pending.push(poly.writer());
+        } else if let Some(upsert_dedup) = spice_table::find_concrete::<UpsertDedupTableProvider>(
+            provider.as_ref(),
+            spice_table::LayerWalk::Write,
+        ) {
+            pending.push(Arc::clone(upsert_dedup.inner()));
+        }
+    }
+    futures::future::join_all(instances.iter().map(CayenneTableProvider::quiesce)).await;
+}
+
 fn spawn_staged_append(
     accelerator: CayenneTableProvider,
     schema: SchemaRef,

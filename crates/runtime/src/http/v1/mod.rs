@@ -51,6 +51,7 @@ use crate::{
         },
     },
     egress::EgressAccount,
+    http::server_timing::ServerTiming,
     status::ComponentStatus,
 };
 use arrow::{array::RecordBatch, datatypes::SchemaRef, util::pretty::pretty_format_batches};
@@ -341,7 +342,7 @@ async fn query_stream_to_http_response(
     let headers = response_headers(format, cache_status).await;
     let account = EgressAccount::register(&memory_pool, "http_egress");
     let body = Body::from_stream(json_array_body_stream(first, data_stream, account));
-    (StatusCode::OK, headers, body).into_response()
+    streamed_response(headers, body)
 }
 
 /// Run a `BEGIN … COMMIT` body through the shared transaction orchestrator
@@ -511,7 +512,15 @@ async fn query_raw_stream_to_http_response(
     let headers = response_headers(format, cache_status).await;
     let account = EgressAccount::register(&memory_pool, "http_egress");
     let body = Body::from_stream(json_array_body_from_batches(first, data_stream, account));
-    (StatusCode::OK, headers, body).into_response()
+    streamed_response(headers, body)
+}
+
+/// A `200 OK` whose body streams, marked so its `Server-Timing` total is sent
+/// as a trailer: the total is not known until the body ends.
+fn streamed_response(headers: HeaderMap, body: Body) -> Response {
+    let mut response = (StatusCode::OK, headers, body).into_response();
+    response.extensions_mut().insert(ServerTiming::Trailer);
+    response
 }
 
 trait SqlJsonBatch: Send + 'static {

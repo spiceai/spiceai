@@ -347,6 +347,10 @@ impl DataConnectorFactory for PostgresFactory {
                     let pool = pool.with_unsupported_type_action(unsupported_type_action);
 
                     let pool = Arc::new(pool);
+                    #[expect(
+                        clippy::disallowed_methods,
+                        reason = "serves only the write path, whose `PostgresTableWriter` neither federates nor pushes filters, and the write-back schema probe, which reads only `schema()`; reads go through `federated_postgres_table_provider`"
+                    )]
                     let factory = PostgresTableFactory::new(Arc::clone(&pool));
                     Ok(Arc::new(Postgres {
                         factory,
@@ -1011,17 +1015,19 @@ async fn federated_postgres_table_provider(
 ) -> std::result::Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>>
 {
     let dyn_pool: Arc<DynPostgresConnectionPool> = pool;
-    let sql_table = Arc::new(
-        SqlTable::new(
-            "postgres",
-            &dyn_pool,
-            table_reference.clone(),
-            Some(Engine::Postgres),
-        )
-        .await
-        .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
-        .with_dialect(Arc::new(PostgreSqlDialect {})),
-    );
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "routed through `create_spice_federated_table_provider` with `deny_spice_functions_for_postgres_table_providers()` below"
+    )]
+    let sql_table = SqlTable::new(
+        "postgres",
+        &dyn_pool,
+        table_reference.clone(),
+        Some(Engine::Postgres),
+    )
+    .await
+    .map_err(|e| Box::new(e) as Box<dyn std::error::Error + Send + Sync>)?
+    .with_dialect(Arc::new(PostgreSqlDialect {}));
 
     let schema = sql_table.schema();
     Ok(Arc::new(create_spice_federated_table_provider(

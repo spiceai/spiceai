@@ -80,11 +80,13 @@ impl Read for ClickhouseTableFactory {
         table_reference: TableReference,
     ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
         let pool = Arc::clone(&self.pool);
-        let sql_table = Arc::new(
-            SqlTable::new("clickhouse", &pool, table_reference.clone(), None)
-                .await
-                .context(UnableToConstructSQLTableSnafu)?,
-        );
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "routed through `create_spice_federated_table_provider` with the factory's policy below, which the connector sets to `deny_spice_specific_functions()`"
+        )]
+        let sql_table = SqlTable::new("clickhouse", &pool, table_reference.clone(), None)
+            .await
+            .context(UnableToConstructSQLTableSnafu)?;
 
         let schema = sql_table.schema();
         let table_provider = Arc::new(create_spice_federated_table_provider(

@@ -20,7 +20,7 @@ use crate::{
         job_executor_context_extension::JobExecutorContextExtension,
         request_context_extension::DataFusionContextExtension,
     },
-    flight::SessionStore,
+    flight::{SessionStore, server_timing::ServerTimingTrailers},
     jobs::JobExecutor,
     model::ModelContextExtension,
     secrets,
@@ -107,7 +107,8 @@ where
     ResBody: http_body::Body + Send + 'static,
     ReqBody: Send + 'static,
 {
-    type Response = http::Response<util::cancel_guard_body::CancelGuardBody<ResBody>>;
+    type Response =
+        http::Response<ServerTimingTrailers<util::cancel_guard_body::CancelGuardBody<ResBody>>>;
     type Error = S::Error;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
@@ -183,6 +184,9 @@ where
                     // the id too.
                     runtime_request_context::attach_trace_id(&mut parts.headers, &request_context);
                     let body = util::cancel_guard_body::CancelGuardBody::new(body, cancel_guard);
+                    // The trailers frame comes after the stream ends, so this is
+                    // where a query `DoGet` can report its server time.
+                    let body = ServerTimingTrailers::new(body, Arc::clone(&request_context));
                     Ok(http::Response::from_parts(parts, body))
                 })
                 .await
