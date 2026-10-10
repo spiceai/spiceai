@@ -682,13 +682,13 @@ impl Runtime {
         // Stop startup registrations still waiting for views this change replaces
         // or removes, so they cannot register the old definition afterwards.
         for name in &views_that_changed {
-            self.view_loads.supersede(name);
+            self.view_loads.supersede(name).await;
         }
         for view in &current_app.views {
             if !new_app.views.iter().any(|v| v.name == view.name)
                 && let Ok(builder) = ViewBuilder::try_from(view.clone())
             {
-                self.view_loads.supersede(&builder.name);
+                self.view_loads.supersede(&builder.name).await;
             }
         }
 
@@ -743,7 +743,7 @@ impl Runtime {
         for view_name in affected_views_in_order_of_dependencies {
             // An unchanged view re-applied because a dependency changed is
             // registered here, so its startup registration must not also run.
-            self.view_loads.supersede(&view_name);
+            self.view_loads.supersede(&view_name).await;
             if let Some(validated_view) =
                 validated_views.iter().find(|vv| vv.view.name == view_name)
             {

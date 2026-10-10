@@ -31,7 +31,9 @@ use crate::datafusion::resolve_table_reference;
 
 #[derive(Default)]
 pub(crate) struct ViewLoads {
-    pending: parking_lot::Mutex<HashMap<ResolvedTableReference, (u64, CancellationToken)>>,
+    pending: parking_lot::Mutex<
+        HashMap<ResolvedTableReference, (u64, CancellationToken, Arc<tokio::sync::Mutex<()>>)>,
+    >,
     next_id: std::sync::atomic::AtomicU64,
 }
 
@@ -41,6 +43,8 @@ pub(crate) struct ViewLoad {
     name: ResolvedTableReference,
     id: u64,
     token: CancellationToken,
+    /// Held until this load is dropped; `supersede` waits for it.
+    _running: tokio::sync::OwnedMutexGuard<()>,
 }
 
 impl ViewLoads {
@@ -64,16 +68,20 @@ impl ViewLoads {
             name,
             id,
             token,
+            _running: guard,
         }
     }
 
-    /// Cancels the pending startup registration of `name`, if any. Returns
-    /// whether one was pending.
-    pub(crate) fn supersede(&self, name: &TableReference) -> bool {
+    /// Cancels the pending startup registration of `name`, if any, and returns
+    /// once it has ended, so it cannot register the view after the caller
+    /// removes or replaces it. Returns whether one was pending.
+    pub(crate) async fn supersede(&self, name: &TableReference) -> bool {
         let name = resolve_table_reference(name.clone());
-        match self.pending.lock().remove(&name) {
-            Some((_, token)) => {
+        let removed = self.pending.lock().remove(&name);
+        match removed {
+            Some((_, token, running)) => {
                 token.cancel();
+                let _ended = running.lock().await;
                 true
             }
             None => false,
@@ -92,7 +100,7 @@ impl Drop for ViewLoad {
         let mut pending = self.loads.pending.lock();
         if pending
             .get(&self.name)
-            .is_some_and(|(id, _)| *id == self.id)
+            .is_some_and(|(id, _, _)| *id == self.id)
         {
             pending.remove(&self.name);
         }
@@ -103,32 +111,53 @@ impl Drop for ViewLoad {
 mod tests {
     use super::*;
 
-    #[test]
-    fn supersede_cancels_only_the_named_view() {
+    #[tokio::test]
+    async fn supersede_cancels_only_the_named_view_and_waits_for_it() {
         let loads = Arc::new(ViewLoads::default());
         let a = loads.begin(&TableReference::bare("a"));
         let b = loads.begin(&TableReference::bare("b"));
-        assert!(loads.supersede(&TableReference::parse_str("public.a")));
-        assert!(a.token().is_cancelled());
+        let token = a.token();
+        let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let ended_task = Arc::clone(&ended);
+        tokio::spawn(async move {
+            token.cancelled().await;
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+            ended_task.store(true, std::sync::atomic::Ordering::SeqCst);
+            drop(a);
+        });
+        assert!(
+            loads
+                .supersede(&TableReference::parse_str("public.a"))
+                .await
+        );
+        assert!(
+            ended.load(std::sync::atomic::Ordering::SeqCst),
+            "supersede must return only after the superseded load has ended"
+        );
         assert!(!b.token().is_cancelled());
-        assert!(!loads.supersede(&TableReference::bare("a")));
+        assert!(!loads.supersede(&TableReference::bare("a")).await);
     }
 
-    #[test]
-    fn a_dropped_load_leaves_nothing_to_supersede() {
+    #[tokio::test]
+    async fn a_dropped_load_leaves_nothing_to_supersede() {
         let loads = Arc::new(ViewLoads::default());
         drop(loads.begin(&TableReference::bare("a")));
-        assert!(!loads.supersede(&TableReference::bare("a")));
+        assert!(!loads.supersede(&TableReference::bare("a")).await);
     }
 
-    #[test]
-    fn a_newer_load_supersedes_the_older_and_survives_its_drop() {
+    #[tokio::test]
+    async fn a_newer_load_supersedes_the_older_and_survives_its_drop() {
         let loads = Arc::new(ViewLoads::default());
         let old = loads.begin(&TableReference::bare("a"));
         let new = loads.begin(&TableReference::bare("a"));
         assert!(old.token().is_cancelled());
         drop(old);
-        assert!(loads.supersede(&TableReference::bare("a")));
-        assert!(new.token().is_cancelled());
+        let token = new.token();
+        tokio::spawn(async move {
+            new.token().cancelled().await;
+            drop(new);
+        });
+        assert!(loads.supersede(&TableReference::bare("a")).await);
+        assert!(token.is_cancelled());
     }
 }
