@@ -19783,6 +19783,11 @@ impl CayenneTableProvider {
             return None;
         }
         let deletion_index_len = self.pk_deletion_snapshot().delete_len();
+        // An empty index has nothing to reclaim — whatever the trigger, even a
+        // configured 0 — and this path is a whole-snapshot rewrite.
+        if deletion_index_len == 0 {
+            return None;
+        }
         // The CONFIGURED trigger, not the adaptive one: the controller lowers that
         // to bake more often, a trade priced against the incremental bake's write
         // amplification, and this path is a full rewrite instead. See

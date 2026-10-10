@@ -195,9 +195,11 @@ async fn drive_rounds(
     Ok(observed)
 }
 
-/// Row count via `SELECT COUNT(*)`, so reclamation is checked against results and
-/// not only against the index counter.
-async fn count_rows(table: &Arc<CayenneTableProvider>, name: &str) -> i64 {
+/// The visible row set, reduced to what reclamation could get wrong: the row
+/// count, the distinct-key count, and how many rows carry the payload of the
+/// final upsert round. A lost key offset by a duplicated one, or a row that
+/// survived with a superseded payload, moves one of the three.
+async fn row_set_summary(table: &Arc<CayenneTableProvider>, name: &str) -> (i64, i64, i64) {
     let ctx = SessionContext::new();
     ctx.register_table(
         name,
@@ -205,20 +207,37 @@ async fn count_rows(table: &Arc<CayenneTableProvider>, name: &str) -> i64 {
     )
     .expect("register table");
     let batches = ctx
-        .sql(&format!("SELECT COUNT(*) FROM {name}"))
+        .sql(&format!(
+            "SELECT COUNT(*), COUNT(DISTINCT id), \
+             SUM(CASE WHEN value LIKE 'gen_0001_%' THEN 1 ELSE 0 END) FROM {name}"
+        ))
         .await
-        .expect("count sql planned")
+        .expect("summary sql planned")
         .collect()
         .await
-        .expect("count collected");
+        .expect("summary collected");
     let merged =
         arrow::compute::concat_batches(&batches[0].schema(), &batches).expect("concat batches");
-    merged
-        .column(0)
-        .as_any()
-        .downcast_ref::<Int64Array>()
-        .expect("count column")
-        .value(0)
+    let column = |index: usize| {
+        merged
+            .column(index)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("integer summary column")
+            .value(0)
+    };
+    (column(0), column(1), column(2))
+}
+
+/// Every round rewrote its own key slice once, so exactly one row per key
+/// survives, each carrying the final round's payload.
+async fn assert_latest_row_per_key(table: &Arc<CayenneTableProvider>, name: &str) {
+    let expected = ROUNDS * ROWS_PER_ROUND;
+    assert_eq!(
+        row_set_summary(table, name).await,
+        (expected, expected, expected),
+        "reclamation changed the visible row set: (rows, distinct keys, rows with the final payload)"
+    );
 }
 
 /// An explicit `deletion_mode: position` primary-key table under repeated upserts
@@ -256,11 +275,7 @@ async fn position_mode_deletion_index_reaches_bounded_steady_state(
 
     // Reclamation must not change what the table returns: every round rewrote the
     // same key range, so exactly one row per key survives.
-    assert_eq!(
-        count_rows(&table, "pos_reclaim").await,
-        ROUNDS * ROWS_PER_ROUND,
-        "reclamation changed the visible row set"
-    );
+    assert_latest_row_per_key(&table, "pos_reclaim").await;
 
     Ok(())
 }
@@ -289,11 +304,7 @@ async fn key_mode_deletion_index_still_reclaims(
         "the index never crossed the reclaim trigger and never shrank, so this test proved nothing: {observed:?}"
     );
 
-    assert_eq!(
-        count_rows(&table, "key_reclaim").await,
-        ROUNDS * ROWS_PER_ROUND,
-        "key-mode reclamation changed the visible row set"
-    );
+    assert_latest_row_per_key(&table, "key_reclaim").await;
 
     Ok(())
 }
@@ -335,11 +346,7 @@ async fn default_mode_deletion_index_reclaims_through_the_bake(
         "the default-mode table was reclaimed by a full rewrite, so `auto` did not resolve to `key`: {observed:?}"
     );
 
-    assert_eq!(
-        count_rows(&table, "auto_reclaim").await,
-        ROUNDS * ROWS_PER_ROUND,
-        "default-mode reclamation changed the visible row set"
-    );
+    assert_latest_row_per_key(&table, "auto_reclaim").await;
 
     Ok(())
 }
@@ -385,11 +392,7 @@ async fn small_write_profile_deletion_index_reclaims_through_the_bake(
         LastSmallFileCompactPath::None,
         "reclaimed by a full rewrite rather than the bake: {observed:?}"
     );
-    assert_eq!(
-        count_rows(&table, "small_write_reclaim").await,
-        ROUNDS * ROWS_PER_ROUND,
-        "reclamation changed the visible row set"
-    );
+    assert_latest_row_per_key(&table, "small_write_reclaim").await;
 
     Ok(())
 }

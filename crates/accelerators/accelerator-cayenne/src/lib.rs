@@ -4257,7 +4257,7 @@ impl DataAccelerator for CayenneAccelerator {
         // The factory reopens the same table on the same catalog, so the
         // previous instance's maintenance must stop before the new one starts:
         // nothing in memory serializes two instances' compaction (#11581).
-        change_sink::quiesce_table_maintenance(&previous_provider, Duration::from_mins(2)).await;
+        change_sink::quiesce_table_maintenance(&previous_provider).await;
         drop(previous_provider);
         provider_factory().await
     }

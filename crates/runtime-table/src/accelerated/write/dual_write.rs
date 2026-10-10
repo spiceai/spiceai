@@ -547,14 +547,10 @@ pub fn extract_cayenne_write_target(
 /// Called when a dataset generation is drained for replacement or removal: the
 /// replacement opens the same table on the same catalog, and nothing in memory
 /// serializes the two instances' maintenance (#11581). Every instance is
-/// quiesced at once and the wait is bounded by `max_wait`, so neither one stuck
-/// pass nor a table with many partitions can hold the reload; past it an
-/// instance is still closed to new maintenance, and the catalog refuses a
-/// compaction commit whose folded snapshots the replacement changed.
-pub async fn quiesce_cayenne_maintenance(
-    table_provider: &Arc<dyn TableProvider>,
-    max_wait: std::time::Duration,
-) {
+/// quiesced at once, and the wait is not bounded: a drain publishes completion
+/// only once the work it drains has ended, and a pass still running when the
+/// replacement starts is exactly the overlap this exists to prevent.
+pub async fn quiesce_cayenne_maintenance(table_provider: &Arc<dyn TableProvider>) {
     let mut instances = Vec::new();
     let mut pending = vec![Arc::clone(table_provider)];
     while let Some(provider) = pending.pop() {
@@ -573,22 +569,14 @@ pub async fn quiesce_cayenne_maintenance(
             spice_table::LayerWalk::Write,
         ) {
             pending.push(poly.writer());
-        } else if let Some(upsert_dedup) = provider.downcast_ref::<UpsertDedupTableProvider>() {
+        } else if let Some(upsert_dedup) = spice_table::find_concrete::<UpsertDedupTableProvider>(
+            provider.as_ref(),
+            spice_table::LayerWalk::Write,
+        ) {
             pending.push(Arc::clone(upsert_dedup.inner()));
         }
     }
-    futures::future::join_all(instances.iter().map(|cayenne| async move {
-        if tokio::time::timeout(max_wait, cayenne.quiesce())
-            .await
-            .is_err()
-        {
-            tracing::debug!(
-                table = cayenne.table_name(),
-                "Stopped waiting for the table's in-flight maintenance to finish; it starts no new maintenance"
-            );
-        }
-    }))
-    .await;
+    futures::future::join_all(instances.iter().map(CayenneTableProvider::quiesce)).await;
 }
 
 fn spawn_staged_append(

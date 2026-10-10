@@ -20,7 +20,7 @@ limitations under the License.
 mod tests;
 
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 use arrow::datatypes::SchemaRef;
 use arrow_tools::record_batch::try_cast_to;
@@ -29,6 +29,7 @@ use async_trait::async_trait;
 use cayenne::{CayenneTableProvider, RebuildableWrite, SlotAdvancer};
 use data_accelerator_api::upsert_dedup::UpsertDedupTableProvider;
 use data_components::cdc::ChangeBatch as CdcBatch;
+use data_components::poly::PolyTableProvider;
 use datafusion::datasource::TableProvider;
 use datafusion::error::{DataFusionError, Result};
 use datafusion::execution::context::SessionContext;
@@ -71,9 +72,10 @@ pub fn provider_schema_evolution(table: &Arc<dyn TableProvider>) -> SchemaEvolut
 
 /// Stop the background maintenance of every Cayenne instance `table` serves
 /// from — the provider itself, each partition of a partitioned table, and the
-/// table an upsert-dedup wrapper writes to — and wait, at most `max_wait`, for
-/// maintenance they already started. See `CayenneTableProvider::quiesce`.
-pub async fn quiesce_table_maintenance(table: &Arc<dyn TableProvider>, max_wait: Duration) {
+/// table a poly or upsert-dedup wrapper writes to — and wait for maintenance
+/// they already started. See `CayenneTableProvider::quiesce`. The same walk as
+/// the runtime's generation drain (`quiesce_cayenne_maintenance`).
+pub async fn quiesce_table_maintenance(table: &Arc<dyn TableProvider>) {
     let mut instances = Vec::new();
     let mut pending = vec![Arc::clone(table)];
     while let Some(provider) = pending.pop() {
@@ -85,18 +87,17 @@ pub async fn quiesce_table_maintenance(table: &Arc<dyn TableProvider>, max_wait:
             find_concrete::<PartitionTableProvider>(provider.as_ref(), LayerWalk::Write)
         {
             pending.extend(partitioned.partition_table_providers().await);
+        } else if let Some(poly) =
+            spice_table::find_layer::<PolyTableProvider>(provider.as_ref(), LayerWalk::Write)
+        {
+            pending.push(poly.writer());
         } else if let Some(dedup) =
             find_concrete::<UpsertDedupTableProvider>(provider.as_ref(), LayerWalk::Write)
         {
             pending.push(Arc::clone(dedup.inner()));
         }
     }
-    futures::future::join_all(instances.iter().map(|cayenne| async move {
-        // Past the bound the instance still starts nothing new, and the catalog
-        // refuses a compaction commit whose folded snapshots changed under it.
-        let _ = tokio::time::timeout(max_wait, cayenne.quiesce()).await;
-    }))
-    .await;
+    futures::future::join_all(instances.iter().map(CayenneTableProvider::quiesce)).await;
 }
 
 struct StorageFenceObserver {

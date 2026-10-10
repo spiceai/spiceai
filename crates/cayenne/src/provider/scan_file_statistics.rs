@@ -160,9 +160,9 @@ impl ScanFileStatisticsFlights {
     }
 
     /// Join the collection in flight for `key`, or register a new one for this
-    /// caller to run. The returned flight deregisters itself when dropped — on
-    /// completion, failure or cancellation — so the registry only ever holds
-    /// collections that a caller is still waiting on.
+    /// caller to run. The last flight of a registration deregisters it when
+    /// dropped — on completion, failure or cancellation — so the registry only
+    /// ever holds collections that a caller is still waiting on.
     pub(crate) fn join(&self, key: ScanFileStatisticsKey) -> ScanFileStatisticsFlight<'_> {
         let (cell, joined) = match self.in_flight.lock().entry(key.clone()) {
             Entry::Occupied(registered) => (Arc::clone(registered.get()), true),
@@ -224,15 +224,17 @@ impl ScanFileStatisticsFlight<'_> {
 
 impl Drop for ScanFileStatisticsFlight<'_> {
     fn drop(&mut self) {
-        // The first participant to leave removes the registration; any other
-        // still holds the cell, and a newer registration under the same key is
-        // left alone. A caller arriving after the removal starts a collection of
-        // its own, which re-checks the cache the finished one filled.
+        // The last participant to leave removes the registration, so a caller
+        // that arrives while any other still waits joins the same cell — and,
+        // when its leader was cancelled, takes over that cell's initialization
+        // instead of starting a second collection beside it. Every participant
+        // holds a clone of the cell and both joining and leaving happen under
+        // this lock, so the registry's clone plus ours is exactly "no one else".
+        // A newer registration under the same key is left alone.
         let mut in_flight = self.flights.in_flight.lock();
-        if in_flight
-            .get(&self.key)
-            .is_some_and(|registered| Arc::ptr_eq(registered, &self.cell))
-        {
+        if in_flight.get(&self.key).is_some_and(|registered| {
+            Arc::ptr_eq(registered, &self.cell) && Arc::strong_count(&self.cell) <= 2
+        }) {
             in_flight.remove(&self.key);
         }
     }
@@ -261,10 +263,13 @@ mod tests {
         ScanFileStatisticsKey::new("snapshot", &meta, &schema, generation)
     }
 
-    /// Callers of one file share a registration, and the registry empties when
-    /// the last of them leaves, whichever leaves first.
+    /// Callers of one file share a registration until the last of them leaves,
+    /// whichever leaves first: a caller arriving while any participant still
+    /// waits — here after the one that registered it left, as a cancelled
+    /// leader does — joins the same cell instead of starting a second
+    /// collection beside it.
     #[test]
-    fn concurrent_callers_share_one_registration_and_leave_none_behind() {
+    fn concurrent_callers_share_one_registration_until_the_last_leaves() {
         let flights = ScanFileStatisticsFlights::default();
         let first = flights.join(key(0));
         let second = flights.join(key(0));
@@ -273,22 +278,39 @@ mod tests {
         assert_eq!(flights.counters().joined_in_flight, 1);
 
         drop(first);
-        assert_eq!(flights.in_flight_len(), 0);
-        // The remaining caller still holds the cell the first one registered.
+        assert_eq!(
+            flights.in_flight_len(),
+            1,
+            "a participant is still waiting, so the registration stays"
+        );
         assert!(!second.cell().initialized());
         let third = flights.join(key(0));
         assert!(
-            !Arc::ptr_eq(&second.cell, &third.cell),
-            "a caller arriving after the registration was removed starts afresh"
+            Arc::ptr_eq(&second.cell, &third.cell),
+            "a caller arriving while a participant still waits joins its cell"
         );
+        assert_eq!(flights.counters().joined_in_flight, 2);
         drop(second);
+        assert_eq!(flights.in_flight_len(), 1);
+        drop(third);
+        assert_eq!(
+            flights.in_flight_len(),
+            0,
+            "the last participant to leave removes the registration"
+        );
+
+        // A registration that replaced an older one under the same key is not
+        // removed by a straggler of the older one.
+        let old = flights.join(key(0));
+        let mut in_flight = flights.in_flight.lock();
+        in_flight.insert(key(0), Arc::default());
+        drop(in_flight);
+        drop(old);
         assert_eq!(
             flights.in_flight_len(),
             1,
             "leaving must not remove a newer registration under the same key"
         );
-        drop(third);
-        assert_eq!(flights.in_flight_len(), 0);
     }
 
     /// A collection from before a clear is a different identity from one after.
