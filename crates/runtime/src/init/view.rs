@@ -126,13 +126,15 @@ impl Runtime {
         let validated_views = Arc::clone(&self).get_valid_views(app, LogErrors(false));
 
         // Determine the dependency order for views based on their SQL dependencies
-        let views_in_dependency_order = order_views_by_dependencies(&validated_views)
-            .unwrap_or_else(|| {
-                validated_views
-                    .iter()
-                    .map(|vv| Arc::clone(&vv.view))
-                    .collect()
-            });
+        let ordered = order_views_by_dependencies(&validated_views);
+        // Waiting on another view is only safe when the views form no cycle.
+        let wait_on_views = ordered.is_some();
+        let views_in_dependency_order = ordered.unwrap_or_else(|| {
+            validated_views
+                .iter()
+                .map(|vv| Arc::clone(&vv.view))
+                .collect()
+        });
 
         let dependencies: HashMap<ResolvedTableReference, Vec<ResolvedTableReference>> =
             validated_views
@@ -157,7 +159,17 @@ impl Runtime {
             .map(resolve_table_reference)
             .collect();
 
-        let mut view_done: HashMap<ResolvedTableReference, CancellationToken> = HashMap::new();
+        // Created for every view up front and compared by resolved name, so a view
+        // that reads `public.v1` waits on `v1` whatever order they are spawned in.
+        let view_done: HashMap<ResolvedTableReference, CancellationToken> = validated_views
+            .iter()
+            .map(|vv| {
+                (
+                    resolve_table_reference(vv.view.name.clone()),
+                    CancellationToken::new(),
+                )
+            })
+            .collect();
         let mut tasks = Vec::new();
 
         for view in views_in_dependency_order {
@@ -165,7 +177,10 @@ impl Runtime {
             let mut waits: Vec<(String, CancellationToken)> = Vec::new();
             let mut wait_for_all = false;
             for dep in dependencies.get(&resolved).into_iter().flatten() {
-                if let Some(token) = view_done.get(dep).or_else(|| dataset_done.get(dep)) {
+                let view_token = view_done
+                    .get(dep)
+                    .filter(|_| wait_on_views && dep != &resolved);
+                if let Some(token) = view_token.or_else(|| dataset_done.get(dep)) {
                     waits.push((dep.to_string(), token.clone()));
                 } else if dataset_names.contains(dep) {
                     wait_for_all = true;
@@ -179,8 +194,7 @@ impl Runtime {
                 );
             }
 
-            let done = CancellationToken::new();
-            view_done.insert(resolved, done.clone());
+            let done = view_done.get(&resolved).cloned().unwrap_or_default();
 
             let runtime = Arc::clone(&self);
             tasks.push(tokio::spawn(async move {
