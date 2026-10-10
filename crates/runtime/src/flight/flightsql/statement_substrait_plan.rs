@@ -108,7 +108,7 @@ fn map_substrait_error(e: DataFusionError) -> Status {
         DataFusionError::NotImplemented(msg) => {
             Status::unimplemented(format!("Substrait feature not supported: {msg}"))
         }
-        other => handle_datafusion_error(other),
+        other => handle_datafusion_error(&other),
     }
 }
 
@@ -133,7 +133,10 @@ pub(crate) async fn get_flight_info(
     }
 
     let query = QueryBuilder::from_plan(plan, cache_key, Arc::clone(&datafusion)).build();
-    let (dataset_schema, _) = query.get_schema().await.map_err(handle_datafusion_error)?;
+    let (dataset_schema, _) = query
+        .get_schema()
+        .await
+        .map_err(|e| handle_datafusion_error(&e))?;
     let dataset_schema = arrow_tools::schema::expand_views_schema(&dataset_schema);
 
     let fd = request.into_inner();
