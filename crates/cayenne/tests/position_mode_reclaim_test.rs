@@ -39,7 +39,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use cayenne::metadata::{CreateTableOptions, DeletionMode, VortexConfig};
-use cayenne::{CayenneTableProvider, MetadataCatalog};
+use cayenne::{CayenneTableProvider, LastSmallFileCompactPath, MetadataCatalog};
 use datafusion::prelude::SessionContext;
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
@@ -47,6 +47,7 @@ use datafusion_table_providers::util::{
 
 test_with_backends!(position_mode_deletion_index_reaches_bounded_steady_state);
 test_with_backends!(key_mode_deletion_index_still_reclaims);
+test_with_backends!(default_mode_deletion_index_reclaims_through_the_bake);
 
 /// Rows per upsert round. Above `INLINE_MAX_ROWS` so each round writes a Vortex
 /// file rather than landing in the inline memtable.
@@ -282,6 +283,52 @@ async fn key_mode_deletion_index_still_reclaims(
         count_rows(&table, "key_reclaim").await,
         ROUNDS * ROWS_PER_ROUND,
         "key-mode reclamation changed the visible row set"
+    );
+
+    Ok(())
+}
+
+/// The same workload on the DEFAULT `deletion_mode` (`auto`), the configuration
+/// issue #13620 reports: a primary-key table left on `auto` resolved to
+/// `position`, so the seq-prefix bake declined it on every pass and its key
+/// deletion index grew by one tombstone per superseded row for the life of the
+/// process. `auto` now resolves to `key` for a primary-key table, so the bake
+/// reclaims the index — the incremental pass, not the whole-snapshot rewrite an
+/// explicit `position` table falls back to.
+async fn default_mode_deletion_index_reclaims_through_the_bake(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = pk_schema();
+    let table = build_table(&fixture, "auto_reclaim", &schema, DeletionMode::Auto).await?;
+
+    let observed = drive_rounds(&table, &schema).await?;
+
+    let rows_per_round = usize::try_from(ROWS_PER_ROUND).expect("row count fits in usize");
+    let unbounded = usize::try_from(ROUNDS).expect("round count fits in usize") * rows_per_round;
+    let peak = observed.iter().copied().max().unwrap_or(0);
+    assert!(
+        peak < unbounded,
+        "a default-mode primary-key table accumulated every tombstone: peak {peak}, observations {observed:?}"
+    );
+    assert!(
+        observed.iter().any(|len| *len >= RECLAIM_TRIGGER)
+            || observed.windows(2).any(|pair| pair[1] < pair[0]),
+        "the index never crossed the reclaim trigger and never shrank, so this test proved nothing: {observed:?}"
+    );
+    // Reclaimed by the bake, not by the full current-snapshot rewrite: the
+    // rewrite is the expensive fallback reserved for an explicit `position`
+    // table, and no current-dir small files accumulate on this workload, so a
+    // `Full` here means `auto` still resolved to `position`.
+    assert_eq!(
+        table.last_small_file_compact_path(),
+        LastSmallFileCompactPath::None,
+        "the default-mode table was reclaimed by a full rewrite, so `auto` did not resolve to `key`: {observed:?}"
+    );
+
+    assert_eq!(
+        count_rows(&table, "auto_reclaim").await,
+        ROUNDS * ROWS_PER_ROUND,
+        "default-mode reclamation changed the visible row set"
     );
 
     Ok(())
