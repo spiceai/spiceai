@@ -217,7 +217,7 @@ jobs:
           archive all_targets cargo nextest archive ${PKGS} \
             --test integration --test retention_oom --test integration_aws_sdk \
             --test integration_snapshot_refresh --test credential_provider \
-            --test partition_table_provider --test hadoop_catalog_test \
+            --test partition_table_provider \
             --features ${FEAT} --archive-file integration_tests.tar.zst
 
           echo "--- archive size ---"
@@ -1074,7 +1074,7 @@ jobs:
           MINIO_ACCESS_KEY_ID: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           MINIO_SECRET_ACCESS_KEY: ${{ secrets.TEST_MINIO_SECRET_KEY }}
         run: |
-          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=data_components::hadoop_catalog_test)'
+          INSTA_WORKSPACE_ROOT="${PWD}" CARGO_MANIFEST_DIR="${PWD}" cargo nextest run --workspace-remap "${PWD}" --archive-file ./integration_tests/integration_tests.tar.zst -E 'binary_id(=data_components::integration) & test(/^hadoop_catalog_test::/)'
 
   test-runtime-partition:
     name: Partition Table Integration Tests
