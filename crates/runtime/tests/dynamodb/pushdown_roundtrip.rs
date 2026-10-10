@@ -261,7 +261,7 @@ async fn seed_colliding(client: &Client) -> Result<(), anyhow::Error> {
     Ok(())
 }
 
-async fn create_table(client: &Client, table: &str) -> Result<(), anyhow::Error> {
+pub(super) async fn create_table(client: &Client, table: &str) -> Result<(), anyhow::Error> {
     let _ = client.delete_table().table_name(table).send().await;
     let key = |name: &str, key_type: KeyType| {
         KeySchemaElement::builder()

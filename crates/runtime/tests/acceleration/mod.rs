@@ -71,6 +71,7 @@ mod newest_by_time;
 mod on_conflict_cayenne;
 #[cfg(feature = "duckdb")]
 mod on_conflict_options;
+mod on_zero_results_retention;
 #[cfg(any(feature = "duckdb", feature = "sqlite"))]
 mod on_zero_results_subqueries;
 mod partition_by_arrow;
