@@ -14,6 +14,7 @@ use crate::accelerated::SnapshotCreateTrigger;
 use crate::accelerated::caching::is_reserved_caching_column;
 use crate::accelerated::refresh::Refresh;
 use crate::accelerated::refresh_completion::{RefreshCompletion, RefreshCompletionOutcome};
+use crate::accelerated::write::{CayenneWriteTarget, dual_write::extract_cayenne_write_target};
 use arrow_schema::{FieldRef, Schema, SchemaRef};
 use data_accelerator_api::DataAccelerator;
 use data_accelerator_api::ReloadProviderFactory;
@@ -25,7 +26,8 @@ use runtime_acceleration::acceleration_source::AccelerationSource;
 use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
 use runtime_acceleration::snapshot::notifications::Subscription;
 use runtime_acceleration::snapshot::{
-    ForceCreate, SnapshotManager, SnapshotUploadError, metrics as snapshot_metrics,
+    ForceCreate, SnapshotLockGuard, SnapshotManager, SnapshotUploadError,
+    metrics as snapshot_metrics,
 };
 use runtime_async::is_shutdown_cancellation;
 use runtime_status::{RuntimeStatus, WaitOutcome};
@@ -394,8 +396,9 @@ pub fn spawn_snapshot_interval_task(
 
 /// Creates a callback that triggers snapshot creation after a specified number of batch updates.
 ///
-/// If `runtime_status` is provided, batch counting will only start after the dataset
-/// is ready. This prevents counting batches during the initial load/bootstrap phase.
+/// Batch counting starts after runtime readiness and the initial snapshot attempt.
+/// The returned task belongs to the table generation and must be stopped and joined
+/// before its storage can be removed or rebound.
 #[expect(clippy::too_many_arguments)]
 pub fn create_periodic_snapshot_callback(
     batches: i64,
@@ -410,7 +413,7 @@ pub fn create_periodic_snapshot_callback(
     last_updated_at: Arc<AtomicI64>,
     accelerator: Option<Arc<dyn TableProvider>>,
     refresh: Arc<RwLock<Refresh>>,
-) -> Option<SnapshotCallback> {
+) -> Option<(tokio::task::JoinHandle<()>, SnapshotCallback)> {
     match (checkpointer, snapshot_manager) {
         (Some(checkpointer), Some(snapshot_manager)) => {
             let dataset_name = dataset_name.clone();
@@ -437,7 +440,7 @@ pub fn create_periodic_snapshot_callback(
             let accelerator_write_mutex_clone = Arc::clone(&accelerator_write_mutex);
             let accelerator_clone = accelerator.clone();
             let refresh_clone = Arc::clone(&refresh);
-            tokio::spawn(async move {
+            let initial_snapshot = tokio::spawn(async move {
                 if runtime_status.wait_for_ready().await == WaitOutcome::ShuttingDown {
                     return;
                 }
@@ -517,7 +520,7 @@ pub fn create_periodic_snapshot_callback(
             })
                 as Box<dyn FnMut() -> Pin<Box<dyn Future<Output = ()> + Send>> + Send>));
 
-            Some(callback)
+            Some((initial_snapshot, callback))
         }
         _ => None,
     }
@@ -619,6 +622,12 @@ async fn create_checkpoint_and_snapshot_once(
     federated_schema: Option<&Arc<Schema>>,
     refresh_sql: Option<&str>,
 ) -> Result<(), SnapshotAttemptError> {
+    // Keeps Cayenne maintenance from deleting files until the archive is written.
+    // Taken before the write lock, so writers never wait on a sweep batch.
+    let file_deletion_hold = match accelerator.and_then(extract_cayenne_write_target) {
+        Some(CayenneWriteTarget::Staged(table)) => Some(table.hold_file_deletions().await),
+        _ => None,
+    };
     let lock_guard = Arc::clone(accelerator_write_mutex).lock_owned().await;
     // Re-derive the checkpoint schema from the LIVE accelerator schema when both
     // the accelerator and the federated (source) schema are available, so an
@@ -657,7 +666,7 @@ async fn create_checkpoint_and_snapshot_once(
     snapshot_manager
         .create_snapshot(
             checkpoint_schema,
-            lock_guard,
+            SnapshotLockGuard::from(lock_guard).with(file_deletion_hold),
             updated_at,
             row_count,
             force_create,

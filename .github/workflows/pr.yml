@@ -277,7 +277,7 @@ jobs:
               return;
             }
 
-            const rustAffecting = /(\.rs$|(^|\/)Cargo\.(toml|lock)$|(^|\/)rust-toolchain(\.toml)?$|(^|\/)\.cargo\/|(^|\/)\.?(clippy|rustfmt)\.toml$|(^|\/)nextest\.toml$|(^|\/)layers\.toml$|^scripts\/(test_)?check_(crate_layers|table_layers|rust_gate_paths|module_reachability|fork_patches|bench_mysql_load_nulls)\.py$|^scripts\/(test_)?rust_guard_common\.py$|^docs\/dev\/fork_patches\.md$|^Makefile$|^test\/tpc-bench\/(Makefile|mysql-null-spec\.awk)$)/;
+            const rustAffecting = /(^(crates|bin|tools|vendor)\/|\.(rs|snap|proto)$|(^|\/)Cargo\.(toml|lock)$|(^|\/)rust-toolchain(\.toml)?$|(^|\/)\.cargo\/|(^|\/)\.?(clippy|rustfmt)\.toml$|(^|\/)nextest\.toml$|(^|\/)layers\.toml$|^scripts\/(test_)?check_(crate_layers|table_layers|rust_gate_paths|module_reachability|fork_patches|bench_mysql_load_nulls)\.py$|^scripts\/(test_)?rust_guard_common\.py$|^docs\/dev\/fork_patches\.md$|^(Makefile|version\.txt)$|^test\/tpc-bench\/(Makefile|mysql-null-spec\.awk)$|^test\/tls\/|^test\/spicepods\/tpch\/sf1\/accelerated\/postgres\[catalog\]\[changes\]\.yaml$)/;
             for (const file of files) {
               // A rename off a .rs path changes Rust sources even though the new
               // name doesn't match, so both sides of the rename must be clean.
@@ -626,7 +626,10 @@ jobs:
   # report success (a required check can't be skipped via paths-ignore).
   check_changes:
     if: ${{ github.event_name != 'pull_request' }}
-    runs-on: spiceai-macos
+    # The pool of the three required builds below, which all wait on this job.
+    # On the `spiceai-macos` minis it queued 13.7 min at the median and 64.7 min
+    # at p90 for a runner, then ran for 0.4 min (merge_group, 2026-09-29..10-06).
+    runs-on: spiceai-macos-large
     # A full-history checkout (`fetch-depth: 0`) and a path diff. Sized for a
     # cold runner having to clone from scratch, not the ~1 min a warm
     # self-hosted workspace takes.
@@ -741,8 +744,9 @@ jobs:
         if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
         run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
 
+      # Pull request and merge-queue checks keep no diagnostic artifacts.
       - name: Upload spiceio logs
-        if: always()
+        if: always() && github.event_name != 'pull_request' && github.event_name != 'merge_group'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: spiceio-lint-logs
@@ -937,8 +941,9 @@ jobs:
         if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
         run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
 
+      # Pull request and merge-queue checks keep no diagnostic artifacts.
       - name: Upload spiceio logs
-        if: always() && needs.check_changes.outputs.relevant_changes == 'true' && steps.setup-spiceio.outputs.pid != ''
+        if: always() && needs.check_changes.outputs.relevant_changes == 'true' && steps.setup-spiceio.outputs.pid != '' && github.event_name != 'pull_request' && github.event_name != 'merge_group'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: spiceio-build-test-logs
@@ -1044,8 +1049,9 @@ jobs:
         if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
         run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
 
+      # Pull request and merge-queue checks keep no diagnostic artifacts.
       - name: Upload spiceio logs
-        if: always() && needs.check_changes.outputs.relevant_changes == 'true' && steps.setup-spiceio.outputs.pid != ''
+        if: always() && needs.check_changes.outputs.relevant_changes == 'true' && steps.setup-spiceio.outputs.pid != '' && github.event_name != 'pull_request' && github.event_name != 'merge_group'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: spiceio-build-install-release-logs

@@ -329,6 +329,7 @@ fn dataset_with(
     if accelerated {
         dataset.acceleration = Some(Acceleration {
             enabled: true,
+            engine: Some("arrow".to_string()),
             ..Acceleration::default()
         });
     }

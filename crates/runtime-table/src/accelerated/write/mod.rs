@@ -27,7 +27,7 @@ limitations under the License.
 //!   for `refresh_mode: changes`, periodic refresh otherwise). This is the
 //!   default and matches the user-facing `write_mode: write_through` contract.
 //! - [`WriteMode::AcceleratorOnly`]: writes go only to the local accelerator
-//!   (used when `on_conflict` upserts into the accelerator without CDC).
+//!   (used for a source that discards writes, `sink`).
 //! - [`WriteMode::WriteBack`]: writes commit to the local accelerator inside a
 //!   transaction and are carried to the federated source by the delivery worker,
 //!   from the dirty-key markers that commit writes. Writes outside a
@@ -63,7 +63,7 @@ pub(crate) enum WriteMode {
     /// user-facing `write_mode: write_through` contract.
     WriteThrough,
     /// Writes go only to the local accelerator (not replicated to the source).
-    /// Used when `on_conflict` is configured or for internal tables.
+    /// Used for a source that discards writes (`sink`) and for internal tables.
     AcceleratorOnly,
     /// Writes commit to the local accelerator inside a transaction and are
     /// carried to the federated source by the delivery worker, from the

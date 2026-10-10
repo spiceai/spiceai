@@ -31,9 +31,14 @@ use datafusion::common::TableReference;
 use futures::{Stream, TryStreamExt as _};
 use rand::RngExt as _;
 use runtime::{
-    Runtime, accelerated::refresh::Refresh, auth::EndpointAuth,
-    component::dataset::acceleration::Acceleration, config::Config, datafusion::DataFusion,
-    flight::RateLimits, internal_table::create_internal_accelerated_table,
+    Runtime,
+    accelerated::refresh::Refresh,
+    auth::EndpointAuth,
+    component::dataset::acceleration::{Acceleration, Engine},
+    config::Config,
+    datafusion::DataFusion,
+    flight::RateLimits,
+    internal_table::create_internal_accelerated_table,
 };
 use runtime_auth::FlightBasicAuth;
 use runtime_secrets::Secrets;
@@ -51,6 +56,7 @@ const LOCALHOST: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 mod do_get;
 mod do_put;
 mod prepared_statements;
+mod query_errors;
 mod statement_substrait_plan;
 mod statement_update;
 mod trace_id;
@@ -252,7 +258,10 @@ async fn register_test_table(
         table_name.clone(),
         schema,
         None,
-        Acceleration::default(),
+        Acceleration {
+            engine: Engine::Arrow,
+            ..Acceleration::default()
+        },
         Refresh::default(),
         None,
         Arc::new(RwLock::new(Secrets::default())),

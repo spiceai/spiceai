@@ -170,8 +170,9 @@ jobs:
         if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
         run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
 
+      # Merge-queue checks keep no diagnostic artifacts.
       - name: Upload spiceio logs
-        if: always()
+        if: always() && github.event_name != 'merge_group'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: spiceio-features-logs

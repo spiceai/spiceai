@@ -462,6 +462,29 @@ const EVENT_GATED_CAYENNE_MAINTENANCE_METRICS: &[&str] = &[
     "cayenne_pk_bloom_split_rows_total",
 ];
 
+/// The value of counter `name` on the series carrying every label in `labels`,
+/// or `None` when no series does.
+fn counter_value(
+    registry: &prometheus::Registry,
+    name: &str,
+    labels: &[(&str, &str)],
+) -> Option<f64> {
+    registry
+        .gather()
+        .into_iter()
+        .filter(|family| family.name() == name)
+        .flat_map(|family| family.get_metric().to_vec())
+        .find(|series| {
+            labels.iter().all(|(key, value)| {
+                series
+                    .get_label()
+                    .iter()
+                    .any(|label| label.name() == *key && label.value() == *value)
+            })
+        })
+        .map(|series| series.get_counter().value())
+}
+
 async fn wait_until<F, Fut>(timeout: Duration, mut f: F) -> bool
 where
     F: FnMut() -> Fut,
@@ -1341,5 +1364,166 @@ async fn a_cache_hit_is_recorded_when_the_stream_is_consumed() {
     assert!(
         recorded_ms >= SLOW_READER_DELAY.as_secs_f64() * 1000.0,
         "the hit recorded {recorded_ms}ms, missing the {SLOW_READER_DELAY:?} its caller took to read it"
+    );
+}
+
+/// A Cayenne refresh reports the rows it received but did not keep — each copy
+/// of a key settled by arrival, identical or not — as `arrival`, while
+/// `rows_written` counts every row received. A dataset with a primary key
+/// publishes `arrival` at zero at load, before its first repeated key; one
+/// without a primary key publishes no series.
+#[cfg(not(windows))]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cayenne_refresh_reports_the_rows_it_supersedes_by_reason() {
+    let registry = &*PROMETHEUS;
+    let dir = tempfile::tempdir().expect("a temporary directory for the fixture");
+    let keyed = |name: &str, primary_key: Option<&str>, csv: &str| {
+        let path = dir.path().join(format!("{name}.csv"));
+        std::fs::write(&path, csv).expect("write the fixture CSV");
+        let mut dataset = Dataset::new(format!("file://{}", path.display()), name);
+        dataset.acceleration = Some(Acceleration {
+            enabled: true,
+            engine: Some("cayenne".to_string()),
+            mode: Mode::File,
+            refresh_mode: Some(RefreshMode::Full),
+            params: Some(Params::from_string_map(
+                [(
+                    "cayenne_file_path".to_string(),
+                    dir.path()
+                        .join(format!("{name}-cayenne"))
+                        .display()
+                        .to_string(),
+                )]
+                .into_iter()
+                .collect(),
+            )),
+            primary_key: primary_key.map(ToString::to_string),
+            ..Acceleration::default()
+        });
+        dataset
+    };
+    // 8,192 distinct keys fill the first record batch; the second repeats key 0
+    // unchanged and key 1 with a new value.
+    let repeated: String = std::iter::once("id,v\n".to_string())
+        .chain((0..8_192).map(|id| format!("{id},first\n")))
+        .chain(["0,first\n".to_string(), "1,second\n".to_string()])
+        .collect();
+    let app = AppBuilder::new("metrics_superseded_rows")
+        .with_dataset(keyed("superseded_arrival", Some("id"), &repeated))
+        .with_dataset(keyed("superseded_unique", Some("id"), "id,v\n1,a\n2,b\n"))
+        .with_dataset(keyed("superseded_keyless", None, "id,v\n1,a\n1,a\n"))
+        .with_runtime(SpicepodRuntime {
+            task_history: TaskHistory {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .build();
+    let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+    tokio::time::timeout(Duration::from_mins(1), Arc::clone(&rt).load_components())
+        .await
+        .expect("the datasets to load within a minute");
+    assert!(
+        wait_until(Duration::from_mins(1), || async { rt.status().is_ready() }).await,
+        "the runtime never reported ready, so the datasets never loaded"
+    );
+
+    let superseded = |dataset: &str, reason: &str| {
+        counter_value(
+            registry,
+            "dataset_acceleration_rows_superseded",
+            &[("dataset", dataset), ("reason", reason)],
+        )
+    };
+    assert_eq!(superseded("superseded_arrival", "arrival"), Some(2.0));
+    assert_eq!(
+        counter_value(
+            registry,
+            "dataset_acceleration_refresh_rows_written",
+            &[("dataset", "superseded_arrival")],
+        ),
+        Some(8_194.0)
+    );
+    assert_eq!(superseded("superseded_unique", "arrival"), Some(0.0));
+    assert_eq!(superseded("superseded_keyless", "arrival"), None);
+}
+
+/// A user's statement reports the rows it received but did not keep: an `INSERT`
+/// repeating a key counts the copy that arrived first as `arrival`.
+#[cfg(not(windows))]
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cayenne_statement_reports_the_rows_it_supersedes() {
+    use runtime_request_context::{Protocol, RequestContext};
+    use spicepod::acceleration::OnConflictBehavior;
+    use spicepod::component::access::AccessMode;
+
+    let registry = &*PROMETHEUS;
+    let dir = tempfile::tempdir().expect("a temporary directory for the fixture");
+    let path = dir.path().join("statement.csv");
+    std::fs::write(&path, "id,v\n1,seed\n").expect("write the fixture CSV");
+    let mut dataset = Dataset::new(format!("file://{}", path.display()), "superseded_statement");
+    dataset.access = AccessMode::ReadWrite;
+    dataset.acceleration = Some(Acceleration {
+        enabled: true,
+        engine: Some("cayenne".to_string()),
+        mode: Mode::File,
+        refresh_mode: Some(RefreshMode::Full),
+        params: Some(Params::from_string_map(
+            [(
+                "cayenne_file_path".to_string(),
+                dir.path().join("cayenne").display().to_string(),
+            )]
+            .into_iter()
+            .collect(),
+        )),
+        primary_key: Some("id".to_string()),
+        // Keeps the statement's writes in the acceleration.
+        on_conflict: HashMap::from([("id".to_string(), OnConflictBehavior::Upsert)]),
+        write_mode: spicepod::acceleration::WriteMode::Acceleration,
+        ..Acceleration::default()
+    });
+    let app = AppBuilder::new("metrics_superseded_statement")
+        .with_dataset(dataset)
+        .with_runtime(SpicepodRuntime {
+            task_history: TaskHistory {
+                enabled: false,
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .build();
+    let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+    tokio::time::timeout(Duration::from_mins(1), Arc::clone(&rt).load_components())
+        .await
+        .expect("the dataset to load within a minute");
+    assert!(
+        wait_until(Duration::from_mins(1), || async { rt.status().is_ready() }).await,
+        "the runtime never reported ready, so the dataset never loaded"
+    );
+
+    Arc::new(RequestContext::builder(Protocol::Http).build())
+        .scope(async {
+            let mut result = QueryBuilder::new(
+                "INSERT INTO superseded_statement VALUES (2, 'a'), (2, 'b'), (3, 'c')",
+                rt.datafusion(),
+            )
+            .build()
+            .run()
+            .await
+            .expect("the insert to run");
+            while let Some(batch) = result.data.next().await {
+                batch.expect("the insert to complete");
+            }
+        })
+        .await;
+
+    assert_eq!(
+        counter_value(
+            registry,
+            "dataset_acceleration_rows_superseded",
+            &[("dataset", "superseded_statement"), ("reason", "arrival")],
+        ),
+        Some(1.0)
     );
 }

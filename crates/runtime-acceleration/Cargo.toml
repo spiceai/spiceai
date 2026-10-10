@@ -34,6 +34,7 @@ fundu.workspace = true
 futures.workspace = true
 gethostname.workspace = true
 object_store.workspace = true
+object_store_occ = { path = "../object_store_occ" }
 parking_lot.workspace = true
 opentelemetry.workspace = true
 runtime-checkpoint-api = { path = "../runtime-checkpoint-api" }
@@ -44,6 +45,7 @@ runtime-parameters = { path = "../runtime-parameters" }
 runtime-object-store = { path = "../runtime-object-store" }
 runtime-secrets = { path = "../runtime-secrets" }
 s3-event-notifications = { path = "../s3-event-notifications" }
+secrecy.workspace = true
 rusqlite = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
@@ -59,6 +61,9 @@ url.workspace = true
 util = { path = "../util", features = ["datafusion"] }
 utoipa = { workspace = true, optional = true }
 uuid = { version = "1", features = ["v7"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [features]
 default = []

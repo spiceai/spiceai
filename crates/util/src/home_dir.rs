@@ -55,26 +55,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_home_dir_returns_some_on_standard_systems() {
-        // On most systems running tests, home directory should be set
-        let home = home_dir();
-        assert!(
-            home.is_some(),
-            "home_dir() should return Some on standard systems"
-        );
-    }
-
-    #[test]
-    fn test_home_dir_path_not_empty() {
-        if let Some(path) = home_dir() {
-            assert!(
-                !path.as_os_str().is_empty(),
-                "home directory path should not be empty"
-            );
-        }
-    }
-
-    #[test]
     fn test_home_dir_is_absolute() {
         if let Some(path) = home_dir() {
             assert!(

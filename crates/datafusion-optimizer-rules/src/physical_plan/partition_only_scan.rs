@@ -649,38 +649,57 @@ mod tests {
         );
     }
 
-    /// The rule must leave a plan without a partition-only file-scan aggregate
-    /// untouched — here a bare in-memory scan, which is not a file scan and has
-    /// no aggregate above it, so there is nothing to rewrite.
+    /// The rule must leave a scan that is not a file scan untouched, even under
+    /// an aggregate it would otherwise rewrite for. `MAX(a)` is
+    /// duplicate-insensitive, so the rule attempts the rewrite of the scan below
+    /// it; an in-memory scan has no per-file values to answer from, so the
+    /// whole plan must come back as the very plan passed in.
     #[test]
     fn leaves_non_file_scan_untouched() {
+        use datafusion::functions_aggregate::min_max::max_udaf;
+        use datafusion::physical_expr::aggregate::AggregateExprBuilder;
+        use datafusion::physical_plan::aggregates::{AggregateMode, PhysicalGroupBy};
+
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]));
         let batch = RecordBatch::try_new(
             Arc::clone(&schema),
             vec![Arc::new(Int32Array::from(vec![1, 2, 3])) as ArrayRef],
         )
         .expect("valid batch");
-        let plan: Arc<dyn ExecutionPlan> =
-            MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None)
+        let scan: Arc<dyn ExecutionPlan> =
+            MemorySourceConfig::try_new_exec(&[vec![batch]], Arc::clone(&schema), None)
                 .expect("valid memory exec");
 
+        let max_a = AggregateExprBuilder::new(max_udaf(), vec![Arc::new(Column::new("a", 0))])
+            .schema(Arc::clone(&schema))
+            .alias("max(a)")
+            .build()
+            .expect("valid MAX(a) aggregate");
+        let aggregate = AggregateExec::try_new(
+            AggregateMode::Single,
+            PhysicalGroupBy::default(),
+            vec![Arc::new(max_a)],
+            vec![None],
+            scan,
+            schema,
+        )
+        .expect("valid aggregate");
+        assert!(
+            is_duplicate_insensitive_aggregate(&aggregate),
+            "MAX(a) must be duplicate-insensitive, or the rule never looks at the scan"
+        );
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(aggregate);
+
         let optimized = PartitionOnlyScanRewrite::new()
-            .optimize(plan, &ConfigOptions::default())
+            .optimize(Arc::clone(&plan), &ConfigOptions::default())
             .expect("optimize succeeds");
 
-        // A non-file-scan leaf is left as an in-memory `DataSourceExec`; the
-        // rule only ever replaces a partition-only *file* scan.
-        let data_source = optimized
-            .as_ref()
-            .downcast_ref::<DataSourceExec>()
-            .expect("plan remains a DataSourceExec");
+        // The rule only ever replaces a partition-only *file* scan; with none
+        // below the aggregate, no node is rebuilt.
         assert!(
-            data_source
-                .data_source()
-                .as_ref()
-                .downcast_ref::<MemorySourceConfig>()
-                .is_some(),
-            "rule must not rewrite a plan with no partition-only file scan"
+            Arc::ptr_eq(&optimized, &plan),
+            "rule must not rewrite a plan with no partition-only file scan, got:\n{}",
+            datafusion::physical_plan::displayable(optimized.as_ref()).indent(true)
         );
     }
 }

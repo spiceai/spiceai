@@ -101,10 +101,12 @@ jobs:
           persist-credentials: false
           fetch-depth: 1
 
-      # Cache Cargo dependencies
-      - name: Cache Cargo registry
+      # Cache Cargo dependencies. Saved by the "Save Cargo registry" step at the
+      # end of this job, and never from the merge queue (see there).
+      - name: Restore Cargo registry
+        id: cargo-registry
         if: needs.check_changes.outputs.relevant_changes == 'true'
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index/
@@ -250,6 +252,20 @@ jobs:
           path: ./integration_tests.tar.zst
           retention-days: 3
           compression-level: 1
+
+      # Not from the merge queue: a cache saved there is scoped to the queue
+      # entry's temporary `gh-readonly-queue/...` ref, which later entries and
+      # trunk cannot restore from, so each save there stored ~3 GiB that was
+      # almost never read. Merge-queue runs restore the cache trunk saves.
+      - name: Save Cargo registry
+        if: needs.check_changes.outputs.relevant_changes == 'true' && github.event_name != 'merge_group' && steps.cargo-registry.outputs.cache-hit != 'true'
+        uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+          key: ${{ steps.cargo-registry.outputs.cache-primary-key }}
 
   test-partitions:
     name: Run Integration Tests (part ${{ matrix.label }})
@@ -783,8 +799,9 @@ jobs:
             --archive-file ./integration_tests/integration_tests.tar.zst \
             --test-threads 1 -E 'binary_id(=runtime::integration) & test(/^github::/)'
 
+      # Pull request and merge-queue checks keep no diagnostic artifacts.
       - name: Upload GitHub permission diagnostics
-        if: always()
+        if: always() && github.event_name != 'pull_request' && github.event_name != 'merge_group'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: github-api-permissions

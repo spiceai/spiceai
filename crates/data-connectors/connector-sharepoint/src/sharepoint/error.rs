@@ -45,6 +45,20 @@ pub enum Error {
 
     #[snafu(display("Error parsing document: {source}"))]
     DocumentParsing { source: document_parse::Error },
+
+    #[snafu(display(
+        "Failed to list SharePoint drive items: the Microsoft Graph response is not a list of drive items: {source}. Report this at https://github.com/spiceai/spiceai/issues"
+    ))]
+    InvalidDriveItemPage { source: serde_json::Error },
+
+    #[snafu(display(
+        "Failed to read SharePoint drive item '{name}' (id '{id}'): the Microsoft Graph response has an unexpected value: {source}. Report this at https://github.com/spiceai/spiceai/issues"
+    ))]
+    InvalidDriveItem {
+        name: String,
+        id: String,
+        source: serde_path_to_error::Error<serde_json::Error>,
+    },
 }
 
 /// Resolves a `GraphFailure` into a human-readable error message.

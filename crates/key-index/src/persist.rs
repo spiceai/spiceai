@@ -98,6 +98,7 @@ pub(crate) fn open(bytes: &[u8], kind: u32) -> Result<Reader<'_>> {
     Ok(reader)
 }
 
+#[derive(Clone, Copy)]
 pub(crate) struct Reader<'a>(&'a [u8]);
 
 impl<'a> Reader<'a> {

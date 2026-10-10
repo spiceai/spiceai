@@ -1202,6 +1202,25 @@ impl DataFusionBuilder {
             if is_not_shipped(&udf) {
                 continue;
             }
+            // Spark's `date_part` is a simplify stub that rewrites `dow` /
+            // `DOW` / mixed case to the built-in plus one (Sunday = 1).
+            // `EXTRACT` never looks up the registry: `DatetimeFunctionPlanner`
+            // binds DataFusion's built-in directly (Sunday = 0). Keep the
+            // built-in on the SQL name too, even when Spark's would not
+            // collide, so the two spellings stay one function.
+            if udf.name() == "date_part" {
+                if let Some(taken) = kept_out(
+                    "scalar",
+                    state.scalar_functions(),
+                    udf.name(),
+                    udf.aliases(),
+                    SPARK_SCALAR_COLLISIONS,
+                ) {
+                    lend_spark_names_to_built_in(&mut state, &udf, &taken);
+                }
+                keep_datafusion_date_part(&mut state);
+                continue;
+            }
             if let Some(taken) = kept_out(
                 "scalar",
                 state.scalar_functions(),
@@ -1413,6 +1432,8 @@ impl DataFusionBuilder {
                 )
             }),
             schema_evolve_locks: TokioRwLock::new(HashMap::new()),
+            change_generations: super::change_generations::ChangeGenerations::default(),
+            bootstrap_owners: parking_lot::Mutex::new(HashMap::new()),
             pending_sink_tables: TokioRwLock::new(HashMap::new()),
             deferred_tables: TokioRwLock::new(HashMap::new()),
             deferred_catalogs: TokioRwLock::new(HashMap::new()),
@@ -1497,7 +1518,9 @@ fn with_spice_logical_optimizers(
         let _ = cte_materialization;
     }
     optimizer_rules.extend(trailing_rules);
-    state.with_optimizer_rules(optimizer_rules)
+    // Leaf-expression pushdown would move a model call below the filters that decide
+    // which rows it runs on; the decision functions' own rule runs last and places it.
+    state.with_optimizer_rules(runtime_decide::guard_async_calls(optimizer_rules))
 }
 
 #[cfg(not(windows))]
@@ -2217,9 +2240,13 @@ enum Keep {
 ///   (#13875, unresolved), so they are not evidence for either side here.
 ///   The fork patch it carries (fork PR #217, `docs/dev/fork_patches.md`) is
 ///   guarded by `the_built_session_concatenates_an_untyped_null`.
-/// - `date_part` (also `datepart`): Spark's counts `dow` from Sunday = 1
-///   where the built-in and `EXTRACT(DOW FROM …)` count from 0, and Spark's
-///   does not accept a time (#13920).
+/// - `date_part` (also `datepart`): Spark's is a simplify stub that counts
+///   `dow` / `DOW` / mixed case from Sunday = 1 (Tuesday = 3) where the
+///   built-in and `EXTRACT(DOW FROM …)` count from 0 on both `DATE` and
+///   `TIMESTAMP`, and Spark's does not accept a time (#13920). The
+///   registration loop re-binds `DataFusion`'s built-in under `date_part` so
+///   the SQL name and `EXTRACT` stay one function even if Spark's would not
+///   collide.
 /// - `date_trunc`: Spark's accepts only a string as the
 ///   value to truncate, so `date_trunc(<unit>, <date>)` stops planning, and a
 ///   federated filter comparing a timestamp against one is pushed down as a
@@ -2308,6 +2335,22 @@ fn kept_out<'a, T>(
     let taken = names_already_registered(registered, name, aliases);
     (!taken.is_empty() && decide_spark_collision(kind, name, &taken, decisions) == Keep::BuiltIn)
         .then_some(taken)
+}
+
+/// Bind `DataFusion`'s `date_part` (Sunday = 0 for `dow`) on the session, over
+/// Spark's stub if that is what the registry currently holds.
+///
+/// Spark's `date_part` never evaluates itself: `simplify` rewrites a
+/// `'dow'` / `'DOW'` / mixed-case field to the built-in plus one. `EXTRACT`
+/// never goes through that stub — `DatetimeFunctionPlanner::plan_extract`
+/// constructs the built-in directly — so a session that leaves Spark's on
+/// the SQL name answers a day high for `date_part` and the documented value
+/// for `EXTRACT`. Re-registering the built-in makes the two spellings agree
+/// regardless of registration order.
+fn keep_datafusion_date_part(state: &mut datafusion::execution::SessionState) {
+    if let Err(e) = state.register_udf(datafusion::functions::datetime::date_part()) {
+        panic!("Unable to register the built-in `date_part`: {e}");
+    }
 }
 
 /// Registers the built-in that `spark` yields to (the function the session
@@ -3097,6 +3140,11 @@ mod tests {
     /// Spark's also takes only a date or a timestamp, so `date_part` over a
     /// time did not plan. This pins the `Keep::BuiltIn` entry in
     /// `SPARK_SCALAR_COLLISIONS`, which the collision-set test does not read.
+    ///
+    /// The weekday cases below are the observed off-by-one: Spark's stub
+    /// answers 3 for Tuesday 2026-10-06 and 1 for Sunday, including when the
+    /// field is `'DOW'` or `'Dow'`. `EXTRACT` stayed on Sunday = 0. Other
+    /// units (`month`, `isodow`) must not move with this binding.
     #[tokio::test]
     #[cfg(not(windows))]
     async fn the_built_session_keeps_the_built_in_date_part() {
@@ -3106,6 +3154,28 @@ mod tests {
             tokio::runtime::Handle::current(),
         )
         .build();
+
+        let state = df.ctx.state();
+        let registered = state
+            .scalar_functions()
+            .get("date_part")
+            .expect("date_part must be registered");
+        let builtin = datafusion::functions::datetime::date_part();
+        assert_eq!(
+            registered.as_ref(),
+            builtin.as_ref(),
+            "the SQL name `date_part` must resolve to DataFusion's built-in, not Spark's stub"
+        );
+        let spark_date_part = datafusion_spark::all_default_scalar_functions()
+            .into_iter()
+            .find(|udf| udf.name() == "date_part")
+            .expect("datafusion-spark ships a date_part");
+        assert_ne!(
+            registered.as_ref(),
+            spark_date_part.as_ref(),
+            "Spark's date_part shifts dow by +1 (Sunday = 1); it must not be bound"
+        );
+        drop(state);
 
         // 2026-01-04 is a Sunday: the one weekday the two conventions name
         // differently at a glance, 0 documented and 1 under Spark's.
@@ -3129,6 +3199,89 @@ mod tests {
                 "+---------------+-------------+",
             ],
             &weekday
+        );
+
+        // Tuesday 2026-10-06: Spark's stub answers 3 (Sunday = 1); DataFusion
+        // and Postgres EXTRACT(DOW) answer 2 (Sunday = 0). Upper- and mixed-
+        // case fields go through the same stub, which lowercases before the
+        // +1 rewrite, so they must agree with EXTRACT too.
+        let tuesday = df
+            .ctx
+            .sql(
+                "SELECT date_part('dow', TIMESTAMP '2026-10-06 12:00:00') AS lower, \
+                 date_part('DOW', TIMESTAMP '2026-10-06 12:00:00') AS upper, \
+                 date_part('Dow', TIMESTAMP '2026-10-06 12:00:00') AS mixed, \
+                 datepart('dow', TIMESTAMP '2026-10-06 12:00:00') AS alias, \
+                 EXTRACT(dow FROM TIMESTAMP '2026-10-06 12:00:00') AS extract_lower, \
+                 EXTRACT(DOW FROM TIMESTAMP '2026-10-06 12:00:00') AS extract_upper",
+            )
+            .await
+            .expect("plan Tuesday timestamp weekday extraction")
+            .collect()
+            .await
+            .expect("run Tuesday timestamp weekday extraction");
+        datafusion::assert_batches_eq!(
+            [
+                "+-------+-------+-------+-------+---------------+---------------+",
+                "| lower | upper | mixed | alias | extract_lower | extract_upper |",
+                "+-------+-------+-------+-------+---------------+---------------+",
+                "| 2     | 2     | 2     | 2     | 2             | 2             |",
+                "+-------+-------+-------+-------+---------------+---------------+",
+            ],
+            &tuesday
+        );
+
+        // Sunday on a TIMESTAMP, including midnight: Spark's stub answers 1.
+        let sunday = df
+            .ctx
+            .sql(
+                "SELECT date_part('dow', TIMESTAMP '2026-01-04 00:00:00') AS lower, \
+                 date_part('DOW', TIMESTAMP '2026-01-04 00:00:00') AS upper, \
+                 date_part('Dow', TIMESTAMP '2026-01-04 00:00:00') AS mixed, \
+                 EXTRACT(dow FROM TIMESTAMP '2026-01-04 00:00:00') AS extract_lower, \
+                 EXTRACT(DOW FROM TIMESTAMP '2026-01-04 00:00:00') AS extract_upper",
+            )
+            .await
+            .expect("plan Sunday timestamp weekday extraction")
+            .collect()
+            .await
+            .expect("run Sunday timestamp weekday extraction");
+        datafusion::assert_batches_eq!(
+            [
+                "+-------+-------+-------+---------------+---------------+",
+                "| lower | upper | mixed | extract_lower | extract_upper |",
+                "+-------+-------+-------+---------------+---------------+",
+                "| 0     | 0     | 0     | 0             | 0             |",
+                "+-------+-------+-------+---------------+---------------+",
+            ],
+            &sunday
+        );
+
+        // Neighbouring units: month of October is 10, ISO weekday of a Tuesday
+        // is 2 (Monday = 1). Spark's stub only shifts `dow`, so a binding that
+        // "fixed" `dow` by changing DatePart globally would move these too.
+        let other_units = df
+            .ctx
+            .sql(
+                "SELECT date_part('month', TIMESTAMP '2026-10-06 12:00:00') AS month, \
+                 date_part('isodow', TIMESTAMP '2026-10-06 12:00:00') AS isodow, \
+                 EXTRACT(MONTH FROM TIMESTAMP '2026-10-06 12:00:00') AS extract_month, \
+                 EXTRACT(ISODOW FROM TIMESTAMP '2026-10-06 12:00:00') AS extract_isodow",
+            )
+            .await
+            .expect("plan neighbouring date_part units")
+            .collect()
+            .await
+            .expect("run neighbouring date_part units");
+        datafusion::assert_batches_eq!(
+            [
+                "+-------+--------+---------------+----------------+",
+                "| month | isodow | extract_month | extract_isodow |",
+                "+-------+--------+---------------+----------------+",
+                "| 10    | 2      | 10            | 2              |",
+                "+-------+--------+---------------+----------------+",
+            ],
+            &other_units
         );
 
         // Spark's overload takes only a timestamp or a date, so a time and an
@@ -4335,6 +4488,51 @@ mod tests {
                 .iter()
                 .any(|r| r.name().starts_with("Cayenne")),
             "No Cayenne physical optimizer rules should be registered when rule selection is none"
+        );
+    }
+
+    /// The point-lookup fast path skips rules by name, so a rule that `DataFusion` renames or
+    /// merges silently stops being skipped (`EnsureRequirements` took the place of
+    /// `EnforceDistribution` and `EnforceSorting`). Every name `SKIPPABLE_RULES` lists must
+    /// belong to a rule the session registers once every optional rule is on.
+    #[test]
+    #[cfg(not(windows))]
+    fn every_point_lookup_skippable_rule_is_registered() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("tokio runtime");
+        let handle = rt.handle().clone();
+
+        let df = DataFusionBuilder::new(
+            status::RuntimeStatus::new(),
+            Arc::new(AcceleratorEngineRegistry::default()),
+            handle,
+        )
+        .cayenne_optimizer_rules(CayenneOptimizerRules::all_enabled())
+        .cte_materialization(CteMaterialization::Auto)
+        .with_caching(Arc::new(cache::Caching::default()))
+        .build();
+
+        let state = df.ctx.state();
+        let registered: std::collections::HashSet<&str> = state
+            .analyzer()
+            .rules
+            .iter()
+            .map(|rule| rule.name())
+            .chain(state.optimizers().iter().map(|rule| rule.name()))
+            .chain(state.physical_optimizers().iter().map(|rule| rule.name()))
+            .collect();
+        let unregistered: Vec<&str> = crate::datafusion::point_lookup::SKIPPABLE_RULES
+            .iter()
+            .copied()
+            // The `DuckDB` rules are only compiled in with the `duckdb` feature.
+            .filter(|name| cfg!(feature = "duckdb") || !name.starts_with("DuckDB"))
+            .filter(|name| !registered.contains(name))
+            .collect();
+        assert!(
+            unregistered.is_empty(),
+            "the point-lookup skip list names rules the session does not register, so they are never skipped: {unregistered:?}"
         );
     }
 

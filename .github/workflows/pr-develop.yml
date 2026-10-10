@@ -185,7 +185,7 @@ jobs:
           # Intersected with the gate's own filterset by the Makefile. Passing it
           # as a second `-E` would union with that filterset and widen the run,
           # because that is how nextest composes repeated `-E` flags.
-          NEXTEST_FILTER_EXTRA: "not (package(aws-sdk-credential-bridge) | package(object_store_occ))"
+          NEXTEST_FILTER_EXTRA: "not package(aws-sdk-credential-bridge)"
 
       - name: Build testoperator
         env:

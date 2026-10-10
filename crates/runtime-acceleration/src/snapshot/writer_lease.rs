@@ -49,6 +49,7 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use object_store::{ObjectStoreExt, PutMode, PutPayload, UpdateVersion, path::Path as ObjectPath};
+use object_store_occ::{ConditionalWriteError, Expected};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use util::{RetryError, retry};
@@ -404,7 +405,7 @@ impl SnapshotManager {
 
             let unchanged_for = self.lease_unchanged_for(observed.as_ref());
             let now_ms = self.next_renew_time_ms();
-            let (mode, record, acquired) = match plan(observed.as_ref(), lease, unchanged_for) {
+            let (expected, record, acquired) = match plan(observed.as_ref(), lease, unchanged_for) {
                 Plan::Standby {
                     holder,
                     lease_duration,
@@ -415,12 +416,12 @@ impl SnapshotManager {
                     });
                 }
                 Plan::Create => (
-                    PutMode::Create,
+                    Expected::Absent,
                     self.lease_record(self.next_writer_generation(0).await?, now_ms, now_ms),
                     Acquired::Created,
                 ),
                 Plan::Renew { version, record } => (
-                    PutMode::Update(version),
+                    Expected::Version(version),
                     self.lease_record(record.generation, record.acquire_time_ms, now_ms),
                     Acquired::Renewed {
                         by_other_process: *record.holder_process != *lease.process,
@@ -432,7 +433,7 @@ impl SnapshotManager {
                     unrenewed_for,
                     previous_generation,
                 } => (
-                    PutMode::Update(version),
+                    Expected::Version(version),
                     self.lease_record(
                         self.next_writer_generation(previous_generation).await?,
                         now_ms,
@@ -452,7 +453,7 @@ impl SnapshotManager {
                 }
             })?;
             match self
-                .put_opts_with_retry(&path, PutPayload::from(body), mode)
+                .conditional_put_with_retry(&path, PutPayload::from(body), &expected)
                 .await
             {
                 Ok(result) => {
@@ -468,15 +469,9 @@ impl SnapshotManager {
                     });
                 }
                 // Another write changed the lease first; read it again.
-                Err(
-                    object_store::Error::AlreadyExists { .. }
-                    | object_store::Error::Precondition { .. },
-                ) => refused = Some((record, acquired)),
-                Err(
-                    object_store::Error::NotImplemented { .. }
-                    | object_store::Error::NotSupported { .. },
-                ) => return Ok(Role::Unsupported),
-                Err(source) => {
+                Err(ConditionalWriteError::Conflict { .. }) => refused = Some((record, acquired)),
+                Err(ConditionalWriteError::Unsupported { .. }) => return Ok(Role::Unsupported),
+                Err(ConditionalWriteError::Store { source, .. }) => {
                     return Err(SnapshotUploadError::WriterLease {
                         dataset: self.dataset_name.clone(),
                         path: path.to_string(),

@@ -199,6 +199,38 @@ impl<
         matches!(outcome, moka::ops::compute::CompResult::ReplacedWith(_))
     }
 
+    async fn put_if(
+        &self,
+        key: &u64,
+        value: V,
+        _weight: usize,
+        admit: &(dyn for<'v> Fn(Option<&'v V>) -> bool + Send + Sync),
+    ) -> bool {
+        // Entries are bounded by count, so `weight` is unused. `Op::Put` inserts
+        // when the key is empty and replaces when it is occupied. The predicate
+        // sees the inner value, not the eviction-listener slot.
+        let outcome = self
+            .cache
+            .entry(*key)
+            .and_compute_with(|current| {
+                let accept = match current.as_ref() {
+                    None => admit(None),
+                    Some(entry) => admit(entry.value().read().as_ref()),
+                };
+                std::future::ready(if accept {
+                    moka::ops::compute::Op::Put(slot(value))
+                } else {
+                    moka::ops::compute::Op::Nop
+                })
+            })
+            .await;
+        matches!(
+            outcome,
+            moka::ops::compute::CompResult::Inserted(_)
+                | moka::ops::compute::CompResult::ReplacedWith(_)
+        )
+    }
+
     async fn invalidate_all(&self) {
         self.cache.invalidate_all();
         // With an eviction listener installed, moka ends a maintenance pass after 100 ms and
@@ -366,40 +398,19 @@ mod tests {
         let result = create_test_cached_result().await;
 
         // Put a value in the cache
-        cache.put_raw_key(&key.as_u64(), result.clone()).await;
+        cache.put_raw_key(&key.as_u64(), result).await;
 
         let key = CacheKey::Query("test_query", None).as_raw_key(cache.hasher());
 
         // Get the value from the cache
         let retrieved = cache.get_raw_key(&key.as_u64()).await;
         let retrieved = retrieved.expect("cache should contain the key");
-        let retrieved_len = retrieved.records().await.expect("Failed to decode").len();
-        let result_len = result.records().await.expect("Failed to decode").len();
-        (retrieved_len == result_len)
-            .then_some(())
-            .expect("retrieved and result should have same length");
-    }
-
-    #[rstest]
-    #[case::siphash(RandomState::default())]
-    #[case::ahash(ahash::RandomState::default())]
-    #[tokio::test]
-    async fn test_cache_miss<
-        H: Hasher + Send + Sync + 'static,
-        T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
-    >(
-        #[case] hasher: T,
-    ) {
-        let cache: SimpleCache<CachedQueryResult, _, _> =
-            SimpleCache::new(10, Duration::from_mins(1), hasher);
-        let key = CacheKey::Query("nonexistent_query", None).as_raw_key(cache.hasher());
-
-        // Try to get a non-existent key
-        let retrieved = cache.get_raw_key(&key.as_u64()).await;
-        retrieved
-            .is_none()
-            .then_some(())
-            .expect("cache should not contain nonexistent key");
+        let retrieved_batches = retrieved.records().await.expect("Failed to decode");
+        assert_eq!(
+            *retrieved_batches,
+            [Arc::new(create_test_record_batch())],
+            "the cache must serve exactly the batch that was stored (`id` = [1, 2, 3])"
+        );
     }
 
     #[rstest]

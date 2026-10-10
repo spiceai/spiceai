@@ -361,16 +361,15 @@ mod tests {
     #[tokio::test]
     async fn the_report_waits_for_both_latches_in_either_order() {
         // Spice Cloud can answer before the load settles or after it, and
-        // neither ordering may lose the report.
-        assert!(
-            completion_under(Order::AcknowledgedThenServing)
-                .await
-                .is_some()
+        // neither ordering may lose the report or change what it reports: the
+        // completion carries exactly the session Spice Cloud acknowledged.
+        assert_eq!(
+            completion_under(Order::AcknowledgedThenServing).await,
+            Some(session(Some("14034"), Some("edge")))
         );
-        assert!(
-            completion_under(Order::ServingThenAcknowledged)
-                .await
-                .is_some()
+        assert_eq!(
+            completion_under(Order::ServingThenAcknowledged).await,
+            Some(session(Some("14034"), Some("edge")))
         );
     }
 

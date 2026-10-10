@@ -239,6 +239,7 @@ async fn duckdb_order_by_special_cases() -> Result<(), String> {
         .await
 }
 
+#[cfg(not(windows))]
 #[tokio::test]
 async fn duckdb_regexp() -> Result<(), String> {
     let _tracing = init_tracing(Some("integration=debug,info"));
@@ -252,12 +253,13 @@ async fn duckdb_regexp() -> Result<(), String> {
                 .expect("failed to write sample file");
 
             let mut other_dataset = make_duckdb_acceleration_dataset(
-                "csv_test_arrow",
+                "csv_test_cayenne",
                 "csv",
                 &format!("'{}'", temp_file.path().display()),
             );
             other_dataset.acceleration = Some(Acceleration {
                 enabled: true,
+                engine: Some("cayenne".to_string()),
                 ..Default::default()
             });
 
@@ -290,20 +292,20 @@ async fn duckdb_regexp() -> Result<(), String> {
             let regex_metachar_semantics = r"
                 WITH duckdb_regex AS (
                     SELECT region FROM csv_test WHERE regexp_like(region, 'A.*A')
-                ), arrow_regex AS (
-                    SELECT region FROM csv_test_arrow WHERE regexp_like(region, 'A.*A')
+                ), cayenne_regex AS (
+                    SELECT region FROM csv_test_cayenne WHERE regexp_like(region, 'A.*A')
                 ), missing_in_duckdb AS (
-                    SELECT region FROM arrow_regex
+                    SELECT region FROM cayenne_regex
                     EXCEPT
                     SELECT region FROM duckdb_regex
-                ), missing_in_arrow AS (
+                ), missing_in_cayenne AS (
                     SELECT region FROM duckdb_regex
                     EXCEPT
-                    SELECT region FROM arrow_regex
+                    SELECT region FROM cayenne_regex
                 )
                 SELECT region FROM missing_in_duckdb
                 UNION ALL
-                SELECT region FROM missing_in_arrow
+                SELECT region FROM missing_in_cayenne
             ";
 
             let regex_semantic_diff: Vec<RecordBatch> = rt
@@ -321,7 +323,7 @@ async fn duckdb_regexp() -> Result<(), String> {
             assert_eq!(
                 regex_semantic_diff.iter().map(RecordBatch::num_rows).sum::<usize>(),
                 0,
-                "regexp_like regex metacharacter semantics diverged between DuckDB and Arrow"
+                "regexp_like regex metacharacter semantics diverged between DuckDB and Cayenne"
             );
 
             let cases = vec![
@@ -353,11 +355,11 @@ async fn duckdb_regexp() -> Result<(), String> {
                     "test_regexp_results_match",
                     "WITH duckdb_regexp_like AS (
                         SELECT * FROM csv_test WHERE regexp_like(region, 'america', 'i')
-                    ), arrow_regexp_like AS (
-                        SELECT * FROM csv_test_arrow WHERE regexp_like(region, 'america', 'i')
+                    ), cayenne_regexp_like AS (
+                        SELECT * FROM csv_test_cayenne WHERE regexp_like(region, 'america', 'i')
                     )
 
-                    SELECT * FROM duckdb_regexp_like d JOIN arrow_regexp_like a ON d.region = a.region",
+                    SELECT * FROM duckdb_regexp_like d JOIN cayenne_regexp_like a ON d.region = a.region",
                 ),
             ];
 

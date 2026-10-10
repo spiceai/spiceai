@@ -153,7 +153,25 @@ mod tests {
             "anthropic_api_key".to_string(),
             SecretString::from("test-key"),
         );
-        let result = AnthropicModelLister::from_params(&params);
-        result.expect("should succeed");
+        let lister = AnthropicModelLister::from_params(&params).expect("should succeed");
+        assert_eq!(lister.api_key.expose_secret(), "test-key");
+        assert_eq!(lister.api_base, "https://api.anthropic.com/v1");
+        assert_eq!(lister.api_version, "2023-06-01");
+
+        // An explicit base and version replace the defaults, so the key goes to
+        // the configured host rather than to `api.anthropic.com`.
+        params.insert(
+            "anthropic_api_base".to_string(),
+            SecretString::from("https://anthropic.example.com/v1"),
+        );
+        params.insert(
+            "anthropic_api_version".to_string(),
+            SecretString::from("2024-01-01"),
+        );
+        let lister =
+            AnthropicModelLister::from_params(&params).expect("should succeed with overrides");
+        assert_eq!(lister.api_key.expose_secret(), "test-key");
+        assert_eq!(lister.api_base, "https://anthropic.example.com/v1");
+        assert_eq!(lister.api_version, "2024-01-01");
     }
 }

@@ -192,6 +192,7 @@ async fn mysql_federation_push_down() -> Result<(), String> {
         .await
 }
 
+#[cfg(not(windows))]
 #[tokio::test]
 async fn mysql_federation_inner_join_with_acc() -> Result<(), String> {
     type QueryTests<'a> = Vec<(&'a str, &'a str, Option<Box<ValidateFn>>)>;

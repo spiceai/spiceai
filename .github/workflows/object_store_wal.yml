@@ -72,8 +72,10 @@ jobs:
       - name: Run process histories against SlateDB
         if: runner.os == 'macOS'
         run: python test/object_store_occ/e2e.py --driver target/debug/examples/wal_test_driver --artifacts wal-e2e-artifacts --slatedb
+      # Pull request and merge-queue checks keep no artifacts. To keep a failed
+      # history, dispatch this workflow on the branch.
       - name: Retain histories and backing stores
-        if: always()
+        if: always() && github.event_name != 'pull_request' && github.event_name != 'merge_group'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: wal-e2e-${{ matrix.os }}

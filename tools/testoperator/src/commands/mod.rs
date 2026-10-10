@@ -39,6 +39,7 @@ const AUTOMATIC_REFERENCE_SCHEMA: &str = "__test_reference";
 #[cfg(feature = "append")]
 pub(crate) mod append;
 pub(crate) mod bench;
+pub(crate) mod cold_start;
 pub(crate) mod data_consistency;
 pub(crate) mod dispatch;
 pub(crate) mod htap;

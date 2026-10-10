@@ -330,6 +330,11 @@ pub enum Error {
     AcceleratedWriteBackWithoutReplication { dataset_name: String },
 
     #[snafu(display(
+        "Dataset '{dataset_name}' sets `acceleration.write_mode: acceleration` and refreshes by `changes` (set by `refresh_mode` or by its connector's default), but the source's changes would overwrite writes kept only in the acceleration, so the dataset cannot load. Use `write_mode: write_through` or `write_back` with a change stream, or another `refresh_mode`. See: https://spiceai.org/docs/reference/spicepod/datasets#accelerationwrite_mode"
+    ))]
+    AccelerationWriteModeWithChanges { dataset_name: String },
+
+    #[snafu(display(
         "An accelerated table for {dataset_name} was configured with 'refresh_mode = changes', but the data connector doesn't support a changes stream."
     ))]
     AcceleratedTableInvalidChanges { dataset_name: String },
@@ -2219,7 +2224,24 @@ impl Runtime {
             })
             .collect();
 
-        join_all(shutdown_futures).await;
+        // A change-data-capture source records how far its accelerations were
+        // advanced on its way out (`data_components::cdc::ShutdownDrainGuard`),
+        // and those writes go into the accelerations DataFusion cleanup closes
+        // below — so they have to land first, and they need the process to still
+        // be here, which signalling alone does not guarantee: a source notices the
+        // signal on its next poll, and this function otherwise finishes in
+        // milliseconds. Waited on alongside the connection drain, under the same
+        // timeout: a source that cannot finish in it costs a rebuild on the next
+        // start, never a hung shutdown.
+        let (unfinished_sources, _) = tokio::join!(
+            data_components::cdc::drain_shutdown(shutdown_timeout),
+            join_all(shutdown_futures),
+        );
+        if unfinished_sources > 0 {
+            tracing::warn!(
+                "Shutdown waited {shutdown_timeout:?} for {unfinished_sources} change-data-capture source(s) to record how far their accelerations were advanced, and gave up; each dataset on those sources will be rebuilt from its source on the next start rather than resumed"
+            );
+        }
 
         // Clean up DataFusion first as there could be datasets loading and accessing registries below.
         self.df.shutdown().await;

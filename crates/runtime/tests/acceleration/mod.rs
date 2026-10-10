@@ -26,6 +26,7 @@ mod caching_mode_constraints;
 mod caching_mode_per_principal;
 #[cfg(feature = "duckdb")]
 mod caching_mode_post_filter;
+mod caching_mode_request_method;
 mod caching_mode_stale_if_error;
 #[cfg(not(target_os = "windows"))]
 mod cayenne_append_overlap;
@@ -35,6 +36,8 @@ mod cayenne_append_timestamptz;
 mod cayenne_maintained_aggregates;
 #[cfg(not(target_os = "windows"))]
 mod cayenne_memory;
+#[cfg(not(target_os = "windows"))]
+mod cayenne_on_conflict_batches;
 #[cfg(feature = "duckdb")]
 mod checkpoint_duckdb;
 #[cfg(feature = "postgres-accel")]
@@ -47,6 +50,8 @@ mod checkpoint_turso;
 mod cron;
 #[cfg(feature = "duckdb")]
 mod duckdb_builtin_pushdown;
+#[cfg(any(feature = "duckdb", feature = "sqlite"))]
+mod empty_projection_scan;
 #[cfg(feature = "duckdb")]
 mod file_create_duckdb;
 #[cfg(feature = "duckdb")]
@@ -57,7 +62,11 @@ mod hash_index;
 mod localpod_sync;
 #[cfg(all(feature = "postgres-accel", feature = "duckdb", feature = "sqlite"))]
 mod on_conflict;
+#[cfg(feature = "sqlite")]
+mod sqlite_builtin_pushdown;
 
+#[cfg(not(target_os = "windows"))]
+mod newest_by_time;
 #[cfg(not(target_os = "windows"))]
 mod on_conflict_cayenne;
 #[cfg(feature = "duckdb")]

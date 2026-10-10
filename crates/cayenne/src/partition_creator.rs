@@ -201,7 +201,8 @@ impl CayennePartitionCreator {
         .with_context(Arc::clone(&self.context))
         .with_retention_filters(self.retention_filters.clone())
         .with_scan_view_reuse(self.scan_view_reuse)
-        .with_secondary_indexes(self.secondary_indexes.clone());
+        .with_secondary_indexes(self.secondary_indexes.clone())
+        .with_dataset_name(&self.table_name);
         if let Some(ref rb) = self.time_retention_filter_builder {
             builder = builder.with_time_retention_filter_builder(rb.clone());
         }

@@ -75,9 +75,16 @@ mod tests {
 
         // Regression: the authenticated principal must be carried on the request
         // (not dropped), so downstream authorization is not silently disabled.
+        let carried = out
+            .extensions()
+            .get::<AuthPrincipalRef>()
+            .expect("interceptor must preserve the authenticated principal");
+        // It must be the verified principal itself, so downstream authorization
+        // sees its `rw` access rather than some other identity's.
         assert!(
-            out.extensions().get::<AuthPrincipalRef>().is_some(),
-            "interceptor must preserve the authenticated principal"
+            Arc::ptr_eq(carried, &principal),
+            "the request must carry the principal the verifier allowed"
         );
+        assert_eq!(carried.groups(), ["read_write"]);
     }
 }

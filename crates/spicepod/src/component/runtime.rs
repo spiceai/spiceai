@@ -101,9 +101,9 @@ pub struct Runtime {
     pub metrics: Option<Metrics>,
 
     /// Shared object-store location for runtime state (`file://`, `s3://`,
-    /// `abfs://`, `abfss://`). Used for SQL results-cache warmup, source
-    /// rate-control, and distributed query state when those sections do not
-    /// set their own `state_location`.
+    /// `abfs://`, `abfss://`). Used for SQL results-cache warmup, cluster
+    /// source rate control, and distributed query state. A
+    /// `runtime.scheduler.state_location` overrides it for the scheduler.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<RuntimeState>,
 
@@ -1422,15 +1422,8 @@ impl Scheduler {
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct SourceRateControl {
-    /// Root URI for globally persisted source rate-control state.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub state_location: Option<String>,
-
-    /// Optional object store params for source rate-control state.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub params: Option<Params>,
-
-    /// How often each runtime refreshes and persists per-source rate-control state in object storage.
+    /// How often each runtime refreshes and persists per-source rate-control
+    /// state at `runtime.state.location`.
     #[serde(default = "default_rate_control_refresh_interval")]
     pub refresh_interval: String,
 
@@ -1442,8 +1435,6 @@ pub struct SourceRateControl {
 impl Default for SourceRateControl {
     fn default() -> Self {
         Self {
-            state_location: None,
-            params: None,
             refresh_interval: default_rate_control_refresh_interval(),
             github_concurrent_connections_limit: None,
         }
@@ -1834,9 +1825,12 @@ mod tests {
           unknown_field: value
         ";
         let result: Result<Runtime, _> = yaml::from_str(yaml);
-        assert!(
-            result.is_err(),
-            "unknown fields in mcp section should be rejected due to deny_unknown_fields"
+        // Rejected by the mcp section's `deny_unknown_fields`, naming the one valid key.
+        assert_eq!(
+            result
+                .expect_err("unknown fields in the mcp section must be rejected")
+                .to_string(),
+            "unknown field `unknown_field`, expected `allowed_hosts`"
         );
     }
 
@@ -2572,9 +2566,11 @@ datasets:
                     temporality: nonsense
         ";
         let result: Result<Runtime, _> = yaml::from_str(yaml);
-        assert!(
-            result.is_err(),
-            "unknown temporality value must fail to parse"
+        assert_eq!(
+            result
+                .expect_err("unknown temporality value must fail to parse")
+                .to_string(),
+            "unknown variant `nonsense`, expected one of `delta`, `cumulative`, `low_memory`"
         );
     }
 
@@ -2804,8 +2800,17 @@ datasets:
             headers: HashMap::new(),
             temporality: OtelTemporality::default(),
         };
-        let result = config.push_interval_duration();
-        let _ = result.expect_err("Expected an error for invalid push_interval");
+        let err = config
+            .push_interval_duration()
+            .expect_err("Expected an error for invalid push_interval");
+        // The parse failure, naming the setting and its value, with the duration
+        // parser's own reason after it.
+        let parse_error = duration_parse::parse_duration("invalid")
+            .expect_err("the duration parser rejects the same value");
+        assert_eq!(
+            err.to_string(),
+            format!("Failed to parse 'push_interval' value 'invalid': {parse_error}")
+        );
     }
 
     #[test]
@@ -3322,9 +3327,11 @@ datasets:
               client_auth_mode: requuired
         ";
         let result: Result<Runtime, _> = yaml::from_str(yaml);
-        assert!(
-            result.is_err(),
-            "expected unknown client_auth_mode value to be rejected"
+        assert_eq!(
+            result
+                .expect_err("expected unknown client_auth_mode value to be rejected")
+                .to_string(),
+            "unknown variant `requuired`, expected one of `none`, `request`, `required`"
         );
     }
 

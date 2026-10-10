@@ -19,7 +19,7 @@ use secrecy::SecretString;
 
 /// Parameters for `from: typesafe` System One evaluation models (Jev).
 ///
-/// Chat completions are not supported. Use `POST /v1/evaluate`.
+/// Chat completions are not supported. Use `POST /v1/decisions` or the SQL decision functions.
 #[derive(TypedParams)]
 #[params(
     prefix = "typesafe",

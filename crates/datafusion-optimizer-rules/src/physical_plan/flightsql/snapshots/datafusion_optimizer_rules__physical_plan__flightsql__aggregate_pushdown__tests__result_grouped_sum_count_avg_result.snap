@@ -1,0 +1,10 @@
+---
+source: crates/datafusion-optimizer-rules/src/physical_plan/flightsql/aggregate_pushdown.rs
+expression: pretty_sorted(&result)
+---
++--------------+-----------------+----------+-----------------+
+| l_returnflag | sum(l_quantity) | count(*) | avg(l_quantity) |
++--------------+-----------------+----------+-----------------+
+| A            | 70.00           | 3        | 23.333333       |
+| B            | 80.00           | 2        | 40.000000       |
++--------------+-----------------+----------+-----------------+

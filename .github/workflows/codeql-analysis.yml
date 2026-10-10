@@ -180,8 +180,10 @@ jobs:
         if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
         run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
 
+      # Merge-queue checks keep no diagnostic artifacts. The SARIF artifact
+      # above is not one: codeql-upload.yml publishes it.
       - name: Upload spiceio logs
-        if: always() && runner.os == 'macOS'
+        if: always() && runner.os == 'macOS' && github.event_name != 'merge_group'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:
           name: spiceio-codeql-logs

@@ -28,6 +28,7 @@ use llms::{
     xai::Xai,
 };
 use llms::{config::GenericAuthMechanism, openai::DEFAULT_LLM_MODEL};
+use runtime_rate_control::RateController;
 use secrecy::{ExposeSecret, SecretString};
 use serde_json::Value;
 use snafu::ResultExt;
@@ -71,7 +72,7 @@ use runtime_tools::options::SpiceToolsOptions;
 
 pub type LLMChatCompletionsModelStore = HashMap<String, Arc<dyn Chat>>;
 
-/// A loaded chat model, both as `/v1/chat/completions` serves it and as `/v1/evaluate`
+/// A loaded chat model, both as `/v1/chat/completions` serves it and as `/v1/decisions`
 /// uses it.
 pub struct LoadedChatModel {
     /// The model with the runtime tools its Spicepod `tools` param enables.
@@ -82,13 +83,16 @@ pub struct LoadedChatModel {
 }
 
 impl LoadedChatModel {
-    /// The evaluator `/v1/evaluate` uses for this model, which the Spicepod names `name`.
+    /// The evaluator decisions use for this model, which the Spicepod names `name`.
     ///
     /// It calls the model without runtime tools: an evaluation's `state` is untrusted
     /// input and must not be able to steer a tool call.
     #[must_use]
-    pub fn evaluator(&self, name: &str) -> Arc<dyn Evaluate> {
-        Arc::new(ChatEvaluator::new(name, Arc::clone(&self.without_tools)))
+    pub fn evaluator(&self, name: &str, rate_controller: Arc<RateController>) -> Arc<dyn Evaluate> {
+        Arc::new(
+            ChatEvaluator::new(name, Arc::clone(&self.without_tools))
+                .with_rate_controller(rate_controller),
+        )
     }
 }
 

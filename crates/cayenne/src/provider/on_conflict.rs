@@ -631,6 +631,7 @@ impl DeletionSink for InlineAwareDeletionSink {
         _context: Arc<TaskContext>,
     ) -> std::result::Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         let _write_guard = self.table.write_lock.lock().await;
+        self.table.ensure_publication_outcome_known()?;
         self.table.mark_maintained_aggregates_stale();
 
         // Make the in-memory CDC tier durable and capture the scan sources inside
@@ -1204,6 +1205,8 @@ pub(crate) struct ProtectedSnapshotScan<'a> {
     /// View-typed read schema so protected-snapshot scans match the main file
     /// scan in the union (see `viewify_read_schema`).
     pub(crate) read_schema: SchemaRef,
+    /// Canonical stored schema captured with the main scan.
+    pub(crate) file_statistics_schema: SchemaRef,
     /// The main scan's secondary index selection and pinned view, applied to
     /// each protected snapshot's files as to the current snapshot's.
     pub(crate) lookup_selection: Option<super::lookup_index::LookupSelection>,
@@ -1271,6 +1274,11 @@ pub(crate) struct OnConflictContext<'a> {
     /// this checkout — the common case.
     pub(crate) pending: Option<&'a PendingPkExistence>,
     pub(crate) incoming_keys: &'a HashSet<u128, PrehashedBuildHasher>,
+    /// Whether a key the write repeats across record batches is left for the
+    /// write to resolve after it is written (see
+    /// [`super::overwrite_postpass`]) rather than rejected. Every copy is then
+    /// kept here; only the first records the stored copy it supersedes.
+    pub(crate) repeats_resolved_after_write: bool,
 }
 
 pub(crate) struct OnConflictValidationStream {
@@ -1304,6 +1312,8 @@ pub(crate) struct OnConflictValidationStream {
     /// records that distinction, so there is no separate flag to fall out of step
     /// with it.
     pk_checkout: Option<PkCheckoutGuard>,
+    /// See [`OnConflictContext::repeats_resolved_after_write`].
+    repeats_resolved_after_write: bool,
     finalized: bool,
 }
 
@@ -1343,8 +1353,16 @@ impl OnConflictValidationStream {
             reinserted_over_tombstone: 0,
             post_validation,
             pk_checkout,
+            repeats_resolved_after_write: false,
             finalized: false,
         }
+    }
+
+    /// Keep the keys this write repeats across record batches for the write to
+    /// resolve after it is written, instead of rejecting them.
+    pub(crate) fn with_repeats_resolved_after_write(mut self) -> Self {
+        self.repeats_resolved_after_write = true;
+        self
     }
 
     fn process_batch(
@@ -1385,8 +1403,10 @@ impl OnConflictValidationStream {
             existing,
             pending: pending.as_ref(),
             incoming_keys: &self.incoming_keys,
+            repeats_resolved_after_write: self.repeats_resolved_after_write,
         };
 
+        let received = batch.num_rows();
         let validation_start = Instant::now();
         let validation_result = self.table.apply_on_conflict_to_batch(batch, &mut ctx);
         record_cayenne_write_phase(
@@ -1419,6 +1439,14 @@ impl OnConflictValidationStream {
 
         self.incoming_keys.extend(kept_keys.digests());
         self.kept_keys.absorb(kept_keys);
+
+        // A row validation drops is settled by arrival order: the stored row
+        // under `drop`, or another copy in the same batch.
+        self.table.count_superseded(
+            util::session_state::SupersededReason::Arrival,
+            received.saturating_sub(filtered_batch.as_ref().map_or(0, RecordBatch::num_rows))
+                as u64,
+        );
 
         Ok(filtered_batch)
     }

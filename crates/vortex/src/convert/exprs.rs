@@ -573,7 +573,9 @@ impl ExpressionConvertor for DefaultExpressionConvertor {
                 // precision/null semantics than DataFusion for some inputs.
                 // Keep those expressions above the scan unless the conversion
                 // can be made exact.
-                if contains_decimal_to_floating_cast(node, input_schema) {
+                if contains_decimal_to_floating_cast(node, input_schema)
+                    || contains_unsupported_temporal_cast(node, input_schema)
+                {
                     scan_projection.extend(
                         collect_columns(node)
                             .into_iter()
@@ -697,6 +699,11 @@ fn try_operator_from_df(value: DFOperator) -> DFResult<Operator> {
 fn can_be_pushed_down_impl(df_expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
     if contains_decimal_to_floating_cast(df_expr, schema) {
         tracing::debug!(%df_expr, "DataFusion expression contains decimal-to-floating cast and can't be pushed down");
+        return false;
+    }
+
+    if contains_unsupported_temporal_cast(df_expr, schema) {
+        tracing::debug!(%df_expr, "DataFusion expression contains a temporal cast Vortex can't evaluate and can't be pushed down");
         return false;
     }
 
@@ -980,6 +987,70 @@ fn contains_decimal_to_floating_cast(df_expr: &Arc<dyn PhysicalExpr>, schema: &S
         .any(|child| contains_decimal_to_floating_cast(child, schema))
 }
 
+/// Whether `df_expr` casts to or from a temporal type in a way Vortex can't evaluate.
+///
+/// Vortex converts a temporal value only from a date to a timestamp, or to the integer
+/// it is stored as. Any other cast to or from a date, time or timestamp — a change of
+/// timestamp unit or timezone, say — has no Vortex kernel, and pushing one into the
+/// scan fails the query. A static filter rarely carries one, because `DataFusion`
+/// unwraps the cast into the literal; a `TopK` dynamic filter pushed through a view's
+/// `CAST(ts AS TIMESTAMP)` does.
+fn contains_unsupported_temporal_cast(df_expr: &Arc<dyn PhysicalExpr>, schema: &Schema) -> bool {
+    if let Some(cast) = df_expr.downcast_ref::<df_expr::CastExpr>() {
+        let target = cast.cast_type();
+        let evaluable = match cast.expr().data_type(schema) {
+            Ok(source) => vortex_evaluates_temporal_cast(&source, target),
+            Err(_) => !is_temporal(target),
+        };
+        if !evaluable {
+            return true;
+        }
+    }
+
+    if let Some(dynamic_filter) = df_expr.downcast_ref::<df_expr::DynamicFilterPhysicalExpr>()
+        && let Ok(current) = dynamic_filter.current()
+        && contains_unsupported_temporal_cast(&current, schema)
+    {
+        return true;
+    }
+
+    df_expr
+        .children()
+        .into_iter()
+        .any(|child| contains_unsupported_temporal_cast(child, schema))
+}
+
+fn vortex_evaluates_temporal_cast(source: &DataType, target: &DataType) -> bool {
+    if !is_temporal(source) && !is_temporal(target) {
+        return true;
+    }
+    source == target
+        || (matches!(source, DataType::Date32 | DataType::Date64)
+            && matches!(target, DataType::Timestamp(_, _)))
+        || temporal_storage_type(source).is_some_and(|storage| storage == *target)
+}
+
+/// The integer type Vortex stores a temporal value as. Vortex casts a temporal value
+/// to it by reinterpreting the stored integer, which is what an Arrow cast does.
+fn temporal_storage_type(data_type: &DataType) -> Option<DataType> {
+    match data_type {
+        DataType::Date32 | DataType::Time32(_) => Some(DataType::Int32),
+        DataType::Date64 | DataType::Timestamp(_, _) | DataType::Time64(_) => Some(DataType::Int64),
+        _ => None,
+    }
+}
+
+fn is_temporal(data_type: &DataType) -> bool {
+    matches!(
+        data_type,
+        DataType::Date32
+            | DataType::Date64
+            | DataType::Timestamp(_, _)
+            | DataType::Time32(_)
+            | DataType::Time64(_)
+    )
+}
+
 fn can_case_be_pushed_down(case_expr: &df_expr::CaseExpr, schema: &Schema) -> bool {
     case_expr
         .expr()
@@ -1199,8 +1270,10 @@ mod tests {
         let expr_convertor = DefaultExpressionConvertor::default();
         let col_expr = Arc::new(df_expr::Column::new("test", 0)) as Arc<dyn PhysicalExpr>;
         let result = make_vortex_predicate(&expr_convertor, &[col_expr])
-            .expect("single predicate conversion should succeed");
-        assert!(result.is_some());
+            .expect("single predicate conversion should succeed")
+            .expect("a non-empty conjunction converts to an expression");
+        // A lone predicate is the converted column itself, not wrapped in a conjunction.
+        assert_eq!(result.to_string(), get_item("test", root()).to_string());
     }
 
     #[test]
@@ -1209,9 +1282,13 @@ mod tests {
         let col1 = Arc::new(df_expr::Column::new("col1", 0)) as Arc<dyn PhysicalExpr>;
         let col2 = Arc::new(df_expr::Column::new("col2", 1)) as Arc<dyn PhysicalExpr>;
         let result = make_vortex_predicate(&expr_convertor, &[col1, col2])
-            .expect("multiple predicate conversion should succeed");
-        assert!(result.is_some());
-        // Result should be an AND expression combining the two columns
+            .expect("multiple predicate conversion should succeed")
+            .expect("a non-empty conjunction converts to an expression");
+        // Every predicate filters the scan, so the result is the AND of both columns.
+        assert_eq!(
+            result.to_string(),
+            vortex::expr::and(get_item("col1", root()), get_item("col2", root())).to_string()
+        );
     }
 
     #[rstest]
@@ -1636,6 +1713,91 @@ mod tests {
         assert!(
             !is_convertible_expr(&declined),
             "CAST over a CASE whose ELSE is not convertible must not be convertible"
+        );
+    }
+
+    /// Which casts the pushdown gate lets into the scan. Vortex evaluates a temporal
+    /// cast only when the type is unchanged, a date becomes a timestamp, or the value
+    /// becomes the integer it is stored as.
+    #[rstest]
+    #[case::timestamp_unit_change(
+        DataType::Timestamp(ArrowTimeUnit::Millisecond, Some(Arc::from("UTC"))),
+        DataType::Timestamp(ArrowTimeUnit::Nanosecond, None),
+        false
+    )]
+    #[case::timestamp_unit_change_same_timezone(
+        DataType::Timestamp(ArrowTimeUnit::Millisecond, Some(Arc::from("UTC"))),
+        DataType::Timestamp(ArrowTimeUnit::Nanosecond, Some(Arc::from("UTC"))),
+        false
+    )]
+    #[case::timestamp_timezone_change(
+        DataType::Timestamp(ArrowTimeUnit::Millisecond, Some(Arc::from("UTC"))),
+        DataType::Timestamp(ArrowTimeUnit::Millisecond, None),
+        false
+    )]
+    #[case::timestamp_to_date(
+        DataType::Timestamp(ArrowTimeUnit::Millisecond, None),
+        DataType::Date32,
+        false
+    )]
+    #[case::timestamp_to_storage(
+        DataType::Timestamp(ArrowTimeUnit::Millisecond, None),
+        DataType::Int64,
+        true
+    )]
+    #[case::date_to_storage(DataType::Date32, DataType::Int32, true)]
+    #[case::date_to_wider_int(DataType::Date32, DataType::Int64, false)]
+    #[case::int_to_timestamp(
+        DataType::Int64,
+        DataType::Timestamp(ArrowTimeUnit::Millisecond, None),
+        false
+    )]
+    #[case::string_to_timestamp(
+        DataType::Utf8,
+        DataType::Timestamp(ArrowTimeUnit::Millisecond, None),
+        false
+    )]
+    #[case::time_unit_change(
+        DataType::Time32(ArrowTimeUnit::Millisecond),
+        DataType::Time64(ArrowTimeUnit::Nanosecond),
+        false
+    )]
+    #[case::timestamp_identity(
+        DataType::Timestamp(ArrowTimeUnit::Millisecond, Some(Arc::from("UTC"))),
+        DataType::Timestamp(ArrowTimeUnit::Millisecond, Some(Arc::from("UTC"))),
+        true
+    )]
+    #[case::date_to_timestamp(
+        DataType::Date32,
+        DataType::Timestamp(ArrowTimeUnit::Nanosecond, None),
+        true
+    )]
+    #[case::non_temporal(DataType::Int32, DataType::Int64, true)]
+    fn test_temporal_cast_pushdown(
+        #[case] source: DataType,
+        #[case] target: DataType,
+        #[case] pushed: bool,
+    ) {
+        let schema = Schema::new(vec![Field::new("c", source, true)]);
+        let cast = Arc::new(df_expr::CastExpr::new(
+            Arc::new(df_expr::Column::new("c", 0)),
+            target,
+            None,
+        )) as Arc<dyn PhysicalExpr>;
+        let is_null =
+            Arc::new(df_expr::IsNullExpr::new(Arc::clone(&cast))) as Arc<dyn PhysicalExpr>;
+        let dynamic_filter = Arc::new(df_expr::DynamicFilterPhysicalExpr::new(
+            vec![Arc::new(df_expr::Column::new("c", 0)) as Arc<dyn PhysicalExpr>],
+            Arc::new(df_expr::Literal::new(ScalarValue::Boolean(Some(true)))),
+        ));
+        dynamic_filter
+            .update(Arc::clone(&is_null))
+            .expect("dynamic filter update should succeed");
+
+        assert_eq!(can_be_pushed_down_impl(&is_null, &schema), pushed);
+        assert_eq!(
+            can_be_pushed_down_impl(&(dynamic_filter as Arc<dyn PhysicalExpr>), &schema),
+            pushed
         );
     }
 
@@ -2155,36 +2317,68 @@ mod tests {
         assert!(!can_be_pushed_down_impl(&like_expr, &test_schema));
     }
 
-    // https://github.com/vortex-data/vortex/issues/6211
-    #[tokio::test]
-    async fn test_cast_int_to_string() -> anyhow::Result<()> {
-        let ctx = TestSessionContext::default();
+    /// The values of the single column `sql` returns, rendered as text.
+    async fn single_column_as_text(
+        ctx: &TestSessionContext,
+        sql: &str,
+    ) -> anyhow::Result<Vec<Option<String>>> {
+        let batches = ctx.session.sql(sql).await?.collect().await?;
+        let mut values = Vec::new();
+        for batch in &batches {
+            anyhow::ensure!(
+                batch.num_columns() == 1,
+                "expected one column from `{sql}`, got {}",
+                batch.num_columns()
+            );
+            let text = datafusion::arrow::compute::cast(batch.column(0), &DataType::Utf8)?;
+            let text = text
+                .as_any()
+                .downcast_ref::<datafusion::arrow::array::StringArray>()
+                .ok_or_else(|| anyhow::anyhow!("a cast to Utf8 must yield a StringArray"))?;
+            values.extend(text.iter().map(|value| value.map(str::to_string)));
+        }
+        Ok(values)
+    }
 
+    /// Writes a one-row file with `id = 1` and checks every shape of an
+    /// integer-to-string cast over it returns that one row: the cast as an aliased
+    /// projection under a filter, the cast inside the filter, and the bare cast
+    /// projection that, with projection pushdown, is evaluated by the Vortex scan.
+    async fn assert_cast_int_to_string_results(ctx: &TestSessionContext) -> anyhow::Result<()> {
         ctx.session
             .sql(r#"copy (select 1 as id) to 'example.vortex'"#)
-            .await?
-            .show()
-            .await?;
-
-        ctx.session
-            .sql(r#"select cast(id as string) as sid from 'example.vortex' where id > 0"#)
-            .await?
-            .show()
-            .await?;
-
-        ctx.session
-            .sql(r#"select id from 'example.vortex' where cast (id as string) == '1'"#)
-            .await?
-            .show()
-            .await?;
-
-        // This fails as it pushes string cast to the scan
-        ctx.session
-            .sql(r#"select cast(id as string) from 'example.vortex'"#)
             .await?
             .collect()
             .await?;
 
+        assert_eq!(
+            single_column_as_text(
+                ctx,
+                r#"select cast(id as string) as sid from 'example.vortex' where id > 0"#
+            )
+            .await?,
+            vec![Some("1".to_string())]
+        );
+        assert_eq!(
+            single_column_as_text(
+                ctx,
+                r#"select id from 'example.vortex' where cast (id as string) == '1'"#
+            )
+            .await?,
+            vec![Some("1".to_string())]
+        );
+        assert_eq!(
+            single_column_as_text(ctx, r#"select cast(id as string) from 'example.vortex'"#)
+                .await?,
+            vec![Some("1".to_string())]
+        );
         Ok(())
+    }
+
+    // https://github.com/vortex-data/vortex/issues/6211
+    #[tokio::test]
+    async fn test_cast_int_to_string() -> anyhow::Result<()> {
+        // Projection pushdown off (the format's default): the casts run above the scan.
+        assert_cast_int_to_string_results(&TestSessionContext::default()).await
     }
 }

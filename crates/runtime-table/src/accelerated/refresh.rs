@@ -54,6 +54,7 @@ use tokio::sync::Mutex;
 use tokio::sync::mpsc::Receiver;
 use tokio::sync::{RwLock, Semaphore};
 use tokio::time::sleep;
+use tokio_util::sync::CancellationToken;
 
 // The refresh-SQL types travel with their parser in `runtime-datafusion`: the
 // parser produces them, and it sits below `runtime` so connectors can call it.
@@ -73,6 +74,15 @@ pub enum Error {
     },
 }
 
+/// How a refresh that keeps each key's newest version by `time_column` resolves it.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VersionsByTime {
+    /// The accelerator resolves a full refresh's repeated keys as it writes them, by
+    /// the row versions the refresh supplies. An append's first load into an empty
+    /// table gets them too when the accelerator says it would take it.
+    pub versions_resolved_after_write: bool,
+}
+
 #[derive(Clone, Debug)]
 pub struct Refresh {
     pub(crate) time_column: Option<String>,
@@ -88,6 +98,10 @@ pub struct Refresh {
     pub(crate) mode: RefreshMode,
     pub(crate) period: Option<Duration>,
     pub(crate) append_overlap: Option<Duration>,
+    /// Keep each key's newest version by `time_column`: only rows newer than the
+    /// version of their key already kept (see `refresh_task::latest_by_time`), resolved as the
+    /// accelerator needs.
+    pub(crate) versions_by_time: Option<VersionsByTime>,
     pub(crate) retry_enabled: bool,
     pub(crate) retry_max_attempts: Option<usize>,
     /// TTL for cache entries. Data older than this is considered stale.
@@ -205,6 +219,12 @@ impl Refresh {
     #[must_use]
     pub fn append_overlap(mut self, append_overlap: Duration) -> Self {
         self.append_overlap = Some(append_overlap);
+        self
+    }
+
+    #[must_use]
+    pub fn versions_by_time(mut self, versions_by_time: Option<VersionsByTime>) -> Self {
+        self.versions_by_time = versions_by_time;
         self
     }
 
@@ -661,6 +681,7 @@ impl Default for Refresh {
             mode: RefreshMode::Full,
             period: None,
             append_overlap: None,
+            versions_by_time: None,
             retry_enabled: false,
             retry_max_attempts: None,
             caching_ttl: None,
@@ -688,6 +709,8 @@ pub struct Refresher {
     federated_source: Option<String>,
     refresh: Arc<RwLock<Refresh>>,
     accelerator: Arc<dyn TableProvider>,
+    change_sink: Option<runtime_acceleration::change_sink::ChangeSink>,
+    cache_write_sender: Option<super::caching::CacheWriteSender>,
     // `Weak` reference to `Caching` is used to prevent blocking cache cleanup during runtime termination.
     caching: Option<Weak<Caching>>,
     /// The caching accelerator's claim set, forwarded to the refresh task so
@@ -699,7 +722,8 @@ pub struct Refresher {
     synchronize_with: Option<SynchronizedTable>,
     snapshot_config: Option<SnapshotCreationConfig>,
     snapshot_refresh_state: Option<crate::accelerated::snapshots::SnapshotRefreshState>,
-    snapshot_interval_task: Option<tokio::task::JoinHandle<()>>,
+    snapshot_task: Option<tokio::task::JoinHandle<()>>,
+    initial_snapshot: Option<InitialSnapshot>,
 
     initial_load_completed: Arc<AtomicBool>,
     disable_federation: bool,
@@ -713,6 +737,10 @@ pub struct Refresher {
     cdc_apply_runtime: Option<Handle>,
     io_runtime: Handle,
     resource_monitor: Option<runtime_resources::ResourceMonitor>,
+    /// The runtime's query `RuntimeEnv`: its memory pool bounds what a refresh holds in
+    /// memory, and its disk manager is where the refresh spills. `None` uses an unbounded
+    /// default.
+    query_runtime_env: Option<Arc<datafusion::execution::runtime_env::RuntimeEnv>>,
     /// Mutex to protect concurrent access to the accelerator during insert/update/delete/cache/snapshot operations
     /// Shared with `DataConnector` and `CachingAccelerationScanExec`.
     accelerator_write_mutex: Arc<Mutex<()>>,
@@ -762,6 +790,8 @@ impl Refresher {
             federated_source,
             refresh,
             accelerator,
+            change_sink: None,
+            cache_write_sender: None,
             caching: None,
             in_flight_revalidations: None,
             refresh_task_runner: None,
@@ -774,12 +804,14 @@ impl Refresher {
             refresh_completion: None,
             snapshot_config: None,
             snapshot_refresh_state: None,
-            snapshot_interval_task: None,
+            snapshot_task: None,
+            initial_snapshot: None,
             metrics: None,
             cpu_runtime,
             cdc_apply_runtime,
             io_runtime,
             resource_monitor: None,
+            query_runtime_env: None,
             accelerator_write_mutex,
             bootstrap_status: BootstrapStatus::none(),
             last_updated_at: Arc::new(AtomicI64::from(0)),
@@ -794,6 +826,22 @@ impl Refresher {
         in_flight_revalidations: crate::accelerated::caching::InFlightRevalidations,
     ) -> &mut Self {
         self.in_flight_revalidations = Some(in_flight_revalidations);
+        self
+    }
+
+    pub fn with_change_sink(
+        &mut self,
+        sink: Option<runtime_acceleration::change_sink::ChangeSink>,
+    ) -> &mut Self {
+        self.change_sink = sink;
+        self
+    }
+
+    pub fn with_cache_write_sender(
+        &mut self,
+        sender: Option<super::caching::CacheWriteSender>,
+    ) -> &mut Self {
+        self.cache_write_sender = sender;
         self
     }
 
@@ -912,6 +960,14 @@ impl Refresher {
         self
     }
 
+    pub fn with_query_runtime_env(
+        &mut self,
+        runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+    ) -> &mut Self {
+        self.query_runtime_env = Some(runtime_env);
+        self
+    }
+
     /// Set whether the acceleration uses S3 Express One Zone storage.
     pub fn with_s3_express_acceleration(&mut self, is_s3_express: bool) -> &mut Self {
         self.is_s3_express_acceleration = is_s3_express;
@@ -1002,6 +1058,22 @@ impl Refresher {
             }
         };
 
+        // The acceleration's last refresh, as its checkpoint records it, is reported
+        // from startup rather than only after the first refresh in this process. Only
+        // a refresh writes the checkpoint of a dataset that neither creates snapshots
+        // (whose interval checkpoints without refreshing) nor was restored from one
+        // (whose checkpoint is the snapshot's); for those, the last refresh is
+        // reported once one completes.
+        if self.snapshot_config.is_none()
+            && !self.bootstrap_status.is_bootstrapped()
+            && let Some(checkpointer) = &self.checkpointer
+            && let Ok(Some(last_refresh)) = checkpointer.last_checkpoint_time().await
+        {
+            self.runtime_status
+                .record_dataset_last_refresh(&dataset_name, last_refresh);
+            record_last_refresh_metric(&dataset_name, &self.refresh, last_refresh).await;
+        }
+
         let (snapshot_manager, snapshot_trigger) = match self.snapshot_config.as_ref() {
             Some(SnapshotCreationConfig {
                 manager,
@@ -1018,7 +1090,13 @@ impl Refresher {
         // Captured once for the start-time checkpoint schema AND threaded into the
         // snapshot tasks so they can re-derive the canonical schema from the LIVE
         // accelerator at each checkpoint (live schema evolution under CDC).
-        let federated_schema = self.federated.schema();
+        // The checkpoint also records the primary key the acceleration was built
+        // with, so a registration without the source can rebuild it (see
+        // `checkpoint_primary_key`).
+        let federated_schema = super::checkpoint_primary_key::with_acceleration_primary_key(
+            self.federated.schema(),
+            &self.accelerator,
+        );
         let checkpoint_schema =
             canonical_checkpoint_schema(&self.accelerator.schema(), &federated_schema);
 
@@ -1032,7 +1110,7 @@ impl Refresher {
                 _,
             ) => receiver,
             (AccelerationRefreshMode::Changes(stream), _) => {
-                let (snapshot_interval_task, on_batch_process_callback) = match snapshot_trigger {
+                let (snapshot_task, on_batch_process_callback) = match snapshot_trigger {
                     None | Some(SnapshotCreateTrigger::RefreshComplete) => (None, None),
                     Some(SnapshotCreateTrigger::Interval(duration)) => (
                         spawn_snapshot_interval_task(
@@ -1051,8 +1129,7 @@ impl Refresher {
                         ),
                         None,
                     ),
-                    Some(SnapshotCreateTrigger::Batches(batches)) => (
-                        None,
+                    Some(SnapshotCreateTrigger::Batches(batches)) => {
                         create_periodic_snapshot_callback(
                             *batches,
                             checkpointer.clone(),
@@ -1066,10 +1143,11 @@ impl Refresher {
                             Arc::clone(&self.last_updated_at),
                             Some(Arc::clone(&self.accelerator)),
                             Arc::clone(&self.refresh),
-                        ),
-                    ),
+                        )
+                        .unzip()
+                    }
                 };
-                self.snapshot_interval_task = snapshot_interval_task;
+                self.snapshot_task = snapshot_task;
 
                 return Ok(Some(
                     self.start_changes_stream(stream, on_batch_process_callback),
@@ -1094,13 +1172,21 @@ impl Refresher {
             refresh_task_runner = refresh_task_runner.with_semaphore(Arc::clone(semaphore));
         }
 
-        refresh_task_runner = refresh_task_runner.with_metrics(self.metrics.clone());
+        refresh_task_runner = refresh_task_runner
+            .with_metrics(self.metrics.clone())
+            .with_change_sink(self.change_sink.clone())
+            .with_cache_write_sender(self.cache_write_sender.clone());
 
         refresh_task_runner = refresh_task_runner.with_cpu_runtime(self.cpu_runtime.clone());
 
         if let Some(ref resource_monitor) = self.resource_monitor {
             refresh_task_runner =
                 refresh_task_runner.with_resource_monitor(resource_monitor.clone());
+        }
+
+        if let Some(ref runtime_env) = self.query_runtime_env {
+            refresh_task_runner =
+                refresh_task_runner.with_query_runtime_env(Arc::clone(runtime_env));
         }
 
         refresh_task_runner =
@@ -1143,32 +1229,31 @@ impl Refresher {
 
         let synchronize_with = self.synchronize_with.clone();
 
-        let (snapshot_interval_task, create_checkpoint_snapshot_after_refresh) =
-            match snapshot_trigger {
-                // This will only create checkpoint - default behavior when snapshots are not configured
-                #[expect(clippy::match_same_arms)]
-                None => (None, true),
-                Some(SnapshotCreateTrigger::Batches(_)) => (None, false),
-                Some(SnapshotCreateTrigger::RefreshComplete) => (None, true),
-                Some(SnapshotCreateTrigger::Interval(duration)) => (
-                    spawn_snapshot_interval_task(
-                        Some(*duration),
-                        checkpointer.clone(),
-                        snapshot_manager.clone(),
-                        Arc::clone(&self.accelerator_write_mutex),
-                        dataset_name.clone(),
-                        Arc::clone(&checkpoint_schema),
-                        Arc::clone(&federated_schema),
-                        Arc::clone(&self.runtime_status),
-                        self.bootstrap_status.clone(),
-                        Arc::clone(&self.last_updated_at),
-                        Some(Arc::clone(&self.accelerator)),
-                        Arc::clone(&self.refresh),
-                    ),
-                    false,
+        let (snapshot_task, create_checkpoint_snapshot_after_refresh) = match snapshot_trigger {
+            // This will only create checkpoint - default behavior when snapshots are not configured
+            #[expect(clippy::match_same_arms)]
+            None => (None, true),
+            Some(SnapshotCreateTrigger::Batches(_)) => (None, false),
+            Some(SnapshotCreateTrigger::RefreshComplete) => (None, true),
+            Some(SnapshotCreateTrigger::Interval(duration)) => (
+                spawn_snapshot_interval_task(
+                    Some(*duration),
+                    checkpointer.clone(),
+                    snapshot_manager.clone(),
+                    Arc::clone(&self.accelerator_write_mutex),
+                    dataset_name.clone(),
+                    Arc::clone(&checkpoint_schema),
+                    Arc::clone(&federated_schema),
+                    Arc::clone(&self.runtime_status),
+                    self.bootstrap_status.clone(),
+                    Arc::clone(&self.last_updated_at),
+                    Some(Arc::clone(&self.accelerator)),
+                    Arc::clone(&self.refresh),
                 ),
-            };
-        self.snapshot_interval_task = snapshot_interval_task;
+                false,
+            ),
+        };
+        self.snapshot_task = snapshot_task;
 
         // Gates when checkpoint counting/creation can start after runtime is ready.
         // Set to true immediately when snapshots are not configured, or after the initial
@@ -1192,14 +1277,19 @@ impl Refresher {
                 let last_updated_at_clone = Arc::clone(&self.last_updated_at);
                 let accelerator_clone = Arc::clone(&self.accelerator);
                 let refresh_clone = Arc::clone(&self.refresh);
+                let not_started = CancellationToken::new();
+                let start_gate = not_started.clone();
 
-                tokio::spawn(async move {
-                    // A shutdown before readiness means the initial load never
-                    // completed — checkpointing a partial accelerator would
-                    // publish it as a complete snapshot.
-                    if runtime_status_clone.wait_for_ready().await
-                        == runtime_status::WaitOutcome::ShuttingDown
-                    {
+                let task = tokio::spawn(async move {
+                    // A shutdown or drain before readiness means the initial
+                    // load never completed — checkpointing a partial
+                    // accelerator would publish it as a complete snapshot.
+                    let outcome = select! {
+                        biased;
+                        outcome = runtime_status_clone.wait_for_ready() => outcome,
+                        () = start_gate.cancelled() => return,
+                    };
+                    if outcome == runtime_status::WaitOutcome::ShuttingDown {
                         return;
                     }
                     if !bootstrap_status.is_bootstrapped() {
@@ -1230,6 +1320,10 @@ impl Refresher {
                         "Refresh-based snapshot creation for {dataset_name_clone} starting after runtime ready"
                     );
                 });
+                self.initial_snapshot = Some(InitialSnapshot {
+                    task: Some(task),
+                    not_started,
+                });
             }
         }
 
@@ -1242,9 +1336,23 @@ impl Refresher {
         //   1. Periodic and manual refreshes happening at the same time
         //   2. The periodic refresh happening less than `refresh_check_interval` after a manual
         //        refresh (the sleep future is reset when a manual refresh completes).
+        let refresh_status = Arc::clone(&self.runtime_status);
+        // Schedules the next periodic refresh after `delay` plus jitter, and records
+        // when it is due for a dataset with a refresh schedule.
+        let schedule_refresh = {
+            let runtime_status = Arc::clone(&self.runtime_status);
+            let dataset_name = dataset_name.clone();
+            move |delay: Duration| {
+                let delay = Self::compute_delay(delay, max_jitter);
+                if refresh_check_interval.is_some() {
+                    runtime_status
+                        .record_dataset_next_refresh(&dataset_name, SystemTime::now() + delay);
+                }
+                sleep(delay)
+            }
+        };
         Ok(Some(tokio::spawn(async move {
-            let mut next_scheduled_refresh_timer =
-                initial_refresh_delay.map(|delay| sleep(Self::compute_delay(delay, max_jitter)));
+            let mut next_scheduled_refresh_timer = initial_refresh_delay.map(&schedule_refresh);
 
             loop {
                 let scheduled_refresh_future: BoxFuture<()> =
@@ -1268,8 +1376,12 @@ impl Refresher {
                         // Apply jitter on manual refreshes. For periodic refreshes, jitter
                         // is added to the timer, `next_scheduled_refresh_timer`.
                         let override_jitter = overrides_opt.as_ref().and_then(|o| o.max_jitter);
-                        if let Some(max_jitter) = override_jitter.or(max_jitter) {
-                            sleep(Self::compute_delay(Duration::from_secs(0), Some(max_jitter))).await;
+                        let delay = Self::compute_delay(Duration::ZERO, override_jitter.or(max_jitter));
+                        // An external trigger replaces the interval timer. Retain its
+                        // due time until completion, including when it has no jitter.
+                        refresh_status.record_dataset_next_refresh(&dataset_name, SystemTime::now() + delay);
+                        if !delay.is_zero() {
+                            sleep(delay).await;
                         }
 
                         // Numbered here rather than at the trigger: a caller
@@ -1290,6 +1402,12 @@ impl Refresher {
                         // An `UpToDate` refresh wrote nothing, so cached results stay valid.
                         let refresh_changed_accelerator = refresh_result_changed_accelerator(&res);
 
+                        if refresh_succeeded {
+                            let completed_at = SystemTime::now();
+                            for refreshed_dataset in refresh_task.get_dataset_names().await {
+                                refresh_status.record_dataset_last_refresh(&refreshed_dataset, completed_at);
+                            }
+                        }
                         after_refresh_task_completed(
                             refresh_succeeded,
                             &initial_load_completed,
@@ -1354,12 +1472,18 @@ impl Refresher {
                         }
 
                         // Restart periodic refresh timer (after either cron or manual dataset refresh).
-                        // For datasets with no periodic refresh, this will be a no-op.
+                        // For datasets with no periodic refresh, this will be a no-op. The next
+                        // refresh is due an interval after the last successful one, so a failed
+                        // refresh retries on the timer but leaves the recorded due time, now past.
+                        if refresh_check_interval.is_none() && refresh_succeeded {
+                            refresh_status.clear_dataset_next_refresh(&dataset_name);
+                        }
                         if let Some(refresh_check_interval) = refresh_check_interval {
-                            next_scheduled_refresh_timer = Some(sleep(Self::compute_delay(
-                                refresh_check_interval,
-                                max_jitter,
-                            )));
+                            next_scheduled_refresh_timer = Some(if refresh_succeeded {
+                                schedule_refresh(refresh_check_interval)
+                            } else {
+                                sleep(Self::compute_delay(refresh_check_interval, max_jitter))
+                            });
                         }
                     }
                 }
@@ -1380,14 +1504,39 @@ impl Refresher {
         }
 
         if let Some(refresh_task_runner) = &self.refresh_task_runner {
+            let child = synchronized_table.child_dataset_name();
+            let parent = synchronized_table.parent_dataset_name();
             refresh_task_runner
                 .add_synchronized_table(synchronized_table)
                 .await;
+            self.runtime_status
+                .record_dataset_refresh_source(&child, &parent);
         } else {
             unreachable!(
                 "Only tables configured with a full refresh mode can subscribe to new table providers - this is an implementation bug"
             );
         }
+    }
+
+    /// Transfer every nested worker to the table generation's drain owner.
+    pub(crate) fn take_background_tasks(&mut self) -> Vec<tokio::task::JoinHandle<()>> {
+        let mut tasks = Vec::with_capacity(2);
+        if let Some(task) = self
+            .refresh_task_runner
+            .as_mut()
+            .and_then(RefreshTaskRunner::take_task)
+        {
+            tasks.push(task);
+        }
+        if let Some(task) = self.snapshot_task.take() {
+            tasks.push(task);
+        }
+        tasks
+    }
+
+    /// Transfer the initial-load snapshot to the table generation's drain owner.
+    pub(crate) fn take_initial_snapshot(&mut self) -> Option<InitialSnapshot> {
+        self.initial_snapshot.take()
     }
 
     fn start_changes_stream(
@@ -1412,7 +1561,9 @@ impl Refresher {
         .with_s3_express_acceleration(self.is_s3_express_acceleration)
         .with_engine_type_rewrites(self.engine_type_rewrites)
         .with_initial_load_completed(Arc::clone(&self.initial_load_completed))
-        .with_cdc_param_overrides(self.cdc_param_overrides.clone());
+        .with_cdc_param_overrides(self.cdc_param_overrides.clone())
+        .with_change_sink(self.change_sink.clone())
+        .with_cache_write_sender(self.cache_write_sender.clone());
 
         let caching = self.caching.clone();
         let refresh = Arc::clone(&self.refresh);
@@ -1455,9 +1606,34 @@ impl Drop for Refresher {
         if let Some(mut refresh_task_runner) = self.refresh_task_runner.take() {
             refresh_task_runner.abort();
         }
-        if let Some(task) = self.snapshot_interval_task.take() {
+        if let Some(task) = self.snapshot_task.take() {
             task.abort();
         }
+    }
+}
+
+/// The one-shot snapshot of the initial load. It stops if its owner goes away
+/// before the runtime is ready; once it has started, it runs to completion, so
+/// a drain waits for it rather than cutting a snapshot off part-way.
+pub(crate) struct InitialSnapshot {
+    task: Option<tokio::task::JoinHandle<()>>,
+    not_started: CancellationToken,
+}
+
+impl InitialSnapshot {
+    /// Stop the snapshot if it has not started, otherwise wait for it to finish.
+    pub(crate) async fn finish(mut self) -> Result<(), tokio::task::JoinError> {
+        self.not_started.cancel();
+        match self.task.take() {
+            Some(task) => task.await,
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for InitialSnapshot {
+    fn drop(&mut self) {
+        self.not_started.cancel();
     }
 }
 
@@ -1528,6 +1704,21 @@ fn issue_refresh_request(refresh_completion: Option<&RefreshCompletion>) -> Refr
     refresh_completion.map_or(0, RefreshCompletion::issue)
 }
 
+/// Publishes `at` as `dataset_name`'s last refresh time, with the labels a completed
+/// refresh publishes it with.
+async fn record_last_refresh_metric(
+    dataset_name: &TableReference,
+    refresh: &Arc<RwLock<Refresh>>,
+    at: SystemTime,
+) {
+    let mut labels = vec![KeyValue::new("dataset", dataset_name.to_string())];
+    if let Some(sql) = &refresh.read().await.sql {
+        labels.push(KeyValue::new("sql", sql.display_sql()));
+    }
+    let at = at.duration_since(UNIX_EPOCH).unwrap_or_default();
+    metrics::LAST_REFRESH_TIME_MS.record(at.as_secs_f64() * 1000.0, &labels);
+}
+
 /// Records a completed refresh under the request that started it.
 ///
 /// A successful refresh records a completion: releases callers waiting on
@@ -1546,29 +1737,12 @@ async fn record_refresh_done(
 ) -> bool {
     if refresh_succeeded {
         refresh_completion.record(request_id);
-        record_last_refresh_time_ms(dataset_name, refresh).await;
+        record_last_refresh_metric(dataset_name, refresh, SystemTime::now()).await;
         return true;
     }
 
     refresh_completion.record_terminal_failure(request_id);
     false
-}
-
-async fn record_last_refresh_time_ms(
-    dataset_name: &TableReference,
-    refresh: &Arc<RwLock<Refresh>>,
-) {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-
-    let mut labels = vec![KeyValue::new("dataset", dataset_name.to_string())];
-    let refresh_guard = refresh.read().await;
-    if let Some(sql) = &refresh_guard.sql {
-        labels.push(KeyValue::new("sql", sql.display_sql()));
-    }
-
-    metrics::LAST_REFRESH_TIME_MS.record(now.as_secs_f64() * 1000.0, &labels);
 }
 
 #[cfg(test)]
@@ -2028,6 +2202,63 @@ mod tests {
             trigger,
             refresh_handle,
         )
+    }
+
+    #[tokio::test]
+    async fn snapshot_task_ownership_transfers_once_or_aborts_on_drop() {
+        timeout(Duration::from_secs(5), async {
+            for transfer in [false, true] {
+                let (mut refresher, _, _, outer) =
+                    started_full_refresher(status::RuntimeStatus::new()).await;
+                let (started_tx, started) = tokio::sync::oneshot::channel();
+                let (lifetime, cancelled) = tokio::sync::oneshot::channel::<()>();
+                let (ping, receive_ping) =
+                    tokio::sync::oneshot::channel::<tokio::sync::oneshot::Sender<()>>();
+                let snapshot = tokio::spawn(async move {
+                    let _lifetime = lifetime;
+                    started_tx.send(()).expect("snapshot started");
+                    if let Ok(reply) = receive_ping.await {
+                        let _ = reply.send(());
+                    }
+                    std::future::pending::<()>().await;
+                });
+                let snapshot_id = snapshot.id();
+                let refresher_mut = Arc::get_mut(&mut refresher).expect("unique refresher");
+                refresher_mut.snapshot_task = Some(snapshot);
+                started.await.expect("snapshot is running");
+                let tasks = if transfer {
+                    let tasks = refresher_mut.take_background_tasks();
+                    assert_eq!(tasks.len(), 2, "refresh and snapshot workers");
+                    assert!(tasks.iter().any(|task| task.id() == snapshot_id));
+                    assert!(refresher_mut.take_background_tasks().is_empty());
+                    tasks
+                } else {
+                    Vec::new()
+                };
+                drop(refresher);
+                if transfer {
+                    let (reply, alive) = tokio::sync::oneshot::channel();
+                    ping.send(reply)
+                        .expect("transferred snapshot remains owned");
+                    alive.await.expect("snapshot survives refresher drop");
+                    for task in tasks {
+                        let is_snapshot = task.id() == snapshot_id;
+                        task.abort();
+                        let result = task.await;
+                        if is_snapshot {
+                            assert!(result.expect_err("aborted snapshot").is_cancelled());
+                        }
+                    }
+                }
+                assert!(cancelled.await.is_err(), "snapshot future is destroyed");
+                if let Some(task) = outer {
+                    task.abort();
+                    let _ = task.await;
+                }
+            }
+        })
+        .await
+        .expect("snapshot ownership must settle");
     }
 
     /// A source that holds its scan open until the test lets it through, and

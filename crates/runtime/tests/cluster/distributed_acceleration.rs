@@ -1232,6 +1232,7 @@ fn make_memory_accelerated_dataset(
 
     dataset.acceleration = Some(Acceleration {
         enabled: true,
+        engine: Some("arrow".to_string()),
         mode: Mode::Memory,
         refresh_mode: Some(RefreshMode::Full),
         partition_by: vec![PartitionedBy {
@@ -1244,7 +1245,8 @@ fn make_memory_accelerated_dataset(
     dataset
 }
 
-/// Create a dataset partitioned by a raw column value (not `bucket()`).
+/// Create a dataset with in-memory Arrow acceleration, partitioned by a raw column value (not
+/// `bucket()`).
 /// Each unique value of `partition_column` becomes its own partition.
 fn make_column_partitioned_dataset(
     source_path: impl Into<String>,
@@ -1255,6 +1257,7 @@ fn make_column_partitioned_dataset(
 
     dataset.acceleration = Some(Acceleration {
         enabled: true,
+        engine: Some("arrow".to_string()),
         mode: Mode::Memory,
         refresh_mode: Some(RefreshMode::Full),
         partition_by: vec![PartitionedBy {

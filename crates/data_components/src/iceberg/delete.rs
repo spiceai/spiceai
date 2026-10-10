@@ -574,9 +574,10 @@ impl TableLayer for IcebergDeletionProvider {
         // Exhaustive on purpose: a wildcard would answer a future walk kind
         // for this layer without anyone deciding what it should say.
         match walk {
-            // Deletion adds no columns and carries no index of its own, so read
-            // discovery and index discovery both reach past it.
-            LayerWalk::Read | LayerWalk::Index => Some(below),
+            // Deletion adds no columns, carries no index of its own, and leaves
+            // reads to the Iceberg table beneath, so read discovery, index
+            // discovery, and passthrough all reach past it.
+            LayerWalk::Read | LayerWalk::Index | LayerWalk::Passthrough => Some(below),
             // Everything else stops: a delete routed around this layer would run
             // against the Iceberg table without its deletion semantics, and a
             // source or CDC walk has no business below an Iceberg delete.

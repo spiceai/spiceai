@@ -411,11 +411,35 @@ Threads:\t32
     /// Exercises the real platform path — the procfs read on Linux, the
     /// `task_info` syscall on macOS. CI runs Linux, so without this the `unsafe`
     /// mach block would be compiled but never executed anywhere.
+    ///
+    /// Faulting in a known number of fresh heap bytes pins the units: the reading
+    /// has to grow by about that many bytes, so a figure in kB or pages, or one
+    /// scaled twice, misses the half-to-double window by a factor of 1024 or more.
     #[test]
     fn the_live_reading_is_plausible() {
-        let resident = process_resident_memory().expect("this process is resident");
+        const TOUCHED: u64 = 64 * 1024 * 1024;
 
-        assert!(resident.total > 0, "a running process has resident memory");
+        let before = process_resident_memory().expect("this process is resident");
+        assert!(before.total > 0, "a running process has resident memory");
+
+        // Write a non-zero byte into every 4 KiB page (which also covers 16 KiB
+        // pages) so each page is faulted in rather than left mapped but untouched.
+        // `black_box` publishes the buffer before the second reading, so the
+        // writes cannot be deferred past it.
+        let mut buffer = vec![0_u8; usize::try_from(TOUCHED).expect("64 MiB fits in usize")];
+        for page in buffer.chunks_mut(4096) {
+            page[0] = 1;
+        }
+        let buffer = std::hint::black_box(buffer);
+
+        let after = process_resident_memory().expect("this process is resident");
+        let grown = after.total.saturating_sub(before.total);
+        assert!(
+            (TOUCHED / 2..=TOUCHED * 2).contains(&grown),
+            "touching {TOUCHED} heap bytes grew the resident total by {grown} ({} -> {})",
+            before.total,
+            after.total,
+        );
 
         // The split only exists on the platforms that implement it; elsewhere it
         // is `None` rather than a fabricated attribution, so asserting it
@@ -424,20 +448,29 @@ Threads:\t32
         // `RssAnon`/`RssFile` pair, which is the same contract, so require the
         // pair only where the syscall cannot omit it.
         #[cfg(target_os = "macos")]
-        let split = Some(
-            resident
+        let splits = Some((
+            before
                 .split
                 .expect("`task_info(TASK_VM_INFO)` always supplies the split"),
-        );
+            after
+                .split
+                .expect("`task_info(TASK_VM_INFO)` always supplies the split"),
+        ));
         #[cfg(target_os = "linux")]
-        let split = resident.split;
+        let splits = before.split.zip(after.split);
 
+        // Heap pages are anonymous, so the anonymous half grows by the same amount.
         #[cfg(any(target_os = "linux", target_os = "macos"))]
-        if let Some(split) = split {
+        if let Some((before_split, after_split)) = splits {
+            let grown_anon = after_split.anon.saturating_sub(before_split.anon);
             assert!(
-                split.anon > 0,
-                "a running process has anonymous memory (heap and stacks)"
+                (TOUCHED / 2..=TOUCHED * 2).contains(&grown_anon),
+                "touching {TOUCHED} heap bytes grew anonymous memory by {grown_anon} ({} -> {})",
+                before_split.anon,
+                after_split.anon,
             );
         }
+
+        drop(buffer);
     }
 }

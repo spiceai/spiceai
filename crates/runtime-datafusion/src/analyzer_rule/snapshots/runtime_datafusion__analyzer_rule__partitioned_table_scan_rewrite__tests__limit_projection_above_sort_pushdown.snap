@@ -1,0 +1,15 @@
+---
+source: crates/runtime-datafusion/src/analyzer_rule/partitioned_table_scan_rewrite.rs
+expression: result.display_indent()
+---
+Limit: skip=0, fetch=3
+  Projection: test_table.id, test_table.name
+    Sort: test_table.partition_id DESC NULLS FIRST
+      SubqueryAlias: test_table
+        Union
+          Sort: test_table.partition_id DESC NULLS FIRST, fetch=3
+            SubqueryAlias: test_table
+              TableScan: test_table, unsupported_filters=[partition_id = Utf8("0")]
+          Sort: test_table.partition_id DESC NULLS FIRST, fetch=3
+            SubqueryAlias: test_table
+              TableScan: test_table, unsupported_filters=[partition_id = Utf8("1")]

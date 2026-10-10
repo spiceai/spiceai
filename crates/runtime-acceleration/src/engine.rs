@@ -13,9 +13,8 @@ limitations under the License.
 use crate::AcceleratorEngineNotAvailableSnafu;
 use std::fmt::Display;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Engine {
-    #[default]
     Arrow,
     PartitionedArrow,
     DuckDB,
@@ -32,6 +31,18 @@ impl Engine {
         match self {
             Engine::PartitionedArrow => Engine::Arrow,
             other => *other,
+        }
+    }
+}
+
+/// The engine named by [`spicepod::acceleration::DEFAULT_ENGINE`]: the one an
+/// acceleration uses when it does not set `engine`.
+impl Default for Engine {
+    fn default() -> Self {
+        if cfg!(windows) {
+            Engine::Arrow
+        } else {
+            Engine::Cayenne
         }
     }
 }

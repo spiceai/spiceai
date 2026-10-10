@@ -493,8 +493,9 @@ struct MemberHandle {
     /// source-commit time is within this of now, so the dataset becomes Ready
     /// only once it has caught up to the source head.
     ready_lag: std::time::Duration,
-    /// Where this member's applied-LSN watermark is recorded. Only
-    /// [`run_applied_lsn_writer`] writes it, which is what keeps concurrent
+    /// Where this member's applied-LSN watermark is recorded. Producers never
+    /// write it directly: only [`write_published_positions`] does, serialized by
+    /// [`SharedSource::position_write_lock`], which is what keeps concurrent
     /// producers from landing out of order.
     applied_lsn_store: Arc<dyn AppliedLsnStore>,
     /// Wakes the applied-position writer when this member publishes a position.
@@ -1023,6 +1024,32 @@ impl CommitChange for SharedLsnCommitter {
     /// published position safe.
     fn supports_deferral(&self) -> bool {
         true
+    }
+
+    fn try_absorb(&mut self, other: &dyn CommitChange) -> bool {
+        let Some(other) = other
+            .as_any()
+            .and_then(|other| other.downcast_ref::<Self>())
+        else {
+            return false;
+        };
+        if !Arc::ptr_eq(&self.slot, &other.slot)
+            || !Arc::ptr_eq(&self.watermark_notify, &other.watermark_notify)
+            || self.dataset != other.dataset
+        {
+            return false;
+        }
+        // Both source position updates are infallible monotonic maxima. The
+        // caller must retain the maximum storage fence of the absorbed commits.
+        if other.flush_to > self.flush_to {
+            self.flush_to = other.flush_to;
+            self.source_commit_ts_ms = other.source_commit_ts_ms;
+        }
+        true
+    }
+
+    fn as_any(&self) -> Option<&dyn std::any::Any> {
+        Some(self)
     }
 }
 
@@ -1795,6 +1822,10 @@ struct SharedSource {
     dead: AtomicBool,
     /// Wakes [`run_applied_lsn_writer`] when a member publishes a position.
     watermark_notify: Arc<Notify>,
+    /// Serializes [`write_published_positions`] between the writer task and the
+    /// pump's final write, so a pass that read an older position cannot land after
+    /// a newer one.
+    position_write_lock: tokio::sync::Mutex<()>,
     /// Positions published by members that have since detached, which the writer's
     /// member sweep can no longer reach. See [`OrphanedPosition`].
     orphaned_positions: Mutex<Vec<OrphanedPosition>>,
@@ -1847,6 +1878,7 @@ impl SharedSource {
             restart_requested: AtomicBool::new(false),
             dead: AtomicBool::new(false),
             watermark_notify: Arc::new(Notify::new()),
+            position_write_lock: tokio::sync::Mutex::new(()),
             orphaned_positions: Mutex::new(Vec::new()),
             slot_created_fresh: AtomicBool::new(false),
             slot_generation: AtomicU64::new(0),
@@ -2618,7 +2650,10 @@ async fn attach_member(
 
     if !source.pump_started.swap(true, Ordering::AcqRel) {
         let pump_source = Arc::clone(source);
-        tokio::spawn(run_pump(pump_source));
+        tokio::spawn(run_pump(
+            pump_source,
+            crate::cdc::ShutdownDrainGuard::hold(),
+        ));
         tokio::spawn(run_applied_lsn_writer(
             Arc::clone(source),
             params.watermark_flush_interval,
@@ -3085,16 +3120,18 @@ struct OrphanedPosition {
     write_back_registry: Option<Arc<XidRegistry>>,
 }
 
-/// The **only** writer of applied positions for a source.
+/// The background writer of applied positions for a source.
 ///
 /// Producers publish a position onto their member's [`AckSlot::pending`] with an
 /// atomic max and wake this task; it persists whatever the furthest published
-/// position is when it gets there. Two properties follow, and both matter:
+/// position is when it gets there. The pump's shutdown also writes, through the same
+/// [`write_published_positions`]. Two properties follow, and both matter:
 ///
 ///   * **No reordering.** [`AppliedLsnStore::save`] overwrites rather than taking a
-///     maximum, so concurrent writers could land out of order and move a recorded
+///     maximum, so concurrent writes could land out of order and move a recorded
 ///     position backwards — costing a rebuild that does not self-correct until the
-///     member advances past the lost value. One writer makes that unrepresentable.
+///     member advances past the lost value. Every write pass holds
+///     [`SharedSource::position_write_lock`], which makes that unrepresentable.
 ///   * **Coalescing.** Positions published while a write is in flight collapse into
 ///     that write's successor, so a busy member costs writes at the store's pace
 ///     rather than one per commit.
@@ -3160,10 +3197,14 @@ fn publish_idle_positions(source: &Arc<SharedSource>) {
 }
 
 /// Persist every member whose published position has moved past what is recorded,
-/// plus any left behind by a detached member. Called only from the writer task and
-/// from the pump's shutdown, which never run concurrently: the pump sets `dead`
-/// before its final flush, and the writer exits on seeing it.
+/// plus any left behind by a detached member. Called from the writer task and from
+/// the pump's shutdown. The pump sets `dead` before its final flush and the writer
+/// exits on seeing it, but a writer pass already inside a store write when the pump
+/// stops is still in flight, so every pass holds
+/// [`SharedSource::position_write_lock`]: a pass reads each position only after the
+/// previous pass has landed, and the pump's final write is the last to land.
 async fn write_published_positions(source: &Arc<SharedSource>) {
+    let _serialized = source.position_write_lock.lock().await;
     // An orphan has no member left for the next sweep to rediscover, so a failed
     // write has to be put back or the detached member's last position is lost to a
     // transient sidecar error. Extend rather than assign, so a detach racing this
@@ -3347,11 +3388,14 @@ enum Acquired {
     RecvError(pgwire_replication::PgWireError),
 }
 
-async fn run_pump(source: Arc<SharedSource>) {
-    // Captured at pump start: the pump stops when the epoch advances (this
-    // Runtime began shutting down); a pump started by a later Runtime in the
-    // same process captures the newer epoch and is unaffected.
-    let shutdown_epoch = crate::cdc::shutdown_epoch();
+async fn run_pump(source: Arc<SharedSource>, shutdown_drain: crate::cdc::ShutdownDrainGuard) {
+    // Captured when the pump was spawned: the pump stops when the epoch advances
+    // (this Runtime began shutting down); a pump started by a later Runtime in
+    // the same process captures the newer epoch and is unaffected. The guard is
+    // held until this returns — on a runtime shutdown, after the final position
+    // write below — and the runtime waits for it before closing the
+    // accelerations that write goes into.
+    let shutdown_epoch = shutdown_drain.epoch();
     let params = source.params.clone();
     let slot_name = source.key.slot_name.clone();
     let publication_name = params.publication_name.clone();
@@ -3514,7 +3558,7 @@ async fn run_pump(source: Arc<SharedSource>) {
                     &e.to_string(),
                     backoff.current().as_millis(),
                 );
-                backoff.wait().await;
+                crate::cdc::until_shutdown(shutdown_epoch, backoff.wait()).await;
                 continue 'reconnect;
             }
             Err(e) => {
@@ -3639,18 +3683,27 @@ async fn run_pump(source: Arc<SharedSource>) {
                     let wait_for = eager_hold
                         .next_flush_in()
                         .map_or(RECV_POLL_INTERVAL, |eager| eager.min(RECV_POLL_INTERVAL));
-                    let polled = tokio::time::timeout(wait_for, client.recv()).await;
+                    let polled = tokio::select! {
+                        polled = tokio::time::timeout(wait_for, client.recv()) => Some(polled),
+                        // Wake for a shutdown as it is signalled, so the position
+                        // flush at the head of the loop runs now rather than at the
+                        // next poll — the runtime is waiting for it. `recv` is
+                        // cancel-safe (see above).
+                        () = crate::cdc::shutdown_signalled(shutdown_epoch) => None,
+                    };
                     input_us_acc = input_us_acc.saturating_add(
                         u64::try_from(recv_start.elapsed().as_micros()).unwrap_or(u64::MAX),
                     );
                     match polled {
-                        Err(_elapsed) => Acquired::Idle,
-                        Ok(Ok(Some(e))) => Acquired::Event(e),
+                        // The poll elapsed, or shutdown was signalled: either way
+                        // re-enter the loop, whose head checks the epoch.
+                        None | Some(Err(_)) => Acquired::Idle,
+                        Some(Ok(Ok(Some(e)))) => Acquired::Event(e),
                         // Server closed cleanly (e.g. orderly Postgres shutdown):
                         // treat like a transient drop and reconnect — the shared
                         // stream is meant to run for the process lifetime.
-                        Ok(Ok(None)) => Acquired::CleanClose,
-                        Ok(Err(e)) => Acquired::RecvError(e),
+                        Some(Ok(Ok(None))) => Acquired::CleanClose,
+                        Some(Ok(Err(e))) => Acquired::RecvError(e),
                     }
                 }
             };
@@ -4008,7 +4061,7 @@ async fn run_pump(source: Arc<SharedSource>) {
         // Mark the drop so the next successful connect can attribute the
         // disconnected duration (this wait + reconnect handshake).
         disconnect_at = Some(std::time::Instant::now());
-        backoff.wait().await;
+        crate::cdc::until_shutdown(shutdown_epoch, backoff.wait()).await;
     } // end 'reconnect
 
     // Fatal exit. Take the setup lock so no subscriber is mid-registration,
@@ -5816,14 +5869,39 @@ mod tests {
         );
     }
 
+    /// A waker that counts its wakes, so a test can observe exactly which
+    /// operation released a future it polls by hand.
+    #[derive(Default)]
+    struct WakeCounter(AtomicUsize);
+
+    impl WakeCounter {
+        fn count(&self) -> usize {
+            self.0.load(Ordering::Acquire)
+        }
+    }
+
+    impl std::task::Wake for WakeCounter {
+        fn wake(self: Arc<Self>) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+
+        fn wake_by_ref(self: &Arc<Self>) {
+            self.0.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
     /// `close` must release a sender parked waiting for capacity, not just the
     /// receiver. `send_control` re-reads `sender_closed` only after a wake, so a
     /// close that woke only the receiver would leave the sender asleep until the
     /// sink drained — and a stalled sink never does. Unreachable today (one
     /// sender per mailbox, all sends from the pump task), which is exactly why it
     /// needs a test: a second sender would turn it into a hang.
-    #[tokio::test]
-    async fn close_releases_a_sender_parked_on_a_full_mailbox() {
+    ///
+    /// The send is polled by hand rather than spawned, so the test proves the
+    /// sender is parked *before* `close` runs — a send that only started after
+    /// the close would see `sender_closed` up front and never exercise the wake.
+    #[test]
+    fn close_releases_a_sender_parked_on_a_full_mailbox() {
         let (tx, _rx) = member_mailbox_with_limits(1, test_limits(8, 8));
         let slot = Arc::new(AckSlot::new(0, false));
         // Fill the single item slot so the next control send must park.
@@ -5837,24 +5915,45 @@ mod tests {
             MailboxSendOutcome::Full(_)
         ));
 
-        let tx = Arc::new(tx);
-        let sender = Arc::clone(&tx);
-        let parked = tokio::spawn(async move {
-            let heartbeat =
-                crate::cdc::build_ready_signal_envelope(&tiny_schema()).expect("second heartbeat");
-            sender.send_control(Ok(heartbeat)).await
-        });
-        // Let it reach the await, then close. The receiver never drains.
-        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        tx.close();
-
-        let returned = tokio::time::timeout(std::time::Duration::from_secs(5), parked)
-            .await
-            .expect("close must release the parked sender rather than hang it")
-            .expect("sender task panicked");
+        let wake_counter = Arc::new(WakeCounter::default());
+        let waker = std::task::Waker::from(Arc::clone(&wake_counter));
+        let mut cx = std::task::Context::from_waker(&waker);
+        let second =
+            crate::cdc::build_ready_signal_envelope(&tiny_schema()).expect("second heartbeat");
+        let mut send = std::pin::pin!(tx.send_control(Ok(second)));
         assert!(
-            returned.is_some(),
-            "a closed mailbox should hand the item back, not swallow it"
+            std::future::Future::poll(send.as_mut(), &mut cx).is_pending(),
+            "a control send into a full mailbox must park waiting for capacity"
+        );
+        assert_eq!(
+            wake_counter.count(),
+            0,
+            "nothing has freed capacity or closed the mailbox yet, so the parked sender must stay asleep"
+        );
+
+        // The receiver never drains: only `close` can release the sender.
+        tx.close();
+        assert_eq!(
+            wake_counter.count(),
+            1,
+            "close must wake the sender parked on capacity exactly once"
+        );
+
+        let std::task::Poll::Ready(returned) = std::future::Future::poll(send.as_mut(), &mut cx)
+        else {
+            panic!("a woken sender on a closed mailbox must return rather than park again");
+        };
+        let envelope = returned
+            .expect("a closed mailbox should hand the item back, not swallow it")
+            .expect("the handed-back item is the heartbeat that was sent, not an error");
+        assert!(
+            envelope.is_heartbeat() && envelope.is_dataset_ready(),
+            "the handed-back item must be the ready-signal heartbeat that was parked"
+        );
+        assert_eq!(
+            tx.shared.buffered_items.load(Ordering::Acquire),
+            1,
+            "only the original change may occupy the mailbox; the parked control item must not be enqueued"
         );
     }
 
@@ -6565,6 +6664,100 @@ mod tests {
         // And the member still counts as idle for crediting.
         ack.credit_idle(700);
         assert_eq!(ack.flush_lsn(), 700);
+    }
+
+    #[tokio::test]
+    async fn deferred_metadata_shared_committer_retains_real_position_and_notification() {
+        let slot = Arc::new(AckSlot::new(10, false));
+        let notify = Arc::new(Notify::new());
+        let make = |flush_to, source_commit_ts_ms| SharedLsnCommitter {
+            slot: Arc::clone(&slot),
+            watermark_notify: Arc::clone(&notify),
+            flush_to,
+            dataset: "customer".into(),
+            source_commit_ts_ms,
+        };
+        let mut committer = make(20, Some(2));
+        assert!(committer.try_absorb(&make(40, Some(4))));
+        assert!(committer.try_absorb(&make(30, None)));
+        assert_eq!(committer.flush_to, 40);
+        assert_eq!(committer.source_commit_ts_ms, Some(4));
+        assert_eq!(
+            slot.committed(),
+            10,
+            "coalescing cannot acknowledge the source"
+        );
+        assert_eq!(
+            slot.pending(),
+            0,
+            "coalescing cannot persist a source position"
+        );
+        committer.commit().await.expect("durable commit");
+        assert_eq!(slot.committed(), 40);
+        assert_eq!(slot.pending(), 40);
+        tokio::time::timeout(std::time::Duration::from_secs(1), notify.notified())
+            .await
+            .expect("the retained committer wakes the position writer");
+        committer.commit().await.expect("retry is idempotent");
+        assert_eq!(slot.committed(), 40);
+    }
+
+    #[test]
+    fn deferred_metadata_shared_committer_rejects_other_identity_without_mutation() {
+        let slot = Arc::new(AckSlot::new(10, false));
+        let notify = Arc::new(Notify::new());
+        let make = || SharedLsnCommitter {
+            slot: Arc::clone(&slot),
+            watermark_notify: Arc::clone(&notify),
+            flush_to: 20,
+            dataset: "customer".into(),
+            source_commit_ts_ms: Some(2),
+        };
+        let mut committer = make();
+        let mut other = make();
+        other.flush_to = 50;
+        other.slot = Arc::new(AckSlot::new(10, false));
+        assert!(
+            !committer.try_absorb(&other),
+            "another member or generation"
+        );
+        other = make();
+        other.watermark_notify = Arc::new(Notify::new());
+        assert!(!committer.try_absorb(&other), "another position writer");
+        other = make();
+        other.dataset = "stock".into();
+        assert!(!committer.try_absorb(&other), "another logical source");
+        assert!(!committer.try_absorb(&crate::cdc::NoOpCommitter));
+        assert_eq!(committer.flush_to, 20);
+        assert_eq!(committer.source_commit_ts_ms, Some(2));
+        assert_eq!(slot.committed(), 10);
+        assert_eq!(slot.pending(), 0);
+    }
+
+    #[test]
+    fn deferred_metadata_shared_committer_preserves_max_lsn_timestamp() {
+        let slot = Arc::new(AckSlot::new(0, false));
+        let notify = Arc::new(Notify::new());
+        let mut first = SharedLsnCommitter {
+            slot: Arc::clone(&slot),
+            watermark_notify: Arc::clone(&notify),
+            flush_to: u64::MAX - 1,
+            dataset: "customer".into(),
+            source_commit_ts_ms: Some(5),
+        };
+        let last = SharedLsnCommitter {
+            slot,
+            watermark_notify: notify,
+            flush_to: u64::MAX,
+            dataset: "customer".into(),
+            source_commit_ts_ms: None,
+        };
+        assert!(first.try_absorb(&last));
+        assert_eq!(first.flush_to, u64::MAX);
+        assert_eq!(
+            first.source_commit_ts_ms, None,
+            "timestamp belongs to the retained LSN"
+        );
     }
 
     #[tokio::test]
@@ -7621,6 +7814,104 @@ mod tests {
             t0.num_rows_hint(),
             1,
             "commits above the recorded position are delivered"
+        );
+    }
+
+    /// An [`AppliedLsnStore`] whose first `save` parks until released, so a test can
+    /// hold the background writer mid-write while another write runs.
+    #[derive(Default)]
+    struct GatedLsnStore {
+        stored: ParkingMutex<Option<u64>>,
+        gate_open: AtomicBool,
+        entered: Notify,
+        release: Notify,
+    }
+
+    #[async_trait]
+    impl AppliedLsnStore for GatedLsnStore {
+        async fn load(
+            &self,
+        ) -> std::result::Result<
+            crate::postgres_replication::RecordedPosition,
+            Box<dyn std::error::Error + Send + Sync>,
+        > {
+            Ok(crate::postgres_replication::RecordedPosition::Absent)
+        }
+
+        async fn save(
+            &self,
+            applied: AppliedLsn,
+        ) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            if !self.gate_open.swap(true, Ordering::AcqRel) {
+                self.entered.notify_one();
+                self.release.notified().await;
+            }
+            *self.stored.lock() = Some(applied.lsn);
+            Ok(())
+        }
+
+        async fn clear(&self) -> std::result::Result<(), Box<dyn std::error::Error + Send + Sync>> {
+            Ok(())
+        }
+    }
+
+    /// The pump's final write at shutdown must not be overtaken by a writer pass
+    /// that captured an older position before it (#14523): the runtime's shutdown
+    /// drain ends when the pump returns, so a stale save landing after it moves the
+    /// recorded position backwards and the next start rebuilds the acceleration.
+    #[tokio::test]
+    async fn final_position_write_is_not_overtaken_by_an_in_flight_writer_pass() {
+        let (source, _probes) = test_source_with_members(0);
+        let store = Arc::new(GatedLsnStore::default());
+        let member_key = key("t0");
+        let (sender, _rx) = member_mailbox(4);
+        lock(&source.members).insert(
+            member_key.clone(),
+            Arc::new(MemberHandle {
+                applied_lsn_store: Arc::clone(&store) as Arc<dyn AppliedLsnStore>,
+                watermark_notify: Arc::new(Notify::new()),
+                dataset_name: "ds0".into(),
+                schema: tiny_schema(),
+                primary_keys: vec![],
+                generated_columns: vec![],
+                policy: SchemaEvolutionPolicy::Block,
+                sender,
+                metrics: ReplicationMetricsCollector::new(),
+                ready_lag: crate::cdc::DEFAULT_READY_LAG,
+                write_back_registry: None,
+            }),
+        );
+        source.ack.register(&member_key, false);
+        let slot = source
+            .ack
+            .slot(&member_key)
+            .expect("member slot registered");
+
+        // The background writer captures 100 and parks inside the store.
+        slot.note_pending(100);
+        let writer = tokio::spawn({
+            let source = Arc::clone(&source);
+            async move { write_published_positions(&source).await }
+        });
+        store.entered.notified().await;
+
+        // The pump publishes 200 and runs its final write while the writer is parked.
+        slot.note_pending(200);
+        let final_write = tokio::spawn({
+            let source = Arc::clone(&source);
+            async move { write_published_positions(&source).await }
+        });
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+        store.release.notify_one();
+        writer.await.expect("writer pass completes");
+        final_write.await.expect("final write completes");
+
+        assert_eq!(
+            *store.stored.lock(),
+            Some(200),
+            "the recorded position must be the newest published one, not an older value an in-flight writer pass landed afterwards"
         );
     }
 }

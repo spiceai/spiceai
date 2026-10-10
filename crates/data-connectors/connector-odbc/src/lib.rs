@@ -394,9 +394,10 @@ mod test {
 
     /// Regression test for #14482 on the ODBC route: the MySQL, PostgreSQL and
     /// Athena profiles reach engines that round a fractional-to-integer cast
-    /// `DataFusion` truncates, so their policy must keep the cast local, where
-    /// the SQLite profile, which truncates too, and a profile with no engine
-    /// keep the plain policy and the pushdown.
+    /// `DataFusion` truncates, so their policy must keep the cast local. The
+    /// `SQLite` profile keeps it local too, under the `SQLite` gate: `SQLite`
+    /// saturates a float past `i64` where `DataFusion` refuses it. A profile
+    /// with no engine keeps the plain policy and the pushdown.
     #[test]
     fn a_fractional_to_integer_cast_stays_local_on_the_odbc_profiles_that_round() {
         use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder};
@@ -416,19 +417,16 @@ mod test {
             ODBCProfile::MySql,
             ODBCProfile::PostgreSql,
             ODBCProfile::Athena,
+            ODBCProfile::Sqlite,
         ] {
             let support = function_support_for_engine(profile.engine());
             assert!(
                 contains_unsupported_functions(&plan_projecting(rounding.clone()), &support)
                     .expect("the support check must not error"),
-                "the {profile:?} profile rounds {rounding}, so its policy must keep it local"
+                "the {profile:?} profile does not evaluate {rounding} as DataFusion does, so its policy must keep it local"
             );
         }
-        for profile in [
-            ODBCProfile::Sqlite,
-            ODBCProfile::Databricks,
-            ODBCProfile::Unknown,
-        ] {
+        for profile in [ODBCProfile::Databricks, ODBCProfile::Unknown] {
             let support = function_support_for_engine(profile.engine());
             assert!(
                 !contains_unsupported_functions(&plan_projecting(rounding.clone()), &support)
@@ -440,6 +438,47 @@ mod test {
             SQLDialectParam::new("postgresql").0,
             "postgresql",
             "the sql_dialect parameter is the engine name the gate keys on"
+        );
+    }
+
+    /// Regression test for #14753 and #14754 on the ODBC route: `SQLite` has
+    /// no date, time or interval types, so the `SQLite` profile keeps a
+    /// timestamp literal, a date literal and an interval local, while a plain
+    /// literal still pushes down.
+    #[test]
+    fn a_temporal_value_stays_local_on_the_odbc_sqlite_profile() {
+        use datafusion::logical_expr::{LogicalPlan, LogicalPlanBuilder};
+        use datafusion::prelude::lit;
+        use datafusion::scalar::ScalarValue;
+        use datafusion_table_providers::util::supported_functions::contains_unsupported_functions;
+
+        fn plan_projecting(expr: datafusion::prelude::Expr) -> LogicalPlan {
+            LogicalPlanBuilder::values(vec![vec![lit(1_i64)]])
+                .expect("values")
+                .project(vec![expr])
+                .expect("project")
+                .build()
+                .expect("build plan")
+        }
+        let sqlite = function_support_for_engine(ODBCProfile::Sqlite.engine());
+        for temporal in [
+            cast(
+                lit("2026-01-30 23:00:00"),
+                DataType::Timestamp(datafusion::arrow::datatypes::TimeUnit::Nanosecond, None),
+            ),
+            cast(lit("2026-01-31"), DataType::Date32),
+            lit(ScalarValue::new_interval_mdn(0, 0, 3_600_000_000_000)),
+        ] {
+            assert!(
+                contains_unsupported_functions(&plan_projecting(temporal.clone()), &sqlite)
+                    .expect("the support check must not error"),
+                "the Sqlite profile must keep {temporal} local"
+            );
+        }
+        assert!(
+            !contains_unsupported_functions(&plan_projecting(lit(1_i64)), &sqlite)
+                .expect("the support check must not error"),
+            "the Sqlite profile must still push down a plain literal"
         );
     }
 

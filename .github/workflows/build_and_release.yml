@@ -300,21 +300,26 @@ jobs:
           # gets its own; unchanged on Apple Silicon. A derived value carries an injection
           # surface a literal does not — a two-line `$GITHUB_ENV` entry appends a second
           # variable to every later step — so refuse one, as `setup-cc` does for its own.
-          rustflags="-L $brew_prefix/lib"
+          #
+          # Only the unixodbc keg, never `$brew_prefix/lib`. A RUSTFLAGS `-L` is searched
+          # before a build script's own `rustc-link-search`, so whatever static library
+          # Homebrew has linked into `$brew_prefix/lib` under the same name replaces the
+          # vendored one when rustc bundles it. With a foreign `libcrypto.a` there,
+          # openssl-sys bundles that instead of the vendored OpenSSL that librdkafka was
+          # compiled against, and the link fails on undefined `_ENGINE_*` symbols. The keg
+          # holds only the libodbc* families, which is all the odbc build needs.
+          rustflags="-L $brew_prefix/opt/unixodbc/lib"
           if [ "$(printf '%s' "$rustflags" | wc -l | tr -d ' ')" != "0" ]; then
             echo "::error::Refusing to export a multi-line RUSTFLAGS built from '$brew_prefix'."
             exit 1
           fi
           echo "RUSTFLAGS=$rustflags" >> "$GITHUB_ENV"
           # The probe above accepts an unlinked unixodbc keg — `$brew_prefix/opt/unixodbc`
-          # exists for a formula that was never linked — and in that state the `-L` above
-          # points at a directory holding no `libodbc.dylib`, so the link dies downstream as
-          # "ld: library 'odbc' not found" (#13475). Before this step probed, `brew install
-          # unixodbc` ran every time and linked it, so the gap is this step's to close.
-          # `setup-cc` covers the same case by publishing the keg's own lib directory, and
-          # deliberately only that one: `$brew_prefix/lib` additionally satisfies -lcrypto,
-          # -lssl and -lzstd, so a crate whose build script emits one of those names would
-          # link a second, differently-built copy. clang expands LIBRARY_PATH into -L entries
+          # exists for a formula that was never linked — and in that state nothing under
+          # `$brew_prefix/lib` holds `libodbc.dylib`, so a link that searched only there
+          # would die as "ld: library 'odbc' not found" (#13475). The keg's own lib
+          # directory covers it, for rustc above and for the C toolchain here, as `setup-cc`
+          # does for every other macOS job. clang expands LIBRARY_PATH into -L entries
           # after those already on the command line, so this restores the search path without
           # displacing anything a build script emitted, and it is not a cargo fingerprint
           # input, so it costs no rebuild.
@@ -552,7 +557,7 @@ jobs:
           # Pass the notes by path, not by value: a release body over 128 KiB
           # exceeds MAX_ARG_STRLEN and the exec fails with E2BIG (exit 126)
           # after every build has already succeeded.
-          if [ "$LATEST_RELEASE" = "true" ]; then
+          if [ "$HAS_RELEASE_NOTES" = "true" ]; then
             BODY_ARGS=(--body-file "./docs/release_notes/v${{ env.REL_VERSION }}.md")
           else
             BODY_ARGS=(--body "This is the release candidate ${{ env.REL_VERSION }}")

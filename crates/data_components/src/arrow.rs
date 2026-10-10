@@ -34,7 +34,7 @@ pub mod indexed;
 pub mod struct_builder;
 pub mod write;
 
-pub use indexed::IndexedMemTable;
+pub use indexed::{IndexedMemTable, unique_index_warning};
 
 #[derive(Debug)]
 pub struct ArrowFactory {}
@@ -71,9 +71,10 @@ fn extract_primary_key_columns(
 /// Represents an index type from the spicepod configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexType {
-    /// A standard index that allows duplicates (not fully utilized yet with hash index).
+    /// A standard index. On Arrow it serves lookups while the column's values are
+    /// distinct; a repeated value disables it until a refresh removes the repeat.
     Enabled,
-    /// A unique index that enforces uniqueness.
+    /// Declared unique. Arrow does not enforce it on write and treats it as `Enabled`.
     Unique,
 }
 
@@ -170,7 +171,8 @@ impl TableProviderFactory for ArrowFactory {
             }
 
             let mut indexed_table =
-                IndexedMemTable::try_new(Arc::clone(&schema), vec![], primary_key_columns)?;
+                IndexedMemTable::try_new(Arc::clone(&schema), vec![], primary_key_columns)?
+                    .with_table_name(cmd.name.to_string());
 
             // Create secondary indexes from parsed config
             if !indexes_config.is_empty() {
@@ -190,10 +192,11 @@ impl TableProviderFactory for ArrowFactory {
                     }
 
                     // Build hash index for secondary columns
-                    // Note: For empty table, we create the index structure; it will be populated on insert
+                    // Note: For empty table, we create the index structure; it will be populated on insert.
+                    // Either index type is rebuilt strictly after each write (see IndexedMemTable::rebuild_index).
                     let partitions: Vec<Vec<arrow::array::RecordBatch>> = vec![];
                     let hash_index = HashIndexBuilder::new(columns.clone())
-                        .allow_duplicates(!is_unique)
+                        .allow_duplicates(false)
                         .build(&partitions)
                         .map_err(|e| {
                             DataFusionError::Execution(format!(
@@ -288,6 +291,7 @@ mod tests {
     use datafusion::common::{Constraint, Constraints};
     use datafusion::execution::SessionStateBuilder;
     use datafusion::logical_expr::CreateExternalTable;
+    use datafusion::prelude::SessionContext;
     use std::collections::HashMap;
 
     fn create_test_schema() -> Schema {
@@ -581,8 +585,16 @@ mod tests {
             ("col2", arrow::datatypes::DataType::Utf8),
         ]);
 
-        let result = parse_indexes_option("(col1,invalid):unique", &schema);
-        let _ = result.expect_err("expected error for invalid column");
+        let err = parse_indexes_option("(col1,invalid):unique", &schema)
+            .expect_err("expected error for invalid column");
+        assert!(
+            matches!(
+                &err,
+                DataFusionError::Configuration(message)
+                    if message == "Index column 'invalid' not found in schema"
+            ),
+            "the compound key must be rejected as a configuration error naming 'invalid', got: {err:?}"
+        );
     }
 
     #[test]
@@ -903,5 +915,136 @@ mod tests {
             .downcast_ref::<Int64Array>()
             .expect("expected int64");
         assert_eq!(custkey_col.value(0), 42);
+    }
+
+    /// A `sender_id` table indexed as `index_type`, created the way the runtime creates it:
+    /// a `unique` index also carries a `Unique` constraint.
+    async fn sender_table(index_type: &str) -> (SessionContext, Arc<dyn TableProvider>) {
+        let schema = Schema::new(vec![
+            Field::new("sender_id", arrow::datatypes::DataType::Utf8, true),
+            Field::new("n", arrow::datatypes::DataType::Int64, false),
+        ]);
+        let constraints = if index_type == "unique" {
+            vec![Constraint::Unique(vec![0])]
+        } else {
+            vec![]
+        };
+        let cmd = CreateExternalTable {
+            schema: Arc::new(
+                datafusion::common::DFSchema::try_from(schema).expect("schema conversion"),
+            ),
+            name: "t".into(),
+            locations: vec![],
+            file_type: String::new(),
+            table_partition_cols: vec![],
+            if_not_exists: false,
+            or_replace: false,
+            temporary: false,
+            definition: None,
+            order_exprs: vec![],
+            unbounded: false,
+            options: HashMap::from([
+                ("hash_index".to_string(), "enabled".to_string()),
+                ("indexes".to_string(), format!("sender_id:{index_type}")),
+            ]),
+            constraints: Constraints::new_unverified(constraints),
+            column_defaults: HashMap::new(),
+        };
+        let state = SessionStateBuilder::new().build();
+        let table = ArrowFactory::new()
+            .create(&state, &cmd)
+            .await
+            .expect("failed to create table");
+        let ctx = SessionContext::new();
+        ctx.register_table("t", Arc::clone(&table))
+            .expect("failed to register");
+        (ctx, table)
+    }
+
+    /// Runs `sql` as the runtime's sinks write: rebuilding the indexes afterwards.
+    async fn write(ctx: &SessionContext, table: &Arc<dyn TableProvider>, sql: &str) {
+        ctx.sql(sql)
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect("write");
+        crate::index_maintenance::perform_index_maintenance(table.as_ref())
+            .await
+            .expect("index maintenance");
+    }
+
+    async fn query(ctx: &SessionContext, sql: &str) -> String {
+        let batches = ctx
+            .sql(sql)
+            .await
+            .expect("query failed")
+            .collect()
+            .await
+            .expect("collect failed");
+        arrow::util::pretty::pretty_format_batches(&batches)
+            .expect("format")
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn test_enabled_index_serves_lookups_while_keys_are_distinct() {
+        let (ctx, table) = sender_table("enabled").await;
+        write(
+            &ctx,
+            &table,
+            "INSERT INTO t VALUES ('a', 1), ('b', 2), (NULL, 3)",
+        )
+        .await;
+
+        let plan = query(&ctx, "EXPLAIN SELECT n FROM t WHERE sender_id = 'a'").await;
+        assert!(
+            plan.contains("IndexedLookupExec: indexed_scan on [sender_id]"),
+            "an enabled index must serve the lookup: {plan}"
+        );
+        let hit = query(&ctx, "SELECT n FROM t WHERE sender_id = 'a'").await;
+        assert!(hit.contains("| 1 |"), "{hit}");
+        let miss = query(&ctx, "SELECT count(*) AS c FROM t WHERE sender_id = 'z'").await;
+        assert!(miss.contains("| 0 |"), "{miss}");
+    }
+
+    /// A `unique` index used to answer a lookup on a repeated key with one of its rows.
+    #[tokio::test]
+    async fn test_repeated_key_disables_the_index_until_a_refresh_removes_it() {
+        for index_type in ["unique", "enabled"] {
+            let (ctx, table) = sender_table(index_type).await;
+            let indexed = (table.as_ref() as &dyn std::any::Any)
+                .downcast_ref::<IndexedMemTable>()
+                .expect("indexed table");
+
+            write(
+                &ctx,
+                &table,
+                "INSERT INTO t VALUES ('a', 1), ('b', 2), ('a', 3)",
+            )
+            .await;
+            assert!(
+                !indexed.secondary_indexes()[0].is_usable(),
+                "{index_type}: a repeated key must disable the index"
+            );
+            let plan = query(&ctx, "EXPLAIN SELECT n FROM t WHERE sender_id = 'a'").await;
+            assert!(
+                !plan.contains("IndexedLookupExec"),
+                "{index_type}: lookups must scan the table: {plan}"
+            );
+            assert_eq!(
+                query(&ctx, "SELECT n FROM t WHERE sender_id = 'a' ORDER BY n").await,
+                "+---+\n| n |\n+---+\n| 1 |\n| 3 |\n+---+",
+                "{index_type}: every row of the key"
+            );
+
+            write(&ctx, &table, "INSERT OVERWRITE t VALUES ('a', 1), ('b', 2)").await;
+            assert!(
+                indexed.secondary_indexes()[0].is_usable(),
+                "{index_type}: distinct keys make the index usable again"
+            );
+            let plan = query(&ctx, "EXPLAIN SELECT n FROM t WHERE sender_id = 'a'").await;
+            assert!(plan.contains("IndexedLookupExec"), "{index_type}: {plan}");
+        }
     }
 }

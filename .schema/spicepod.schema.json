@@ -688,7 +688,7 @@
           ]
         },
         "state": {
-          "description": "Shared object-store location for runtime state (`file://`, `s3://`, `abfs://`, `abfss://`). Used for SQL results-cache warmup, source rate-control, and distributed query state when those sections do not set their own `state_location`.",
+          "description": "Shared object-store location for runtime state (`file://`, `s3://`, `abfs://`, `abfss://`). Used for SQL results-cache warmup, cluster source rate control, and distributed query state. A `runtime.scheduler.state_location` overrides it for the scheduler.",
           "anyOf": [
             {
               "$ref": "#/$defs/RuntimeState"
@@ -1771,26 +1771,8 @@
     "SourceRateControl": {
       "type": "object",
       "properties": {
-        "state_location": {
-          "description": "Root URI for globally persisted source rate-control state.",
-          "type": [
-            "string",
-            "null"
-          ]
-        },
-        "params": {
-          "description": "Optional object store params for source rate-control state.",
-          "anyOf": [
-            {
-              "$ref": "#/$defs/Params"
-            },
-            {
-              "type": "null"
-            }
-          ]
-        },
         "refresh_interval": {
-          "description": "How often each runtime refreshes and persists per-source rate-control state in object storage.",
+          "description": "How often each runtime refreshes and persists per-source rate-control state at `runtime.state.location`.",
           "type": "string",
           "default": "30s"
         },
@@ -3122,6 +3104,7 @@
           "default": "auto"
         },
         "engine": {
+          "description": "The acceleration engine. Defaults to `cayenne`, or to `arrow` on Windows, where\nCayenne is not available.",
           "type": [
             "string",
             "null"
@@ -3190,7 +3173,7 @@
           ]
         },
         "params": {
-          "description": "Configuration parameters for the acceleration engine. The available parameters depend on the engine type specified in 'engine' (default: arrow). Available engines: arrow, cayenne, duckdb, postgres, sqlite, turso.",
+          "description": "Configuration parameters for the acceleration engine. The available parameters depend on the engine type specified in 'engine' (default: cayenne). Available engines: arrow, cayenne, duckdb, postgres, sqlite, turso.",
           "anyOf": [
             {
               "$ref": "#/$defs/Params"
@@ -3466,7 +3449,7 @@
               "params": {
                 "anyOf": [
                   {
-                    "$ref": "#/$defs/ArrowAcceleratorParams"
+                    "$ref": "#/$defs/CayenneAcceleratorParams"
                   },
                   {
                     "type": "null"
@@ -22680,7 +22663,7 @@
       "type": "object",
       "properties": {
         "from": {
-          "description": "Model source for TypeSafe System One evaluation (Jev). Accepts `typesafe`, `typesafe:<model_id>`, or `typesafe/<model_id>`. Chat completions are not supported; use POST /v1/evaluate.",
+          "description": "Model source for TypeSafe System One evaluation (Jev). Accepts `typesafe`, `typesafe:<model_id>`, or `typesafe/<model_id>`. Chat completions are not supported; use POST /v1/decisions or the SQL decision functions.",
           "type": "string",
           "pattern": "^typesafe($|:.+|/.+)"
         },

@@ -181,9 +181,12 @@ async fn the_cache_holds_about_what_it_reports_holding() {
                 .build();
 
             let rt = Arc::new(Runtime::builder().with_app(app).build().await);
-            tokio::time::timeout(Duration::from_mins(2), Arc::clone(&rt).load_components())
-                .await
-                .expect("the dataset should load within two minutes");
+            tokio::time::timeout(
+                Duration::from_mins(2),
+                Box::pin(Arc::clone(&rt).load_components()),
+            )
+            .await
+            .expect("the dataset should load within two minutes");
 
             // The accelerator has to finish its first refresh before a query
             // against it will run at all.

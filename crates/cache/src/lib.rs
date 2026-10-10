@@ -114,6 +114,11 @@ pub enum Error {
         "Invalid hashing algorithm. Please refer to the documentation for supported algorithms: https://spiceai.org/docs/features/caching#choosing-a-hashing_algorithm"
     ))]
     InvalidHashingAlgorithm,
+
+    #[snafu(display(
+        "The query result ({size} bytes) is larger than the SQL results cache max_size ({max_size} bytes), so it was not cached"
+    ))]
+    ResultLargerThanMaxSize { size: u64, max_size: u64 },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -252,6 +257,20 @@ pub trait CacheProvider<V: Clone + Send + Sync + 'static>:
         key: &u64,
         value: V,
         should_replace: &(dyn for<'v> Fn(&'v V) -> bool + Send + Sync),
+    ) -> bool;
+    /// Insert `value`, or replace the resident, only when `admit` accepts the
+    /// current value (`None` when the key is empty).
+    ///
+    /// Deliberately has no default. A default that always inserted would let a
+    /// slower read overwrite a later one on any wrapper that forgot to forward
+    /// the method. `weight` is what [`Sizeable::get_memory_size`] returns for
+    /// `value`; a cache that bounds entries by count ignores it.
+    async fn put_if(
+        &self,
+        key: &u64,
+        value: V,
+        weight: usize,
+        admit: &(dyn for<'v> Fn(Option<&'v V>) -> bool + Send + Sync),
     ) -> bool;
     async fn invalidate_all(&self);
     async fn size_bytes(&self) -> u64;
@@ -1108,13 +1127,15 @@ impl QueryResultsCacheProvider {
     /// lookup could serve it; keeping an entry that read later counts as stored.
     ///
     /// A result whose tables changed while it ran is stored only inside a
-    /// `stale_while_revalidate_ttl` window, to be served stale, and never over
-    /// an entry whose read began later. `weight` is
-    /// `result.get_memory_size()` when already computed.
+    /// `stale_while_revalidate_ttl` window, to be served stale. Fresh and stale
+    /// admissions both use a timestamp-ordered insert, so a write that was
+    /// `Valid` when the query started cannot replace a later resident after
+    /// encoding. `weight` is `result.get_memory_size()` when already computed.
     ///
     /// # Errors
     ///
-    /// Will return `Err` if method fails to access the cache
+    /// Will return `Err` if method fails to access the cache, or
+    /// [`Error::ResultLargerThanMaxSize`] when `result` is heavier than `max_size`.
     pub async fn store_raw_key(
         &self,
         raw_key: &RawCacheKey,
@@ -1133,55 +1154,29 @@ impl QueryResultsCacheProvider {
                 );
                 Ok(false)
             }
-            EntryValidity::Valid => {
-                self.put_with_optional_weight(raw_key, result, weight)
-                    .await?;
-                Ok(true)
-            }
-            EntryValidity::StaleWhileRevalidate => {
-                let read_started_at = result.read_started_at;
-                // The predicate runs only for a resident entry, so not running
-                // it means the key is empty.
-                let resident_seen = std::sync::atomic::AtomicBool::new(false);
-                let replaced = self
-                    .cache
-                    .replace_if(
-                        &raw_key.as_u64(),
-                        result.clone(),
-                        &|current: &CachedQueryResult| {
-                            resident_seen.store(true, std::sync::atomic::Ordering::Relaxed);
-                            current.read_started_at < read_started_at
-                        },
-                    )
-                    .await;
-                if replaced {
-                    return Ok(true);
+            EntryValidity::Valid | EntryValidity::StaleWhileRevalidate => {
+                let weight = weight.unwrap_or_else(|| result.get_memory_size());
+                // The cache refuses a result heavier than `max_size` before it consults
+                // the resident. That refusal is neither storage nor invalidation, and the
+                // key may stay empty, so it is an error the caller can tell apart.
+                let weight_bytes = u64::try_from(weight).unwrap_or(u64::MAX);
+                if weight_bytes > self.cache_max_size {
+                    return ResultLargerThanMaxSizeSnafu {
+                        size: weight_bytes,
+                        max_size: self.cache_max_size,
+                    }
+                    .fail();
                 }
-                if resident_seen.load(std::sync::atomic::Ordering::Relaxed) {
+                let stored = self
+                    .put_raw_key_unless_older_read(raw_key, result, weight)
+                    .await?;
+                if !stored {
                     tracing::debug!(
                         "A result from a query that began later is already cached under this key, keeping it"
                     );
-                    return Ok(true);
                 }
-                // A concurrent store landing before this write is overwritten.
-                // Every hit re-rules the entry left behind, so this costs
-                // freshness, not correctness.
-                self.put_with_optional_weight(raw_key, result, weight)
-                    .await?;
                 Ok(true)
             }
-        }
-    }
-
-    async fn put_with_optional_weight(
-        &self,
-        raw_key: &RawCacheKey,
-        result: CachedQueryResult,
-        weight: Option<usize>,
-    ) -> Result<()> {
-        match weight {
-            Some(weight) => self.put_raw_key_with_weight(raw_key, result, weight).await,
-            None => self.put_raw_key(raw_key, result).await,
         }
     }
 
@@ -1484,6 +1479,33 @@ impl QueryResultsCacheProvider {
         read_started_at: std::time::Instant,
     ) -> bool {
         self.table_changes.changed_since(tables, read_started_at)
+    }
+
+    /// Store `result` unless a resident of `raw_key` began reading at least as
+    /// late as `result`.
+    ///
+    /// The comparison and the write share the shard lock, so a slower result
+    /// cannot overwrite one the predicate has already rejected. Used for both
+    /// fresh and stale admissions: [`Self::entry_validity`] still refuses to
+    /// return a stale result as a fresh hit.
+    ///
+    /// # Errors
+    ///
+    /// Will return `Err` if the cache write fails.
+    pub async fn put_raw_key_unless_older_read(
+        &self,
+        raw_key: &RawCacheKey,
+        result: CachedQueryResult,
+        weight: usize,
+    ) -> Result<bool> {
+        let read_started_at = result.read_started_at;
+        let stored = self
+            .cache
+            .put_if(&raw_key.as_u64(), result, weight, &|current| {
+                current.is_none_or(|existing| existing.read_started_at < read_started_at)
+            })
+            .await;
+        Ok(stored)
     }
 
     #[must_use]
@@ -2009,13 +2031,21 @@ mod tests {
             .await
             .expect("cache access should succeed");
 
-        assert!(
-            provider
-                .get_raw_key(&key)
-                .await
-                .expect("cache access should succeed")
-                .is_some(),
-            "an entry for an uninvalidated table must remain cached"
+        let served = provider
+            .get_raw_key(&key)
+            .await
+            .expect("cache access should succeed")
+            .expect("an entry for an uninvalidated table must remain cached");
+        // The served entry is the one stored, with the read start it was stored with:
+        // the `orders` invalidation, later than that read start, must not touch it.
+        assert_eq!(
+            *served.input_tables,
+            HashSet::from([TableReference::bare("customer")]),
+            "the served entry must be the result stored for `customer`"
+        );
+        assert_eq!(
+            served.read_started_at, read_started_at,
+            "the served entry must carry the read start it was stored with"
         );
     }
 
@@ -2665,6 +2695,15 @@ mod tests {
         ) -> bool {
             false
         }
+        async fn put_if(
+            &self,
+            _key: &u64,
+            _value: V,
+            _weight: usize,
+            _admit: &(dyn for<'v> Fn(Option<&'v V>) -> bool + Send + Sync),
+        ) -> bool {
+            false
+        }
         async fn invalidate_all(&self) {}
         async fn size_bytes(&self) -> u64 {
             0
@@ -3266,6 +3305,42 @@ mod tests {
         }
     }
 
+    /// A result heavier than `max_size` is refused before any resident is consulted.
+    /// That is reported as its own error, not as storage or invalidation, and the key
+    /// stays empty.
+    #[tokio::test]
+    async fn store_raw_key_reports_a_result_heavier_than_the_cache_as_an_error() {
+        let provider =
+            QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
+                .expect("valid provider");
+        let key = RawCacheKey::new(1);
+        let max_size = provider.max_size();
+        let too_heavy = usize::try_from(max_size).expect("max_size fits usize") + 1;
+
+        let err = provider
+            .store_raw_key(
+                &key,
+                cached_result_for("customer", Instant::now()).await,
+                Some(too_heavy),
+            )
+            .await
+            .expect_err("a result heavier than max_size is not stored");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "The query result ({too_heavy} bytes) is larger than the SQL results cache max_size ({max_size} bytes), so it was not cached"
+            )
+        );
+        assert!(
+            provider
+                .get_raw_key(&key)
+                .await
+                .expect("cache access should succeed")
+                .is_none(),
+            "the key stays empty"
+        );
+    }
+
     /// Without a stale window, an overtaken result is not stored.
     #[tokio::test]
     async fn store_raw_key_drops_a_result_overtaken_by_a_change_without_a_stale_window() {
@@ -3409,6 +3484,121 @@ mod tests {
                 .expect("cache access should succeed")
                 .is_some(),
             "the newer result read after the change and is still served fresh"
+        );
+    }
+
+    /// Both writes are still fresh (`Valid`) — no table change — so this is
+    /// the admission that used an unconditional insert. The later resident
+    /// must stay; overwriting it would move the cache backwards.
+    #[tokio::test]
+    async fn store_raw_key_keeps_a_newer_resident_over_an_older_fresh_result() {
+        let provider =
+            QueryResultsCacheProvider::try_new(&config_with_stale_window("5m"), Box::new([]))
+                .expect("valid provider");
+        let key = RawCacheKey::new(7);
+        let tables = HashSet::from([TableReference::bare("customer")]);
+
+        let older_read = Instant::now();
+        tick().await;
+        let newer_read = Instant::now();
+
+        assert_eq!(
+            provider.entry_validity(&tables, older_read, Instant::now()),
+            EntryValidity::Valid,
+            "the older write is still a fresh admission"
+        );
+        assert_eq!(
+            provider.entry_validity(&tables, newer_read, Instant::now()),
+            EntryValidity::Valid,
+            "the newer write is a fresh admission"
+        );
+
+        assert!(
+            provider
+                .store_raw_key(&key, cached_result_for("customer", newer_read).await, None)
+                .await
+                .expect("cache access should succeed")
+        );
+        assert!(
+            provider
+                .store_raw_key(&key, cached_result_for("customer", older_read).await, None)
+                .await
+                .expect("cache access should succeed")
+        );
+
+        assert_eq!(
+            resident_read_started_at(&provider, &key).await,
+            Some(newer_read),
+            "a fresh admission must not replace a resident that began reading later"
+        );
+        assert!(
+            provider
+                .get_raw_key(&key)
+                .await
+                .expect("cache access should succeed")
+                .is_some(),
+            "the newer result is still served fresh"
+        );
+    }
+
+    /// Q1 is Valid when it starts, a table then changes, Q2 stores, then Q1
+    /// writes. The newer resident must stay so the hit path cannot serve Q1
+    /// as stale.
+    #[tokio::test]
+    async fn store_raw_key_keeps_a_newer_resident_when_invalidation_lands_between_admission_and_write()
+     {
+        let provider =
+            QueryResultsCacheProvider::try_new(&config_with_stale_window("5m"), Box::new([]))
+                .expect("valid provider");
+        let key = RawCacheKey::new(8);
+        let tables = HashSet::from([TableReference::bare("customer")]);
+
+        let q1_started = Instant::now();
+        assert_eq!(
+            provider.entry_validity(&tables, q1_started, Instant::now()),
+            EntryValidity::Valid,
+            "Q1 is a fresh admission before the invalidation"
+        );
+
+        provider
+            .invalidate_for_table(TableReference::bare("customer"))
+            .await
+            .expect("invalidation should succeed");
+        tick().await;
+        let q2_started = Instant::now();
+
+        assert!(
+            provider
+                .store_raw_key(&key, cached_result_for("customer", q2_started).await, None)
+                .await
+                .expect("cache access should succeed")
+        );
+        assert!(
+            provider
+                .store_raw_key(&key, cached_result_for("customer", q1_started).await, None)
+                .await
+                .expect("cache access should succeed")
+        );
+
+        assert_eq!(
+            resident_read_started_at(&provider, &key).await,
+            Some(q2_started),
+            "Q1 finishing after encoding must not replace Q2"
+        );
+        let (entry, validity) = provider
+            .get_raw_key_with_validity(&key)
+            .await
+            .expect("cache access should succeed")
+            .expect("Q2 must remain servable");
+        assert_eq!(entry.read_started_at, q2_started);
+        assert_eq!(validity, EntryValidity::Valid);
+        assert!(
+            provider
+                .get_raw_key(&key)
+                .await
+                .expect("cache access should succeed")
+                .is_some(),
+            "Q2 read after the change and must still be served fresh, not Q1 as stale"
         );
     }
 

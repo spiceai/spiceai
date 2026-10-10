@@ -14,36 +14,18 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Staged **upsert** lifecycle for `CayenneTableProvider`: a PK/on-conflict
-//! write is encoded into a fresh, **unreferenced** snapshot directory
-//! (invisible to readers) and published — or discarded — at a later moment.
-//! It is a split of the synchronous on-conflict path at the listing fence.
+//! Optimistic primary-key writes staged in unpublished snapshots.
 //!
-//! Staging is **off-lock optimistic** ([`CayenneTableProvider::begin_staged_upsert_occ`]):
-//! validation (private keyset) + Vortex encode run **without** `write_lock`, so
-//! many transactions stage concurrently; the lock is taken only at
-//! [`CayenneStagedUpsert::commit`], briefly, to re-check the optimistic-concurrency
-//! token and publish. Detection is at per-table granularity: if any commit landed
-//! on the table between the token capture (at transaction begin, before the gate
-//! read) and this commit, the sequence high-water moved → the commit aborts with
-//! [`Error::WriteConflict`] (a retryable conflict) rather than risking a lost
-//! update.
+//! Validation uses a private keyset without holding the table write lock. Each
+//! statement resolves repeated keys against its complete input. Commit holds
+//! the write lock while checking the transaction's read footprint and write-set
+//! against a token captured before its gate read. Conflicting writes fail with
+//! [`Error::WriteConflict`].
 //!
-//! [`CayenneStagedUpsert::commit`] runs the fenced publish: apply the
-//! on-conflict deletions, reserve the protected-snapshot sequence (strictly
-//! above the delete sequence, so the staged rows survive their own conflict
-//! deletes), durably record it, then flip the deletion caches and the protected
-//! snapshot in one listing-fence write. [`CayenneStagedUpsert::rollback`]
-//! discards the staged snapshot directory.
-//!
-//! Sequence stamping is deferred by construction: the sync path already reserves
-//! every sequence at publish time, and the protected snapshot's deletion
-//! threshold is its own (highest) sequence, so a commit that lands between stage
-//! and publish never mis-orders the staged rows.
-//!
-//! The stage is deliberately **not** durable: the federated source is the system
-//! of record and CDC (`refresh_mode: changes`) is the crash backstop, so a crash
-//! before commit simply drops the staged directory.
+//! Snapshot visibility and deletion metadata commit in one catalog transaction.
+//! The protected snapshot's sequence exceeds its deletion sequence so replacement
+//! rows survive their own tombstones. The listing fence covers publication of
+//! the matching in-memory views. Rollback discards unpublished files.
 
 use std::sync::Arc;
 
@@ -51,6 +33,7 @@ use datafusion::execution::SendableRecordBatchStream;
 
 use super::Error;
 use super::Result;
+use super::append_stage::{StagedAppend, ValidationScope};
 use super::column_stats::ColumnStatsAccumulator;
 use super::delta_encoding::WritePolicy;
 use super::on_conflict::{OnConflictDeletions, PostValidationState};
@@ -90,19 +73,6 @@ impl TransactionWriteToken {
     }
 }
 
-/// The staged bits: rows written to a fresh invisible snapshot dir, plus the
-/// on-conflict deletions and validated keys captured during validation.
-struct StagedData {
-    new_snapshot_id: String,
-    on_conflict_deletions: OnConflictDeletions,
-    validated_keys: PkDigestSet,
-    stats: Arc<ColumnStatsAccumulator>,
-    row_count: u64,
-    /// Existing rows this upsert replaces (for the live-row-count delta),
-    /// captured before `on_conflict_deletions` is consumed.
-    superseded: usize,
-}
-
 /// A staged upsert: the replacement rows have been written to a fresh snapshot
 /// directory, but no catalog visibility change has been made yet. The rows are
 /// published (or discarded) at [`Self::commit`] / [`Self::rollback`].
@@ -133,7 +103,11 @@ impl std::fmt::Debug for CayenneStagedUpsert {
 }
 
 impl CayenneStagedUpsert {
-    fn new(table: CayenneTableProvider, token: TransactionWriteToken, staged: StagedData) -> Self {
+    fn new(
+        table: CayenneTableProvider,
+        token: TransactionWriteToken,
+        staged: StagedAppend,
+    ) -> Self {
         Self {
             table,
             token,
@@ -156,6 +130,15 @@ impl CayenneStagedUpsert {
     /// commit-time per-key OCC re-check.
     pub(crate) fn validated_keys(&self) -> &PkDigestSet {
         &self.validated_keys
+    }
+
+    /// Whether committing publishes nothing: no row was staged, so no stored
+    /// row is superseded either.
+    pub(crate) fn publishes_nothing(&self) -> bool {
+        self.row_count == 0
+            && self.on_conflict_deletions.delete_specs.is_empty()
+            && self.on_conflict_deletions.total_superseded() == 0
+            && self.on_conflict_deletions.reinserted_over_tombstone == 0
     }
 
     /// Prepare this staged upsert's durable payload for an atomic multi-table
@@ -223,20 +206,16 @@ impl CayenneStagedUpsert {
     /// transaction's per-key read footprint + write-set first, aborting with
     /// [`Error::WriteConflict`] (staged dir cleaned up) if any of those keys was
     /// committed after the transaction began (or, when per-key state is
-    /// unavailable, if the table's high-water moved at all). It then mirrors the
-    /// fenced tail of the sync on-conflict publish: apply the
-    /// on-conflict deletions, reserve the protected-snapshot sequence, record it
-    /// durably, then flip the deletion caches + protected snapshot under one
-    /// listing-fence write.
+    /// unavailable, if the table's high-water moved at all). An owned commit task
+    /// retains that lock through atomic catalog publication and cache updates.
     ///
     /// # Errors
     ///
     /// Returns [`Error::WriteConflict`] on a lost OCC race (retryable), or an
     /// error if applying the deletions, reserving the sequence, or the durable
-    /// snapshot-sequence write fails. On a hard error the staged snapshot
-    /// directory is left in place so the caller can retry the commit or roll back.
+    /// snapshot-sequence write fails. Uncommitted staged files are removed on error.
     pub async fn commit(
-        mut self,
+        self,
         footprint: std::collections::HashSet<u128>,
         footprint_complete: bool,
     ) -> Result<u64> {
@@ -264,65 +243,20 @@ impl CayenneStagedUpsert {
             });
         }
 
-        // Taken before the publish below, which makes this transaction's staged
-        // rows visible while the `num_rows` delta describing them only reaches
-        // the maintenance queue afterwards. Released on drop if the commit
-        // returns early — nothing was published.
-        let reserved_live_rows_delta = self.table.reserve_live_rows_delta();
-
-        // visibility lock then listing fence — the same order as
-        // `apply_under_barrier` and the sync on-conflict publish.
-        let _visibility = self.table.visibility_lock_arc().lock_owned().await;
-        let _fence = self.table.lock_listing_fence_write_owned().await;
-
-        let on_conflict_deletions = std::mem::take(&mut self.on_conflict_deletions);
-        let update = self
-            .table
-            .apply_on_conflict_deletions(on_conflict_deletions)
-            .await?;
-
-        // Reserve the snapshot sequence AFTER `apply_on_conflict_deletions` (which
-        // reserves the lower delete/insert sequences), so the protected snapshot's
-        // deletion threshold is strictly above them and the staged rows survive
-        // their own conflict deletes.
-        let new_sequence = self.table.reserve_sequences_local(1).await?;
-        self.table
-            .record_written_snapshot_sequence(&self.new_snapshot_id, new_sequence)
-            .await?;
-        // Atomically publish the deletion-cache update and the protected snapshot
-        // so a concurrent scan never sees the new rows without the deletes that
-        // hide their prior versions.
-        self.table
-            .commit_on_conflict_publish(update, Some((&self.new_snapshot_id, new_sequence)))
-            .await;
-
-        // The rows are visible now, so the claim survives from here: a commit
-        // that dies after publishing has left rows it will never queue a delta
-        // for.
-        let published_live_rows_delta = reserved_live_rows_delta.published();
-
-        let retention_requested = self.table.has_retention_delete_filters();
-        let live_rows_delta = i64::try_from(self.row_count)
-            .unwrap_or(i64::MAX)
-            .saturating_sub(i64::try_from(self.superseded).unwrap_or(i64::MAX));
-        self.table.schedule_post_write_maintenance(
-            Some(Arc::clone(&self.stats)),
-            // The publish above already refreshed listing visibility; only stats
-            // / retention / row-count maintenance is scheduled here.
-            false,
-            retention_requested,
-            live_rows_delta,
-            published_live_rows_delta,
-        );
-        if retention_requested {
-            self.table.clear_cached_pk_keyset();
-        } else {
-            self.table
-                .record_file_pk_keys(&self.validated_keys, new_sequence);
+        super::append_commit::PreparedResolvedAppend {
+            context: Arc::clone(self.table.context()),
+            table: self.table,
+            _write_guard: write_guard,
+            snapshot_id: self.new_snapshot_id,
+            rows: self.row_count,
+            stats: self.stats,
+            deletions: self.on_conflict_deletions,
+            validated_keys: self.validated_keys,
+            superseded: self.superseded,
+            into_empty_table: false,
         }
-
-        Ok(self.row_count)
-        // `_fence`, `_visibility`, and `write_guard` drop here, in that order.
+        .commit()
+        .await
     }
 
     /// Discard the staged upsert and remove its staged snapshot directory.
@@ -420,6 +354,25 @@ impl PreparedTxnCommit {
             }
         }
         Ok(())
+    }
+
+    /// The staged snapshot this commit publishes.
+    pub(crate) fn snapshot_id(&self) -> &str {
+        &self.new_snapshot_id
+    }
+
+    /// The sequence the staged snapshot commits under.
+    pub(crate) fn snapshot_sequence(&self) -> i64 {
+        self.publish.snapshot_sequence
+    }
+
+    /// Keep this table's staged files and refuse its writes until it is
+    /// reloaded, after a shared commit whose outcome could not be read back.
+    pub(crate) fn retain_after_unknown_outcome(&mut self) {
+        self.publish.retain_files_for_wal_recovery();
+        self.table
+            .publication_outcome_unknown()
+            .store(true, std::sync::atomic::Ordering::Release);
     }
 
     /// Disarm the publish's destructive abort cleanup after the shared
@@ -536,13 +489,28 @@ impl CayenneTableProvider {
         &self,
         data: SendableRecordBatchStream,
         target_partitions: usize,
-    ) -> Result<StagedData> {
+    ) -> Result<StagedAppend> {
         // Partitioned tables publish across partitions; their visibility flip
         // cannot be a single protected-snapshot publish. Out of scope for the MVP.
         if self.metadata().partition_column.is_some() {
             return Err(Error::Unsupported {
                 operation: "staged upsert for partitioned Cayenne tables",
             });
+        }
+
+        if let Some(resolver) = self.key_resolver()? {
+            return self
+                .stage_resolved_append(
+                    data,
+                    resolver,
+                    super::overwrite::WriteShape {
+                        target_size_bytes: self.target_file_size_bytes(),
+                        target_partitions,
+                        write_policy: WritePolicy::DELTA,
+                    },
+                    ValidationScope::Optimistic,
+                )
+                .await;
         }
 
         let prepared = self.prepare_stream_for_insert_offlock(data).await?;
@@ -581,7 +549,7 @@ impl CayenneTableProvider {
         } = post_validation.lock().take().unwrap_or_default();
         let superseded = on_conflict_deletions.total_superseded();
 
-        Ok(StagedData {
+        Ok(StagedAppend {
             new_snapshot_id,
             on_conflict_deletions,
             validated_keys,
@@ -598,7 +566,7 @@ impl CayenneTableProvider {
 /// row, `current_snapshot_id` unchanged), so leaving it is safe; object stores
 /// (S3) have no atomic "remove dir" and are left to the next successful
 /// snapshot-cleanup cycle, mirroring [`super::overwrite::PreparedOverwrite::rollback`].
-async fn cleanup_orphan_snapshot_dir(table: &CayenneTableProvider, snapshot_id: &str) {
+pub(super) async fn cleanup_orphan_snapshot_dir(table: &CayenneTableProvider, snapshot_id: &str) {
     if table.table_path().starts_with("s3://") {
         return;
     }

@@ -248,6 +248,7 @@ key-index = "foundation"
 libnfs = "foundation"
 ns_lookup = "foundation"
 object_store_occ = "foundation"
+object_store_spawn = "foundation"
 otel-arrow = "foundation"
 podswatcher = "foundation"
 repl = "foundation"
@@ -311,7 +312,7 @@ yaml = "foundation"
 #   app, cache, cayenne, data-accelerator-api, data_components, datafusion-ddl,
 #   datafusion-optimizer-rules, evaluate-chat, llms, package, runtime-acceleration,
 #   runtime-auth, runtime-cluster, runtime-datafusion, runtime-datafusion-udfs,
-#   runtime-drasi, runtime-parameters, runtime-request-context, runtime-search,
+#   runtime-decide, runtime-drasi, runtime-parameters, runtime-request-context, runtime-search,
 #   runtime-secrets, runtime-table-partition, runtime-tools, search,
 #   test-framework, workers
 #

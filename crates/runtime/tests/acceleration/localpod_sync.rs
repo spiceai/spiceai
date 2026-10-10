@@ -25,7 +25,7 @@ limitations under the License.
 //!
 //! - Engines backed by a `PolyTableProvider` (duckdb/sqlite/postgres/cayenne) expose a federated
 //!   source, so the parent is wrapped in a `FederatedTableProviderAdaptor`.
-//! - The default in-memory Arrow accelerator has no federated source, so the parent is registered
+//! - The in-memory Arrow accelerator has no federated source, so the parent is registered
 //!   as a bare `AcceleratedTable`.
 //!
 //! Regression test for <https://github.com/spiceai/spiceai/issues/11137>: a child of an
@@ -294,7 +294,7 @@ async fn test_localpod_refresh_invalidates_child_cached_results() -> Result<(), 
         .await
 }
 
-/// A localpod child whose parent uses the default in-memory (Arrow) accelerator must keep tracking
+/// A localpod child whose parent uses the in-memory Arrow accelerator must keep tracking
 /// the parent's full refreshes at runtime, not just load once at startup.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_localpod_full_refresh_synchronization_with_arrow_parent() -> Result<(), anyhow::Error>
@@ -313,7 +313,7 @@ async fn test_localpod_full_refresh_synchronization_with_arrow_parent() -> Resul
                 .await
                 .expect("write initial csv");
 
-            // Parent: file connector, full refresh, default (Arrow / in-memory) accelerator.
+            // Parent: file connector, full refresh, in-memory Arrow accelerator.
             // No refresh_check_interval, so the parent only refreshes when triggered manually,
             // keeping the test deterministic.
             let mut parent = Dataset::new(format!("file://{}", csv_path.display()), "time_series");
@@ -327,6 +327,7 @@ async fn test_localpod_full_refresh_synchronization_with_arrow_parent() -> Resul
             ));
             parent.acceleration = Some(Acceleration {
                 enabled: true,
+                engine: Some("arrow".to_string()),
                 refresh_mode: Some(RefreshMode::Full),
                 ..Acceleration::default()
             });
@@ -336,6 +337,7 @@ async fn test_localpod_full_refresh_synchronization_with_arrow_parent() -> Resul
             let mut child = Dataset::new("localpod:time_series", "local_time_series");
             child.acceleration = Some(Acceleration {
                 enabled: true,
+                engine: Some("arrow".to_string()),
                 refresh_mode: Some(RefreshMode::Full),
                 ..Acceleration::default()
             });

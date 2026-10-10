@@ -20,6 +20,7 @@ use crate::collector::{CatalogConnectorSchema, ConnectorSchema, ModelSourceSchem
 use crate::transform::{connector_params_to_schema, to_pascal_case};
 use schemars::Schema;
 use serde_json::{Map, Value};
+use spicepod::acceleration::DEFAULT_ENGINE;
 
 /// Enriches the root schema with connector-specific parameter definitions.
 ///
@@ -376,7 +377,7 @@ fn model_source_from_pattern(name: &str) -> String {
 
 fn model_source_from_description(name: &str) -> String {
     if name == "typesafe" {
-        "Model source for TypeSafe System One evaluation (Jev). Accepts `typesafe`, `typesafe:<model_id>`, or `typesafe/<model_id>`. Chat completions are not supported; use POST /v1/evaluate.".to_string()
+        "Model source for TypeSafe System One evaluation (Jev). Accepts `typesafe`, `typesafe:<model_id>`, or `typesafe/<model_id>`. Chat completions are not supported; use POST /v1/decisions or the SQL decision functions.".to_string()
     } else {
         format!("Model source for {name} provider. Format: {name}:<model_id>")
     }
@@ -1097,8 +1098,8 @@ fn update_acceleration_params(
     defs_obj: &mut Map<String, Value>,
     data_accelerators: &[ConnectorSchema],
 ) {
-    // Find the Arrow accelerator for the default case
-    let arrow_accelerator = data_accelerators.iter().find(|a| a.name == "arrow");
+    // Find the accelerator for the default case
+    let default_accelerator = data_accelerators.iter().find(|a| a.name == DEFAULT_ENGINE);
 
     // Build if/then conditionals for each accelerator based on engine field
     let mut conditionals: Vec<Value> = data_accelerators
@@ -1150,8 +1151,8 @@ fn update_acceleration_params(
         })
         .collect();
 
-    // Add default case: when engine is not specified, use Arrow params (Arrow is the default engine)
-    if let Some(arrow) = arrow_accelerator {
+    // Add default case: when engine is not specified, use the default engine's params
+    if let Some(default_accelerator) = default_accelerator {
         // Match when engine property is not present using JSON Schema "not" + "required"
         let mut required_obj = Map::new();
         required_obj.insert(
@@ -1168,7 +1169,7 @@ fn update_acceleration_params(
             "$ref".to_string(),
             Value::String(format!(
                 "#/$defs/{}AcceleratorParams",
-                to_pascal_case(&arrow.name)
+                to_pascal_case(&default_accelerator.name)
             )),
         );
         params_schema.insert(
@@ -1210,7 +1211,7 @@ fn update_acceleration_params(
             params_prop.insert(
                 "description".to_string(),
                 Value::String(format!(
-                    "Configuration parameters for the acceleration engine. The available parameters depend on the engine type specified in 'engine' (default: arrow). Available engines: {}.",
+                    "Configuration parameters for the acceleration engine. The available parameters depend on the engine type specified in 'engine' (default: {DEFAULT_ENGINE}). Available engines: {}.",
                     accelerator_names.join(", ")
                 )),
             );

@@ -99,6 +99,7 @@ linkme.workspace = true
 llms = { path = "../llms", default-features = false }
 evaluate-api = { path = "../evaluate-api" }
 evaluate-chat = { path = "../evaluate-chat" }
+runtime-decide = { path = "../runtime-decide" }
 mediatype = "0.21.0"
 moka.workspace = true
 mysql_async = { workspace = true, optional = true }
@@ -474,3 +475,10 @@ workspace = true
 name = "result_correctness"
 path = "tests/result_correctness.rs"
 required-features = ["duckdb", "sqlite"]
+
+# A binary of its own so `make nextest` can run it without loading `integration`,
+# which on macOS is too large for dyld to map the shared cache beside it.
+[[test]]
+name = "rate_control"
+path = "tests/rate_control.rs"
+required-features = ["rate-control"]
