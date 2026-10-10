@@ -203,7 +203,7 @@ impl Runtime {
                         .update_view(&view.name, status::ComponentStatus::Initializing);
                     let shutdown = runtime.status.shutdown_token();
                     tokio::select! {
-                        () = futures::future::join_all(
+                        _ = futures::future::join_all(
                             waits.iter().map(|(_, token)| token.cancelled()),
                         ) => {}
                         () = shutdown.cancelled() => return,
