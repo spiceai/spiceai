@@ -105,11 +105,33 @@ impl FallbackRetentionKeep {
             None => None,
         };
         Ok(match (scheduled, retention_sql_delete_expr) {
-            (Some(keep), Some(expr)) => Some(keep.merge(Self::from_delete_expr(expr))),
+            (Some(keep), Some(expr)) => Some(keep.with_delete_expr(expr)),
             (Some(keep), None) => Some(keep),
             (None, Some(expr)) => Some(Self::from_delete_expr(expr)),
             (None, None) => None,
         })
+    }
+
+    /// Add a `retention_sql` delete predicate unless `filters` already holds it.
+    ///
+    /// A scheduled policy built from the same `retention_sql` already carries
+    /// the predicate. A second copy is not idempotent when the predicate is
+    /// volatile: `random() < 0.25 OR random() < 0.25` draws twice per row and
+    /// matches about 44% of rows, not the 25% the retention pass deletes.
+    fn with_delete_expr(mut self, delete_expr: Expr) -> Self {
+        let present = self.filters.iter().any(|filter| {
+            matches!(
+                filter,
+                DataRetentionFilter::Expression { delete_expr: existing }
+                    if **existing == delete_expr
+            )
+        });
+        if !present {
+            self.filters.push(DataRetentionFilter::Expression {
+                delete_expr: Box::new(delete_expr),
+            });
+        }
+        self
     }
 
     /// Time retention inverted onto fallback when no scheduled worker runs.
@@ -450,6 +472,34 @@ mod tests {
         .expect("sql still inverts when the scheduled policy is computed-only")
         .expect("a keep spec");
         assert_eq!(keep.filters.len(), 1);
+    }
+
+    #[test]
+    fn from_configured_inverts_scheduled_retention_sql_once() {
+        // The scheduled policy is built from the same `retention_sql` the
+        // caller passes, so it already carries the predicate. The simplifier
+        // folds `p OR p` to `p` only when `p` is not volatile, so a volatile
+        // predicate is the one a second copy would change.
+        let delete_expr = datafusion::functions::expr_fn::random().lt(lit(0.25));
+        let scheduled = Retention {
+            filters: vec![DataRetentionFilter::Expression {
+                delete_expr: Box::new(delete_expr.clone()),
+            }],
+            check_interval: Duration::from_secs(1),
+            computed: None,
+        };
+        let keep =
+            FallbackRetentionKeep::from_configured(Some(&scheduled), Some(delete_expr.clone()))
+                .expect("retention_sql is invertible")
+                .expect("a keep spec");
+        let schema = events_schema();
+        assert_eq!(
+            keep.keep_filters(&schema).expect("keep"),
+            FallbackRetentionKeep::from_delete_expr(delete_expr)
+                .keep_filters(&schema)
+                .expect("keep"),
+            "fallback must invert the retention predicate once, as the retention pass evaluates it"
+        );
     }
 
     #[test]
