@@ -181,8 +181,13 @@ def check_revisions() -> None:
         try:
             hub_get(f"{repo}/revision/{revision}")
         except HTTPError as error:
-            gone.append(f"{repo}@{revision} (HTTP {error.code})")
-    assert not gone, "Pinned Hub revisions no longer resolve; repin them: " + ", ".join(gone)
+            if error.code != 404:
+                raise AssertionError(
+                    f"The Hub answered HTTP {error.code} for {repo}@{revision}; "
+                    "it is unavailable or limiting requests, so this says nothing about the pin"
+                ) from error
+            gone.append(f"{repo}@{revision}")
+    assert not gone, "Pinned Hub revisions are gone (HTTP 404); repin them: " + ", ".join(gone)
     main = hub_get("stanfordnlp/imdb/revision/main")["sha"]
     pinned_main = IMDB.rpartition("@")[2]
     assert main == pinned_main, (
