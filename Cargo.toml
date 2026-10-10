@@ -262,10 +262,10 @@ chrono = "0.4.44"
 clap = { version = "4.5.60", features = ["derive", "env"] }
 crash-handler = "0.8"
 ctor = "1.0.13"
-clickhouse-rs = { git = "https://github.com/spiceai/clickhouse-rs.git", tag = "0.2.2", features = [
+clickhouse-rs = { git = "https://github.com/spiceai/clickhouse-rs.git", rev = "d93e350575d4be2f56f37d513bfbfc672d128528", features = [
     "tokio_io",
     "tls",
-] }
+] } # branch: async-await
 datafusion = "55.2.0"
 datafusion-catalog = "55.2.0"
 datafusion-common = "55.2.0"
