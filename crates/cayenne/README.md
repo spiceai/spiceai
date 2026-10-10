@@ -16,7 +16,7 @@ Cayenne provides a lakehouse format that enables efficient CRUD operations on co
 - **CDC apply pipelining** (`provider/mutation_writer::write_cdc_pipelined`): Stage A writes Vortex files into the staging dir under the staging WAL; Stage B (move + listing-cache invalidation, plus on-conflict deletion publish for upserts) is spawned as a finalize task so the next burst's Stage A can begin work. On-conflict upserts pipeline too — they stage into a protected snapshot whose deletions are resolved and published by the finalize task; a burst that replaces *inlined* rows (which the staged on-conflict commit cannot represent, only known after validation) stages optimistically and then falls back to a synchronous publish that reuses the staged files (the `cdc_path_inline_fallback` write-phase metric tracks how often this happens). Stage A and Stage B always preserve burst order.
 - **Sequence-based ordering** (Iceberg-style) for correct delete/insert visibility across snapshots.
 - **Partitioning** via composite partition keys (with cross-partition atomic-commit coordination in the runtime).
-- **PK conflict detection opt-out** (`cayenne_pk_conflict_detection: none`) for append-only streams (`refresh_mode: append`) where the source enforces PK uniqueness and the ingestion path cannot replay existing rows. The runtime refuses it on datasets that rewrite stored keys: `refresh_mode: changes`, `write_mode: write_back` and `write_mode: acceleration`.
+- **PK conflict detection opt-out** (`cayenne_pk_conflict_detection: none`) for sources that enforce PK uniqueness when no row reaches the table twice. A full or append refresh does not guarantee that: an append without a `time_column` re-appends stored rows, and #14883 covers both with a `time_column`. The runtime refuses it on datasets that rewrite stored keys: `refresh_mode: changes`, and writable datasets whose writes go to Cayenne (`write_mode: write_back`, `write_mode: acceleration`, or a `sink` source). A table created with `none` keeps it; reopening it with `auto` is refused until the acceleration is rebuilt (one restart with `mode: file_create`).
 - **MERGE DML** and **DDL** (`CREATE TABLE`, `DROP TABLE`, `CREATE SCHEMA`) handlers behind the `partition-table-provider` feature, for direct SQL DDL/DML against a Cayenne catalog.
 - **Snapshot engine** (`CayenneSnapshotEngine` in the runtime) that exports a per-dataset metastore "slice" (versioned JSON) so snapshots are portable across nodes with different data directories and never archive raw `cayenne.db*` files.
 - **Logical and physical optimizer rules** that surface Cayenne-friendly join shapes for HTAP workloads (predicate transitive closure for non-key dim filters, dynamic-filter sharing across same-source scans, anti/semi-join sort-merge rewrite above a 10M-row build side, in-list-to-range rewrite).
@@ -105,7 +105,7 @@ Every mutation is stamped with a monotonically increasing **sequence number** re
 
 The runtime's CDC apply loop (`crates/runtime/src/accelerated_table/refresh_task/changes.rs`) coalesces source change-data-capture envelopes into a burst and calls `write_cdc_append_stream_with_source_commit_ts`. Those envelopes are connector-agnostic: every Spice CDC connector — PostgreSQL WAL logical replication, DynamoDB Streams, MongoDB Change Streams, and **Debezium** (CDC over Kafka, for sources like MySQL/SQL Server/Oracle or where Debezium is already deployed) — decodes its source's changes into the same `{op, primary_keys, data}` change batch, so Cayenne ingests all of them through this one path. A `refresh_mode: changes` dataset uses Cayenne when it sets `engine: cayenne`, or no `engine` on Linux and macOS, the same way it would use DuckDB, SQLite, or Postgres; Cayenne's owned Vortex storage and in-memory CDC tier make it the engine of choice for high-rate, large CDC streams. As of the dedicated CDC-apply runtime, that loop runs on its own default-priority tokio runtime so it isn't scheduler-starved by background compaction. Per burst:
 
-1. **Conflict preparation.** Under the per-table `write_lock`, if `pk_conflict_detection: auto` the provider builds (or reuses, from the byte-budgeted PK keyset cache) the set of existing primary keys and resolves which incoming rows are *re-insertions* that must tombstone an older copy. `pk_conflict_detection: none` skips this for append-only sources.
+1. **Conflict preparation.** Under the per-table `write_lock`, if `pk_conflict_detection: auto` the provider builds (or reuses, from the byte-budgeted PK keyset cache) the set of existing primary keys and resolves which incoming rows are *re-insertions* that must tombstone an older copy. `pk_conflict_detection: none` skips this.
 2. **Tier selection.** Small batches that fit the per-write admission gate are absorbed into the **inline memtable** (or, under `cdc_durability: memory`, appended to the **in-RAM mem-tier**) rather than written as a Vortex file. Larger batches are encoded to **Vortex files**.
 3. **Stage A (durable, on the write path).** Vortex files are written into a *staging* snapshot directory and the file list is made crash-safe by the staging WAL (`tmp + fsync + rename` of `_wal.json`). The burst's source LSN can be acked once Stage A is durable.
 4. **Stage B (visible, off the write path).** A backgrounded finalize task moves the staged files into the current snapshot, publishes any on-conflict deletion vectors, flips the snapshot pointer, and invalidates DataFusion's list-files cache. The pipeline preserves burst order via a FIFO, so reads never see a later burst before an earlier one. A burst qualifies for this pipelined split when the table is not partitioned; on-conflict upserts and tables with pending PK deletions stage too (resolved by the finalize task), while partitioned tables take the synchronous publish path.
@@ -301,7 +301,7 @@ pub struct VortexConfig {
     pub inline_flush_max_bytes: i64,                    // small-write profile = 2_097_152, otherwise = 8_388_608
 
     // PK conflict detection
-    pub pk_conflict_detection: PkConflictDetection,     // default Auto; None opts into blind append for CDC
+    pub pk_conflict_detection: PkConflictDetection,     // default Auto; None opts into blind append
 }
 ```
 
@@ -860,7 +860,7 @@ df.show().await?;
 - Configurable deletion mode (`cayenne_deletion_mode: auto`/`key`/`position`); merge-on-read position deletes via `Selection::ExcludeRoaring`
 - Optional per-table adaptive tuning controller (`cayenne_tuning: adaptive`, preview) bounded by the static `auto` config
 - Fast-path delete that extracts PK values directly from `IN`-list and OR-of-AND-equality filter trees, skipping the data scan
-- Per-dataset `cayenne_pk_conflict_detection` opt-out for append-only CDC
+- Per-dataset `cayenne_pk_conflict_detection` opt-out for sources that enforce primary-key uniqueness
 - CDC apply observability metrics (`dataset_acceleration_cdc_apply_*`)
 - Same-source large-join `HashJoin → SortMergeJoin` rewriter for spillable hash-join build sides
 - Logical and physical optimizer rules for HTAP / chbench workloads

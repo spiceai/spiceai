@@ -223,6 +223,11 @@ pub enum CatalogError {
     },
 
     #[snafu(display(
+        "Failed to load table '{table_name}': it was created with 'cayenne_pk_conflict_detection: none', so it can hold more than one row per primary key, and the setting is now 'auto'. An existing table keeps the setting it was created with. To rebuild it from the source with one row per primary key, restart once with 'acceleration.mode: file_create', then set 'mode' back to 'file'. Rows that exist only in the acceleration are not kept."
+    ))]
+    PkConflictDetectionEnabledOnExistingTable { table_name: String },
+
+    #[snafu(display(
         "Table '{table_name}' metadata is invalid or corrupted. Delete the acceleration, and try again. {source}"
     ))]
     InvalidMetadata {
