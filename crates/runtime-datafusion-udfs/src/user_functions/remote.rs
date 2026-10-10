@@ -429,7 +429,11 @@ impl TableProvider for RemoteTableProvider {
     }
 
     fn table_type(&self) -> TableType {
-        TableType::Base
+        // Remote table functions are never `Immutable` (see
+        // `map_volatility`), and the planned `TableScan` drops the declared
+        // volatility. `Temporary` marks the scan as non-deterministic so the
+        // SQL results cache refuses to store it.
+        TableType::Temporary
     }
 
     async fn scan(

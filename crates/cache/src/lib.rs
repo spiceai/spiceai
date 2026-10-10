@@ -1601,6 +1601,12 @@ impl QueryResultsCacheProvider {
         while let Some(current_plan) = plan_stack.pop() {
             match current_plan {
                 LogicalPlan::TableScan(source, ..) => {
+                    // Table-function providers (remote UDTFs, search) are
+                    // planned as `Temporary` scans whose rows can change
+                    // between executions; never cache them.
+                    if source.source.table_type() == datafusion::datasource::TableType::Temporary {
+                        return false;
+                    }
                     let schema_name = source.table_name.schema();
                     let Some(schema) = schema_name else {
                         continue;
@@ -2539,6 +2545,49 @@ mod tests {
             .expect("cache access should succeed")
             .expect("an entry for an uninvalidated table must remain cached");
         assert_eq!(validity, EntryValidity::Valid);
+    }
+
+    #[test]
+    fn test_cache_is_disabled_for_temporary_table_function_scan() {
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::datasource::{TableType, empty::EmptyTable, provider_as_source};
+        use datafusion::logical_expr::LogicalPlanBuilder;
+
+        #[derive(Debug)]
+        struct TempTable(EmptyTable);
+        #[async_trait::async_trait]
+        impl datafusion::catalog::TableProvider for TempTable {
+            fn as_any(&self) -> &dyn std::any::Any {
+                self
+            }
+            fn schema(&self) -> arrow::datatypes::SchemaRef {
+                self.0.schema()
+            }
+            fn table_type(&self) -> TableType {
+                TableType::Temporary
+            }
+            async fn scan(
+                &self,
+                state: &dyn datafusion::catalog::Session,
+                projection: Option<&Vec<usize>>,
+                filters: &[datafusion::logical_expr::Expr],
+                limit: Option<usize>,
+            ) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>>
+            {
+                self.0.scan(state, projection, filters, limit).await
+            }
+        }
+
+        let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, true)]));
+        let provider = Arc::new(TempTable(EmptyTable::new(schema)));
+        let plan = LogicalPlanBuilder::scan("udtf", provider_as_source(provider), None)
+            .expect("scan")
+            .build()
+            .expect("plan");
+        let cache_provider =
+            QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
+                .expect("valid cache provider");
+        assert!(!cache_provider.cache_is_enabled_for_plan(&plan));
     }
 
     #[tokio::test]
