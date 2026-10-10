@@ -1,0 +1,116 @@
+version: v1
+kind: Spicepod
+name: http-cache-ratelimit-ratecontrol-sameorigin
+
+# Ad-hoc probe (run_sameorigin_probe.py, not one of run_phase2.py's SCENARIOS):
+# does rate control couple two DATASETS that share the same upstream ORIGIN
+# (same host:port, different path), and leave a dataset on a DIFFERENT origin
+# untouched? crates/data-http-rate-control's `shared_rate_limiter_for_config`/
+# `shared_metrics`/`reserve_shared_rate_controller_for_component` are all keyed
+# by `rate_control_key(base_url)` = scheme://host:port (path-independent) and
+# cached in a shared registry -- "One origin gets one limiter" (a literal
+# comment in lib.rs). So d2 and d3 below, which share host:port :9002, MUST
+# share one HttpRateLimiter and one adaptive RateController; d1, on a
+# different host:port (:9001), gets an independent one.
+#
+# The origin server's fault is scoped to d2's path only (`fault_paths:
+# ["/data"]` via /control on the shared origin's server.py) so d3's own
+# content is NEVER faulted -- any admission/latency effect on d3 during the
+# fault window can only come from sharing the throttled limiter with d2, not
+# from d3's own requests erroring.
+
+runtime:
+  telemetry:
+    enabled: true
+  task_history:
+    enabled: true
+  query:
+    max_concurrent_queries: 0
+  caching:
+    sql_results:
+      enabled: false
+  params:
+    http_adaptive_rate_control: enabled
+    http_adaptive_rate_control_failure_threshold: "10%"
+    http_adaptive_rate_control_window: "3s"
+    http_requests_per_second_limit: "100"
+
+datasets:
+  - from: http://127.0.0.1:9001/data
+    name: d1
+    params:
+      file_format: json
+      client_timeout: "2"
+      connect_timeout: "1s"
+      allowed_request_paths: "/data"
+      request_query_filters: enabled
+    columns:
+      - name: request_query
+        type: text
+      - name: id
+        type: bigint
+      - name: version
+        type: bigint
+      - name: served_at_ms
+        type: bigint
+      - name: origin
+        type: text
+      - name: payload
+        type: text
+      - name: extra
+        type: text
+        metadata:
+          json_object: "*"
+
+  - from: http://127.0.0.1:9002/data
+    name: d2
+    params:
+      file_format: json
+      client_timeout: "2"
+      connect_timeout: "1s"
+      allowed_request_paths: "/data"
+      request_query_filters: enabled
+    columns:
+      - name: request_query
+        type: text
+      - name: id
+        type: bigint
+      - name: version
+        type: bigint
+      - name: served_at_ms
+        type: bigint
+      - name: origin
+        type: text
+      - name: payload
+        type: text
+      - name: extra
+        type: text
+        metadata:
+          json_object: "*"
+
+  # Same origin (host:port) as d2, DIFFERENT path -- never itself faulted.
+  - from: http://127.0.0.1:9002/data.json
+    name: d3
+    params:
+      file_format: json
+      client_timeout: "2"
+      connect_timeout: "1s"
+      allowed_request_paths: "/data.json"
+      request_query_filters: enabled
+    columns:
+      - name: request_query
+        type: text
+      - name: id
+        type: bigint
+      - name: version
+        type: bigint
+      - name: served_at_ms
+        type: bigint
+      - name: origin
+        type: text
+      - name: payload
+        type: text
+      - name: extra
+        type: text
+        metadata:
+          json_object: "*"

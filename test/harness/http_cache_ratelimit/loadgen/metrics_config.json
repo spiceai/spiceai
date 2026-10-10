@@ -1,0 +1,56 @@
+{
+  "_comment": [
+    "Harness-relevant Prometheus series, kept in ONE place so a metric rename",
+    "on the rate-control branch is a one-line change here, not a code edit",
+    "(harness plan, open question 7).",
+    "",
+    "The scraper keeps a scraped series when its name STARTS WITH one of the",
+    "base names below. Prefix matching absorbs any suffix the OpenTelemetry ->",
+    "Prometheus exporter appends. Verify the exact names and the `origin` label",
+    "against a live scrape before trusting a run; discovered names are written",
+    "to `discovered_metrics.txt` in every run directory.",
+    "",
+    "Verified against a live scrape of spiced v2.4.0-unstable-build.c7460de8c6",
+    "(PR #14143, --features rate-control) on 2026-10-06.",
+    "",
+    "Gone since the earlier revision, with the persisted budget they reported:",
+    "`cluster_effective_burst`, `lease_acquire_duration_ms` and",
+    "`lease_acquire_conflicts_total`. The budget is now derived per replica and",
+    "never written back, so `adaptive_admission_ratio` is the only coefficient",
+    "the runtime exports.",
+    "",
+    "In cluster mode `adaptive_admission_ratio` is absent until the first lease,",
+    "and `adaptive_throttled_total` stays 0 by design: the cluster lowers its",
+    "budget rather than charging a heavier weight."
+  ],
+  "metrics_endpoint": "http://127.0.0.1:9090/metrics",
+  "origin_label": "origin",
+  "adaptive": {
+    "admission_ratio": "dataset_http_rate_control_adaptive_admission_ratio",
+    "throttled_total": "dataset_http_rate_control_adaptive_throttled_total"
+  },
+  "cluster": {
+    "budget_remaining": "dataset_http_rate_control_cluster_budget_remaining",
+    "lease_granted": "dataset_http_rate_control_lease_granted",
+    "lease_refresh_errors_total": "dataset_http_rate_control_lease_refresh_errors_total",
+    "fail_closed_total": "dataset_http_rate_control_fail_closed_total"
+  },
+  "cooldown": {
+    "retry_after_updates_total": "dataset_http_rate_limit_retry_after_updates_total",
+    "retry_after_waits_total": "dataset_http_rate_limit_retry_after_waits_total",
+    "retry_after_wait_duration_ms": "dataset_http_rate_limit_retry_after_wait_duration_ms",
+    "retry_after_remaining_ms": "dataset_http_rate_limit_retry_after_remaining_ms"
+  },
+  "static_limiter": {
+    "inflight_operations": "dataset_http_inflight_operations",
+    "available_permits": "dataset_http_rate_control_available_permits",
+    "acquisitions_total": "dataset_http_rate_control_acquisitions_total",
+    "acquire_errors_total": "dataset_http_rate_control_acquire_errors_total",
+    "wait_duration_ms": "dataset_http_rate_control_wait_duration_ms",
+    "requests_per_second_limit": "dataset_http_rate_control_requests_per_second_limit",
+    "requests_per_minute_limit": "dataset_http_rate_control_requests_per_minute_limit",
+    "max_concurrent_requests": "dataset_http_rate_control_max_concurrent_requests",
+    "jitter_min_ms": "dataset_http_rate_control_jitter_min_ms",
+    "jitter_max_ms": "dataset_http_rate_control_jitter_max_ms"
+  }
+}

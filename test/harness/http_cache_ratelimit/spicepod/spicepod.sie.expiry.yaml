@@ -1,0 +1,67 @@
+version: v1
+kind: Spicepod
+name: http-cache-ratelimit-sie-expiry
+
+# Phase 1, `caching-sie-expiry` scenario: a duration-BOUNDED stale-if-error
+# window, so responses serve stale up to the bound and then fail closed
+# (the origin error propagates) once staleness passes it.
+#
+# PENDING: the prebuilt spiced v2.3.1 REJECTS a duration value here at
+# dataset load:
+#   Invalid 'caching_stale_if_error' value: '10s'. Expected 'enabled' or
+#   'disabled'.
+# The duration-bounded SIE window is a newer feature (#14126) and is not in
+# the released binary. This spicepod is the config to use once a build with
+# #14126 is available; until then `run_phase1.sh caching-sie-expiry`
+# detects the load error and reports the scenario BLOCKED / PENDING rather
+# than running it.
+
+runtime:
+  telemetry:
+    enabled: true
+  caching:
+    sql_results:
+      enabled: false
+
+datasets:
+  - from: http://127.0.0.1:9001/data
+    name: d1
+    params:
+      file_format: json
+      client_timeout: "1"
+      connect_timeout: "1"
+      allowed_request_paths: "/data"
+      # Each distinct `request_query` value is its own upstream request /
+      # cache entry, so many keys are exercised per origin.
+      request_query_filters: enabled
+    columns:
+      # HTTP metadata column (passed through, not JSON-shredded). Declaring it
+      # puts `request_query` in the schema so `WHERE request_query = '...'`
+      # plans instead of being rejected as an unknown column.
+      - name: request_query
+        type: text
+      - name: id
+        type: bigint
+      - name: version
+        type: bigint
+      - name: served_at_ms
+        type: bigint
+      - name: origin
+        type: text
+      - name: payload
+        type: text
+      - name: extra
+        type: text
+        metadata:
+          json_object: "*"
+    acceleration:
+      enabled: true
+      engine: duckdb
+      refresh_mode: caching
+      params:
+        caching_ttl: "3s"
+        caching_stale_while_revalidate_ttl: "6s"
+        # Duration-bounded SIE window (fail closed once staleness > 10s).
+        caching_stale_if_error: "10s"
+        caching_max_items: "1000"
+      retention_period: "10m"

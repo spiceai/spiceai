@@ -1,0 +1,53 @@
+version: v1
+kind: Spicepod
+name: http-cache-ratelimit-phase0
+
+runtime:
+  telemetry:
+    enabled: false
+  caching:
+    # Keep the SQL results cache OFF so the acceleration (refresh_mode:
+    # caching) cache is the only cache in front of the origin.
+    sql_results:
+      enabled: false
+
+datasets:
+  - from: http://127.0.0.1:9001/data
+    name: d1
+    params:
+      file_format: json
+      client_timeout: "2s"
+      connect_timeout: "1s"
+      allowed_request_paths: "/data"
+      # Let each distinct `request_query` value become its own upstream
+      # request / cache entry, so the harness exercises many keys per origin.
+      request_query_filters: enabled
+    columns:
+      # `request_query` is an HTTP metadata column (passed through, not
+      # shredded from the JSON body). Declaring it puts it in the table schema
+      # so `WHERE request_query = '...'` plans; without it the planner rejects
+      # the filter as an unknown column.
+      - name: request_query
+        type: text
+      - name: id
+        type: bigint
+      - name: version
+        type: bigint
+      - name: served_at_ms
+        type: bigint
+      - name: origin
+        type: text
+      - name: payload
+        type: text
+      - name: extra
+        type: text
+        metadata:
+          json_object: "*"
+    acceleration:
+      enabled: true
+      engine: duckdb
+      refresh_mode: caching
+      retention_period: "10m"
+      params:
+        caching_ttl: "3s"
+        caching_stale_while_revalidate_ttl: "6s"
