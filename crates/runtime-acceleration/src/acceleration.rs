@@ -646,8 +646,13 @@ impl Acceleration {
     }
 
     /// Returns whether this configuration resolves to durable federated
-    /// write-back: a Cayenne `write_mode: write_back` dataset that declares an
-    /// `on_conflict` key and is CDC-fed (`refresh_mode: changes`).
+    /// write-back: a Cayenne `write_mode: write_back` dataset that is CDC-fed
+    /// (`refresh_mode: changes`).
+    ///
+    /// `on_conflict` plays no part: Cayenne keeps one row per primary key
+    /// whatever it says, and a transactional commit records its markers from the
+    /// keys it validated against that primary key. The key itself is judged at
+    /// registration over the declared `primary_key`.
     ///
     /// Such a dataset marks every committed write's primary keys so a delivery
     /// worker can reconcile them to the federated source. Delivery mutates the
@@ -672,12 +677,9 @@ impl Acceleration {
     /// cannot come to mean one thing to the check and another to what the user is
     /// told to add. Naming the settings only — the sentence around them belongs to
     /// the error that renders it.
-    fn durable_write_back_gaps(&self) -> [Option<&'static str>; 3] {
+    fn durable_write_back_gaps(&self) -> [Option<&'static str>; 2] {
         [
             (self.engine != Engine::Cayenne).then_some("acceleration.engine: cayenne"),
-            self.on_conflict
-                .is_empty()
-                .then_some("an 'acceleration.on_conflict' upsert on the primary key"),
             (self.refresh_mode != Some(RefreshMode::Changes))
                 .then_some("acceleration.refresh_mode: changes"),
         ]
@@ -2109,15 +2111,9 @@ mod tests {
 
     /// The exact configuration that turns durable federated write-back on.
     fn durable_write_back_acceleration() -> Acceleration {
-        let mut on_conflict = HashMap::new();
-        on_conflict.insert(
-            ColumnReference::try_from("id").expect("valid column reference"),
-            OnConflictBehavior::Upsert(UpsertOptions::default()),
-        );
         Acceleration {
             engine: Engine::Cayenne,
             write_mode: spicepod_acceleration::WriteMode::WriteBack,
-            on_conflict,
             refresh_mode: Some(RefreshMode::Changes),
             ..Acceleration::default()
         }
@@ -2149,6 +2145,29 @@ mod tests {
         assert!(durable_write_back_acceleration().resolves_to_durable_write_back());
     }
 
+    /// Regression test for #14886: Cayenne keeps one row per primary key without
+    /// `on_conflict`, so write-back must neither require it nor change its answer
+    /// when it is set.
+    #[test]
+    fn durable_write_back_does_not_depend_on_on_conflict() {
+        let without = durable_write_back_acceleration();
+        assert!(without.on_conflict.is_empty());
+        assert!(without.resolves_to_durable_write_back());
+        assert_eq!(without.unmet_durable_write_back_prerequisites(), None);
+
+        let mut on_conflict = HashMap::new();
+        on_conflict.insert(
+            ColumnReference::try_from("id").expect("valid column reference"),
+            OnConflictBehavior::Upsert(UpsertOptions::default()),
+        );
+        let with = Acceleration {
+            on_conflict,
+            ..durable_write_back_acceleration()
+        };
+        assert!(with.resolves_to_durable_write_back());
+        assert_eq!(with.unmet_durable_write_back_prerequisites(), None);
+    }
+
     /// Every conjunct must be load-bearing: if dropping one still reports
     /// durable write-back, the registration gate would fire on datasets that
     /// never mark keys (or, worse, stay silent on ones that do).
@@ -2170,15 +2189,6 @@ mod tests {
         assert!(
             !not_write_back.resolves_to_durable_write_back(),
             "write-through commits to the source directly, with no delivery worker"
-        );
-
-        let no_on_conflict = Acceleration {
-            on_conflict: HashMap::new(),
-            ..durable_write_back_acceleration()
-        };
-        assert!(
-            !no_on_conflict.resolves_to_durable_write_back(),
-            "without on_conflict there is no key to reconcile"
         );
 
         for refresh_mode in [

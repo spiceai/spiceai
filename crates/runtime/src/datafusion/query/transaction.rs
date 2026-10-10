@@ -359,7 +359,7 @@ async fn prepare_transaction(
         let table_name = table_ref.table();
         let Some(provider) = resolve_cayenne_staged(df, table_name).await else {
             return Err(TransactionError::Rejected(format!(
-                "transaction target '{table_name}' must be an accelerator-only, non-partitioned Cayenne dataset (configure on_conflict without CDC); other modes route writes to the federated source"
+                "transaction target '{table_name}' must be a non-partitioned Cayenne dataset with 'acceleration.write_mode: acceleration', or 'write_mode: write_back' with 'refresh_mode: changes'; other modes route writes to the federated source"
             )));
         };
         let token = provider.transaction_write_token().await;

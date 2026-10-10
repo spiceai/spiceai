@@ -16,7 +16,8 @@ name: chbench-writeback-local
 # crates/runtime/src/init/dataset.rs):
 #   - dataset-level access: read_write            (write_mode only applies to a writable dataset)
 #   - acceleration.refresh_mode: changes          (CDC bootstrap + ongoing sync)
-#   - acceleration.on_conflict: upsert            (a write-back table upserts by PK)
+#   - acceleration.primary_key: a single column   (delivery keys on it; the composite keys below
+#                                                 are refused, so this pod does not load -- see README.md)
 #   - acceleration.write_mode: write_back         (WriteMode::WriteBack)
 #   - dataset-level replication.enabled: true     (opt in to async source durability)
 #
@@ -61,8 +62,6 @@ datasets:
       refresh_mode: changes
       write_mode: write_back
       primary_key: (d_w_id, d_id)
-      on_conflict:
-        (d_w_id, d_id): upsert
 
   - from: postgres:stock
     name: stock
@@ -76,8 +75,6 @@ datasets:
     acceleration:
       <<: *cayenne_wb
       primary_key: (s_w_id, s_i_id)
-      on_conflict:
-        (s_w_id, s_i_id): upsert
       # Maintained aggregate on the column the driver's gated transactions UPDATE. After a
       # committed transaction, a query over this aggregate MUST reflect the update — the exact
       # fused-txn IVM-staleness bug this PR fixes (the driver's IVM oracle checks
@@ -101,8 +98,6 @@ datasets:
     acceleration:
       <<: *cayenne_wb
       primary_key: (o_w_id, o_d_id, o_id)
-      on_conflict:
-        (o_w_id, o_d_id, o_id): upsert
 
   # ---- Static reference tables (read-only, full refresh — not written by the driver) ----
 
@@ -116,8 +111,6 @@ datasets:
       mode: file
       refresh_mode: full
       primary_key: w_id
-      on_conflict:
-        w_id: upsert
 
   - from: postgres:item
     name: item
@@ -129,5 +122,3 @@ datasets:
       mode: file
       refresh_mode: full
       primary_key: i_id
-      on_conflict:
-        i_id: upsert

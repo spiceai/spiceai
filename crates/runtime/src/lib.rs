@@ -348,7 +348,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to register dataset {dataset_name} ({connector}): durable write-back needs a source that can apply a delivered row in one atomic step, and the {connector} connector cannot yet. Delivering as a separate delete and insert lets the deleted state echo back over CDC, which can silently drop a committed write. Remove 'on_conflict' to keep writes on the accelerator, or use a different 'acceleration.write_mode'. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
+        "Failed to register dataset {dataset_name} ({connector}): durable write-back needs a source that can apply a delivered row in one atomic step, and the {connector} connector cannot yet. Delivering as a separate delete and insert lets the deleted state echo back over CDC, which can silently drop a committed write. Set 'acceleration.write_mode: write_through' to send writes to the source directly instead. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
     ))]
     DurableWriteBackUnsupportedBySource {
         dataset_name: String,
@@ -362,6 +362,17 @@ pub enum Error {
         dataset_name: String,
         connector: String,
         retention_setting: String,
+    },
+
+    #[snafu(display(
+        "Failed to register dataset {dataset_name} ({connector}): '{param}: none' turns off the primary-key check Cayenne uses to replace a stored row, but {consequence}. {advice} See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+    ))]
+    PkConflictDetectionDisabled {
+        dataset_name: String,
+        connector: String,
+        param: String,
+        consequence: String,
+        advice: String,
     },
 
     #[snafu(display(

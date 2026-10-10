@@ -1265,13 +1265,36 @@ pub fn get_primary_keys_from_constraints(
         .collect()
 }
 
+/// The parameter that turns Cayenne's primary-key conflict detection off, or
+/// `None` when detection stays on.
+///
+/// Resolves the two spellings the way the Cayenne accelerator does:
+/// `cayenne_pk_conflict_detection` takes precedence over the unprefixed
+/// `pk_conflict_detection`, and the value is matched without regard to case.
+/// Table creation and the runtime's registration refusal both read it here, so
+/// they cannot disagree about whether a dataset turned detection off.
+#[must_use]
+pub fn cayenne_pk_conflict_detection_disabled_by(
+    acceleration_settings: &Acceleration,
+) -> Option<&'static str> {
+    if !matches!(acceleration_settings.engine, Engine::Cayenne) {
+        return None;
+    }
+    ["cayenne_pk_conflict_detection", "pk_conflict_detection"]
+        .into_iter()
+        .find_map(|key| {
+            acceleration_settings
+                .params
+                .get(key)
+                .map(|value| (key, value))
+        })
+        .filter(|(_, value)| value.eq_ignore_ascii_case("none"))
+        .map(|(key, _)| key)
+}
+
 #[must_use]
 pub fn cayenne_pk_conflict_detection_none(acceleration_settings: &Acceleration) -> bool {
-    matches!(acceleration_settings.engine, Engine::Cayenne)
-        && ["cayenne_pk_conflict_detection", "pk_conflict_detection"]
-            .iter()
-            .filter_map(|key| acceleration_settings.params.get(*key))
-            .any(|value| value.eq_ignore_ascii_case("none"))
+    cayenne_pk_conflict_detection_disabled_by(acceleration_settings).is_some()
 }
 
 /// Starting values for an engine's adaptive-tuning knobs, derived from the host.
@@ -1329,7 +1352,8 @@ pub struct SpicepodWriteProfile {
 mod tests {
     use super::{
         AcceleratorExternalTableBuilder, AcceleratorRuntimeConfig,
-        cayenne_pk_conflict_detection_none, format_engine_list, get_primary_keys_from_constraints,
+        cayenne_pk_conflict_detection_disabled_by, cayenne_pk_conflict_detection_none,
+        format_engine_list, get_primary_keys_from_constraints,
         upsert_dedup::extract_upsert_options,
     };
     use ::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
@@ -1529,6 +1553,39 @@ mod tests {
             assert!(
                 !cayenne_pk_conflict_detection_none(&acceleration),
                 "{value:?} must leave pk conflict detection on"
+            );
+        }
+    }
+
+    /// Both spellings set: the prefixed one decides, as it does in the Cayenne
+    /// accelerator. Reading either `none` as authoritative created a table with no
+    /// key resolution while the accelerator ran with detection on.
+    #[test]
+    fn pk_conflict_detection_prefixed_spelling_takes_precedence() {
+        for (prefixed, unprefixed, expected) in [
+            ("auto", "none", None),
+            ("none", "auto", Some("cayenne_pk_conflict_detection")),
+            ("NONE", "none", Some("cayenne_pk_conflict_detection")),
+        ] {
+            let mut acceleration = Acceleration {
+                engine: Engine::Cayenne,
+                ..Acceleration::default()
+            };
+            acceleration.params.insert(
+                "cayenne_pk_conflict_detection".to_string(),
+                prefixed.to_string(),
+            );
+            acceleration
+                .params
+                .insert("pk_conflict_detection".to_string(), unprefixed.to_string());
+            assert_eq!(
+                cayenne_pk_conflict_detection_disabled_by(&acceleration),
+                expected,
+                "cayenne_pk_conflict_detection={prefixed}, pk_conflict_detection={unprefixed}"
+            );
+            assert_eq!(
+                cayenne_pk_conflict_detection_none(&acceleration),
+                expected.is_some()
             );
         }
     }

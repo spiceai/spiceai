@@ -2709,11 +2709,10 @@ impl CayenneAccelerator {
             table_name,
         );
 
-        // Durable federated write-back (#11838): a write_back + on_conflict +
-        // refresh_mode:changes Cayenne dataset resolves to WriteMode::WriteBack
-        // (on_conflict with a non-`changes` refresh forces AcceleratorOnly). When
-        // so configured, every committed write durably marks its PKs so the
-        // delivery worker reconciles them to the federated source.
+        // Durable federated write-back (#11838): a `write_mode: write_back` +
+        // `refresh_mode: changes` Cayenne dataset. When so configured, every
+        // committed write durably marks its PKs so the delivery worker
+        // reconciles them to the federated source.
         // `resolves_to_durable_write_back` is shared with the registration gate
         // that requires the source connector to advertise a safe delivery
         // primitive, so marking can never be switched on for a dataset the gate
@@ -3069,7 +3068,7 @@ fn declares_unique_index(source: &dyn AccelerationSource) -> bool {
 /// duplicate rows.
 fn unique_index_warning(table_name: &str) -> String {
     format!(
-        "Dataset '{table_name}' (cayenne): a `unique` entry in `indexes` speeds up lookups but does not constrain writes, so duplicate rows are not rejected. Set `primary_key` with `on_conflict` to deduplicate on a column set. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+        "Dataset '{table_name}' (cayenne): a `unique` entry in `indexes` speeds up lookups but does not constrain writes, so duplicate rows are not rejected. Set `primary_key`, with `cayenne_pk_conflict_detection` left at its default `auto`, to keep one row per value of a column set. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
     )
 }
 
@@ -3201,7 +3200,7 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .description("Encoding effort for fresh delta writes (CDC/append snapshot files), zstd-style. 'auto' (default) size-gates: deltas smaller than a quarter of the target file size encode with a light scheme set (skipping the per-file encoder-strategy search and FSST training) and are re-encoded by compaction; larger or unknown-size writes use the full default. Explicit levels 0..=10 pin the effort (0 = uncompressed canonical, 7 = the full default cascade i.e. the explicit opt-out, 8..=10 reserved). Compaction and rewrite outputs always use the full default encoding regardless of this setting.")
             .default("auto"),
         ParameterSpec::component("pk_conflict_detection")
-            .description("Whether Cayenne scans existing primary keys on insert. 'auto' (default) detects conflicts and applies on_conflict behavior. 'none' skips conflict detection and is only safe when the source enforces primary-key uniqueness and the ingestion path cannot replay existing rows, such as steady-state append-only CDC after bootstrap.")
+            .description("Whether Cayenne scans existing primary keys on insert. 'auto' (default) detects conflicts and keeps one row per primary key. 'none' skips conflict detection and is only safe when the source enforces primary-key uniqueness and the ingestion path cannot replay existing rows, such as an append-only stream ('refresh_mode: append') after bootstrap. 'none' is refused with refresh_mode: changes, write_mode: write_back or write_mode: acceleration, which rewrite stored keys.")
             .one_of(&["auto", "none"])
             .default("auto"),
         ParameterSpec::component("deletion_mode")
@@ -5112,7 +5111,9 @@ mod tests {
             "the warning must say what a `unique` entry will not do: {warning}"
         );
         assert!(
-            warning.contains("primary_key") && warning.contains("on_conflict"),
+            warning.contains("primary_key")
+                && warning.contains("cayenne_pk_conflict_detection")
+                && !warning.contains("on_conflict"),
             "the warning must give the actionable alternative: {warning}"
         );
     }
