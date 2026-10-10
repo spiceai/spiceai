@@ -22663,7 +22663,7 @@
       "type": "object",
       "properties": {
         "from": {
-          "description": "Model source for TypeSafe System One evaluation (Jev). Accepts `typesafe`, `typesafe:<model_id>`, or `typesafe/<model_id>`. Chat completions are not supported; use POST /v1/evaluate.",
+          "description": "Model source for TypeSafe System One evaluation (Jev). Accepts `typesafe`, `typesafe:<model_id>`, or `typesafe/<model_id>`. Chat completions are not supported; use POST /v1/decisions or the SQL decision functions.",
           "type": "string",
           "pattern": "^typesafe($|:.+|/.+)"
         },

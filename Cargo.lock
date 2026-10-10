@@ -8397,6 +8397,7 @@ name = "evaluate-api"
 version = "2.4.0-unstable"
 dependencies = [
  "async-trait",
+ "criterion 0.7.0",
  "schemars 1.2.1",
  "serde",
  "serde_json",
@@ -8414,6 +8415,7 @@ dependencies = [
  "chat-api",
  "evaluate-api",
  "insta",
+ "runtime-rate-control",
  "serde",
  "serde_json",
  "tokio",
@@ -17642,6 +17644,7 @@ dependencies = [
  "runtime-datafusion",
  "runtime-datafusion-index",
  "runtime-datafusion-udfs",
+ "runtime-decide",
  "runtime-drasi",
  "runtime-execution-plans",
  "runtime-metrics",
@@ -18120,6 +18123,28 @@ dependencies = [
  "util",
  "wasmtime",
  "wat",
+]
+
+[[package]]
+name = "runtime-decide"
+version = "2.4.0-unstable"
+dependencies = [
+ "arrow",
+ "arrow-json",
+ "async-trait",
+ "criterion 0.7.0",
+ "datafusion",
+ "evaluate-api",
+ "futures",
+ "insta",
+ "linkme",
+ "runtime-request-context",
+ "runtime-status",
+ "runtime-udfs-api",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

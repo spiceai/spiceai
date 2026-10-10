@@ -108,7 +108,7 @@ use tower_http::limit::RequestBodyLimitLayer;
         v1::status::get,
         v1::spicepods::get,
         v1::embeddings::post,
-        v1::evaluate::post,
+        v1::decisions::post,
         v1::search::post,
         v1::chat::post,
         v1::responses::post,
@@ -133,14 +133,24 @@ use tower_http::limit::RequestBodyLimitLayer;
         DatasetQueryParams,
         DatasetFilter,
         Format,
-        evaluate_api::EvaluateRequest,
-        evaluate_api::EvaluateResponse,
-        evaluate_api::Question,
-        evaluate_api::Answer,
-        evaluate_api::EntryType,
-        evaluate_api::NonNullEntry,
-        evaluate_api::NullableEntry,
-        evaluate_api::NoulCriteria,
+        evaluate_api::openai::DecisionRequest,
+        evaluate_api::openai::DecisionInput,
+        evaluate_api::openai::DecisionInputMessage,
+        evaluate_api::openai::DecisionInputRole,
+        evaluate_api::openai::DecisionMessageType,
+        evaluate_api::openai::DecisionMessageContent,
+        evaluate_api::openai::DecisionInputPart,
+        evaluate_api::openai::DecisionQuestion,
+        evaluate_api::openai::ChoiceOption,
+        evaluate_api::openai::ChoiceValue,
+        evaluate_api::openai::ScoreLevel,
+        evaluate_api::openai::DecisionResponse,
+        evaluate_api::openai::DecisionAnswer,
+        evaluate_api::openai::ChoiceProbability,
+        evaluate_api::openai::LevelProbability,
+        evaluate_api::openai::DecisionUsage,
+        evaluate_api::openai::InputTokensDetails,
+        evaluate_api::openai::OutputTokensDetails,
     ))
 )]
 pub(crate) struct ApiDoc;
@@ -492,8 +502,8 @@ pub(crate) fn routes(
             )
             .route("/v1/embeddings", post(v1::embeddings::post))
             .route(
-                "/v1/evaluate",
-                post(v1::evaluate::post).layer(ModelContextLayer),
+                "/v1/decisions",
+                post(v1::decisions::post).layer(ModelContextLayer),
             )
             .route("/v1/search", post(v1::search::post))
             .merge(tools_router)
