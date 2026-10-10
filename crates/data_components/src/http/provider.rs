@@ -3468,6 +3468,47 @@ struct PaginationState {
     recent_page_urls: VecDeque<String>,
 }
 
+const REQUEST_PATH_DOT_SEGMENT_MESSAGE: &str = "The 'request_path' value contains a '.' or '..' segment, including a percent-encoded one such as '%2e%2e', which is not allowed for security reasons. Remove the segment from the path.";
+
+const REQUEST_PATH_REWRITTEN_MESSAGE: &str = "The 'request_path' value would be changed before the request is sent, because URLs cannot contain tabs or newlines and treat '\\' as '/'. Remove those characters, using '/' to separate path segments.";
+
+/// Rejects a `request_path` the HTTP request would not send as written.
+///
+/// `allowed_request_paths` is matched against the path as written, but the request goes to
+/// the path `Url::set_path` produces, and WHATWG URL parsing resolves percent-encoded dot
+/// segments (`%2e%2e`, `.%2e`), removes tabs and newlines, and turns `\` into `/`. Each of
+/// these lets a path that matches an allowed pattern reach one that does not, or climb out
+/// of the path in the dataset's `from` URL. Comparing the decoded path before and after
+/// parsing catches every such rewrite rather than a list of known encodings. The segment
+/// check also rejects a dot segment behind an encoded slash (`%2e%2e%2fadmin`), which the
+/// URL parser leaves alone but an origin that decodes `%2f` before routing would resolve.
+///
+/// The messages do not repeat the value: a path can carry identifiers or tokens, and these
+/// errors reach logs and query history.
+fn ensure_request_path_is_sent_as_written(raw: &str, base_url: &Url) -> Result<()> {
+    let decoded = percent_encoding::percent_decode_str(raw).decode_utf8_lossy();
+    if decoded
+        .split(['/', '\\'])
+        .any(|segment| segment == "." || segment == "..")
+    {
+        return Err(Error::FilterRejected {
+            message: REQUEST_PATH_DOT_SEGMENT_MESSAGE.to_string(),
+        });
+    }
+
+    // Only the request path is compared, so replacing the base path here is deliberate: the
+    // base path is joined in front of an accepted value, which cannot remove a segment of it.
+    let mut url = base_url.clone();
+    url.set_path(raw);
+    if percent_encoding::percent_decode_str(url.path()).decode_utf8_lossy() != decoded {
+        return Err(Error::FilterRejected {
+            message: REQUEST_PATH_REWRITTEN_MESSAGE.to_string(),
+        });
+    }
+
+    Ok(())
+}
+
 fn pagination_request_label(url: &Url) -> String {
     let mut hasher = DefaultHasher::new();
     url.as_str().hash(&mut hasher);
@@ -4201,6 +4242,7 @@ impl HttpTableProvider {
                 ),
             });
         }
+        ensure_request_path_is_sent_as_written(raw, &self.base_url)?;
 
         let Some((globset, patterns)) = &self.allowed_paths else {
             tracing::warn!("Path filter attempted but allowed_paths is None");
@@ -6954,6 +6996,57 @@ mod tests {
 
         assert_eq!(url.path(), "/v1/users");
         assert_eq!(url.as_str(), "https://api.example.com/v1/users");
+    }
+
+    /// Every rejected value here matches `/shows/**` as written, yet `Url::set_path` would
+    /// send it somewhere else — outside `/shows/`, or outside the `/api/v1` base path.
+    #[test]
+    fn test_request_path_rewritten_by_url_parsing_is_rejected() {
+        let base_url = Url::parse("https://api.example.com/api/v1").expect("valid URL");
+        // The messages are asserted in full so a reword cannot reintroduce the path, which
+        // may carry identifiers or tokens, or a raw newline from it.
+        let dot_segment = "The 'request_path' value contains a '.' or '..' segment, including a percent-encoded one such as '%2e%2e', which is not allowed for security reasons. Remove the segment from the path.";
+        let rewritten = "The 'request_path' value would be changed before the request is sent, because URLs cannot contain tabs or newlines and treat '\\' as '/'. Remove those characters, using '/' to separate path segments.";
+
+        let cases = [
+            ("/shows/%2e%2e/people/1", dot_segment),
+            ("/shows/%2E%2E/people/1", dot_segment),
+            ("/shows/%2E%2e/people/1", dot_segment),
+            ("/shows/.%2e/people/1", dot_segment),
+            ("/shows/%2e./people/1", dot_segment),
+            ("/shows/%2e/people/1", dot_segment),
+            ("/shows/./people/1", dot_segment),
+            ("/shows/%2e%2e/%2e%2e/%2e%2e/admin", dot_segment),
+            ("/shows/%2e%2e%2fadmin", dot_segment),
+            ("/shows/%2e%2e%5cadmin", dot_segment),
+            ("/shows/.\t./people/1", rewritten),
+            ("/shows/.\n./people/1", rewritten),
+            ("/shows/a\\b", rewritten),
+        ];
+        for (raw, expected) in cases {
+            match ensure_request_path_is_sent_as_written(raw, &base_url) {
+                Err(Error::FilterRejected { message }) => {
+                    assert_eq!(message, expected, "request_path {raw:?}");
+                }
+                other => panic!("request_path {raw:?} must be rejected, got {other:?}"),
+            }
+        }
+
+        // Percent-encoding the URL parser applies or leaves alone does not change the path
+        // the origin sees, and an encoded slash inside a segment is an ordinary value.
+        for raw in [
+            "/shows/1",
+            "/shows/a b",
+            "/shows/caf\u{e9}",
+            "/shows/%2e%2e-not-a-dot-segment",
+            "/shows/group%2Fproject",
+            "/shows/%252e%252e",
+            "/shows/a..b",
+        ] {
+            if let Err(err) = ensure_request_path_is_sent_as_written(raw, &base_url) {
+                panic!("request_path {raw:?} must be accepted, got {err:?}");
+            }
+        }
     }
 
     #[test]
