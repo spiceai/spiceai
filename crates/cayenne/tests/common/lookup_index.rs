@@ -82,9 +82,9 @@ pub struct TableSpec<'a> {
     pub indexes: &'a [&'a [&'a str]],
     pub config: VortexConfig,
     pub upsert_key: Option<&'a str>,
-    /// Enabled, as at runtime; a test of the unpersisted path opts out. Set
-    /// explicitly, so the environment does not decide what a test exercises.
-    pub persistence: IndexPersistence,
+    /// `None` keeps the builder's default, persisted as at runtime; a test of
+    /// an unpersisted index sets `Disabled`.
+    pub persistence: Option<IndexPersistence>,
 }
 
 impl<'a> TableSpec<'a> {
@@ -96,7 +96,7 @@ impl<'a> TableSpec<'a> {
             indexes,
             config: file_mode_config(),
             upsert_key: None,
-            persistence: IndexPersistence::Enabled,
+            persistence: None,
         }
     }
 
@@ -111,7 +111,7 @@ impl<'a> TableSpec<'a> {
     }
 
     pub fn persistence(mut self, persistence: IndexPersistence) -> Self {
-        self.persistence = persistence;
+        self.persistence = Some(persistence);
         self
     }
 }
@@ -141,9 +141,11 @@ pub async fn open_table(
     };
     let catalog = Arc::clone(&fixture.catalog);
     let catalog: Arc<dyn MetadataCatalog> = catalog;
-    let builder = CayenneTableProviderBuilder::new(catalog, runtime_env)
-        .with_context(context)
-        .with_index_persistence(spec.persistence);
+    let builder = CayenneTableProviderBuilder::new(catalog, runtime_env).with_context(context);
+    let builder = match spec.persistence {
+        Some(persistence) => builder.with_index_persistence(persistence),
+        None => builder,
+    };
     Arc::new(
         builder
             .with_secondary_indexes(

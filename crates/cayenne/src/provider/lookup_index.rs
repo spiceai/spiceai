@@ -32,8 +32,7 @@ limitations under the License.
 //! a background build that reads back only the files not yet covered, paced
 //! so it takes a bounded share of a core. Each run also persists as a file
 //! under the table's `_lookup_index` directory, registered in the metastore,
-//! so a reopened table loads its runs instead of reading its files back;
-//! `SPICE_CAYENNE_INDEX_PERSISTENCE=disabled` persists nothing.
+//! so a reopened table loads its runs instead of reading its files back.
 //!
 //! Declared with the acceleration's `indexes`, one key per entry:
 //!
@@ -2564,10 +2563,6 @@ impl vortex_datafusion::VortexWriteObserver for RunObserver {
 /// sorts the write's keys: about 140 ms for 1.2M rows and 3.5 s for 20M,
 /// measured in `spiced`.
 const DEFER_FINISH_ROWS: usize = 1 << 20;
-
-/// Turns off persisting a table's secondary index runs as run files:
-/// `SPICE_CAYENNE_INDEX_PERSISTENCE=disabled`.
-pub(crate) const PERSISTENCE_ENV: &str = "SPICE_CAYENNE_INDEX_PERSISTENCE";
 
 /// Serializes persistence for one durable table location across provider opens.
 /// The weak owner fences work queued by providers that have been replaced.

@@ -1216,6 +1216,38 @@ async fn a_reopened_table_loads_its_persisted_runs() {
     );
 }
 
+/// A table opened with no persistence override persists its index runs, and
+/// reopening it loads them: the default, not a test setting, is exercised.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_table_persists_its_index_by_default() {
+    const ROWS: usize = 5_000;
+    let fixture = common::TestFixture::new(common::BackendType::Sqlite)
+        .await
+        .expect("fixture");
+    let env = Arc::new(RuntimeEnv::default());
+    let name = "persisted_by_default";
+
+    let table = open(&fixture, Arc::clone(&env), name, &[&KEY]).await;
+    overwrite(&table, vec![rows(0, ROWS)]).await;
+    wait_for_persisted_runs(&fixture, name, 1).await;
+    drop(table);
+
+    let reopened = open(&fixture, env, name, &[&KEY]).await;
+    let verification = reopened
+        .verify_lookup_index_against_read_back()
+        .await
+        .expect("verify");
+    assert!(verification.agrees(), "{verification:?}");
+    assert_eq!(
+        (
+            verification.uncovered_files,
+            counters(&reopened).builds_started
+        ),
+        (0, 0),
+        "a reopened table must load its index by default: {verification:?}"
+    );
+}
+
 /// A table that cannot list its persisted runs when it opens loads none of
 /// them, and must not then delete them as unwanted: they are still valid,
 /// and the next open loads them. The listing is made to fail by hiding the

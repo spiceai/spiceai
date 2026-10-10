@@ -155,7 +155,7 @@ async fn opening_persisted_runs_respects_the_memory_budget() {
         indexes,
         upsert_key: None,
         config: VortexConfig::default(),
-        persistence: IndexPersistence::Enabled,
+        persistence: Some(IndexPersistence::Enabled),
     };
     let (writer_env, writer_pool) = runtime_with_pool(1024 * MIB);
     let table = open_table(&fixture, writer_env, spec()).await;
