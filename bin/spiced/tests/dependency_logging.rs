@@ -123,6 +123,7 @@ async fn read_after_connection_closes() {
 
 #[tokio::test]
 async fn iceberg_retry_uses_friendly_warning_and_preserves_debug_diagnostics() {
+    crate::require_process_per_test("this test installs the process-global tracing subscriber");
     let writer = Writer::default();
     let (filter, reload) =
         tracing_subscriber::reload::Layer::new(EnvFilter::new("runtime=info,warn"));
