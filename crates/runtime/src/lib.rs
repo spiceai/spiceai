@@ -695,7 +695,7 @@ pub struct Runtime {
     /// Registered reranker models (native cross-encoders, reranker-API
     /// providers). Consumed by the `rerank()` UDTF; may be empty when only
     /// LLM-as-reranker usage is needed — chat models are resolved from
-    /// `completion_llms` as a fallback.
+    /// `completion_llms`, then evaluation models from `evaluate_models`, as fallbacks.
     rerankers: Arc<RwLock<RerankerModelStore>>,
     workers: WorkerRegistry,
     tools: Arc<RwLock<HashMap<String, Tooling>>>,

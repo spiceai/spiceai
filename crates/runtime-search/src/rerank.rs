@@ -30,12 +30,16 @@ limitations under the License.
 //!  2. `chat_models` store — any registered chat model can be used as a
 //!     reranker via [`llms::rerank::LlmRerank`] with a built-in listwise
 //!     prompt template. No extra configuration required.
+//!  3. `evaluate_models` store — any evaluation model (e.g. `TypeSafe` Jev) can
+//!     be used as a reranker via [`llms::rerank::EvaluateRerank`].
+//!
+//! `strategy => ...` applies to (2) and (3); native rerankers ignore it.
 //!
 //! Output schema: `schema(input) ∪ {rerank_score}` (after dropping the input's
 //! `_score`/`_fused_score` to avoid confusion). Rows are sorted by
 //! `rerank_score DESC` and limited to the requested `limit` (or all rows).
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::sync::{Arc, LazyLock, Weak};
 
 use arrow::array::{Array, ArrayRef, Float32Array, LargeStringArray, RecordBatch, StringArray};
@@ -63,7 +67,8 @@ use datafusion_expr::expr::ScalarFunction;
 use datafusion_expr::{LogicalPlanBuilder, ScalarFunctionArgs, ScalarUDFImpl};
 use futures::TryStreamExt;
 use llms::chat::Chat;
-use llms::rerank::{LlmRerank, LlmStrategy, Rerank, RerankerModelStore};
+use llms::evaluate::{Evaluate, EvaluateModelStore};
+use llms::rerank::{EvaluateRerank, LlmRerank, LlmStrategy, Rerank, RerankerModelStore};
 use runtime_query_engine::query_engine::QueryEngine;
 use tokio::sync::RwLock;
 use tracing::Instrument;
@@ -174,7 +179,8 @@ pub struct RerankTableFuncArgs {
     pub query: Option<String>,
     /// Max rows to return.
     pub limit: Option<usize>,
-    /// LLM strategy when using an LLM-as-reranker (ignored by native rerankers).
+    /// Strategy for chat and evaluation models used as rerankers (ignored by
+    /// native rerankers).
     pub strategy: Option<LlmStrategy>,
     /// Optional override of the built-in prompt template for LLM rerankers.
     pub prompt_template: Option<String>,
@@ -408,14 +414,56 @@ fn extract_string_named(named: &HashMap<&str, &Expr>, key: &str) -> Option<Strin
     }
 }
 
+/// The stores a `rerank(model => ...)` name resolves against, in lookup order.
+#[derive(Clone)]
+pub struct RerankModelStores {
+    pub rerankers: Arc<RwLock<RerankerModelStore>>,
+    pub chat_models: Arc<RwLock<ChatModelStore>>,
+    pub evaluate_models: Arc<RwLock<EvaluateModelStore>>,
+}
+
+impl RerankModelStores {
+    /// Every resolvable model name. A set, because each chat model is also
+    /// registered as an evaluation model.
+    async fn names(&self) -> BTreeSet<String> {
+        let mut names: BTreeSet<String> = self.rerankers.read().await.keys().cloned().collect();
+        names.extend(self.chat_models.read().await.keys().cloned());
+        names.extend(self.evaluate_models.read().await.keys().cloned());
+        names
+    }
+
+    /// Native reranker, else a chat model wrapped in [`LlmRerank`], else an
+    /// evaluation model wrapped in [`EvaluateRerank`].
+    async fn resolve(&self, name: &str, args: &RerankTableFuncArgs) -> Option<Arc<dyn Rerank>> {
+        if let Some(rr) = self.rerankers.read().await.get(name) {
+            return Some(Arc::clone(rr));
+        }
+        if let Some(chat) = self.chat_models.read().await.get(name) {
+            let mut adapter = LlmRerank::new(name, Arc::clone(chat));
+            if let Some(strategy) = args.strategy {
+                adapter = adapter.with_strategy(strategy);
+            }
+            if let Some(tpl) = &args.prompt_template {
+                adapter = adapter.with_prompt_template(Some(tpl.clone()));
+            }
+            return Some(Arc::new(adapter));
+        }
+        let evaluator: Arc<dyn Evaluate> = Arc::clone(self.evaluate_models.read().await.get(name)?);
+        let mut adapter = EvaluateRerank::new(name, evaluator);
+        if let Some(strategy) = args.strategy {
+            adapter = adapter.with_strategy(strategy);
+        }
+        Some(Arc::new(adapter))
+    }
+}
+
 /// The UDTF scaffold. Analogous to [`VectorSearchTableFunc`] — holds a weak
 /// reference to the [`QueryEngine`] instance plus the model stores needed to
 /// resolve the requested reranker at scan time.
 pub struct RerankTableFunc {
     df: Weak<dyn QueryEngine>,
     df_ptr: u64,
-    rerankers: Arc<RwLock<RerankerModelStore>>,
-    chat_models: Arc<RwLock<ChatModelStore>>,
+    models: RerankModelStores,
 }
 
 impl std::fmt::Debug for RerankTableFunc {
@@ -442,18 +490,9 @@ impl std::hash::Hash for RerankTableFunc {
 
 impl RerankTableFunc {
     #[must_use]
-    pub fn new(
-        df: Weak<dyn QueryEngine>,
-        rerankers: Arc<RwLock<RerankerModelStore>>,
-        chat_models: Arc<RwLock<ChatModelStore>>,
-    ) -> Self {
+    pub fn new(df: Weak<dyn QueryEngine>, models: RerankModelStores) -> Self {
         let df_ptr = df.as_ptr().addr() as u64;
-        Self {
-            df,
-            df_ptr,
-            rerankers,
-            chat_models,
-        }
+        Self { df, df_ptr, models }
     }
 
     fn scalar_invocation_error<T>() -> DataFusionResult<T> {
@@ -491,8 +530,7 @@ impl TableFunctionImpl for RerankTableFunc {
             args: parsed,
             input: input_provider,
             input_is_nested,
-            rerankers: Arc::clone(&self.rerankers),
-            chat_models: Arc::clone(&self.chat_models),
+            models: self.models.clone(),
         }))
     }
 }
@@ -535,8 +573,7 @@ pub struct RerankUDTFProvider {
     /// inner scan. Bare-table inputs have no such cap, so we apply
     /// `DEFAULT_MAX_CANDIDATES` defensively.
     input_is_nested: bool,
-    rerankers: Arc<RwLock<RerankerModelStore>>,
-    chat_models: Arc<RwLock<ChatModelStore>>,
+    models: RerankModelStores,
 }
 
 impl std::fmt::Debug for RerankUDTFProvider {
@@ -586,61 +623,31 @@ impl RerankUDTFProvider {
             .collect()
     }
 
-    /// Pick the reranker model to use. Checks the rerankers store first, then
-    /// falls back to wrapping a chat model in `LlmRerank`.
+    /// Pick the reranker model to use: the named one, or the only one registered.
     async fn resolve_reranker(&self) -> DataFusionResult<Arc<dyn Rerank>> {
-        // 1. Explicit model name.
-        if let Some(name) = &self.args.model {
-            let rerankers = self.rerankers.read().await;
-            if let Some(rr) = rerankers.get(name) {
-                return Ok(Arc::clone(rr));
-            }
-            drop(rerankers);
-            let chats = self.chat_models.read().await;
-            if let Some(chat) = chats.get(name) {
-                let mut adapter = LlmRerank::new(name, Arc::clone(chat));
-                if let Some(strategy) = self.args.strategy {
-                    adapter = adapter.with_strategy(strategy);
+        let name = if let Some(name) = &self.args.model {
+            name.clone()
+        } else {
+            let mut names = self.models.names().await.into_iter();
+            match (names.next(), names.next()) {
+                (Some(only), None) => only,
+                (None, _) => {
+                    return Err(DataFusionError::Plan(format!(
+                        "{RERANK_UDTF_NAME}: no rerankers, chat models, or evaluation models configured. Add one to your Spicepod and reference it via `model => '<name>'`."
+                    )));
                 }
-                if let Some(tpl) = &self.args.prompt_template {
-                    adapter = adapter.with_prompt_template(Some(tpl.clone()));
-                }
-                return Ok(Arc::new(adapter));
-            }
-            return Err(DataFusionError::Plan(format!(
-                "{RERANK_UDTF_NAME}: model '{name}' not found in rerankers or chat_models."
-            )));
-        }
-
-        // 2. No model name — auto-pick if exactly one is available.
-        let rerankers = self.rerankers.read().await;
-        let chats = self.chat_models.read().await;
-        let total = rerankers.len() + chats.len();
-        match total {
-            0 => Err(DataFusionError::Plan(format!(
-                "{RERANK_UDTF_NAME}: no rerankers or chat models configured. Add one to your Spicepod and reference it via `model => '<name>'`."
-            ))),
-            1 => {
-                if let Some((name, rr)) = rerankers.iter().next() {
-                    let _ = name;
-                    Ok(Arc::clone(rr))
-                } else if let Some((name, chat)) = chats.iter().next() {
-                    let mut adapter = LlmRerank::new(name, Arc::clone(chat));
-                    if let Some(strategy) = self.args.strategy {
-                        adapter = adapter.with_strategy(strategy);
-                    }
-                    if let Some(tpl) = &self.args.prompt_template {
-                        adapter = adapter.with_prompt_template(Some(tpl.clone()));
-                    }
-                    Ok(Arc::new(adapter))
-                } else {
-                    unreachable!("total == 1 but both stores empty")
+                (Some(_), Some(_)) => {
+                    return Err(DataFusionError::Plan(format!(
+                        "{RERANK_UDTF_NAME}: multiple models configured. Specify which with `model => '<name>'`."
+                    )));
                 }
             }
-            _ => Err(DataFusionError::Plan(format!(
-                "{RERANK_UDTF_NAME}: multiple models configured. Specify which with `model => '<name>'`."
-            ))),
-        }
+        };
+        self.models.resolve(&name, &self.args).await.ok_or_else(|| {
+            DataFusionError::Plan(format!(
+                "{RERANK_UDTF_NAME}: model '{name}' not found in rerankers, chat models, or evaluation models."
+            ))
+        })
     }
 
     /// Extract the configured document column from a record batch. Returns a
@@ -1778,13 +1785,7 @@ mod tests {
         }
     }
 
-    #[expect(clippy::type_complexity)]
-    fn make_rerank_session() -> (
-        Arc<SessionContext>,
-        Arc<RwLock<llms::rerank::RerankerModelStore>>,
-        Arc<RwLock<ChatModelStore>>,
-        Arc<TestQueryEngine>,
-    ) {
+    fn make_rerank_session() -> (Arc<SessionContext>, RerankModelStores, Arc<TestQueryEngine>) {
         // Use PostgreSQL dialect so that `name => value` named args in UDTF
         // calls are parsed as `FunctionArg::ExprNamed`, which is the variant
         // handled by the Spice DataFusion fork's UDTF relation planner. The
@@ -1809,9 +1810,11 @@ mod tests {
             Arc::new(rrf::ReciprocalRankFusion::from_ctx(&ctx)),
         );
 
-        let rerankers: Arc<RwLock<llms::rerank::RerankerModelStore>> =
-            Arc::new(RwLock::new(HashMap::new()));
-        let chat_models: Arc<RwLock<ChatModelStore>> = Arc::new(RwLock::new(HashMap::new()));
+        let models = RerankModelStores {
+            rerankers: Arc::new(RwLock::new(HashMap::new())),
+            chat_models: Arc::new(RwLock::new(HashMap::new())),
+            evaluate_models: Arc::new(RwLock::new(HashMap::new())),
+        };
 
         // Register rerank UDTF. Use our TestQueryEngine which supports both sync and async
         // table lookups.
@@ -1820,23 +1823,14 @@ mod tests {
             Arc::downgrade(&(Arc::clone(&test_engine) as Arc<dyn QueryEngine>));
 
         ctx.register_udf(
-            RerankTableFunc::new(
-                std::sync::Weak::clone(&weak_ctx),
-                Arc::clone(&rerankers),
-                Arc::clone(&chat_models),
-            )
-            .into(),
+            RerankTableFunc::new(std::sync::Weak::clone(&weak_ctx), models.clone()).into(),
         );
         ctx.register_udtf(
             RERANK_UDTF_NAME,
-            Arc::new(RerankTableFunc::new(
-                weak_ctx,
-                Arc::clone(&rerankers),
-                Arc::clone(&chat_models),
-            )),
+            Arc::new(RerankTableFunc::new(weak_ctx, models.clone())),
         );
 
-        (ctx, rerankers, chat_models, test_engine)
+        (ctx, models, test_engine)
     }
 
     /// Register a small test table and insert a mock reranker.
@@ -1885,8 +1879,8 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn rerank_bare_table_ordering_and_limit() -> DataFusionResult<()> {
-        let (ctx, rerankers, _chat_models, test_engine) = make_rerank_session();
-        setup_test_table(&ctx, &rerankers, vec![0.1, 0.9, 0.5, 0.3, 0.7]).await?;
+        let (ctx, models, test_engine) = make_rerank_session();
+        setup_test_table(&ctx, &models.rerankers, vec![0.1, 0.9, 0.5, 0.3, 0.7]).await?;
 
         // Register the table with TestQueryEngine for sync lookups
         if let Ok(provider) = ctx.table_provider(TableReference::bare("test_docs")).await {
@@ -1906,10 +1900,10 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread")]
     async fn rerank_filter_pushdown_reduces_candidates() -> DataFusionResult<()> {
-        let (ctx, rerankers, _chat_models, test_engine) = make_rerank_session();
+        let (ctx, models, test_engine) = make_rerank_session();
         // 5 scores but only 2 rows match category='electronics' (ids 1,2).
         // MockRerank returns scores in positional order of the filtered input.
-        setup_test_table(&ctx, &rerankers, vec![0.4, 0.8, 0.0, 0.0, 0.0]).await?;
+        setup_test_table(&ctx, &models.rerankers, vec![0.4, 0.8, 0.0, 0.0, 0.0]).await?;
 
         // Register the table with TestQueryEngine for sync lookups
         if let Ok(provider) = ctx.table_provider(TableReference::bare("test_docs")).await {
@@ -1925,5 +1919,123 @@ mod tests {
         insta::assert_snapshot!("filter_pushdown_result", query_snapshot(&ctx, sql).await);
 
         Ok(())
+    }
+
+    /// Evaluation model that answers every `noul` question from a fixed
+    /// document → score table, and counts the requests it receives.
+    #[derive(Debug, Default)]
+    struct MockEvaluate {
+        requests: std::sync::atomic::AtomicUsize,
+    }
+
+    impl MockEvaluate {
+        fn score(document: &str) -> f64 {
+            match document {
+                "great battery life and performance" => 0.9,
+                "best purchase ever made" => 0.5,
+                "average product nothing special" => 0.3,
+                "terrible battery drains fast" => 0.2,
+                _ => 0.1,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl Evaluate for MockEvaluate {
+        async fn evaluate(
+            &self,
+            request: llms::evaluate::EvaluateRequest,
+        ) -> llms::evaluate::Result<llms::evaluate::EvaluateResponse> {
+            self.requests
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let llms::evaluate::EvaluateState::Object(state) = &request.state else {
+                panic!("rerank sends an object state");
+            };
+            // Pointwise sends `document`; listwise sends `documents` keyed by question id.
+            let answers = request
+                .questions
+                .keys()
+                .map(|id| {
+                    let document = state
+                        .get("document")
+                        .or_else(|| state.get("documents").and_then(|docs| docs.get(id)))
+                        .and_then(serde_json::Value::as_str)
+                        .expect("a document for each question");
+                    (
+                        id.clone(),
+                        llms::evaluate::Answer::Noul {
+                            noul: Self::score(document),
+                        },
+                    )
+                })
+                .collect();
+            Ok(llms::evaluate::EvaluateResponse {
+                model: "mock".into(),
+                answers,
+                usage: None,
+            })
+        }
+
+        async fn health(&self) -> llms::evaluate::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Reranks `test_docs` with the evaluation model `jev`, passing `strategy_arg`
+    /// verbatim. Returns the ids in output order and the number of model requests.
+    async fn rerank_with_evaluate_model(strategy_arg: &str) -> (Vec<i64>, usize) {
+        let (ctx, models, test_engine) = make_rerank_session();
+        setup_test_table(&ctx, &models.rerankers, vec![])
+            .await
+            .expect("test table");
+        if let Ok(provider) = ctx.table_provider(TableReference::bare("test_docs")).await {
+            test_engine.register_table("test_docs", provider);
+        }
+        let mock = Arc::new(MockEvaluate::default());
+        models
+            .evaluate_models
+            .write()
+            .await
+            .insert("jev".to_string(), Arc::clone(&mock) as Arc<dyn Evaluate>);
+
+        let sql = format!(
+            "SELECT id FROM rerank(test_docs, document => 'content', query => 'battery', model => 'jev'{strategy_arg})"
+        );
+        let batches = execute_query!(ctx, &sql).expect("query must succeed");
+        let ids = batches
+            .iter()
+            .flat_map(|batch| {
+                batch
+                    .column(0)
+                    .as_any()
+                    .downcast_ref::<arrow::array::Int64Array>()
+                    .expect("int64 ids")
+                    .values()
+                    .to_vec()
+            })
+            .collect();
+        (ids, mock.requests.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rerank_evaluate_model_listwise_sends_one_request() {
+        let (ids, requests) = rerank_with_evaluate_model(", strategy => 'listwise'").await;
+        assert_eq!(ids, vec![1, 5, 4, 2, 3]);
+        assert_eq!(requests, 1);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rerank_evaluate_model_pointwise_sends_one_request_per_row() {
+        let (ids, requests) = rerank_with_evaluate_model(", strategy => 'pointwise'").await;
+        assert_eq!(ids, vec![1, 5, 4, 2, 3]);
+        assert_eq!(requests, 5);
+    }
+
+    /// Without `strategy =>`, an evaluation model reranks pointwise.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn rerank_evaluate_model_defaults_to_pointwise() {
+        let (ids, requests) = rerank_with_evaluate_model("").await;
+        assert_eq!(ids, vec![1, 5, 4, 2, 3]);
+        assert_eq!(requests, 5);
     }
 }
