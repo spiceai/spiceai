@@ -1582,6 +1582,17 @@ impl QueryResultsCacheProvider {
         }
     }
 
+    /// Whether results of `plan` may be stored in / served from the SQL
+    /// results cache.
+    ///
+    /// Caching policy for non-deterministic plans: a plan is never cached if
+    /// any expression (including in subqueries) calls a
+    /// `Volatility::Volatile` function such as `random()` or `uuid()`, or a
+    /// time function listed in [`NON_CACHEABLE_TIME_FUNCTIONS`] (`now()`,
+    /// `current_date`, `current_time`, ...). DataFusion marks the time
+    /// functions `Stable` (constant within one statement), but a cached result
+    /// would replay a stale clock across statements, so they are treated as
+    /// uncacheable too. Such queries report no results-cache status.
     #[must_use]
     pub fn cache_is_enabled_for_plan(&self, plan: &LogicalPlan) -> bool {
         let mut plan_stack = vec![plan];
@@ -1617,8 +1628,77 @@ impl QueryResultsCacheProvider {
             plan_stack.extend(current_plan.inputs());
         }
 
-        true
+        !plan_is_non_deterministic(plan)
     }
+}
+
+/// Time functions that DataFusion marks `Volatility::Stable` (the value is
+/// fixed for one statement but changes between statements). Caching their
+/// results would serve a stale clock, so they are treated as uncacheable.
+pub const NON_CACHEABLE_TIME_FUNCTIONS: &[&str] = &[
+    "now",
+    "current_timestamp",
+    "current_date",
+    "current_time",
+    "localtime",
+    "localtimestamp",
+    "today",
+];
+
+/// Returns `true` when `plan` (including any subquery) contains a function
+/// whose result can differ between two executions of the same plan: any
+/// `Volatility::Volatile` function (`random()`, `uuid()`, ...) or one of
+/// [`NON_CACHEABLE_TIME_FUNCTIONS`]. Results of such plans must not be served
+/// from the SQL results cache.
+#[must_use]
+pub fn plan_is_non_deterministic(plan: &LogicalPlan) -> bool {
+    use datafusion::common::tree_node::TreeNodeRecursion;
+
+    let mut found = false;
+    let _ = plan.apply_with_subqueries(|node| {
+        node.apply_expressions(|expr| {
+            if expr_is_non_deterministic(expr) {
+                found = true;
+                Ok(TreeNodeRecursion::Stop)
+            } else {
+                Ok(TreeNodeRecursion::Continue)
+            }
+        })
+    });
+    found
+}
+
+fn is_time_function_name(name: &str) -> bool {
+    NON_CACHEABLE_TIME_FUNCTIONS
+        .iter()
+        .any(|f| f.eq_ignore_ascii_case(name))
+}
+
+/// Checks a single expression tree (not descending into subquery plans,
+/// which [`plan_is_non_deterministic`] visits itself).
+fn expr_is_non_deterministic(expr: &datafusion::logical_expr::Expr) -> bool {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    use datafusion::logical_expr::{Expr, Volatility};
+
+    let mut found = false;
+    let _ = expr.apply(|e| {
+        let hit = match e {
+            Expr::ScalarFunction(f) => {
+                f.func.signature().volatility == Volatility::Volatile
+                    || is_time_function_name(f.func.name())
+                    || f.func.aliases().iter().any(|a| is_time_function_name(a))
+            }
+            Expr::AggregateFunction(f) => f.func.signature().volatility == Volatility::Volatile,
+            _ => false,
+        };
+        if hit {
+            found = true;
+            Ok(TreeNodeRecursion::Stop)
+        } else {
+            Ok(TreeNodeRecursion::Continue)
+        }
+    });
+    found
 }
 
 impl Display for QueryResultsCacheProvider {
@@ -2500,6 +2580,53 @@ mod tests {
             .cache_is_enabled_for_plan(&logical_plan)
             .then_some(())
             .expect("cache should be enabled for simple SELECT");
+    }
+
+    #[tokio::test]
+    async fn test_cache_is_disabled_for_non_deterministic_functions() {
+        let cache_provider =
+            QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
+                .expect("valid cache provider");
+
+        for sql in [
+            "SELECT uuid() u",
+            "SELECT random() r",
+            "SELECT uuid() u, random() r, now() t",
+            "SELECT now()",
+            "SELECT current_timestamp",
+            "SELECT current_date",
+            "SELECT current_time()",
+            "SELECT id, random() FROM customer",
+            "SELECT * FROM customer WHERE random() > 0.5",
+            "SELECT * FROM customer WHERE now() > to_timestamp(0)",
+            "SELECT * FROM customer WHERE id IN (SELECT id FROM customer WHERE random() > 0.5)",
+            "SELECT count(*) FROM customer GROUP BY id ORDER BY random()",
+        ] {
+            let logical_plan = parse_sql_to_logical_plan(sql).await;
+            assert!(
+                !cache_provider.cache_is_enabled_for_plan(&logical_plan),
+                "results cache must be disabled for non-deterministic query: {sql}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cache_is_enabled_for_deterministic_functions() {
+        let cache_provider =
+            QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
+                .expect("valid cache provider");
+
+        for sql in [
+            "SELECT abs(-1), upper('a')",
+            "SELECT id, lower(first_name) FROM customer WHERE id > 1",
+            "SELECT * FROM customer WHERE id IN (SELECT id FROM customer WHERE state = 'NY')",
+        ] {
+            let logical_plan = parse_sql_to_logical_plan(sql).await;
+            assert!(
+                cache_provider.cache_is_enabled_for_plan(&logical_plan),
+                "results cache must stay enabled for deterministic query: {sql}"
+            );
+        }
     }
 
     #[tokio::test]

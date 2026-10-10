@@ -2201,6 +2201,47 @@ mod tests {
         assert_eq!(value, 1);
     }
 
+    /// Plans with volatile functions (`random()`, `uuid()`) or time functions
+    /// (`now()`, `current_date`) must never be served from, or stored in, the
+    /// results cache, under every cache key type. A deterministic control
+    /// query on the same runtime still hits.
+    #[tokio::test]
+    async fn test_results_cache_skips_non_deterministic_plans() {
+        for key_type in [
+            spicepod::component::caching::CacheKeyType::Plan,
+            spicepod::component::caching::CacheKeyType::Sql,
+        ] {
+            let df = prepare_runtime(Some(SQLResultsCacheConfig {
+                item_ttl: Some("10m".to_string()),
+                cache_key_type: key_type,
+                ..Default::default()
+            }))
+            .await;
+
+            for sql in [
+                "SELECT CAST(random() * 1000000000000 AS BIGINT)",
+                "SELECT CAST(length(uuid()) AS BIGINT) + CAST(random() * 1000000000000 AS BIGINT)",
+                "SELECT CAST(date_part('epoch', now()) * 1000000 AS BIGINT)",
+                "SELECT CAST(date_part('day', current_date) AS BIGINT)",
+            ] {
+                for _ in 0..2 {
+                    let (status, _) = run_i64_query(&df, sql, ResultsCacheMode::Default).await;
+                    assert_eq!(
+                        status,
+                        CacheStatus::CacheDisabled,
+                        "{key_type:?}: non-deterministic query must not use the results cache: {sql}"
+                    );
+                }
+            }
+
+            let (status, _) = run_i64_query(&df, "SELECT 42", ResultsCacheMode::Default).await;
+            assert_eq!(status, CacheStatus::CacheMiss, "{key_type:?}");
+            let (status, value) = run_i64_query(&df, "SELECT 42", ResultsCacheMode::Default).await;
+            assert_eq!(status, CacheStatus::CacheHit, "{key_type:?}");
+            assert_eq!(value, 42);
+        }
+    }
+
     /// A one-row table whose value is the cache namespace of the request that
     /// planned the scan. It reads the namespace the way the caching accelerator
     /// scopes its rows: from the `RequestContext` that `Query::run_internal`

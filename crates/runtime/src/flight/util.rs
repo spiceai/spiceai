@@ -113,3 +113,24 @@ pub(crate) async fn set_flightsql_protocol() {
     let request_context = RequestContext::current(AsyncMarker::new().await);
     request_context.update_protocol(Protocol::FlightSQL);
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A query the results cache refuses (e.g. one calling `random()` or
+    /// `now()`) reports `CacheDisabled`, which must emit no cache metadata
+    /// rather than a misleading HIT/MISS.
+    #[test]
+    fn disabled_results_cache_emits_no_metadata() {
+        assert!(status_to_results_cache_value(CacheStatus::CacheDisabled).is_none());
+        assert!(status_to_x_cache_value(CacheStatus::CacheDisabled).is_none());
+        assert_eq!(
+            status_to_results_cache_value(CacheStatus::CacheHit)
+                .expect("HIT")
+                .to_str()
+                .expect("ascii"),
+            "HIT"
+        );
+    }
+}
