@@ -572,6 +572,8 @@ pub const REQUEST_KEY_COLUMNS: [&str; 3] = ["request_path", "request_query", "re
 /// they name none.
 pub const REQUEST_BODY_COLUMN: &str = "request_body";
 
+pub const REQUEST_QUERY_COLUMN: &str = "request_query";
+
 /// Whether `filters` make the HTTP connector send an explicit-empty POST.
 ///
 /// Its response is stored with `request_body = ''`, exactly as a GET's is, so
@@ -600,6 +602,7 @@ pub fn sends_explicit_empty_request_body(filters: &[Expr]) -> bool {
 pub fn request_identity_filters(
     filters: &[Expr],
     cache_schema: &arrow::datatypes::Schema,
+    http_source: bool,
 ) -> Vec<Expr> {
     // Any predicate on a request column makes the read a lookup — even one the
     // connector turns into no request value, such as `request_body <> 'z'`,
@@ -611,14 +614,98 @@ pub fn request_identity_filters(
             .chain(["request_headers"])
             .any(|name| column.name == name)
     });
+    let mut identity = Vec::new();
     if names_request
         && cache_schema.column_with_name(REQUEST_BODY_COLUMN).is_some()
         && HttpTableProvider::request_filter_values(filters, REQUEST_BODY_COLUMN).is_empty()
     {
-        vec![col(REQUEST_BODY_COLUMN).eq(lit(""))]
-    } else {
-        Vec::new()
+        identity.push(col(REQUEST_BODY_COLUMN).eq(lit("")));
     }
+    if http_source
+        && names_request
+        && cache_schema
+            .column_with_name(REQUEST_QUERY_COLUMN)
+            .is_some()
+        && HttpTableProvider::request_filter_values(filters, REQUEST_QUERY_COLUMN).is_empty()
+    {
+        identity.push(col(REQUEST_QUERY_COLUMN).eq(lit("")));
+    }
+    identity
+}
+
+#[must_use]
+pub fn http_table_source(provider: &dyn TableProvider) -> bool {
+    spice_table::find_concrete::<HttpTableProvider>(provider, spice_table::LayerWalk::Read)
+        .is_some()
+}
+
+fn normalize_request_query_stamps(
+    mut batches: Vec<RecordBatch>,
+    filters: &[Expr],
+    http_source: bool,
+) -> Vec<RecordBatch> {
+    if !http_source || batches.is_empty() {
+        return batches;
+    }
+    let mut first: Option<String> = None;
+    let mut divergent = false;
+    for batch in &batches {
+        let Some(column) = batch
+            .column_by_name(REQUEST_QUERY_COLUMN)
+            .and_then(|column| column.as_any().downcast_ref::<StringArray>())
+        else {
+            continue;
+        };
+        if column.is_empty() {
+            continue;
+        }
+        if (1..column.len()).any(|i| column.value(i) != column.value(0)) {
+            divergent = true;
+            break;
+        }
+        match &first {
+            None => first = Some(column.value(0).to_string()),
+            Some(value) if value != column.value(0) => {
+                divergent = true;
+                break;
+            }
+            _ => {}
+        }
+    }
+    if !divergent {
+        return batches;
+    }
+    let canonical =
+        match HttpTableProvider::request_filter_values(filters, REQUEST_QUERY_COLUMN).as_slice() {
+            [] => "",
+            [value] => value,
+            _ => return batches,
+        };
+    for batch in &mut batches {
+        let schema = batch.schema();
+        let Some((index, _)) = schema.column_with_name(REQUEST_QUERY_COLUMN) else {
+            continue;
+        };
+        if batch.num_rows() == 0 {
+            continue;
+        }
+        let columns: Vec<ArrayRef> = batch
+            .columns()
+            .iter()
+            .enumerate()
+            .map(|(position, column)| {
+                if position == index {
+                    Arc::new(StringArray::from(vec![canonical; batch.num_rows()])) as ArrayRef
+                } else {
+                    Arc::clone(column)
+                }
+            })
+            .collect();
+        if let Ok(stamped) = RecordBatch::try_new(schema, columns) {
+            *batch = stamped;
+        }
+    }
+    batches
 }
 
 /// The filters that re-request a stored entry from the source. The row stores
@@ -628,17 +715,20 @@ pub fn request_identity_filters(
 fn source_replay_filters(filters: &[Expr]) -> Vec<Expr> {
     filters
         .iter()
-        .filter(|filter| !is_empty_request_body_predicate(filter))
+        .filter(|filter| {
+            !is_empty_request_value_predicate(filter, REQUEST_BODY_COLUMN)
+                && !is_empty_request_value_predicate(filter, REQUEST_QUERY_COLUMN)
+        })
         .cloned()
         .collect()
 }
 
-fn is_empty_request_body_predicate(filter: &Expr) -> bool {
+fn is_empty_request_value_predicate(filter: &Expr, column_name: &str) -> bool {
     let Expr::BinaryExpr(binary) = filter else {
         return false;
     };
     binary.op == datafusion::logical_expr::Operator::Eq
-        && matches!(binary.left.as_ref(), Expr::Column(column) if column.name == REQUEST_BODY_COLUMN)
+        && matches!(binary.left.as_ref(), Expr::Column(column) if column.name == column_name)
         && matches!(
             binary.right.as_ref(),
             Expr::Literal(
@@ -687,6 +777,7 @@ pub struct CacheWriteRequest {
     /// overwrite each other's rows for the same `(request_path, query, body)`
     /// key.
     pub namespace_id: Arc<str>,
+    pub http_source: bool,
 }
 
 /// Receiver half of the cache write channel
@@ -992,7 +1083,7 @@ async fn flush_cache_writes(
         // A GET entry's replace must not delete the POST entries cached for
         // the same path, so it carries the predicate its lookup reads by.
         if !filters.is_empty() {
-            let identity = request_identity_filters(&filters, &storage_schema);
+            let identity = request_identity_filters(&filters, &storage_schema, !req.http_source);
             filters.extend(identity);
         }
         if needs_namespace_stamp {
@@ -1420,6 +1511,7 @@ impl NativeCacheWrite {
     async fn run(self) -> DataFusionResult<()> {
         let batches = self.request.batches.clone();
         let filters = self.request.filters.clone();
+        let http_source = self.request.http_source;
         let namespace_id = Arc::clone(&self.request.namespace_id);
 
         // Admission follows registry acquisition. Initialization can therefore
@@ -1494,6 +1586,7 @@ impl NativeCacheWrite {
                 cache_key: claim.key().to_string(),
                 replaces_existing: true,
                 namespace_id: Arc::clone(&namespace_id),
+                http_source,
             };
             let result = if child.writer.requires_complete_fetch() {
                 child.writer.send_claimed_and_wait(request, claim).await
@@ -1674,6 +1767,7 @@ impl CacheRefreshHelper {
                         cache_key: claim.key().to_string(),
                         namespace_id: namespace_id.into(),
                         replaces_existing: true,
+                        http_source: http_table_source(federated.as_ref()),
                     };
                     cache_write_tx.send_claimed_and_wait(request, claim).await?;
                     return Ok(refreshed_rows);
@@ -1811,6 +1905,7 @@ impl CacheRefreshHelper {
             cache_key: claim.key().to_string(),
             namespace_id: namespace.storage_id().into(),
             replaces_existing: true,
+            http_source: http_table_source(federated.as_ref()),
         };
 
         batch_write_tx.send_claimed(request, claim).await?;
@@ -2318,6 +2413,7 @@ impl CacheRefreshHelper {
         complete: bool,
         input_charge: Option<Arc<RetainedBufferCharge>>,
         namespace_id: &str,
+        http_source: bool,
     ) {
         let children = synchronized_children.read().await.clone();
         if children.is_empty() {
@@ -2363,6 +2459,7 @@ impl CacheRefreshHelper {
                 namespace_id: namespace_id.into(),
                 // The parent's cache miss does not establish that the child is empty.
                 replaces_existing: true,
+                http_source,
             };
             if let Err(e) = child.writer.send_claimed(request, claim).await {
                 tracing::warn!(
@@ -2506,6 +2603,7 @@ impl CacheRefreshHelper {
                 cache_key: claim.key().to_string(),
                 namespace_id: namespace_id.into(),
                 replaces_existing: true,
+                http_source: false,
             };
             child.writer.send_claimed_and_wait(request, claim).await?;
         }
@@ -2623,6 +2721,9 @@ impl CacheRefreshHelper {
             dataset_name
         );
 
+        let http_source = http_table_source(federated.as_ref());
+        let all_batches = normalize_request_query_stamps(all_batches, filters, http_source);
+
         Ok(CacheFetch {
             batches: all_batches,
             complete,
@@ -2710,6 +2811,8 @@ impl CacheRefreshHelper {
         if !is_expired {
             batch_write_tx.confirm_empty_scan(&mut claim);
         }
+
+        let http_source = http_table_source(federated.as_ref());
 
         // Capture time before the origin fetch while leaving the cached rows
         // unread until a failed fetch actually needs them.
@@ -2806,6 +2909,7 @@ impl CacheRefreshHelper {
                             cache_key: claim.key().to_string(),
                             namespace_id: namespace.storage_id().into(),
                             replaces_existing: is_expired,
+                            http_source,
                         };
                         if native {
                             if let Some(input_charge) = &charge {
@@ -2858,6 +2962,7 @@ impl CacheRefreshHelper {
                                 complete,
                                 charge,
                                 namespace.storage_id(),
+                                http_source,
                             )
                             .await;
                         });
@@ -4004,6 +4109,7 @@ mod pool_tests {
                     cache_key: key,
                     namespace_id: "public".into(),
                     replaces_existing: true,
+                    http_source: false,
                 },
                 claim,
                 Arc::new(tokio::sync::RwLock::new(Vec::new())),
@@ -4489,6 +4595,7 @@ mod pool_tests {
             true,
             Some(charge),
             "public",
+            false,
         )
         .await;
         assert_eq!(
@@ -4558,6 +4665,7 @@ mod pool_tests {
                 cache_key: key,
                 namespace_id: "public".into(),
                 replaces_existing: true,
+                http_source: false,
             },
             claim,
             Arc::new(tokio::sync::RwLock::new(vec![child.clone()])),
@@ -4704,28 +4812,62 @@ mod tests {
         ];
         for (name, filters, schema, expected) in cases {
             assert_eq!(
-                request_identity_filters(&filters, schema),
+                request_identity_filters(&filters, schema, false),
                 expected,
                 "{name}"
             );
         }
     }
 
+    #[test]
+    fn request_identity_filters_pin_queryless_lookups_on_http_sources() {
+        let http = Schema::new(vec![
+            Field::new("request_path", DataType::Utf8, true),
+            Field::new("request_query", DataType::Utf8, true),
+            Field::new("request_body", DataType::Utf8, true),
+        ]);
+        let filters = vec![col("request_path").eq(lit("/items"))];
+        assert_eq!(
+            request_identity_filters(&filters, &http, true),
+            vec![
+                col("request_body").eq(lit("")),
+                col("request_query").eq(lit("")),
+            ]
+        );
+        assert_eq!(
+            request_identity_filters(&filters, &http, false),
+            vec![col("request_body").eq(lit(""))]
+        );
+        let named = vec![
+            col("request_path").eq(lit("/items")),
+            col("request_query").eq(lit("q=a")),
+        ];
+        assert_eq!(
+            request_identity_filters(&named, &http, true),
+            vec![col("request_body").eq(lit(""))]
+        );
+    }
+
     /// A stored GET entry is re-requested without its `request_body = ''`
     /// predicate, and every other request predicate is kept.
     #[test]
-    fn source_replay_filters_drop_only_the_empty_body() {
+    fn source_replay_filters_drop_the_empty_body_and_query() {
         let path = col("request_path").eq(lit("/items"));
-        let query = col("request_query").eq(lit(""));
+        let empty_query = col("request_query").eq(lit(""));
         let empty_body = col("request_body").eq(lit(""));
+        let query = col("request_query").eq(lit("q=a"));
         let body = col("request_body").eq(lit("x"));
         assert_eq!(
-            source_replay_filters(&[path.clone(), query.clone(), empty_body]),
-            vec![path.clone(), query.clone()]
+            source_replay_filters(&[path.clone(), empty_query.clone(), empty_body.clone()]),
+            vec![path.clone()]
         );
         assert_eq!(
             source_replay_filters(&[path.clone(), query.clone(), body.clone()]),
-            vec![path, query, body]
+            vec![path.clone(), query.clone(), body.clone()]
+        );
+        assert_eq!(
+            source_replay_filters(&[path.clone(), empty_query, body.clone()]),
+            vec![path, body]
         );
     }
 
@@ -6252,6 +6394,7 @@ mod tests {
                 cache_key: format!("key_{i}"),
                 namespace_id: "public".into(),
                 replaces_existing: false,
+                http_source: false,
             })
             .await
             .expect("to send write request");
@@ -8891,6 +9034,7 @@ mod write_path_tests {
             cache_key: "key".to_string(),
             namespace_id: "public".into(),
             replaces_existing: false,
+            http_source: false,
         })
         .await
         .expect("send");
@@ -8924,6 +9068,7 @@ mod write_path_tests {
                 cache_key: "same-key".to_string(),
                 namespace_id: "public".into(),
                 replaces_existing: false,
+                http_source: false,
             })
             .await
             .expect("send");
@@ -8950,6 +9095,7 @@ mod write_path_tests {
             cache_key: "key".to_string(),
             namespace_id: "public".into(),
             replaces_existing: true,
+            http_source: false,
         })
         .await
         .expect("send");

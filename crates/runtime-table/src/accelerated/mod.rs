@@ -1961,11 +1961,15 @@ impl AcceleratedTable {
         // path. Without filters the scan lists the whole cache and makes no
         // request, so nothing is pinned.
         let identity_filters: Vec<Expr> = if is_caching_mode && !filters.is_empty() {
-            caching::request_identity_filters(filters, &self.accelerator.schema())
+            let source_provider = self.federated.table_provider().await;
+            caching::request_identity_filters(
+                filters,
+                &self.accelerator.schema(),
+                caching::http_table_source(source_provider.as_ref()),
+            )
         } else {
             Vec::new()
         };
-
         // For caching mode, scope the accelerator scan to the current
         // request's namespace by appending a `__spice_cache_namespace = $ns_id`
         // predicate. The federated source still receives only the user's
