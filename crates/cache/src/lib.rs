@@ -1585,14 +1585,15 @@ impl QueryResultsCacheProvider {
     /// Whether results of `plan` may be stored in / served from the SQL
     /// results cache.
     ///
-    /// Caching policy for non-deterministic plans: a plan is never cached if
-    /// any expression (including in subqueries) calls a
-    /// `Volatility::Volatile` function such as `random()` or `uuid()`, or a
-    /// time function listed in [`NON_CACHEABLE_TIME_FUNCTIONS`] (`now()`,
-    /// `current_date`, `current_time`, ...). DataFusion marks the time
-    /// functions `Stable` (constant within one statement), but a cached result
-    /// would replay a stale clock across statements, so they are treated as
-    /// uncacheable too. Such queries report no results-cache status.
+    /// Caching policy for non-deterministic plans: only plans whose functions
+    /// are all `Volatility::Immutable` are cacheable. A plan is never cached if
+    /// any scalar, aggregate, or window function (including in subqueries) is
+    /// `Volatile` (`random()`, `uuid()`, ...) or `Stable`. `Stable` covers the
+    /// time functions (`now()`, `current_date`, `current_time`, ...; see
+    /// [`NON_CACHEABLE_TIME_FUNCTIONS`]) and remote HTTP UDFs, which are capped
+    /// at `Stable`. They are constant within one statement, but a cached result
+    /// would replay stale output across statements. Such queries report no
+    /// results-cache status.
     #[must_use]
     pub fn cache_is_enabled_for_plan(&self, plan: &LogicalPlan) -> bool {
         let mut plan_stack = vec![plan];
@@ -1632,7 +1633,7 @@ impl QueryResultsCacheProvider {
     }
 }
 
-/// Time functions that DataFusion marks `Volatility::Stable` (the value is
+/// Time functions that `DataFusion` marks `Volatility::Stable` (the value is
 /// fixed for one statement but changes between statements). Caching their
 /// results would serve a stale clock, so they are treated as uncacheable.
 pub const NON_CACHEABLE_TIME_FUNCTIONS: &[&str] = &[
@@ -1647,8 +1648,8 @@ pub const NON_CACHEABLE_TIME_FUNCTIONS: &[&str] = &[
 
 /// Returns `true` when `plan` (including any subquery) contains a function
 /// whose result can differ between two executions of the same plan: any
-/// `Volatility::Volatile` function (`random()`, `uuid()`, ...) or one of
-/// [`NON_CACHEABLE_TIME_FUNCTIONS`]. Results of such plans must not be served
+/// function that is not `Volatility::Immutable` (`random()`, `uuid()`,
+/// `now()`, remote UDFs, ...) or one of [`NON_CACHEABLE_TIME_FUNCTIONS`]. Results of such plans must not be served
 /// from the SQL results cache.
 #[must_use]
 pub fn plan_is_non_deterministic(plan: &LogicalPlan) -> bool {
@@ -1684,11 +1685,12 @@ fn expr_is_non_deterministic(expr: &datafusion::logical_expr::Expr) -> bool {
     let _ = expr.apply(|e| {
         let hit = match e {
             Expr::ScalarFunction(f) => {
-                f.func.signature().volatility == Volatility::Volatile
+                f.func.signature().volatility != Volatility::Immutable
                     || is_time_function_name(f.func.name())
                     || f.func.aliases().iter().any(|a| is_time_function_name(a))
             }
-            Expr::AggregateFunction(f) => f.func.signature().volatility == Volatility::Volatile,
+            Expr::AggregateFunction(f) => f.func.signature().volatility != Volatility::Immutable,
+            Expr::WindowFunction(w) => w.fun.signature().volatility != Volatility::Immutable,
             _ => false,
         };
         if hit {
@@ -2606,6 +2608,45 @@ mod tests {
             assert!(
                 !cache_provider.cache_is_enabled_for_plan(&logical_plan),
                 "results cache must be disabled for non-deterministic query: {sql}"
+            );
+        }
+    }
+
+    /// `Stable` user functions (e.g. remote HTTP UDFs, which are capped at
+    /// `Stable`) can change between statements, so only `Immutable`
+    /// functions are cacheable.
+    #[tokio::test]
+    async fn test_cache_is_disabled_for_stable_udf() {
+        use datafusion::arrow::datatypes::DataType;
+        use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
+
+        let cache_provider =
+            QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
+                .expect("valid cache provider");
+
+        for (volatility, cacheable) in [(Volatility::Stable, false), (Volatility::Immutable, true)]
+        {
+            let ctx = utils::tests::create_session_context();
+            ctx.register_udf(create_udf(
+                "probe",
+                vec![],
+                DataType::Int64,
+                volatility,
+                std::sync::Arc::new(|_: &[ColumnarValue]| {
+                    Ok(ColumnarValue::Scalar(
+                        datafusion::scalar::ScalarValue::Int64(Some(1)),
+                    ))
+                }),
+            ));
+            let plan = ctx
+                .state()
+                .create_logical_plan("SELECT probe()")
+                .await
+                .expect("plan");
+            assert_eq!(
+                cache_provider.cache_is_enabled_for_plan(&plan),
+                cacheable,
+                "{volatility:?}"
             );
         }
     }
