@@ -16,6 +16,13 @@ limitations under the License.
 
 pub mod llms;
 
+// Credential-free tests that run in `make nextest`; `llms` calls live provider
+// APIs and runs in `integration_llms.yml`.
+mod anthropic_stream_errors;
+mod list_models_errors;
+#[cfg(feature = "local_embed")]
+mod model2vec_hf_cache;
+
 use std::{collections::HashSet, sync::LazyLock};
 
 use tracing_subscriber::EnvFilter;
@@ -86,4 +93,65 @@ fn init_tracing(default_level: Option<&str>) -> tracing::subscriber::DefaultGuar
         .with_ansi(true)
         .finish();
     tracing::subscriber::set_default(subscriber)
+}
+
+/// Fails the calling test unless it runs in a process of its own.
+///
+/// nextest runs every test in its own process; plain `cargo test` runs a
+/// binary's tests on threads of one process. A test that changes process-global
+/// state calls this before changing it, so under `cargo test` it fails with
+/// instructions instead of changing the state every neighbouring test runs under.
+/// `why` names that state.
+fn require_process_per_test(why: &str) {
+    assert!(
+        std::env::var("NEXTEST_EXECUTION_MODE").as_deref() == Ok("process-per-test"),
+        "{why}, so it must run in a process of its own. Run it with \
+         `cargo nextest run -p llms --test integration <test name>`: plain \
+         `cargo test` runs every test in the binary on threads of one process"
+    );
+}
+
+/// `autotests = false` means cargo compiles only the test targets `Cargo.toml`
+/// names, so a new `tests/<name>.rs` that is neither a module of a target nor its own
+/// `[[test]]` would build nothing and its tests would never run, silently.
+#[test]
+fn every_test_file_is_compiled() {
+    let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"));
+    let manifest =
+        std::fs::read_to_string(dir.join("Cargo.toml")).expect("Cargo.toml should be readable");
+    let target_paths: Vec<&str> = manifest
+        .lines()
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix("path = \"tests/")
+                .and_then(|path| path.strip_suffix(".rs\""))
+        })
+        .collect();
+    let roots: Vec<String> = target_paths
+        .iter()
+        .map(|stem| {
+            std::fs::read_to_string(dir.join(format!("tests/{stem}.rs")))
+                .expect("test target root should be readable")
+        })
+        .collect();
+    let mut missing: Vec<String> = std::fs::read_dir(dir.join("tests"))
+        .expect("tests/ should be readable")
+        .map(|entry| entry.expect("tests/ entry should be readable").path())
+        .filter(|path| path.extension().is_some_and(|ext| ext == "rs"))
+        .filter_map(|path| Some(path.file_stem()?.to_str()?.to_string()))
+        .filter(|stem| {
+            !target_paths.contains(&stem.as_str())
+                && !roots.iter().any(|root| {
+                    root.lines()
+                        .any(|line| line.trim() == format!("mod {stem};"))
+                })
+        })
+        .collect();
+    missing.sort();
+    assert!(
+        missing.is_empty(),
+        "these files in crates/llms/tests are not compiled into any test binary: \
+         {missing:?}. Add `mod <name>;` to tests/integration.rs, or a `[[test]]` \
+         entry in crates/llms/Cargo.toml if the file needs its own binary"
+    );
 }
