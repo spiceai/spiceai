@@ -366,7 +366,7 @@ mod chat_backend_tests {
     clippy::expect_used,
     reason = "a failed set-up in a test should name itself and stop"
 )]
-mod authorization_header_tests {
+pub(crate) mod authorization_header_tests {
     use std::io::{Read as _, Write as _};
     use std::net::TcpListener;
     use std::sync::mpsc;
@@ -377,7 +377,7 @@ mod authorization_header_tests {
 
     /// Stand a one-shot HTTP server up and hand back its base URL together with a
     /// channel carrying the request headers it receives.
-    fn capture_one_request() -> (String, mpsc::Receiver<String>) {
+    pub(crate) fn capture_one_request() -> (String, mpsc::Receiver<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind a local port");
         let port = listener
             .local_addr()

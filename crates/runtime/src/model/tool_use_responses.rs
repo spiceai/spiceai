@@ -128,6 +128,7 @@ impl ToolUsingResponses {
                     strict: t.strict(),
                     name: encode_tool_name(t.name().to_string().as_str()),
                     description: t.description().map(|d| d.to_string()),
+                    defer_loading: None,
                     parameters: Some(
                         t.parameters()
                             .map(|mut params| {
@@ -243,6 +244,7 @@ impl ToolUsingResponses {
                 arguments: tool_call.arguments.clone(),
                 call_id: tool_call.id.clone().unwrap_or_default(),
                 name: tool_call.name.clone(),
+                namespace: tool_call.namespace.clone(),
                 id: Some(tool_call.name.clone()),
                 status: None,
             })));
@@ -727,6 +729,7 @@ fn to_input_item(input: InputParam) -> Vec<InputItem> {
             content: EasyInputContent::Text(text),
             role: Role::User,
             r#type: MessageType::Message,
+            phase: None,
         })],
         InputParam::Items(items) => items,
     }

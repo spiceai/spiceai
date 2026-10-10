@@ -541,14 +541,14 @@ impl TryFrom<(AnthropicModelVariant, CreateChatCompletionRequest)> for MessageCr
                 ResponseFormat::JsonSchema {
                     json_schema:
                         ResponseFormatJsonSchema {
-                            schema: Some(schema_v),
+                            schema: schema_v,
                             ..
                         },
                 } => Some(OutputFormat {
                     format_type: "json_schema".to_string(),
                     schema: schema_v,
                 }),
-                _ => None,
+                ResponseFormat::Text => None,
             }),
         })
     }
