@@ -1495,6 +1495,7 @@ impl AcceleratedTable {
                     .then(|| self.synchronized_with.clone())
                     .flatten();
                 let claims = Arc::clone(&self.in_flight_revalidations);
+                let accelerator = Arc::clone(&self.accelerator);
                 let (sender, receiver) = tokio::sync::watch::channel(None);
                 self.io_runtime.spawn(async move {
                     let mut producer_failure = None;
@@ -1528,6 +1529,16 @@ impl AcceleratedTable {
                         Some(publication) => publication.wait().await,
                         None => Ok(()),
                     };
+                    // The accelerator's own background maintenance — compaction,
+                    // sweeps, checkpoints — is not a change producer, so nothing
+                    // above stops it, and the generation that replaces this one
+                    // opens the same storage. Stop it once ingest has drained, so
+                    // the two instances never maintain one table at once (#11581).
+                    write::dual_write::quiesce_cayenne_maintenance(
+                        &accelerator,
+                        ACCELERATOR_MAINTENANCE_QUIESCE_WAIT,
+                    )
+                    .await;
                     // Initialization owns the registry write guard. The admission
                     // fence prevents a later initializer from attaching a child.
                     drop(children.write().await);
@@ -2890,6 +2901,12 @@ impl RetentionBuilder {
 }
 
 /// The docs page every retention refusal points at.
+/// How long a generation drain waits for one Cayenne instance's in-flight
+/// maintenance pass before moving on. Matches the background compactor's own
+/// shutdown drain: long enough for the large merges seen at scale to finish their
+/// write, bounded so a stuck pass cannot hold a reload or an unload.
+const ACCELERATOR_MAINTENANCE_QUIESCE_WAIT: Duration = Duration::from_mins(2);
+
 const RETENTION_DOCS_URL: &str = "https://spiceai.org/docs/components/data-accelerators";
 
 /// Why [`RetentionBuilder::assemble`] could not assemble a retention policy.

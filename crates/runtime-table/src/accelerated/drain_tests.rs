@@ -154,3 +154,71 @@ async fn change_sink_drain_joins_producer_and_retains_accepted_write() {
     .await
     .expect("drain must not hang");
 }
+
+/// Draining a generation stops its Cayenne accelerator's background maintenance.
+/// The generation that replaces it opens the same table on the same catalog with
+/// its own `compaction_lock`, so a compaction pass of the drained instance that
+/// outlived the hand-over could interleave with the replacement's and register
+/// rows twice (#11581). Nothing else stops it: the maintenance is not a change
+/// producer, and the drained table may stay alive while queries hold it.
+#[tokio::test]
+async fn drain_quiesces_the_cayenne_accelerators_maintenance() {
+    use cayenne::metadata::{CreateTableOptions, VortexConfig};
+    use cayenne::{CayenneCatalog, CayenneTableProviderBuilder, MetadataCatalog};
+
+    tokio::time::timeout(WAIT, async {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = temp_dir.path().join("metadata");
+        tokio::fs::create_dir_all(&metadata_dir)
+            .await
+            .expect("metadata dir");
+        let catalog = Arc::new(
+            CayenneCatalog::new(format!("sqlite://{}/cayenne.db", metadata_dir.display()))
+                .expect("catalog"),
+        ) as Arc<dyn MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let cayenne = CayenneTableProviderBuilder::new(catalog, SessionContext::new().runtime_env())
+            .create(CreateTableOptions {
+                table_name: "drain_cayenne".to_string(),
+                schema: Arc::clone(&schema),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: temp_dir.path().join("data").display().to_string(),
+                partition_column: None,
+                vortex_config: VortexConfig::default(),
+            })
+            .await
+            .expect("Cayenne table");
+        let observer = cayenne.clone_for_write_operations();
+        let accelerator: Arc<dyn TableProvider> = Arc::new(cayenne);
+        let source = Arc::new(
+            data_components::arrow::write::MemTable::try_new(Arc::clone(&schema), vec![vec![]])
+                .expect("source"),
+        );
+        let table = Builder::new(
+            runtime_status::RuntimeStatus::new(),
+            TableReference::bare("drain_cayenne"),
+            Arc::new(FederatedTable::new_unchecked(source)),
+            "cayenne".into(),
+            accelerator,
+            refresh::Refresh::new(super::RefreshMode::Disabled),
+            Handle::current(),
+        )
+        .build()
+        .await
+        .expect("table");
+
+        assert!(
+            !observer.is_maintenance_closed(),
+            "a live generation's accelerator runs its maintenance"
+        );
+        table.drain_changes().await.expect("drain");
+        assert!(
+            observer.is_maintenance_closed(),
+            "draining the generation must stop its Cayenne accelerator's maintenance"
+        );
+    })
+    .await
+    .expect("drain finishes");
+}

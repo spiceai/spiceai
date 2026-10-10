@@ -4254,6 +4254,10 @@ impl DataAccelerator for CayenneAccelerator {
         previous_provider: Arc<dyn TableProvider>,
         provider_factory: data_accelerator_api::ReloadProviderFactory,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+        // The factory reopens the same table on the same catalog, so the
+        // previous instance's maintenance must stop before the new one starts:
+        // nothing in memory serializes two instances' compaction (#11581).
+        change_sink::quiesce_table_maintenance(&previous_provider).await;
         drop(previous_provider);
         provider_factory().await
     }

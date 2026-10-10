@@ -2632,6 +2632,14 @@ pub struct CayenneTableProvider {
     /// pass runs is re-evaluated once it ends
     /// (see [`coalesced_task_state_after_signal`]).
     post_write_compaction_state: Arc<AtomicU8>,
+    /// Set once by [`Self::quiesce`] and never cleared: this instance no longer
+    /// starts maintenance — compaction, the orphaned-DV and snapshot-directory
+    /// sweeps, inline and mem-tier checkpoints, cold-tier promotion and GC.
+    /// Shared across `clone_for_write` copies, so a detached task that holds a
+    /// copy observes it too. A replacement instance opens the same table on the
+    /// same catalog with its own `compaction_lock`, so nothing in memory would
+    /// serialize this instance's maintenance against the replacement's (#11581).
+    maintenance_closed: Arc<AtomicBool>,
     /// Coalescing state of the orphaned-deletion-vector cleanup sweep — one of
     /// [`COALESCED_TASK_IDLE`], [`COALESCED_TASK_RUNNING`],
     /// [`COALESCED_TASK_RUNNING_DIRTY`]. Signalled by every publication that can
@@ -6456,7 +6464,8 @@ impl CayenneTableProvider {
     /// write phase that outlives the GC grace could have its not-yet-committed
     /// objects swept (`NotFound` at commit).
     pub async fn run_cold_tier_gc_tick(&self) {
-        if !self.table_metadata.vortex_config.cold_tier_enabled() {
+        if self.is_maintenance_closed() || !self.table_metadata.vortex_config.cold_tier_enabled()
+        {
             return;
         }
         let Some(cold_location) = self.table_metadata.vortex_config.cold_tier_location.clone()
@@ -6694,6 +6703,9 @@ impl CayenneTableProvider {
     const SNAPSHOT_CLEANUP_REARMS: u8 = 3;
 
     pub(crate) fn schedule_old_snapshot_cleanup(&self) {
+        if self.is_maintenance_closed() {
+            return;
+        }
         // A commit refills the follow-up budget: whatever a pass cannot reclaim
         // now is worth coming back for.
         self.snapshot_cleanup_rearms_left
@@ -6827,6 +6839,9 @@ impl CayenneTableProvider {
     /// At most one re-arm is in flight per table, so a high commit rate cannot
     /// multiply these.
     fn rearm_snapshot_cleanup(&self) {
+        if self.is_maintenance_closed() {
+            return;
+        }
         // Spend a follow-up, or stop and wait for the next commit. Without this
         // a pin that outlives the budget — a cached scan view, a table still
         // being listed — would re-arm forever, and the timer's own handle keeps
@@ -7395,7 +7410,9 @@ impl CayenneTableProvider {
     /// stay until a rotation-anchored cleanup covers them (a bounded leak;
     /// this path's correctness contract is the priority).
     pub(crate) fn sweep_retired_snapshot_dirs(&self) {
-        if self.table_metadata.path.starts_with("s3://") {
+        // A closed instance's ledger and scan pins do not cover the scans of the
+        // instance that replaced it, so it must not judge any directory unused.
+        if self.is_maintenance_closed() || self.table_metadata.path.starts_with("s3://") {
             return;
         }
         // Lock order everywhere in this file: ledger, then last-listed.
@@ -9701,6 +9718,7 @@ impl CayenneTableProvider {
             compaction_lock: Arc::new(tokio::sync::RwLock::new(())),
             protected_merge_claims: Arc::new(ParkingMutex::new(ProtectedMergeClaims::default())),
             post_write_compaction_state: Arc::new(AtomicU8::new(COALESCED_TASK_IDLE)),
+            maintenance_closed: Arc::new(AtomicBool::new(false)),
             orphan_dv_sweep_state: Arc::new(AtomicU8::new(COALESCED_TASK_IDLE)),
             file_deletion_fence: Arc::new(tokio::sync::RwLock::new(())),
             footprint_sample_gate: Arc::new(SampleGate::default()),
@@ -11938,6 +11956,7 @@ impl CayenneTableProvider {
             compaction_lock: Arc::clone(&self.compaction_lock),
             protected_merge_claims: Arc::clone(&self.protected_merge_claims),
             post_write_compaction_state: Arc::clone(&self.post_write_compaction_state),
+            maintenance_closed: Arc::clone(&self.maintenance_closed),
             orphan_dv_sweep_state: Arc::clone(&self.orphan_dv_sweep_state),
             file_deletion_fence: Arc::clone(&self.file_deletion_fence),
             footprint_sample_gate: Arc::clone(&self.footprint_sample_gate),
@@ -20498,7 +20517,8 @@ impl CayenneTableProvider {
     pub(crate) fn schedule_post_write_compaction(&self) {
         // A request raised while a pass runs is recorded on it rather than
         // dropped: it is usually the append that aborts that pass.
-        if !self.post_write_compaction_due()
+        if self.is_maintenance_closed()
+            || !self.post_write_compaction_due()
             || !coalesced_task_try_claim(&self.post_write_compaction_state)
         {
             return;
@@ -20577,6 +20597,9 @@ impl CayenneTableProvider {
     /// publisher's `listing_fence` write guard anyway) and misreports when cleanup
     /// became due.
     pub(crate) fn schedule_orphan_dv_sweep(&self) {
+        if self.is_maintenance_closed() {
+            return;
+        }
         // Only the idle -> running winner owns the worker; every other signal has
         // been recorded on the worker that is already running.
         if !coalesced_task_try_claim(&self.orphan_dv_sweep_state) {
@@ -20629,6 +20652,51 @@ impl CayenneTableProvider {
     pub async fn drain_orphan_dv_sweep(&self, min_files: usize) {
         self.drain_orphan_dv_backlog(min_files, ORPHAN_DV_SWEEP_MAX_BATCH)
             .await;
+    }
+
+    /// Whether [`Self::quiesce`] has closed this instance's maintenance.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn is_maintenance_closed(&self) -> bool {
+        self.maintenance_closed.load(Ordering::Acquire)
+    }
+
+    /// Take this instance out of maintenance for good, then wait for the
+    /// maintenance it already started to finish.
+    ///
+    /// The runtime calls this when it replaces or removes the dataset this
+    /// instance serves — a reload, a schema rebind, an unload. The replacement
+    /// opens the same table on the same catalog, and its `compaction_lock` is its
+    /// own, so a pass of this instance that outlived the hand-over would
+    /// interleave with the replacement's maintenance — the duplicate-row race of
+    /// #11581 — and a sweep run from this instance's scan pins could delete a
+    /// directory the replacement is reading. After this returns no maintenance
+    /// of this instance is running or will start: every scheduler and periodic
+    /// tick checks the flag set here, and the drain below waits out a pass that
+    /// was already running, including one holding `compaction_lock`.
+    ///
+    /// Reads and writes through this instance keep working; only maintenance
+    /// stops. Idempotent. Callers must not hold `write_lock` or
+    /// `compaction_lock`.
+    pub async fn quiesce(&self) {
+        let already_closed = self.maintenance_closed.swap(true, Ordering::AcqRel);
+        if let Err(error) = self.drain_in_flight_maintenance().await {
+            // The flag is set, so nothing new starts; only the wait for queued
+            // retention/statistics bookkeeping failed.
+            tracing::debug!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                %error,
+                "Failed to drain queued maintenance while quiescing the table"
+            );
+        }
+        if !already_closed {
+            tracing::debug!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                "Quiesced the table's maintenance before another instance takes it over"
+            );
+        }
     }
 
     /// Quiesce this provider instance before it is dropped or replaced in-process
@@ -21233,9 +21301,10 @@ impl CayenneTableProvider {
     }
 
     pub(crate) fn schedule_inline_checkpoint_if_memtable_pressure_exceeded(&self) {
-        if self
-            .inline_checkpoint_scheduled
-            .swap(true, Ordering::AcqRel)
+        if self.is_maintenance_closed()
+            || self
+                .inline_checkpoint_scheduled
+                .swap(true, Ordering::AcqRel)
         {
             return;
         }
@@ -23611,6 +23680,34 @@ impl CayenneTableProvider {
                         catalog_snapshot_id = current.as_str(),
                         "Aborting current-snapshot compaction: the catalog moved to another \
                          snapshot during the re-encode; discarding output and retrying"
+                    );
+                    maintenance_metrics::track_compaction(
+                        table_name,
+                        CompactionKind::Full,
+                        CompactionOutcome::AbortedConcurrentChange,
+                    );
+                    return Ok(false);
+                }
+                if let crate::catalog::CatalogError::ProtectedSnapshotsReplaced {
+                    folded,
+                    missing,
+                    ..
+                } = &e
+                {
+                    // Another writer merged or removed protected snapshots this
+                    // rewrite folded — a second provider instance for the table,
+                    // whose `compaction_lock` does not serialize against ours.
+                    // The output holds their rows, so committing it would leave
+                    // the replacement registered beside it and every row in it
+                    // read twice. Discard and retry against the new roster.
+                    tracing::debug!(
+                        target: "cayenne::compaction",
+                        table = self.table_metadata.table_name.as_str(),
+                        new_snapshot_id = new_snapshot_id.as_str(),
+                        folded,
+                        missing,
+                        "Aborting current-snapshot compaction: protected snapshots it \
+                         folded were replaced during the re-encode; discarding output and retrying"
                     );
                     maintenance_metrics::track_compaction(
                         table_name,
@@ -39779,6 +39876,11 @@ fn format_bytes_per_sec(bytes_per_sec: f64) -> String {
 #[async_trait::async_trait]
 impl super::compaction::CompactionRunner for CayenneTableProvider {
     async fn run_compaction_trigger(&self) -> std::result::Result<bool, String> {
+        // A quiesced instance has been replaced or removed; its periodic tick may
+        // still fire until the last copy drops, and must do nothing.
+        if self.is_maintenance_closed() {
+            return Ok(false);
+        }
         // Compaction rewrites the table from its in-memory view, which may miss
         // rows after a write whose commit outcome is unknown.
         if self.ensure_publication_outcome_known().is_err() {
@@ -40222,6 +40324,9 @@ impl CayenneTableProvider {
 #[async_trait::async_trait]
 impl super::compaction::ColdTierPromotionRunner for CayenneTableProvider {
     async fn run_cold_tier_promotion_tick(&self) {
+        if self.is_maintenance_closed() {
+            return;
+        }
         // Moving data rewrites the table from its in-memory view, which may miss
         // rows after a write whose commit outcome is unknown.
         if self.ensure_publication_outcome_known().is_err() {
@@ -40272,6 +40377,12 @@ impl super::compaction::ColdTierPromotionRunner for CayenneTableProvider {
 #[async_trait::async_trait]
 impl super::compaction::MemTierCheckpointRunner for CayenneTableProvider {
     async fn run_mem_tier_checkpoint_tick(&self) {
+        // A quiesced instance's RAM tier was flushed when its ingest was drained,
+        // and a checkpoint from it now would publish into a table another
+        // instance owns. Not a tick outcome: the instance is out of service.
+        if self.is_maintenance_closed() {
+            return;
+        }
         // Background tick OUTCOME telemetry (`cayenne_mem_tier_checkpoint_tick_total`):
         // attributes a stalled deferred slot ack to the trigger path vs the checkpoint
         // body. A flat-zero `fired` under a growing WAL backlog is the smoking gun the
@@ -43450,6 +43561,226 @@ mod tests {
             .await
             .expect("persist the baseline statistics");
         (provider, tmp)
+    }
+
+    /// A key-mode upsert table holding three protected snapshots that no
+    /// maintenance pass has merged, with a merge of two already due. The seed
+    /// writes run under `compaction_lock`, so the write-driven passes they
+    /// schedule decline as busy, and this waits for those passes to end before
+    /// handing the table over — otherwise one of them merges the snapshots behind
+    /// the caller's back.
+    async fn three_unmerged_protected_snapshots(
+        table_name: &str,
+        ctx: &SessionContext,
+    ) -> (CayenneTableProvider, Arc<dyn MetadataCatalog>, TempDir) {
+        let (provider, catalog, tmp) = create_cdc_upsert_table_with_vortex_config(
+            table_name,
+            ctx.runtime_env(),
+            VortexConfig {
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 0,
+                compaction_trigger_protected_snapshots: 2,
+                compaction_background_interval_ms: 3_600_000,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let schema = provider.table_schema();
+        {
+            let _no_merge = provider.compaction_lock.write().await;
+            for i in 0..3i64 {
+                insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[i], &[i * 10]))
+                    .await;
+            }
+            provider
+                .flush_pending_maintenance()
+                .await
+                .expect("drain the seed writes' bookkeeping");
+            while provider.post_write_compaction_state.load(Ordering::Acquire)
+                != COALESCED_TASK_IDLE
+            {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        }
+        assert_eq!(
+            provider.protected_snapshot_ids().len(),
+            3,
+            "precondition: three unmerged protected snapshots"
+        );
+        (provider, catalog, tmp)
+    }
+
+    /// Two provider instances for one table — what a dataset reload leaves behind
+    /// while the replaced provider's maintenance is still running (#11581) — hold
+    /// distinct `compaction_lock`s, so one instance's full rewrite and the other's
+    /// protected-snapshot merge can interleave. The rewrite folds snapshots the
+    /// merge has already swapped for its merged snapshot. Committing anyway leaves
+    /// the merged snapshot registered beside the rewrite's output, and every row in
+    /// it is read twice from then on — the duplicate rows #11581 reports, seen by
+    /// the next provider to open the table. The fenced commit must refuse instead.
+    #[tokio::test]
+    async fn a_full_rewrite_does_not_commit_over_another_instances_protected_merge() {
+        let table_name = "rewrite_vs_second_instance_merge";
+        let ctx = SessionContext::new();
+        let (first, catalog, _tmp) = three_unmerged_protected_snapshots(table_name, &ctx).await;
+
+        // The second instance opens the same table on the same catalog, as a
+        // reload's replacement provider does.
+        let second = CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
+            .open(table_name)
+            .await
+            .expect("second instance opens the table");
+
+        // Inside the first instance's pre-commit window, the second merges the
+        // protected snapshots the first instance's rewrite folded.
+        let merged = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let second_in_hook = second.clone_for_write();
+            let merged = Arc::clone(&merged);
+            *first.test_pre_rewrite_commit_hook.lock() = Some(Box::new(move || {
+                Box::pin(async move {
+                    let committed = second_in_hook
+                        .compact_protected_snapshots_subset(usize::MAX)
+                        .await
+                        .expect("the second instance's merge");
+                    merged.store(committed, Ordering::SeqCst);
+                })
+            }));
+        }
+        let rewrote = first
+            .rewrite_current_snapshot_for_compaction()
+            .await
+            .expect("the first instance's rewrite");
+        assert!(
+            merged.load(Ordering::SeqCst),
+            "precondition: the second instance's merge must commit inside the rewrite's pre-commit window"
+        );
+
+        // A fresh provider reads exactly what the catalog registers.
+        drop(first);
+        drop(second);
+        let reopened = CayenneTableProviderBuilder::new(Arc::clone(&catalog), ctx.runtime_env())
+            .open(table_name)
+            .await
+            .expect("reopen");
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &reopened, table_name).await,
+            vec![(0, 0), (1, 10), (2, 20)],
+            "every row exactly once after the two instances' interleaved maintenance"
+        );
+        assert!(
+            !rewrote,
+            "the rewrite folded protected snapshots the other instance had already merged away, so it must not commit"
+        );
+    }
+
+    /// A quiesced instance starts no maintenance, from any entry point, while its
+    /// reads and writes keep working — the replacement instance owns the table's
+    /// maintenance from here on (#11581).
+    #[tokio::test]
+    async fn a_quiesced_instance_starts_no_maintenance_but_still_serves() {
+        use super::super::compaction::CompactionRunner as _;
+
+        let table_name = "quiesced_instance";
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = three_unmerged_protected_snapshots(table_name, &ctx).await;
+        let schema = provider.table_schema();
+        let protected_before = provider.protected_snapshot_ids();
+        assert!(
+            provider.post_write_compaction_due(),
+            "precondition: a compaction is due, so the schedule below would spawn one"
+        );
+
+        provider.quiesce().await;
+        assert!(provider.is_maintenance_closed());
+
+        provider.schedule_post_write_compaction();
+        assert_eq!(
+            provider.post_write_compaction_state.load(Ordering::Acquire),
+            COALESCED_TASK_IDLE,
+            "a quiesced instance must not spawn a write-driven compaction"
+        );
+        provider.schedule_orphan_dv_sweep();
+        assert_eq!(
+            provider.orphan_dv_sweep_state.load(Ordering::Acquire),
+            COALESCED_TASK_IDLE,
+            "a quiesced instance must not spawn an orphaned-DV sweep"
+        );
+        assert_eq!(
+            provider.run_compaction_trigger().await,
+            Ok(false),
+            "the periodic compaction tick of a quiesced instance must do nothing"
+        );
+        assert_eq!(
+            provider.protected_snapshot_ids(),
+            protected_before,
+            "no compaction ran on the quiesced instance"
+        );
+
+        // Writes and reads still go through: only maintenance stopped.
+        insert_batch(&provider, id_value_batch(Arc::clone(&schema), &[3], &[30])).await;
+        assert_eq!(
+            provider.post_write_compaction_state.load(Ordering::Acquire),
+            COALESCED_TASK_IDLE,
+            "a write to a quiesced instance must not schedule its compaction"
+        );
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, table_name).await,
+            vec![(0, 0), (1, 10), (2, 20), (3, 30)]
+        );
+    }
+
+    /// `quiesce` returns only once a maintenance pass that was already running —
+    /// here a full rewrite parked just before its commit, holding
+    /// `compaction_lock` — has finished, so nothing of the old instance is still
+    /// mid-flight when its replacement starts maintaining the table.
+    #[tokio::test]
+    async fn quiesce_waits_for_a_running_compaction_pass() {
+        let table_name = "quiesce_waits_for_pass";
+        let ctx = SessionContext::new();
+        let (provider, _tmp) = seeded_key_rewrite_table(table_name, &ctx).await;
+
+        let (parked_tx, parked_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        *provider.test_pre_rewrite_commit_hook.lock() = Some(Box::new(move || {
+            Box::pin(async move {
+                parked_tx.send(()).expect("report the parked pass");
+                release_rx.await.expect("release the parked pass");
+            })
+        }));
+        // Under `compaction_lock`, as every production pass runs.
+        let rewriting = provider.clone_for_write();
+        let rewrite = tokio::spawn(async move {
+            let _pass = rewriting.compaction_lock.write().await;
+            rewriting.rewrite_current_snapshot_for_compaction().await
+        });
+        parked_rx.await.expect("the rewrite parks before its commit");
+
+        let quiescing = provider.clone_for_write();
+        let mut quiesce = Box::pin(async move { quiescing.quiesce().await });
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), quiesce.as_mut())
+                .await
+                .is_err(),
+            "quiesce must wait for the running pass"
+        );
+        assert!(
+            provider.is_maintenance_closed(),
+            "new maintenance is refused while the running pass finishes"
+        );
+
+        release_tx.send(()).expect("release");
+        assert!(
+            rewrite.await.expect("join").expect("rewrite"),
+            "the pass that was already running finishes and commits"
+        );
+        tokio::time::timeout(Duration::from_secs(30), quiesce)
+            .await
+            .expect("quiesce returns once the pass has finished");
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, table_name).await,
+            vec![(0, 0), (1, 10), (2, 20)]
+        );
     }
 
     /// A full rewrite that retains a protected snapshot published during its

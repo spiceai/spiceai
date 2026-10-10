@@ -69,6 +69,29 @@ pub fn provider_schema_evolution(table: &Arc<dyn TableProvider>) -> SchemaEvolut
     SchemaEvolutionSupport::Restart
 }
 
+/// Stop the background maintenance of every Cayenne instance `table` serves
+/// from — the provider itself, each partition of a partitioned table, and the
+/// table an upsert-dedup wrapper writes to — and wait for maintenance they
+/// already started. See `CayenneTableProvider::quiesce`.
+pub async fn quiesce_table_maintenance(table: &Arc<dyn TableProvider>) {
+    let mut pending = vec![Arc::clone(table)];
+    while let Some(provider) = pending.pop() {
+        if let Some(cayenne) =
+            find_concrete::<CayenneTableProvider>(provider.as_ref(), LayerWalk::Write)
+        {
+            cayenne.quiesce().await;
+        } else if let Some(partitioned) =
+            find_concrete::<PartitionTableProvider>(provider.as_ref(), LayerWalk::Write)
+        {
+            pending.extend(partitioned.partition_table_providers().await);
+        } else if let Some(dedup) =
+            find_concrete::<UpsertDedupTableProvider>(provider.as_ref(), LayerWalk::Write)
+        {
+            pending.push(Arc::clone(dedup.inner()));
+        }
+    }
+}
+
 struct StorageFenceObserver {
     observer: Arc<dyn DurabilityObserver>,
 }
