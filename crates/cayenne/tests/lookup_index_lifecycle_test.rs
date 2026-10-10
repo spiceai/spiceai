@@ -258,8 +258,8 @@ async fn indexes_follow_each_registration_not_the_stored_table() {
 
 /// A runtime join lookup queues the same paced read-back build as a literal
 /// lookup. Its first execution scans; a later execution uses the published
-/// index without requiring a literal query to prime it. Without persistence,
-/// so the reopened table has no index to load.
+/// index without requiring a literal query to prime it. The test disables
+/// persistence, so the reopened table has no persisted index to load.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_dynamic_lookup_rebuilds_the_index_after_reopen() {
     const ROWS: usize = 4_000;
