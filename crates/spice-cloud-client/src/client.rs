@@ -1215,7 +1215,11 @@ mod tests {
         })
         .expect("completed auth exchange should not fail");
 
-        assert!(result.is_some());
+        // The completed exchange hands back the issued token itself.
+        assert_eq!(
+            result.and_then(|response| response.access_token).as_deref(),
+            Some("token")
+        );
     }
 
     #[test]

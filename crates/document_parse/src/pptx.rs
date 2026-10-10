@@ -228,9 +228,20 @@ mod tests {
             .build()
             .expect("create tokio runtime")
             .block_on(PptxParser::default().parse(&Bytes::from(buf)));
-        assert!(
-            result.is_err(),
-            "a slide exceeding the decompression cap should be rejected"
+        let Err(err) = result else {
+            panic!("a slide exceeding the decompression cap should be rejected");
+        };
+        // The cap itself rejected the slide — not a zip or XML failure on the way.
+        let crate::Error::InternalParsingError {
+            format: DocumentType::Pptx,
+            source,
+        } = &err
+        else {
+            panic!("expected a PPTX parsing error, got: {err}");
+        };
+        assert_eq!(
+            source.to_string(),
+            "PPTX slide 'ppt/slides/slide1.xml' exceeds the 67108864-byte decompression limit (possible decompression bomb)"
         );
     }
 

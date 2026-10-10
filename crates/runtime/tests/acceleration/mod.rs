@@ -26,6 +26,7 @@ mod caching_mode_constraints;
 mod caching_mode_per_principal;
 #[cfg(feature = "duckdb")]
 mod caching_mode_post_filter;
+mod caching_mode_request_method;
 mod caching_mode_stale_if_error;
 #[cfg(not(target_os = "windows"))]
 mod cayenne_append_overlap;
@@ -61,6 +62,8 @@ mod hash_index;
 mod localpod_sync;
 #[cfg(all(feature = "postgres-accel", feature = "duckdb", feature = "sqlite"))]
 mod on_conflict;
+#[cfg(feature = "sqlite")]
+mod sqlite_builtin_pushdown;
 
 #[cfg(not(target_os = "windows"))]
 mod newest_by_time;

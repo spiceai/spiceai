@@ -761,7 +761,15 @@ mod tests {
     #[test]
     fn test_get_bucket_name_invalid() {
         let url = Url::parse("s3:///path/to/file").expect("Failed to parse URL");
-        get_bucket_name(&url).expect_err("Should fail to get bucket name");
+        let err = get_bucket_name(&url).expect_err("Should fail to get bucket name");
+        assert!(
+            matches!(&err, Error::ParseBucketName { url } if url == "s3:///path/to/file"),
+            "{err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            "Not able to parse bucket name from s3 url: s3:///path/to/file"
+        );
     }
 
     // Tests for determine_s3_credential_config
@@ -963,16 +971,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_should_use_sdk_credentials_without_explicit() {
-        let params: std::collections::HashMap<String, &str> = std::collections::HashMap::new();
-
-        let result = should_use_sdk_credentials(&params, "key", "secret");
-        // Result depends on whether SDK config is initialized, so we just check it doesn't panic
-        // In a real scenario without SDK config, this would return None
-        let _ = result;
-    }
-
     #[tokio::test]
     async fn test_initiate_config_with_explicit_credentials() {
         let config_loader = initiate_config_with_credentials(
@@ -1101,11 +1099,16 @@ mod tests {
             .load()
             .await;
 
-        let store = from_s3_url_and_config(&url, None, &sdk_config, Handle::current());
+        let store = from_s3_url_and_config(&url, None, &sdk_config, Handle::current())
+            .expect("object store should build when the SDK config provides the region");
 
+        assert_eq!(store.to_string(), "AmazonS3(my-bucket)");
+        // `AmazonS3Builder` falls back to `us-east-1` when no region is set, so a successful
+        // build alone does not show the SDK config's region was applied; the store's config does.
+        let described = format!("{store:?}");
         assert!(
-            store.is_ok(),
-            "object store should build when the SDK config provides the region"
+            described.contains(r#"region: "ap-south-1""#),
+            "the store must use the SDK config's region: {described}"
         );
     }
 }

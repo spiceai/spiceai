@@ -112,18 +112,45 @@ mod tests {
         tool.call(args.as_str()).await
     }
 
+    /// Asserts the tool reported one inserted row and `audit` now holds
+    /// exactly the row `run_insert` wrote.
+    async fn assert_one_row_inserted(df: &DataFusion, result: &serde_json::Value) {
+        assert_eq!(
+            result,
+            &serde_json::Value::String(r#"[{"count":1}]"#.to_string())
+        );
+        let rows = df
+            .ctx
+            .sql("SELECT id, name FROM audit")
+            .await
+            .expect("plan the read-back of audit")
+            .collect()
+            .await
+            .expect("read audit back");
+        datafusion::assert_batches_eq!(
+            [
+                "+----+-----------+",
+                "| id | name      |",
+                "+----+-----------+",
+                "| 1  | unit-test |",
+                "+----+-----------+",
+            ],
+            &rows
+        );
+    }
+
     #[tokio::test]
     async fn read_write_principal_can_insert() {
-        let (_df, tool) = build_sql_tool();
+        let (df, tool) = build_sql_tool();
         let ctx = context_with_principal(Some(Arc::new(ApiKey::ReadWrite {
             key: "rw-key".into(),
         }) as AuthPrincipalRef));
 
-        let result = ctx.scope(async { run_insert(&tool).await }).await;
-        assert!(
-            result.is_ok(),
-            "INSERT under ReadWrite principal should succeed; got {result:?}"
-        );
+        let result = ctx
+            .scope(async { run_insert(&tool).await })
+            .await
+            .expect("INSERT under ReadWrite principal should succeed");
+        assert_one_row_inserted(&df, &result).await;
     }
 
     #[tokio::test]
@@ -148,13 +175,13 @@ mod tests {
         // principal is set, the tool surface itself is gated upstream by
         // `require_auth_configured`, but the inner read-only check
         // resolves to `false` (writable) — same behavior as /v1/sql.
-        let (_df, tool) = build_sql_tool();
+        let (df, tool) = build_sql_tool();
         let ctx = context_with_principal(None);
 
-        let result = ctx.scope(async { run_insert(&tool).await }).await;
-        assert!(
-            result.is_ok(),
-            "INSERT with no principal should succeed; got {result:?}"
-        );
+        let result = ctx
+            .scope(async { run_insert(&tool).await })
+            .await
+            .expect("INSERT with no principal should succeed");
+        assert_one_row_inserted(&df, &result).await;
     }
 }

@@ -393,13 +393,79 @@ mod tests {
         }
     }
 
-    #[test]
-    fn light_levels_produce_strategy_overrides() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn light_levels_produce_strategy_overrides() {
         for level in 0..FULL_LEVEL {
             assert!(
                 strategy_builder_for_level(level).is_some(),
                 "level {level} must produce a restricted-scheme strategy override"
             );
         }
+
+        // The overrides are not interchangeable. The pinned builder no longer exposes its
+        // scheme list, so compare what each writes for the same column: level 0 registers no
+        // scheme, so strings stay canonical — larger even than the full default cascade —
+        // while the `auto` light level and the rich light level both carry string `Zstd`.
+        let batch = compressible_strings();
+        let canonical = encoded_file_size(0, &batch).await;
+        let full = encoded_file_size(FULL_LEVEL, &batch).await;
+        let auto_light = encoded_file_size(AUTO_LIGHT_LEVEL, &batch).await;
+        let rich_light = encoded_file_size(3, &batch).await;
+        assert!(
+            full < canonical,
+            "level 0 must leave strings uncompressed: {canonical} bytes vs {full} for the full cascade"
+        );
+        assert!(
+            auto_light * 2 < canonical,
+            "the auto light level must Zstd-encode strings: {auto_light} bytes vs {canonical} canonical"
+        );
+        assert!(
+            rich_light * 2 < canonical,
+            "level 3 must Zstd-encode strings: {rich_light} bytes vs {canonical} canonical"
+        );
+    }
+
+    /// One `Utf8` column of 8,192 distinct values that share long runs of text: no
+    /// dictionary helps, but an entropy coder shrinks the shared text.
+    fn compressible_strings() -> arrow::array::RecordBatch {
+        let values: Vec<String> = (0..8192)
+            .map(|i| format!("customer-{i:08}-segment-wholesale-region-north-america-padding"))
+            .collect();
+        arrow::array::RecordBatch::try_from_iter([(
+            "s",
+            std::sync::Arc::new(arrow::array::StringArray::from(values)) as arrow::array::ArrayRef,
+        )])
+        .expect("build the probe batch")
+    }
+
+    /// The size of the file `batch` is written to through the strategy `level` resolves
+    /// to; a full level writes with the session-default cascade.
+    async fn encoded_file_size(level: u8, batch: &arrow::array::RecordBatch) -> usize {
+        use vortex::VortexSessionDefault;
+        use vortex::array::stream::ArrayStreamAdapter;
+        use vortex::arrow::ArrowSessionExt;
+        use vortex::buffer::ByteBufferMut;
+        use vortex::file::WriteOptionsSessionExt;
+        use vortex_session::VortexSession;
+
+        let mut session = VortexSession::default();
+        if let Some(strategy) = strategy_builder_for_level(level) {
+            session = session.set(strategy);
+        }
+        let schema = batch.schema();
+        let arrow = session.arrow();
+        let dtype = arrow
+            .from_arrow_schema(&schema)
+            .expect("schema converts to a Vortex dtype");
+        let chunk = arrow.from_arrow_record_batch(batch.clone(), &schema);
+        drop(arrow);
+        let stream = ArrayStreamAdapter::new(dtype, futures::stream::iter([chunk]));
+        let mut file = ByteBufferMut::empty();
+        session
+            .write_options()
+            .write(&mut file, stream)
+            .await
+            .expect("write the probe column");
+        file.len()
     }
 }

@@ -783,7 +783,14 @@ mod tests {
             body: None,
             body_ref: None,
             metadata: HashMap::default(),
-            params: HashMap::default(),
+            // The mock endpoint is on loopback, which the SSRF guard refuses unless the
+            // function allows it.
+            params: HashMap::from([(
+                "allowed_endpoint_ranges".to_string(),
+                serde_json::Value::Array(vec![serde_json::Value::String(
+                    "127.0.0.0/8".to_string(),
+                )]),
+            )]),
             depends_on: vec![],
             metrics: None,
             as_tool: true,

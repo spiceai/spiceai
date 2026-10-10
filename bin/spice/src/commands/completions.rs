@@ -289,37 +289,68 @@ mod tests {
         });
     }
 
-    #[test]
-    fn all_shells_return_some_path() {
-        with_xdg_env(|_| {
-            for shell in [
-                Shell::Bash,
-                Shell::Zsh,
-                Shell::Fish,
-                Shell::Elvish,
-                Shell::PowerShell,
-            ] {
-                assert!(
-                    completion_path(shell).is_some(),
-                    "completion_path({shell}) should return Some"
-                );
-            }
-        });
-    }
-
+    /// The post-install message is what `spice completions` prints after writing
+    /// the file, so each shell's text is pinned exactly, including the paths it
+    /// names.
     #[test]
     fn all_shells_have_post_install_message() {
-        with_xdg_env(|_| {
-            for shell in [
-                Shell::Bash,
-                Shell::Zsh,
-                Shell::Fish,
-                Shell::Elvish,
-                Shell::PowerShell,
-            ] {
-                let (_, msg) = completion_path(shell).expect("completion_path should return Some");
-                assert!(msg.is_some(), "{shell} should have a post-install message");
-            }
+        with_xdg_env(|tmp| {
+            let completion = |shell: Shell| {
+                let (path, message) =
+                    completion_path(shell).expect("completion_path should return Some");
+                (
+                    path,
+                    message.expect("every shell should have a post-install message"),
+                )
+            };
+
+            // macOS prefers a Homebrew directory when one exists and words the
+            // message for it; every other host uses the XDG location, which
+            // `bash_and_zsh_use_xdg_on_linux` pins.
+            let (bash_path, bash_message) = completion(Shell::Bash);
+            let expected_bash = if bash_path == tmp.join("bash-completion/completions/spice") {
+                "Completions will be loaded automatically in new bash sessions.\n\
+                 If bash-completion is not installed, install it first:\n  \
+                 apt install bash-completion   # Debian/Ubuntu\n  \
+                 brew install bash-completion@2 # macOS"
+            } else {
+                "Completions will be loaded automatically in new bash sessions.\n\
+                 Requires bash-completion: brew install bash-completion@2"
+            };
+            assert_eq!(bash_message, expected_bash, "{}", bash_path.display());
+
+            let (zsh_path, zsh_message) = completion(Shell::Zsh);
+            let expected_zsh = if zsh_path == tmp.join("zsh/site-functions/_spice") {
+                format!(
+                    "To enable, ensure the following is in your .zshrc:\n  \
+                     fpath=({} $fpath)\n  \
+                     autoload -Uz compinit && compinit\n\n\
+                     Then restart your shell or run: source ~/.zshrc",
+                    tmp.join("zsh/site-functions").display()
+                )
+            } else {
+                "Completions will be loaded automatically in new zsh sessions.\n\
+                 If not working, ensure compinit is enabled in your .zshrc:\n  \
+                 autoload -Uz compinit && compinit"
+                    .to_string()
+            };
+            assert_eq!(zsh_message, expected_zsh, "{}", zsh_path.display());
+
+            assert_eq!(
+                completion(Shell::Fish).1,
+                "Completions will be loaded automatically in new fish sessions."
+            );
+            assert_eq!(
+                completion(Shell::Elvish).1,
+                "To enable, add to your ~/.config/elvish/rc.elv:\n  use spice"
+            );
+            assert_eq!(
+                completion(Shell::PowerShell).1,
+                format!(
+                    "To enable, add to your PowerShell profile ($PROFILE):\n  . {}",
+                    tmp.join("powershell/completions/spice.ps1").display()
+                )
+            );
         });
     }
 

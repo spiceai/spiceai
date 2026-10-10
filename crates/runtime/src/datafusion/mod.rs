@@ -600,6 +600,9 @@ impl Error {
     /// is the conservative one.
     #[must_use]
     pub(crate) fn is_retriable(&self) -> bool {
+        if let Self::UnableToCreateDataAccelerator { source } = self {
+            return source.is_retriable();
+        }
         !matches!(
             self,
             // Invalid `refresh_sql` / `retention_sql` in the Spicepod.
@@ -1053,6 +1056,32 @@ fn initialization_error(error: DataFusionError, dataset_name: String) -> Error {
             Ok(error) => Error::AcceleratorInitialization {
                 source: error.source,
             },
+            Err(error) => Error::UnableToDrainChanges {
+                dataset_name,
+                source: DataFusionError::External(error),
+            },
+        },
+        error => Error::UnableToDrainChanges {
+            dataset_name,
+            source: error,
+        },
+    }
+}
+
+/// A drain that never succeeds, for a failed build whose producers nothing stopped.
+fn unproven_cleanup() -> runtime_acceleration::change_sink::Publication {
+    let (_, receiver) =
+        tokio::sync::watch::channel(Some(Err(Arc::new(DataFusionError::Execution(
+            "the failed build may have started work that nothing stopped".into(),
+        )))));
+    runtime_acceleration::change_sink::Publication::Pending(receiver)
+}
+
+/// Report a table build's own failure as such, and anything else as a lifecycle failure.
+fn construction_error(error: DataFusionError, dataset_name: String) -> Error {
+    match error {
+        DataFusionError::External(error) => match error.downcast::<Error>() {
+            Ok(error) => *error,
             Err(error) => Error::UnableToDrainChanges {
                 dataset_name,
                 source: DataFusionError::External(error),
@@ -3543,7 +3572,7 @@ impl DataFusion {
                 } else {
                     None
                 };
-                let mut table = df
+                let mut table = match df
                     .build_accelerated_table(
                         &dataset,
                         Arc::clone(&source),
@@ -3553,7 +3582,20 @@ impl DataFusion {
                         initial_partition_filters,
                     )
                     .await
-                    .map_err(|error| DataFusionError::External(Box::new(error)))?;
+                {
+                    Ok(table) => table,
+                    // The table that would drain what the builder started is gone.
+                    Err(error)
+                        if matches!(
+                            &error,
+                            Error::UnableToBuildAcceleratedTable { source, .. }
+                                if source.may_have_started_ingestion()
+                        ) =>
+                    {
+                        return Ok(GenerationOwner::new(Err(error), unproven_cleanup));
+                    }
+                    Err(error) => return Err(DataFusionError::External(Box::new(error))),
+                };
                 let hook_result = if registration_hook {
                     source
                         .on_accelerated_table_registration(&dataset, &mut table)
@@ -3573,7 +3615,7 @@ impl DataFusion {
                 ))
             })
             .await
-            .context(UnableToDrainChangesSnafu { dataset_name: name })?;
+            .map_err(|error| construction_error(error, name))?;
         Ok(PreparedAcceleratedTable {
             generation: generation.try_map(|result| result)?,
             bootstrap: bootstrap.owner,
@@ -3995,22 +4037,16 @@ impl DataFusion {
         refresh = refresh.versions_by_time(
             acceleration_settings
                 .orders_versions_by_time(dataset.time_column.as_deref(), refresh_mode)
-                .then(|| {
-                    VersionsByTime {
-                        // An unpartitioned Cayenne table resolves a full refresh's repeated
-                        // keys as it writes them, ordered by the row versions the refresh
-                        // supplies: in file mode after writing, in memory mode over the
-                        // buffered write. Only file mode does so for an append into an
-                        // empty table, and not when the table has `retention_sql`.
-                        versions_resolved_after_write: acceleration_settings.engine
-                            == Engine::Cayenne
-                            && acceleration_settings.partition_by.is_empty(),
-                        appends_resolved_after_write: acceleration_settings.engine
-                            == Engine::Cayenne
-                            && acceleration_settings.mode == Mode::File
-                            && acceleration_settings.partition_by.is_empty()
-                            && acceleration_settings.retention_sql.is_none(),
-                    }
+                .then(|| VersionsByTime {
+                    // An unpartitioned Cayenne table resolves a full refresh's repeated
+                    // keys as it writes them, ordered by the row versions the refresh
+                    // supplies: in file mode after writing, in memory mode over the
+                    // buffered write. With `cayenne_pk_conflict_detection: none` it
+                    // resolves no keys and keeps every row, which that setting reserves
+                    // for a source whose keys are unique. The refresh asks the table itself
+                    // whether it takes an append's versions.
+                    versions_resolved_after_write: acceleration_settings.engine == Engine::Cayenne
+                        && acceleration_settings.partition_by.is_empty(),
                 }),
         );
         if let Some(caching_ttl) = acceleration_settings.caching_ttl {

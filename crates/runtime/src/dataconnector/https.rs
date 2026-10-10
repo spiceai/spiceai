@@ -3323,6 +3323,31 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         .await;
         let dataset = test_dataset("https://example.com/api", RefreshMode::Append, None).await;
 
+        // The identity comes from exactly the inline PEMs given, in their roles.
+        match connector
+            .resolve_client_identity_config(&dataset)
+            .expect("inline mTLS params should be valid")
+            .expect("expected a client identity config")
+        {
+            ClientIdentityConfig::FromPem {
+                cert_pem: resolved_cert,
+                key_pem: resolved_key,
+            } => {
+                assert_eq!(resolved_cert, cert_pem.as_bytes());
+                assert_eq!(resolved_key, key_pem.as_bytes());
+            }
+            config @ ClientIdentityConfig::FromFiles { .. } => {
+                panic!("expected an inline identity config, got {config:?}")
+            }
+        }
+        assert!(
+            connector
+                .resolve_client_identity(&dataset)
+                .await
+                .expect("the inline identity should parse")
+                .is_some(),
+            "a configured inline identity must yield a client identity"
+        );
         connector
             .build_http_client(&dataset)
             .await
@@ -3351,6 +3376,31 @@ uGgYIHbi/F+GaiUPzDyqe5p9
         .await;
         let dataset = test_dataset("https://example.com/api", RefreshMode::Append, None).await;
 
+        // The identity is read from exactly the two files given, in their roles.
+        match connector
+            .resolve_client_identity_config(&dataset)
+            .expect("file-based mTLS params should be valid")
+            .expect("expected a client identity config")
+        {
+            ClientIdentityConfig::FromFiles {
+                cert_path: resolved_cert,
+                key_path: resolved_key,
+            } => {
+                assert_eq!(resolved_cert, cert_path);
+                assert_eq!(resolved_key, key_path);
+            }
+            config @ ClientIdentityConfig::FromPem { .. } => {
+                panic!("expected a file-based identity config, got {config:?}")
+            }
+        }
+        assert!(
+            connector
+                .resolve_client_identity(&dataset)
+                .await
+                .expect("the identity files should be read and parse")
+                .is_some(),
+            "a configured file identity must yield a client identity"
+        );
         connector
             .build_http_client(&dataset)
             .await
@@ -3481,20 +3531,47 @@ uGgYIHbi/F+GaiUPzDyqe5p9
     /// Rate-control metrics keep working through the combined provider — a
     /// delegating impl that silently answered `None` would leave them
     /// registered but never observed.
+    /// An `AsyncInstrument` that records what a metric callback observes.
+    #[derive(Default)]
+    struct RecordingInstrument(parking_lot::Mutex<Vec<u64>>);
+
+    impl opentelemetry::metrics::AsyncInstrument<u64> for RecordingInstrument {
+        fn observe(&self, measurement: u64, _attributes: &[KeyValue]) {
+            self.0.lock().push(measurement);
+        }
+    }
+
     #[tokio::test]
     async fn rate_control_metrics_still_observe_through_the_combined_provider() {
         let connector = test_connector_with(&[("max_concurrent_requests", "4")]).await;
+        // Apply the resolved config the way creating the table provider does,
+        // so the metric has the configured value to report.
+        let dataset = test_dataset("https://example.com/api", RefreshMode::Append, None).await;
+        let config = http_rate_control::resolve_config(
+            &connector.params,
+            connector.runtime_rate_control_params.as_ref(),
+            &dataset,
+            "https",
+        )
+        .expect("the rate-control config should resolve");
+        connector.metrics.set_config(&config);
         let metrics_provider =
             DataConnector::metrics_provider(&connector).expect("the connector exposes metrics");
 
         let metric = metrics_provider
             .get_metric("rate_control_max_concurrent_requests")
             .expect("rate-control metrics remain available");
-        assert!(
-            metrics_provider
-                .callback_to_observe_metric(metric, vec![])
-                .is_some(),
-            "a rate-control metric must still be observed, not just listed"
+        let Some(ObserveMetricCallback::U64(callback)) =
+            metrics_provider.callback_to_observe_metric(metric, vec![])
+        else {
+            panic!("a rate-control metric must still be observed, as a u64, not just listed");
+        };
+        let observed = RecordingInstrument::default();
+        callback(&observed);
+        assert_eq!(
+            *observed.0.lock(),
+            vec![4],
+            "the callback must observe the configured max_concurrent_requests"
         );
     }
 

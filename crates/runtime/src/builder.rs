@@ -2235,14 +2235,52 @@ mod test {
     #[cfg(not(windows))]
     #[test]
     fn a_cayenne_acceleration_reserves_its_write_path_state() {
-        let app = Arc::new(
+        const MIB: u64 = 1024 * 1024;
+        let inline_admission = u64::try_from(cayenne::metadata::DEFAULT_INLINE_MAX_BYTES)
+            .expect("the inline entry cap fits in u64")
+            + u64::try_from(cayenne::metadata::DEFAULT_INLINE_MAX_BUFFER_BYTES)
+                .expect("the inline buffer cap fits in u64");
+
+        // A full-refresh table (postgres leaves `refresh_mode` unset, which is
+        // `full`) is a whole-table replace: it reserves the inline-admission pair
+        // and no CDC write path.
+        let full = Arc::new(
             app::AppBuilder::new("test")
                 .with_dataset(dataset_with_cayenne("accelerated", None))
                 .build(),
         );
+        assert_cayenne_reservation(&full, inline_admission);
+
+        // A `changes` table also holds the CDC write path: the keyset cache (set
+        // explicitly to 64 MiB so the figure does not depend on the host), the
+        // default 128 MiB coalesce buffer and the default 8 MiB inline memtable.
+        let mut changes = dataset_with_cayenne("changes", None);
+        let acceleration = changes
+            .acceleration
+            .as_mut()
+            .expect("the dataset has a Cayenne acceleration");
+        acceleration.refresh_mode = Some(spicepod::acceleration::RefreshMode::Changes);
+        acceleration.params = Some(spicepod::param::Params::from_string_map(
+            [("cayenne_pk_keyset_cache_mb".to_string(), "64".to_string())]
+                .into_iter()
+                .collect(),
+        ));
+        let changes = Arc::new(app::AppBuilder::new("test").with_dataset(changes).build());
+        assert_cayenne_reservation(&changes, inline_admission + 64 * MIB + 128 * MIB + 8 * MIB);
+    }
+
+    /// Asserts the reservation for `app` is `write_path` plus the process-wide
+    /// segment cache. That cache is installed at most once per process, so the
+    /// estimate, which reads it between the two reads here, matches one of them.
+    #[cfg(not(windows))]
+    fn assert_cayenne_reservation(app: &Arc<app::App>, write_path: u64) {
+        let cache_before = vortex_datafusion::process_segment_cache_capacity_bytes().unwrap_or(0);
+        let estimate = estimate_cayenne_reservation_bytes(Some(app), &HashMap::new());
+        let cache_after = vortex_datafusion::process_segment_cache_capacity_bytes().unwrap_or(0);
         assert!(
-            estimate_cayenne_reservation_bytes(Some(&app), &HashMap::new()) > 0,
-            "a Cayenne table reserves against the query pool"
+            estimate == write_path + cache_before || estimate == write_path + cache_after,
+            "expected {write_path} bytes of write-path state plus the segment cache \
+             ({cache_before} or {cache_after} bytes), got {estimate}"
         );
     }
 

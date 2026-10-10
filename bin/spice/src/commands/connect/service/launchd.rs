@@ -2683,11 +2683,21 @@ mod tests {
     fn a_path_that_cannot_be_represented_is_refused_rather_than_written() {
         // A plist carrying a raw control character is one `plutil` rejects and
         // launchd silently declines to load, so it never reaches disk.
-        let refused = escape_plist_path(Path::new("/opt/edge\u{1}1"));
-        assert!(refused.is_err(), "{refused:?}");
+        let refused = escape_plist_path(Path::new("/opt/edge\u{1}1"))
+            .expect_err("a path with a control character must be refused");
         assert!(
-            escape_plist_path(Path::new("/opt/edge-1")).is_ok(),
-            "an ordinary path must render"
+            matches!(
+                &refused,
+                Error::InvalidArgument { message } if message
+                    == "Failed to install the Spice Cloud Connect service: path /opt/edge\u{1}1 \
+                        contains a control character and cannot be represented safely in a \
+                        launchd definition."
+            ),
+            "{refused:?}"
+        );
+        assert_eq!(
+            escape_plist_path(Path::new("/opt/edge-1")).expect("an ordinary path must render"),
+            "/opt/edge-1"
         );
     }
 
@@ -3032,6 +3042,13 @@ mod tests {
             "https://127.0.0.1:8090/health",
         )
         .expect("launchd's own report is the answer here");
+        // The pass comes from launchd holding one run for a whole settle window,
+        // taken on the first sample after it elapsed — not from an early return.
+        let slept = *host.slept.borrow();
+        assert!(
+            slept >= SETTLE_WINDOW && slept < SETTLE_WINDOW + HEALTH_POLL_INTERVAL,
+            "the gate must pass on the first sample after a whole settle window, slept {slept:?}"
+        );
     }
 
     #[test]
@@ -3164,8 +3181,16 @@ mod tests {
         let dir = Path::new("/opt/edge-1");
         let manifest = manifest_for(dir, ServiceScope::User);
         let target = service_target(&manifest.name, ServiceScope::User);
-        let host = ScriptedHost::new().has_no_job(&format!("{LAUNCHCTL} print {target}"));
+        let print = format!("{LAUNCHCTL} print {target}");
+        let host = ScriptedHost::new().has_no_job(&print);
         stop(&host, &manifest).expect("idempotent");
+        // Idempotent means nothing was asked of launchd but what the job is:
+        // no `bootout` of a job it does not hold, and never a `disable`.
+        let calls = host.calls();
+        assert!(
+            !calls.is_empty() && calls.iter().all(|call| *call == print),
+            "{calls:?}"
+        );
     }
 
     #[test]
@@ -3590,7 +3615,7 @@ mod tests {
             stdout: service_log::live_path(&directory),
             stderr: service_log::live_path(&directory),
         });
-        logs(
+        let printed = logs(
             &manifest,
             LogRequest {
                 number: 100,
@@ -3599,6 +3624,18 @@ mod tests {
             },
         )
         .expect("a service with no output yet is a fact, not a failure");
+        assert_eq!(printed, None, "printed logs return nothing to the caller");
+
+        let captured = logs(
+            &manifest,
+            LogRequest {
+                number: 100,
+                follow: false,
+                capture: true,
+            },
+        )
+        .expect("capturing an empty history is not a failure");
+        assert_eq!(captured, Some(Vec::<String>::new()));
     }
 
     #[test]

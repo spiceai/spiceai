@@ -279,10 +279,20 @@ mod tests {
         add_entry(&cs, entry("a", id, 0, 30_000)).await;
         hb.heartbeat("a", id, 1_000, 30_000).await.expect("hb");
         let r = Reaper::new(Arc::clone(&cs), Arc::clone(&hb));
-        r.tick(1_000_000).await.expect("tick");
-        // Heartbeat file is still present (orphan now, but not deleted
-        // by the reaper).
+        let out = r.tick(1_000_000).await.expect("tick");
+        // The reaper ran and evicted the stale scheduler...
+        assert_eq!(out.evicted, vec!["a".to_string()]);
+        // ...but its heartbeat file is still present and unchanged (an orphan
+        // now, but not deleted by the reaper).
         let beat = hb.read("a").await.expect("read");
-        assert!(beat.is_some());
+        assert_eq!(
+            beat,
+            Some(heartbeat::SchedulerHeartbeat {
+                scheduler_id: "a".to_string(),
+                instance_id: id,
+                last_heartbeat_ms: 1_000,
+                ttl_ms: 30_000,
+            })
+        );
     }
 }

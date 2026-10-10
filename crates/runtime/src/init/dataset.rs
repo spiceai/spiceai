@@ -1397,14 +1397,14 @@ impl Runtime {
                 metrics::datasets::LOAD_ERROR.add(1, &[]);
                 let spaced_tracer = Arc::clone(&self.spaced_tracer);
                 if !err.is_retriable() {
-                    error_spaced!(spaced_tracer, "{}{err}", "");
+                    error_spaced!(spaced_tracer, key = load_failure_log_key(&ds.name), "{err}");
                     return PermanentDatasetFailureSnafu {
                         dataset: ds.name.clone(),
                         reason: err.to_string(),
                     }
                     .fail();
                 }
-                warn_spaced!(spaced_tracer, "{}{err}", "");
+                warn_spaced!(spaced_tracer, key = load_failure_log_key(&ds.name), "{err}");
                 UnableToLoadDatasetConnectorSnafu {
                     dataset: ds.name.clone(),
                 }
@@ -1532,7 +1532,7 @@ impl Runtime {
                 dataset_name: ds.name.to_string(),
             }
             .build();
-            warn_spaced!(spaced_tracer, "{}{err}", "");
+            warn_spaced!(spaced_tracer, key = load_failure_log_key(&ds.name), "{err}");
             return Err(err);
         }
 
@@ -1593,7 +1593,7 @@ impl Runtime {
                     reason,
                 }
                 .build();
-                warn_spaced!(spaced_tracer, "{}{err}", "");
+                warn_spaced!(spaced_tracer, key = load_failure_log_key(&ds.name), "{err}");
                 return Err(err);
             }
         }
@@ -1750,14 +1750,14 @@ impl Runtime {
                 );
                 metrics::datasets::LOAD_ERROR.add(1, &[]);
                 if is_permanent_dataset_failure(&err) {
-                    error_spaced!(spaced_tracer, "{}{err}", "");
+                    error_spaced!(spaced_tracer, key = load_failure_log_key(&ds.name), "{err}");
                     return PermanentDatasetFailureSnafu {
                         dataset: ds.name.clone(),
                         reason: err.to_string(),
                     }
                     .fail();
                 }
-                warn_spaced!(spaced_tracer, "{}{err}", "");
+                warn_spaced!(spaced_tracer, key = load_failure_log_key(&ds.name), "{err}");
 
                 Err(err)
             }
@@ -3398,6 +3398,16 @@ fn preflight_dataset(
     // Everything `validate_dataset` raises is a pure function of the Spicepod, so
     // retrying cannot change the answer.
     Err(refuse_permanently(ds, status, spaced_tracer, &err))
+}
+
+/// The key that rate-limits `dataset`'s load-failure lines on the runtime's
+/// shared `SpacedTracer`.
+///
+/// It is per dataset, so one dataset's failure cannot hide another's. It also
+/// differs from the dataset-name key of the connector and accelerator failure
+/// lines, so a load failure does not hide those lines for the same dataset.
+fn load_failure_log_key(dataset: &TableReference) -> String {
+    format!("load failure: {dataset}")
 }
 
 /// Report a refusal and return it as permanent.
@@ -5092,6 +5102,7 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
             let loaded = || checks.fetch_add(1, Ordering::SeqCst) >= 1;
 
             let (_recorder, waiter) = silent();
+            let started = tokio::time::Instant::now();
             await_hot_reload_initial_refresh(
                 &reloading(),
                 &loaded,
@@ -5101,6 +5112,15 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
             )
             .await
             .expect("a load that lands at the bound must not discard the table");
+
+            // The wait ran to the bound, and the table was accepted by the
+            // backstop re-check after it: exactly the pre-wait check and one more.
+            assert_eq!(started.elapsed(), TIMEOUT, "the wait must end at the bound");
+            assert_eq!(
+                checks.load(Ordering::SeqCst),
+                2,
+                "the pre-wait check and the backstop check after the bound"
+            );
         }
 
         /// A one-shot load failure must not accept the unloaded table. Recording
@@ -5191,6 +5211,93 @@ use the Enterprise distribution of Spice.ai. Learn more at https://docs.spice.ai
             matches!(err, Error::PermanentDatasetFailure { .. }),
             "expected a permanent failure, got: {err}"
         );
+    }
+
+    /// Regression test for #14918: every dataset's load-failure line goes through
+    /// the runtime's one rate limiter, so the limiter has to be keyed on the
+    /// dataset. A shared key would let the first dataset to fail suppress every
+    /// other dataset's failure for the whole interval, leaving them in `Error`
+    /// with no line naming them.
+    #[test]
+    fn each_failing_dataset_logs_its_own_load_failure() {
+        let lines = crate::tracing_util::warn_lines_emitted_by(|| {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .expect("to build a test runtime")
+                .block_on(async {
+                    register_connector_factory("schema_only", Arc::new(SchemaOnlyConnectorFactory))
+                        .await;
+                    let runtime = Arc::new(crate::Runtime::builder().build().await);
+                    // The `_a` dataset fails a second time inside the interval in
+                    // each loop, and must still log only once.
+                    //
+                    // A missing `time_column` is a permanent failure (`error_spaced!`).
+                    for name in ["time_column_a", "time_column_b", "time_column_a"] {
+                        let ds = accelerated_schema_only_dataset(&runtime, name, |dataset| {
+                            dataset.time_column = Some("not_in_the_source_schema".to_string());
+                        });
+                        runtime
+                            .try_load_dataset_once(ds, BootstrapStatus::None, None)
+                            .await
+                            .expect_err("a missing time column should fail the load");
+                    }
+                    // `refresh_mode: changes` over a source without a change stream
+                    // is a retriable failure (`warn_spaced!`).
+                    for name in ["changes_a", "changes_b", "changes_a"] {
+                        let ds = accelerated_schema_only_dataset(&runtime, name, |dataset| {
+                            if let Some(acceleration) = dataset.acceleration.as_mut() {
+                                acceleration.refresh_mode =
+                                    Some(spicepod::acceleration::RefreshMode::Changes);
+                            }
+                        });
+                        runtime
+                            .try_load_dataset_once(ds, BootstrapStatus::None, None)
+                            .await
+                            .expect_err(
+                                "a changes load over a source without a change stream should fail",
+                            );
+                    }
+                });
+        });
+
+        let failures_of = |name: &str| {
+            lines
+                .iter()
+                .filter(|line| line.contains(&format!(" {name} ")))
+                .count()
+        };
+        assert_eq!(
+            ["time_column_a", "time_column_b", "changes_a", "changes_b"].map(failures_of),
+            [1, 1, 1, 1],
+            "each failing dataset must log its own failure, once per interval: {lines:#?}"
+        );
+    }
+
+    /// An accelerated `schema_only` dataset named `name`, adjusted by `configure`.
+    fn accelerated_schema_only_dataset(
+        runtime: &Arc<crate::Runtime>,
+        name: &str,
+        configure: impl FnOnce(&mut spicepod::component::dataset::Dataset),
+    ) -> Arc<Dataset> {
+        let mut dataset = spicepod::component::dataset::Dataset::new("schema_only:any", name);
+        dataset.acceleration = Some(spicepod::acceleration::Acceleration {
+            enabled: true,
+            ..spicepod::acceleration::Acceleration::default()
+        });
+        configure(&mut dataset);
+
+        let app = app::AppBuilder::new(name)
+            .with_dataset(dataset.clone())
+            .build();
+        Arc::new(
+            DatasetBuilder::try_from(dataset)
+                .expect("valid dataset builder")
+                .with_app(Arc::new(app))
+                .with_runtime(Arc::clone(runtime))
+                .build()
+                .expect("valid runtime dataset"),
+        )
     }
 
     /// `access: read_write` over a source that only supports reads is a Spicepod
