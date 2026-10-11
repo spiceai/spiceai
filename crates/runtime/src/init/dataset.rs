@@ -4330,10 +4330,11 @@ mod tests {
         .build()
         .to_string();
         // Write-through loads for a source that takes writes; a read-only
-        // source such as MySQL loads only with `access: read`.
+        // source such as MySQL also needs `access: read`, and `access: read`
+        // alone does not clear this refusal.
         assert_eq!(
             message,
-            "Failed to register dataset orders (mysql): durable write-back needs a source that can apply a delivered row in one atomic step, and the mysql connector cannot yet. Delivering as a separate delete and insert lets the deleted state echo back over CDC, which can silently drop a committed write. Set 'acceleration.write_mode: write_through' to send writes to the source directly instead, or set 'access: read' if the source does not accept writes. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
+            "Failed to register dataset orders (mysql): durable write-back needs a source that can apply a delivered row in one atomic step, and the mysql connector cannot yet. Delivering as a separate delete and insert lets the deleted state echo back over CDC, which can silently drop a committed write. Set 'acceleration.write_mode: write_through' to send writes to the source directly instead, and also set 'access: read' if the source does not accept writes. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
         );
     }
 
