@@ -150,7 +150,7 @@
             }
           },
           "400": {
-            "description": "The specified model is an evaluation model; use POST /v1/evaluate"
+            "description": "The specified model is a decision model; use POST /v1/decisions"
           },
           "404": {
             "description": "The specified model was not found"
@@ -162,6 +162,38 @@
                 "schema": {},
                 "example": {
                   "error": "An internal server error occurred while processing the chat completion."
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/config": {
+      "get": {
+        "tags": [
+          "Iceberg"
+        ],
+        "summary": "Get Iceberg API config",
+        "description": "This endpoint returns the Iceberg Catalog API configuration, including details about overrides, defaults, and available endpoints.",
+        "operationId": "get_config",
+        "responses": {
+          "200": {
+            "description": "API configuration retrieved successfully",
+            "content": {
+              "application/json": {
+                "schema": {},
+                "example": {
+                  "overrides": {},
+                  "defaults": {},
+                  "endpoints": [
+                    "GET /v1/{prefix}/namespaces",
+                    "GET /v1/{prefix}/namespaces/{namespace}",
+                    "HEAD /v1/{prefix}/namespaces/{namespace}",
+                    "GET /v1/{prefix}/namespaces/{namespace}/tables",
+                    "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}",
+                    "HEAD /v1/{prefix}/namespaces/{namespace}/tables/{table}"
+                  ]
                 }
               }
             }
@@ -513,6 +545,59 @@
         }
       }
     },
+    "/v1/decisions": {
+      "post": {
+        "tags": [
+          "AI"
+        ],
+        "summary": "Create a decision",
+        "description": "Answers typed questions about `input`, compatible with `OpenAI`'s Decisions API: a\n`predicate` returns the probability a statement is true, a `choice` returns the\nmost probable of its `choices` with the distribution and a confidence, and a\n`score` returns the probability-weighted 0-based index of its `levels`. Answers come\nback in question order with each question's `name`. `model` names any model in the\nSpicepod: a decision model such as `TypeSafe` Jev, whose probabilities are\ncalibrated, or a chat model, whose probabilities are its own estimates.",
+        "operationId": "post_decisions",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/DecisionRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "The answers, in question order",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DecisionResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request, including unknown fields, image inputs, and `reasoning_effort` for a decision model"
+          },
+          "401": {
+            "description": "The model provider rejected the credentials"
+          },
+          "403": {
+            "description": "The model provider denied access"
+          },
+          "404": {
+            "description": "No model with this name"
+          },
+          "429": {
+            "description": "Rate limited"
+          },
+          "500": {
+            "description": "The model could not answer"
+          },
+          "503": {
+            "description": "The model provider is unavailable"
+          }
+        }
+      }
+    },
     "/v1/embeddings": {
       "post": {
         "tags": [
@@ -592,375 +677,6 @@
                 }
               }
             }
-          }
-        }
-      }
-    },
-    "/v1/evaluate": {
-      "post": {
-        "tags": [
-          "AI"
-        ],
-        "summary": "Evaluate",
-        "description": "Evaluate unstructured `state` against a map of typed System One questions\n(noul / choice / score). Returns structured answers with probabilities and\nconfidence. `model` names either a System One model (`TypeSafe` Jev), whose\nprobabilities are calibrated, or any chat model, whose probabilities are the\nmodel's own estimates. System One models do not support chat completions.",
-        "operationId": "post_evaluate",
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/EvaluateRequest"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "description": "Evaluation succeeded",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/EvaluateResponse"
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Invalid request"
-          },
-          "401": {
-            "description": "Upstream authentication failed"
-          },
-          "403": {
-            "description": "Upstream permission denied"
-          },
-          "404": {
-            "description": "No System One or chat model with this name"
-          },
-          "422": {
-            "description": "Malformed JSON request body (Axum Json extractor)"
-          },
-          "429": {
-            "description": "Rate limited"
-          },
-          "500": {
-            "description": "Evaluation failed"
-          },
-          "503": {
-            "description": "Upstream provider unavailable"
-          }
-        }
-      }
-    },
-    "/v1/iceberg/config": {
-      "get": {
-        "tags": [
-          "Iceberg"
-        ],
-        "summary": "Get Iceberg API config",
-        "description": "This endpoint returns the Iceberg Catalog API configuration, including details about overrides, defaults, and available endpoints.",
-        "operationId": "get_config",
-        "responses": {
-          "200": {
-            "description": "API configuration retrieved successfully",
-            "content": {
-              "application/json": {
-                "schema": {},
-                "example": {
-                  "overrides": {},
-                  "defaults": {},
-                  "endpoints": [
-                    "GET /v1/iceberg/namespaces",
-                    "HEAD /v1/iceberg/namespaces/{namespace}",
-                    "GET /v1/iceberg/namespaces/{namespace}/tables",
-                    "HEAD /v1/iceberg/namespaces/{namespace}/tables/{table}",
-                    "GET /v1/iceberg/namespaces/{namespace}/tables/{table}"
-                  ]
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/v1/iceberg/namespaces": {
-      "get": {
-        "tags": [
-          "Iceberg"
-        ],
-        "summary": "List Iceberg namespaces",
-        "description": "This endpoint retrieves namespaces available in the Iceberg catalog.\nIf a `parent` namespace is provided, it will list the child namespaces under the specified parent.",
-        "operationId": "get_iceberg_namespaces",
-        "parameters": [
-          {
-            "name": "parent",
-            "in": "query",
-            "description": "The parent namespace from which to retrieve child namespaces.",
-            "required": false,
-            "schema": {
-              "$ref": "#/components/schemas/Namespace"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Namespaces retrieved successfully",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/NamespacesResponse"
-                },
-                "example": {
-                  "namespaces": [
-                    {
-                      "parts": [
-                        "catalog_a"
-                      ]
-                    },
-                    {
-                      "parts": [
-                        "catalog_b",
-                        "schema_1"
-                      ]
-                    }
-                  ]
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Bad request",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/IcebergResponseError"
-                },
-                "example": {
-                  "error": {
-                    "message": "Invalid namespace request",
-                    "type": "BadRequestException",
-                    "code": 400
-                  }
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Namespace not found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/IcebergResponseError"
-                },
-                "example": {
-                  "error": {
-                    "message": "Namespace provided does not exist",
-                    "type": "NoSuchNamespaceException",
-                    "code": 404
-                  }
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Internal server error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/IcebergResponseError"
-                },
-                "example": {
-                  "error": {
-                    "message": "Internal Server Error: DF_SCHEMA_NOT_FOUND",
-                    "type": "InternalServerError",
-                    "code": 500
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/v1/iceberg/namespaces/{namespace}": {
-      "get": {
-        "tags": [
-          "Iceberg"
-        ],
-        "summary": "Check if a namespace exists.",
-        "description": "This endpoint returns a 200 OK response if the namespace exists, otherwise it returns a 404 Not Found response.",
-        "operationId": "get_namespace",
-        "responses": {
-          "200": {
-            "description": "Namespace exists"
-          },
-          "400": {
-            "description": "Invalid namespace format"
-          },
-          "404": {
-            "description": "Namespace does not exist"
-          }
-        }
-      },
-      "head": {
-        "tags": [
-          "Iceberg"
-        ],
-        "summary": "Check Namespace exists",
-        "description": "This endpoint returns a 200 OK response if the namespace exists, otherwise it returns a 404 Not Found response.",
-        "operationId": "head_namespace",
-        "responses": {
-          "200": {
-            "description": "Namespace exists"
-          },
-          "400": {
-            "description": "Invalid namespace format"
-          },
-          "404": {
-            "description": "Namespace does not exist"
-          }
-        }
-      }
-    },
-    "/v1/iceberg/namespaces/{namespace}/tables": {
-      "get": {
-        "tags": [
-          "Iceberg"
-        ],
-        "operationId": "list_tables",
-        "responses": {
-          "200": {
-            "description": "Tables retrieved successfully",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ListTablesResponse"
-                },
-                "example": {
-                  "identifiers": [
-                    {
-                      "namespace": {
-                        "parts": [
-                          "catalog_a"
-                        ]
-                      },
-                      "name": "table_1"
-                    },
-                    {
-                      "namespace": {
-                        "parts": [
-                          "catalog_b",
-                          "schema_1"
-                        ]
-                      },
-                      "name": "table_2"
-                    }
-                  ]
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Invalid namespace format"
-          },
-          "404": {
-            "description": "Namespace does not exist"
-          }
-        }
-      }
-    },
-    "/v1/iceberg/namespaces/{namespace}/tables/{table}": {
-      "get": {
-        "tags": [
-          "Iceberg"
-        ],
-        "summary": "Get a table.",
-        "description": "This endpoint returns the table if it exists, otherwise it returns a 404 Not Found response.",
-        "operationId": "get_table",
-        "parameters": [
-          {
-            "name": "namespace",
-            "in": "path",
-            "description": "The namespace of the table.",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "table",
-            "in": "path",
-            "description": "The name of the table.",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Table exists",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/LoadTableResponse"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Table does not exist"
-          },
-          "500": {
-            "description": "An internal server error occurred while getting the table",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/IcebergResponseError"
-                },
-                "example": {
-                  "error": {
-                    "message": "Request failed. An internal server error occurred while getting the table.",
-                    "r#type": "InternalServerError",
-                    "code": 500
-                  }
-                }
-              }
-            }
-          }
-        }
-      },
-      "head": {
-        "tags": [
-          "Iceberg"
-        ],
-        "summary": "Check if a table exists.",
-        "description": "This endpoint returns a 200 OK response if the table exists, otherwise it returns a 404 Not Found response.",
-        "operationId": "head_table",
-        "parameters": [
-          {
-            "name": "namespace",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/NamespacePath"
-            }
-          },
-          {
-            "name": "table",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Table exists"
-          },
-          "404": {
-            "description": "Table does not exist"
           }
         }
       }
@@ -1184,6 +900,326 @@
                 }
               }
             }
+          }
+        }
+      }
+    },
+    "/v1/namespaces": {
+      "get": {
+        "tags": [
+          "Iceberg"
+        ],
+        "summary": "List Iceberg namespaces",
+        "description": "This endpoint retrieves namespaces available in the Iceberg catalog.\nIf a `parent` namespace is provided, it will list the child namespaces under the specified parent.",
+        "operationId": "get_iceberg_namespaces",
+        "parameters": [
+          {
+            "name": "parent",
+            "in": "query",
+            "description": "The parent namespace from which to retrieve child namespaces.",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/Namespace"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Namespaces retrieved successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NamespacesResponse"
+                },
+                "example": {
+                  "namespaces": [
+                    {
+                      "parts": [
+                        "catalog_a"
+                      ]
+                    },
+                    {
+                      "parts": [
+                        "catalog_b",
+                        "schema_1"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IcebergResponseError"
+                },
+                "example": {
+                  "error": {
+                    "message": "Invalid namespace request",
+                    "type": "BadRequestException",
+                    "code": 400
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Namespace not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IcebergResponseError"
+                },
+                "example": {
+                  "error": {
+                    "message": "Namespace provided does not exist",
+                    "type": "NoSuchNamespaceException",
+                    "code": 404
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IcebergResponseError"
+                },
+                "example": {
+                  "error": {
+                    "message": "Internal Server Error: DF_SCHEMA_NOT_FOUND",
+                    "type": "InternalServerError",
+                    "code": 500
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/namespaces/{namespace}": {
+      "get": {
+        "tags": [
+          "Iceberg"
+        ],
+        "summary": "Load an Iceberg namespace",
+        "description": "Returns the namespace if it exists. Spice does not store namespace properties, so `properties` is `null`.",
+        "operationId": "get_namespace",
+        "responses": {
+          "200": {
+            "description": "Namespace exists",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GetNamespaceResponse"
+                },
+                "example": {
+                  "namespace": [
+                    "spice",
+                    "public"
+                  ],
+                  "properties": null
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid namespace format"
+          },
+          "404": {
+            "description": "Namespace does not exist"
+          }
+        }
+      },
+      "head": {
+        "tags": [
+          "Iceberg"
+        ],
+        "summary": "Check Namespace exists",
+        "description": "This endpoint returns a 200 OK response if the namespace exists, otherwise it returns a 404 Not Found response.",
+        "operationId": "head_namespace",
+        "responses": {
+          "200": {
+            "description": "Namespace exists"
+          },
+          "400": {
+            "description": "Invalid namespace format"
+          },
+          "404": {
+            "description": "Namespace does not exist"
+          }
+        }
+      }
+    },
+    "/v1/namespaces/{namespace}/tables": {
+      "get": {
+        "tags": [
+          "Iceberg"
+        ],
+        "operationId": "list_tables",
+        "responses": {
+          "200": {
+            "description": "Tables retrieved successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListTablesResponse"
+                },
+                "example": {
+                  "identifiers": [
+                    {
+                      "namespace": {
+                        "parts": [
+                          "catalog_a"
+                        ]
+                      },
+                      "name": "table_1"
+                    },
+                    {
+                      "namespace": {
+                        "parts": [
+                          "catalog_b",
+                          "schema_1"
+                        ]
+                      },
+                      "name": "table_2"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid namespace format"
+          },
+          "404": {
+            "description": "Namespace does not exist"
+          }
+        }
+      }
+    },
+    "/v1/namespaces/{namespace}/tables/{table}": {
+      "get": {
+        "tags": [
+          "Iceberg"
+        ],
+        "summary": "Load a table.",
+        "description": "A table Spice reads unchanged from an Iceberg table (a federated `iceberg:`\nor `glue:` dataset, a table in an Iceberg or Glue catalog, or an Iceberg DDL\ntable) is returned as that Iceberg table: its current metadata and metadata\nlocation, loaded from its catalog on every request, so an Iceberg client\nreads the snapshot Spice's next query reads. A column added to the table\noutside Spice reaches the client at once, while Spice keeps the columns the\ntable had when it was registered until it is reloaded. Any other table\n(accelerated, with columns Spice computes such as embeddings, a view, or a\nsource that is not Iceberg) is refused with `400`, naming the reason: query\nit with SQL through Spice instead.",
+        "operationId": "get_table",
+        "parameters": [
+          {
+            "name": "namespace",
+            "in": "path",
+            "description": "The namespace of the table.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "table",
+            "in": "path",
+            "description": "The name of the table.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The Iceberg table Spice reads the table from",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LoadTableResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The table cannot be read as an Iceberg table",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IcebergResponseError"
+                },
+                "example": {
+                  "error": {
+                    "message": "Failed to load table 'spice.public.orders' as an Iceberg table: it is accelerated, so Spice answers queries from its acceleration rather than from an Iceberg table that Iceberg clients can read directly. Query it with SQL through Spice instead, over HTTP (`/v1/sql`) or Arrow Flight SQL. See: https://spiceai.org/docs/api/HTTP/get-table",
+                    "type": "BadRequestException",
+                    "code": 400
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Table does not exist",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IcebergResponseError"
+                },
+                "example": {
+                  "error": {
+                    "message": "Table 'spice.public.orders' does not exist",
+                    "type": "NoSuchTableException",
+                    "code": 404
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The table's Iceberg catalog could not be reached",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IcebergResponseError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "head": {
+        "tags": [
+          "Iceberg"
+        ],
+        "summary": "Check if a table exists.",
+        "description": "This endpoint returns a 200 OK response if the table exists, otherwise it returns a 404 Not Found response.",
+        "operationId": "head_table",
+        "parameters": [
+          {
+            "name": "namespace",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/NamespacePath"
+            }
+          },
+          {
+            "name": "table",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Table exists"
+          },
+          "404": {
+            "description": "Table does not exist"
           }
         }
       }
@@ -2704,109 +2740,6 @@
             "description": "A path to a file."
           }
         ]
-      },
-      "Answer": {
-        "oneOf": [
-          {
-            "type": "object",
-            "required": [
-              "noul",
-              "type"
-            ],
-            "properties": {
-              "noul": {
-                "type": "number",
-                "format": "double"
-              },
-              "type": {
-                "type": "string",
-                "enum": [
-                  "noul"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "choice",
-              "probabilities",
-              "confidence",
-              "type"
-            ],
-            "properties": {
-              "choice": {
-                "type": "string"
-              },
-              "confidence": {
-                "type": "number",
-                "format": "double"
-              },
-              "probabilities": {
-                "type": "object",
-                "additionalProperties": {
-                  "type": "number",
-                  "format": "double"
-                },
-                "propertyNames": {
-                  "type": "string"
-                }
-              },
-              "type": {
-                "type": "string",
-                "enum": [
-                  "choice"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "required": [
-              "score",
-              "legend",
-              "probabilities",
-              "confidence",
-              "type"
-            ],
-            "properties": {
-              "confidence": {
-                "type": "number",
-                "format": "double"
-              },
-              "legend": {
-                "type": "object",
-                "additionalProperties": {
-                  "$ref": "#/components/schemas/EntryType"
-                },
-                "propertyNames": {
-                  "type": "string"
-                }
-              },
-              "probabilities": {
-                "type": "object",
-                "additionalProperties": {
-                  "type": "number",
-                  "format": "double"
-                },
-                "propertyNames": {
-                  "type": "string"
-                }
-              },
-              "score": {
-                "type": "number",
-                "format": "double"
-              },
-              "type": {
-                "type": "string",
-                "enum": [
-                  "score"
-                ]
-              }
-            }
-          }
-        ],
-        "description": "A typed answer returned for one question."
       },
       "ApplyPatchCallOutputStatus": {
         "type": "string",
@@ -4595,6 +4528,53 @@
           }
         ]
       },
+      "ChoiceOption": {
+        "type": "object",
+        "description": "One option of a choice question.",
+        "required": [
+          "value"
+        ],
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "value": {
+            "$ref": "#/components/schemas/ChoiceValue"
+          }
+        },
+        "additionalProperties": false
+      },
+      "ChoiceProbability": {
+        "type": "object",
+        "description": "The probability of one choice option.",
+        "required": [
+          "value",
+          "probability"
+        ],
+        "properties": {
+          "probability": {
+            "type": "number",
+            "format": "double"
+          },
+          "value": {
+            "$ref": "#/components/schemas/ChoiceValue"
+          }
+        }
+      },
+      "ChoiceValue": {
+        "oneOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "string"
+          }
+        ],
+        "description": "A choice value. `OpenAI` treats a string and a boolean with the same text as\ndifferent values."
+      },
       "ClickButtonType": {
         "type": "string",
         "enum": [
@@ -5891,7 +5871,7 @@
                 "type": "null"
               },
               {
-                "$ref": "#/components/schemas/ServiceTier",
+                "$ref": "#/components/schemas/ServiceTierResponse",
                 "description": "The service tier used for processing the request. This field is only included if the `service_tier` parameter is specified in the request."
               }
             ]
@@ -6595,6 +6575,450 @@
           }
         }
       },
+      "DecisionAnswer": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "probability",
+              "type"
+            ],
+            "properties": {
+              "name": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "probability": {
+                "type": "number",
+                "format": "double"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "predicate"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "choice",
+              "probabilities",
+              "confidence",
+              "type"
+            ],
+            "properties": {
+              "choice": {
+                "$ref": "#/components/schemas/ChoiceValue"
+              },
+              "confidence": {
+                "type": "number",
+                "format": "double"
+              },
+              "name": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "probabilities": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/ChoiceProbability"
+                }
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "choice"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "score",
+              "probabilities",
+              "confidence",
+              "type"
+            ],
+            "properties": {
+              "confidence": {
+                "type": "number",
+                "format": "double"
+              },
+              "name": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "probabilities": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/LevelProbability"
+                }
+              },
+              "score": {
+                "type": "number",
+                "format": "double"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "score"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "The model declined to answer this question; the other answers stand.",
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "name": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "refusal"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "The answer to one question. `name` echoes the question's name, or is null."
+      },
+      "DecisionInput": {
+        "oneOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DecisionInputMessage"
+            }
+          }
+        ],
+        "description": "The evidence every question is answered from."
+      },
+      "DecisionInputMessage": {
+        "type": "object",
+        "description": "A user message carrying text.",
+        "required": [
+          "role",
+          "content"
+        ],
+        "properties": {
+          "content": {
+            "$ref": "#/components/schemas/DecisionMessageContent"
+          },
+          "role": {
+            "$ref": "#/components/schemas/DecisionInputRole"
+          },
+          "type": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/DecisionMessageType"
+              }
+            ]
+          }
+        },
+        "additionalProperties": false
+      },
+      "DecisionInputPart": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "text",
+              "type"
+            ],
+            "properties": {
+              "text": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "input_text"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "image_url",
+              "type"
+            ],
+            "properties": {
+              "detail": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "image_url": {
+                "type": "string"
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "input_image"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "One part of a message. Image parts are accepted by the schema and refused with a\nmessage naming the limitation, so a client learns why rather than seeing a parse error."
+      },
+      "DecisionInputRole": {
+        "type": "string",
+        "description": "Only user messages are accepted.",
+        "enum": [
+          "user"
+        ]
+      },
+      "DecisionMessageContent": {
+        "oneOf": [
+          {
+            "type": "string"
+          },
+          {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DecisionInputPart"
+            }
+          }
+        ],
+        "description": "A message's content: a string, or a list of parts."
+      },
+      "DecisionMessageType": {
+        "type": "string",
+        "description": "The optional `type` of an input message.",
+        "enum": [
+          "message"
+        ]
+      },
+      "DecisionQuestion": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "How likely a statement about the input is true. Answered with a `probability`.",
+            "required": [
+              "instructions",
+              "type"
+            ],
+            "properties": {
+              "instructions": {
+                "type": "string"
+              },
+              "name": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "predicate"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Which of the supplied options fits the input. Answered with the most probable\noption and the distribution over all of them.",
+            "required": [
+              "instructions",
+              "choices",
+              "type"
+            ],
+            "properties": {
+              "choices": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/ChoiceOption"
+                },
+                "description": "Between 2 and 255 distinct options."
+              },
+              "instructions": {
+                "type": "string"
+              },
+              "name": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "choice"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Where the input sits on ordered levels, lowest first. Answered with the\nprobability-weighted 0-based level index.",
+            "required": [
+              "instructions",
+              "levels",
+              "type"
+            ],
+            "properties": {
+              "instructions": {
+                "type": "string"
+              },
+              "levels": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/ScoreLevel"
+                },
+                "description": "Between 2 and 10 levels, lowest first."
+              },
+              "name": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "score"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "A question about the input, with an optional name echoed in its answer."
+      },
+      "DecisionRequest": {
+        "type": "object",
+        "description": "Request body for `POST /v1/decisions`.",
+        "required": [
+          "model",
+          "input",
+          "questions"
+        ],
+        "properties": {
+          "input": {
+            "$ref": "#/components/schemas/DecisionInput",
+            "description": "Shared evidence for every question: a text string, or user messages with text\nparts."
+          },
+          "model": {
+            "type": "string",
+            "description": "The model that answers: the name of a model under `models` in the Spicepod."
+          },
+          "questions": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DecisionQuestion"
+            },
+            "description": "What to decide, in order: between 1 and 200 questions."
+          },
+          "reasoning_effort": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ReasoningEffort",
+                "description": "How much a chat model reasons before it answers. Omitted keeps the model's\nsetting. A Spice extension: `OpenAI`'s Decisions API has no such field, and a\ndecision model returns 400 for it."
+              }
+            ]
+          },
+          "safety_identifier": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Opaque end-user identifier, at most 128 characters. Forwarded to `OpenAI`\ndecision models."
+          }
+        },
+        "additionalProperties": false
+      },
+      "DecisionResponse": {
+        "type": "object",
+        "description": "Response body for `POST /v1/decisions`.",
+        "required": [
+          "model",
+          "answers"
+        ],
+        "properties": {
+          "answers": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/DecisionAnswer"
+            },
+            "description": "One answer per question, in question order."
+          },
+          "model": {
+            "type": "string",
+            "description": "The model that answered."
+          },
+          "usage": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/DecisionUsage",
+                "description": "Tokens the decision used. Omitted when the model did not report them."
+              }
+            ]
+          }
+        }
+      },
+      "DecisionUsage": {
+        "type": "object",
+        "description": "Tokens a decision used.",
+        "required": [
+          "input_tokens",
+          "output_tokens"
+        ],
+        "properties": {
+          "input_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "input_tokens_details": {
+            "$ref": "#/components/schemas/InputTokensDetails"
+          },
+          "output_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "output_tokens_details": {
+            "$ref": "#/components/schemas/OutputTokensDetails"
+          },
+          "total_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
       "DoubleClickAction": {
         "type": "object",
         "description": "A double click action.",
@@ -6788,29 +7212,6 @@
           "base64"
         ]
       },
-      "EntryType": {
-        "oneOf": [
-          {
-            "type": "string"
-          },
-          {
-            "type": "array",
-            "items": {}
-          },
-          {
-            "type": "object",
-            "additionalProperties": {},
-            "propertyNames": {
-              "type": "string"
-            }
-          },
-          {
-            "type": "null",
-            "default": null
-          }
-        ],
-        "description": "`TypeSafe` `EntryType`: string, object, array, or null.\n\nUsed for `instructions` and structured criteria descriptions.\nSee <https://docs.typesafe.ai/primitives/advanced>."
-      },
       "ErrorObject": {
         "type": "object",
         "description": "Error returned by the API when a request fails.",
@@ -6828,82 +7229,6 @@
             "description": "A human-readable description of the error."
           }
         }
-      },
-      "EvaluateRequest": {
-        "type": "object",
-        "description": "Request body for `POST /v1/evaluate` and provider System One calls.",
-        "required": [
-          "model",
-          "state",
-          "questions"
-        ],
-        "properties": {
-          "model": {
-            "type": "string",
-            "description": "Spicepod model name (runtime) or provider model id (provider forward)."
-          },
-          "questions": {
-            "type": "object",
-            "additionalProperties": {
-              "$ref": "#/components/schemas/Question"
-            },
-            "minProperties": 1
-          },
-          "state": {
-            "$ref": "#/components/schemas/EvaluateState",
-            "description": "State for the model to evaluate: string, object, or array."
-          }
-        }
-      },
-      "EvaluateResponse": {
-        "type": "object",
-        "description": "Response body for evaluation: typed answers plus provider metadata.",
-        "required": [
-          "model",
-          "answers"
-        ],
-        "properties": {
-          "answers": {
-            "type": "object",
-            "additionalProperties": {
-              "$ref": "#/components/schemas/Answer"
-            },
-            "minProperties": 1
-          },
-          "model": {
-            "type": "string",
-            "description": "Versioned model id that answered (e.g. `jev-1.13.0`), when the provider reports it."
-          },
-          "usage": {
-            "oneOf": [
-              {
-                "type": "null"
-              },
-              {
-                "$ref": "#/components/schemas/Usage"
-              }
-            ]
-          }
-        }
-      },
-      "EvaluateState": {
-        "oneOf": [
-          {
-            "type": "string"
-          },
-          {
-            "type": "array",
-            "items": {}
-          },
-          {
-            "type": "object",
-            "additionalProperties": {},
-            "propertyNames": {
-              "type": "string"
-            }
-          }
-        ],
-        "description": "Evaluation `state`: string, object, or array (not bool/number/null)."
       },
       "FileCitationBody": {
         "type": "object",
@@ -7722,6 +8047,31 @@
           }
         }
       },
+      "GetNamespaceResponse": {
+        "type": "object",
+        "description": "The Iceberg REST `GetNamespaceResponse`.",
+        "required": [
+          "namespace"
+        ],
+        "properties": {
+          "namespace": {
+            "$ref": "#/components/schemas/Namespace"
+          },
+          "properties": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Always `null`: Spice does not store namespace properties, and the spec\nasks a server without them to return `null` rather than `{}`.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        }
+      },
       "GrammarSyntax": {
         "type": "string",
         "enum": [
@@ -7773,7 +8123,9 @@
         "type": "string",
         "enum": [
           "NoSuchNamespaceException",
+          "NoSuchTableException",
           "BadRequestException",
+          "ServiceUnavailableException",
           "InternalServerError"
         ]
       },
@@ -8305,6 +8657,22 @@
             "type": "integer",
             "format": "int32",
             "description": "The number of tokens that were retrieved from the cache.\n[More on prompt caching](https://platform.openai.com/docs/guides/prompt-caching).",
+            "minimum": 0
+          }
+        }
+      },
+      "InputTokensDetails": {
+        "type": "object",
+        "description": "Breakdown of input tokens. Zero unless the model reports a cache.",
+        "properties": {
+          "cache_write_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "cached_tokens": {
+            "type": "integer",
+            "format": "int64",
             "minimum": 0
           }
         }
@@ -8904,6 +9272,29 @@
           }
         }
       },
+      "LevelProbability": {
+        "type": "object",
+        "description": "The probability of one score level, by its 0-based index.",
+        "required": [
+          "value",
+          "label",
+          "probability"
+        ],
+        "properties": {
+          "label": {
+            "type": "string"
+          },
+          "probability": {
+            "type": "number",
+            "format": "double"
+          },
+          "value": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
       "ListTablesResponse": {
         "type": "object",
         "required": [
@@ -8939,12 +9330,20 @@
       },
       "LoadTableResponse": {
         "type": "object",
+        "description": "The Iceberg REST `LoadTableResult`: the table's metadata and where it is\nstored. No `config` or `storage-credentials`: a client reads the table's\nfiles with its own credentials.",
         "required": [
           "metadata"
         ],
         "properties": {
           "metadata": {
-            "$ref": "#/components/schemas/TableMetadata"
+            "type": "object",
+            "description": "Iceberg table metadata, see `<https://iceberg.apache.org/spec/#table-metadata>`."
+          },
+          "metadata-location": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         }
       },
@@ -9690,37 +10089,6 @@
           }
         }
       },
-      "NonNullEntry": {
-        "oneOf": [
-          {
-            "type": "string"
-          },
-          {
-            "type": "array",
-            "items": {}
-          },
-          {
-            "type": "object",
-            "additionalProperties": {},
-            "propertyNames": {
-              "type": "string"
-            }
-          }
-        ],
-        "description": "Non-null `EntryType` values: string, object, or array (not JSON null).\n\nUsed for score rubric levels so the `OpenAPI` contract matches `TypeSafe`'s\nnon-empty `list[str | object | array]` criteria shape."
-      },
-      "NoulCriteria": {
-        "type": "object",
-        "description": "Optional yes/no rubric for a noul question.\n\n`true` / `false` use [`NullableEntry`] so explicit JSON `null` is preserved when\nforwarding to `TypeSafe` (unlike `Option<EntryType>`, which drops nulls).",
-        "properties": {
-          "false": {
-            "$ref": "#/components/schemas/NullableEntry"
-          },
-          "true": {
-            "$ref": "#/components/schemas/NullableEntry"
-          }
-        }
-      },
       "NsqlColumnContext": {
         "type": "object",
         "required": [
@@ -10253,29 +10621,6 @@
             "minimum": 0
           }
         }
-      },
-      "NullableEntry": {
-        "oneOf": [
-          {
-            "type": "string"
-          },
-          {
-            "type": "array",
-            "items": {}
-          },
-          {
-            "type": "object",
-            "additionalProperties": {},
-            "propertyNames": {
-              "type": "string"
-            }
-          },
-          {
-            "type": "null",
-            "default": null
-          }
-        ],
-        "description": "`TypeSafe` `EntryType`: string, object, array, or null.\n\nUsed for `instructions` and structured criteria descriptions.\nSee <https://docs.typesafe.ai/primitives/advanced>."
       },
       "OutputItem": {
         "oneOf": [
@@ -10830,6 +11175,17 @@
           }
         }
       },
+      "OutputTokensDetails": {
+        "type": "object",
+        "description": "Breakdown of output tokens. Zero unless the model reports reasoning.",
+        "properties": {
+          "reasoning_tokens": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
       "PredictionContent": {
         "oneOf": [
           {
@@ -10932,96 +11288,6 @@
             "minimum": 0
           }
         }
-      },
-      "Question": {
-        "oneOf": [
-          {
-            "type": "object",
-            "description": "Yes/no probability question. Answer is `noul` in \\[0, 1\\] (P(yes)).",
-            "required": [
-              "type"
-            ],
-            "properties": {
-              "criteria": {
-                "oneOf": [
-                  {
-                    "type": "null"
-                  },
-                  {
-                    "$ref": "#/components/schemas/NoulCriteria"
-                  }
-                ]
-              },
-              "instructions": {
-                "$ref": "#/components/schemas/NullableEntry"
-              },
-              "type": {
-                "type": "string",
-                "enum": [
-                  "noul"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "description": "Closed-set selection. Answer is the highest-probability option plus the full distribution.",
-            "required": [
-              "criteria",
-              "type"
-            ],
-            "properties": {
-              "criteria": {
-                "type": "object",
-                "description": "Option id → description (`EntryType`, or JSON null).",
-                "additionalProperties": {
-                  "$ref": "#/components/schemas/EntryType"
-                },
-                "propertyNames": {
-                  "type": "string"
-                }
-              },
-              "instructions": {
-                "$ref": "#/components/schemas/NullableEntry"
-              },
-              "type": {
-                "type": "string",
-                "enum": [
-                  "choice"
-                ]
-              }
-            }
-          },
-          {
-            "type": "object",
-            "description": "Ordered rubric score. Answer is a probability-weighted value across levels.",
-            "required": [
-              "criteria",
-              "type"
-            ],
-            "properties": {
-              "criteria": {
-                "type": "array",
-                "items": {
-                  "$ref": "#/components/schemas/NonNullEntry"
-                },
-                "description": "Two to ten non-null rubric levels: `TypeSafe` documents score criteria as\n\"at least two levels and takes up to 10\"\n(<https://docs.typesafe.ai/primitives/score>).",
-                "maxItems": 10,
-                "minItems": 2
-              },
-              "instructions": {
-                "$ref": "#/components/schemas/NullableEntry"
-              },
-              "type": {
-                "type": "string",
-                "enum": [
-                  "score"
-                ]
-              }
-            }
-          }
-        ],
-        "description": "A typed question sent to a System One evaluation model.\n\n`instructions` uses [`NullableEntry`] so an explicit JSON `null` survives the round\ntrip to `TypeSafe` instead of collapsing into an omitted field."
       },
       "RankVersionType": {
         "type": "string",
@@ -11260,6 +11526,17 @@
             "type": "string",
             "description": "The natural language query to be converted into SQL"
           },
+          "reasoning_effort": {
+            "oneOf": [
+              {
+                "type": "null"
+              },
+              {
+                "$ref": "#/components/schemas/ReasoningEffort",
+                "description": "How much the model reasons before it writes SQL. Omitted keeps the model setting."
+              }
+            ]
+          },
           "sample_data_enabled": {
             "type": "boolean",
             "description": "Whether sample data is included in the context for SQL generation. Default: false"
@@ -11458,7 +11735,7 @@
                 "type": "null"
               },
               {
-                "$ref": "#/components/schemas/ServiceTier",
+                "$ref": "#/components/schemas/ServiceTierResponse",
                 "description": "Specifies the processing type used for serving the request.\n- If set to 'auto', then the request will be processed with the service tier configured in the Project settings. Unless otherwise configured, the Project will use 'default'.\n- If set to 'default', then the request will be processed with the standard pricing and performance for the selected model.\n- If set to '[flex](https://platform.openai.com/docs/guides/flex-processing)' or '[priority](https://openai.com/api-priority-processing/)', then the request will be processed with the corresponding service tier.\n- When not set, the default behavior is 'auto'.\n\nWhen the `service_tier` parameter is set, the response body will include the `service_tier` value based on the processing mode actually used to serve the request. This response value may be different from the value set in the parameter."
               }
             ]
@@ -11749,6 +12026,25 @@
           }
         }
       },
+      "ScoreLevel": {
+        "type": "object",
+        "description": "One level of a score question.",
+        "required": [
+          "label"
+        ],
+        "properties": {
+          "description": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "label": {
+            "type": "string"
+          }
+        },
+        "additionalProperties": false
+      },
       "Scroll": {
         "type": "object",
         "description": "A scroll action.",
@@ -11870,12 +12166,30 @@
       },
       "ServiceTier": {
         "type": "string",
+        "description": "The processing tier a request asks for.",
         "enum": [
           "auto",
           "default",
           "flex",
           "scale",
           "priority"
+        ]
+      },
+      "ServiceTierResponse": {
+        "anyOf": [
+          {
+            "type": "string",
+            "enum": [
+              "auto",
+              "default",
+              "flex",
+              "scale",
+              "priority"
+            ]
+          },
+          {
+            "type": "string"
+          }
         ]
       },
       "SpicepodSummary": {
@@ -12036,12 +12350,6 @@
           }
         ]
       },
-      "TableFormatVersion": {
-        "type": "string",
-        "enum": [
-          "V2"
-        ]
-      },
       "TableIdentifier": {
         "type": "object",
         "required": [
@@ -12054,79 +12362,6 @@
           },
           "namespace": {
             "$ref": "#/components/schemas/Namespace"
-          }
-        }
-      },
-      "TableMetadata": {
-        "type": "object",
-        "required": [
-          "format-version",
-          "table-uuid",
-          "location",
-          "schemas",
-          "last-updated-ms",
-          "last-column-id",
-          "last-sequence-number",
-          "current-schema-id",
-          "partition-specs",
-          "default-spec-id",
-          "last-partition-id",
-          "sort-orders",
-          "default-sort-order-id"
-        ],
-        "properties": {
-          "current-schema-id": {
-            "type": "integer",
-            "format": "int32",
-            "minimum": 0
-          },
-          "default-sort-order-id": {
-            "type": "integer",
-            "format": "int32",
-            "minimum": 0
-          },
-          "default-spec-id": {
-            "type": "integer",
-            "format": "int32",
-            "minimum": 0
-          },
-          "format-version": {
-            "$ref": "#/components/schemas/TableFormatVersion"
-          },
-          "last-column-id": {
-            "type": "integer",
-            "format": "int32"
-          },
-          "last-partition-id": {
-            "type": "integer",
-            "format": "int32",
-            "minimum": 0
-          },
-          "last-sequence-number": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "last-updated-ms": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "location": {
-            "type": "string"
-          },
-          "partition-specs": {
-            "type": "object"
-          },
-          "schemas": {
-            "type": "object",
-            "description": "Iceberg schemas, see `<https://apache.github.io/iceberg/spec/#schemas>`."
-          },
-          "sort-orders": {
-            "type": "object"
-          },
-          "table-uuid": {
-            "type": "string",
-            "example": "2b9da507-2c07-4bb3-9f0b-8df66a5e9e53"
           }
         }
       },
@@ -12946,23 +13181,6 @@
           "url": {
             "type": "string",
             "description": "The URL of the web resource."
-          }
-        }
-      },
-      "Usage": {
-        "type": "object",
-        "description": "Token usage reported by the provider.",
-        "properties": {
-          "input_tokens": {
-            "type": "integer",
-            "format": "int64",
-            "description": "Defaulted: the provider may report one count without the other, and a partial\n`usage` block must not fail an otherwise successful evaluation.",
-            "minimum": 0
-          },
-          "output_tokens": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
           }
         }
       },

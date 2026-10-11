@@ -26,7 +26,7 @@ limitations under the License.
 //! partition makes the join output a single partition, and the memory gate is
 //! set low enough that every build side here counts as oversized.
 
-mod common;
+use crate::common;
 
 use std::collections::HashSet;
 use std::sync::Arc;

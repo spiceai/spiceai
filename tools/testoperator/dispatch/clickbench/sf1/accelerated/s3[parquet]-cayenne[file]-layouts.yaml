@@ -1,0 +1,16 @@
+# s3[parquet]-cayenne[file].yaml under acceleration layouts (see
+# tpch/sf1/accelerated/file[parquet]-cayenne[file]-layouts.yaml). `hits` is
+# keyed on the five columns ClickBench's own PostgreSQL schema declares.
+schedule: weekly
+tests:
+  bench:
+    spicepod_path: accelerated/s3[parquet]-cayenne[file].yaml
+    query_set: clickbench
+    runner_type: spiceai-dev-large-runners
+    ready_wait: 1800
+    validate_results: true
+    layouts:
+      - sort
+      - cluster
+      - partition
+      - primary_key,time_column

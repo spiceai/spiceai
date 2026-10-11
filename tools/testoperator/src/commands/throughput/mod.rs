@@ -35,6 +35,7 @@ pub(crate) async fn run(args: &DatasetTestArgs) -> anyhow::Result<()> {
     // Surface a bad connection-topology combination now, not after the
     // ready-wait.
     args.validate_fleet()?;
+    super::ensure_layout_applies(args)?;
     let concurrency = args.effective_concurrency();
     if concurrency < 2 {
         return Err(anyhow::anyhow!(

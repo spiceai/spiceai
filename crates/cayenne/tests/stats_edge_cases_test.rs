@@ -22,7 +22,7 @@ limitations under the License.
 //! overwrites, deletions, all-null columns, mixed data types, large
 //! inserts that bypass inlining, checkpoint flush, and table reopen.
 
-mod common;
+use crate::common;
 
 use arrow::array::{Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};

@@ -33,12 +33,11 @@ limitations under the License.
 #![cfg(not(windows))]
 #![allow(clippy::expect_used, clippy::cast_precision_loss)]
 
-mod common;
+use crate::common;
 
-use std::alloc::{GlobalAlloc, Layout, System};
+use crate::live_bytes;
 use std::io::Cursor;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -49,54 +48,11 @@ use cayenne::metadata::{CdcDurability, CreateTableOptions, VortexConfig};
 use cayenne::{CayenneTableProvider, MetadataCatalog};
 use datafusion::prelude::SessionContext;
 
-struct CountingAllocator;
-
-static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
-
-unsafe impl GlobalAlloc for CountingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let ptr = unsafe { System.alloc(layout) };
-        if !ptr.is_null() {
-            LIVE_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
-        }
-        ptr
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
-        unsafe { System.dealloc(ptr, layout) };
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
-        if !new_ptr.is_null() {
-            LIVE_BYTES.fetch_add(new_size, Ordering::Relaxed);
-            LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
-        }
-        new_ptr
-    }
-}
-
-#[global_allocator]
-static ALLOC: CountingAllocator = CountingAllocator;
-
-fn live_bytes() -> usize {
-    LIVE_BYTES.load(Ordering::Relaxed)
-}
-
-/// Serializes the tests in this file.
+/// Keeps this module's two measurement windows serialized in-process.
 ///
-/// `LIVE_BYTES` is a process-global counter, so it reports every thread's
-/// allocations, not the measuring thread's. `cargo test` runs a file's tests
-/// concurrently on one process, so a sibling test allocating inside a
-/// measurement window lands in that window's figure — the scan test holds
-/// megabytes of decoded batches while the memory test is reading what its
-/// table retained, which is the memory test's whole measurement. Observed as a
-/// nondeterministic failure of the IPC-decoded arm, reporting more resident
-/// bytes than the polluted window said the process held. Every test here
-/// takes this lock for its whole body so only one measurement window is ever
-/// open. `parking_lot` does not poison, so a failing test still releases it and
-/// its sibling reports its own result rather than a lock error.
+/// The process guard requires a separate process for each test. This lock is
+/// harmless there and also serializes these two tests if invoked in-process.
+/// `parking_lot` does not poison, so failure still releases the lock.
 static MEASUREMENT: parking_lot::Mutex<()> = parking_lot::Mutex::new(());
 
 /// The configured memory limit of both tables.
@@ -255,6 +211,9 @@ async fn fill_until_rejected(
 #[test]
 fn a_memory_mode_table_admits_the_same_rows_whatever_allocation_they_arrive_in()
 -> Result<(), String> {
+    common::require_process_per_test(
+        "this test measures the process's live heap through a counting global allocator",
+    );
     let _measurement = MEASUREMENT.lock();
     common::run_with_backend_blocking(common::BackendType::Sqlite, |fixture| async move {
         // Warm the write path so its one-off allocations sit under the baselines.
@@ -299,6 +258,9 @@ fn a_memory_mode_table_admits_the_same_rows_whatever_allocation_they_arrive_in()
 /// over the batches a file-backed scan actually yields.
 #[test]
 fn a_file_scan_yields_batches_whose_buffers_do_not_share_allocations() -> Result<(), String> {
+    common::require_process_per_test(
+        "this test measures the process's live heap through a counting global allocator",
+    );
     let _measurement = MEASUREMENT.lock();
     common::run_with_backend_blocking(common::BackendType::Sqlite, |fixture| async move {
         let schema = wide_schema();

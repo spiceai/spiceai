@@ -18,7 +18,7 @@ limitations under the License.
 
 //! Tests covering retention filter application at write time.
 
-mod common;
+use crate::common;
 
 use arrow::array::{Array, Int64Array, RecordBatch, TimestampMicrosecondArray, UInt64Array};
 
