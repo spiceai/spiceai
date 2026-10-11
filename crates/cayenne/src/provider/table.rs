@@ -13427,8 +13427,9 @@ impl CayenneTableProvider {
         !self.pk_deletion_strategy.is_position_based() && self.pk_deletion_mode.uses_positions()
     }
 
-    /// Whether this table's position-delete rewrites hold writers off for their
-    /// whole duration: a PK table configured with `deletion_mode: position`.
+    /// Whether this table's position-delete rewrites — the whole-table reclaim and
+    /// the protected-snapshot merges — hold writers off while they run: a PK
+    /// table configured with `deletion_mode: position`.
     ///
     /// Such a table can carry position deletes with nothing else hiding their row
     /// — a key repeated within one write is hidden by a position delete alone —
@@ -13480,10 +13481,7 @@ impl CayenneTableProvider {
                 mode.resolved(has_primary_key),
                 crate::metadata::ResolvedDeletionMode::Adaptive
             ) {
-            match catalog
-                .table_storage_stats(&table_metadata.table_id)
-                .await
-            {
+            match catalog.table_storage_stats(&table_metadata.table_id).await {
                 Ok(stats) => Some(Self::warm_table_bytes(&stats)),
                 Err(error) => {
                     tracing::debug!(
@@ -13753,7 +13751,7 @@ impl CayenneTableProvider {
             let listed_bytes: u64 = listed
                 .file_groups
                 .iter()
-                .flat_map(|group| group.iter())
+                .flat_map(FileGroup::iter)
                 .map(|file| file.object_meta.size)
                 .sum();
             if !auto.fits(listed_bytes) {
@@ -15711,6 +15709,10 @@ impl CayenneTableProvider {
             };
 
         let deduplicate_batch = !ctx.upsert_options.is_default();
+        // Read once per batch: a table `deletion_mode: auto` moved to key deletes
+        // records no further position delete, even for a row whose captured
+        // position a keyset checked out before the switch still carries.
+        let record_positions = self.should_capture_positions();
         let mut keep_mask = Vec::with_capacity(batch.num_rows());
         let mut kept_keys: PkDigestSet = PkDigestSet::with_capacity(batch.num_rows());
         let mut delete_specs: HashMap<Arc<str>, Vec<u64>> = HashMap::new();
@@ -15952,10 +15954,11 @@ impl CayenneTableProvider {
                                 // the same row twice is idempotent for
                                 // visibility; `total_superseded` counts
                                 // dual-encoded rows exactly once.
-                                if let RowLocation::FilePositioned {
-                                    file_path,
-                                    position,
-                                } = existing
+                                if record_positions
+                                    && let RowLocation::FilePositioned {
+                                        file_path,
+                                        position,
+                                    } = existing
                                 {
                                     delete_specs
                                         .entry(Arc::clone(file_path))
@@ -20133,6 +20136,7 @@ impl CayenneTableProvider {
         // deletes instead, and the seq-prefix bake reclaims the index from the next
         // trigger on. The size is read here, under `compaction_lock`, because this
         // pass is the one about to pay for the rewrite.
+        let mut deletion_index_trigger = deletion_index_trigger;
         if let Some(auto) = self.pk_deletion_mode.auto()
             && auto.uses_positions()
         {
@@ -20146,13 +20150,21 @@ impl CayenneTableProvider {
                     // Unsized, the rewrite is not known to be cheap: take the bake.
                     Err(_) => true,
                 };
-            if over_bound && self.switch_auto_to_key_deletes("table outgrew position deletes") {
-                // The whole-table rewrite this pass would have run is over the
-                // budget `auto` gives a position-delete reclaim.
+            if over_bound {
+                self.switch_auto_to_key_deletes("table outgrew position deletes");
+            }
+        }
+        // A deletion-index trigger computed before this pass took `compaction_lock`
+        // is stale if the table has moved to key deletes since — here, or in a pass
+        // that held the lock meanwhile: on key deletes the index is the bake's to
+        // reclaim, so only the small-file trigger can still ask this pass for work.
+        if deletion_index_trigger.is_some() && !self.should_capture_positions() {
+            deletion_index_trigger = None;
+            if !small_files {
                 maintenance_metrics::track_compaction(
                     table_name,
                     CompactionKind::SubsetCurrent,
-                    CompactionOutcome::DeclinedOverPassBudget,
+                    CompactionOutcome::DeclinedBelowTrigger,
                 );
                 return Ok(false);
             }
@@ -20164,7 +20176,7 @@ impl CayenneTableProvider {
         // append-counter guard does not observe deletes, so a full re-encode must
         // run without a concurrent writer. The full rewrite below reuses these
         // guards rather than acquiring its own (see
-        // `rewrite_current_snapshot_for_compaction_holding`): `write_lock` is not
+        // `rewrite_current_snapshot_holding_bounded`): `write_lock` is not
         // reentrant.
         //
         // BLOCKING acquire, as the rewrite's own acquire is, and for the same
@@ -20193,7 +20205,7 @@ impl CayenneTableProvider {
         if let Some(trigger) = deletion_index_trigger {
             self.log_snapshot_maintenance_trigger(trigger);
             let committed = self
-                .rewrite_current_snapshot_for_compaction_tracked(position_guards)
+                .rewrite_current_snapshot_for_reclaim_tracked(position_guards)
                 .await?;
             if committed {
                 self.record_small_file_compact_path(LastSmallFileCompactPath::Full);
@@ -23382,14 +23394,36 @@ impl CayenneTableProvider {
     /// background and post-write compaction triggers call.
     ///
     /// `held_position_guards` is passed through to
-    /// [`Self::rewrite_current_snapshot_for_compaction_holding`].
+    /// [`Self::rewrite_current_snapshot_holding_bounded`].
     async fn rewrite_current_snapshot_for_compaction_tracked(
         &self,
         held_position_guards: Option<PositionRewriteGuards>,
     ) -> Result<bool> {
+        self.rewrite_current_snapshot_tracked(held_position_guards, false)
+            .await
+    }
+
+    /// [`Self::rewrite_current_snapshot_for_compaction_tracked`] for the rewrite a
+    /// position-delete table reclaims its deletion index with. On a table
+    /// `deletion_mode: auto` put on position deletes, that rewrite is bounded: it
+    /// sizes what it captured and moves the table to key deletes instead of
+    /// rewriting past the bound.
+    async fn rewrite_current_snapshot_for_reclaim_tracked(
+        &self,
+        held_position_guards: Option<PositionRewriteGuards>,
+    ) -> Result<bool> {
+        self.rewrite_current_snapshot_tracked(held_position_guards, true)
+            .await
+    }
+
+    async fn rewrite_current_snapshot_tracked(
+        &self,
+        held_position_guards: Option<PositionRewriteGuards>,
+        reclaim: bool,
+    ) -> Result<bool> {
         let pass_start = Instant::now();
         let result = self
-            .rewrite_current_snapshot_for_compaction_holding(held_position_guards)
+            .rewrite_current_snapshot_holding_bounded(held_position_guards, reclaim)
             .await;
         let table = self.table_metadata.table_name.clone();
         let result_label = if result.is_ok() {
@@ -23444,6 +23478,17 @@ impl CayenneTableProvider {
             .await
     }
 
+    /// The full rewrite, never bounded as a reclaim (see
+    /// [`Self::rewrite_current_snapshot_holding_bounded`]).
+    #[cfg(test)]
+    async fn rewrite_current_snapshot_for_compaction_holding(
+        &self,
+        held_position_guards: Option<PositionRewriteGuards>,
+    ) -> Result<bool> {
+        self.rewrite_current_snapshot_holding_bounded(held_position_guards, false)
+            .await
+    }
+
     /// Consolidate the full visible row set into a single new current snapshot
     /// dir and atomically flip the current-snapshot pointer to it.
     ///
@@ -23459,9 +23504,14 @@ impl CayenneTableProvider {
     /// locks for the whole pass. `held_position_guards` is those two locks when
     /// the caller already holds them, and they are reused instead of acquired.
     /// Pass `None` unless this task holds both: `write_lock` is not reentrant.
-    async fn rewrite_current_snapshot_for_compaction_holding(
+    ///
+    /// `reclaim` marks the deletion-index reclaim of a position-delete table,
+    /// which an `auto` table bounds by size (see
+    /// [`Self::rewrite_current_snapshot_for_reclaim_tracked`]).
+    async fn rewrite_current_snapshot_holding_bounded(
         &self,
         held_position_guards: Option<PositionRewriteGuards>,
+        reclaim: bool,
     ) -> Result<bool> {
         // Committed/failed belong to the tracked wrapper; every non-committed
         // exit below reports itself, so the two together account for each pass
@@ -23497,8 +23547,8 @@ impl CayenneTableProvider {
         // the snapshot but before the drop is wiped while its row is already in
         // the new file — resurrecting it. `compaction_lock` (held here) and
         // `write_lock` (held by writers) are distinct, so writes DO interleave.
-        let uses_position_deletes =
-            self.position_rewrites_exclude_writers() || self.pk_deletion_strategy.is_position_based();
+        let uses_position_deletes = self.position_rewrites_exclude_writers()
+            || self.pk_deletion_strategy.is_position_based();
 
         // Position-delete tables: tombstones are file-scoped (a row position in a
         // named data file), not sequence-tagged, so they cannot be carried
@@ -23721,6 +23771,30 @@ impl CayenneTableProvider {
             )
         } else {
             let _capture_guard = self.write_lock_arc().lock_owned().await;
+            // A pipelined staged write reserves its sequences under `write_lock`
+            // (stage A) and publishes its rows and tombstones later without it
+            // (stage B). One that reserved before the cutoff below and published
+            // after it would land tombstones at or below that cutoff, which the
+            // commit then prunes, while the rows they hide sit in this rewrite's
+            // output. Holding `write_lock` blocks new stage A commits and stage B
+            // needs only the visibility lock and listing fence, so draining here
+            // leaves no write straddling the cutoff.
+            if !self
+                .drain_inflight_staged_writes(STAGED_WRITE_DRAIN_TIMEOUT)
+                .await
+            {
+                tracing::debug!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    "Aborting full rewrite: in-flight staged writes did not drain; will retry on the next trigger",
+                );
+                maintenance_metrics::track_compaction(
+                    table_name,
+                    CompactionKind::Full,
+                    CompactionOutcome::AbortedConcurrentChange,
+                );
+                return Ok(false);
+            }
             // Defense-in-depth for table replacement while this pass encodes.
             // Promotion is serialized by `compaction_lock`; overwrite/reopened
             // providers may still flip `current_snapshot_id` without moving the
@@ -23762,6 +23836,47 @@ impl CayenneTableProvider {
                 snapshot_id_before,
             )
         };
+
+        // An `auto` table on position deletes reclaims by rewriting itself whole
+        // only within its bound. The pass that scheduled this reclaim sized the
+        // table from the manifest, which can trail a just-published write, so size
+        // what this rewrite actually captured — the current snapshot and every
+        // protected snapshot it folds — before encoding any of it.
+        if reclaim
+            && let Some(auto) = self.pk_deletion_mode.auto()
+            && auto.uses_positions()
+        {
+            let folded = match &scope {
+                RewriteScope::Fenced { folded, .. }
+                | RewriteScope::AllTombstonesFoldedSnapshots { folded } => Some(folded),
+                RewriteScope::All => None,
+            };
+            let mut captured_bytes = 0_u64;
+            let mut sized = true;
+            for snapshot_id in
+                std::iter::once(&snapshot_id_before).chain(folded.into_iter().flatten())
+            {
+                let Ok(files) = self.list_snapshot_files_with_sizes(snapshot_id).await else {
+                    sized = false;
+                    break;
+                };
+                captured_bytes = files.iter().fold(captured_bytes, |total, (_, size)| {
+                    total.saturating_add(*size)
+                });
+            }
+            if !sized || !auto.fits(captured_bytes) {
+                drop(stream);
+                // The caller holds `compaction_lock`, as every caller of this
+                // rewrite does.
+                self.switch_auto_to_key_deletes("table outgrew position deletes");
+                maintenance_metrics::track_compaction(
+                    table_name,
+                    CompactionKind::Full,
+                    CompactionOutcome::DeclinedOverPassBudget,
+                );
+                return Ok(false);
+            }
+        }
 
         // Compaction is the file-count reduction path. Ordinary appends shard
         // across the session's target partitions for encode throughput, but a
@@ -24096,6 +24211,12 @@ impl CayenneTableProvider {
                     let cold_cap = self.cold_tombstone_prune_cap().await;
                     let prune_cutoff = cold_cap.map_or(*cutoff, |cap| (*cutoff).min(cap));
                     self.prune_deletion_caches_after_full_rewrite(prune_cutoff, folded);
+                    // The rewritten files are gone, and the rows any position delete
+                    // on them hid were left out of the new file; a scan planned
+                    // before this flip carries its own copy of each bitmap.
+                    self.retire_position_deletions_of(
+                        std::iter::once(&snapshot_id_before).chain(folded.iter()),
+                    );
                 }
             }
 
@@ -25571,8 +25692,10 @@ impl CayenneTableProvider {
         // physically applied to the merged output. Serialize those rewrites with
         // writers and staged visibility flips. Key-delete tables remain safe to
         // compact without the writer gate because post-fence deletes are carried
-        // by sequence number and still apply to the merged snapshot.
-        let serialize_position_deletes = self.should_capture_positions();
+        // by sequence number and still apply to the merged snapshot. So does a
+        // table `deletion_mode: auto` put on position deletes: each of its position
+        // deletes carries such a key tombstone (`position_rewrites_exclude_writers`).
+        let serialize_position_deletes = self.position_rewrites_exclude_writers();
         let _position_write_guard = if serialize_position_deletes {
             if let Ok(guard) = self.write_lock_arc().try_lock_owned() {
                 self.position_compaction_skip_streak.lock().reset();
@@ -25592,24 +25715,9 @@ impl CayenneTableProvider {
                     CompactionKind::ProtectedSubset,
                     CompactionOutcome::DeclinedWriterActive,
                 );
-                let starved = self.position_compaction_skip_streak.lock().record_denial();
-                if let Some(consecutive_skips) = starved
-                    && let Some(auto) = self.pk_deletion_mode.auto()
+                if let Some(consecutive_skips) =
+                    self.position_compaction_skip_streak.lock().record_denial()
                 {
-                    // A table `auto` put on position deletes whose writers never
-                    // leave room for its compaction has outgrown position deletes:
-                    // move it to key deletes, whose merges run alongside writers.
-                    if auto.request_switch_to_key() {
-                        tracing::debug!(
-                            target: "cayenne::compaction",
-                            table = self.table_metadata.table_name.as_str(),
-                            consecutive_skips,
-                            starved_for_secs = POSITION_COMPACTION_SKIP_WARN_AFTER.as_secs(),
-                            "deletion_mode auto: protected-snapshot compaction starved by writers; switching to key deletes on the next compaction trigger"
-                        );
-                        self.schedule_post_write_compaction();
-                    }
-                } else if let Some(consecutive_skips) = starved {
                     tracing::warn!(
                         target: "cayenne::compaction",
                         table = self.table_metadata.table_name.as_str(),
@@ -28609,6 +28717,26 @@ impl CayenneTableProvider {
             folded_protected = folded_protected_ids.len(),
             "Pruned deletion caches after sequence-fenced full rewrite"
         );
+    }
+
+    /// Drop the position deletes that target files of `snapshot_ids` — snapshots
+    /// a committed rewrite replaced, whose files no scan planned after it reads.
+    /// Left in place they would hide no row, but they would still mark the table's
+    /// file statistics inexact.
+    fn retire_position_deletions_of<'a>(&self, snapshot_ids: impl Iterator<Item = &'a String>) {
+        let cache = self.pk_deletion_strategy.position_cache();
+        if cache.load().is_empty() {
+            return;
+        }
+        let dirs: Vec<String> = snapshot_ids
+            .map(|snapshot_id| format!("/{}/{snapshot_id}/", self.table_metadata.table_id))
+            .collect();
+        cache.rcu(|current| {
+            let mut next = PositionBitmap::clone(current);
+            next.retain(|path, _| !dirs.iter().any(|dir| path.contains(dir.as_str())));
+            next
+        });
+        self.refresh_deletion_memory_accounting();
     }
 
     /// Highest commit sequence covered by the datalake (cold) manifest, when

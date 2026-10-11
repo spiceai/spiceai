@@ -95,6 +95,10 @@ impl PkDeletionMode {
 /// `deletion_mode: auto` on a primary-key table: position deletes while the table
 /// is small enough to rewrite whole, key deletes once it is not.
 ///
+/// While on position deletes, every rewrite of the table — the whole-table
+/// reclaim and the protected-snapshot merges — runs alongside writers, as on a
+/// key-delete table (see `CayenneTableProvider::position_rewrites_exclude_writers`).
+///
 /// The switch goes one way. A table that outgrows the bound stays on key deletes
 /// for the life of this provider; the next open sizes it again.
 #[derive(Debug)]

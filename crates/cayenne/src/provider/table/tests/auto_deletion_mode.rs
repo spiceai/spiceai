@@ -90,7 +90,7 @@ async fn write_incompressible(provider: &CayenneTableProvider, ids: &[i64]) {
         .iter()
         .map(|id| {
             // SplitMix64 of the key.
-            let mut z = (*id as u64).wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = id.cast_unsigned().wrapping_add(0x9E37_79B9_7F4A_7C15);
             z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
             z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
             i64::from_ne_bytes((z ^ (z >> 31)).to_ne_bytes())
@@ -156,10 +156,11 @@ async fn a_small_auto_table_uses_position_deletes_and_a_large_one_key_deletes() 
         .drain_in_flight_maintenance()
         .await
         .expect("quiesce before reopening");
-    let reopened = CayenneTableProviderBuilder::new(Arc::clone(&catalog), SessionContext::new().runtime_env())
-        .open("auto_reopened_large")
-        .await
-        .expect("reopen");
+    let reopened =
+        CayenneTableProviderBuilder::new(Arc::clone(&catalog), SessionContext::new().runtime_env())
+            .open("auto_reopened_large")
+            .await
+            .expect("reopen");
     assert!(
         !reopened.should_capture_positions(),
         "an auto table past its bound at open starts on key deletes"
@@ -241,9 +242,15 @@ async fn an_upsert_racing_an_auto_tables_rewrite_stays_superseded() {
     // against them.
     let racing = provider.clone_for_write();
     let race_ids = ids.clone();
+    let recorded = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let recorded_in_hook = Arc::clone(&recorded);
     *provider.test_pre_rewrite_commit_hook.lock() = Some(Box::new(move || {
         Box::pin(async move {
             write(&racing, &race_ids, 300).await;
+            recorded_in_hook.store(
+                position_deletes(&racing),
+                std::sync::atomic::Ordering::SeqCst,
+            );
         })
     }));
     {
@@ -256,9 +263,15 @@ async fn an_upsert_racing_an_auto_tables_rewrite_stays_superseded() {
             "the rewrite commits alongside the racing upsert"
         );
     }
-    assert!(
-        position_deletes(&provider) > 0,
-        "premise: the racing upsert recorded position deletes against the replaced files"
+    assert_eq!(
+        recorded.load(std::sync::atomic::Ordering::SeqCst),
+        u64::try_from(ids.len()).expect("small"),
+        "premise: the racing upsert recorded a position delete per key against the replaced files"
+    );
+    assert_eq!(
+        position_deletes(&provider),
+        0,
+        "the commit retires the position deletes of the files it replaced"
     );
 
     let ctx = SessionContext::new();
@@ -270,28 +283,62 @@ async fn an_upsert_racing_an_auto_tables_rewrite_stays_superseded() {
 }
 
 /// Past its bound, an auto table's reclaim moves it to key deletes instead of
-/// rewriting it whole; the seq-prefix bake reclaims from then on, and positions
-/// the read-back captured are forgotten, so no later upsert records a position
-/// delete.
+/// rewriting it whole. The switch forgets the positions the read-back captured,
+/// and the upsert path stops recording position deletes, so a later upsert of a
+/// key that was located records only a key tombstone; position deletes recorded
+/// before the switch keep applying.
 #[tokio::test]
 async fn an_auto_table_past_its_bound_switches_to_key_deletes() {
     let name = "auto_outgrown";
     // 1 MiB target file size: a 256 KiB bound.
     let (provider, catalog, _tmp) = table(name, DeletionMode::Auto, 1).await;
-    let ids: Vec<i64> = (0..8).collect();
-    write(&provider, &ids, 100).await;
+    // Keys 0..8 are upserted while the table is on position deletes; keys 8..16
+    // stay located, unupserted, until after the switch.
+    let upserted: Vec<i64> = (0..8).collect();
+    let located: Vec<i64> = (8..16).collect();
+    let seed: Vec<i64> = (0..16).collect();
+    write(&provider, &seed, 100).await;
     provider
         .rewrite_current_snapshot_for_compaction_tracked(None)
         .await
         .expect("fold the seed into the current snapshot");
     capture_positions(&provider).await;
-    write(&provider, &ids, 200).await;
+    write(&provider, &upserted, 200).await;
     let positions_before = position_deletes(&provider);
     assert!(
         positions_before > 0,
         "premise: the table recorded position deletes while within its bound"
     );
-    assert!(provider.should_capture_positions());
+    let located_positions = |provider: &CayenneTableProvider| -> usize {
+        let pk_indices = provider
+            .primary_key_indices()
+            .expect("pk indices")
+            .expect("primary key");
+        let converter = provider.build_pk_converter(&pk_indices).expect("converter");
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        let batch = id_value_batch(schema, &located, &vec![0; located.len()]);
+        let rows = converter
+            .convert_columns(&[Arc::clone(batch.column(0))])
+            .expect("convert keys");
+        let guard = provider.pk_keyset_cache.lock();
+        let Some(CachedPkIndex::Exact(keyset)) = guard.as_ref() else {
+            panic!("premise: an exact keyset tracks the located keys");
+        };
+        (0..rows.num_rows())
+            .filter(|row| {
+                let digest = pk_digest(&rows.row(*row).owned());
+                matches!(
+                    keyset.location_by_digest(digest),
+                    Some(RowLocation::FilePositioned { .. })
+                )
+            })
+            .count()
+    };
+    assert_eq!(
+        located_positions(&provider),
+        located.len(),
+        "premise: the unupserted keys are located"
+    );
 
     // Grow the table past its bound.
     let grow: Vec<i64> = (1_000..61_000).collect();
@@ -322,22 +369,15 @@ async fn an_auto_table_past_its_bound_switches_to_key_deletes() {
         !provider.should_capture_positions(),
         "the table is on key deletes now"
     );
-    {
-        let guard = provider.pk_keyset_cache.lock();
-        if let Some(CachedPkIndex::Exact(keyset)) = guard.as_ref() {
-            assert!(
-                keyset
-                    .locations()
-                    .all(|location| !matches!(location, RowLocation::FilePositioned { .. })),
-                "the switch forgets every captured position"
-            );
-            assert!(keyset.captured_files.is_empty());
-        }
-    }
+    assert_eq!(
+        located_positions(&provider),
+        0,
+        "the switch forgets every captured position"
+    );
 
-    // A later upsert records key deletes only; the position deletes from before
-    // the switch still apply.
-    write(&provider, &ids, 300).await;
+    // An upsert of the formerly located keys records key deletes only; the
+    // position deletes from before the switch still apply.
+    write(&provider, &located, 300).await;
     assert_eq!(
         position_deletes(&provider),
         positions_before,
@@ -345,13 +385,14 @@ async fn an_auto_table_past_its_bound_switches_to_key_deletes() {
     );
     let ctx = SessionContext::new();
     let rows = collect_id_value_pairs(&ctx, &provider, name).await;
-    assert_eq!(rows.len(), ids.len() + grow.len(), "one row per key");
-    let latest: Vec<(i64, i64)> = rows.iter().copied().filter(|(id, _)| *id < 8).collect();
-    assert_eq!(
-        latest,
-        ids.iter().map(|id| (*id, 300)).collect::<Vec<_>>(),
-        "every seed key shows its latest row"
-    );
+    assert_eq!(rows.len(), seed.len() + grow.len(), "one row per key");
+    let expected: Vec<(i64, i64)> = upserted
+        .iter()
+        .map(|id| (*id, 200))
+        .chain(located.iter().map(|id| (*id, 300)))
+        .collect();
+    let latest: Vec<(i64, i64)> = rows.iter().copied().filter(|(id, _)| *id < 16).collect();
+    assert_eq!(latest, expected, "every seed key shows its latest row");
 }
 
 /// A key repeated within one write is folded out of an auto table's files, as key
@@ -392,6 +433,131 @@ async fn an_auto_table_folds_a_key_repeated_within_one_write() {
             collect_id_value_pairs(&ctx, &provider, &name).await,
             vec![(0, 1), (1, 2), (2, 2), (3, 2)],
             "{mode:?}: the last copy of each key wins"
+        );
+    }
+}
+
+/// A pipelined staged upsert reserves its sequences under `write_lock` (stage A)
+/// and publishes its replacement rows and tombstones later, without it (stage B).
+/// A writer-concurrent full rewrite that captured its cutoff while such a write
+/// was staged would see neither the write's rows nor its tombstones, keep the
+/// superseded copies in its output, and then — the write's tombstones being at or
+/// below that cutoff once published — prune exactly the tombstones that hide
+/// them. Both key mode and `auto`'s position regime take that rewrite.
+#[tokio::test]
+async fn a_staged_upsert_straddling_a_fenced_rewrite_stays_superseded() {
+    for mode in [DeletionMode::Key, DeletionMode::Auto] {
+        let name = format!("straddled_rewrite_{}", mode.as_str());
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            &name,
+            ctx.runtime_env(),
+            VortexConfig {
+                deletion_mode: mode,
+                cdc_durability: crate::metadata::CdcDurability::File,
+                inline_max_rows: 0,
+                inline_max_bytes: 0,
+                inline_max_buffer_bytes: 0,
+                compaction_background_interval_ms: 3_600_000,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let ids: Vec<i64> = (0..8).collect();
+        write(&provider, &ids, 100).await;
+        provider
+            .rewrite_current_snapshot_for_compaction_tracked(None)
+            .await
+            .expect("fold the seed into the current snapshot");
+
+        // Stage A of an upsert of every key: sequences reserved, rows staged, the
+        // publish still to come.
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        let staged = provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(schema, &ids, &vec![300; ids.len()])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("stage the upsert");
+
+        // Stage B lands shortly after; the rewrite cannot commit before it has.
+        let (published_tx, published_rx) = tokio::sync::oneshot::channel::<()>();
+        let finisher = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            staged.finish().await.expect("publish the staged upsert");
+            published_tx.send(()).expect("report the publish");
+        });
+        *provider.test_pre_rewrite_commit_hook.lock() = Some(Box::new(move || {
+            Box::pin(async move {
+                published_rx.await.expect("the staged upsert publishes");
+            })
+        }));
+        {
+            let _pass = provider.compaction_lock.write().await;
+            provider
+                .rewrite_current_snapshot_for_compaction()
+                .await
+                .expect("rewrite");
+        }
+        finisher.await.expect("join the publish");
+
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, &name).await,
+            ids.iter().map(|id| (*id, 300)).collect::<Vec<_>>(),
+            "{mode:?}: every key has exactly its staged replacement after the rewrite"
+        );
+    }
+}
+
+/// Every entry in the deletion index, including insert-only ones.
+fn deletion_index_entries(provider: &CayenneTableProvider) -> usize {
+    match provider.pk_deletion_snapshot() {
+        PkDeletionSnapshot::Int64Pk { tombstones } => tombstones.len(),
+        PkDeletionSnapshot::RowConverterBased { tombstones } => tombstones.len(),
+        PkDeletionSnapshot::PositionBased => 0,
+    }
+}
+
+/// A writer-concurrent full rewrite reclaims an upsert's tombstone together with
+/// the re-insert marker recorded beside it: the rows both describe are in the
+/// rewritten file, and every later delete of the key is newer than the
+/// re-insertion, so the marker decides nothing. Left behind, such markers would
+/// accumulate one per key ever upserted, walked by every scan's tombstone
+/// pushdown and held in the index's memory reservation. Key mode's seq-prefix
+/// bake reclaims through the same prune.
+#[tokio::test]
+async fn a_reclaim_leaves_no_reinsert_marker_at_or_below_its_cutoff() {
+    for mode in [DeletionMode::Key, DeletionMode::Auto] {
+        let name = format!("reinsert_markers_{}", mode.as_str());
+        let (provider, _catalog, _tmp) = table(&name, mode, 256).await;
+        let ids: Vec<i64> = (0..100).collect();
+        write(&provider, &ids, 1).await;
+        write(&provider, &ids, 2).await;
+        assert_eq!(
+            deletion_index_entries(&provider),
+            ids.len(),
+            "{mode:?} premise: the upsert recorded a tombstone and re-insert marker per key"
+        );
+        {
+            let _pass = provider.compaction_lock.write().await;
+            assert!(
+                provider
+                    .rewrite_current_snapshot_for_compaction()
+                    .await
+                    .expect("rewrite"),
+                "{mode:?}: the rewrite commits"
+            );
+        }
+        assert_eq!(
+            deletion_index_entries(&provider),
+            0,
+            "{mode:?}: the rewrite reclaims the re-insert markers with the tombstones"
+        );
+        let ctx = SessionContext::new();
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, &name).await,
+            ids.iter().map(|id| (*id, 2)).collect::<Vec<_>>()
         );
     }
 }

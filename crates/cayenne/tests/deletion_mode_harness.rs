@@ -237,9 +237,8 @@ async fn deletion_mode_steady_state_harness() -> Result<(), Box<dyn std::error::
     };
     let catalog: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
     let ctx = SessionContext::new();
-    let table = Arc::new(
-        CayenneTableProvider::create_table(catalog, options, ctx.runtime_env()).await?,
-    );
+    let table =
+        Arc::new(CayenneTableProvider::create_table(catalog, options, ctx.runtime_env()).await?);
     ctx.register_table("t", Arc::clone(&table) as Arc<dyn TableProvider>)?;
 
     eprintln!(
@@ -331,9 +330,9 @@ async fn deletion_mode_steady_state_harness() -> Result<(), Box<dyn std::error::
                 next = end;
             }
             let dups = rows * dup_permille / 1000;
-            if dups > 0 {
+            if let Some(stride) = rows.checked_div(dups) {
                 // Spread the repeated keys over the whole key space.
-                let stride = (rows / dups).max(1);
+                let stride = stride.max(1);
                 let ids: Vec<i64> = (0..dups).map(|i| ((i * stride) % rows) as i64).collect();
                 batches.push(rows_batch(&schema, &ids, generation + 1_000));
             }
@@ -462,9 +461,8 @@ async fn deletion_mode_concurrent_harness() -> Result<(), Box<dyn std::error::Er
     };
     let catalog: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
     let ctx = SessionContext::new();
-    let table = Arc::new(
-        CayenneTableProvider::create_table(catalog, options, ctx.runtime_env()).await?,
-    );
+    let table =
+        Arc::new(CayenneTableProvider::create_table(catalog, options, ctx.runtime_env()).await?);
     table.spawn_background_compaction(Arc::new(tokio::sync::Semaphore::new(2)));
     ctx.register_table("t", Arc::clone(&table) as Arc<dyn TableProvider>)?;
     eprintln!(
@@ -525,6 +523,8 @@ async fn deletion_mode_concurrent_harness() -> Result<(), Box<dyn std::error::Er
         })
     };
 
+    let explain = env_usize("HARNESS_EXPLAIN", 0) == 1;
+    let midpoint = Instant::now() + Duration::from_secs(duration_s / 2);
     let reader = {
         let ctx = ctx.clone();
         tokio::spawn(async move {
@@ -533,7 +533,20 @@ async fn deletion_mode_concurrent_harness() -> Result<(), Box<dyn std::error::Er
             let mut filter = Vec::new();
             let mut point = Vec::new();
             let mut count = Vec::new();
+            let mut explained = !explain;
             while Instant::now() < deadline {
+                if !explained && Instant::now() >= midpoint {
+                    explained = true;
+                    let plan = run_query(
+                        &ctx,
+                        "EXPLAIN ANALYZE SELECT SUM(amount), SUM(qty), COUNT(payload) FROM t",
+                    )
+                    .await;
+                    eprintln!(
+                        "HARNESS_EXPLAIN mid\n{}",
+                        arrow::util::pretty::pretty_format_batches(&plan).expect("format plan")
+                    );
+                }
                 let start = Instant::now();
                 run_query(&ctx, "SELECT SUM(amount), SUM(qty), COUNT(payload) FROM t").await;
                 agg.push(start.elapsed().as_secs_f64() * 1e3);
