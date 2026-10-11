@@ -214,9 +214,10 @@ Nothing collects a finished run's objects, so `wal_test_driver --purge` deletes
 every object under an `s3://` prefix; it refuses a bare bucket.
 
 `.github/workflows/object_store_wal.yml` runs on the self-hosted pools,
-`spiceai-dev-runners` for Linux and `spiceai-macos` for macOS, for changes to
-this crate and in the merge queue, where an entry that touches none of its paths
-runs no leg. Every leg runs in parallel, each with the mandatory SlateDB oracle:
+`spiceai-dev-runners` for Linux and `spiceai-macos` for macOS. It runs for
+changes to this crate, its harness, the workflow, the workspace manifest and
+lockfile, or the toolchain, in pull requests and in the merge queue. Every leg
+runs in parallel, each with the mandatory SlateDB oracle:
 
 | Store | Linux | macOS |
 | --- | --- | --- |
@@ -232,7 +233,10 @@ macOS. spiceio fronts the CI NAS's SMB share through macOS CommonCrypto, so it
 has no Linux leg. It refuses conditional writes outside `SPICEIO_STRICT_PREFIXES`,
 so the leg sets one over its namespace, turns off write-back and the disk spill,
 and purges its objects at the end. spiceio keeps a permanent lock record for each
-key ever written under a strict prefix, so each run leaves those records in the
-share's `.spiceio-locks/`. The spiceio leg needs the `UNAS_SMB_PASS` secret and
-does not run without it. Both oracles are test dependencies. This qualifies the
+key ever written under a strict prefix, so each run leaves about a thousand
+records in the share's `.spiceio-locks/`, which nothing may remove. The spiceio
+leg therefore runs only for changes to this crate, its harness or the workflow,
+and when the workflow is dispatched by hand. Dependency-only changes run the
+other legs. The spiceio leg needs the `UNAS_SMB_PASS` secret and does not run
+without it. Both oracles are test dependencies. This qualifies the
 library path; it is not a Cayenne/runtime integration test.

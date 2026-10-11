@@ -23,19 +23,21 @@ jobs:
   plan:
     name: Plan WAL E2E legs
     runs-on: spiceai-dev-runners
-    # A checkout, a path filter and a script returning a literal.
-    timeout-minutes: 10
+    # A merge group's checkout takes the full history, sized for a cold runner
+    # cloning from scratch.
+    timeout-minutes: 45
     outputs:
       legs: ${{ steps.legs.outputs.result }}
     steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        if: github.event_name != 'workflow_dispatch'
+        with:
+          persist-credentials: false
+          # A pull request's merge commit and its base parent suffice for its diff.
+          fetch-depth: ${{ github.event_name == 'merge_group' && 0 || 2 }}
       # A merge group cannot be filtered by path, and every leg holds a
       # self-hosted runner, so a queue entry that touches none of the
       # pull_request paths above runs no leg. Keep the two lists equal.
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        if: github.event_name == 'merge_group'
-        with:
-          persist-credentials: false
-          fetch-depth: 0
       - name: Check the merge group for WAL changes
         id: changes
         if: github.event_name == 'merge_group'
@@ -49,11 +51,26 @@ jobs:
               - 'Cargo.toml'
               - 'Cargo.lock'
               - 'rust-toolchain.toml'
+      # spiceio keeps a lock record on the shared NAS for every key ever written
+      # under a strict prefix, and nothing may remove one, so every run of its leg
+      # leaves about a thousand behind. Most runs here come from dependency
+      # changes, which the MinIO and RustFS legs cover. The spiceio leg runs for
+      # changes to the WAL, its harness, or this workflow, which pins spiceio.
+      - name: Check for changes the spiceio leg covers
+        id: spiceio
+        if: github.event_name != 'workflow_dispatch'
+        env:
+          BASE: ${{ github.event_name == 'merge_group' && github.event.merge_group.base_sha || 'HEAD^1' }}
+        run: |
+          set -euo pipefail
+          changed=$(git diff --name-only "$BASE" HEAD -- crates/object_store_occ test/object_store_occ .github/workflows/object_store_wal.yml)
+          echo "relevant=$([ -n "$changed" ] && echo true || echo false)" >> "$GITHUB_OUTPUT"
       - name: Choose legs
         id: legs
         uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
         env:
           RELEVANT: ${{ github.event_name != 'merge_group' || steps.changes.outputs.relevant_changes == 'true' }}
+          SPICEIO_RELEVANT: ${{ github.event_name == 'workflow_dispatch' || steps.spiceio.outputs.relevant == 'true' }}
           HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
         with:
           script: |
@@ -74,6 +91,10 @@ jobs:
             if (process.env.RELEVANT !== 'true') {
               core.notice('This merge group changes nothing the WAL E2E suite covers, so no leg runs.');
               return [];
+            }
+            if (process.env.SPICEIO_RELEVANT !== 'true') {
+              core.notice('This change leaves the WAL crate, its harness and this workflow untouched, so the spiceio leg does not run. Dispatch the workflow to run it anyway.');
+              return legs.filter((leg) => leg.store !== 'spiceio');
             }
             if (process.env.HAS_SPICEIO_SECRET !== 'true') {
               core.warning('UNAS_SMB_PASS is not available to this run, so the spiceio leg does not run. It runs on branches of spiceai/spiceai and in the merge queue.');
