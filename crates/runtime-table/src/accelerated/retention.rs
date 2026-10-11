@@ -571,6 +571,38 @@ mod tests {
         .await;
     }
 
+    #[tokio::test]
+    async fn retention_sql_eviction_count_is_the_number_of_deleted_rows() {
+        let batch = create_test_data();
+        let schema = batch.schema();
+        let mem_table =
+            MemTable::try_new(schema, vec![vec![batch]]).expect("mem table should be created");
+        let accelerator = Arc::new(mem_table) as Arc<dyn TableProvider>;
+        let federated = Arc::new(FederatedTable::new_unchecked(Arc::clone(&accelerator)));
+        let delete_expr = runtime_datafusion::retention_sql::parse_retention_sql(
+            &TableReference::bare("test"),
+            "DELETE FROM test WHERE deleted = true",
+            accelerator.schema(),
+        )
+        .expect("parse retention SQL")
+        .delete_expr;
+
+        let deleted = apply_retention_filters_once(
+            &TableReference::bare("test"),
+            &accelerator,
+            &federated,
+            delete_expr,
+            &Handle::current(),
+        )
+        .await
+        .expect("retention delete");
+
+        assert_eq!(
+            deleted, 2,
+            "two fixture rows have deleted = true; the logged eviction count must be that number"
+        );
+    }
+
     #[test]
     fn test_strip_index_wrapper_layers_unwraps_all_known_layers() {
         use data_components::MetadataEnrichedTableProvider;
@@ -580,13 +612,14 @@ mod tests {
             MemTable::try_new(create_test_schema(), vec![]).expect("mem table should be created"),
         );
 
+        // Each case must yield the very provider the layers wrap — the one a
+        // retention DELETE executes against — not merely some `MemTable`.
+
         // An index layer alone.
         let wrapped: Arc<dyn TableProvider> =
             SpiceTable::over(Arc::new(IndexLayer::new()), Arc::clone(&mem_table));
         assert!(
-            strip_index_wrapper_layers(&wrapped)
-                .downcast_ref::<MemTable>()
-                .is_some(),
+            Arc::ptr_eq(&strip_index_wrapper_layers(&wrapped), &mem_table),
             "stripping an IndexLayer must yield the underlying MemTable"
         );
 
@@ -602,17 +635,17 @@ mod tests {
         let wrapped_with_metadata: Arc<dyn TableProvider> =
             SpiceTable::over(Arc::new(IndexLayer::new()), metadata_enriched);
         assert!(
-            strip_index_wrapper_layers(&wrapped_with_metadata)
-                .downcast_ref::<MemTable>()
-                .is_some(),
+            Arc::ptr_eq(
+                &strip_index_wrapper_layers(&wrapped_with_metadata),
+                &mem_table
+            ),
             "stripping must peel through a nested metadata layer"
         );
 
         // A provider with no wrapper layers is returned unchanged.
         assert!(
-            strip_index_wrapper_layers(&mem_table)
-                .downcast_ref::<MemTable>()
-                .is_some()
+            Arc::ptr_eq(&strip_index_wrapper_layers(&mem_table), &mem_table),
+            "a bare provider is its own retention target"
         );
     }
 }

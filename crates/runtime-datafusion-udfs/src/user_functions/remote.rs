@@ -2162,14 +2162,49 @@ mod tests {
         }
     }
 
+    /// `allowed_endpoint_ranges` holding `ranges`.
+    fn ranges_value(ranges: &[&str]) -> serde_json::Value {
+        serde_json::Value::Array(
+            ranges
+                .iter()
+                .map(|range| serde_json::Value::String((*range).to_string()))
+                .collect(),
+        )
+    }
+
+    /// [`sample_decl`] with `allowed_endpoint_ranges` set to `ranges`.
+    fn decl_with_ranges(from: &str, ranges: &[&str]) -> Function {
+        let mut decl = sample_decl(from);
+        decl.params
+            .insert(ALLOWED_ENDPOINT_RANGES_PARAM.into(), ranges_value(ranges));
+        decl
+    }
+
+    /// The endpoint policy `allowed_endpoint_ranges: ranges` parses to.
+    fn policy(ranges: &[&str]) -> EndpointAccessPolicy {
+        parse_endpoint_policy(Some(&ranges_value(ranges))).expect("endpoint ranges parse")
+    }
+
     #[test]
     fn endpoint_parse_allows_configured_non_public_range() {
-        let mut d = sample_decl("http://198.18.0.1:9000/udf");
-        d.params.insert(
-            ALLOWED_ENDPOINT_RANGES_PARAM.into(),
-            serde_json::Value::Array(vec![serde_json::Value::String("198.18.0.1/32".into())]),
+        let udf = build_scalar_udf(&decl_with_ranges(
+            "http://198.18.0.1:9000/udf",
+            &["198.18.0.1/32"],
+        ))
+        .expect("non-public endpoint allowed by explicit CIDR");
+        assert_eq!(udf.name(), "remote_fn");
+
+        // An IP-literal endpoint is never seen by the DNS filter, so this is its only gate:
+        // the /32 admits exactly that address and not the one beside it.
+        let err = build_scalar_udf(&decl_with_ranges(
+            "http://198.18.0.2:9000/udf",
+            &["198.18.0.1/32"],
+        ))
+        .expect_err("an address outside the configured /32 stays rejected");
+        assert!(
+            matches!(&err, RemoteBuildError::PrivateEndpoint { host } if host == "198.18.0.2"),
+            "{err:?}"
         );
-        build_scalar_udf(&d).expect("non-public endpoint allowed by explicit CIDR");
     }
 
     #[test]
@@ -2194,32 +2229,95 @@ mod tests {
 
     #[test]
     fn endpoint_parse_allows_private_with_allowed_range() {
-        let mut d = sample_decl("http://127.0.0.1:9000/udf");
-        d.params.insert(
-            ALLOWED_ENDPOINT_RANGES_PARAM.into(),
-            serde_json::Value::Array(vec![serde_json::Value::String("127.0.0.1/32".into())]),
-        );
-        build_scalar_udf(&d).expect("private endpoint allowed by explicit CIDR");
+        let udf = build_scalar_udf(&decl_with_ranges(
+            "http://127.0.0.1:9000/udf",
+            &["127.0.0.1/32"],
+        ))
+        .expect("private endpoint allowed by explicit CIDR");
+        assert_eq!(udf.name(), "remote_fn");
+
+        // Only that address: other loopback and private literals stay rejected.
+        for (from, rejected) in [
+            ("http://127.0.0.2:9000/udf", "127.0.0.2"),
+            ("http://10.0.0.1/udf", "10.0.0.1"),
+        ] {
+            let err = build_scalar_udf(&decl_with_ranges(from, &["127.0.0.1/32"]))
+                .expect_err("a private address outside the configured /32 stays rejected");
+            assert!(
+                matches!(&err, RemoteBuildError::PrivateEndpoint { host } if host == rejected),
+                "{from}: {err:?}"
+            );
+        }
     }
 
-    #[test]
-    fn endpoint_parse_allows_localhost_domain_with_allowed_range() {
-        let mut d = sample_decl("http://localhost:9000/udf");
-        d.params.insert(
-            ALLOWED_ENDPOINT_RANGES_PARAM.into(),
-            serde_json::Value::Array(vec![serde_json::Value::String("127.0.0.1/32".into())]),
-        );
-        build_scalar_udf(&d).expect("localhost endpoint allowed by explicit CIDR");
+    #[tokio::test]
+    async fn endpoint_parse_allows_localhost_domain_with_allowed_range() {
+        let udf = build_scalar_udf(&decl_with_ranges(
+            "http://localhost:9000/udf",
+            &["127.0.0.1/32"],
+        ))
+        .expect("localhost endpoint allowed by explicit CIDR");
+        assert_eq!(udf.name(), "remote_fn");
+
+        // Once a range is configured the build no longer checks the name — a range that does
+        // not cover loopback builds too — so the configured CIDR is enforced on what the name
+        // resolves to.
+        build_scalar_udf(&decl_with_ranges(
+            "http://localhost:9000/udf",
+            &["10.0.0.0/8"],
+        ))
+        .expect("the build defers a named host to the DNS filter");
+        let loopback = || {
+            Arc::new(StaticResolver {
+                addrs: vec!["127.0.0.1:0".parse().expect("valid socket address")],
+            })
+        };
+
+        let covering = EndpointFilteringResolver::with_inner(policy(&["127.0.0.1/32"]), loopback());
+        match covering
+            .resolve("localhost".parse().expect("valid dns name"))
+            .await
+        {
+            Ok(mut addrs) => {
+                assert_eq!(
+                    addrs.next().expect("one resolved address").ip(),
+                    "127.0.0.1".parse::<IpAddr>().expect("valid IP")
+                );
+                assert!(addrs.next().is_none(), "only the one resolved address");
+            }
+            Err(err) => panic!("127.0.0.1/32 must admit localhost's loopback address: {err}"),
+        }
+
+        let elsewhere = EndpointFilteringResolver::with_inner(policy(&["10.0.0.0/8"]), loopback());
+        match elsewhere
+            .resolve("localhost".parse().expect("valid dns name"))
+            .await
+        {
+            Ok(_) => panic!("10.0.0.0/8 must not admit localhost's loopback address"),
+            Err(err) => assert_eq!(
+                err.to_string(),
+                "remote UDF endpoint host 'localhost' resolved only to disallowed addresses, \
+                 including 127.0.0.1 (IPv4 non-public address); add a specific CIDR to \
+                 `allowed_endpoint_ranges` or set it to [\"*\"] only for trusted endpoints"
+            ),
+        }
     }
 
     #[test]
     fn endpoint_parse_allows_all_ranges_with_wildcard() {
-        let mut d = sample_decl("http://metadata.google.internal/computeMetadata/v1/");
-        d.params.insert(
-            ALLOWED_ENDPOINT_RANGES_PARAM.into(),
-            serde_json::Value::Array(vec![serde_json::Value::String("*".into())]),
-        );
-        build_scalar_udf(&d).expect("wildcard range allows all endpoints");
+        // `*` admits named hosts and IP literals alike, the cloud metadata address included.
+        for from in [
+            "http://metadata.google.internal/computeMetadata/v1/",
+            "http://169.254.169.254/latest/meta-data/",
+        ] {
+            let udf = build_scalar_udf(&decl_with_ranges(from, &["*"]))
+                .unwrap_or_else(|err| panic!("the wildcard range must allow {from}: {err}"));
+            assert_eq!(udf.name(), "remote_fn");
+        }
+        // It turns the gate off rather than listing a range, so no DNS filter is installed.
+        let wildcard = policy(&["*"]);
+        assert!(wildcard.allow_all, "{wildcard:?}");
+        assert!(wildcard.allowed_ranges.is_empty(), "{wildcard:?}");
     }
 
     #[test]

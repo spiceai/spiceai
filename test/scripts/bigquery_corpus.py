@@ -57,11 +57,21 @@ COHORT_CASES = {168, 169}
 # #14482); issue #14607 tracks restoring the pushdown through a truncating
 # rendering. The offline corpus test pins the same three counts.
 ROUNDING_CAST_PARTIAL = {33: 3, 124: 5, 147: 1}
+# The queries an aggregate's argument-list ORDER BY keeps from federating whole,
+# and the number of remote subtrees each one keeps. The unparser drops such an
+# ORDER BY and the BigQuery dialect does not render it, so every connector policy
+# keeps the ordered ARRAY_AGG or STRING_AGG local. The offline corpus test pins
+# the same four counts.
+ORDERED_AGGREGATE_PARTIAL = {85: 3, 86: 6, 87: 3, 226: 1}
 # Remote subtrees of those queries that never reach BigQuery against the empty
 # fixtures: a join whose build side is empty never polls its probe side. Query
 # 033's outer left join skips its two-subtree probe side; each cross join in
-# query 124 skips its probe subtree.
-EMPTY_BUILD_SKIPPED = {33: 2, 124: 3}
+# query 124 skips its probe subtree. In 085, 086 and 087 the local ordered
+# aggregate is the build side of the joins above it, so only its own subtree runs.
+EMPTY_BUILD_SKIPPED = {33: 2, 124: 3, 85: 2, 86: 5, 87: 2}
+# A local aggregate with an argument-list ORDER BY, as a physical plan displays
+# one. A remote subtree renders as BigQuery's own SQL, which has no such brackets.
+LOCAL_ORDERED_AGGREGATE = re.compile(r"AggregateExec: .*\) ORDER BY \[")
 # An Arrow integer type in a physical plan is always a locally evaluated cast: a
 # remote subtree renders as BigQuery's own SQL, which spells these INT64/BIGINT.
 LOCAL_INTEGER_CAST = re.compile(r"AS U?Int(?:8|16|32|64)\)")
@@ -181,7 +191,10 @@ def physical_schemas(index: int, explain: str, physical: str) -> list[str]:
 def check_plan(index: int, explain: str) -> None:
     physical = harness.physical_plan(explain)
     nodes = [(len(match[1]), match[2]) for match in PLAN_NODE.finditer(physical)]
-    expected = ROUNDING_CAST_PARTIAL.get(index, 0 if index in TABLE_FREE else 1)
+    expected = ROUNDING_CAST_PARTIAL.get(
+        index,
+        ORDERED_AGGREGATE_PARTIAL.get(index, 0 if index in TABLE_FREE else 1),
+    )
     if (
         not nodes
         or sum(name == "VirtualExecutionPlan" for _, name in nodes) != expected
@@ -210,6 +223,14 @@ def check_plan(index: int, explain: str) -> None:
         if not LOCAL_INTEGER_CAST.search(physical):
             raise harness.HarnessError(
                 f"Query {index:03}: rounding-cast case has no local integer cast left"
+            )
+        return
+    if index in ORDERED_AGGREGATE_PARTIAL:
+        # As above: the remote-node count pins the cost, and the ordered
+        # aggregate that forced it must still be evaluated locally.
+        if not LOCAL_ORDERED_AGGREGATE.search(physical):
+            raise harness.HarnessError(
+                f"Query {index:03}: ordered-aggregate case has no local ordered aggregate left"
             )
         return
     if nodes[-1][1] != "VirtualExecutionPlan" or [depth for depth, _ in nodes] != list(
@@ -417,12 +438,13 @@ def execute_case(
 
 def expected_execution_jobs(queries: list[tuple[int, str]]) -> int:
     """One job per executed remote subtree: one for each query with a table, one
-    more for each extra subtree a rounding cast splits a query into, less the
-    subtrees an empty join build side never runs."""
+    more for each extra subtree a rounding cast or an ordered aggregate splits a
+    query into, less the subtrees an empty join build side never runs."""
     return (
         len(queries)
         - len(TABLE_FREE)
         + sum(remotes - 1 for remotes in ROUNDING_CAST_PARTIAL.values())
+        + sum(remotes - 1 for remotes in ORDERED_AGGREGATE_PARTIAL.values())
         - sum(EMPTY_BUILD_SKIPPED.values())
     )
 

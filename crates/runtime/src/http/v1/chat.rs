@@ -111,7 +111,7 @@ pub static KEEP_ALIVE_INTERVAL: u64 = 30;
                 }
             })
         ))),
-        (status = 400, description = "The specified model is an evaluation model; use POST /v1/evaluate"),
+        (status = 400, description = "The specified model is a decision model; use POST /v1/decisions"),
         (status = 404, description = "The specified model was not found"),
         (status = 500, description = "An internal server error occurred while processing the chat completion", content((
             serde_json::Value = "application/json",
@@ -608,8 +608,8 @@ mod tests {
         assert_eq!(body_json["param"].as_str(), Some("model"), "{body_json}");
         let message = body_json["message"].as_str().expect("message");
         assert!(
-            message.contains("/v1/evaluate"),
-            "message should direct callers to /v1/evaluate: {message}"
+            message.contains("/v1/decisions"),
+            "message should direct callers to /v1/decisions: {message}"
         );
     }
 

@@ -539,37 +539,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_parse_sse_stream_partial_chunk() {
-        let body = "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\"";
-
-        let stream =
-            futures::stream::once(async move { Ok::<_, reqwest::Error>(bytes::Bytes::from(body)) });
-
-        let mut parsed_stream = Box::pin(parse_sse_stream(Box::pin(stream)));
-
-        let chunk = parsed_stream
-            .next()
-            .await
-            .expect("stream should yield one item");
-
-        chunk.expect_err("partial chunk should be an error");
-    }
-
-    #[tokio::test]
     async fn test_parse_sse_stream_invalid_chunk() {
-        let body = "data: {\"candidates\":[{\"content\":{\"role\":\"model\",\"parts\"\r\n\r\n";
+        // A terminated event whose payload is cut off mid-object, then a valid event.
+        let body = format!(
+            "data: {{\"candidates\":[{{\"content\":{{\"role\":\"model\",\"parts\"\r\n\r\n{}",
+            text_event("Hello")
+        );
 
-        let stream =
-            futures::stream::once(async move { Ok::<_, reqwest::Error>(bytes::Bytes::from(body)) });
+        let mut parsed_stream = Box::pin(parse_sse_stream(dribble(vec![body.as_bytes()])));
 
-        let mut parsed_stream = Box::pin(parse_sse_stream(Box::pin(stream)));
-
-        let chunk = parsed_stream
+        let error = parsed_stream
             .next()
             .await
-            .expect("stream should yield one item");
+            .expect("stream should yield one item")
+            .expect_err("chunk should be an error");
+        assert!(
+            matches!(
+                &error,
+                crate::error::Error::JsonError { source }
+                    if source.classify() == serde_json::error::Category::Eof
+            ),
+            "a terminated event with a truncated payload must be a JSON decode error, got: {error:?}"
+        );
 
-        chunk.expect_err("chunk should be an error");
+        // The bad event is reported once; the stream neither stops nor drops what follows it.
+        let second = parsed_stream
+            .next()
+            .await
+            .expect("the following event should still be yielded")
+            .expect("should parse successfully");
+        assert_eq!(text_of(&second), "Hello");
+        assert!(
+            parsed_stream.next().await.is_none(),
+            "the stream should end once the buffer is drained"
+        );
     }
 
     type ByteStream =

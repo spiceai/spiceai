@@ -1,0 +1,12 @@
+# chbench/sf1/postgres-cayenne[file].yaml on every PostgreSQL release line in
+# test/source_versions.json, on a runner that starts the source in Docker.
+# The HTAP gates compare Spice with the source after the CDC stream drains.
+tests:
+  htap:
+    spicepod_path: accelerated/postgres-cayenne[file].yaml
+    runner_type: spiceai-dev-large-runners
+    scale_factor: 1
+    duration: 1800
+    ready_wait: 60
+    rate: 5000
+    source_version: all

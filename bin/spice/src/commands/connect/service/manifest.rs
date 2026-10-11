@@ -1177,9 +1177,39 @@ mod tests {
         let dir = tempfile::tempdir().expect("create tempdir");
         let fake = FakeBackend::new(dir.path());
         let instance_dir = dir.path().join("edge-1");
-        manifest_for(&fake, &instance_dir)
+        let manifest = manifest_for(&fake, &instance_dir);
+
+        // A directory that never held a manifest.
+        manifest
             .remove(&PinnedConfigDir::unlocked(dir.path()))
-            .expect("idempotent removal");
+            .expect("removing a manifest that was never written is idempotent");
+
+        // A manifest that is removed is gone, and removing it again succeeds.
+        let config_dir = instance_dir.join(".spice");
+        let path = ServiceManifest::path_in(&config_dir);
+        manifest
+            .write(&PinnedConfigDir::unlocked(&config_dir))
+            .expect("write manifest");
+        assert!(path.is_file(), "{} was not written", path.display());
+
+        manifest
+            .remove(&PinnedConfigDir::unlocked(&config_dir))
+            .expect("remove the manifest");
+        assert!(!path.exists(), "{} survived its removal", path.display());
+        assert_eq!(
+            ServiceManifest::load(
+                &PinnedConfigDir::unlocked(&config_dir),
+                &instance_dir,
+                &fake
+            )
+            .expect("load after removal"),
+            None
+        );
+
+        manifest
+            .remove(&PinnedConfigDir::unlocked(&config_dir))
+            .expect("removing an already-removed manifest is idempotent");
+        assert!(!path.exists(), "{}", path.display());
     }
 
     #[cfg(unix)]

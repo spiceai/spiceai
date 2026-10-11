@@ -971,8 +971,16 @@ mod tests {
     #[test]
     fn test_parse_s3_url_style_invalid_value() {
         let params = HashMap::from([("url_style".to_string(), "invalid".to_string())]);
-        let _ = SpiceObjectStoreRegistry::parse_s3_url_style(&params)
+        let err = SpiceObjectStoreRegistry::parse_s3_url_style(&params)
             .expect_err("invalid url_style should error");
+        assert!(
+            matches!(
+                &err,
+                DataFusionError::Configuration(message)
+                    if message == "invalid is not a valid value for url_style"
+            ),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]

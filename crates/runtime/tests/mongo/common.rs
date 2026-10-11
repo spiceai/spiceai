@@ -17,8 +17,10 @@ limitations under the License.
 use std::{collections::HashMap, time::Duration};
 
 use bollard::secret::HealthConfig;
+#[cfg(any(feature = "duckdb", not(target_os = "windows")))]
+use spicepod::acceleration::RefreshMode;
 #[cfg(feature = "duckdb")]
-use spicepod::acceleration::{Mode, OnConflictBehavior, RefreshMode};
+use spicepod::acceleration::{Mode, OnConflictBehavior};
 #[cfg(feature = "duckdb")]
 use spicepod::component::dataset::OnSchemaChange;
 use spicepod::{
@@ -26,10 +28,11 @@ use spicepod::{
 };
 use tracing::instrument;
 
+use test_framework::source_versions::{Source, source_image};
+
 use crate::docker::{ContainerRunnerBuilder, RunningContainer};
 
 const MONGODB_ROOT_PASSWORD: &str = "integration-test-pw";
-const MONGODB_IMAGE: &str = "docker.io/library/mongo:latest";
 const MONGODB_DOCKER_CONTAINER: &str = "runtime-integration-test-mongo";
 const MONGODB_CONTAINER_START_TIMEOUT: Duration = Duration::from_mins(3);
 const MONGODB_HOST_PORT_READY_TIMEOUT: Duration = Duration::from_mins(1);
@@ -99,6 +102,41 @@ pub fn make_mongodb_widen_dataset(path: &str, name: &str, port: u16, duckdb_file
 
 #[cfg(feature = "duckdb")]
 pub fn make_mongodb_change_stream_dataset(path: &str, name: &str, port: u16) -> Dataset {
+    change_stream_dataset(
+        path,
+        name,
+        port,
+        Acceleration {
+            enabled: true,
+            engine: Some("duckdb".to_string()),
+            refresh_mode: Some(RefreshMode::Changes),
+            primary_key: Some("_id".to_string()),
+            on_conflict: HashMap::from([("_id".to_string(), OnConflictBehavior::Upsert)]),
+            ..Default::default()
+        },
+    )
+}
+
+/// A Change Streams dataset on Cayenne keyed by `_id` alone: Cayenne keeps one row
+/// per primary key without `on_conflict`.
+#[cfg(not(target_os = "windows"))]
+pub fn make_mongodb_cayenne_change_stream_dataset(path: &str, name: &str, port: u16) -> Dataset {
+    change_stream_dataset(
+        path,
+        name,
+        port,
+        Acceleration {
+            enabled: true,
+            engine: Some("cayenne".to_string()),
+            refresh_mode: Some(RefreshMode::Changes),
+            primary_key: Some("_id".to_string()),
+            ..Default::default()
+        },
+    )
+}
+
+#[cfg(any(feature = "duckdb", not(target_os = "windows")))]
+fn change_stream_dataset(path: &str, name: &str, port: u16, acceleration: Acceleration) -> Dataset {
     let mut dataset = Dataset::new(format!("mongodb:{path}"), name.to_string());
     let connection_string =
         format!("mongodb://localhost:{port}/testdb?directConnection=true&replicaSet=rs0&tls=false");
@@ -115,14 +153,7 @@ pub fn make_mongodb_change_stream_dataset(path: &str, name: &str, port: u16) -> 
         ("change_stream_batch_size".to_string(), "10".to_string()),
     ]);
     dataset.params = Some(DatasetParams::from_string_map(params));
-    dataset.acceleration = Some(Acceleration {
-        enabled: true,
-        engine: Some("duckdb".to_string()),
-        refresh_mode: Some(RefreshMode::Changes),
-        primary_key: Some("_id".to_string()),
-        on_conflict: HashMap::from([("_id".to_string(), OnConflictBehavior::Upsert)]),
-        ..Default::default()
-    });
+    dataset.acceleration = Some(acceleration);
     dataset
 }
 
@@ -161,7 +192,7 @@ pub fn make_mongodb_change_stream_dataset_inferred(path: &str, name: &str, port:
 #[instrument]
 pub async fn start_mongodb_docker_container() -> Result<RunningContainer, anyhow::Error> {
     let running_container = ContainerRunnerBuilder::new(MONGODB_DOCKER_CONTAINER)
-        .image(MONGODB_IMAGE.to_string())
+        .image(source_image(Source::MongoDb)?)
         .publish_port(27017)
         .add_env_var("MONGO_INITDB_ROOT_USERNAME", "root")
         .add_env_var("MONGO_INITDB_ROOT_PASSWORD", MONGODB_ROOT_PASSWORD)
@@ -193,7 +224,7 @@ pub async fn start_mongodb_docker_container() -> Result<RunningContainer, anyhow
 pub async fn start_mongodb_replica_set_docker_container() -> Result<RunningContainer, anyhow::Error>
 {
     let running_container = ContainerRunnerBuilder::new(&format!("{MONGODB_DOCKER_CONTAINER}-rs"))
-        .image(MONGODB_IMAGE.to_string())
+        .image(source_image(Source::MongoDb)?)
         .publish_port(27017)
         .command(["mongod", "--replSet", "rs0", "--bind_ip_all"])
         .healthcheck(HealthConfig {

@@ -596,17 +596,19 @@ mod test {
         let accelerator_engine_registry = runtime.accelerator_engine_registry();
         let df = create_test_datafusion(accelerator_engine_registry);
 
-        let dataset = DatasetBuilder::try_new("spice.ai".to_string(), "foo.dataset_name")
+        let mut dataset = DatasetBuilder::try_new("spice.ai".to_string(), "foo.dataset_name")
             .expect("Failed to create builder")
             .with_app(Arc::new(app))
             .with_runtime(Arc::new(runtime))
             .build()
             .expect("Failed to build dataset");
+        // Monitoring is opt-in: only a dataset with an interval is registered.
+        dataset.check_availability_interval = Some(Duration::from_secs(60));
         let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int64, false)]));
-        let table_provider =
-            MemTable::try_new(schema, vec![vec![]]).expect("to create table provider");
+        let table_provider: Arc<dyn TableProvider> =
+            Arc::new(MemTable::try_new(schema, vec![vec![]]).expect("to create table provider"));
         df.ctx
-            .register_table(dataset.name.clone(), Arc::new(table_provider))
+            .register_table(dataset.name.clone(), Arc::clone(&table_provider))
             .expect("to register table provider");
 
         let monitor = DatasetsHealthMonitor::new(Arc::clone(&df));
@@ -615,8 +617,26 @@ mod test {
             .register_dataset(&dataset)
             .await
             .expect("should register dataset");
+        {
+            let monitored = monitor.monitored_datasets.lock().await;
+            assert_eq!(monitored.len(), 1, "exactly the one dataset is monitored");
+            let info = monitored
+                .get("foo.dataset_name")
+                .expect("the dataset is monitored under its qualified name");
+            assert_eq!(info.name, "foo.dataset_name");
+            assert_eq!(info.table_ref, dataset.name);
+            assert_eq!(info.interval, Duration::from_secs(60));
+            assert!(
+                Arc::ptr_eq(&info.table_provider, &table_provider),
+                "the monitor must probe the table registered for the dataset"
+            );
+        }
 
         monitor.deregister_dataset(&dataset.name.to_string()).await;
+        assert!(
+            monitor.monitored_datasets.lock().await.is_empty(),
+            "deregistering must stop monitoring the dataset"
+        );
     }
 
     fn test_availability_info(table_ref: &TableReference) -> DatasetAvailabilityInfo {

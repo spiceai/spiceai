@@ -2465,6 +2465,8 @@ pub mod cayenne {
         pub file_statistics_rows: u64,
         /// Re-insert records held in the metastore.
         pub insert_records: u64,
+        /// Registered persisted secondary-index runs.
+        pub index_run_rows: u64,
         /// Inline (level-0) data entries not yet checkpointed to Vortex files.
         pub inlined_entries: u64,
         /// Rows held in those inline entries.
@@ -2598,6 +2600,7 @@ pub mod cayenne {
             ("cayenne_snapshot_sequence", storage.snapshot_sequences),
             ("cayenne_delete_file", storage.delete_files),
             ("cayenne_insert_record", storage.insert_records),
+            ("cayenne_index_run", storage.index_run_rows),
             ("cayenne_inlined_data", storage.inlined_entries),
             ("cayenne_inlined_delete", storage.inlined_delete_entries),
             ("cayenne_cold_tier_file", storage.cold_files),
@@ -2668,6 +2671,10 @@ pub mod cayenne {
         pub staging_files: u64,
         /// Bytes under `_staging/`.
         pub staging_bytes: u64,
+        /// Persisted secondary index files (under `_lookup_index/`).
+        pub lookup_index_files: u64,
+        /// Bytes of the persisted secondary index files.
+        pub lookup_index_bytes: u64,
         /// Everything else (write-ahead logs, temporary files).
         pub other_files: u64,
         /// Bytes of everything else.
@@ -2685,13 +2692,13 @@ pub mod cayenne {
 
     /// Publishes one table's measured data-directory usage. `dimensions` carries
     /// `table`; a `kind` label (`data` / `deletion_vector` / `staging` /
-    /// `other`) splits files and bytes by file role.
+    /// `lookup_index` / `other`) splits files and bytes by file role.
     pub fn track_data_dir_usage(usage: &CayenneDataDirUsage, dimensions: &[KeyValue]) {
         let files = DATA_DIR_FILES.get_or_init(|| {
             operational_meter()
                 .u64_gauge("cayenne_data_dir_files")
                 .with_description(
-                    "Files present in a Cayenne table's data directory by role (`data`, `deletion_vector`, `staging`, `other`), measured by walking the directory rather than reading the manifest.",
+                    "Files present in a Cayenne table's data directory by role (`data`, `deletion_vector`, `staging`, `lookup_index`, `other`), measured by walking the directory rather than reading the manifest.",
                 )
                 .with_unit("files")
                 .build()
@@ -2714,6 +2721,11 @@ pub mod cayenne {
                 usage.deletion_vector_bytes,
             ),
             ("staging", usage.staging_files, usage.staging_bytes),
+            (
+                "lookup_index",
+                usage.lookup_index_files,
+                usage.lookup_index_bytes,
+            ),
             ("other", usage.other_files, usage.other_bytes),
         ] {
             let d = with_label(dimensions, "kind", kind);

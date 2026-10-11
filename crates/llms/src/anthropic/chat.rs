@@ -312,6 +312,10 @@ impl TryFrom<ChatCompletionRequestMessage> for MessageParam {
     }
 }
 
+fn non_empty_text_block(text: String) -> Option<ContentBlock> {
+    (!text.is_empty()).then(|| ContentBlock::Text(TextBlockParam::new(text)))
+}
+
 fn assistant_messages_to_content_blocks(
     msg: ChatCompletionRequestAssistantMessage,
 ) -> Result<MessageParam, OpenAIError> {
@@ -321,19 +325,20 @@ fn assistant_messages_to_content_blocks(
         ..
     } = msg;
 
+    // Anthropic rejects empty text blocks. OpenAI clients send `content: ""` alongside `tool_calls`.
     let mut content_blocks: Vec<ContentBlock> = match content {
         Some(ChatCompletionRequestAssistantMessageContent::Text(text)) => {
-            vec![ContentBlock::Text(TextBlockParam::new(text))]
+            non_empty_text_block(text).into_iter().collect()
         }
         Some(ChatCompletionRequestAssistantMessageContent::Array(parts)) => parts
             .iter()
-            .map(|p| match p {
+            .filter_map(|p| match p {
                 ChatCompletionRequestAssistantMessageContentPart::Text(
                     ChatCompletionRequestMessageContentPartText { text },
-                ) => Ok(ContentBlock::Text(TextBlockParam::new(text.clone()))),
-                ChatCompletionRequestAssistantMessageContentPart::Refusal(_) => Err(
+                ) => non_empty_text_block(text.clone()).map(Ok),
+                ChatCompletionRequestAssistantMessageContentPart::Refusal(_) => Some(Err(
                     OpenAIError::InvalidArgument("Refusal not supported".to_string()),
-                ),
+                )),
             })
             .collect::<Result<Vec<_>, OpenAIError>>()?,
         None => vec![],
@@ -594,6 +599,28 @@ mod tests {
     use async_openai::types::chat::{
         ChatCompletionRequestUserMessageArgs, CreateChatCompletionRequest,
     };
+
+    #[test]
+    fn assistant_tool_call_with_empty_content_has_no_text_block() {
+        for content in [json!(""), json!([{ "type": "text", "text": "" }])] {
+            let msg: ChatCompletionRequestMessage = serde_json::from_value(json!({
+                "role": "assistant",
+                "content": content,
+                "tool_calls": [{
+                    "id": "call_1",
+                    "type": "function",
+                    "function": { "name": "sql", "arguments": "{}" }
+                }]
+            }))
+            .expect("assistant message should deserialize");
+
+            let param = MessageParam::try_from(msg).expect("message should convert");
+            let value = serde_json::to_value(&param).expect("message should serialize");
+            let blocks = value["content"].as_array().expect("content is an array");
+            assert_eq!(blocks.len(), 1, "content: {content}");
+            assert_eq!(blocks[0]["type"], "tool_use");
+        }
+    }
 
     #[test]
     fn prompt_cache_key_enables_automatic_cache_control() {

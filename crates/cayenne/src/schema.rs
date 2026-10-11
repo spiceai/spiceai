@@ -648,8 +648,22 @@ mod tests {
             DataType::Duration(TimeUnit::Second),
             false,
         )]);
-        transform_schema_for_vortex(&schema, UnsupportedTypeAction::Error)
+        let err = transform_schema_for_vortex(&schema, UnsupportedTypeAction::Error)
             .expect_err("Duration should be unsupported");
+        // The message a user sees names the column and its type, and the setting that
+        // converts it instead.
+        assert!(
+            matches!(
+                &err,
+                datafusion::error::DataFusionError::Execution(message) if message
+                    == "Unsupported data type(s) in schema: 'd' (type: Duration(Second)). By \
+                        default, unsupported types cause an error. To convert top-level \
+                        unsupported columns to strings, set 'unsupported_type_action: string'; \
+                        nested unsupported types must be removed or rewritten to preserve data \
+                        correctness."
+            ),
+            "{err:?}"
+        );
     }
 
     #[test]

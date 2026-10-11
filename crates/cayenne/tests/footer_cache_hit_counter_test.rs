@@ -32,13 +32,13 @@ limitations under the License.
 //! cache is full: the live entries and the bytes they hold are then constant, so
 //! anything that grows is held outside the accounting.
 //!
-//! It is its own integration binary because it installs a global allocator, and
-//! it is one test because the counter is process-wide.
+//! This module uses the `isolated` binary's global allocator. The process guard
+//! keeps each measurement in a process of its own.
 
-use std::alloc::{GlobalAlloc, Layout, System};
+use crate::common;
+use crate::live_bytes;
 use std::any::Any;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use chrono::{DateTime, Utc};
 use datafusion_common::HashMap;
@@ -47,45 +47,6 @@ use datafusion_execution::cache::cache_manager::{CachedFileMetadataEntry, FileMe
 use datafusion_execution::runtime_env::RuntimeEnvBuilder;
 use object_store::ObjectMeta;
 use object_store::path::Path;
-
-struct CountingAllocator;
-
-static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
-
-// SAFETY: delegates every call to `System` and only adds bookkeeping.
-unsafe impl GlobalAlloc for CountingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        // SAFETY: forwarded unchanged.
-        let ptr = unsafe { System.alloc(layout) };
-        if !ptr.is_null() {
-            LIVE_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
-        }
-        ptr
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
-        // SAFETY: forwarded unchanged.
-        unsafe { System.dealloc(ptr, layout) };
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        // SAFETY: forwarded unchanged.
-        let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
-        if !new_ptr.is_null() {
-            LIVE_BYTES.fetch_add(new_size, Ordering::Relaxed);
-            LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
-        }
-        new_ptr
-    }
-}
-
-#[global_allocator]
-static ALLOC: CountingAllocator = CountingAllocator;
-
-fn live_bytes() -> usize {
-    LIVE_BYTES.load(Ordering::Relaxed)
-}
 
 /// What one cached footer reports to the cache. Its real allocation is tiny, so
 /// the measurement is of the cache's own bookkeeping rather than of footers.
@@ -148,6 +109,9 @@ fn read_footer(cache: &dyn Cache<Path, CachedFileMetadataEntry>, n: usize) {
 
 #[test]
 fn an_evicted_footer_leaves_no_hit_counter_behind() {
+    common::require_process_per_test(
+        "this test measures the process's live heap through a counting global allocator",
+    );
     // The runtime builds its environment this way, with
     // `runtime.query.metadata_cache_limit` when one is set.
     let runtime_env = RuntimeEnvBuilder::default()

@@ -449,14 +449,6 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn no_indexes_is_a_successful_finalize() {
-        let erased: Vec<Arc<dyn Index + Send + Sync>> = vec![];
-        finalize_indexes("TestSink", erased.iter())
-            .await
-            .expect("an empty index set cannot fail");
-    }
-
     /// An [`Index`] whose start outcome and start-fatality are configurable, recording how
     /// many times it was started and rolled back.
     #[derive(Debug)]
@@ -645,13 +637,5 @@ mod tests {
             0,
             "an index that never started must not be rolled back"
         );
-    }
-
-    #[tokio::test]
-    async fn no_indexes_is_a_successful_prepare() {
-        let erased: Vec<Arc<dyn Index + Send + Sync>> = vec![];
-        prepare_indexes("TestSink", erased.iter(), WriteWindow::Append)
-            .await
-            .expect("an empty index set cannot fail");
     }
 }

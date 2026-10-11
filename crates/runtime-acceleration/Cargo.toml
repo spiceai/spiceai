@@ -62,6 +62,9 @@ util = { path = "../util", features = ["datafusion"] }
 utoipa = { workspace = true, optional = true }
 uuid = { version = "1", features = ["v7"] }
 
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
 [features]
 default = []
 duckdb = ["dep:duckdb"]

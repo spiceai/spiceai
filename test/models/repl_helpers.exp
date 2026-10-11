@@ -10,6 +10,17 @@
 #
 # Every `expect` block in these scripts therefore needs an `eof` branch calling
 # `repl_died`, and every `send` goes through `repl_send`.
+#
+# A block waiting on a REPL response additionally needs a branch that consumes
+# the lines arriving before the terminator and `exp_continue`s, so the bound
+# below measures silence rather than total response time (#13711). That branch
+# must consume whole lines only: `expect` removes everything up to and including
+# a match, so a catch-all like `-re {.+}` will eat a terminator that arrived
+# split across two reads — `"…text\nch"` then `"at> "` — and then wait for a
+# prompt that has already gone by. Whole lines are also what separates the
+# REPL's output from its own spinner: the spinner redraws with a bare carriage
+# return and never writes a newline, so it does not count as progress and a
+# request that hangs behind a spinner still trips the bound.
 
 # Renders text passed to `repl_send` for a diagnostic message.
 proc repl_render {text} {
@@ -85,21 +96,53 @@ proc repl_endpoint_args {} {
     return [list]
 }
 
-# Seconds to wait for a REPL response. `SPICE_CHAT_EXPECT_TIMEOUT` overrides
-# `default` when set to a positive integer so CI or a local run can raise the
-# budget without editing the script.
-proc repl_timeout_seconds {default} {
-    if {![info exists ::env(SPICE_CHAT_EXPECT_TIMEOUT)] || $::env(SPICE_CHAT_EXPECT_TIMEOUT) eq ""} {
-        return $default
+# How many seconds of silence from a REPL count as a stall.
+#
+# A fixed bound on a whole response is not a property of a working runtime:
+# answer length is nondeterministic, a search's latency depends on the embedding
+# model behind it, and the self-hosted macOS pool is contended, so a REPL that
+# was still producing output tripped the bound and the failure ejected unrelated
+# PRs from the merge queue (#13711). Bounding silence instead measures something
+# the runtime controls — it has either produced output recently or it has
+# stopped. The guard against a genuinely wedged runtime stays the job's own
+# `timeout-minutes`.
+#
+# Progress is counted per line, because the prompt that ends a response carries
+# no newline (see the header). A chat answer streams its tokens without newlines
+# until the model emits one, so the default is sized for the longest paragraph a
+# CI model emits at its slowest rate, with room to spare: it is a stall bound,
+# not a latency target.
+#
+# SPICE_REPL_IDLE_TIMEOUT overrides the bound so expect_test.sh can exercise the
+# stall path without waiting the production value, and so a run against a slower
+# host can widen it without editing the scripts.
+proc repl_idle_timeout {} {
+    if {![info exists ::env(SPICE_REPL_IDLE_TIMEOUT)] || $::env(SPICE_REPL_IDLE_TIMEOUT) eq ""} {
+        return 90
     }
 
-    set raw [string trim $::env(SPICE_CHAT_EXPECT_TIMEOUT)]
-    if {![string is integer -strict $raw] || $raw < 1} {
-        send_user "SPICE_CHAT_EXPECT_TIMEOUT must be a positive integer (seconds); got \"$raw\"\n"
+    # A bound that cannot be read is not a bound. Reject it here rather than
+    # letting the next `expect` call reject it, where the message names a line in
+    # one of these scripts instead of the variable that was set wrong.
+    set override [string trim $::env(SPICE_REPL_IDLE_TIMEOUT)]
+    if {![string is integer -strict $override] || $override <= 0} {
+        send_user "SPICE_REPL_IDLE_TIMEOUT must be a positive whole number of seconds, got \"$override\".\n"
         exit 1
     }
 
-    return $raw
+    return $override
+}
+
+# Reports a REPL that stopped producing output, then fails the script. `context`
+# says what the script was waiting for.
+#
+# Says which of the two things happened, because the reader of a red merge-queue
+# check otherwise has to decide between "the runtime hung" and "the runner was
+# slow" with no evidence either way. This bound only fires on the former.
+proc repl_stalled {context} {
+    send_user "\n$context: no output from the REPL for [repl_idle_timeout]s.\n"
+    send_user "The wait is bounded on silence, not on total response time, so the REPL had stopped producing output rather than being slow to finish.\n"
+    exit 1
 }
 
 # Fails the script if the spawned process has exited. Writing to the pty of an

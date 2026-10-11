@@ -27,6 +27,7 @@ pub use format::VortexFormat;
 pub use format::VortexFormatFactory;
 pub use format::VortexTableOptions;
 pub use format::WriteShardConfig;
+pub use format::bounds_account_for_nan;
 pub use segment_cache::{
     install_process_segment_cache, process_segment_cache_capacity_bytes,
     register_segment_cache_metrics,

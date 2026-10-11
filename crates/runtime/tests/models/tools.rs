@@ -19,7 +19,8 @@ mod mcp {
     use crate::models::{http_get, sort_json_keys};
     use crate::utils::init_tracing_with_task_history;
     use crate::utils::runtime_ready_check;
-    use app::AppBuilder;
+    use app::{App, AppBuilder};
+    use futures::TryStreamExt;
     use http::{
         HeaderMap, HeaderValue,
         header::{ACCEPT, CONTENT_TYPE, HOST},
@@ -35,6 +36,19 @@ mod mcp {
 
     /// A fixed test API key used when the runtime has auth enabled.
     const TEST_API_KEY: &str = "test-mcp-integration-key";
+
+    /// A read-only API key, configured next to the read-write [`TEST_API_KEY`] by
+    /// [`start_spiced_with_memory_dataset`].
+    const TEST_READ_ONLY_API_KEY: &str = "test-mcp-read-only-key";
+
+    /// The writable `memory:store` dataset that the write-access tests write to.
+    const MEMORY_DATASET: &str = "memories";
+
+    /// The `sql` tool's error for an INSERT by a read-only API key.
+    const READ_ONLY_SQL_REJECTION: &str = "Query execution failed: External error: Failed to execute query: Error during planning: Insert Into operations are not allowed in read-only SQL context.";
+
+    /// The `store_memory` tool's error for a read-only API key.
+    const READ_ONLY_STORE_MEMORY_REJECTION: &str = "Failed to store memories: the API key on this request does not allow write access. Retry with a read-write API key (a `runtime.auth.api-key.keys` entry ending in `:rw`). See https://spiceai.org/docs/api/auth";
 
     /// Test that spiced can run a stdio MCP server.
     #[tokio::test]
@@ -188,11 +202,22 @@ params:
         headers: &[(&str, &str)],
         body: &Value,
     ) -> anyhow::Result<reqwest::Response> {
+        post_mcp_as(client, http_server_url, TEST_API_KEY, headers, body).await
+    }
+
+    /// [`post_mcp`] authenticated with `api_key` instead of [`TEST_API_KEY`].
+    async fn post_mcp_as(
+        client: &reqwest::Client,
+        http_server_url: &str,
+        api_key: &str,
+        headers: &[(&str, &str)],
+        body: &Value,
+    ) -> anyhow::Result<reqwest::Response> {
         let mut req = client
             .post(format!("{http_server_url}/v1/mcp"))
             .header(ACCEPT, "application/json, text/event-stream")
             .header(CONTENT_TYPE, "application/json")
-            .header("X-API-Key", TEST_API_KEY);
+            .header("X-API-Key", api_key);
         for (name, value) in headers {
             req = req.header(*name, *value);
         }
@@ -624,6 +649,176 @@ params:
         Ok(())
     }
 
+    /// `tools/call` runs as the API key on the request, as `/v1/sql` does: a
+    /// read-only key is refused the `sql` INSERT and `store_memory` writes but can
+    /// still read, and a read-write key's writes land.
+    ///
+    /// rmcp runs the tool on a worker task, outside the HTTP request's scope. If
+    /// the authenticated principal does not reach that task, the call looks
+    /// unauthenticated and a read-only key can write.
+    #[tokio::test]
+    async fn test_mcp_tools_call_enforces_api_key_write_access() -> Result<(), anyhow::Error> {
+        let (http_server_url, rt) = start_spiced_with_memory_dataset().await?;
+        let client = reqwest::Client::new();
+
+        let denied = call_tool_modern(
+            &client,
+            &http_server_url,
+            TEST_READ_ONLY_API_KEY,
+            1,
+            "sql",
+            serde_json::json!({ "query": insert_memory_sql("sql insert by read-only key") }),
+        )
+        .await?;
+        assert_read_only_rejection(&denied, READ_ONLY_SQL_REJECTION);
+
+        let denied = call_tool_modern(
+            &client,
+            &http_server_url,
+            TEST_READ_ONLY_API_KEY,
+            2,
+            "store_memory",
+            serde_json::json!({ "thoughts": ["store_memory by read-only key"] }),
+        )
+        .await?;
+        assert_read_only_rejection(&denied, READ_ONLY_STORE_MEMORY_REJECTION);
+
+        assert_eq!(
+            memory_values(&rt).await?,
+            Vec::<String>::new(),
+            "a read-only key's MCP writes must not land"
+        );
+
+        let inserted = call_tool_modern(
+            &client,
+            &http_server_url,
+            TEST_API_KEY,
+            3,
+            "sql",
+            serde_json::json!({ "query": insert_memory_sql("sql insert by read-write key") }),
+        )
+        .await?;
+        assert_eq!(
+            sql_tool_rows(&inserted)?,
+            serde_json::json!([{ "count": 1 }])
+        );
+
+        let stored = call_tool_modern(
+            &client,
+            &http_server_url,
+            TEST_API_KEY,
+            4,
+            "store_memory",
+            serde_json::json!({ "thoughts": ["store_memory by read-write key"] }),
+        )
+        .await?;
+        assert_eq!(tool_result_text(&stored)?, "null");
+
+        assert_eq!(
+            memory_values(&rt).await?,
+            vec![
+                "sql insert by read-write key".to_string(),
+                "store_memory by read-write key".to_string(),
+            ],
+            "a read-write key's MCP writes must land"
+        );
+
+        let read = call_tool_modern(
+            &client,
+            &http_server_url,
+            TEST_READ_ONLY_API_KEY,
+            5,
+            "sql",
+            serde_json::json!({
+                "query": format!("SELECT value FROM {MEMORY_DATASET} ORDER BY value")
+            }),
+        )
+        .await?;
+        assert_eq!(
+            sql_tool_rows(&read)?,
+            serde_json::json!([
+                { "value": "sql insert by read-write key" },
+                { "value": "store_memory by read-write key" },
+            ]),
+            "a read-only key must still read through MCP"
+        );
+
+        Ok(())
+    }
+
+    /// A legacy (`2025-03-26`) session keeps one rmcp worker across requests, so
+    /// the API key that opened it must not carry over: every `tools/call` on the
+    /// session runs as the key on that request.
+    #[tokio::test]
+    async fn test_mcp_legacy_session_enforces_each_request_api_key() -> Result<(), anyhow::Error> {
+        let (http_server_url, rt) = start_spiced_with_memory_dataset().await?;
+        let client = reqwest::Client::new();
+        let session_id = initialize_legacy_session(&client, &http_server_url, TEST_API_KEY).await?;
+
+        let inserted = call_tool_legacy(
+            &client,
+            &http_server_url,
+            TEST_API_KEY,
+            &session_id,
+            2,
+            "sql",
+            serde_json::json!({ "query": insert_memory_sql("sql insert by read-write key") }),
+        )
+        .await?;
+        assert_eq!(
+            sql_tool_rows(&inserted)?,
+            serde_json::json!([{ "count": 1 }])
+        );
+
+        let denied = call_tool_legacy(
+            &client,
+            &http_server_url,
+            TEST_READ_ONLY_API_KEY,
+            &session_id,
+            3,
+            "sql",
+            serde_json::json!({ "query": insert_memory_sql("sql insert by read-only key") }),
+        )
+        .await?;
+        assert_read_only_rejection(&denied, READ_ONLY_SQL_REJECTION);
+
+        let denied = call_tool_legacy(
+            &client,
+            &http_server_url,
+            TEST_READ_ONLY_API_KEY,
+            &session_id,
+            4,
+            "store_memory",
+            serde_json::json!({ "thoughts": ["store_memory by read-only key"] }),
+        )
+        .await?;
+        assert_read_only_rejection(&denied, READ_ONLY_STORE_MEMORY_REJECTION);
+
+        // The read-only calls must not leave the session read-only either.
+        let stored = call_tool_legacy(
+            &client,
+            &http_server_url,
+            TEST_API_KEY,
+            &session_id,
+            5,
+            "store_memory",
+            serde_json::json!({ "thoughts": ["store_memory by read-write key"] }),
+        )
+        .await?;
+        assert_eq!(tool_result_text(&stored)?, "null");
+
+        assert_eq!(
+            memory_values(&rt).await?,
+            vec![
+                "sql insert by read-write key".to_string(),
+                "store_memory by read-write key".to_string(),
+            ],
+            "only the read-write key's writes may land on a shared session"
+        );
+
+        Ok(())
+    }
+
     /// Test that an MCP request with a Host header matching `runtime.mcp.allowed_hosts` succeeds.
     #[tokio::test]
     async fn test_mcp_allowed_host_accepted() -> Result<(), anyhow::Error> {
@@ -785,6 +980,54 @@ params:
             .with_runtime(runtime_config)
             .build();
 
+        let (http_base_url, _rt) = start_spiced_app(app).await?;
+        Ok(http_base_url)
+    }
+
+    /// Starts a spiced runtime whose `/v1/mcp` accepts the read-write
+    /// [`TEST_API_KEY`] and the read-only [`TEST_READ_ONLY_API_KEY`], with a
+    /// writable `memory:store` dataset named [`MEMORY_DATASET`] for the `sql` and
+    /// `store_memory` tools to write to.
+    ///
+    /// Returns the HTTP base URL and the runtime, so a test can read the dataset
+    /// without going through MCP.
+    async fn start_spiced_with_memory_dataset() -> anyhow::Result<(String, Arc<Runtime>)> {
+        use spicepod::component::access::AccessMode;
+        use spicepod::component::dataset::Dataset;
+        use spicepod::component::runtime::Runtime as SpicepodRuntime;
+
+        let runtime_config = SpicepodRuntime {
+            mcp: Some(McpConfig {
+                allowed_hosts: Some(vec!["*".to_string()]),
+            }),
+            auth: Some(Auth {
+                api_key: Some(ApiKeyAuth {
+                    enabled: true,
+                    keys: vec![
+                        ApiKey::ReadWrite {
+                            key: TEST_API_KEY.to_string(),
+                        },
+                        ApiKey::ReadOnly {
+                            key: TEST_READ_ONLY_API_KEY.to_string(),
+                        },
+                    ],
+                }),
+            }),
+            ..Default::default()
+        };
+        let mut memories = Dataset::new("memory:store", MEMORY_DATASET);
+        memories.access = AccessMode::ReadWrite;
+        let app = AppBuilder::new("mcp-write-access-test")
+            .with_runtime(runtime_config)
+            .with_dataset(memories)
+            .build();
+
+        start_spiced_app(app).await
+    }
+
+    /// Starts `app` with its servers, waits until its components are ready, and
+    /// returns the HTTP base URL and the runtime.
+    async fn start_spiced_app(app: App) -> anyhow::Result<(String, Arc<Runtime>)> {
         let api_config = create_api_bindings_config();
         let http_base_url = format!("http://{}", api_config.http_bind_address);
 
@@ -811,7 +1054,214 @@ params:
 
         runtime_ready_check(&rt).await;
 
-        Ok(http_base_url)
+        Ok((http_base_url, rt))
+    }
+
+    /// Sends a modern (`2026-07-28`, sessionless) `tools/call` as `api_key` and
+    /// returns its JSON-RPC response.
+    async fn call_tool_modern(
+        client: &reqwest::Client,
+        http_server_url: &str,
+        api_key: &str,
+        id: u64,
+        tool: &str,
+        arguments: Value,
+    ) -> anyhow::Result<Value> {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": {
+                "name": tool,
+                "arguments": arguments,
+                "_meta": modern_request_meta(),
+            },
+        });
+        let resp = post_mcp_as(
+            client,
+            http_server_url,
+            api_key,
+            &[
+                ("MCP-Protocol-Version", MODERN_PROTOCOL_VERSION),
+                ("Mcp-Method", "tools/call"),
+                ("Mcp-Name", tool),
+            ],
+            &body,
+        )
+        .await?;
+        jsonrpc_response(resp).await
+    }
+
+    /// The legacy protocol revision the session tests negotiate with `initialize`.
+    const LEGACY_PROTOCOL_VERSION: &str = "2025-03-26";
+
+    /// Opens a legacy (`initialize`) MCP session as `api_key` and returns its
+    /// `Mcp-Session-Id`.
+    async fn initialize_legacy_session(
+        client: &reqwest::Client,
+        http_server_url: &str,
+        api_key: &str,
+    ) -> anyhow::Result<String> {
+        let init_body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": LEGACY_PROTOCOL_VERSION,
+                "capabilities": {},
+                "clientInfo": {
+                    "name": "spice-integration-test",
+                    "version": env!("CARGO_PKG_VERSION"),
+                },
+            },
+        });
+        let resp = post_mcp_as(client, http_server_url, api_key, &[], &init_body).await?;
+        let session_id = resp
+            .headers()
+            .get("mcp-session-id")
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned)
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "initialize response ({}) has no Mcp-Session-Id header",
+                    resp.status()
+                )
+            })?;
+        let init = jsonrpc_response(resp).await?;
+        anyhow::ensure!(init.get("result").is_some(), "initialize failed: {init}");
+
+        let initialized = post_mcp_as(
+            client,
+            http_server_url,
+            api_key,
+            &[
+                ("MCP-Protocol-Version", LEGACY_PROTOCOL_VERSION),
+                ("mcp-session-id", session_id.as_str()),
+            ],
+            &serde_json::json!({ "jsonrpc": "2.0", "method": "notifications/initialized" }),
+        )
+        .await?;
+        anyhow::ensure!(
+            initialized.status() == reqwest::StatusCode::ACCEPTED,
+            "notifications/initialized should be HTTP 202, got {}",
+            initialized.status()
+        );
+
+        Ok(session_id)
+    }
+
+    /// Sends a legacy `tools/call` on `session_id` as `api_key` and returns its
+    /// JSON-RPC response.
+    async fn call_tool_legacy(
+        client: &reqwest::Client,
+        http_server_url: &str,
+        api_key: &str,
+        session_id: &str,
+        id: u64,
+        tool: &str,
+        arguments: Value,
+    ) -> anyhow::Result<Value> {
+        let body = serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": id,
+            "method": "tools/call",
+            "params": { "name": tool, "arguments": arguments },
+        });
+        let resp = post_mcp_as(
+            client,
+            http_server_url,
+            api_key,
+            &[
+                ("MCP-Protocol-Version", LEGACY_PROTOCOL_VERSION),
+                ("mcp-session-id", session_id),
+            ],
+            &body,
+        )
+        .await?;
+        jsonrpc_response(resp).await
+    }
+
+    /// The JSON-RPC message of a successful HTTP response.
+    async fn jsonrpc_response(resp: reqwest::Response) -> anyhow::Result<Value> {
+        let status = resp.status();
+        let body = resp.text().await?;
+        anyhow::ensure!(
+            status.is_success(),
+            "MCP request failed: {status} body={body}"
+        );
+        parse_jsonrpc_body(&body)
+    }
+
+    /// Asserts that a `tools/call` was refused with `message`: a JSON-RPC
+    /// internal error carrying the tool's error.
+    fn assert_read_only_rejection(response: &Value, message: &str) {
+        assert_eq!(
+            response.pointer("/error/code").and_then(Value::as_i64),
+            Some(-32603),
+            "a read-only API key's write must be refused: {response}"
+        );
+        assert_eq!(
+            response.pointer("/error/message").and_then(Value::as_str),
+            Some(message),
+            "unexpected refusal: {response}"
+        );
+    }
+
+    /// The text content of a successful `tools/call`: the tool's result as JSON.
+    fn tool_result_text(response: &Value) -> anyhow::Result<&str> {
+        anyhow::ensure!(
+            response.pointer("/result/isError").and_then(Value::as_bool) != Some(true),
+            "tools/call failed: {response}"
+        );
+        response
+            .pointer("/result/content/0/text")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow::anyhow!("tools/call returned no text content: {response}"))
+    }
+
+    /// The rows a successful `sql` tool call returned. Its result is a JSON
+    /// string that holds the rows as a JSON array.
+    fn sql_tool_rows(response: &Value) -> anyhow::Result<Value> {
+        let rows: String = serde_json::from_str(tool_result_text(response)?)?;
+        Ok(serde_json::from_str(&rows)?)
+    }
+
+    /// An INSERT of one row whose `id` and `value` are `value` into
+    /// [`MEMORY_DATASET`].
+    fn insert_memory_sql(value: &str) -> String {
+        format!(
+            "INSERT INTO {MEMORY_DATASET} (id, value, created_by, created_at) \
+             VALUES ('{value}', '{value}', 'mcp-integration-test', to_timestamp_seconds(0))"
+        )
+    }
+
+    /// The `value` column of [`MEMORY_DATASET`], sorted. Read in-process rather
+    /// than over MCP, so the check does not share the path under test.
+    async fn memory_values(rt: &Arc<Runtime>) -> anyhow::Result<Vec<String>> {
+        let sql = format!("SELECT value FROM {MEMORY_DATASET} ORDER BY value");
+        let batches = rt
+            .datafusion()
+            .query_builder(&sql)
+            .build()
+            .run()
+            .await?
+            .data
+            .try_collect::<Vec<_>>()
+            .await?;
+        let mut values = Vec::new();
+        for batch in &batches {
+            let column = arrow::compute::cast(batch.column(0), &arrow::datatypes::DataType::Utf8)?;
+            let column = column
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .ok_or_else(|| anyhow::anyhow!("'value' did not cast to a string column"))?;
+            values.extend(
+                column
+                    .iter()
+                    .map(|value| value.unwrap_or_default().to_string()),
+            );
+        }
+        Ok(values)
     }
 
     /// Returns the runtime (with all components ready) and the base URL of the HTTP server.

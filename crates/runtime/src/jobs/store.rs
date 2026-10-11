@@ -1013,6 +1013,16 @@ mod tests {
             .expect("to create job")
             .job_id;
         job_store.delete_job(&job_id).await.expect("first delete");
+        // The first delete removed the job, so the second runs against an
+        // absent object.
+        let gone = job_store.get_job(&job_id).await;
+        assert!(
+            matches!(
+                &gone,
+                Err(super::super::error::Error::JobNotFound { job_id: missing }) if *missing == job_id
+            ),
+            "the first delete must remove the job, got {gone:?}"
+        );
         job_store
             .delete_job(&job_id)
             .await
@@ -1521,38 +1531,37 @@ mod tests {
             let store = Arc::new(InMemory::new());
             let job_store = JobStore::new(store, "test", "node-1");
 
-            let state = job_store
+            let mut state = job_store
                 .create_job(make_request("SELECT 1"), false, test_owner())
                 .await
                 .expect("to create job");
 
-            // Version should be set after creation
-            assert!(
-                state.version.is_some(),
-                "Version should be set after job creation"
-            );
-        }
-
-        #[tokio::test]
-        async fn test_get_job_sets_version() {
-            let store = Arc::new(InMemory::new());
-            let job_store = JobStore::new(store, "test", "node-1");
-
-            let created = job_store
-                .create_job(make_request("SELECT 1"), false, test_owner())
+            // The version create_job returns is the stored object's: a write
+            // carrying it is accepted. (A state with no version is written as
+            // a create, which the existing object refuses.)
+            job_store
+                .update_job(&mut state)
                 .await
-                .expect("to create job");
+                .expect("a write carrying the creation version should succeed");
 
-            let retrieved = job_store
-                .get_job(&created.job_id)
+            // Once another writer has moved the job on, that version is stale,
+            // and the conditional write is refused instead of overwriting the
+            // newer state.
+            job_store
+                .set_job_running(&state.job_id)
                 .await
-                .expect("to get job");
-
-            // Version should be set after retrieval
+                .expect("another writer sets the job running");
+            let err = job_store
+                .update_job(&mut state)
+                .await
+                .expect_err("a write carrying a stale version must be refused");
             assert!(
-                retrieved.version.is_some(),
-                "Version should be set after job retrieval"
+                matches!(&err, Error::ConcurrentModification { job_id } if *job_id == state.job_id),
+                "expected ConcurrentModification for {}, got {err:?}",
+                state.job_id
             );
+            let stored = job_store.get_job(&state.job_id).await.expect("to get job");
+            assert_eq!(stored.status, JobStatus::Running);
         }
 
         #[tokio::test]

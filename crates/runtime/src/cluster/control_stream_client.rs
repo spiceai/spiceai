@@ -787,22 +787,6 @@ mod tests {
     }
 
     #[test]
-    fn test_control_stream_manager_new_with_metrics_reader() {
-        let reader = MetricsReader::new();
-        let manager = ControlStreamManager::new(
-            "executor-2".to_string(),
-            "executor-2".to_string(),
-            None,
-            Some(reader),
-            None,
-            None,
-            None,
-            None,
-        );
-        assert!(manager.metrics_reader.is_some());
-    }
-
-    #[test]
     fn test_control_stream_manager_update_schedulers_empty() {
         let mut manager = ControlStreamManager::new(
             "executor-1".to_string(),

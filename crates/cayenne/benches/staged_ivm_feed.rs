@@ -468,6 +468,46 @@ fn bench_feed_vs_rebuild(c: &mut Criterion) {
                 });
             },
         );
+
+        // Lane C — the provider's rebuild fold: `begin_rebuild`, then
+        // `apply_projected` over each scanned batch, as
+        // `rebuild_maintained_aggregates_from_visible_state` runs it. The scan
+        // here projects the whole `(id, value)` table. The timer wraps only the
+        // folds.
+        group.throughput(Throughput::Elements(rows as u64));
+        group.bench_with_input(
+            BenchmarkId::new("rebuild_fold_rows", rows),
+            &rows,
+            |b, _| {
+                b.iter_custom(|iters| {
+                    let mut total = Duration::ZERO;
+                    for _ in 0..iters {
+                        let reg = MaintainedAggregateRegistry::try_new_with_pk(
+                            &count_sum_specs(),
+                            &table_schema(),
+                            &[0],
+                            usize::MAX,
+                        )
+                        .expect("rebuild registry");
+                        let columns = reg.rebuild_columns();
+                        let mut rebuilder = reg.begin_rebuild(0).expect("rebuild begins");
+                        assert!(
+                            rebuilder.set_snapshot_epoch(0),
+                            "the snapshot is at the epoch the rebuild holds from"
+                        );
+                        let start = Instant::now();
+                        for batch in &base {
+                            rebuilder
+                                .apply_projected(batch, &columns)
+                                .expect("rebuild folds a batch");
+                        }
+                        total += start.elapsed();
+                        black_box(reg.finish_rebuild(rebuilder).expect("rebuild installs"));
+                    }
+                    total
+                });
+            },
+        );
     }
     group.finish();
 }

@@ -18,7 +18,7 @@ limitations under the License.
 
 //! Test that verifies `partition_by` works correctly with the new chunking implementation
 
-mod common;
+use crate::common;
 
 use arrow::array::{Array, Int64Array, StringArray};
 

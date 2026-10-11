@@ -1369,29 +1369,31 @@ mod write_maintenance_tests {
         let offset_col = ChunkedSearchIndex::chunking_offset_col("content");
         let embedding = embedding_col("content");
 
-        let query = index.query_result_schema();
-        query
-            .field_with_name(CHUNKED_INDEX_CHUNK_KEY)
-            .expect("query schema should expose the chunk key column");
-        query
-            .field_with_name(&offset_col)
-            .expect("query schema should expose the offset column");
-        query
-            .field_with_name(&embedding)
-            .expect("query schema should expose the embedding column");
-        query
-            .field_with_name(SEARCH_SCORE_COLUMN_NAME)
-            .expect("query schema should expose the score column");
-
-        let list = index.list_result_schema();
-        list.field_with_name(CHUNKED_INDEX_CHUNK_KEY)
-            .expect("list schema should expose the chunk key column");
-        list.field_with_name(&offset_col)
-            .expect("list schema should expose the offset column");
-        list.field_with_name(&embedding)
-            .expect("list schema should expose the embedding column");
-        list.field_with_name(SEARCH_SCORE_COLUMN_NAME)
-            .expect_err("list schema should not expose the score column");
+        // Every column, in order, with its exact type and nullability: the augmented key
+        // (the row's key, then the chunk key), the chunk offsets, the embedding, and — for a
+        // query only — the score.
+        let item = |data_type: DataType| Arc::new(Field::new("item", data_type, false));
+        let mut fields = vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new(CHUNKED_INDEX_CHUNK_KEY, DataType::UInt64, false),
+            Field::new(
+                &offset_col,
+                DataType::FixedSizeList(item(DataType::Int32), 2),
+                false,
+            ),
+            Field::new(
+                &embedding,
+                DataType::FixedSizeList(item(DataType::Float32), 3),
+                true,
+            ),
+        ];
+        assert_eq!(*index.list_result_schema(), Schema::new(fields.clone()));
+        fields.push(Field::new(
+            SEARCH_SCORE_COLUMN_NAME,
+            DataType::Float64,
+            true,
+        ));
+        assert_eq!(*index.query_result_schema(), Schema::new(fields));
     }
 
     /// The core fallback-contract guard: a `CompoundVectorIndex` pairing an in-memory warm
@@ -1412,6 +1414,32 @@ mod write_maintenance_tests {
         )
         .expect("memory warm index should build");
 
+        // What each side answers with on its own.
+        let warm_query = memory
+            .query_table_provider("query")
+            .expect("warm query plan")
+            .schema()
+            .as_arrow()
+            .clone();
+        let warm_list = memory
+            .list_table_provider()
+            .expect("warm list plan")
+            .schema()
+            .as_arrow()
+            .clone();
+        let es_query = es_index
+            .query_table_provider("query")
+            .expect("Elasticsearch query plan")
+            .schema()
+            .as_arrow()
+            .clone();
+        let es_list = es_index
+            .list_table_provider()
+            .expect("Elasticsearch list plan")
+            .schema()
+            .as_arrow()
+            .clone();
+
         let compound = CompoundVectorIndex::try_new(
             Arc::new(memory) as Arc<dyn VectorIndex>,
             Arc::new(es_index) as Arc<dyn VectorIndex>,
@@ -1419,12 +1447,46 @@ mod write_maintenance_tests {
         )
         .expect("compound index should build");
 
-        compound
+        let query = compound
             .query_table_provider("query")
             .expect("query fallback plan should build over the augmented primary key + metadata");
-        compound
+        let list = compound
             .list_table_provider()
             .expect("list fallback plan should build over the augmented primary key + metadata");
+
+        let offsets =
+            DataType::FixedSizeList(Arc::new(Field::new("item", DataType::Int32, false)), 2);
+        for (label, fallback, warm, es) in [
+            ("query", query.schema().as_arrow(), &warm_query, &es_query),
+            ("list", list.schema().as_arrow(), &warm_list, &es_list),
+        ] {
+            // The fallback answers with exactly the warm index's columns...
+            assert_eq!(fallback, warm, "{label} fallback schema");
+            // ...each of which Elasticsearch provides by name...
+            for field in warm.fields() {
+                es.field_with_name(field.name()).unwrap_or_else(|_| {
+                    panic!("the Elasticsearch {label} plan lacks '{}'", field.name())
+                });
+            }
+            // ...and the row and chunk keys and the chunk offsets reach it with their own
+            // types, so none of them is cast on the way.
+            for (key, data_type) in [
+                ("id", DataType::Int64),
+                (CHUNKED_INDEX_CHUNK_KEY, DataType::UInt64),
+                ("content_offset", offsets.clone()),
+            ] {
+                let warm_type = warm
+                    .field_with_name(key)
+                    .unwrap_or_else(|_| panic!("the warm {label} plan lacks '{key}'"))
+                    .data_type();
+                let es_type = es
+                    .field_with_name(key)
+                    .unwrap_or_else(|_| panic!("the Elasticsearch {label} plan lacks '{key}'"))
+                    .data_type();
+                assert_eq!(warm_type, &data_type, "warm {label} '{key}'");
+                assert_eq!(es_type, &data_type, "Elasticsearch {label} '{key}'");
+            }
+        }
     }
 }
 

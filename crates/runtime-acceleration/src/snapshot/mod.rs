@@ -2175,6 +2175,11 @@ impl SnapshotManager {
             .into_iter()
             .map(|e| (e.archive_path, e.bytes))
             .collect();
+        let optional_files: Vec<(PathBuf, String)> = plan
+            .optional_files
+            .into_iter()
+            .map(|file| (file.source, file.archive_path))
+            .collect();
 
         // Step 1: Create a temporary tar archive of all directories
         let temp_archive_path = std::env::temp_dir().join(format!(
@@ -2189,6 +2194,7 @@ impl SnapshotManager {
             &temp_archive_path,
             &skip_paths,
             &extras,
+            &optional_files,
         )
         .await
         {
@@ -4847,6 +4853,7 @@ mod tests {
             &archive,
             &[],
             &[],
+            &[],
         )
         .await
         .expect("archive cayenne directories");
@@ -5013,28 +5020,26 @@ mod tests {
             &metadata_with(&schema, vec![broken.clone()], 7),
         )
         .await;
+        // The replacement's archive is stored up front; it only becomes the current snapshot
+        // once metadata naming it is published.
+        let replacement = put_cayenne_snapshot_entry(&store, 8, 2, b"replacement").await;
+        let replacement_metadata = metadata_with(&schema, vec![broken, replacement], 8);
+        let replacement_payload =
+            serde_json::to_vec_pretty(&replacement_metadata).expect("serialize metadata");
 
         let root = TempDir::new().expect("create temp dir");
         let mut manager = build_cayenne_manager(Arc::clone(&store), root.path(), &schema);
         manager.bootstrap_failure_behavior = BootstrapOnFailureBehavior::Retry;
 
-        let writer_store = Arc::clone(&store);
-        let writer_path = metadata_path.clone();
-        let writer_schema = Arc::clone(&schema);
-        let writer = tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            let replacement = put_cayenne_snapshot_entry(&writer_store, 8, 2, b"replacement").await;
-            write_metadata(
-                &writer_store,
-                &writer_path,
-                &metadata_with(&writer_schema, vec![broken, replacement], 8),
-            )
-            .await;
-        });
-
+        // The first validation runs after the first attempt has read, and pinned, the broken
+        // snapshot's metadata. Publishing the replacement from inside it means only a retry
+        // that reads the metadata again can find snapshot 8, whatever the task scheduling.
         let validated = std::sync::atomic::AtomicUsize::new(0);
         let validator = |_: &SchemaRef| {
-            validated.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if validated.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0 {
+                let publish = store.put(&metadata_path, replacement_payload.clone().into());
+                futures::executor::block_on(publish).expect("publish replacement metadata");
+            }
             true
         };
         let poll = tokio::time::timeout(
@@ -5044,13 +5049,25 @@ mod tests {
         .await
         .expect("retry must observe the replacement snapshot instead of retrying forever")
         .expect("download_if_newer should succeed");
-        writer.await.expect("writer task");
 
         assert_eq!(poll.download.as_ref().map(|info| info.snapshot_id), Some(8));
-        assert!(poll.metadata_e_tag.is_some());
+        let current_e_tag = store
+            .head(&metadata_path)
+            .await
+            .expect("head replacement metadata")
+            .e_tag;
         assert!(
-            validated.load(std::sync::atomic::Ordering::Relaxed) >= 2,
-            "each retry validates the snapshot it downloads"
+            current_e_tag.is_some(),
+            "the in-memory store reports an ETag"
+        );
+        assert_eq!(
+            poll.metadata_e_tag, current_e_tag,
+            "the poll reports the ETag of the metadata it loaded"
+        );
+        assert_eq!(
+            validated.load(std::sync::atomic::Ordering::Relaxed),
+            2,
+            "the failed attempt and the retry that downloaded the replacement each validate"
         );
         let restored = fs::read(root.path().join("data").join("part-8.vortex"))
             .await
