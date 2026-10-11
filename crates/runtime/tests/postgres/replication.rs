@@ -1249,7 +1249,7 @@ async fn first_change_after_column_type_change_decodes_with_the_new_type()
     let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
 
     let container = common::start_postgres_docker_container_with_logical_wal().await?;
-    let port = u16::try_from(container.host_port(5432)?).expect("port fits in u16");
+    let port = container.host_port(5432)?;
 
     // `sync_all_columns` widens `k` to `Float64` live and carries 1.5 exactly.
     let (source, mut stream) = start_alter_type_stream(
@@ -1269,8 +1269,10 @@ async fn first_change_after_column_type_change_decodes_with_the_new_type()
     assert_eq!(id, 4);
     assert_eq!(k.data_type(), &DataType::Float64, "k is widened to Float64");
     assert_eq!(
-        k.as_primitive::<arrow::datatypes::Float64Type>().value(0),
-        1.5
+        k.as_primitive::<arrow::datatypes::Float64Type>()
+            .value(0)
+            .to_bits(),
+        1.5f64.to_bits()
     );
     envelope.commit().await?;
     drop(stream);
@@ -1326,7 +1328,7 @@ async fn resume_across_a_column_type_change_applies_wal_from_both_sides()
     let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
 
     let container = common::start_postgres_docker_container_with_logical_wal().await?;
-    let port = u16::try_from(container.host_port(5432)?).expect("port fits in u16");
+    let port = container.host_port(5432)?;
     let table = "alter_type_resume";
     let (source, stream) =
         start_alter_type_stream(port, table, SchemaEvolutionPolicy::SyncAllColumns).await?;
@@ -1389,11 +1391,13 @@ async fn resume_across_a_column_type_change_applies_wal_from_both_sides()
         );
         seen.push((
             id,
-            k.as_primitive::<arrow::datatypes::Float64Type>().value(0),
+            k.as_primitive::<arrow::datatypes::Float64Type>()
+                .value(0)
+                .to_bits(),
         ));
         envelope.commit().await?;
     }
-    assert_eq!(seen, vec![(4, 7.0), (5, 1.5)]);
+    assert_eq!(seen, vec![(4, 7.0f64.to_bits()), (5, 1.5f64.to_bits())]);
     Ok(())
 }
 

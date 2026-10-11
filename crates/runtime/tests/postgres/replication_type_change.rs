@@ -229,7 +229,7 @@ async fn cayenne_block_keeps_the_registered_type() -> Result<(), anyhow::Error> 
         .await
 }
 
-/// DuckDB cannot evolve mid-stream, so under `sync_all_columns` a change is
+/// `DuckDB` cannot evolve mid-stream, so under `sync_all_columns` a change is
 /// cast to the table's current `Int32` type until a restart applies the
 /// evolution. A value the cast holds exactly is applied; one it would round
 /// is refused, never stored rounded.

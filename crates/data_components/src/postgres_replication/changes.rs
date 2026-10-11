@@ -108,7 +108,8 @@ impl WireNumber {
     /// `f32` is an `f64`, so a value `f64` cannot hold is not an `f32` either.
     #[expect(
         clippy::cast_possible_truncation,
-        reason = "the conversion is checked by converting back and comparing"
+        clippy::float_cmp,
+        reason = "the conversion is checked by converting back and comparing exactly"
     )]
     fn to_f32(self) -> Option<f32> {
         self.to_f64().and_then(|v| {
