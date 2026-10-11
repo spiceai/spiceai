@@ -266,6 +266,9 @@ impl DatasetLoadSummary {
 
 impl Runtime {
     pub(crate) async fn load_datasets(self: Arc<Self>) {
+        // Read before the app, so a reload that supersedes a view after this
+        // snapshot rejects this load's stale registration of it.
+        let view_generation = self.view_loads.generation();
         let Some(app) = self.read_app().await else {
             return;
         };
@@ -564,7 +567,7 @@ impl Runtime {
         // Views are loaded as soon as the datasets each one reads from have loaded,
         // not after every dataset has: a dataset that keeps failing must only hold
         // back the views that depend on it.
-        let view_tasks = Arc::clone(&self).load_views(&app, &dataset_done);
+        let view_tasks = Arc::clone(&self).load_views(&app, &dataset_done, view_generation);
 
         let _ = join_all(spawned_tasks).await;
         let _ = join_all(view_tasks).await;

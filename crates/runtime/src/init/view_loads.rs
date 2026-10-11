@@ -35,7 +35,16 @@ pub(crate) struct ViewLoads {
         HashMap<ResolvedTableReference, (u64, CancellationToken, Arc<tokio::sync::Mutex<()>>)>,
     >,
     next_id: std::sync::atomic::AtomicU64,
+    /// Bumped by every `supersede`; `superseded_at` records, per view, the
+    /// generation of its latest supersede, so a load whose app snapshot predates
+    /// it is rejected even if it begins after the supersede ran.
+    generation: std::sync::atomic::AtomicU64,
+    superseded_at: parking_lot::Mutex<HashMap<ResolvedTableReference, u64>>,
 }
+
+/// The `ViewLoads` generation observed when an app snapshot was read.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Generation(u64);
 
 /// A pending startup registration of a view, until it is dropped.
 pub(crate) struct ViewLoad {
@@ -48,20 +57,37 @@ pub(crate) struct ViewLoad {
 }
 
 impl ViewLoads {
+    /// The current generation. Read it before reading the app snapshot whose
+    /// views are later passed to [`ViewLoads::begin`].
+    pub(crate) fn generation(&self) -> Generation {
+        Generation(self.generation.load(std::sync::atomic::Ordering::SeqCst))
+    }
+
     /// Registers a pending startup registration of `name`, superseding any
-    /// earlier one.
-    pub(crate) fn begin(self: &Arc<Self>, name: &TableReference) -> ViewLoad {
+    /// earlier one. If `name` was superseded after `since` (the app snapshot is
+    /// stale for it), the returned load is already cancelled and not tracked.
+    pub(crate) fn begin(self: &Arc<Self>, name: &TableReference, since: Generation) -> ViewLoad {
         let name = resolve_table_reference(name.clone());
         let token = CancellationToken::new();
+        let running = Arc::new(tokio::sync::Mutex::new(()));
+        let guard = Arc::clone(&running)
+            .try_lock_owned()
+            .unwrap_or_else(|_| unreachable!("a fresh mutex is unlocked"));
         let id = self
             .next_id
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        if let Some((_, old)) = self
-            .pending
-            .lock()
-            .insert(name.clone(), (id, token.clone()))
         {
-            old.cancel();
+            // Lock order: superseded_at, then pending (same as `supersede`).
+            let superseded_at = self.superseded_at.lock();
+            if superseded_at.get(&name).is_some_and(|g| *g > since.0) {
+                token.cancel();
+            } else if let Some((_, old, _)) = self
+                .pending
+                .lock()
+                .insert(name.clone(), (id, token.clone(), running))
+            {
+                old.cancel();
+            }
         }
         ViewLoad {
             loads: Arc::clone(self),
@@ -77,7 +103,15 @@ impl ViewLoads {
     /// removes or replaces it. Returns whether one was pending.
     pub(crate) async fn supersede(&self, name: &TableReference) -> bool {
         let name = resolve_table_reference(name.clone());
-        let removed = self.pending.lock().remove(&name);
+        let removed = {
+            let mut superseded_at = self.superseded_at.lock();
+            let generation = self
+                .generation
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                + 1;
+            superseded_at.insert(name.clone(), generation);
+            self.pending.lock().remove(&name)
+        };
         match removed {
             Some((_, token, running)) => {
                 token.cancel();
@@ -114,8 +148,8 @@ mod tests {
     #[tokio::test]
     async fn supersede_cancels_only_the_named_view_and_waits_for_it() {
         let loads = Arc::new(ViewLoads::default());
-        let a = loads.begin(&TableReference::bare("a"));
-        let b = loads.begin(&TableReference::bare("b"));
+        let a = loads.begin(&TableReference::bare("a"), loads.generation());
+        let b = loads.begin(&TableReference::bare("b"), loads.generation());
         let token = a.token();
         let ended = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let ended_task = Arc::clone(&ended);
@@ -141,15 +175,15 @@ mod tests {
     #[tokio::test]
     async fn a_dropped_load_leaves_nothing_to_supersede() {
         let loads = Arc::new(ViewLoads::default());
-        drop(loads.begin(&TableReference::bare("a")));
+        drop(loads.begin(&TableReference::bare("a"), loads.generation()));
         assert!(!loads.supersede(&TableReference::bare("a")).await);
     }
 
     #[tokio::test]
     async fn a_newer_load_supersedes_the_older_and_survives_its_drop() {
         let loads = Arc::new(ViewLoads::default());
-        let old = loads.begin(&TableReference::bare("a"));
-        let new = loads.begin(&TableReference::bare("a"));
+        let old = loads.begin(&TableReference::bare("a"), loads.generation());
+        let new = loads.begin(&TableReference::bare("a"), loads.generation());
         assert!(old.token().is_cancelled());
         drop(old);
         let token = new.token();
@@ -159,5 +193,19 @@ mod tests {
         });
         assert!(loads.supersede(&TableReference::bare("a")).await);
         assert!(token.is_cancelled());
+    }
+
+    #[tokio::test]
+    async fn a_load_from_a_snapshot_older_than_a_supersede_is_rejected() {
+        let loads = Arc::new(ViewLoads::default());
+        let snapshot = loads.generation();
+        // The reload supersedes before the stale startup path reaches `begin`.
+        assert!(!loads.supersede(&TableReference::bare("a")).await);
+        let stale = loads.begin(&TableReference::bare("a"), snapshot);
+        assert!(stale.token().is_cancelled());
+        let other = loads.begin(&TableReference::bare("b"), snapshot);
+        assert!(!other.token().is_cancelled());
+        let fresh = loads.begin(&TableReference::bare("a"), loads.generation());
+        assert!(!fresh.token().is_cancelled());
     }
 }

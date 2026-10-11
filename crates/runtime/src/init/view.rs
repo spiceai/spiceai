@@ -157,6 +157,7 @@ impl Runtime {
         self: Arc<Self>,
         app: &Arc<App>,
         dataset_done: &HashMap<ResolvedTableReference, CancellationToken>,
+        since: crate::init::view_loads::Generation,
     ) -> Vec<tokio::task::JoinHandle<()>> {
         // `LogErrors(false)`: `load_datasets` is this function's only caller and it has
         // already validated the same views with `LogErrors(true)` before its snapshot
@@ -237,7 +238,7 @@ impl Runtime {
             let done = view_done.get(&resolved).cloned().unwrap_or_default();
 
             let runtime = Arc::clone(&self);
-            let view_load = self.view_loads.begin(&view.name);
+            let view_load = self.view_loads.begin(&view.name, since);
             tasks.push(tokio::spawn(async move {
                 let done = done.drop_guard();
                 let superseded = view_load.token();
