@@ -2201,6 +2201,25 @@ mod tests {
         assert_eq!(value, 1);
     }
 
+    /// [`run_i64_query`] as a request that keys the results cache the way
+    /// `key_type` configures it: by the logical plan, or by the SQL text, whose
+    /// hit is answered before the query is planned.
+    async fn run_i64_query_keyed(
+        df: &Arc<DataFusion>,
+        sql: &str,
+        key_type: spicepod::component::caching::CacheKeyType,
+    ) -> (CacheStatus, i64) {
+        let cache_key_type = if matches!(key_type, spicepod::component::caching::CacheKeyType::Sql)
+        {
+            CacheKeyType::Raw
+        } else {
+            CacheKeyType::Default
+        };
+        create_test_request_context(CacheControl::Cache(cache_key_type), None)
+            .scope(run_i64_query(df, sql, ResultsCacheMode::Default))
+            .await
+    }
+
     /// Plans with volatile functions (`random()`, `uuid()`) or time functions
     /// (`now()`, `current_date`) must never be served from, or stored in, the
     /// results cache, under every cache key type. A deterministic control
@@ -2225,7 +2244,7 @@ mod tests {
                 "SELECT CAST(date_part('day', current_date) AS BIGINT)",
             ] {
                 for _ in 0..2 {
-                    let (status, _) = run_i64_query(&df, sql, ResultsCacheMode::Default).await;
+                    let (status, _) = run_i64_query_keyed(&df, sql, key_type).await;
                     assert_eq!(
                         status,
                         CacheStatus::CacheDisabled,
@@ -2234,9 +2253,9 @@ mod tests {
                 }
             }
 
-            let (status, _) = run_i64_query(&df, "SELECT 42", ResultsCacheMode::Default).await;
+            let (status, _) = run_i64_query_keyed(&df, "SELECT 42", key_type).await;
             assert_eq!(status, CacheStatus::CacheMiss, "{key_type:?}");
-            let (status, value) = run_i64_query(&df, "SELECT 42", ResultsCacheMode::Default).await;
+            let (status, value) = run_i64_query_keyed(&df, "SELECT 42", key_type).await;
             assert_eq!(status, CacheStatus::CacheHit, "{key_type:?}");
             assert_eq!(value, 42);
         }
@@ -2303,10 +2322,8 @@ body: SELECT CAST(random() * 1000000000000 AS BIGINT) AS v
                 "SELECT v FROM stable_rows()",
                 "SELECT (SELECT max(v) FROM default_rows())",
             ] {
-                let (first_status, first) =
-                    run_i64_query(&df, sql, ResultsCacheMode::Default).await;
-                let (second_status, second) =
-                    run_i64_query(&df, sql, ResultsCacheMode::Default).await;
+                let (first_status, first) = run_i64_query_keyed(&df, sql, key_type).await;
+                let (second_status, second) = run_i64_query_keyed(&df, sql, key_type).await;
                 assert_eq!(
                     (first_status, second_status),
                     (CacheStatus::CacheDisabled, CacheStatus::CacheDisabled),
@@ -2321,9 +2338,9 @@ body: SELECT CAST(random() * 1000000000000 AS BIGINT) AS v
             }
 
             let sql = "SELECT v FROM immutable_rows()";
-            let (status, first) = run_i64_query(&df, sql, ResultsCacheMode::Default).await;
+            let (status, first) = run_i64_query_keyed(&df, sql, key_type).await;
             assert_eq!(status, CacheStatus::CacheMiss, "{key_type:?}");
-            let (status, second) = run_i64_query(&df, sql, ResultsCacheMode::Default).await;
+            let (status, second) = run_i64_query_keyed(&df, sql, key_type).await;
             assert_eq!(status, CacheStatus::CacheHit, "{key_type:?}");
             assert_eq!(first, second, "{key_type:?}");
         }
