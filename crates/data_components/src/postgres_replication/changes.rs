@@ -1206,6 +1206,30 @@ impl FieldBuilder {
         Ok(())
     }
 
+    /// Whether the builder decodes a binary value of `type_oid` itself: always
+    /// for a builder that is not fixed-width (its decode dispatches on the OID or
+    /// takes the bytes as they are), otherwise only for its own source type.
+    #[inline]
+    fn decodes_wire_type(&self, type_oid: u32) -> bool {
+        match self {
+            Self::Bool(_) => type_oid == PG_BOOL_OID,
+            Self::Int8(_) => type_oid == PG_CHAR_OID,
+            Self::Int16(_) => type_oid == PG_INT2_OID,
+            Self::Int32(_) => type_oid == PG_INT4_OID,
+            Self::Int64(_) => type_oid == PG_INT8_OID,
+            Self::UInt32(_) => type_oid == PG_OID_OID,
+            Self::Float32(_) => type_oid == PG_FLOAT4_OID,
+            Self::Float64(_) => type_oid == PG_FLOAT8_OID,
+            Self::Date32(_) => type_oid == PG_DATE_OID,
+            Self::Time64Nanos(_) => type_oid == PG_TIME_OID,
+            Self::TimestampMicros(..) | Self::TimestampNanos(..) => {
+                type_oid == PG_TIMESTAMP_OID || type_oid == PG_TIMESTAMPTZ_OID
+            }
+            Self::Decimal128(..) => type_oid == PG_NUMERIC_OID,
+            _ => true,
+        }
+    }
+
     /// Handle a binary value whose source type is not the builder's own.
     ///
     /// The builder is typed from the dataset's working schema, which can differ
@@ -1217,39 +1241,30 @@ impl FieldBuilder {
     /// decoded as its wire type and appended when the builder's type holds it
     /// exactly, and any other value of a known source type is an error.
     ///
-    /// Returns `false`, appending nothing, when the wire type is one the builder
-    /// decodes itself, or when the builder or the wire type is not fixed-width
-    /// and known; the caller then decodes the value as the builder's type.
+    /// Called only when [`Self::decodes_wire_type`] is `false`. Returns `false`,
+    /// appending nothing, when the wire type is not one this handles; the caller
+    /// then decodes the value as the builder's type.
+    #[cold]
+    #[inline(never)]
     fn append_binary_of_another_type(&mut self, raw: &[u8], type_oid: u32) -> Result<bool> {
         use postgres_protocol::types as pg;
 
-        let (accepts, target): (&[u32], DataType) = match self {
-            Self::Bool(_) => (&[PG_BOOL_OID], DataType::Boolean),
-            Self::Int8(_) => (&[PG_CHAR_OID], DataType::Int8),
-            Self::Int16(_) => (&[PG_INT2_OID], DataType::Int16),
-            Self::Int32(_) => (&[PG_INT4_OID], DataType::Int32),
-            Self::Int64(_) => (&[PG_INT8_OID], DataType::Int64),
-            Self::UInt32(_) => (&[PG_OID_OID], DataType::UInt32),
-            Self::Float32(_) => (&[PG_FLOAT4_OID], DataType::Float32),
-            Self::Float64(_) => (&[PG_FLOAT8_OID], DataType::Float64),
-            Self::Date32(_) => (&[PG_DATE_OID], DataType::Date32),
-            Self::Time64Nanos(_) => (&[PG_TIME_OID], DataType::Time64(TimeUnit::Nanosecond)),
-            Self::TimestampMicros(_, tz) => (
-                &[PG_TIMESTAMP_OID, PG_TIMESTAMPTZ_OID],
-                DataType::Timestamp(TimeUnit::Microsecond, tz.clone()),
-            ),
-            Self::TimestampNanos(_, tz) => (
-                &[PG_TIMESTAMP_OID, PG_TIMESTAMPTZ_OID],
-                DataType::Timestamp(TimeUnit::Nanosecond, tz.clone()),
-            ),
-            Self::Decimal128(_, precision, scale) => {
-                (&[PG_NUMERIC_OID], DataType::Decimal128(*precision, *scale))
-            }
+        let target = match self {
+            Self::Bool(_) => DataType::Boolean,
+            Self::Int8(_) => DataType::Int8,
+            Self::Int16(_) => DataType::Int16,
+            Self::Int32(_) => DataType::Int32,
+            Self::Int64(_) => DataType::Int64,
+            Self::UInt32(_) => DataType::UInt32,
+            Self::Float32(_) => DataType::Float32,
+            Self::Float64(_) => DataType::Float64,
+            Self::Date32(_) => DataType::Date32,
+            Self::Time64Nanos(_) => DataType::Time64(TimeUnit::Nanosecond),
+            Self::TimestampMicros(_, tz) => DataType::Timestamp(TimeUnit::Microsecond, tz.clone()),
+            Self::TimestampNanos(_, tz) => DataType::Timestamp(TimeUnit::Nanosecond, tz.clone()),
+            Self::Decimal128(_, precision, scale) => DataType::Decimal128(*precision, *scale),
             _ => return Ok(false),
         };
-        if accepts.contains(&type_oid) {
-            return Ok(false);
-        }
         let (wire_name, decoded) = match type_oid {
             PG_INT2_OID => (
                 "int2",
@@ -1334,7 +1349,7 @@ impl FieldBuilder {
             ),
         };
 
-        if self.append_binary_of_another_type(raw, type_oid)? {
+        if !self.decodes_wire_type(type_oid) && self.append_binary_of_another_type(raw, type_oid)? {
             return Ok(());
         }
 
