@@ -208,6 +208,12 @@ jobs:
           port=$(docker port "$WAL_CONTAINER" 9000/tcp | head -n 1 | sed 's/.*://')
           echo "AWS_ENDPOINT=http://127.0.0.1:${port:?no published port for the $STORE container}" >> "$GITHUB_ENV"
 
+      # The toolchain MinIO's go.mod names for the release the next step builds.
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        if: runner.os == 'macOS' && matrix.store == 'minio'
+        with:
+          go-version: '1.24.8'
+          cache: false
       - name: Start ${{ matrix.store }} on the host
         if: runner.os == 'macOS' && (matrix.store == 'minio' || matrix.store == 'rustfs')
         run: |
@@ -215,17 +221,24 @@ jobs:
           dir="$RUNNER_TEMP/wal-$STORE"
           mkdir -p "$dir/data"
           case "$STORE" in
-            # MinIO no longer publishes binaries. This is Homebrew's bottle of the
-            # final community release, RELEASE.2025-10-15T17-29-55Z, for macOS 14,
-            # the oldest macOS Homebrew builds it for: the bottle for each newer
-            # macOS runs only on that macOS or later, and a leg can land on any
-            # Mac in either pool.
+            # MinIO no longer publishes binaries. This builds the final community
+            # release, RELEASE.2025-10-15T17-29-55Z, the way MinIO built its own
+            # releases: without cgo. Homebrew's bottles use cgo, which compiles in
+            # go-m1cpu's initializer. That reads Apple Silicon power-manager
+            # properties through IOKit, and on a Mac that lacks one it
+            # dereferences null, so the server dies with SIGSEGV before it starts.
             minio)
-              digest=f8e0395a3145bc094c61b7da79df655d708d9c610b8aec82d765fdeca940d6cd
-              curl -fsSL --retry 3 -H 'Authorization: Bearer QQ==' -o "$dir/minio.tar.gz" \
-                "https://ghcr.io/v2/homebrew/core/minio/blobs/sha256:$digest"
-              echo "$digest  $dir/minio.tar.gz" | shasum -a 256 -c -
-              tar -xzf "$dir/minio.tar.gz" -C "$dir" --strip-components 3 minio/2025-10-15T17-29-55Z/bin/minio
+              commit=9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a
+              GOBIN="$dir" GOMODCACHE="$dir/go-mod" GOCACHE="$dir/go-build" GOFLAGS=-modcacherw \
+                GOTOOLCHAIN=local CGO_ENABLED=0 go install -tags kqueue -trimpath -ldflags "-s -w \
+                -X github.com/minio/minio/cmd.Version=2025-10-15T17:29:55Z \
+                -X github.com/minio/minio/cmd.ReleaseTag=RELEASE.2025-10-15T17-29-55Z \
+                -X github.com/minio/minio/cmd.CommitID=$commit \
+                -X github.com/minio/minio/cmd.ShortCommitID=${commit:0:12} \
+                -X github.com/minio/minio/cmd.CopyrightYear=2025" \
+                "github.com/minio/minio@$commit"
+              # The module and build caches take about 2 GB on a shared Mac.
+              rm -rf "$dir/go-mod" "$dir/go-build"
               ;;
             rustfs)
               digest=18aac7101c3484b98f93de64a0609aaa8e02aba072ba7927172c4b2eae7d4843

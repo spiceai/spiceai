@@ -223,7 +223,7 @@ runs in parallel, each with the mandatory SlateDB oracle:
 | Store | Linux | macOS |
 | --- | --- | --- |
 | Local directory | ✓ | ✓ |
-| MinIO | `cgr.dev/chainguard/minio` container | Homebrew bottle of RELEASE.2025-10-15T17-29-55Z |
+| MinIO | `cgr.dev/chainguard/minio` container | RELEASE.2025-10-15T17-29-55Z, built without cgo |
 | RustFS 1.0.1 | `rustfs/rustfs` container | release binary |
 | spiceio | not available | built from spiceai/spiceio@35977eac |
 
