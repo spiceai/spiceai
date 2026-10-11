@@ -30,7 +30,7 @@ limitations under the License.
 //! `GROUP BY` aggregation — which triggers `DataFusion` file re-partitioning —
 //! to verify correctness.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 

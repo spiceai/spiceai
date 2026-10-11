@@ -1,0 +1,18 @@
+# file[parquet]-cayenne[file].yaml under acceleration layouts (see
+# tpch/sf1/accelerated/file[parquet]-cayenne[file]-layouts.yaml). The fact
+# tables sort, cluster and partition on date keys that are NULL on a share of
+# rows. Validated against the unaccelerated __test_reference.* clones.
+schedule: weekly
+tests:
+  bench:
+    spicepod_path: accelerated/file[parquet]-cayenne[file].yaml
+    ready_wait: 300
+    query_set: tpcds
+    runner_type: spiceai-dev-runners
+    validate_results: true
+    layouts:
+      - primary_key,indexes
+      - sort,time_column
+      - cluster
+      - partition
+      - primary_key,indexes,sort,time_column,partition
