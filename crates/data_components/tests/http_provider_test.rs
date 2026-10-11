@@ -55,7 +55,6 @@ fn build_provider(
     provider
 }
 
-/// Integration test that fetches real data from httpbin.org
 /// A session whose plans do not depend on the machine: `DataFusion`'s default
 /// `target_partitions` is the number of CPU cores, and it appears in every
 /// `RepartitionExec` the snapshots record.
@@ -63,6 +62,7 @@ fn session() -> SessionContext {
     SessionContext::new_with_config(SessionConfig::new().with_target_partitions(16))
 }
 
+/// Integration test that fetches real data from httpbin.org
 #[tokio::test]
 async fn test_http_provider_with_real_endpoint() {
     let provider = build_provider("https://httpbin.org", "json", &["/json"], false, false);
