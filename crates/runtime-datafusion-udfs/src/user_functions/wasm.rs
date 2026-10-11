@@ -393,6 +393,7 @@ async fn build_table_func(
             entrypoint: config.entrypoint,
             limits,
         }),
+        table_type: super::table_type_for_volatility(decl.volatility),
     }))
 }
 
@@ -471,6 +472,8 @@ struct WasmTableFunc {
     output_schema: SchemaRef,
     configured_input_source: Option<InputSource>,
     runner: Arc<WasmRunner>,
+    /// See [`super::table_type_for_volatility`].
+    table_type: TableType,
 }
 
 impl Debug for WasmTableFunc {
@@ -497,6 +500,7 @@ impl TableFunctionImpl for WasmTableFunc {
             input_source,
             runner: Arc::clone(&self.runner),
             args,
+            table_type: self.table_type,
         }))
     }
 }
@@ -555,6 +559,7 @@ struct WasmTableProvider {
     input_source: InputSource,
     runner: Arc<WasmRunner>,
     args: Vec<ScalarValue>,
+    table_type: TableType,
 }
 
 #[async_trait::async_trait]
@@ -564,7 +569,7 @@ impl TableProvider for WasmTableProvider {
     }
 
     fn table_type(&self) -> TableType {
-        TableType::Base
+        self.table_type
     }
 
     async fn scan(
@@ -1561,6 +1566,45 @@ mod tests {
         let runner = looping_runner(10);
         let err = runner.invoke(&[], &[]).expect_err("fuel exhaustion");
         assert!(matches!(err, WasmBuildError::CallExport { .. }));
+    }
+
+    /// A table-function call plans as a `TableScan` of the provider it
+    /// returned, so the provider's table type is the only trace of the
+    /// declared volatility the SQL results cache can see. Anything not
+    /// declared `immutable` must plan as `Temporary`, which the cache never
+    /// stores.
+    #[tokio::test]
+    async fn wasm_table_udtf_scan_is_temporary_unless_immutable() {
+        use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+
+        let temp_dir = tempfile::tempdir().expect("tempdir");
+        let module = identity_wasm(&temp_dir);
+        for (volatility, expected) in [
+            (Volatility::Immutable, TableType::Base),
+            (Volatility::Stable, TableType::Temporary),
+            (Volatility::Volatile, TableType::Temporary),
+        ] {
+            let mut decl = wasm_identity_decl(&module);
+            decl.volatility = volatility;
+            let udtf = build_table_udtf(&decl, None).await.expect("builds");
+            let ctx = SessionContext::new();
+            ctx.register_udtf(&decl.name, udtf);
+            let plan = ctx
+                .state()
+                .create_logical_plan("SELECT value FROM wasm_identity()")
+                .await
+                .expect("plans");
+
+            let mut scan_types = Vec::new();
+            plan.apply(|node| {
+                if let LogicalPlan::TableScan(scan) = node {
+                    scan_types.push(scan.source.table_type());
+                }
+                Ok(TreeNodeRecursion::Continue)
+            })
+            .expect("walks the plan");
+            assert_eq!(scan_types, [expected], "{volatility:?}");
+        }
     }
 
     #[tokio::test]

@@ -30,13 +30,13 @@ use crate::transport::http::HttpTransport;
 use crate::transport::redis_stream::RedisStreamTransport;
 use crate::transport::{DrasiTransport, PreparedChange};
 
-/// One CDC batch to forward.
+/// One batch to forward from CDC or an internal runtime table.
 ///
 /// The change stream's own representation is columnar and carries the primary
 /// key as a per-row list of *column names*; this is the flattened view of it
 /// that the mapping needs.
 pub struct DrasiChangeRows<'a> {
-    /// Debezium operation code per row (`c`, `u`, `d`, `r`, …).
+    /// Operation code per row (`c`, `u`, `d`, `r`, …).
     pub op_codes: Vec<&'a str>,
     /// Primary-key column names per row.
     ///
@@ -361,10 +361,29 @@ mod tests {
             .expect("maps rows");
 
         assert_eq!(prepared.len(), 2);
-        assert_eq!(prepared[0].op, ChangeOp::Insert);
+        assert_eq!(prepared[0].op, ChangeOp::Update);
         assert_eq!(prepared[0].node.id, "public.orders:1");
         assert_eq!(prepared[1].op, ChangeOp::Delete);
         assert_eq!(prepared[1].node.id, "public.orders:2");
+    }
+
+    #[test]
+    fn creates_snapshots_and_updates_prepare_as_upserts() {
+        let sink = DrasiSink::with_transport(
+            config(OnDeliveryError::Block),
+            RecordingTransport::always_ok(),
+        );
+        let data = batch();
+        for code in ["c", "r", "u"] {
+            let prepared = sink
+                .prepare(&rows(&data, vec![code, code]))
+                .expect("maps keyed rows as upserts");
+
+            assert_eq!(
+                prepared.iter().map(|change| change.op).collect::<Vec<_>>(),
+                vec![ChangeOp::Update, ChangeOp::Update]
+            );
+        }
     }
 
     /// Truncate cannot be expressed as a set of deletes, and dropping it would

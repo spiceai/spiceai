@@ -98,7 +98,7 @@ use datafusion::common::stats::Precision;
 use datafusion::common::tree_node::{Transformed, TransformedResult, TreeNode, TreeNodeRecursion};
 use datafusion::config::ConfigOptions;
 use datafusion::physical_expr::PhysicalExpr;
-use datafusion::physical_expr::expressions::{DynamicFilterPhysicalExpr, Literal};
+use datafusion::physical_expr::expressions::{Column, DynamicFilterPhysicalExpr, Literal};
 use datafusion::physical_optimizer::PhysicalOptimizerRule;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::physical_plan::aggregates::AggregateExec;
@@ -346,7 +346,31 @@ fn partition_only_file_scan(plan: &Arc<dyn ExecutionPlan>) -> Option<&FileScanCo
         return None;
     }
 
+    // DataFusion folds a projection above a scan into the scan, aliases
+    // included, so a field named after a partition column can carry a data
+    // column's values (`SELECT value AS p` over a table partitioned by `p`), or
+    // a value computed from the partition column (`p || '0' AS p`). The field
+    // names cannot tell those apart from the column itself; the projected
+    // expressions can.
+    if !projects_only_plain_columns(config) {
+        return None;
+    }
+
     Some(config)
+}
+
+/// Whether every expression `config` projects is a plain column read under its
+/// own name, so each output field holds exactly the column it is named after. A
+/// scan with no projection emits the table's columns unchanged.
+fn projects_only_plain_columns(config: &FileScanConfig) -> bool {
+    config.file_source().projection().is_none_or(|projection| {
+        projection.iter().all(|projected| {
+            projected
+                .expr
+                .downcast_ref::<Column>()
+                .is_some_and(|column| column.name() == projected.alias)
+        })
+    })
 }
 
 /// Statistics fast path: when every file has an **exact** row count, build an

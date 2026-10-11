@@ -533,3 +533,454 @@ async fn a_widened_table_still_serves_its_files_from_the_persisted_blob(
 
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Concurrent cold scans share one collection per file (#13829)
+// ---------------------------------------------------------------------------
+//
+// Two scans of a table that miss the statistics cache together — a self-join or
+// a CTE read twice in one plan, or two concurrent queries — used to collect every
+// file's statistics once each: each read the footer and each upserted the
+// persisted row. These tests observe the footer reads through the object store
+// and the upserts through triggers on the metastore table, so neither depends on
+// the provider's own accounting.
+
+test_with_backends!(concurrent_cold_scans_share_one_footer_read_and_upsert_per_file);
+test_with_backends!(scan_file_statistics_counters_match_the_store_and_the_metastore);
+
+const SINGLE_FLIGHT_TABLE: &str = "file_stats_single_flight";
+const SINGLE_FLIGHT_FILES: usize = 4;
+const ROWS_PER_FILE: i64 = 256;
+const CONCURRENT_SCANS: usize = 6;
+
+/// A primary-key-less table whose current snapshot holds `SINGLE_FLIGHT_FILES`
+/// Vortex files, with no persisted statistics rows. Returns the table id.
+async fn write_multi_file_table(fixture: &common::TestFixture) -> TestResult<String> {
+    let ctx = SessionContext::new();
+    let table = Arc::new(
+        CayenneTableProvider::create_table(
+            Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>,
+            CreateTableOptions {
+                table_name: SINGLE_FLIGHT_TABLE.to_string(),
+                schema: schema(),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: fixture.data_path.to_string_lossy().to_string(),
+                partition_column: None,
+                vortex_config: VortexConfig {
+                    // One Vortex file per insert, and nothing to merge them.
+                    inline_max_rows: 0,
+                    inline_max_bytes: 0,
+                    inline_max_buffer_bytes: 0,
+                    compaction_trigger_files: 64,
+                    compaction_background_interval_ms: 0,
+                    ..VortexConfig::default()
+                },
+            },
+            ctx.runtime_env(),
+        )
+        .await?,
+    );
+    for file in 0..SINGLE_FLIGHT_FILES {
+        let start = i64::try_from(file)? * ROWS_PER_FILE;
+        insert_rows(&table, start..start + ROWS_PER_FILE).await?;
+    }
+    table.drain_in_flight_maintenance().await?;
+    let table_id = table.table_id().to_string();
+    // The manifest rows land with the write's maintenance; poll for them.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let files = fixture.catalog.get_all_snapshot_files(&table_id).await?;
+        if files.len() == SINGLE_FLIGHT_FILES {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "each insert must land as its own file within 30s, or the per-file counts \
+             below compare nothing; the manifest holds {files:?}"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    Ok(table_id)
+}
+
+/// Counts the reads of each Vortex file, so a test can see how many times a
+/// scan read its footer.
+#[derive(Debug, Default)]
+struct FooterReadCounter {
+    inner: object_store::local::LocalFileSystem,
+    reads: parking_lot::Mutex<std::collections::BTreeMap<String, usize>>,
+}
+
+impl FooterReadCounter {
+    fn reads(&self) -> std::collections::BTreeMap<String, usize> {
+        self.reads.lock().clone()
+    }
+}
+
+impl std::fmt::Display for FooterReadCounter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("FooterReadCounter")
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for FooterReadCounter {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        if !options.head && location.as_ref().ends_with(".vortex") {
+            *self
+                .reads
+                .lock()
+                .entry(location.as_ref().to_string())
+                .or_default() += 1;
+        }
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::path::Path>,
+        >,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::path::Path>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &object_store::path::Path,
+        to: &object_store::path::Path,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+/// A provider over the fixture's metastore with every cache cold — a fresh
+/// catalog connection, a fresh provider, and a runtime that keeps no footers —
+/// whose reads go through a fresh [`FooterReadCounter`].
+async fn open_cold(
+    fixture: &common::TestFixture,
+) -> TestResult<(
+    Arc<CayenneTableProvider>,
+    SessionContext,
+    Arc<FooterReadCounter>,
+)> {
+    let catalog = Arc::new(CayenneCatalog::new(fixture.connection_string())?);
+    catalog.init().await?;
+    let runtime = datafusion::execution::runtime_env::RuntimeEnvBuilder::new()
+        .with_metadata_cache_limit(0)
+        .build_arc()?;
+    let ctx = SessionContext::new_with_config_rt(SessionConfig::new(), runtime);
+    let table = Arc::new(
+        CayenneTableProviderBuilder::new(
+            Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
+            ctx.runtime_env(),
+        )
+        .open(SINGLE_FLIGHT_TABLE)
+        .await?,
+    );
+    let store = Arc::new(FooterReadCounter::default());
+    ctx.runtime_env().register_object_store(
+        &url::Url::parse("file:///")?,
+        Arc::clone(&store) as Arc<dyn object_store::ObjectStore>,
+    );
+    Ok((table, ctx, store))
+}
+
+/// The full statistics of a plain scan's plan.
+async fn plan_statistics(
+    table: &Arc<CayenneTableProvider>,
+    ctx: &SessionContext,
+) -> TestResult<Statistics> {
+    let plan = table.scan(&ctx.state(), None, &[], None).await?;
+    let stats = datafusion::physical_plan::StatisticsContext::new().compute(
+        plan.as_ref(),
+        &datafusion::physical_plan::StatisticsArgs::new(),
+    )?;
+    Ok(Statistics::clone(&stats))
+}
+
+/// Writes to `cayenne_snapshot_file_statistics`, counted by triggers on the
+/// `SQLite` metastore itself; `None` on a backend this cannot instrument.
+struct StatisticsWriteLog {
+    db_path: std::path::PathBuf,
+}
+
+impl StatisticsWriteLog {
+    async fn install(fixture: &common::TestFixture) -> TestResult<Option<Self>> {
+        if fixture.backend_type != common::BackendType::Sqlite {
+            return Ok(None);
+        }
+        let db_path = fixture.db_path();
+        let path = db_path.clone();
+        tokio::task::spawn_blocking(move || -> rusqlite::Result<()> {
+            let conn = rusqlite::Connection::open(path)?;
+            conn.busy_timeout(std::time::Duration::from_secs(10))?;
+            // An upsert fires the INSERT trigger for a new row and the UPDATE
+            // trigger for an existing one — one log row per statement either way.
+            conn.execute_batch(
+                "CREATE TABLE IF NOT EXISTS test_statistics_write_log (file_path TEXT NOT NULL);
+                 CREATE TRIGGER IF NOT EXISTS test_statistics_write_log_insert
+                   AFTER INSERT ON cayenne_snapshot_file_statistics
+                   BEGIN INSERT INTO test_statistics_write_log VALUES (NEW.file_path); END;
+                 CREATE TRIGGER IF NOT EXISTS test_statistics_write_log_update
+                   AFTER UPDATE ON cayenne_snapshot_file_statistics
+                   BEGIN INSERT INTO test_statistics_write_log VALUES (NEW.file_path); END;",
+            )
+        })
+        .await??;
+        Ok(Some(Self { db_path }))
+    }
+
+    /// Writes logged so far, per file.
+    async fn writes(&self) -> TestResult<std::collections::BTreeMap<String, usize>> {
+        let path = self.db_path.clone();
+        let rows = tokio::task::spawn_blocking(
+            move || -> rusqlite::Result<std::collections::BTreeMap<String, usize>> {
+                let conn = rusqlite::Connection::open(path)?;
+                conn.busy_timeout(std::time::Duration::from_secs(10))?;
+                let mut statement = conn.prepare(
+                    "SELECT file_path, COUNT(*) FROM test_statistics_write_log GROUP BY file_path",
+                )?;
+                let rows = statement
+                    .query_map([], |row| {
+                        let count: i64 = row.get(1)?;
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            usize::try_from(count).unwrap_or(0),
+                        ))
+                    })?
+                    .collect::<rusqlite::Result<_>>()?;
+                Ok(rows)
+            },
+        )
+        .await??;
+        Ok(rows)
+    }
+
+    async fn clear(&self) -> TestResult<()> {
+        let path = self.db_path.clone();
+        tokio::task::spawn_blocking(move || -> rusqlite::Result<()> {
+            let conn = rusqlite::Connection::open(path)?;
+            conn.busy_timeout(std::time::Duration::from_secs(10))?;
+            conn.execute("DELETE FROM test_statistics_write_log", [])?;
+            Ok(())
+        })
+        .await??;
+        Ok(())
+    }
+}
+
+async fn concurrent_cold_scans_share_one_footer_read_and_upsert_per_file(
+    fixture: common::TestFixture,
+) -> TestResult<()> {
+    let table_id = write_multi_file_table(&fixture).await?;
+    let write_log = StatisticsWriteLog::install(&fixture).await?;
+    let expected_rows = usize::try_from(i64::try_from(SINGLE_FLIGHT_FILES)? * ROWS_PER_FILE)?;
+
+    // Reference: one cold scan alone reads each footer and persists each row.
+    fixture
+        .catalog
+        .clear_snapshot_file_statistics(&table_id)
+        .await?;
+    if let Some(log) = &write_log {
+        log.clear().await?;
+    }
+    let (table, ctx, store) = open_cold(&fixture).await?;
+    let reference = plan_statistics(&table, &ctx).await?;
+    let lone_reads = store.reads();
+    let lone_writes = match &write_log {
+        Some(log) => Some(log.writes().await?),
+        None => None,
+    };
+    assert_eq!(
+        lone_reads.len(),
+        SINGLE_FLIGHT_FILES,
+        "a cold scan reads every file's footer: {lone_reads:?}"
+    );
+    assert_eq!(reference.num_rows, Precision::Exact(expected_rows));
+    assert!(
+        matches!(reference.total_byte_size, Precision::Exact(_)),
+        "the footer path reports an exact size: {:?}",
+        reference.total_byte_size
+    );
+    if let Some(writes) = &lone_writes {
+        assert_eq!(
+            writes.values().copied().collect::<Vec<_>>(),
+            vec![1; SINGLE_FLIGHT_FILES],
+            "a lone cold scan persists each file's statistics once: {writes:?}"
+        );
+    }
+
+    // The same cold start, scanned `CONCURRENT_SCANS` times at once.
+    fixture
+        .catalog
+        .clear_snapshot_file_statistics(&table_id)
+        .await?;
+    if let Some(log) = &write_log {
+        log.clear().await?;
+    }
+    let (table, ctx, store) = open_cold(&fixture).await?;
+    let started = std::time::Instant::now();
+    let concurrent =
+        futures::future::try_join_all((0..CONCURRENT_SCANS).map(|_| plan_statistics(&table, &ctx)))
+            .await?;
+    let elapsed = started.elapsed();
+    let concurrent_reads = store.reads();
+    eprintln!(
+        "SINGLE_FLIGHT {CONCURRENT_SCANS} concurrent cold scans planned in {} us",
+        elapsed.as_micros()
+    );
+    let concurrent_writes = match &write_log {
+        Some(log) => Some(log.writes().await?),
+        None => None,
+    };
+    eprintln!(
+        "SINGLE_FLIGHT footer reads per file: one scan {lone_reads:?}, \
+         {CONCURRENT_SCANS} concurrent scans {concurrent_reads:?}"
+    );
+    eprintln!(
+        "SINGLE_FLIGHT statistics writes per file: one scan {lone_writes:?}, \
+         {CONCURRENT_SCANS} concurrent scans {concurrent_writes:?}"
+    );
+    assert_eq!(
+        concurrent_reads, lone_reads,
+        "{CONCURRENT_SCANS} concurrent cold scans must read each footer exactly as often as one scan does"
+    );
+    assert_eq!(
+        concurrent_writes, lone_writes,
+        "{CONCURRENT_SCANS} concurrent cold scans must persist each file's statistics exactly once"
+    );
+    for (scan, statistics) in concurrent.iter().enumerate() {
+        assert_eq!(
+            statistics, &reference,
+            "concurrent scan {scan} must report exactly the statistics a lone scan does"
+        );
+    }
+
+    // One plan that scans the table twice: a self-join plans both scans together.
+    fixture
+        .catalog
+        .clear_snapshot_file_statistics(&table_id)
+        .await?;
+    if let Some(log) = &write_log {
+        log.clear().await?;
+    }
+    let (table, ctx, _store) = open_cold(&fixture).await?;
+    ctx.register_table("t", Arc::clone(&table) as Arc<dyn TableProvider>)?;
+    let batches = ctx
+        .sql("SELECT COUNT(*) AS n FROM t AS a JOIN t AS b ON a.id = b.id")
+        .await?
+        .collect()
+        .await?;
+    let joined = batches[0]
+        .column(0)
+        .as_any()
+        .downcast_ref::<Int64Array>()
+        .expect("COUNT(*) is Int64")
+        .value(0);
+    assert_eq!(
+        joined,
+        i64::try_from(expected_rows)?,
+        "every id joins itself once"
+    );
+    if let Some(log) = &write_log {
+        let writes = log.writes().await?;
+        eprintln!("SINGLE_FLIGHT statistics writes per file for one self-join: {writes:?}");
+        assert_eq!(
+            writes.values().copied().collect::<Vec<_>>(),
+            vec![1; SINGLE_FLIGHT_FILES],
+            "a self-join's two scans must persist each file's statistics once: {writes:?}"
+        );
+    }
+    Ok(())
+}
+
+/// The provider's own accounting agrees with what the store and the metastore
+/// observed, and shows the collections were shared rather than merely ordered.
+async fn scan_file_statistics_counters_match_the_store_and_the_metastore(
+    fixture: common::TestFixture,
+) -> TestResult<()> {
+    let table_id = write_multi_file_table(&fixture).await?;
+    fixture
+        .catalog
+        .clear_snapshot_file_statistics(&table_id)
+        .await?;
+
+    // Cold, no persisted rows: every file goes to its footer, once.
+    let (table, ctx, store) = open_cold(&fixture).await?;
+    futures::future::try_join_all((0..CONCURRENT_SCANS).map(|_| plan_statistics(&table, &ctx)))
+        .await?;
+    let counters = table.scan_file_statistics_counters();
+    eprintln!("SINGLE_FLIGHT counters, cold without persisted rows: {counters:?}");
+    assert_eq!(counters.footer_reads, u64::try_from(SINGLE_FLIGHT_FILES)?);
+    assert_eq!(
+        counters.persisted_upserts,
+        u64::try_from(SINGLE_FLIGHT_FILES)?
+    );
+    assert_eq!(counters.persisted_hits, 0);
+    assert!(
+        counters.joined_in_flight > 0,
+        "the concurrent scans must have waited on each other's collections, or this \
+         proves nothing about coalescing: {counters:?}"
+    );
+    assert_eq!(
+        store.reads().len(),
+        SINGLE_FLIGHT_FILES,
+        "the store saw a footer read for each file"
+    );
+
+    // A restart over those rows: every file is served from its persisted row,
+    // read once however many scans asked.
+    let (table, ctx, store) = open_cold(&fixture).await?;
+    futures::future::try_join_all((0..CONCURRENT_SCANS).map(|_| plan_statistics(&table, &ctx)))
+        .await?;
+    let counters = table.scan_file_statistics_counters();
+    eprintln!("SINGLE_FLIGHT counters, cold over persisted rows: {counters:?}");
+    assert_eq!(counters.footer_reads, 0);
+    assert_eq!(counters.persisted_hits, u64::try_from(SINGLE_FLIGHT_FILES)?);
+    assert_eq!(counters.persisted_upserts, 0);
+    assert!(
+        store.reads().is_empty(),
+        "no footer is read when every row is persisted: {:?}",
+        store.reads()
+    );
+    Ok(())
+}

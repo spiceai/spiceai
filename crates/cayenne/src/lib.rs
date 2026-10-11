@@ -102,6 +102,13 @@ pub mod lookup_index {
     pub use crate::provider::lookup_index::{LookupIndexCounters, LookupIndexVerification};
 }
 
+/// Per-file scan statistics accounting, so a check can prove concurrent cold
+/// scans shared their footer reads and metastore writes. Not a stable API.
+#[doc(hidden)]
+pub mod scan_file_statistics {
+    pub use crate::provider::ScanFileStatisticsCounters;
+}
+
 pub mod row_converter;
 pub(crate) mod schema;
 pub mod stats;
@@ -123,7 +130,7 @@ pub use metadata::{
 };
 pub use metastore::sqlite::{SqliteAutoVacuum, SqliteMetastoreConfig, set_sqlite_metastore_config};
 #[cfg(feature = "partition-table-provider")]
-pub use partition_creator::CayennePartitionCreator;
+pub use partition_creator::{CayennePartitionCreator, partition_column_labels};
 pub use provider::RebuildableWrite;
 pub use provider::constants::{
     LOOKUP_INDEX_DIR_NAME, STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME,
