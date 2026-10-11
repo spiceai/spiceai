@@ -532,21 +532,10 @@ workspace = true
 name = "integration"
 path = "tests/integration.rs"
 
+# Process-wide heap measurements share one counting global allocator.
 [[test]]
-name = "footer_cache_hit_counter_test"
-path = "tests/footer_cache_hit_counter_test.rs"
-
-[[test]]
-name = "inline_cache_gauge_test"
-path = "tests/inline_cache_gauge_test.rs"
-
-[[test]]
-name = "lookup_index_memory_test"
-path = "tests/lookup_index_memory_test.rs"
-
-[[test]]
-name = "mem_tier_limit_accounting_test"
-path = "tests/mem_tier_limit_accounting_test.rs"
+name = "isolated"
+path = "tests/isolated.rs"
 
 # Result correctness vs chDB (SQLLancer + micro). Its own binary because chDB and
 # DuckDB cannot be linked into one process, and the DuckDB lanes are modules of

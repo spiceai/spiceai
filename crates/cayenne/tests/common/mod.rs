@@ -138,7 +138,7 @@ pub fn require_process_per_test(why: &str) {
     assert!(
         std::env::var("NEXTEST_EXECUTION_MODE").as_deref() == Ok("process-per-test"),
         "{why}, so it must run in a process of its own. Run it with \
-         `cargo nextest run -p cayenne --test integration <test name>`: plain \
+         `cargo nextest run -p cayenne <test name>`: plain \
          `cargo test` runs every test in the binary on threads of one process"
     );
 }

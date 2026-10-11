@@ -36,15 +36,10 @@ limitations under the License.
 #![cfg(not(windows))]
 #![allow(clippy::expect_used)]
 
-#[expect(
-    dead_code,
-    reason = "shared helpers for every Cayenne test binary; this one uses only some"
-)]
-mod common;
+use crate::common;
 
-use std::alloc::{GlobalAlloc, Layout, System};
+use crate::live_bytes;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 
 use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
@@ -53,45 +48,6 @@ use cayenne::metadata::CreateTableOptions;
 use cayenne::{CayenneTableProvider, MetadataCatalog};
 use datafusion::datasource::TableProvider;
 use datafusion::prelude::SessionContext;
-
-/// Live heap bytes: everything allocated and not yet freed.
-///
-/// Each integration-test file is its own binary and nextest runs a process per
-/// test, so this counts only this test's own work.
-struct CountingAllocator;
-
-static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
-
-unsafe impl GlobalAlloc for CountingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let ptr = unsafe { System.alloc(layout) };
-        if !ptr.is_null() {
-            LIVE_BYTES.fetch_add(layout.size(), Ordering::Relaxed);
-        }
-        ptr
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
-        unsafe { System.dealloc(ptr, layout) };
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
-        if !new_ptr.is_null() {
-            LIVE_BYTES.fetch_add(new_size, Ordering::Relaxed);
-            LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
-        }
-        new_ptr
-    }
-}
-
-#[global_allocator]
-static ALLOC: CountingAllocator = CountingAllocator;
-
-fn live_bytes() -> usize {
-    LIVE_BYTES.load(Ordering::Relaxed)
-}
 
 /// Appends, each landing as its own inline entry and its own decoded batch.
 ///
@@ -163,6 +119,9 @@ fn rows(schema: &Arc<Schema>, first_id: i64) -> RecordBatch {
 
 #[test]
 fn the_inline_cache_reports_no_more_than_the_process_holds() -> Result<(), String> {
+    common::require_process_per_test(
+        "this test measures the process's live heap through a counting global allocator",
+    );
     common::run_with_backend_blocking(common::BackendType::Sqlite, |fixture| async move {
         let schema = wide_schema();
         let ctx = SessionContext::new();
