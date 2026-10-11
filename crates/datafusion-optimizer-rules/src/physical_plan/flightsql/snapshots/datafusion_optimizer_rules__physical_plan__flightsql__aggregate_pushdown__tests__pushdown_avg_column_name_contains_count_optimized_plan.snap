@@ -1,0 +1,9 @@
+---
+source: crates/datafusion-optimizer-rules/src/physical_plan/flightsql/aggregate_pushdown.rs
+expression: plan_display(&optimized)
+---
+AggregateExec: mode=Final, gby=[l_returnflag@0 as l_returnflag], aggr=[avg(l_discount)]
+  CoalescePartitionsExec
+    UnionExec
+      PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", COUNT("l_discount") AS "__agg_0", SUM("l_discount") AS "__agg_1" FROM foo.foo.lineitem GROUP BY "l_returnflag"
+      PartialAggregationFlightSqlExec sql=SELECT "l_returnflag", COUNT("l_discount") AS "__agg_0", SUM("l_discount") AS "__agg_1" FROM foo.foo.lineitem GROUP BY "l_returnflag"

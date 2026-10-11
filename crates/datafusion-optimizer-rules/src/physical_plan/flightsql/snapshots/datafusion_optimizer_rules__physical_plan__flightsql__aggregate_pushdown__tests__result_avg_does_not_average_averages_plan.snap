@@ -1,0 +1,10 @@
+---
+source: crates/datafusion-optimizer-rules/src/physical_plan/flightsql/aggregate_pushdown.rs
+expression: plan_display(&plan)
+---
+AggregateExec: mode=Final, gby=[], aggr=[avg(l_quantity)]
+  CoalescePartitionsExec
+    AggregateExec: mode=Partial, gby=[], aggr=[avg(l_quantity)]
+      UnionExec
+        FlightSqlExec sql=SELECT l_quantity, l_extendedprice, l_discount, l_returnflag, l_linestatus FROM foo.foo.lineitem
+        FlightSqlExec sql=SELECT l_quantity, l_extendedprice, l_discount, l_returnflag, l_linestatus FROM foo.foo.lineitem

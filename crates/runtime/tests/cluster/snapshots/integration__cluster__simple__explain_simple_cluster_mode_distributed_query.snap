@@ -12,7 +12,7 @@ expression: pretty
 |                  |   DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/test_simple_cluster_mode.csv]]}, projection=[id, name, age, city, score], file_type=csv, has_header=true   |
 |                  |                                                                                                                                                                  |
 | distributed_plan | =========ResolvedStage[stage_id=1.0, partitions=1]=========                                                                                                      |
-|                  | ShuffleWriterExec: partitioning: None                                                                                                                            |
+|                  | ShuffleWriterExec: partitioning: UnknownPartitioning(1)                                                                                                          |
 |                  |   SortExec: expr=[id@0 ASC NULLS LAST], preserve_partitioning=[false]                                                                                            |
 |                  |     DataSourceExec: file_groups={1 group: [[<TEMP_PATH>/test_simple_cluster_mode.csv]]}, projection=[id, name, age, city, score], file_type=csv, has_header=true |
 |                  |                                                                                                                                                                  |
