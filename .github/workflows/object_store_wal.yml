@@ -170,7 +170,7 @@ jobs:
                 "$image" /data
               ;;
           esac
-          echo "$STORE image: $(docker image inspect --format '{{index .RepoDigests 0}}' "$image")"
+          echo "$STORE image: $(docker image inspect --format '{{index .RepoDigests 0}}' "$(docker inspect --format '{{.Image}}' wal-object-store)")"
           port=$(docker port wal-object-store 9000/tcp | head -n 1 | sed 's/.*://')
           echo "AWS_ENDPOINT=http://127.0.0.1:${port:?no published port for the $STORE container}" >> "$GITHUB_ENV"
 
