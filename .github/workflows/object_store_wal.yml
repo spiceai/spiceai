@@ -125,6 +125,10 @@ jobs:
         with:
           persist-credentials: false
       - uses: ./.github/actions/setup-rust
+      # The dev runner image has no C toolchain, and rustc links through cc. The
+      # Macs already have one.
+      - uses: ./.github/actions/setup-cc
+        if: runner.os == 'Linux'
       # The dev runner image has python3 but no pip. The macOS runners carry
       # Homebrew interpreters, and installing one through setup-python needs sudo.
       - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
@@ -201,23 +205,37 @@ jobs:
               ;;
           esac
           "$dir/$STORE" --version
-          # Several runner instances share each Mac, so take whatever port is free.
-          port=$(python -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+          # Several runner instances share each Mac. Port 0 has the kernel pick a
+          # free port as the server binds it, so no other process can take the port
+          # in between, and RustFS's console, on a fixed port, stays off.
           case "$STORE" in
             minio)
               MINIO_ROOT_USER="$AWS_ACCESS_KEY_ID" MINIO_ROOT_PASSWORD="$AWS_SECRET_ACCESS_KEY" MINIO_BROWSER=off \
-                "$dir/minio" server "$dir/data" --address "127.0.0.1:$port" > "$dir/server.log" 2>&1 &
+                "$dir/minio" server "$dir/data" --address 127.0.0.1:0 > "$dir/server.log" 2>&1 &
               ;;
             rustfs)
-              RUSTFS_ACCESS_KEY="$AWS_ACCESS_KEY_ID" RUSTFS_SECRET_KEY="$AWS_SECRET_ACCESS_KEY" \
-                "$dir/rustfs" server --address "127.0.0.1:$port" "$dir/data" > "$dir/server.log" 2>&1 &
+              RUSTFS_ACCESS_KEY="$AWS_ACCESS_KEY_ID" RUSTFS_SECRET_KEY="$AWS_SECRET_ACCESS_KEY" RUSTFS_CONSOLE_ENABLE=false \
+                "$dir/rustfs" server --address 127.0.0.1:0 "$dir/data" > "$dir/server.log" 2>&1 &
               ;;
           esac
+          pid=$!
           {
-            echo "WAL_SERVER_PID=$!"
+            echo "WAL_SERVER_PID=$pid"
             echo "WAL_SERVER_LOG=$dir/server.log"
-            echo "AWS_ENDPOINT=http://127.0.0.1:$port"
           } >> "$GITHUB_ENV"
+          port=''
+          for _ in $(seq 1 30); do
+            port=$(lsof -nP -a -p "$pid" -iTCP@127.0.0.1 -sTCP:LISTEN -Fn 2> /dev/null | sed -n 's/^n127\.0\.0\.1://p' | head -n 1) || true
+            if [ -n "$port" ] || ! kill -0 "$pid" 2> /dev/null; then
+              break
+            fi
+            sleep 1
+          done
+          if [ -z "$port" ]; then
+            echo "::error::$STORE was not listening on 127.0.0.1 within 30 seconds; its log is printed below."
+            exit 1
+          fi
+          echo "AWS_ENDPOINT=http://127.0.0.1:$port" >> "$GITHUB_ENV"
 
       - name: Create the WAL bucket
         if: matrix.store == 'minio' || matrix.store == 'rustfs'
@@ -241,8 +259,7 @@ jobs:
             if [ "$code" = 200 ]; then
               exit 0
             fi
-            # A server that exited, for example over a port another job took
-            # first, would otherwise be waited out here.
+            # A server that has exited would otherwise be waited out here.
             if ! server_running; then
               echo "::error::$STORE exited before it created bucket '$WAL_BUCKET' at $AWS_ENDPOINT; its log is printed below."
               exit 1
