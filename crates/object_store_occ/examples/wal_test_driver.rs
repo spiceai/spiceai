@@ -16,6 +16,17 @@ limitations under the License.
 
 //! JSON-lines worker for the process-level WAL qualification harness.
 //! Run via `test/object_store_occ/e2e.py`; this is not a runtime API.
+//!
+//! A location is a local directory, or `s3://bucket/prefix` on an S3-compatible
+//! service configured through the standard `AWS_*` environment variables
+//! (`AWS_ENDPOINT`, `AWS_ALLOW_HTTP`, `AWS_ACCESS_KEY_ID`, ...).
+//!
+//! ```text
+//! wal_test_driver <location>                 serve the protocol on stdin/stdout
+//! wal_test_driver --probe <location>         report conditional-write enforcement
+//! wal_test_driver --export <location> <dir>  copy every object into a directory
+//! wal_test_driver --purge <location>         delete every object under an s3:// prefix
+//! ```
 #![expect(
     clippy::expect_used,
     reason = "qualification worker reports test preconditions"
@@ -28,8 +39,11 @@ use std::sync::atomic::{AtomicU8, Ordering};
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use futures::{StreamExt, TryStreamExt};
+use object_store::aws::AmazonS3Builder;
 use object_store::path::Path;
-use object_store_occ::LocalConditionalPut;
+use object_store::prefix::PrefixStore;
+use object_store::{ObjectStore, ObjectStoreExt};
 use object_store_occ::store::{
     self, ExpectedRevision, ObjectStoreState, StateChange, StateRecord, StateStore, WriteId,
     WriteOutcome,
@@ -38,10 +52,109 @@ use object_store_occ::wal::{
     CommitOutcome, CommitReceipt, Limits, PreparedCommit, Resolution, Snapshot, Transaction,
     WalStateStore,
 };
+use object_store_occ::{Enforcement, LocalConditionalPut, probe_conditional_writes};
 use serde::Deserialize;
 use serde_json::{Value, json};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error>>;
+
+const USAGE: &str =
+    "usage: wal_test_driver [--probe | --purge] <location> | --export <location> <directory>";
+
+/// Concurrent requests while exporting a store's objects.
+const EXPORT_CONCURRENCY: usize = 16;
+
+/// Splits `s3://bucket/prefix` into its bucket and prefix; any other location
+/// is a local directory.
+fn object_store_location(location: &str) -> Option<(&str, Path)> {
+    let rest = location.strip_prefix("s3://")?;
+    let (bucket, prefix) = rest.split_once('/').unwrap_or((rest, ""));
+    Some((bucket, Path::from(prefix)))
+}
+
+fn open_store(location: &str) -> Result<Arc<dyn ObjectStore>> {
+    let Some((bucket, prefix)) = object_store_location(location) else {
+        return Ok(Arc::new(LocalConditionalPut::new(location)?));
+    };
+    let store = AmazonS3Builder::from_env()
+        .with_bucket_name(bucket)
+        .build()?;
+    Ok(Arc::new(PrefixStore::new(store, prefix)))
+}
+
+fn enforcement(enforcement: &Enforcement) -> String {
+    match enforcement {
+        Enforcement::Enforced => "enforced".to_owned(),
+        Enforcement::Ignored => "ignored".to_owned(),
+        Enforcement::Unsupported => "unsupported".to_owned(),
+        Enforcement::Unknown(reason) => format!("unknown: {reason}"),
+    }
+}
+
+/// Reports whether the store refuses a duplicate create and a stale update,
+/// which every WAL guarantee depends on.
+async fn probe(location: &str) -> Result<()> {
+    let store = open_store(location)?;
+    let support = probe_conditional_writes(store.as_ref(), &Path::default()).await;
+    emit(&json!({
+        "create": enforcement(&support.create),
+        "update": enforcement(&support.update),
+    }));
+    Ok(())
+}
+
+/// Copies every object under `location` into `directory`, keeping its key as
+/// the relative path, so a history's backing store outlives the service.
+async fn export(location: &str, directory: &std::path::Path) -> Result<()> {
+    let store = open_store(location)?;
+    let keys: Vec<Path> = store
+        .list(None)
+        .map_ok(|meta| meta.location)
+        .try_collect()
+        .await?;
+    futures::stream::iter(keys.iter().map(|key| {
+        let store = Arc::clone(&store);
+        let file = directory.join(key.as_ref());
+        async move {
+            let bytes = store.get(key).await?.bytes().await?;
+            if let Some(parent) = file.parent() {
+                tokio::fs::create_dir_all(parent).await?;
+            }
+            tokio::fs::write(&file, bytes).await?;
+            Ok::<_, Box<dyn std::error::Error>>(())
+        }
+    }))
+    .buffer_unordered(EXPORT_CONCURRENCY)
+    .try_collect::<()>()
+    .await?;
+    emit(&json!({"exported": keys.len()}));
+    Ok(())
+}
+
+/// Deletes every object under an `s3://bucket/prefix` location. The WAL keeps
+/// no garbage collector, so a shared service accumulates every run's history
+/// until something removes it. A whole bucket is never purged.
+async fn purge(location: &str) -> Result<()> {
+    let Some((_, prefix)) = object_store_location(location) else {
+        return Err(format!("{location} is not an s3:// location").into());
+    };
+    if prefix.as_ref().is_empty() {
+        return Err(format!("refusing to purge every object in {location}; name a prefix").into());
+    }
+    let store = open_store(location)?;
+    // List before deleting, so a paginated listing never races its own deletes.
+    let keys: Vec<Path> = store
+        .list(None)
+        .map_ok(|meta| meta.location)
+        .try_collect()
+        .await?;
+    let deleted = store
+        .delete_stream(futures::stream::iter(keys.into_iter().map(Ok)).boxed())
+        .try_fold(0_usize, |deleted, _| async move { Ok(deleted + 1) })
+        .await?;
+    emit(&json!({"deleted": deleted}));
+    Ok(())
+}
 
 #[derive(Deserialize)]
 #[serde(tag = "op", rename_all = "snake_case", deny_unknown_fields)]
@@ -274,15 +387,23 @@ impl Driver {
 }
 
 fn main() -> Result<()> {
-    let root = std::env::args()
-        .nth(1)
-        .ok_or("expected storage directory")?;
+    let args: Vec<String> = std::env::args().skip(1).collect();
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()?;
-    let inner: Arc<dyn StateStore> = Arc::new(ObjectStoreState::new(Arc::new(
-        LocalConditionalPut::new(root)?,
-    )));
+    match args.iter().map(String::as_str).collect::<Vec<_>>()[..] {
+        ["--probe", location] => runtime.block_on(probe(location)),
+        ["--export", location, directory] => {
+            runtime.block_on(export(location, std::path::Path::new(directory)))
+        }
+        ["--purge", location] => runtime.block_on(purge(location)),
+        [location] if !location.starts_with("--") => serve(&runtime, location),
+        _ => Err(USAGE.into()),
+    }
+}
+
+fn serve(runtime: &tokio::runtime::Runtime, location: &str) -> Result<()> {
+    let inner: Arc<dyn StateStore> = Arc::new(ObjectStoreState::new(open_store(location)?));
     let armed = Arc::new(AtomicU8::new(0));
     let state: Arc<dyn StateStore> = Arc::new(Barriers {
         inner,

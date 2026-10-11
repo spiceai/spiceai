@@ -7,6 +7,10 @@ SlateDB and Redis can run the same committed histories as independent oracles.
 SlateDB also checks overlays and historical snapshots. Redis checks MULTI/EXEC
 batches and whole-domain WATCH conflicts; it does not emulate MVCC snapshots.
 SlateDB's finer-grained conflict policy is not compared to whole-head WAL OCC.
+
+The WAL under test runs on local directories, or with --store on an
+S3-compatible service configured through the standard AWS_* environment
+variables (AWS_ENDPOINT, AWS_ALLOW_HTTP, AWS_ACCESS_KEY_ID, ...).
 """
 
 from __future__ import annotations
@@ -24,17 +28,57 @@ import selectors
 import subprocess
 import threading
 import time
+from uuid import uuid4
 
 TIMEOUT = 60
 
 
+class Stores:
+    """Where each history keeps its WAL.
+
+    Local runs use a directory per history under the artifacts. An object-store
+    run gets a fresh namespace under the --store URL, because a WAL namespace is
+    never reused; its objects are copied into the artifacts when the run ends.
+    The SlateDB oracle always runs on local disk.
+    """
+
+    def __init__(self, artifacts, url):
+        self.local = artifacts / "stores"
+        self.local.mkdir()
+        self.url = f"{url.rstrip('/')}/{uuid4().hex}" if url else None
+
+    def location(self, name):
+        return f"{self.url}/{name}" if self.url else self.local / name
+
+
+def driver_command(executable, *args, timeout):
+    result = subprocess.run(
+        [str(executable), *map(str, args)], capture_output=True, text=True,
+        timeout=timeout, check=False,
+    )
+    assert result.returncode == 0, f"{args[0]} failed ({result.returncode}): {result.stderr.strip()}"
+    return json.loads(result.stdout)
+
+
+def check_conditional_writes(executable, location):
+    # Every WAL guarantee rests on the store refusing a duplicate create and a
+    # stale update. A store that ignores the condition still passes the
+    # single-writer histories, and loses data only under concurrency.
+    if isinstance(location, Path):
+        location.mkdir(parents=True)
+    support = driver_command(executable, "--probe", location, timeout=TIMEOUT)
+    assert support == {"create": "enforced", "update": "enforced"}, f"conditional writes are not enforced: {support}"
+    print("conditional writes: create-if-absent and update-at-version are enforced", flush=True)
+
+
 class Worker:
-    def __init__(self, executable, directory, artifacts, name):
-        directory.mkdir(parents=True, exist_ok=True)
+    def __init__(self, executable, location, artifacts, name):
+        if isinstance(location, Path):
+            location.mkdir(parents=True, exist_ok=True)
         self.log = (artifacts / f"{name}.jsonl").open("w", encoding="utf-8")
         self.errors = (artifacts / f"{name}.stderr").open("w", encoding="utf-8")
         self.process = subprocess.Popen(
-            [str(executable), str(directory)], stdin=subprocess.PIPE,
+            [str(executable), str(location)], stdin=subprocess.PIPE,
             stdout=subprocess.PIPE, stderr=self.errors, text=True, bufsize=1,
         )
         self.selector = selectors.DefaultSelector()
@@ -122,20 +166,20 @@ async def slate_rows(reader, prefix=""):
     return result
 
 
-async def differential(executable, root, artifacts, use_slate, redis, seed, steps):
+async def differential(executable, stores, artifacts, use_slate, redis, seed, steps):
     db = None
     oracle_store = None
     if use_slate:
         from slatedb.uniffi import DbBuilder, IsolationLevel, ObjectStoreBuilder, ObjectStoreType
 
-        oracle_dir = root / f"slate-{seed}"
+        oracle_dir = stores.local / f"slate-{seed}"
         oracle_dir.mkdir()
         builder = ObjectStoreBuilder(ObjectStoreType.LOCAL)
         builder.with_config("local_path", str(oracle_dir.resolve()))
         oracle_store = builder.build()
         db = await DbBuilder("oracle", oracle_store).build()
-    directory = root / f"differential-{seed}"
-    worker = Worker(executable, directory, artifacts, f"history-{seed}-0")
+    location = stores.location(f"differential-{seed}")
+    worker = Worker(executable, location, artifacts, f"history-{seed}-0")
     rng = random.Random(seed)
     model, retained = {}, []
     keys = [f"keys/{n:02}" for n in range(19)] + ["é/雪", "é/a", "keys/\x00", "z" * 1024]
@@ -212,7 +256,7 @@ async def differential(executable, root, artifacts, use_slate, redis, seed, step
             if step % 31 == 30:
                 retained.clear()
                 worker.close()
-                worker = Worker(executable, directory, artifacts, f"history-{seed}-{step + 1}")
+                worker = Worker(executable, location, artifacts, f"history-{seed}-{step + 1}")
                 if db:
                     await db.shutdown()
                     db = await DbBuilder("oracle", oracle_store).build()
@@ -231,10 +275,10 @@ async def differential(executable, root, artifacts, use_slate, redis, seed, step
         print(f"Redis seed={seed}: {steps} atomic batches; committed point/prefix reads and client reconnect agree", flush=True)
 
 
-def redis_conflicts(executable, root, artifacts, redis):
+def redis_conflicts(executable, stores, artifacts, redis):
     # A whole Redis hash is the same conflict domain as one WAL head. These
     # writes change data: checkpoints and no-op publications have no Redis analog.
-    with Worker(executable, root / "redis-conflict", artifacts, "redis-conflict-wal") as worker:
+    with Worker(executable, stores.location("redis-conflict"), artifacts, "redis-conflict-wal") as worker:
         for winner, loser in [
             ({"new/key": []}, {"stale/key": [9]}),
             ({"new/key": [0, 255]}, {"new/key": None, "stale/key": []}),
@@ -260,16 +304,16 @@ def atomic_state(state):
     return a, b
 
 
-def concurrency(executable, root, artifacts, writers=4, rounds=20):
-    directory = root / "concurrency"
-    with Worker(executable, directory, artifacts, "initialize") as worker:
+def concurrency(executable, stores, artifacts, writers=4, rounds=20):
+    location = stores.location("concurrency")
+    with Worker(executable, location, artifacts, "initialize") as worker:
         worker.prepare({"accounts/a": list(b"10000"), "accounts/b": list(b"0")})
         assert worker.request(op="commit", name="tx")["outcome"] == "committed"
     done = threading.Event()
 
     def writer(index):
         results = []
-        with Worker(executable, directory, artifacts, f"writer-{index}") as worker:
+        with Worker(executable, location, artifacts, f"writer-{index}") as worker:
             for number in range(rounds):
                 for retry in range(500):
                     worker.request(op="begin", name="tx")
@@ -294,7 +338,7 @@ def concurrency(executable, root, artifacts, writers=4, rounds=20):
 
     def reader():
         samples, previous = 0, 0
-        with Worker(executable, directory, artifacts, "reader") as worker:
+        with Worker(executable, location, artifacts, "reader") as worker:
             worker.request(op="snapshot", name="pinned")
             pinned = worker.read(snapshot="pinned")
             while not done.is_set() or samples < 20:
@@ -308,7 +352,7 @@ def concurrency(executable, root, artifacts, writers=4, rounds=20):
 
     def checkpointer():
         attempts = 0
-        with Worker(executable, directory, artifacts, "checkpointer") as worker:
+        with Worker(executable, location, artifacts, "checkpointer") as worker:
             while not done.is_set():
                 result = worker.request(op="checkpoint")
                 assert result["outcome"] in ("applied", "conflict"), result
@@ -326,7 +370,7 @@ def concurrency(executable, root, artifacts, writers=4, rounds=20):
             done.set()
         samples = readers.result(timeout=TIMEOUT)
         checkpoint_count = checkpoints.result(timeout=TIMEOUT)
-    with Worker(executable, directory, artifacts, "concurrency-recovery") as worker:
+    with Worker(executable, location, artifacts, "concurrency-recovery") as worker:
         state = worker.read()
         assert atomic_state(state) == (10000 - writers * rounds, writers * rounds), state
         assert sorted(seq for seq, _ in results) == list(range(2, writers * rounds + 2))
@@ -335,15 +379,15 @@ def concurrency(executable, root, artifacts, writers=4, rounds=20):
     print(f"concurrency: {len(results)} acknowledged transfers, {samples} reader snapshots, {checkpoint_count} competing checkpoints", flush=True)
 
 
-def crashes(executable, root, artifacts):
+def crashes(executable, stores, artifacts):
     for point in [1, 2, 3]:
-        directory = root / f"commit-crash-{point}"
-        with Worker(executable, directory, artifacts, f"commit-crash-{point}") as worker:
+        location = stores.location(f"commit-crash-{point}")
+        with Worker(executable, location, artifacts, f"commit-crash-{point}") as worker:
             receipt = worker.prepare({"a": [1], "b": [2]})
             worker.send(op="commit", name="tx", barrier=point)
             assert worker.receive() == {"paused": point}
             worker.close(kill=True)
-        with Worker(executable, directory, artifacts, f"commit-recovery-{point}") as worker:
+        with Worker(executable, location, artifacts, f"commit-recovery-{point}") as worker:
             result = worker.read()
             assert result["rows"] == ([["a", [1]], ["b", [2]]] if point == 3 else []), result
             assert worker.request(op="resolve", receipt=receipt)["outcome"] == ("committed" if point == 3 else "pending")
@@ -351,8 +395,8 @@ def crashes(executable, root, artifacts):
             assert worker.request(op="resolve", receipt=receipt)["outcome"] == ("committed" if point == 3 else "rejected")
             print(f"SIGKILL commit boundary={point}: rows={result['rows']}, sequence={result['sequence']}", flush=True)
     for point in [1, 3, 4, 5]:
-        directory = root / f"checkpoint-crash-{point}"
-        with Worker(executable, directory, artifacts, f"checkpoint-crash-{point}") as worker:
+        location = stores.location(f"checkpoint-crash-{point}")
+        with Worker(executable, location, artifacts, f"checkpoint-crash-{point}") as worker:
             for batch in range(3):
                 worker.prepare({f"keys/{batch}": [batch] * (80 * 1024)})
                 assert worker.request(op="commit", name="tx")["outcome"] == "committed"
@@ -360,25 +404,38 @@ def crashes(executable, root, artifacts):
             worker.send(op="checkpoint", barrier=point)
             assert worker.receive() == {"paused": point}
             worker.close(kill=True)
-        with Worker(executable, directory, artifacts, f"checkpoint-recovery-{point}") as worker:
+        with Worker(executable, location, artifacts, f"checkpoint-recovery-{point}") as worker:
             assert worker.read() == expected
             assert worker.request(op="checkpoint")["outcome"] == "applied"
             assert worker.read() == expected
         print(f"SIGKILL checkpoint boundary={point}: recovered all 3 pages", flush=True)
 
 
+def export_store(executable, stores):
+    # The service does not outlive the run, so its objects are kept with the
+    # histories. A failed copy is reported without replacing the run's result.
+    target = stores.local / "object-store"
+    try:
+        exported = driver_command(executable, "--export", stores.url, target, timeout=TIMEOUT * 5)["exported"]
+        print(f"copied {exported} objects from {stores.url} into {target}", flush=True)
+    except (AssertionError, json.JSONDecodeError, subprocess.TimeoutExpired) as error:
+        print(f"could not copy {stores.url} into the artifacts: {error}", flush=True)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--driver", type=Path, required=True)
     parser.add_argument("--artifacts", type=Path, required=True)
+    parser.add_argument("--store", help="run the WAL on an object store, e.g. s3://bucket/prefix (default: local directories)")
     parser.add_argument("--slatedb", action="store_true", help="require the pinned independent oracle")
     parser.add_argument("--redis-url", help="require a Redis oracle, e.g. redis://127.0.0.1:6379/0")
     parser.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 17, 5489])
     parser.add_argument("--steps", type=int, default=96)
     args = parser.parse_args()
     args.artifacts.mkdir(parents=True, exist_ok=False)
-    root = args.artifacts / "stores"
-    root.mkdir()
+    driver = args.driver.resolve()
+    stores = Stores(args.artifacts, args.store)
+    print(f"WAL store: {stores.url or stores.local}", flush=True)
     if args.slatedb:
         version = importlib.metadata.version("slatedb")
         assert version == "0.17.0", f"expected SlateDB 0.17.0, found {version}"
@@ -389,15 +446,20 @@ def main():
         from redis_oracle import RedisOracle
     else:
         print("Redis differential testing NOT RUN (pass --redis-url)", flush=True)
-    for seed in args.seeds:
-        oracle = RedisOracle(args.redis_url, args.artifacts, f"redis-{seed}") if args.redis_url else nullcontext()
-        with oracle as redis:
-            asyncio.run(differential(args.driver.resolve(), root, args.artifacts, args.slatedb, redis, seed, args.steps))
-    if args.redis_url:
-        with RedisOracle(args.redis_url, args.artifacts, "redis-conflict") as redis:
-            redis_conflicts(args.driver.resolve(), root, args.artifacts, redis)
-    concurrency(args.driver.resolve(), root, args.artifacts)
-    crashes(args.driver.resolve(), root, args.artifacts)
+    check_conditional_writes(driver, stores.location("probe"))
+    try:
+        for seed in args.seeds:
+            oracle = RedisOracle(args.redis_url, args.artifacts, f"redis-{seed}") if args.redis_url else nullcontext()
+            with oracle as redis:
+                asyncio.run(differential(driver, stores, args.artifacts, args.slatedb, redis, seed, args.steps))
+        if args.redis_url:
+            with RedisOracle(args.redis_url, args.artifacts, "redis-conflict") as redis:
+                redis_conflicts(driver, stores, args.artifacts, redis)
+        concurrency(driver, stores, args.artifacts)
+        crashes(driver, stores, args.artifacts)
+    finally:
+        if stores.url:
+            export_store(driver, stores)
     print("PASS: WAL process-level qualification", flush=True)
 
 
