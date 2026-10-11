@@ -69,6 +69,26 @@ const DANGEROUS_PATH_PATTERNS: &[&str] = &[
     "?:*",    // Windows drive letter (C:, D:, etc.)
 ];
 
+/// Parent variables a stdio MCP server inherits; Spicepod `env` adds to these.
+/// Matches the MCP Python SDK so secrets in the `spiced` environment do not leak.
+#[cfg(not(windows))]
+const INHERITED_STDIO_ENV_VARS: &[&str] = &["HOME", "LOGNAME", "PATH", "SHELL", "TERM", "USER"];
+#[cfg(windows)]
+const INHERITED_STDIO_ENV_VARS: &[&str] = &[
+    "APPDATA",
+    "HOMEDRIVE",
+    "HOMEPATH",
+    "LOCALAPPDATA",
+    "PATH",
+    "PATHEXT",
+    "PROCESSOR_ARCHITECTURE",
+    "SYSTEMDRIVE",
+    "SYSTEMROOT",
+    "TEMP",
+    "USERNAME",
+    "USERPROFILE",
+];
+
 /// Pre-compiled glob set for path validation
 static DANGEROUS_PATH_GLOB_SET: LazyLock<GlobSet> = LazyLock::new(|| {
     let mut builder = GlobSetBuilder::new();
@@ -512,7 +532,14 @@ impl McpToolCatalog {
 
                 let transport =
                     TokioChildProcess::new(Command::new(command.as_str()).configure(|c| {
-                        c.envs(env).args(args);
+                        c.env_clear()
+                            .envs(
+                                INHERITED_STDIO_ENV_VARS.iter().filter_map(|key| {
+                                    std::env::var_os(key).map(|value| (*key, value))
+                                }),
+                            )
+                            .envs(env)
+                            .args(args);
                     }))
                     .boxed()
                     .context(UnderlyingTransportSnafu)?;
