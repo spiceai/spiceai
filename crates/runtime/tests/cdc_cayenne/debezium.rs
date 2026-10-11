@@ -43,10 +43,6 @@ limitations under the License.
 
 #![allow(clippy::expect_used)]
 
-// Accelerator engines are their own crates and self-register through a linkme slice. Each
-// integration test is a separate binary that links independently, and the linker drops an
-// unreferenced slice static, so a binary exercising Cayenne must name the crate itself.
-#[cfg(not(windows))]
 use super::make_refresh_task;
 
 use std::sync::Arc;
