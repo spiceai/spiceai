@@ -23,6 +23,8 @@ use spicepod::{
 };
 use tracing::instrument;
 
+use test_framework::source_versions::{Source, source_image};
+
 use crate::docker::{ContainerRunnerBuilder, RunningContainer};
 
 pub fn make_mysql_dataset(path: &str, name: &str, port: u16, accelerated: bool) -> Dataset {
@@ -43,14 +45,13 @@ pub fn make_mysql_dataset(path: &str, name: &str, port: u16, accelerated: bool) 
 }
 
 pub const MYSQL_ROOT_PASSWORD: &str = "integration-test-pw";
-const MYSQL_IMAGE: &str = "docker.io/library/mysql:latest";
 const MYSQL_DOCKER_CONTAINER: &str = "runtime-integration-test-mysql";
 const MYSQL_CONTAINER_START_TIMEOUT: Duration = Duration::from_mins(3);
 const MYSQL_HOST_PORT_READY_TIMEOUT: Duration = Duration::from_mins(1);
 
 #[instrument]
 pub async fn start_mysql_docker_container() -> Result<RunningContainer, anyhow::Error> {
-    start_mysql_docker_container_with_image(MYSQL_IMAGE).await
+    start_mysql_docker_container_with_image(&source_image(Source::MySql)?).await
 }
 
 /// How many times [`start_mysql_docker_container_retrying_startup`] tries to
@@ -106,7 +107,7 @@ pub async fn start_mysql_docker_container_with_image(
 #[instrument]
 pub async fn start_mysql_gtid_docker_container() -> Result<RunningContainer, anyhow::Error> {
     start_mysql_container_inner(
-        MYSQL_IMAGE,
+        &source_image(Source::MySql)?,
         &["--gtid-mode=ON", "--enforce-gtid-consistency=ON"],
     )
     .await

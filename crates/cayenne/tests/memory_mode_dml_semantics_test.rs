@@ -32,7 +32,7 @@ limitations under the License.
 //!   source — so the refresh path is the only way in, and the policy is exercised
 //!   here directly.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 

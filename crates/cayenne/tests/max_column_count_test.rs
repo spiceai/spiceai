@@ -26,7 +26,7 @@ limitations under the License.
 //! The test creates a table with 1000 columns, inserts data, and verifies that
 //! queries against the accelerated table return correct results.
 
-mod common;
+use crate::common;
 
 use arrow::array::{Array, Int64Array, RecordBatch, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
