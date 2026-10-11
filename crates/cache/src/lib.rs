@@ -1271,6 +1271,17 @@ impl QueryResultsCacheProvider {
             .await;
     }
 
+    /// Drops every cached result.
+    ///
+    /// For a change no table change records: a result's key is the query, not
+    /// the definitions of the functions it called, so when a Spicepod reload
+    /// redefines or removes a user function, any entry may hold rows the old
+    /// definition computed. A `cache_key_type: sql` hit is answered before
+    /// planning, so discarding cached plans does not reach it; this does.
+    pub async fn invalidate_all(&self) {
+        self.cache.invalidate_all().await;
+    }
+
     /// Invalidates the cached results that read `table_name`, because the table's
     /// *contents* changed — an accelerated refresh, a DML write.
     ///

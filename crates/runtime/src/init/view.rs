@@ -140,19 +140,19 @@ fn has_view_cycle(reads: &HashMap<ResolvedTableReference, Option<TablesRead>>) -
         }
         unresolved.insert(view, count);
     }
-    let mut ready: Vec<&ResolvedTableReference> = unresolved
+    let mut queue: Vec<&ResolvedTableReference> = unresolved
         .iter()
         .filter(|(_, count)| **count == 0)
         .map(|(view, _)| *view)
         .collect();
     let mut taken = 0;
-    while let Some(view) = ready.pop() {
+    while let Some(view) = queue.pop() {
         taken += 1;
         for reader in readers.get(view).into_iter().flatten() {
             if let Some(count) = unresolved.get_mut(reader) {
                 *count -= 1;
                 if *count == 0 {
-                    ready.push(reader);
+                    queue.push(reader);
                 }
             }
         }
