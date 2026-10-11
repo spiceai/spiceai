@@ -238,20 +238,15 @@ pub fn init_interner_metrics() {
 pub enum InvalidationMode {
     /// The entries that read the table were dropped from the cache.
     Evict,
-    /// The entries were left resident and marked stale as of this instant, to
-    /// be served once more inside `stale_while_revalidate_ttl` while a
-    /// background revalidation replaces each of them.
-    MarkStale,
 }
 
 impl InvalidationMode {
     /// Every variant, so a caller publishing the series up front cannot omit one.
-    pub const ALL: [Self; 2] = [Self::Evict, Self::MarkStale];
+    pub const ALL: [Self; 1] = [Self::Evict];
 
     fn as_str(self) -> &'static str {
         match self {
             Self::Evict => "evict",
-            Self::MarkStale => "mark_stale",
         }
     }
 
@@ -263,36 +258,19 @@ impl InvalidationMode {
 /// Why a lookup found an entry but would not serve it, reported as the `reason`
 /// attribute on `*_cache_stale_rejections`.
 ///
-/// The three are operationally distinct, and an unlabelled total cannot be
-/// acted on: only [`StaleRejectionReason::WindowExpired`] says the configured
-/// `stale_while_revalidate_ttl` is too short for the rate queries arrive at.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StaleRejectionReason {
-    /// No `stale_while_revalidate_ttl` is configured, so an invalidation is a
-    /// hard one and the entry stopped being servable the moment it was marked.
-    NoStaleWindow,
-    /// A window is configured but the query arrived after it closed, so the
-    /// entry expired unserved instead of absorbing the refresh it was kept for.
-    WindowExpired,
-    /// The entry is inside the window, but this lookup serves only fresh
-    /// results and so declined it — a miss the stale-while-revalidate path
-    /// would have absorbed.
-    FreshRequired,
+    /// A table changed at or after the entry's read began.
+    Invalidated,
 }
 
 impl StaleRejectionReason {
-    /// Every variant, so a caller publishing the series up front cannot omit one.
-    pub const ALL: [Self; 3] = [
-        Self::NoStaleWindow,
-        Self::WindowExpired,
-        Self::FreshRequired,
-    ];
+    /// Every rejection reason, for seeding the metric series.
+    pub const ALL: [Self; 1] = [Self::Invalidated];
 
     fn as_str(self) -> &'static str {
         match self {
-            Self::NoStaleWindow => "no_window",
-            Self::WindowExpired => "window_expired",
-            Self::FreshRequired => "fresh_required",
+            Self::Invalidated => "invalidated",
         }
     }
 
@@ -439,7 +417,7 @@ macro_rules! generate_cache_metrics {
                 METER
                     .u64_counter(concat!($prefix, "_cache_stale_rejections"))
                     .with_description(
-                        "Number of lookups that found an entry but refused to serve it because a table it read had since been invalidated. Split by `reason` into whether no stale-while-revalidate window is configured, the window had closed, or the caller serves only fresh results. These are also counted as misses.",
+                        "Number of lookups that found an entry but refused to serve it because a table it read had since been invalidated. Reported with reason `invalidated`. These are also counted as misses.",
                     )
                     .build()
             });
@@ -448,7 +426,7 @@ macro_rules! generate_cache_metrics {
                 METER
                     .u64_counter(concat!($prefix, "_cache_table_invalidations"))
                     .with_description(
-                        "Number of table invalidations applied to this cache, split by `mode` into whether the dependent entries were evicted or left resident and marked stale. Counts invalidations, not the entries each one affected.",
+                        "Number of hard table invalidations applied to this cache, with mode `evict`. Counts invalidations, not the entries each one affected.",
                     )
                     .build()
             });
@@ -458,15 +436,6 @@ macro_rules! generate_cache_metrics {
                     .u64_counter(concat!($prefix, "_cache_swr_revalidations"))
                     .with_description(
                         "Number of completed background stale-while-revalidate revalidations, split by `outcome`. Any outcome other than `stored` leaves the previous entry in place to be served stale until it expires.",
-                    )
-                    .build()
-            });
-
-            pub static INVALIDATION_STALE_HITS: LazyLock<Counter<u64>> = LazyLock::new(|| {
-                METER
-                    .u64_counter(concat!($prefix, "_cache_invalidation_stale_hits"))
-                    .with_description(
-                        "Number of results served from an entry a table invalidation had marked stale, within the configured stale-while-revalidate window. Counted where the result is handed back, so a request whose own `max-stale` is shorter than the window, or whose entry fails to decode, is not counted here even though the entry was found.",
                     )
                     .build()
             });
@@ -512,7 +481,6 @@ macro_rules! generate_cache_metrics {
                 REQUESTS.add(0, &[]);
                 HITS.add(0, &[]);
                 MISSES.add(0, &[]);
-                INVALIDATION_STALE_HITS.add(0, &[]);
                 STALE_WHILE_REVALIDATE_SKIPPED.add(0, &[]);
                 STALE_WHILE_REVALIDATE_BACKGROUND_QUERIES.add(0, &[]);
                 for reason in EvictionReason::ALL {
@@ -577,8 +545,7 @@ pub trait CacheMetrics: Send + Sync {
     /// Records a table invalidation applied to this cache, and what it did to
     /// the dependent entries. Counts invalidations, not the entries each one
     /// affected — the per-entry count is [`Self::record_eviction`] under
-    /// [`EvictionReason::Invalidated`], which reports nothing at all when the
-    /// invalidation marks entries stale instead of removing them.
+    /// [`EvictionReason::Invalidated`].
     fn record_table_invalidation(mode: InvalidationMode)
     where
         Self: Sized;

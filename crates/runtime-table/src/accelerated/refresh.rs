@@ -1416,13 +1416,13 @@ impl Refresher {
                                     // No cache provider means runtime is shutting down and cache is already cleaned up
                                     if let Some(cache_provider) = cache_provider_ref.upgrade() {
                                         // The refresh rewrote every synchronized (e.g. localpod) child's
-                                        // accelerator along with this dataset's, so cached results for the
-                                        // children are exactly as stale as the parent's (#12887). Children
+                                        // accelerator along with this dataset's, so their plans and search
+                                        // caches must be invalidated as well (#12887). Children
                                         // attach after their own initial load completes, so the set is
                                         // resolved live rather than captured when this loop started.
                                         for table_name in refresh_task.get_dataset_names().await {
-                                            if let Err(e) = cache_provider.invalidate_for_table(table_name.clone()).await {
-                                                tracing::warn!("Failed to invalidate cached results for dataset {table_name}: {e}");
+                                            if let Err(e) = cache_provider.invalidate_for_refresh(table_name.clone()).await {
+                                                tracing::warn!("Failed to invalidate cached query plans and search results for dataset {table_name} after a refresh, so they may reflect the previous data until they expire: {e}");
                                             }
                                         }
                                     }
@@ -1650,12 +1650,12 @@ fn refresh_result_changed_accelerator(result: &super::Result<RefreshOutcome>) ->
     )
 }
 
-/// After a refresh task finishes: invalidate cached results, then publish
+/// After a refresh task finishes: invalidate plans and search caches, then publish
 /// `initial_load_completed`, then record the outcome.
 ///
 /// Results-cache warmup waits on the outcome recorded here after the first
-/// full/append refresh. Publishing the flag before invalidation would let a
-/// poller of that flag store entries this callback then evicts. The flag still
+/// full/append refresh. Publishing the flag after derived-cache invalidation
+/// lets warmup plan against refreshed state. SQL results age independently. The flag still
 /// precedes `record_done`, so a waiter woken by a successful completion
 /// observes the initial load as done — the same pairing as
 /// `RefreshTask::signal_dataset_ready`.
