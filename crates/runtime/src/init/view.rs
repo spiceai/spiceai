@@ -167,9 +167,9 @@ const MAX_LISTED_WAITS: usize = 10;
 /// waiting for. The same cadence as the dataset load summary.
 const VIEW_WAIT_REPORT_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
 
-/// How long a startup view waits for a dataset it reads only in a subquery to
-/// be registered: the minute `register_view` gives each table in a view's
-/// `FROM` clause.
+/// How long a startup view waits for each dataset it reads only in a subquery
+/// to be registered: the minute `register_view` waits for a missing table in a
+/// view's `FROM` clause.
 const SUBQUERY_DATASET_GRACE: std::time::Duration = std::time::Duration::from_mins(1);
 
 /// The line a startup view logs when it has to wait before it registers.
@@ -211,10 +211,10 @@ impl Runtime {
     /// catalog table, a dataset that is not loading (it failed accelerator
     /// initialization, waits on a snapshot, or is chained deeper behind another
     /// dataset), or a view in a cycle — waits for every startup dataset instead,
-    /// which is what every view did before. A dataset the view reads only in a
-    /// subquery also gets the minute `register_view` gives the tables in its
-    /// `FROM` clause to be registered once its load has ended. A view a Spicepod
-    /// change has already taken over is left to that change.
+    /// which is what every view did before. Each dataset the view reads only in
+    /// a subquery also gets up to a minute to be registered once its load has
+    /// ended, as `register_view` waits for a missing `FROM` table. A view a
+    /// Spicepod change has already taken over is left to that change.
     ///
     /// Returns the tasks loading the views.
     pub(crate) fn load_views(
@@ -397,9 +397,9 @@ impl Runtime {
                 // registered: a Spicepod change that replaces it stops the load and
                 // registers the replacement itself. Planning the view before then
                 // fails it for good, so give each dataset it reads only in a
-                // subquery the grace its `FROM` tables get.
-                let deadline = tokio::time::Instant::now() + SUBQUERY_DATASET_GRACE;
+                // subquery its own minute to be registered.
                 for table in &subquery_datasets {
+                    let deadline = tokio::time::Instant::now() + SUBQUERY_DATASET_GRACE;
                     while !runtime.df.table_exists(table) && tokio::time::Instant::now() < deadline
                     {
                         tokio::select! {
