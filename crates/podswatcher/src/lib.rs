@@ -506,9 +506,10 @@ mod tests {
     /// `MaxFilesWatch` retreats to the limit it just hit, and the warning's claim that the
     /// directories below are unwatched is false.
     ///
-    /// Asserted by removing a registration that is known to exist and then removing it again:
-    /// the second call can only be `WatchNotFound`, so a version of this that quietly skipped
-    /// the `unwatch` would leave the registration in place and fail here.
+    /// Asserted by removing a registration that is known to exist and then asking the watcher
+    /// itself: it must no longer know the root (`WatchNotFound`), so a version of this that
+    /// quietly skipped the `unwatch` would leave the registration in place and fail here.
+    /// Clearing it again is then tolerated.
     #[test]
     fn clearing_a_partial_registration_removes_it_and_tolerates_its_absence() {
         let root = tempfile::tempdir().expect("failed to create temp dir");
@@ -522,6 +523,13 @@ mod tests {
 
         unwatch_partial_registration(&mut watcher, root.path())
             .expect("clearing a registered watch must succeed");
+        let gone = watcher
+            .unwatch(root.path())
+            .expect_err("the cleared registration must no longer exist");
+        assert!(
+            matches!(gone.kind, notify::ErrorKind::WatchNotFound),
+            "{gone:?}"
+        );
         unwatch_partial_registration(&mut watcher, root.path())
             .expect("clearing an already-cleared watch must be tolerated, not an error");
     }
@@ -536,6 +544,15 @@ mod tests {
         let mut watcher = notify::recommended_watcher(|_: notify::Result<notify::Event>| {})
             .expect("failed to construct a platform watcher");
 
+        // The backend answers `WatchNotFound` for a path it never registered...
+        let never = watcher
+            .unwatch(root.path())
+            .expect_err("a path that was never watched has no registration to remove");
+        assert!(
+            matches!(never.kind, notify::ErrorKind::WatchNotFound),
+            "{never:?}"
+        );
+        // ...which is the answer the fallback treats as nothing to clear.
         unwatch_partial_registration(&mut watcher, root.path())
             .expect("an unwatched path must not stop the fallback");
     }

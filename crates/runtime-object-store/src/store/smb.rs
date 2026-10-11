@@ -951,7 +951,20 @@ mod tests {
     fn test_guard_read_size() {
         guard_read_size(1024).expect("small reads are allowed");
         guard_read_size(MAX_BUFFERED_READ).expect("exactly at cap is allowed");
-        assert!(guard_read_size(MAX_BUFFERED_READ + 1).is_err());
+        let err = guard_read_size(MAX_BUFFERED_READ + 1)
+            .expect_err("one byte over the cap must be refused");
+        let object_store::Error::Generic { store, source } = &err else {
+            panic!("expected a generic SMB store error, got {err:?}");
+        };
+        assert_eq!(*store, STORE_NAME);
+        assert_eq!(
+            source.to_string(),
+            "SMB read of 2147483649 bytes exceeds 2147483648-byte cap; reduce range or stream"
+        );
+        assert_eq!(
+            err.to_string(),
+            "Generic SMB error: SMB read of 2147483649 bytes exceeds 2147483648-byte cap; reduce range or stream"
+        );
     }
 
     // ── Multipart upload "already finalized" semantics ──────────────────

@@ -2709,13 +2709,22 @@ mod tests {
 
     #[test]
     fn pg_array_literal_rejects_malformed() {
-        for bad in [
-            "not-an-array",
-            "{unterminated",
-            r#"{"open}"#,
-            "{{1,2},{3,4}}",
+        // Each malformed shape is paired with the rejection branch it must hit,
+        // so a change that rejects it for a different reason is caught.
+        for (bad, reason) in [
+            ("not-an-array", "expected {...}"),
+            ("{unterminated", "expected {...}"),
+            (r#"{"open}"#, "unterminated quoted element"),
+            ("{{1,2},{3,4}}", "multidimensional arrays are not supported"),
+            ("[0:1{a,b}", "unterminated bounds prefix"),
+            (r#"{"a\}"#, "dangling escape"),
         ] {
-            parse_pg_array_literal(bad).expect_err(bad);
+            let err = parse_pg_array_literal(bad).expect_err(bad);
+            assert_eq!(
+                err.to_string(),
+                format!("pgoutput decode error: postgres array literal parse '{bad}': {reason}"),
+                "wrong rejection for {bad}"
+            );
         }
     }
 

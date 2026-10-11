@@ -1128,9 +1128,18 @@ mod tests {
         );
 
         let rule = HttpParamsPushdown;
-        let _ = rule
+        let err = rule
             .optimize(join, &ConfigOptions::new())
             .expect_err("inner join on HTTP param should error");
+        // The error is the user's only signal that this join would return wrong
+        // rows, so it must be the planning error that names the column and the fix.
+        match err {
+            DataFusionError::Plan(message) => assert_eq!(
+                message,
+                "JOIN on HTTP request parameter column 'request_headers' is not supported. Use `WHERE request_headers IN (SELECT ...)` instead."
+            ),
+            other => panic!("expected a planning error naming the column, got {other:?}"),
+        }
     }
 
     // -----------------------------------------------------------------------

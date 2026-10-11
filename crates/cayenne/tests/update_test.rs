@@ -25,7 +25,7 @@ limitations under the License.
 //! UPDATE coverage in `crates/runtime/tests/cayenne_catalog_ddl/mod.rs` and
 //! `crates/runtime/tests/cluster/distributed_cayenne_catalog.rs`.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 

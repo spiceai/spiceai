@@ -62,6 +62,7 @@ connector-cosmosdb = { path = "../../crates/data-connectors/connector-cosmosdb" 
 connector-databricks = { path = "../../crates/data-connectors/connector-databricks" }
 connector-elasticsearch = { path = "../../crates/data-connectors/connector-elasticsearch" }
 connector-git = { path = "../../crates/data-connectors/connector-git" }
+connector-huggingface = { path = "../../crates/data-connectors/connector-huggingface" }
 connector-github = { path = "../../crates/data-connectors/connector-github" }
 connector-glue = { path = "../../crates/data-connectors/connector-glue" }
 connector-ducklake = { path = "../../crates/data-connectors/connector-ducklake" }

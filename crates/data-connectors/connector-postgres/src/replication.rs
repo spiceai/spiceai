@@ -39,6 +39,7 @@ use data_connector_api::federated::FederatedTableProvider;
 use data_connector_api::parameters::ConnectorContext;
 use datafusion::common::TableReference;
 use datafusion_table_providers::sql::db_connection_pool::postgrespool::PostgresConnectionPool;
+use datafusion_table_providers::util::column_reference::ColumnReference;
 use futures::StreamExt;
 use opentelemetry::KeyValue;
 use runtime_api_types::v1::ComponentType;
@@ -520,12 +521,12 @@ pub async fn build_changes_stream(
         .map(|pk| pk.iter().map(ToString::to_string).collect())
         .unwrap_or_default();
 
-    // UPDATE events rely on `on_conflict: upsert` (or an upsert-dedup
-    // variant) to mutate the existing row in place, and the conflict target
-    // MUST match the dataset's primary key — otherwise the accelerator's
-    // write path falls through to append and silently inserts duplicate rows
-    // on every UPDATE. DuckDB / SQLite / Postgres / Cayenne all need this;
-    // the Arrow engine genuinely can't support upsert and is documented as
+    // UPDATE events must replace the row stored under the dataset's primary
+    // key — otherwise the accelerator's write path falls through to append and
+    // silently inserts duplicate rows on every UPDATE. Cayenne keeps one row per
+    // declared `primary_key` on its own; DuckDB / SQLite / Postgres / Turso
+    // also need an `on_conflict: upsert` (or upsert-dedup) entry keyed on it.
+    // The Arrow engine genuinely can't support upsert and is documented as
     // append-only for UPDATEs — skip the check there.
     let engine = dataset
         .acceleration
@@ -537,6 +538,8 @@ pub async fn build_changes_stream(
         runtime_component::dataset::acceleration::Engine::Arrow
             | runtime_component::dataset::acceleration::Engine::PartitionedArrow
     );
+    let keeps_one_row_per_key_alone =
+        engine == runtime_component::dataset::acceleration::Engine::Cayenne;
     // The on_conflict map is keyed on a ColumnReference (same type as
     // primary_key), so checking whether the PK has an Upsert entry is a
     // direct lookup. This is a much tighter check than "any value is
@@ -544,10 +547,11 @@ pub async fn build_changes_stream(
     // would previously pass and still let UPDATEs append duplicate rows.
     let has_upsert_on_pk = dataset.acceleration.as_ref().is_some_and(|a| {
         a.primary_key.as_ref().is_some_and(|pk| {
-            matches!(
-                a.on_conflict.get(pk),
-                Some(runtime_component::dataset::acceleration::OnConflictBehavior::Upsert(_))
-            )
+            keeps_one_row_per_key_alone
+                || matches!(
+                    a.on_conflict.get(pk),
+                    Some(runtime_component::dataset::acceleration::OnConflictBehavior::Upsert(_))
+                )
         })
     });
 
@@ -572,6 +576,8 @@ pub async fn build_changes_stream(
         }
     };
 
+    let missing_key_message = missing_primary_key_message(dataset);
+
     Box::pin(try_stream! {
         let table_provider = federated_table.table_provider().await;
         let schema = table_provider.schema();
@@ -591,30 +597,42 @@ pub async fn build_changes_stream(
             declared_pks.clone()
         };
 
-        // refresh_mode: changes is useless without a PK — DELETE and UPDATE
-        // require one to route the change to a row. Fail fast with a clear
-        // message instead of erroring cryptically later in the refresh loop.
+        // The dataset load normally rejects a table without a key first (see
+        // `changes_dataset_lacks_primary_key`); the stream still never starts
+        // without one.
         if primary_keys.is_empty() {
             Err(StreamError::External(format!(
-                "postgres replication for dataset `{dataset_name}`: no primary key available. \
-                 Set `acceleration.primary_key` on the dataset (and a matching \
-                 `acceleration.on_conflict` entry) — `refresh_mode: changes` cannot route \
-                 UPDATE/DELETE events without one."
+                "postgres replication for dataset `{dataset_name}`: {missing_key_message}"
             )))?;
         }
 
         // Now that primary_keys is resolved, report the upsert-config error
         // with a concrete PK hint. Two cases produce this error:
         //   1. `acceleration.primary_key` is set but `on_conflict` is missing
-        //      the Upsert entry keyed on the PK.
+        //      the Upsert entry keyed on the PK (never on Cayenne).
         //   2. `acceleration.primary_key` is unset (we're relying on the
         //      source table's PK), in which case the user must also set
         //      `acceleration.primary_key` — `on_conflict` can only be keyed
         //      on a ColumnReference, and acceleration's write path consults
         //      only its own `primary_key` / `on_conflict` config.
         if engine_supports_upsert && !has_upsert_on_pk {
-            let pk_hint = primary_keys.first().cloned().unwrap_or_else(|| "<pk>".to_string());
-            let msg = if declared_pks.is_empty() {
+            // Composite keys hint the full parenthesized column list — a
+            // single-column suggestion would mis-route UPDATE/DELETE events.
+            let pk_hint = match primary_keys.as_slice() {
+                [] => "<pk>".to_string(),
+                [single] => single.clone(),
+                composite => format!("({})", composite.join(", ")),
+            };
+            let msg = if declared_pks.is_empty() && keeps_one_row_per_key_alone {
+                format!(
+                    "postgres replication for dataset `{dataset_name}`: the source table's \
+                     primary key (`{pk_hint}`) is not declared on the dataset. \
+                     `refresh_mode: changes` requires `acceleration.primary_key: {pk_hint}` so \
+                     UPDATE events replace rows on the `{engine}` engine — without the \
+                     declaration, the accelerator's write path falls through to append and \
+                     produces duplicate rows."
+                )
+            } else if declared_pks.is_empty() {
                 format!(
                     "postgres replication for dataset `{dataset_name}`: the source table's \
                      primary key (`{pk_hint}`) is not declared on the dataset. \
@@ -1379,6 +1397,59 @@ fn split_schema_table(from: &str) -> (String, String) {
         (Some(schema), table) => (schema.to_string(), table.to_string()),
         (None, table) => ("public".to_string(), table.to_string()),
     }
+}
+
+/// Whether `dataset` streams changes but has no key to route UPDATE and DELETE
+/// events by: no `acceleration.primary_key`, and no source primary key for the
+/// runtime to apply as one. `REPLICA IDENTITY FULL` does not supply a key — the
+/// full old row is not unique when the table holds identical rows.
+pub(crate) fn changes_dataset_lacks_primary_key(
+    dataset: &DatasetSpec,
+    provider: &Arc<dyn datafusion::datasource::TableProvider>,
+) -> bool {
+    let Some(acceleration) = dataset.acceleration.as_ref() else {
+        return false;
+    };
+    let schema = provider.schema();
+    acceleration.enabled
+        && acceleration.refresh_mode
+            == Some(runtime_component::dataset::acceleration::RefreshMode::Changes)
+        && acceleration
+            .primary_key
+            .as_ref()
+            .is_none_or(ColumnReference::is_empty)
+        && data_components::inferred_schema::InferredSchema::from_metadata(schema.metadata())
+            .primary_key
+            .is_empty()
+        && extract_primary_keys(provider).is_empty()
+}
+
+/// Where the replica identity and primary key requirements are documented.
+const CDC_DOCS: &str = "https://spiceai.org/docs/features/cdc/postgres-replication";
+
+/// The fix for [`changes_dataset_lacks_primary_key`]: a declared key, plus a
+/// replica identity that makes Postgres send that key's columns with every
+/// UPDATE and DELETE.
+pub(crate) fn missing_primary_key_message(dataset: &DatasetSpec) -> String {
+    use runtime_component::dataset::acceleration::Engine;
+    let (schema_name, table_name) = split_schema_table(&dataset.from);
+    let engine = dataset
+        .acceleration
+        .as_ref()
+        .map(|a| a.engine.to_unpartitioned())
+        .unwrap_or_default();
+    let on_conflict_note = match engine {
+        Engine::Cayenne | Engine::Arrow | Engine::PartitionedArrow => "",
+        _ => " with a matching `acceleration.on_conflict` upsert entry",
+    };
+    format!(
+        "Table `{schema_name}.{table_name}` has no primary key, and `refresh_mode: changes` needs \
+         one to apply UPDATE and DELETE events. Set `acceleration.primary_key` to the columns \
+         that identify a row{on_conflict_note}. Postgres sends those columns with every \
+         change only under `REPLICA IDENTITY FULL` (run \
+         `ALTER TABLE {schema_name}.{table_name} REPLICA IDENTITY FULL;`) or \
+         `REPLICA IDENTITY USING INDEX` on a unique index over them. See: {CDC_DOCS}"
+    )
 }
 
 fn extract_primary_keys(provider: &Arc<dyn datafusion::datasource::TableProvider>) -> Vec<String> {

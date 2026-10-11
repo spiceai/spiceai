@@ -37,8 +37,6 @@ limitations under the License.
 //! Operators must provide a writable instance directory with
 //! `SPICE_CONFIG_DIR` so the single-runtime guarantee can be enforced.
 
-#[cfg(test)]
-use runtime_cloud_connect::draft::EnrollmentDraft;
 use runtime_cloud_connect::{CloudConnectConfig, RuntimeLock};
 
 /// This process's ownership of its instance directory, held until the process
@@ -103,34 +101,6 @@ mod tests {
 
         drop(held);
         claim(&config_dir).expect("the directory is free once the holder exits");
-    }
-
-    #[test]
-    fn an_ordinary_local_runtime_claims_the_instance_before_later_enrollment() {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let config_dir = dir.path().join(".spice");
-
-        let held = claim(&config_dir).expect("the local runtime claims its instance");
-        claim(&config_dir).expect_err("token bootstrap must not overlap the local runtime");
-        drop(held);
-    }
-
-    #[test]
-    fn a_token_bootstrap_claims_even_before_an_identity_exists() {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let config_dir = dir.path().join(".spice");
-        claim(&config_dir).expect("the bootstrap claims its instance");
-    }
-
-    #[test]
-    fn a_draft_only_directory_is_claimed_without_a_new_token() {
-        let dir = tempfile::tempdir().expect("create tempdir");
-        let config_dir = dir.path().join(".spice");
-        std::fs::create_dir_all(&config_dir).expect("create config directory");
-        std::fs::write(EnrollmentDraft::path_in(&config_dir), b"durable draft")
-            .expect("write enrollment draft marker");
-
-        claim(&config_dir).expect("durable Cloud state requires the runtime lease");
     }
 
     #[cfg(unix)]

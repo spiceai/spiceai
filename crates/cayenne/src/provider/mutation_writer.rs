@@ -327,6 +327,11 @@ impl<'a> AppendMutationWriter<'a> {
         }
     }
 
+    fn can_buffer_rebuildable_write(&self) -> bool {
+        self.table.is_cdc_memory_mode()
+            && super::write_recovery::RebuildableWrite::permits(self.table, self.task_context)
+    }
+
     /// Write into a table the caller observed, under the write lock it still
     /// holds, to hold no rows: a streaming append skips the conflict check.
     #[must_use]
@@ -372,7 +377,7 @@ impl<'a> AppendMutationWriter<'a> {
         // ALWAYS at N=1 — falls through to the byte-identical serial path below.
         let mem_tier_shards = self.table.mem_tier_shard_count();
         if mem_tier_shards > 1
-            && self.table.is_cdc_mem_tier_armed()
+            && (self.table.is_cdc_mem_tier_armed() || self.can_buffer_rebuildable_write())
             && self.table.metadata().partition_column.is_none()
         {
             if let Some(prepared) = self
@@ -438,8 +443,14 @@ impl<'a> AppendMutationWriter<'a> {
         // The RAM tier owns the whole write before publishing, so resolve its
         // raw batches before preparing conflict validation. The durable fallback
         // receives those same resolved raw batches for a fresh validation pass.
+        // Buffer only permanent memory data, replayable CDC with a real source
+        // callback, or an explicitly rebuildable write to this storage owner.
+        // Rebuildable writes make no source acknowledgement promise. Replayable
+        // CDC still defers acknowledgement behind the covering checkpoint.
         let (data, write_guard) = if self.table.metadata().partition_column.is_none()
-            && (self.table.is_memory_resident_mode() || self.table.is_cdc_mem_tier_armed())
+            && (self.table.is_memory_resident_mode()
+                || self.table.is_cdc_mem_tier_armed()
+                || self.can_buffer_rebuildable_write())
         {
             match self
                 .write_cdc_in_memory(data, write_guard, write_start)

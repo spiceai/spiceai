@@ -43,7 +43,7 @@ use arrow::array::{ArrayRef, RecordBatchOptions};
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::record_batch::RecordBatch;
 use arrow_ipc::{reader::StreamReader, writer::StreamWriter};
-use arrow_tools::map_entries::MapEntriesNormalizer;
+use arrow_tools::map_entries::{self, MapEntriesNormalizer};
 use datafusion::catalog::{
     Session, TableFunctionImpl, TableProvider, default_table_source::provider_as_source,
 };
@@ -1145,11 +1145,25 @@ fn decode_ipc(
     }
     let reader = StreamReader::try_new(Cursor::new(bytes), None).context(DecodeArrowSnafu)?;
     // A WASM module is free to declare a MAP's `entries` field nullable, which the Arrow map
-    // layout forbids. Such a batch decodes here and then fails in whichever kernel first rebuilds
-    // the column — and `validate_schema` below would reject it first, naming the nullability
-    // rather than the layout rule it breaks. One stream carries one schema, so what its batches
-    // need is resolved once.
-    let normalizer = MapEntriesNormalizer::for_schema(&reader.schema());
+    // layout forbids. `ArrayData` validation refuses to build a batch under that declaration, so
+    // such a stream is read through `read_ipc_stream`, which relabels the stream's schema message,
+    // decodes every buffer with full validation, and brings each batch back to the map it
+    // describes. One stream carries one schema, so what its batches need is resolved once.
+    let declared = reader.schema();
+    let normalizer = MapEntriesNormalizer::for_schema(&declared);
+    if !Arc::ptr_eq(normalizer.decode_schema(), &declared) {
+        return map_entries::read_ipc_stream(bytes).map_err(|error| match error {
+            map_entries::Error::UndecodableStream { source } => {
+                WasmBuildError::DecodeArrow { source }
+            }
+            named => WasmBuildError::MapEntriesNotNormalizable {
+                function_name: function_name.to_string(),
+                source: named,
+            },
+        });
+    }
+    // A conforming declaration decodes as it stands. The normalizer still refuses a map whose
+    // entries hold nulls, naming the column, where a later kernel would fail without naming it.
     reader
         .map(|batch| {
             normalizer

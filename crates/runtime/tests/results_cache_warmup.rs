@@ -121,7 +121,7 @@ async fn warmup_record_persist_restart_refresh_ready_cache_hit() {
                     .with_dataset(lookup_dataset(&fixture_dir))
                     .build();
                 let rt = Arc::new(Runtime::builder().with_app(app).build().await);
-                tokio::time::timeout(Duration::from_mins(2), Arc::clone(&rt).load_components())
+                tokio::time::timeout(Duration::from_mins(2), Box::pin(Arc::clone(&rt).load_components()))
                     .await
                     .expect("load");
                 wait_ready(&rt).await;
@@ -166,7 +166,7 @@ async fn warmup_record_persist_restart_refresh_ready_cache_hit() {
                 .with_dataset(lookup_dataset(&fixture_dir))
                 .build();
             let rt = Arc::new(Runtime::builder().with_app(app).build().await);
-            tokio::time::timeout(Duration::from_mins(2), Arc::clone(&rt).load_components())
+            tokio::time::timeout(Duration::from_mins(2), Box::pin(Arc::clone(&rt).load_components()))
                 .await
                 .expect("load after restart");
             wait_ready(&rt).await;

@@ -67,6 +67,7 @@ use connector_git as _;
 use connector_github as _;
 use connector_glue as _;
 use connector_graphql as _;
+use connector_huggingface as _;
 #[cfg(feature = "imap")]
 use connector_imap as _;
 #[cfg(feature = "kafka")]

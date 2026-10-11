@@ -2587,19 +2587,31 @@ mod tests {
         status.hold_dataset_ready();
         assert!(!status.is_ready());
 
+        // The replay signals once it is running, then stalls forever.
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel::<()>();
+        let stalled_replay = async move {
+            started_tx
+                .send(())
+                .expect("the test waits for the replay to start");
+            std::future::pending::<()>().await;
+        };
+
         let shutdown = CancellationToken::new();
         let task = tokio::spawn({
             let status = Arc::clone(&status);
             let shutdown = shutdown.clone();
             async move {
-                run_warmup_releasing_ready(status, shutdown, std::future::pending()).await;
+                run_warmup_releasing_ready(status, shutdown, stalled_replay).await;
             }
         });
 
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        tokio::time::timeout(Duration::from_secs(5), started_rx)
+            .await
+            .expect("the warmup replay must start")
+            .expect("the replay signals before it stalls");
         assert!(
             !status.is_ready(),
-            "the ready-hold must stay until shutdown cancels warmup"
+            "the ready-hold must stay while the replay is stalled, until shutdown cancels warmup"
         );
         shutdown.cancel();
 

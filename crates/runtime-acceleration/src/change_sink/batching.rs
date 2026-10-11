@@ -19,6 +19,7 @@ limitations under the License.
 
 use std::ops::ControlFlow;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use arrow::datatypes::SchemaRef;
@@ -155,6 +156,7 @@ pub struct CdcIngress {
     pub limits: CoalescingLimits,
     labels: [KeyValue; 1],
     queued: parking_lot::Mutex<(usize, usize)>,
+    applying: AtomicBool,
 }
 
 impl std::fmt::Debug for CdcIngress {
@@ -177,7 +179,16 @@ impl CdcIngress {
             limits,
             labels: [KeyValue::new("dataset", dataset.to_string())],
             queued: parking_lot::Mutex::new((0, 0)),
+            applying: AtomicBool::new(false),
         }
+    }
+
+    /// Whether the owner is applying a burst from this lane. The producer
+    /// builds deferred rows ahead only then: an idle or lingering owner builds
+    /// its burst in one handoff, and building ahead would only add handoffs.
+    #[must_use]
+    pub fn is_applying(&self) -> bool {
+        self.applying.load(Ordering::Acquire)
     }
 
     pub fn record_queue(&self, occupancy: usize, capacity: usize, bytes: usize) {
@@ -246,6 +257,25 @@ impl CdcIngress {
 
     pub fn record_duration(&self, start: Instant) {
         metrics::CDC_APPLY_BURST_DURATION_MS.record(elapsed_ms(start), &self.labels);
+    }
+}
+
+/// Marks a lane's burst as applying until dropped. `Drop` also covers a
+/// cancelled or panicking apply, so the producer never keeps building ahead
+/// for an apply that is gone.
+pub(crate) struct ApplyingGuard(Arc<CdcIngress>);
+
+impl ApplyingGuard {
+    #[must_use]
+    pub(crate) fn enter(ingress: &Arc<CdcIngress>) -> Self {
+        ingress.applying.store(true, Ordering::Release);
+        Self(Arc::clone(ingress))
+    }
+}
+
+impl Drop for ApplyingGuard {
+    fn drop(&mut self) {
+        self.0.applying.store(false, Ordering::Release);
     }
 }
 
@@ -365,7 +395,8 @@ impl CdcBurst {
     }
 
     /// Decode every input before classification or mutation. Deferred sources
-    /// share one blocking-pool handoff; eager sources take no task hop.
+    /// share one blocking-pool handoff; a burst whose inputs are all built,
+    /// eagerly or ahead by their producer, takes no task hop.
     ///
     /// # Errors
     /// Returns an error if decoding or schema classification fails, an input has

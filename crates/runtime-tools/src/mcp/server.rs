@@ -1781,6 +1781,7 @@ mod tests {
             .recv()
             .expect("replace_from_map must enter try_all before the catalog publishes");
 
+        let (publishing_tx, publishing_rx) = std::sync::mpsc::channel();
         let publish_snapshot = Arc::clone(&snapshot);
         let publisher = std::thread::spawn(move || {
             let mut listed = HashMap::new();
@@ -1788,21 +1789,34 @@ mod tests {
                 "deploy".to_string(),
                 mcp_tool_from_spice("deploy", &ZoneAnnotatedTool),
             );
+            publishing_tx
+                .send(())
+                .expect("the test waits for the catalog publish to start");
             let changed = apply_listed_catalog_cache(&publish_snapshot, "srv", &listed, true);
             publish_snapshot.bump_if(changed);
         });
 
-        // Give the publisher time to block on the publish lock (or, on
-        // the unsynchronized path, to write Zone before we release).
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        publishing_rx
+            .recv()
+            .expect("the catalog publish must start while replace_from_map is gated");
+        // replace_from_map is parked inside try_all. Holding the publish lock
+        // there is what makes the racing catalog publish wait and land last;
+        // collecting outside it leaves the lock free here.
+        assert!(
+            matches!(
+                snapshot.publish.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ),
+            "replace_from_map must collect from try_all under the snapshot publish lock"
+        );
         let exposed = encode_tool_name("srv", "deploy");
-        assert_ne!(
+        assert_eq!(
             snapshot
                 .get(&exposed)
                 .as_ref()
                 .and_then(x_mcp_header_region),
-            Some("Zone"),
-            "catalog publish must wait for replace_from_map; Zone already present means a stale overwrite can follow"
+            None,
+            "nothing may publish while replace_from_map holds the publish lock"
         );
 
         release_tx
@@ -1823,9 +1837,10 @@ mod tests {
             Some("Zone"),
             "final_schema must be Zone after the catalog publish; Region after Zone is the stale overwrite"
         );
-        assert!(
-            snapshot.epoch() >= 2,
-            "both the full replace and the catalog publish bump the epoch"
+        assert_eq!(
+            snapshot.epoch(),
+            2,
+            "the full replace and the catalog publish each bump the epoch once"
         );
     }
 
@@ -1862,6 +1877,7 @@ mod tests {
             .recv()
             .expect("replace_listed_from_map must enter try_all before the catalog publishes");
 
+        let (publishing_tx, publishing_rx) = std::sync::mpsc::channel();
         let publish_snapshot = Arc::clone(&snapshot);
         let publisher = std::thread::spawn(move || {
             let mut listed = HashMap::new();
@@ -1869,19 +1885,34 @@ mod tests {
                 "deploy".to_string(),
                 mcp_tool_from_spice("deploy", &ZoneAnnotatedTool),
             );
+            publishing_tx
+                .send(())
+                .expect("the test waits for the catalog publish to start");
             let changed = apply_listed_catalog_cache(&publish_snapshot, "srv", &listed, true);
             publish_snapshot.bump_if(changed);
         });
 
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        publishing_rx
+            .recv()
+            .expect("the catalog publish must start while replace_listed_from_map is gated");
+        // replace_listed_from_map is parked inside try_all. Holding the publish
+        // lock there is what makes the racing catalog publish wait and land
+        // last; collecting outside it leaves the lock free here.
+        assert!(
+            matches!(
+                snapshot.publish.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ),
+            "replace_listed_from_map must collect from try_all under the snapshot publish lock"
+        );
         let exposed = encode_tool_name("srv", "deploy");
-        assert_ne!(
+        assert_eq!(
             snapshot
                 .get(&exposed)
                 .as_ref()
                 .and_then(x_mcp_header_region),
-            Some("Zone"),
-            "catalog publish must wait for replace_listed_from_map; Zone already present means a stale overwrite can follow"
+            None,
+            "nothing may publish while replace_listed_from_map holds the publish lock"
         );
 
         release_tx
@@ -1902,9 +1933,10 @@ mod tests {
             Some("Zone"),
             "final_schema must be Zone after the catalog publish; Region after Zone is the stale overwrite"
         );
-        assert!(
-            snapshot.epoch() >= 2,
-            "both the listed replace and the catalog publish bump the epoch"
+        assert_eq!(
+            snapshot.epoch(),
+            2,
+            "the listed replace and the catalog publish each bump the epoch once"
         );
     }
 
@@ -1941,6 +1973,7 @@ mod tests {
             .recv()
             .expect("merge_from_map must enter try_all before the catalog publishes");
 
+        let (publishing_tx, publishing_rx) = std::sync::mpsc::channel();
         let publish_snapshot = Arc::clone(&snapshot);
         let publisher = std::thread::spawn(move || {
             let mut listed = HashMap::new();
@@ -1948,19 +1981,34 @@ mod tests {
                 "deploy".to_string(),
                 mcp_tool_from_spice("deploy", &ZoneAnnotatedTool),
             );
+            publishing_tx
+                .send(())
+                .expect("the test waits for the catalog publish to start");
             let changed = apply_listed_catalog_cache(&publish_snapshot, "srv", &listed, true);
             publish_snapshot.bump_if(changed);
         });
 
-        std::thread::sleep(std::time::Duration::from_millis(50));
+        publishing_rx
+            .recv()
+            .expect("the catalog publish must start while merge_from_map is gated");
+        // merge_from_map is parked inside try_all. Holding the publish lock
+        // there is what makes the racing catalog publish wait and land last;
+        // collecting outside it leaves the lock free here.
+        assert!(
+            matches!(
+                snapshot.publish.try_lock(),
+                Err(std::sync::TryLockError::WouldBlock)
+            ),
+            "merge_from_map must collect from try_all under the snapshot publish lock"
+        );
         let exposed = encode_tool_name("srv", "deploy");
-        assert_ne!(
+        assert_eq!(
             snapshot
                 .get(&exposed)
                 .as_ref()
                 .and_then(x_mcp_header_region),
-            Some("Zone"),
-            "catalog publish must wait for merge_from_map; Zone already present means a stale overwrite can follow"
+            None,
+            "nothing may publish while merge_from_map holds the publish lock"
         );
 
         release_tx
@@ -1978,6 +2026,11 @@ mod tests {
                 .and_then(x_mcp_header_region),
             Some("Zone"),
             "final_schema must be Zone after the catalog publish; Region after Zone is the stale overwrite"
+        );
+        assert_eq!(
+            snapshot.epoch(),
+            2,
+            "the merge and the catalog publish each bump the epoch once"
         );
     }
 

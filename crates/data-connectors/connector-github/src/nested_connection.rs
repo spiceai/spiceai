@@ -35,6 +35,7 @@ limitations under the License.
 //! a partial set.
 
 use crate::identity::insert_identity;
+use connector_graphql::graphql::client::NESTED_DELIVERED_BEFORE_KEY;
 use connector_graphql::graphql::{Error, Result};
 use serde_json::{Map, Value};
 
@@ -179,12 +180,26 @@ where
     Ok(rows)
 }
 
+/// Nodes already fanned out from earlier pages of this connection.
+///
+/// Follow-up pages stamp [`NESTED_DELIVERED_BEFORE_KEY`]; a first page has none.
+fn delivered_before(connection: &Value) -> usize {
+    connection
+        .get(NESTED_DELIVERED_BEFORE_KEY)
+        .and_then(Value::as_u64)
+        .and_then(|n| usize::try_from(n).ok())
+        .unwrap_or(0)
+}
+
 /// Fails, naming the parent, when this page is truncated and cannot continue.
 ///
 /// `totalCount` is the full connection, not this page. A follow-up last page
 /// therefore has `returned < totalCount` even when it is complete — GitHub's
-/// `pageInfo.hasNextPage` is the signal that more pages exist. When `pageInfo`
-/// is absent, fall back to comparing `totalCount` against this page's nodes.
+/// `pageInfo.hasNextPage` is the signal that more pages exist, and
+/// [`NESTED_DELIVERED_BEFORE_KEY`] is how many rows earlier pages already
+/// emitted. A first page that claims no next page must still account for
+/// `totalCount` on its own. When `pageInfo` is absent, fall back to comparing
+/// `totalCount` against delivered-so-far plus this page's nodes.
 fn ensure_complete(
     connection: &Value,
     returned: usize,
@@ -194,12 +209,10 @@ fn ensure_complete(
     parent_id: Option<&Value>,
 ) -> Result<()> {
     let page_info = |field: &str| connection.get("pageInfo").and_then(|info| info.get(field));
+    let delivered = delivered_before(connection).saturating_add(returned);
+    let delivered_count = i64::try_from(delivered).unwrap_or(i64::MAX);
 
-    // `totalCount` is the full connection. A last follow-up page is complete
-    // when GitHub says there is no next page, even if this page is short.
     match page_info("hasNextPage").and_then(Value::as_bool) {
-        // No more pages: this page completes the connection.
-        Some(false) => return Ok(()),
         // More pages, and a cursor to reach them with.
         Some(true)
             if page_info("endCursor")
@@ -210,13 +223,15 @@ fn ensure_complete(
         }
         // More pages and no way to ask for them.
         Some(true) => {}
-        // No `pageInfo` selected: fall back to this page against the total.
-        None => {
+        // Terminal page (`hasNextPage: false`) or no `pageInfo`: complete only
+        // if delivered-so-far covers `totalCount`. A first page that claims
+        // no next page with `returned < totalCount` would otherwise fan out a
+        // silent short set.
+        Some(false) | None => {
             let Some(total_count) = connection.get("totalCount").and_then(Value::as_i64) else {
                 return Ok(());
             };
-            let returned_count = i64::try_from(returned).unwrap_or(i64::MAX);
-            if total_count <= returned_count {
+            if total_count <= delivered_count {
                 return Ok(());
             }
         }
@@ -322,6 +337,7 @@ fn truncated_connection_error(
 #[cfg(test)]
 mod tests {
     use super::{NestedConnection, fan_out, flatten_login, flatten_member};
+    use connector_graphql::graphql::client::NESTED_DELIVERED_BEFORE_KEY;
     use serde_json::{Map, Value, json};
 
     const REVIEWS: NestedConnection<'static> = NestedConnection {
@@ -515,10 +531,35 @@ mod tests {
     }
 
     #[test]
+    fn fan_out_fails_a_first_page_that_claims_to_be_complete_but_is_short() {
+        // `hasNextPage: false` on the first page means this is the whole
+        // connection. Accepting `returned=1, totalCount=110` would emit one
+        // row and drop 109 with nothing to say they are missing.
+        let truncated = json!({
+            "pull_request_id": "PR_1",
+            "pull_request_number": 42,
+            "reviews": {
+                "totalCount": 110,
+                "pageInfo": {"hasNextPage": false, "endCursor": "cursor"},
+                "nodes": [{"id": "R_1"}]
+            }
+        });
+
+        let error = fan_out(&truncated, &REVIEWS, "spiceai", "spiceai", |_| {})
+            .expect_err("a short first page that claims no next page must fail the scan");
+        let message = error.to_string();
+        assert!(
+            message.contains("110") && message.contains("reviews"),
+            "the error must say how many were unreachable, got: {message}"
+        );
+    }
+
+    #[test]
     fn fan_out_emits_a_last_page_whose_total_count_covers_prior_pages() {
         // Follow-up pages still carry the connection's totalCount (110), not
-        // the remaining count. hasNextPage false means this cursor is done.
-        let last_page = json!({
+        // the remaining count. hasNextPage false means this cursor is done
+        // only once earlier pages plus this one cover the total.
+        let mut last_page = json!({
             "pull_request_id": "PR_1",
             "pull_request_number": 10473,
             "reviews": {
@@ -527,6 +568,7 @@ mod tests {
                 "nodes": [{"id": "R_101"}]
             }
         });
+        last_page["reviews"][NESTED_DELIVERED_BEFORE_KEY] = json!(109);
 
         let rows = fan_out(&last_page, &REVIEWS, "spiceai", "spiceai", |_| {})
             .expect("a last follow-up page must not fail the scan");
@@ -540,7 +582,7 @@ mod tests {
         // 200 reviews in two 100-node pages: the last page is full and
         // hasNextPage is false. Failing that page would retry the whole scan.
         let nodes: Vec<Value> = (0..100).map(|i| json!({"id": format!("R_{i}")})).collect();
-        let last_page = json!({
+        let mut last_page = json!({
             "pull_request_id": "PR_1",
             "pull_request_number": 42,
             "reviews": {
@@ -549,6 +591,7 @@ mod tests {
                 "nodes": nodes
             }
         });
+        last_page["reviews"][NESTED_DELIVERED_BEFORE_KEY] = json!(100);
 
         let rows = fan_out(&last_page, &REVIEWS, "spiceai", "spiceai", |_| {})
             .expect("a full last page is complete");

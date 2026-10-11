@@ -421,6 +421,7 @@ mod test {
     use crate::schedule::Schedule;
     use crate::task::{ScheduledTask, TaskRequest};
     use async_trait::async_trait;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::{sync::LazyLock, time::Duration};
     use tokio::time::Instant;
     use tracing_subscriber::EnvFilter;
@@ -439,29 +440,6 @@ mod test {
         tracing::subscriber::set_default(subscriber)
     }
 
-    static TEST_EXECUTION_COUNT: LazyLock<RwLock<HashMap<Arc<str>, usize>>> = LazyLock::new(|| {
-        let mut map = HashMap::new();
-        map.insert(Arc::from("test_scheduler"), 0);
-        map.insert(Arc::from("test_multi_schedule"), 0);
-        map.insert(Arc::from("test_multi_component_schedule"), 0);
-        map.insert(Arc::from("test_multi_evaluator"), 0);
-        map.insert(Arc::from("test_manual_interrupts"), 0);
-        map.insert(Arc::from("test_manual_queued_with_interrupt"), 0);
-        map.insert(Arc::from("test_manual_queue_clears_after_immediate"), 0);
-        map.insert(
-            Arc::from("test_adding_schedule_while_running_starts_existing"),
-            0,
-        );
-        map.insert(
-            Arc::from("test_adding_schedule_while_running_starts_new"),
-            0,
-        );
-        map.insert(Arc::from("test_adding_trigger_to_existing_schedule"), 0);
-        map.insert(Arc::from("test_remove_schedule"), 0);
-
-        RwLock::new(map)
-    });
-
     static TIMING_MAP: LazyLock<RwLock<HashMap<Arc<str>, Vec<Instant>>>> = LazyLock::new(|| {
         let mut map = HashMap::new();
         map.insert(Arc::from("test_scheduler_timing"), Vec::new());
@@ -469,24 +447,25 @@ mod test {
         RwLock::new(map)
     });
 
+    /// Counts its executions in a counter owned by the test. A plain atomic,
+    /// rather than an async lock shared between tests: on the paused clock,
+    /// time auto-advances whenever the runtime is idle, including while a task
+    /// waits for a lock another test holds, which would move the timeline.
     struct TestComponent {
-        name: Arc<str>,
+        executions: Arc<AtomicUsize>,
     }
 
     #[async_trait]
     impl ScheduledTask for TestComponent {
         async fn execute(&self) -> Result<()> {
-            let mut map_lock = TEST_EXECUTION_COUNT.write().await;
-            let count = map_lock
-                .get_mut(self.name.as_ref())
-                .expect("To get test execution count");
-            *count += 1;
+            self.executions.fetch_add(1, Ordering::SeqCst);
             Ok(())
         }
     }
 
+    /// Like [`TestComponent`], but each execution takes `wait` seconds.
     struct LongComponent {
-        name: Arc<str>,
+        executions: Arc<AtomicUsize>,
         wait: u64,
     }
 
@@ -494,12 +473,31 @@ mod test {
     impl ScheduledTask for LongComponent {
         async fn execute(&self) -> Result<()> {
             tokio::time::sleep(std::time::Duration::from_secs(self.wait)).await;
-            let mut map_lock = TEST_EXECUTION_COUNT.write().await;
-            let count = map_lock
-                .get_mut(self.name.as_ref())
-                .expect("To get test execution count");
-            *count += 1;
+            self.executions.fetch_add(1, Ordering::SeqCst);
             Ok(())
+        }
+    }
+
+    /// Polls `executions` until it reaches `expected`, failing with the last
+    /// count seen if that takes longer than `within`. On the paused clock each
+    /// poll interval only advances once every task is idle, so work already
+    /// queued always finishes before the next check.
+    async fn wait_for_executions(executions: &AtomicUsize, expected: usize, within: Duration) {
+        let deadline = Instant::now() + within;
+        loop {
+            let observed = executions.load(Ordering::SeqCst);
+            assert!(
+                observed <= expected,
+                "executed {observed} times, more than the expected {expected}"
+            );
+            if observed == expected {
+                return;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "executed {observed} times, expected {expected} within {within:?}"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
         }
     }
 
@@ -520,28 +518,25 @@ mod test {
         }
     }
 
-    #[tokio::test]
+    /// Runs on the paused clock: an interval trigger fires once per interval,
+    /// with ticks at 1s, 2s, ... after start, so stopping at 5.5s (between two
+    /// ticks rather than on one) leaves exactly five runs.
+    #[tokio::test(start_paused = true)]
     async fn test_scheduler() {
+        let executions = Arc::new(AtomicUsize::new(0));
         let schedule = Schedule::new(
             Arc::from("test_scheduler"),
             Arc::new(TestComponent {
-                name: Arc::from("test_scheduler"),
+                executions: Arc::clone(&executions),
             }),
         )
         .add_trigger(Arc::new(RwLock::new(IntervalRequestChannel::new(1))));
         let scheduler =
             Scheduler::<NotStarted>::new("test_scheduler".into(), vec![Arc::new(schedule)]);
         let scheduler = scheduler.start().await.expect("Scheduler should start");
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_millis(5500)).await;
         scheduler.stop().await;
-        let map_lock = TEST_EXECUTION_COUNT.read().await;
-        let count = map_lock
-            .get("test_scheduler")
-            .expect("To get test execution count");
-        assert!(
-            *count == 4 || *count == 5,
-            "Test component should have executed 4 or 5 times, but got {count}"
-        );
+        assert_eq!(executions.load(Ordering::SeqCst), 5);
     }
 
     /// Runs on the paused clock: the property under test is that the interval trigger
@@ -583,19 +578,23 @@ mod test {
         }
     }
 
-    #[tokio::test]
+    /// Runs on the paused clock, for the same reason as `test_scheduler`: the
+    /// two schedules tick independently, five times each by 5.5s.
+    #[tokio::test(start_paused = true)]
     async fn test_multi_schedule() {
+        let executions_one = Arc::new(AtomicUsize::new(0));
+        let executions_two = Arc::new(AtomicUsize::new(0));
         let schedule_one = Schedule::new(
             Arc::from("test_multi_schedule_one"),
             Arc::new(TestComponent {
-                name: Arc::from("test_multi_schedule"),
+                executions: Arc::clone(&executions_one),
             }),
         )
         .add_trigger(Arc::new(RwLock::new(IntervalRequestChannel::new(1))));
         let schedule_two = Schedule::new(
             Arc::from("test_multi_schedule_two"),
             Arc::new(TestComponent {
-                name: Arc::from("test_multi_schedule"),
+                executions: Arc::clone(&executions_two),
             }),
         )
         .add_trigger(Arc::new(RwLock::new(IntervalRequestChannel::new(1))));
@@ -604,89 +603,78 @@ mod test {
             vec![Arc::new(schedule_one), Arc::new(schedule_two)],
         );
         let scheduler = scheduler.start().await.expect("Scheduler should start");
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_millis(5500)).await;
         scheduler.stop().await;
-        let map_lock = TEST_EXECUTION_COUNT.read().await;
-        let count = map_lock
-            .get("test_multi_schedule")
-            .expect("To get test execution count");
-        assert!(
-            *count == 8 || *count == 10,
-            "Test component should have executed 8 or 10 times, but got {count}"
-        );
+        assert_eq!(executions_one.load(Ordering::SeqCst), 5);
+        assert_eq!(executions_two.load(Ordering::SeqCst), 5);
     }
 
-    #[tokio::test]
+    /// Runs on the paused clock: the interval trigger runs at 1s..=4s, and a
+    /// manual request sent at 4.5s runs at once, between two ticks. The wait for
+    /// it ends before the 5s tick could stand in for it.
+    #[tokio::test(start_paused = true)]
     async fn test_multi_evaluator() {
+        let executions = Arc::new(AtomicUsize::new(0));
         let (tx, rx) = tokio::sync::mpsc::channel::<Option<Arc<TaskRequest>>>(1);
         let manual_channel = ManualRequestChannel::new(rx);
         let manual_channel_lock = Arc::new(RwLock::new(manual_channel));
         let schedule = Schedule::new(
             Arc::from("test_multi_evaluator"),
             Arc::new(TestComponent {
-                name: "test_multi_evaluator".into(),
+                executions: Arc::clone(&executions),
             }),
         )
         .add_trigger(Arc::new(RwLock::new(IntervalRequestChannel::new(1))))
         .add_trigger(manual_channel_lock);
         let scheduler = Scheduler::new("test_multi_evaluator".into(), vec![Arc::new(schedule)]);
         let scheduler = scheduler.start().await.expect("Scheduler should start");
-        tokio::time::sleep(std::time::Duration::from_secs(4)).await;
+        tokio::time::sleep(Duration::from_millis(4500)).await;
+        assert_eq!(executions.load(Ordering::SeqCst), 4);
         tx.send(Some(Arc::new(TaskRequest::default().clears_queue())))
             .await
             .expect("To send task request");
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        wait_for_executions(&executions, 5, Duration::from_millis(400)).await;
         scheduler.stop().await;
-        let map_lock = TEST_EXECUTION_COUNT.read().await;
-        let count = map_lock
-            .get("test_multi_evaluator")
-            .expect("To get test execution count");
-        assert!(
-            *count == 4 || *count == 5,
-            "Test component should have executed 4 or 5 times, but got {count}"
-        );
+        assert_eq!(executions.load(Ordering::SeqCst), 5);
     }
 
-    #[tokio::test]
+    /// Runs on the paused clock so the bounded waits are exact: each manual
+    /// interrupt runs the task once, before the next one is sent.
+    #[tokio::test(start_paused = true)]
     async fn test_manual_interrupts() {
+        let executions = Arc::new(AtomicUsize::new(0));
         let (tx, rx) = tokio::sync::mpsc::channel::<Option<Arc<TaskRequest>>>(1);
         let manual_channel = ManualRequestChannel::new(rx);
         let manual_channel_lock = Arc::new(RwLock::new(manual_channel));
         let schedule = Schedule::new(
             Arc::from("test_manual_interrupts"),
             Arc::new(TestComponent {
-                name: "test_manual_interrupts".into(),
+                executions: Arc::clone(&executions),
             }),
         )
         .add_trigger(manual_channel_lock);
         let scheduler = Scheduler::new("test_manual_interrupts".into(), vec![Arc::new(schedule)]);
         let scheduler = scheduler.start().await.expect("Scheduler should start");
-        tx.send(None).await.expect("To send task request");
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        tx.send(None).await.expect("To send task request");
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-        tx.send(None).await.expect("To send task request");
-        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+        for expected in 1..=3 {
+            tx.send(None).await.expect("To send task request");
+            wait_for_executions(&executions, expected, Duration::from_secs(1)).await;
+        }
         scheduler.stop().await;
-        let map_lock = TEST_EXECUTION_COUNT.read().await;
-        let count = map_lock
-            .get("test_manual_interrupts")
-            .expect("To get test execution count");
-        assert!(
-            *count == 3,
-            "Test component should have executed 3 times, but got {count}"
-        );
+        assert_eq!(executions.load(Ordering::SeqCst), 3);
     }
 
-    #[tokio::test]
+    /// Runs on the paused clock: all five queued requests run, and nothing
+    /// runs after them.
+    #[tokio::test(start_paused = true)]
     async fn test_manual_queued_with_interrupt() {
+        let executions = Arc::new(AtomicUsize::new(0));
         let (tx, rx) = tokio::sync::mpsc::channel::<Option<Arc<TaskRequest>>>(1);
         let manual_channel = ManualRequestChannel::new(rx);
         let manual_channel_lock = Arc::new(RwLock::new(manual_channel));
         let schedule = Schedule::new(
             Arc::from("test_manual_queued_with_interrupt"),
             Arc::new(TestComponent {
-                name: "test_manual_queued_with_interrupt".into(),
+                executions: Arc::clone(&executions),
             }),
         )
         .add_trigger(manual_channel_lock);
@@ -700,27 +688,29 @@ mod test {
                 .await
                 .expect("To send task request");
         }
-        tokio::time::sleep(std::time::Duration::from_secs(7)).await;
+        wait_for_executions(&executions, 5, Duration::from_secs(1)).await;
+        // Time under test: nothing else may run once the queue is drained.
+        tokio::time::sleep(Duration::from_secs(7)).await;
         scheduler.stop().await;
-        let map_lock = TEST_EXECUTION_COUNT.read().await;
-        let count = map_lock
-            .get("test_manual_queued_with_interrupt")
-            .expect("To get test execution count");
-        assert!(
-            *count == 5,
-            "Test component should have executed 5 times, but got {count}"
-        );
+        assert_eq!(executions.load(Ordering::SeqCst), 5);
     }
 
-    #[tokio::test]
+    /// Runs on the paused clock, where the 5s component and the 1s interval
+    /// keep the same timeline but exactly: the interval's first run takes
+    /// 1s..6s, the clearing manual request at 3s arrives while it runs and is
+    /// dropped, and the next interval run starts at 7s and ends at 12s.
+    /// Stopping at 11.5s separates "dropped" (one run) from "queued behind the
+    /// running task" (which would have finished a second run at 11s).
+    #[tokio::test(start_paused = true)]
     async fn test_manual_queue_clears_after_immediate() {
+        let executions = Arc::new(AtomicUsize::new(0));
         let (tx, rx) = tokio::sync::mpsc::channel::<Option<Arc<TaskRequest>>>(1);
         let manual_channel = ManualRequestChannel::new(rx);
         let manual_channel_lock = Arc::new(RwLock::new(manual_channel));
         let schedule = Schedule::new(
             Arc::from("test_manual_queue_clears_after_immediate"),
             Arc::new(LongComponent {
-                name: "test_manual_queue_clears_after_immediate".into(),
+                executions: Arc::clone(&executions),
                 wait: 5,
             }),
         )
@@ -731,28 +721,27 @@ mod test {
             vec![Arc::new(schedule)],
         );
         let scheduler = scheduler.start().await.expect("Scheduler should start");
-        tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+        tokio::time::sleep(Duration::from_secs(3)).await;
         tx.send(Some(Arc::new(TaskRequest::default().clears_queue())))
             .await
             .expect("To send task request");
-        tokio::time::sleep(std::time::Duration::from_secs(8)).await;
+        tokio::time::sleep(Duration::from_millis(8500)).await;
         scheduler.stop().await;
-        let map_lock = TEST_EXECUTION_COUNT.read().await;
-        let count = map_lock
-            .get("test_manual_queue_clears_after_immediate")
-            .expect("To get test execution count");
-        assert!(
-            *count == 1,
-            "Test component should have executed 1 times, but got {count}"
-        );
+        assert_eq!(executions.load(Ordering::SeqCst), 1);
     }
 
-    #[tokio::test]
+    /// Runs on the paused clock: the existing schedule ticks at whole seconds,
+    /// and the schedule added at 5.5s first ticks one interval later, at 6.5s.
+    /// Stopping at 10.75s leaves ten runs of the existing schedule (1s..=10s)
+    /// and five of the new one (6.5s..=10.5s), with no tick on a wake-up.
+    #[tokio::test(start_paused = true)]
     async fn test_adding_schedule_while_running_starts() {
+        let existing_executions = Arc::new(AtomicUsize::new(0));
+        let new_executions = Arc::new(AtomicUsize::new(0));
         let schedule = Schedule::new(
             Arc::from("test_adding_schedule_while_running_starts_existing"),
             Arc::new(TestComponent {
-                name: Arc::from("test_adding_schedule_while_running_starts_existing"),
+                executions: Arc::clone(&existing_executions),
             }),
         )
         .add_trigger(Arc::new(RwLock::new(IntervalRequestChannel::new(1))));
@@ -761,13 +750,14 @@ mod test {
             vec![Arc::new(schedule)],
         );
         let scheduler = scheduler.start().await.expect("Scheduler should start");
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_millis(5500)).await;
+        assert_eq!(existing_executions.load(Ordering::SeqCst), 5);
 
         // add a new schedule while the scheduler has been running for some time
         let new_schedule = Schedule::new(
             Arc::from("test_adding_schedule_while_running_starts_new"),
             Arc::new(TestComponent {
-                name: Arc::from("test_adding_schedule_while_running_starts_new"),
+                executions: Arc::clone(&new_executions),
             }),
         )
         .add_trigger(Arc::new(RwLock::new(IntervalRequestChannel::new(1))));
@@ -779,29 +769,19 @@ mod test {
         tokio::time::sleep(Duration::from_millis(5250)).await;
 
         scheduler.stop().await;
-        let map_lock = TEST_EXECUTION_COUNT.read().await;
-        let count = map_lock
-            .get("test_adding_schedule_while_running_starts_existing")
-            .expect("To get test execution count");
-        assert!(
-            *count == 9 || *count == 10,
-            "Test component should have executed 9 or 10 times, but got {count}" // environment load in CI can cause this to vary
-        );
-        let count = map_lock
-            .get("test_adding_schedule_while_running_starts_new")
-            .expect("To get test execution count");
-        assert!(
-            *count == 4 || *count == 5,
-            "Test component should have executed 4 or 5 times, but got {count}"
-        );
+        assert_eq!(existing_executions.load(Ordering::SeqCst), 10);
+        assert_eq!(new_executions.load(Ordering::SeqCst), 5);
     }
 
-    #[tokio::test]
+    /// Runs on the paused clock: a schedule without triggers never runs, and
+    /// the trigger added at 5s ticks at 6s..=10s before the stop at 10.5s.
+    #[tokio::test(start_paused = true)]
     async fn test_adding_trigger_to_existing_schedule() {
+        let executions = Arc::new(AtomicUsize::new(0));
         let schedule = Schedule::new(
             Arc::from("test_adding_trigger_to_existing_schedule"),
             Arc::new(TestComponent {
-                name: Arc::from("test_adding_trigger_to_existing_schedule"),
+                executions: Arc::clone(&executions),
             }),
         );
         let scheduler = Scheduler::<NotStarted>::new(
@@ -810,16 +790,11 @@ mod test {
         );
         let scheduler = scheduler.start().await.expect("Scheduler should start");
         tokio::time::sleep(Duration::from_secs(5)).await;
-
-        let map_lock = TEST_EXECUTION_COUNT.read().await;
-        let count = map_lock
-            .get("test_adding_trigger_to_existing_schedule")
-            .expect("To get test execution count");
-        assert!(
-            *count == 0,
-            "Test component should have executed 0 times, but got {count}"
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            0,
+            "a schedule without triggers must not run"
         );
-        drop(map_lock);
 
         // add a new trigger to the existing schedule
         let new_trigger = Arc::new(RwLock::new(IntervalRequestChannel::new(1)));
@@ -831,43 +806,29 @@ mod test {
             .await
             .expect("To add new trigger");
 
-        tokio::time::sleep(Duration::from_secs(5)).await;
+        tokio::time::sleep(Duration::from_millis(5500)).await;
         scheduler.stop().await;
-        let map_lock = TEST_EXECUTION_COUNT.read().await;
-        let count = map_lock
-            .get("test_adding_trigger_to_existing_schedule")
-            .expect("To get test execution count");
-        assert!(
-            *count == 4 || *count == 5,
-            "Test component should have executed 4 or 5 times, but got {count}"
-        );
+        assert_eq!(executions.load(Ordering::SeqCst), 5);
     }
 
-    #[tokio::test]
+    /// Runs on the paused clock: five runs (1s..=5s) before the removal at
+    /// 5.5s, and not one more in the five seconds after it.
+    #[tokio::test(start_paused = true)]
     async fn test_remove_schedule() {
+        let executions = Arc::new(AtomicUsize::new(0));
         let schedule = Schedule::new(
             Arc::from("test_remove_schedule"),
             Arc::new(TestComponent {
-                name: Arc::from("test_remove_schedule"),
+                executions: Arc::clone(&executions),
             }),
         )
         .add_trigger(Arc::new(RwLock::new(IntervalRequestChannel::new(1))));
         let scheduler =
             Scheduler::<NotStarted>::new("test_remove_schedule".into(), vec![Arc::new(schedule)]);
         let scheduler = scheduler.start().await.expect("Scheduler should start");
-        tokio::time::sleep(Duration::from_secs(5)).await;
-
-        let map_lock = TEST_EXECUTION_COUNT.read().await;
-        let count = map_lock
-            .get("test_remove_schedule")
-            .expect("To get test execution count");
-
-        assert!(
-            *count == 4 || *count == 5,
-            "Test component should have executed 4 or 5 times, but got {count}"
-        );
-
-        drop(map_lock);
+        tokio::time::sleep(Duration::from_millis(5500)).await;
+        let before_removal = executions.load(Ordering::SeqCst);
+        assert_eq!(before_removal, 5);
 
         // remove the schedule
         scheduler
@@ -878,13 +839,10 @@ mod test {
         tokio::time::sleep(Duration::from_secs(5)).await;
 
         scheduler.stop().await;
-        let map_lock = TEST_EXECUTION_COUNT.read().await;
-        let count = map_lock
-            .get("test_remove_schedule")
-            .expect("To get test execution count");
-        assert!(
-            *count == 4 || *count == 5,
-            "Test component should have executed 4 or 5 times, but got {count}"
+        assert_eq!(
+            executions.load(Ordering::SeqCst),
+            before_removal,
+            "a removed schedule must not run again"
         );
     }
 }

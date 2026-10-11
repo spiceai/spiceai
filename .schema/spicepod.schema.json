@@ -11328,6 +11328,10 @@
           "description": "The Anthropic Auth Token.",
           "type": "string"
         },
+        "anthropic_workspace_id": {
+          "description": "The Anthropic workspace ID, sent as the `anthropic-workspace-id` header. Required when the API key is not scoped to a workspace.",
+          "type": "string"
+        },
         "anthropic_usage_tier": {
           "description": "Anthropic usage tier (1-4). Used for rate limit defaults.",
           "type": "string"
@@ -22663,7 +22667,7 @@
       "type": "object",
       "properties": {
         "from": {
-          "description": "Model source for TypeSafe System One evaluation (Jev). Accepts `typesafe`, `typesafe:<model_id>`, or `typesafe/<model_id>`. Chat completions are not supported; use POST /v1/evaluate.",
+          "description": "Model source for TypeSafe System One evaluation (Jev). Accepts `typesafe`, `typesafe:<model_id>`, or `typesafe/<model_id>`. Chat completions are not supported; use POST /v1/decisions or the SQL decision functions.",
           "type": "string",
           "pattern": "^typesafe($|:.+|/.+)"
         },

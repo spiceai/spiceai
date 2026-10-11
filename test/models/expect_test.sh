@@ -7,6 +7,9 @@
 # the exit status, or the signal that ended it — rather than as a step that passed
 # or as expect's "spawn id expN not open".
 #
+# And a response that is still arriving must not be reported as a failure at all:
+# the waits are bounded on silence, not on how long a model takes to finish.
+#
 # Drives stand-in processes instead of the real `spice` binary, so it needs only
 # `expect`: no Spice runtime, no model provider, no network.
 #
@@ -169,11 +172,11 @@ assert_reports 'Sending "how many issues?"'
 assert_reports 'exited with status 3'
 assert_silent_about 'REACHED THE END'
 
-# SPICE_CHAT_EXPECT_TIMEOUT overrides the script default when it is a positive
+# SPICE_REPL_IDLE_TIMEOUT overrides the built-in bound when it is a positive
 # integer, and is rejected when it is not.
-helper_case 'SPICE_CHAT_EXPECT_TIMEOUT overrides the default' '
-set ::env(SPICE_CHAT_EXPECT_TIMEOUT) 7
-set t [repl_timeout_seconds 120]
+helper_case 'SPICE_REPL_IDLE_TIMEOUT overrides the default' '
+set ::env(SPICE_REPL_IDLE_TIMEOUT) 7
+set t [repl_idle_timeout]
 if {$t != 7} { send_user "got $t\n"; exit 1 }
 send_user "OVERRIDE_OK\n"
 exit 0
@@ -181,24 +184,24 @@ exit 0
 assert_status 0
 assert_reports 'OVERRIDE_OK'
 
-helper_case 'absent SPICE_CHAT_EXPECT_TIMEOUT keeps the default' '
-unset -nocomplain ::env(SPICE_CHAT_EXPECT_TIMEOUT)
-set t [repl_timeout_seconds 120]
-if {$t != 120} { send_user "got $t\n"; exit 1 }
+helper_case 'absent SPICE_REPL_IDLE_TIMEOUT keeps the default' '
+unset -nocomplain ::env(SPICE_REPL_IDLE_TIMEOUT)
+set t [repl_idle_timeout]
+if {$t != 90} { send_user "got $t\n"; exit 1 }
 send_user "DEFAULT_OK\n"
 exit 0
 '
 assert_status 0
 assert_reports 'DEFAULT_OK'
 
-helper_case 'rejects a non-integer SPICE_CHAT_EXPECT_TIMEOUT' '
-set ::env(SPICE_CHAT_EXPECT_TIMEOUT) not-a-number
-repl_timeout_seconds 30
+helper_case 'rejects a non-integer SPICE_REPL_IDLE_TIMEOUT' '
+set ::env(SPICE_REPL_IDLE_TIMEOUT) not-a-number
+repl_idle_timeout
 send_user "REACHED THE END\n"
 exit 0
 '
 assert_status 1
-assert_reports 'SPICE_CHAT_EXPECT_TIMEOUT must be a positive integer'
+assert_reports 'SPICE_REPL_IDLE_TIMEOUT must be a positive whole number of seconds'
 assert_silent_about 'REACHED THE END'
 
 # A healthy exchange still runs to completion: the helpers must not turn a
@@ -251,8 +254,32 @@ set -u
 mode=$1
 exit_before=${SPICE_FAKE_EXIT_BEFORE_TURN:-0}
 exit_after=${SPICE_FAKE_EXIT_AFTER_TURN:-0}
+# Silence: how long the stand-in waits before answering a turn, or before its
+# first prompt. A model that has stalled and a search that is still running
+# both look like this to the script.
 sleep_secs=${SPICE_FAKE_SLEEP_SECONDS:-0}
 initial_sleep_secs=${SPICE_FAKE_INITIAL_SLEEP_SECONDS:-0}
+# A response that arrives in pieces, the way a streaming model answers: a few
+# filler lines spaced apart before the line the script is looking for.
+stream_lines=${SPICE_FAKE_STREAM_LINES:-0}
+stream_delay=${SPICE_FAKE_STREAM_DELAY_SECONDS:-0}
+# Goes quiet after answering, without exiting — a runtime that has stopped
+# producing output but is still alive, which no eof branch can catch.
+stall_after=${SPICE_FAKE_STALL_AFTER_TURN:-0}
+# Writes the prompt in two pieces so it lands across two reads. A wait that
+# consumes the stream with a greedy catch-all eats the first piece and then
+# waits forever for a prompt that has already gone by.
+split_prompt=${SPICE_FAKE_SPLIT_PROMPT:-0}
+
+write_prompt() {
+  if [ "$split_prompt" -ne 0 ]; then
+    printf '%s' "${prompt%"> "}"
+    sleep 0.3
+    printf '> '
+  else
+    printf '%s' "$prompt"
+  fi
+}
 
 # Records how the script invoked us, so a test can check that the runtime
 # endpoint was passed through rather than left at the CLI default.
@@ -269,7 +296,7 @@ turn=0
 if [ "$initial_sleep_secs" -gt 0 ]; then
   sleep "$initial_sleep_secs"
 fi
-printf '%s' "$prompt"
+write_prompt
 
 while IFS= read -r line; do
   turn=$((turn + 1))
@@ -280,6 +307,21 @@ while IFS= read -r line; do
 
   if [ "$sleep_secs" -gt 0 ]; then
     sleep "$sleep_secs"
+  fi
+
+  emitted=0
+  while [ "$emitted" -lt "$stream_lines" ]; do
+    sleep "$stream_delay"
+    printf 'still thinking about it, line %s\r\n' "$((emitted + 1))"
+    emitted=$((emitted + 1))
+  done
+
+  if [ "$stall_after" -ne 0 ] && [ "$turn" -ge "$stall_after" ]; then
+    # No answer, no prompt, no exit: the script has to notice the silence. The
+    # sleep only has to outlast the bound under test, and is kept short so a
+    # stand-in that outlives its pty does not sit on the runner.
+    sleep 30
+    exit 45
   fi
 
   if [ "$mode" = 'search' ]; then
@@ -294,7 +336,7 @@ while IFS= read -r line; do
     esac
   fi
 
-  printf '%s' "$prompt"
+  write_prompt
 
   # Leaving after the prompt is written is how a REPL that dies while sitting
   # idle looks to the script driving it.
@@ -336,7 +378,7 @@ for script in chat_01.exp chat_01_simple.exp search_01.exp; do
   script_case "$script against a healthy REPL" "$script"
   assert_status 0
   assert_silent_about 'no longer running'
-  assert_silent_about 'Timeout waiting'
+  assert_silent_about 'no output from the REPL'
 done
 
 script_case 'chat_01.exp when the REPL exits before answering' chat_01.exp \
@@ -353,23 +395,6 @@ assert_reports 'Waiting for the response to'
 assert_reports 'exited with status 44'
 assert_silent_about 'Model returned expected response'
 
-# A stand-in that starts but never reaches its prompt must still time out.
-script_case 'chat_01_simple.exp times out waiting for the initial prompt' chat_01_simple.exp \
-  SPICE_CHAT_EXPECT_TIMEOUT=1 \
-  SPICE_FAKE_INITIAL_SLEEP_SECONDS=3
-assert_status 1
-assert_reports 'Timeout waiting for initial chat prompt'
-assert_silent_about 'Model returned expected response'
-
-# A generation that outlives the chat expect budget must fail as a timeout, not
-# as a hang of the 120s default. The stand-in sleeps 3s; 1s is enough to trip.
-script_case 'chat_01_simple.exp times out when generation exceeds SPICE_CHAT_EXPECT_TIMEOUT' chat_01_simple.exp \
-  SPICE_CHAT_EXPECT_TIMEOUT=1 \
-  SPICE_FAKE_SLEEP_SECONDS=3
-assert_status 1
-assert_reports 'Timeout waiting for expected response'
-assert_silent_about 'Model returned expected response'
-
 script_case 'search_01.exp when the REPL exits before answering' search_01.exp \
   SPICE_FAKE_EXIT_BEFORE_TURN=1
 assert_status 1
@@ -382,6 +407,110 @@ script_case 'chat_01.exp when the REPL exits while idle' chat_01.exp \
 assert_status 1
 assert_reports 'Checking the chat REPL is still running'
 assert_reports 'exited with status 44'
+
+# ---------------------------------------------------------------------------
+# What the wait on a REPL response is bounded by
+# ---------------------------------------------------------------------------
+#
+# A bound on a whole response is a bound on answer length and runner speed: a
+# model that is still streaming, or a search that is still running, fails it and
+# ejects unrelated PRs from the merge queue (#13711). The bound is on silence: a
+# response that keeps arriving is allowed to take as long as it takes, and only
+# a runtime that has stopped emitting trips it.
+#
+# Each case sets SPICE_REPL_IDLE_TIMEOUT so the stall path can be reached in
+# seconds. The streaming cases take longer in total than that bound while never
+# pausing for as long as it: the shape a bound on total response time fails and
+# a bound on silence passes. The stand-in's longest pause is half the bound, so
+# a scheduling hiccup on a contended runner does not read as a stall.
+
+for script in chat_01.exp chat_01_simple.exp; do
+  script_case "$script when the response streams for longer than the bound" "$script" \
+    SPICE_REPL_IDLE_TIMEOUT=4 \
+    SPICE_FAKE_STREAM_LINES=3 \
+    SPICE_FAKE_STREAM_DELAY_SECONDS=2
+  assert_status 0
+  assert_silent_about 'no output from the REPL'
+
+  script_case "$script when the prompt arrives split across two reads" "$script" \
+    SPICE_REPL_IDLE_TIMEOUT=5 \
+    SPICE_FAKE_SPLIT_PROMPT=1
+  assert_status 0
+  assert_silent_about 'no output from the REPL'
+done
+
+# A search answers in one piece once the embedding model has run, so "slow" and
+# "streaming" are the same thing to the script: nothing arrives until the
+# result. A fixed 5s budget fails a search that is still running, as job
+# 112954591167 shows.
+script_case 'search_01.exp when the search takes 6s to answer' search_01.exp \
+  SPICE_REPL_IDLE_TIMEOUT=10 \
+  SPICE_FAKE_SLEEP_SECONDS=6
+assert_status 0
+assert_reports 'Search returned expected result'
+assert_silent_about 'no output from the REPL'
+
+script_case 'search_01.exp when the search produces nothing for longer than the bound' search_01.exp \
+  SPICE_REPL_IDLE_TIMEOUT=2 \
+  SPICE_FAKE_SLEEP_SECONDS=4
+assert_status 1
+assert_reports 'no output from the REPL for 2s'
+assert_reports 'Searching for "Spice runtime error"'
+assert_silent_about 'Search returned expected result'
+
+# A stand-in that starts but never reaches its prompt must still time out.
+script_case 'chat_01_simple.exp when nothing arrives before the initial prompt' chat_01_simple.exp \
+  SPICE_REPL_IDLE_TIMEOUT=1 \
+  SPICE_FAKE_INITIAL_SLEEP_SECONDS=3
+assert_status 1
+assert_reports 'no output from the REPL for 1s'
+assert_reports 'Waiting for the initial chat prompt'
+assert_silent_about 'Model returned expected response'
+
+# A model that pauses for longer than the bound before answering is a stall,
+# however short the answer that would have followed. The stand-in sleeps 3s;
+# a 1s bound is enough to trip.
+script_case 'chat_01_simple.exp when the model pauses for longer than the bound' chat_01_simple.exp \
+  SPICE_REPL_IDLE_TIMEOUT=1 \
+  SPICE_FAKE_SLEEP_SECONDS=3
+assert_status 1
+assert_reports 'no output from the REPL for 1s'
+assert_reports 'Waiting for the response to'
+assert_silent_about 'Model returned expected response'
+
+# Output that then stops is still a stall: the per-line reset must not make the
+# bound unreachable once the answer has started arriving.
+script_case 'chat_01_simple.exp when the REPL streams part of an answer and then goes silent' chat_01_simple.exp \
+  SPICE_REPL_IDLE_TIMEOUT=3 \
+  SPICE_FAKE_STREAM_LINES=2 \
+  SPICE_FAKE_STALL_AFTER_TURN=1
+assert_status 1
+assert_reports 'no output from the REPL for 3s'
+assert_reports 'Waiting for the response to'
+assert_silent_about 'Model returned expected response'
+
+# chat_01.exp reads the same bound: a pause longer than it is reported from the
+# turn that was waiting.
+script_case 'chat_01.exp when the model pauses for longer than the bound' chat_01.exp \
+  SPICE_REPL_IDLE_TIMEOUT=1 \
+  SPICE_FAKE_SLEEP_SECONDS=3
+assert_status 1
+assert_reports 'no output from the REPL for 1s'
+assert_reports 'Waiting for the list of datasets'
+assert_silent_about 'Model confirmed access to all datasets'
+
+script_case 'chat_01_simple.exp when the idle bound is not a positive number' chat_01_simple.exp \
+  SPICE_REPL_IDLE_TIMEOUT=soon
+assert_status 1
+assert_reports 'SPICE_REPL_IDLE_TIMEOUT must be a positive whole number of seconds'
+
+# An unset override interpolates to an empty string, which is what a caller that
+# does not set the bound looks like from inside the script. That has to mean the
+# built-in default, not a rejected value.
+script_case 'chat_01_simple.exp when the idle bound is left empty' chat_01_simple.exp \
+  SPICE_REPL_IDLE_TIMEOUT=''
+assert_status 0
+assert_silent_about 'must be a positive whole number'
 
 # ---------------------------------------------------------------------------
 # The runtime endpoint the REPL is pointed at

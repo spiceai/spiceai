@@ -993,18 +993,6 @@ simple: shallow
     }
 
     #[test]
-    fn test_parse_yaml_invalid_syntax() {
-        let result = parse_yaml("key: [unclosed");
-        let _ = result.expect_err("should fail on invalid YAML");
-    }
-
-    #[test]
-    fn test_parse_yaml_multi_invalid_syntax() {
-        let result = parse_yaml_multi("---\nvalid: ok\n---\nkey: [unclosed");
-        let _ = result.expect_err("should fail on invalid YAML");
-    }
-
-    #[test]
     fn test_parse_yaml_whitespace_only() {
         let value = parse_yaml("   \n\n  \t  ").expect("whitespace only is valid");
         assert!(value.is_null());

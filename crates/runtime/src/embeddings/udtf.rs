@@ -1162,6 +1162,7 @@ mod tests {
     use datafusion::catalog::TableProvider;
     use datafusion::common::TableReference;
     use datafusion::datasource::MemTable;
+    use datafusion::error::DataFusionError;
     use datafusion::logical_expr::expr::FieldMetadata;
     use datafusion::prelude::Expr;
     use datafusion::scalar::ScalarValue;
@@ -1488,6 +1489,14 @@ mod tests {
         assert_eq!(parsed.limit, None);
     }
 
+    /// Asserts `err` is a planning error carrying exactly `expected`.
+    fn assert_plan_error(err: &DataFusionError, expected: &str) {
+        assert!(
+            matches!(err, DataFusionError::Plan(message) if message == expected),
+            "expected DataFusionError::Plan({expected:?}), got {err:?}"
+        );
+    }
+
     #[test]
     fn parse_args_duplicate_positional_and_named_limit_rejected() {
         let exprs = vec![
@@ -1496,8 +1505,12 @@ mod tests {
             Expr::Literal(ScalarValue::Int64(Some(10)), None), // positional limit
             named_arg("limit", ScalarValue::Int64(Some(50))),  // named limit
         ];
-        let _err = VectorSearchTableFunc::parse_args(&exprs)
+        let err = VectorSearchTableFunc::parse_args(&exprs)
             .expect_err("Duplicate limit should be rejected");
+        assert_plan_error(
+            &err,
+            "Duplicate 'limit' argument: provided both positionally and as a named argument.",
+        );
     }
 
     #[test]
@@ -1507,18 +1520,30 @@ mod tests {
             lit_utf8("hello"),
             named_arg("limit", ScalarValue::Boolean(Some(true))),
         ];
-        let _err = VectorSearchTableFunc::parse_args(&exprs)
+        let err = VectorSearchTableFunc::parse_args(&exprs)
             .expect_err("Boolean limit should be rejected");
+        assert_plan_error(
+            &err,
+            "Limit argument must be a non-negative integer, but got true.",
+        );
     }
 
     #[test]
     fn parse_args_named_column_wrong_type_rejected() {
+        let named_column = named_arg("column", ScalarValue::Int64(Some(42)));
         let exprs = vec![
             Expr::Column(datafusion::common::Column::new_unqualified("docs")),
             lit_utf8("hello"),
-            named_arg("column", ScalarValue::Int64(Some(42))),
+            named_column.clone(),
         ];
-        let _err = VectorSearchTableFunc::parse_args(&exprs)
+        let err = VectorSearchTableFunc::parse_args(&exprs)
             .expect_err("Integer column should be rejected");
+        // The message names the offending argument as it was written.
+        assert_plan_error(
+            &err,
+            &format!(
+                "Named 'column' argument must be a column reference or string, got {named_column:?}."
+            ),
+        );
     }
 }

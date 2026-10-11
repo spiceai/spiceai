@@ -271,9 +271,13 @@ mod tests {
         let mask = MaskFuture::new(4, async { Err(vortex_err!("filter failed")) });
         let expr = root().bind(reader.dtype())?;
         let result = reader.projection_evaluation(&(0..4), &expr, mask)?.await;
+        let Err(err) = result else {
+            panic!("a failed filter must surface as a failed projection");
+        };
+        // The filter's own error is what surfaces, not a substitute raised later.
         assert!(
-            result.is_err(),
-            "a failed filter must surface as a failed projection"
+            err.to_string().contains("filter failed"),
+            "expected the filter's error to surface, got: {err}"
         );
         assert_eq!(calls.load(Ordering::Relaxed), 0);
         Ok(())
