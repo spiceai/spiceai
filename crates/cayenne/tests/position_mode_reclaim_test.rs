@@ -29,7 +29,7 @@ limitations under the License.
 //! writes and maintenance to prove it reaches a bounded steady state instead of
 //! growing for the life of the table.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 use std::time::Duration;

@@ -107,6 +107,7 @@ mod partition_chunking_test;
 mod partition_pruning_test;
 mod partitioned_overlay_test;
 mod position_based_deletion_test;
+mod position_mode_reclaim_test;
 mod position_mode_upsert_test;
 mod predicate_delete_ram_tier_rows;
 mod protected_snapshot_projection_test;
