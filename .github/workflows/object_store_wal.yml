@@ -119,6 +119,7 @@ jobs:
       # Unique per attempt: a WAL namespace is never reused, and spiceio's share
       # outlives the job.
       WAL_PREFIX: object_store_wal/${{ github.run_id }}-${{ github.run_attempt }}
+      WAL_CONTAINER: wal-${{ matrix.store }}-${{ github.run_id }}-${{ github.run_attempt }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -156,22 +157,23 @@ jobs:
           set -euo pipefail
           case "$STORE" in
             # MinIO no longer publishes images or binaries. Chainguard builds the
-            # upstream source and runs it as a user that cannot create /data.
+            # upstream source (this is its 2026-10-10 build) and runs it as a user
+            # that cannot create /data.
             minio)
-              image=cgr.dev/chainguard/minio:latest
-              docker run -d --name wal-object-store --user 0:0 --publish 127.0.0.1::9000 \
+              image=cgr.dev/chainguard/minio@sha256:7df55d002b698e4494a131b848dd553361bbe58b7e19f62d9623c29af1ba9ccf
+              docker run -d --name "$WAL_CONTAINER" --user 0:0 --publish 127.0.0.1::9000 \
                 -e MINIO_ROOT_USER="$AWS_ACCESS_KEY_ID" -e MINIO_ROOT_PASSWORD="$AWS_SECRET_ACCESS_KEY" \
                 -e MINIO_BROWSER=off "$image" server /data
               ;;
             rustfs)
               image=rustfs/rustfs:1.0.1@sha256:1803faef57627e2d9c2e7d89d655d712ddded5389040054987163043fecb6a3c
-              docker run -d --name wal-object-store --publish 127.0.0.1::9000 \
+              docker run -d --name "$WAL_CONTAINER" --publish 127.0.0.1::9000 \
                 -e RUSTFS_ACCESS_KEY="$AWS_ACCESS_KEY_ID" -e RUSTFS_SECRET_KEY="$AWS_SECRET_ACCESS_KEY" \
                 "$image" /data
               ;;
           esac
-          echo "$STORE image: $(docker image inspect --format '{{index .RepoDigests 0}}' "$(docker inspect --format '{{.Image}}' wal-object-store)")"
-          port=$(docker port wal-object-store 9000/tcp | head -n 1 | sed 's/.*://')
+          docker exec "$WAL_CONTAINER" "$STORE" --version || echo "::warning::Could not read the $STORE version from $image."
+          port=$(docker port "$WAL_CONTAINER" 9000/tcp | head -n 1 | sed 's/.*://')
           echo "AWS_ENDPOINT=http://127.0.0.1:${port:?no published port for the $STORE container}" >> "$GITHUB_ENV"
 
       - name: Start ${{ matrix.store }} on the host
@@ -221,6 +223,13 @@ jobs:
         if: matrix.store == 'minio' || matrix.store == 'rustfs'
         run: |
           set -euo pipefail
+          server_running() {
+            if [ -n "${WAL_SERVER_PID:-}" ]; then
+              kill -0 "$WAL_SERVER_PID" 2> /dev/null
+            else
+              [ "$(docker container inspect --format '{{.State.Running}}' "$WAL_CONTAINER" 2> /dev/null)" = true ]
+            fi
+          }
           # The server accepts connections before its S3 API answers, so the first
           # signed request that succeeds is also the readiness check.
           code=000
@@ -231,6 +240,12 @@ jobs:
               "$AWS_ENDPOINT/$WAL_BUCKET") || true
             if [ "$code" = 200 ]; then
               exit 0
+            fi
+            # A server that exited, for example over a port another job took
+            # first, would otherwise be waited out here.
+            if ! server_running; then
+              echo "::error::$STORE exited before it created bucket '$WAL_BUCKET' at $AWS_ENDPOINT; its log is printed below."
+              exit 1
             fi
             sleep 1
           done
@@ -317,8 +332,8 @@ jobs:
         run: |
           mkdir -p wal-e2e-artifacts
           if [ "$RUNNER_OS" = Linux ]; then
-            docker logs wal-object-store > wal-e2e-artifacts/server.log 2>&1 || true
-            docker rm -f wal-object-store > /dev/null 2>&1 || true
+            docker logs "$WAL_CONTAINER" > wal-e2e-artifacts/server.log 2>&1 || true
+            docker rm -f "$WAL_CONTAINER" > /dev/null 2>&1 || true
           else
             if [ -n "${WAL_SERVER_PID:-}" ]; then
               kill "$WAL_SERVER_PID" 2> /dev/null || true

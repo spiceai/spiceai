@@ -413,20 +413,27 @@ def crashes(executable, stores, artifacts):
 
 def export_store(executable, stores):
     # The service does not outlive the run, so its objects are kept with the
-    # histories. A failed copy is reported without replacing the run's result.
+    # histories. This runs while a history failure may be propagating, so no
+    # error from the copy may replace the run's own result.
     target = stores.local / "object-store"
     try:
         exported = driver_command(executable, "--export", stores.url, target, timeout=TIMEOUT * 5)["exported"]
         print(f"copied {exported} objects from {stores.url} into {target}", flush=True)
-    except (AssertionError, json.JSONDecodeError, subprocess.TimeoutExpired) as error:
-        print(f"could not copy {stores.url} into the artifacts: {error}", flush=True)
+    except Exception as error:  # noqa: BLE001
+        print(f"could not copy {stores.url} into the artifacts: {error!r}", flush=True)
+
+
+def object_store_url(value):
+    if not value.startswith("s3://") or not value[len("s3://"):].strip("/"):
+        raise argparse.ArgumentTypeError(f"expected s3://bucket[/prefix], not {value!r}")
+    return value
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--driver", type=Path, required=True)
     parser.add_argument("--artifacts", type=Path, required=True)
-    parser.add_argument("--store", help="run the WAL on an object store, e.g. s3://bucket/prefix (default: local directories)")
+    parser.add_argument("--store", type=object_store_url, help="run the WAL on an object store, e.g. s3://bucket/prefix (default: local directories)")
     parser.add_argument("--slatedb", action="store_true", help="require the pinned independent oracle")
     parser.add_argument("--redis-url", help="require a Redis oracle, e.g. redis://127.0.0.1:6379/0")
     parser.add_argument("--seeds", type=int, nargs="+", default=[0, 1, 17, 5489])
