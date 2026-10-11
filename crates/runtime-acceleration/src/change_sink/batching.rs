@@ -564,7 +564,15 @@ impl CdcBurst {
                 target = Arc::clone(&plan.evolved_schema);
             }
             if matches!(schema, SchemaDecision::Proceed)
-                && batch.data_schema().fields() != target.fields()
+                && !batch
+                    .data_schema()
+                    .fields()
+                    .iter()
+                    .zip(target.fields().iter())
+                    .all(|(incoming, current)| {
+                        incoming.name() == current.name()
+                            && incoming.data_type() == current.data_type()
+                    })
             {
                 ensure_numbers_cast_exactly(&batch.data_batch(), &target)?;
             }

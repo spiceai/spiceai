@@ -89,7 +89,7 @@ impl CdcPolicy for RefreshCdcPolicy {
                         &schema_evolution_labels(&dataset, kind, "blocked_by_policy"),
                     );
                     if schema_evolution_first_warn(format!("{dataset}|policy|{change}")) {
-                        tracing::warn!(dataset = %dataset, "widening schema change detected on the CDC stream ({change}) but `on_schema_change: {}` only evolves added columns; values continue to be cast to the current schema. Set `on_schema_change: sync_all_columns` to evolve types", settings.policy);
+                        tracing::warn!(dataset = %dataset, "widening schema change detected on the CDC stream ({change}) but `on_schema_change: {}` only evolves added columns; values continue to be cast to the current schema, and a change with a value it cannot hold exactly is refused. Set `on_schema_change: sync_all_columns` to evolve types", settings.policy);
                         emit_schema_evolution_event(&dataset, "blocked_by_policy", &change, true);
                     }
                     return Ok(SchemaDecision::Proceed);
@@ -116,7 +116,7 @@ impl CdcPolicy for RefreshCdcPolicy {
                             &schema_evolution_labels(&dataset, kind, "restart_required"),
                         );
                         if schema_evolution_first_warn(format!("{dataset}|restart|{change}")) {
-                            tracing::warn!(dataset = %dataset, "widening schema change detected on the CDC stream ({change}) but this acceleration engine cannot evolve mid-stream; incoming values are cast to the current schema (new columns dropped) until restart. Restart Spice to apply the evolution");
+                            tracing::warn!(dataset = %dataset, "widening schema change detected on the CDC stream ({change}) but this acceleration engine cannot evolve mid-stream; incoming values are cast to the current schema (new columns dropped) until restart, and a change with a value it cannot hold exactly is refused. Restart Spice to apply the evolution");
                             emit_schema_evolution_event(
                                 &dataset,
                                 "restart_required",

@@ -73,6 +73,12 @@ pub(crate) struct RelationSchemaTracker {
     /// the runtime classifier applies), so it is rejected here too.
     constraint_columns: Vec<String>,
     column_oids: HashMap<String, u32>,
+    /// The baseline was seeded and no `Relation` has been diffed against it
+    /// yet. That first `Relation` can describe WAL written before the source
+    /// catalog the seed was read from (a resumed slot replaying changes from
+    /// before an `ALTER`), so a type it reports that the working type already
+    /// holds every value of is accepted rather than read as a narrowing.
+    seed_pending: bool,
 }
 
 impl RelationSchemaTracker {
@@ -88,6 +94,7 @@ impl RelationSchemaTracker {
             dataset_name,
             constraint_columns,
             column_oids: HashMap::new(),
+            seed_pending: false,
         }
     }
 
@@ -100,6 +107,7 @@ impl RelationSchemaTracker {
     /// never be diffed and its values would be decoded as the registered type.
     #[must_use]
     pub(crate) fn with_column_type_oids(mut self, column_oids: HashMap<String, u32>) -> Self {
+        self.seed_pending = !column_oids.is_empty();
         self.column_oids = column_oids;
         self
     }
@@ -155,6 +163,16 @@ impl RelationSchemaTracker {
 
             let previous_oid = self.column_oids.get(field.name()).copied();
             if first_observation || previous_oid == Some(col.type_oid) {
+                evolved_fields.push(Arc::clone(field));
+                continue;
+            }
+
+            // WAL older than the seeded catalog: its values are widened into the
+            // working type on decode.
+            if self.seed_pending
+                && map_pg_oid_to_arrow(col.type_oid, col.type_modifier)
+                    .is_some_and(|mapped| is_widening_cast(&mapped, field.data_type()))
+            {
                 evolved_fields.push(Arc::clone(field));
                 continue;
             }
@@ -266,6 +284,7 @@ impl RelationSchemaTracker {
             .fail();
         }
 
+        self.seed_pending = false;
         self.column_oids = rel
             .columns
             .iter()
@@ -409,6 +428,37 @@ mod tests {
         assert!(obs.schema_changed);
         assert_eq!(obs.summary, "widened `k`: Int32 -> Float64");
         assert_eq!(t.working_schema().field(1).data_type(), &DataType::Float64);
+    }
+
+    /// A resumed slot can replay WAL from before the `ALTER` the seed already
+    /// reflects: the first `Relation` then reports the older, narrower type,
+    /// which the working type holds, so it is not a narrowing. Only that first
+    /// `Relation` is read this way; a later narrowing is still an error.
+    #[test]
+    fn seeded_baseline_accepts_older_narrower_wal_only_first() {
+        let mut t = tracker_with_schema(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("k", DataType::Float64, true),
+            ])),
+            SchemaEvolutionPolicy::SyncAllColumns,
+        )
+        .with_column_type_oids(HashMap::from([
+            ("id".to_string(), 23),
+            ("k".to_string(), 701),
+        ]));
+        let obs = t
+            .observe_relation(&relation(vec![("id", 23), ("k", 23)]))
+            .expect("replayed int4 relation fits the Float64 working type");
+        assert!(!obs.schema_changed);
+        assert_eq!(t.working_schema().field(1).data_type(), &DataType::Float64);
+        t.observe_relation(&relation(vec![("id", 23), ("k", 701)]))
+            .expect("the post-ALTER relation matches the working type");
+        let msg = t
+            .observe_relation(&relation(vec![("id", 23), ("k", 23)]))
+            .expect_err("a later narrowing is an error")
+            .to_string();
+        assert!(msg.contains("not a lossless widening"), "{msg}");
     }
 
     /// A seeded column the dataset does not project is not "added" when the

@@ -1315,6 +1315,88 @@ async fn first_change_after_column_type_change_decodes_with_the_new_type()
     Ok(())
 }
 
+/// A stream that resumes with WAL from both sides of a column type change still
+/// unconsumed keeps applying it. The dataset is registered from the source as it
+/// is now (`k` already `double precision`), so the first `Relation` the resumed
+/// stream receives describes an older, narrower type than the registered one;
+/// its values are widened into the registered type rather than refused.
+#[tokio::test(flavor = "multi_thread")]
+async fn resume_across_a_column_type_change_applies_wal_from_both_sides()
+-> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
+
+    let container = common::start_postgres_docker_container_with_logical_wal().await?;
+    let port = u16::try_from(container.host_port(5432)?).expect("port fits in u16");
+    let table = "alter_type_resume";
+    let (source, stream) =
+        start_alter_type_stream(port, table, SchemaEvolutionPolicy::SyncAllColumns).await?;
+    drop(stream);
+    // Model a restart: the changes below are written while no stream holds the
+    // slot, so the resumed stream reads them in a new replication session.
+    let slot = format!("{table}_slot");
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let active: bool = source
+            .query_one(
+                "SELECT active FROM pg_replication_slots WHERE slot_name = $1",
+                &[&slot],
+            )
+            .await?
+            .get(0);
+        if !active {
+            break;
+        }
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "slot {slot} stayed active after its stream was dropped"
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    // One transaction each: a multi-statement `simple_query` would run as one.
+    for statement in [
+        format!("INSERT INTO public.{table} VALUES (4, 7)"),
+        format!("ALTER TABLE public.{table} ALTER COLUMN k TYPE double precision"),
+        format!("INSERT INTO public.{table} VALUES (5, 1.5)"),
+    ] {
+        source.simple_query(&statement).await?;
+    }
+
+    let input = ReplicationStreamInput {
+        dataset_name: table.into(),
+        params: params_for(port, &format!("{table}_slot"), &format!("{table}_pub")),
+        schema: Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("k", DataType::Float64, true),
+        ])),
+        primary_keys: vec!["id".into()],
+        schema_name: "public".into(),
+        table_name: table.into(),
+        metrics: ReplicationMetricsCollector::new(),
+        policy: SchemaEvolutionPolicy::SyncAllColumns,
+        applied_lsn_store: Arc::new(NoopAppliedLsnStore),
+        write_back_registry: None,
+    };
+    let mut stream = start_replication_stream(input);
+    let mut seen = Vec::new();
+    while seen.len() < 2 {
+        let envelope = next_change_envelope(&mut stream, "replayed inserts").await?;
+        let (id, k) = single_change_value(&envelope);
+        assert_eq!(
+            k.data_type(),
+            &DataType::Float64,
+            "k stays the registered Float64"
+        );
+        seen.push((
+            id,
+            k.as_primitive::<arrow::datatypes::Float64Type>().value(0),
+        ));
+        envelope.commit().await?;
+    }
+    assert_eq!(seen, vec![(4, 7.0), (5, 1.5)]);
+    Ok(())
+}
+
 pub(super) async fn drop_replication_slot_when_inactive(
     source: &tokio_postgres::Client,
     slot: &str,

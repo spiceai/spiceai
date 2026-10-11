@@ -54,15 +54,22 @@ const PG_EPOCH_MICROS: i64 = 946_684_800_000_000;
 /// since the Postgres epoch; Arrow `Date32` is days since the Unix epoch.
 const PG_EPOCH_DAYS: i32 = 10_957;
 
+const PG_BOOL_OID: u32 = 16;
+const PG_CHAR_OID: u32 = 18;
 const PG_INT8_OID: u32 = 20;
 const PG_INT2_OID: u32 = 21;
 const PG_INT4_OID: u32 = 23;
+const PG_OID_OID: u32 = 26;
 const PG_FLOAT4_OID: u32 = 700;
 const PG_FLOAT8_OID: u32 = 701;
+const PG_DATE_OID: u32 = 1082;
+const PG_TIME_OID: u32 = 1083;
+const PG_TIMESTAMP_OID: u32 = 1114;
+const PG_TIMESTAMPTZ_OID: u32 = 1184;
 const PG_NUMERIC_OID: u32 = 1700;
 
 /// An integer or float decoded by its wire type, before conversion to the
-/// builder's type ([`FieldBuilder::append_converted_number`]).
+/// builder's type ([`FieldBuilder::append_binary_of_another_type`]).
 #[derive(Clone, Copy, Debug, PartialEq)]
 enum WireNumber {
     Int(i64),
@@ -1198,35 +1205,48 @@ impl FieldBuilder {
         Ok(())
     }
 
-    /// Decode a binary integer or float whose source type is not the builder's
-    /// own, and append it only when the builder's type holds the value exactly.
+    /// Handle a binary value whose source type is not the builder's own.
     ///
     /// The builder is typed from the dataset's working schema, which can differ
     /// from the type a column has in the WAL: under `on_schema_change: block`
     /// after the source column's type changed, or for WAL written before a
-    /// widening the dataset has already adopted. Decoding the bytes as the
-    /// builder's type would misread them, so they are decoded as the wire type.
-    /// A value the builder's type cannot represent exactly is an error rather
-    /// than a rounded or truncated row.
+    /// widening the dataset has already adopted. The `send` decoders check only
+    /// a value's length, so decoding its bytes as the builder's type would
+    /// misread any value of the same width. Instead, an integer or float is
+    /// decoded as its wire type and appended when the builder's type holds it
+    /// exactly, and any other value of a known source type is an error.
     ///
-    /// Returns `false`, appending nothing, when the wire type is the builder's
-    /// own type or is not a number this conversion handles; the caller then
-    /// decodes the value as the builder's type.
-    fn append_converted_number(&mut self, raw: &[u8], type_oid: u32) -> Result<bool> {
+    /// Returns `false`, appending nothing, when the wire type is one the builder
+    /// decodes itself, or when the builder or the wire type is not fixed-width
+    /// and known; the caller then decodes the value as the builder's type.
+    fn append_binary_of_another_type(&mut self, raw: &[u8], type_oid: u32) -> Result<bool> {
         use postgres_protocol::types as pg;
 
-        let (builder_oid, target) = match self {
-            Self::Int16(_) => (PG_INT2_OID, DataType::Int16),
-            Self::Int32(_) => (PG_INT4_OID, DataType::Int32),
-            Self::Int64(_) => (PG_INT8_OID, DataType::Int64),
-            Self::Float32(_) => (PG_FLOAT4_OID, DataType::Float32),
-            Self::Float64(_) => (PG_FLOAT8_OID, DataType::Float64),
+        let (accepts, target): (&[u32], DataType) = match self {
+            Self::Bool(_) => (&[PG_BOOL_OID], DataType::Boolean),
+            Self::Int8(_) => (&[PG_CHAR_OID], DataType::Int8),
+            Self::Int16(_) => (&[PG_INT2_OID], DataType::Int16),
+            Self::Int32(_) => (&[PG_INT4_OID], DataType::Int32),
+            Self::Int64(_) => (&[PG_INT8_OID], DataType::Int64),
+            Self::UInt32(_) => (&[PG_OID_OID], DataType::UInt32),
+            Self::Float32(_) => (&[PG_FLOAT4_OID], DataType::Float32),
+            Self::Float64(_) => (&[PG_FLOAT8_OID], DataType::Float64),
+            Self::Date32(_) => (&[PG_DATE_OID], DataType::Date32),
+            Self::Time64Nanos(_) => (&[PG_TIME_OID], DataType::Time64(TimeUnit::Nanosecond)),
+            Self::TimestampMicros(_, tz) => (
+                &[PG_TIMESTAMP_OID, PG_TIMESTAMPTZ_OID],
+                DataType::Timestamp(TimeUnit::Microsecond, tz.clone()),
+            ),
+            Self::TimestampNanos(_, tz) => (
+                &[PG_TIMESTAMP_OID, PG_TIMESTAMPTZ_OID],
+                DataType::Timestamp(TimeUnit::Nanosecond, tz.clone()),
+            ),
             Self::Decimal128(_, precision, scale) => {
-                (PG_NUMERIC_OID, DataType::Decimal128(*precision, *scale))
+                (&[PG_NUMERIC_OID], DataType::Decimal128(*precision, *scale))
             }
             _ => return Ok(false),
         };
-        if builder_oid == type_oid {
+        if accepts.contains(&type_oid) {
             return Ok(false);
         }
         let (wire_name, decoded) = match type_oid {
@@ -1246,6 +1266,21 @@ impl FieldBuilder {
                     .map(WireNumber::Float),
             ),
             PG_FLOAT8_OID => ("float8", pg::float8_from_sql(raw).map(WireNumber::Float)),
+            _ if type_oid == PG_NUMERIC_OID
+                || super::schema_evolution::map_pg_oid_to_arrow(type_oid, -1).is_some() =>
+            {
+                return PgOutputDecodeSnafu {
+                    message: format!(
+                        "postgres_replication: the source column's type (type oid {type_oid}) is not \
+                         the dataset column's type `{target}`, so its value cannot be decoded. The \
+                         source column's type changed since the dataset was registered; set \
+                         `on_schema_change: sync_all_columns` to adopt a widening, or restart Spice \
+                         so the dataset re-registers with the new type. See: \
+                         https://spiceai.org/docs/components/data-connectors/postgres"
+                    ),
+                }
+                .fail();
+            }
             _ => return Ok(false),
         };
         let value = decoded.map_err(|e| super::Error::PgOutputDecode {
@@ -1298,7 +1333,7 @@ impl FieldBuilder {
             ),
         };
 
-        if self.append_converted_number(raw, type_oid)? {
+        if self.append_binary_of_another_type(raw, type_oid)? {
             return Ok(());
         }
 
@@ -3319,6 +3354,32 @@ mod tests {
             assert!(
                 message.contains(&format!(
                     "the {wire} value {value} (type oid {oid}) cannot be stored in the dataset's `{dt}` column without loss"
+                )),
+                "{dt} from oid {oid}: {message}"
+            );
+        }
+    }
+
+    /// A value of a known source type that is neither the column's own type
+    /// nor a number converted above is an error, not bytes reinterpreted as the
+    /// column's type: a binary `numeric` zero is exactly eight bytes, and an
+    /// `int8` decode of it would store the scale.
+    #[test]
+    fn binary_value_of_another_known_type_is_an_error_not_a_misread() {
+        let numeric_zero = enc_numeric(&[], 0, false, 2);
+        assert_eq!(numeric_zero.len(), 8);
+        let text = b"1234".to_vec();
+        for (dt, oid, raw) in [
+            (DataType::Int64, 1700, numeric_zero.clone()),
+            (DataType::Float64, 1700, numeric_zero),
+            (DataType::Int32, 25, text.clone()),
+            (DataType::Float32, 1043, text),
+            (DataType::Int64, 1114, 0i64.to_be_bytes().to_vec()),
+        ] {
+            let message = bin_convert(&dt, oid, &raw).expect_err("no misread");
+            assert!(
+                message.contains(&format!(
+                    "the source column's type (type oid {oid}) is not the dataset column's type `{dt}`"
                 )),
                 "{dt} from oid {oid}: {message}"
             );
