@@ -47,23 +47,28 @@ import sys
 import tomllib
 from pathlib import Path
 
-# Slowest observed duration for each long-running test binary on a QUIET pool.
+# Slowest observed duration for each long-running test set on a QUIET pool.
 #
 # Source: `Remote Sign-off` run 30833882620 (trunk @ 7b98c234), which ran with no
-# other sign-off in flight. Value is the slowest single test in that binary.
+# other sign-off in flight. Value is the slowest single test in that set.
+#
+# A key is either a binary name, matched by a `binary(=name)` filter term, or
+# `package::binary::module` for one module of a test binary that holds many,
+# matched by a `(binary_id(=package::binary) & test(/^module::/))` term. Cayenne's
+# integration tests are modules of its single `integration` binary.
 QUIET_BASELINE_SECONDS = {
-    "mutation_property_test": 239.5,  # prop_concurrent_mixed_position_sqlite
-    "partition_chunking_test": 247.9,  # ..._timestamp_partition_with_date_part_impl_sqlite
-    "layout_pruning_ab_test": 170.1,  # pruning_ab_inferred_vs_authoritative_sort
-    "mutation_model_test": 107.1,  # test_exhaustive_composite_single_row_sequences_impl_sqlite
+    "cayenne::integration::mutation_property_test": 239.5,  # prop_concurrent_mixed_position_sqlite
+    "cayenne::integration::partition_chunking_test": 247.9,  # ..._timestamp_partition_with_date_part_impl_sqlite
+    "cayenne::integration::layout_pruning_ab_test": 170.1,  # pruning_ab_inferred_vs_authoritative_sort
+    "cayenne::integration::mutation_model_test": 107.1,  # test_exhaustive_composite_single_row_sequences_impl_sqlite
     # tpcds_and_clickbench_parity_vs_duckdb, measured with fixtures already on
     # disk. CI regenerates them with `dsdgen` on every fresh runner, so the
     # baseline is rounded up from the observed 127.7s to cover that.
-    "result_correctness_vs_duckdb_test": 180.0,
+    "cayenne::integration::result_correctness_vs_duckdb_test": 180.0,
     # tpcds_full_result_parity_vs_sqlite at SF 0.1: 166.9s locally with the
     # fixture on disk, plus the 25.4s `tpcdsgen` takes to write it on a fresh
     # runner, rounded up.
-    "result_correctness_vs_sqlite_test": 200.0,
+    "cayenne::integration::result_correctness_vs_sqlite_test": 200.0,
 }
 
 # Worst same-test slowdown measured between a quiet pool and a saturated one.
@@ -71,7 +76,7 @@ QUIET_BASELINE_SECONDS = {
 # Source: sign-off run 31239284344, where
 # `mutation_property_test prop_concurrent_upsert_only_key_sqlite` passed at
 # 422.1s against a 92.0s quiet baseline in run 30833882620. Contention on this
-# pool is shared-machine CPU starvation, so it applies to any binary here.
+# pool is shared-machine CPU starvation, so it applies to any test set here.
 CONTENTION_FACTOR = 4.6
 
 # Multiplier applied on top of `CONTENTION_FACTOR` when sizing a ceiling.
@@ -86,20 +91,20 @@ CONTENTION_FACTOR = 4.6
 # cost.
 CONTENTION_HEADROOM = 1.25
 
-# Binaries whose failures must never be retried: they assert that the accelerated
+# Test sets whose failures must never be retried: they assert that the accelerated
 # table converges to a reference model, so a retry that happens to pass hides a
 # real race rather than working around flakiness. Each must ALSO carry its own
 # `slow-timeout` — with `retries = 0`, the ceiling is the difference between a
 # recoverable timeout and a hard merge-queue failure.
 ZERO_RETRY_BINARIES = frozenset(
     {
-        "mutation_property_test",
-        "cdc_compaction_delete_race_test",
-        "maintained_aggregate_filter_test",
+        "cayenne::integration::mutation_property_test",
+        "cayenne::integration::cdc_compaction_delete_race_test",
+        "cayenne::integration::maintained_aggregate_filter_test",
         # Engine-vs-engine parity: a mismatch is deterministic, so a retry buys
-        # nothing but repeated runs of a ~250s binary before the same failure.
-        "result_correctness_vs_duckdb_test",
-        "result_correctness_vs_sqlite_test",
+        # nothing but repeated runs of ~250s of tests before the same failure.
+        "cayenne::integration::result_correctness_vs_duckdb_test",
+        "cayenne::integration::result_correctness_vs_sqlite_test",
     }
 )
 
@@ -127,11 +132,17 @@ EXPECTED_GLOBAL_SLOW_TIMEOUT = {"period": "120s", "terminate-after": 3}
 _DURATION = re.compile(r"^(?P<value>\d+(?:\.\d+)?)(?P<unit>ms|s|m|h)$")
 _UNIT_SECONDS = {"ms": 0.001, "s": 1.0, "m": 60.0, "h": 3600.0}
 
-# The only binary-filter spelling this guard resolves. `binary(~x)`, `binary(/re/)`
-# and `binary-id(...)` would each need different matching, so they are rejected
-# rather than silently treated as non-matching.
+# The only binary-filter spellings this guard resolves: `binary(=name)` for a
+# whole binary, and the parenthesized conjunction below for one module of a
+# binary. `binary(~x)`, `binary(/re/)`, `binary-id(...)` and any other `&`
+# conjunction would each need different matching, so they are rejected rather
+# than silently treated as non-matching.
 _BINARY_EQ_TERM = re.compile(r"binary\(=([A-Za-z0-9_]+)\)")
-_OTHER_BINARY_TERM = re.compile(r"binary(?:-id)?\((?!=[A-Za-z0-9_]+\))")
+_MODULE_TERM = re.compile(
+    r"\(\s*binary_id\(=([A-Za-z0-9_-]+)::([A-Za-z0-9_]+)\)"
+    r"\s*&\s*test\(/\^([A-Za-z0-9_]+)::/\)\s*\)"
+)
+_OTHER_BINARY_TERM = re.compile(r"binary(?:-id|_id)?\((?!=[A-Za-z0-9_]+\))")
 
 
 def parse_duration(text: str) -> float:
@@ -242,22 +253,31 @@ def step_timeout_minutes(workflow_text: str, step_name: str) -> int | None:
     return None
 
 
-def binaries_matched(filter_expr: str) -> set[str]:
-    """Return the binaries a filter expression matches by exact name.
+def selectors_matched(filter_expr: str) -> set[str]:
+    """Return the test-set keys a filter expression matches exactly.
 
-    Only `binary(=name)` terms are understood. A filter selecting tests by name
-    (for example `test(=mysql::…)`) matches no binary here, which is correct: it
-    cannot be resolved to a binary without knowing that binary's test names.
+    A `binary(=name)` term yields `name`; a
+    `(binary_id(=p::b) & test(/^module::/))` term yields `p::b::module`.
+    A filter selecting tests by name alone (for example `test(=mysql::…)`)
+    matches nothing here, which is correct: it cannot be resolved to a test set
+    without knowing every binary's test names.
     """
-    if _OTHER_BINARY_TERM.search(filter_expr):
+    selectors = {
+        f"{package}::{binary}::{module}"
+        for package, binary, module in _MODULE_TERM.findall(filter_expr)
+    }
+    rest = _MODULE_TERM.sub("", filter_expr)
+    if _OTHER_BINARY_TERM.search(rest) or (
+        "&" in rest and _BINARY_EQ_TERM.search(rest)
+    ):
         raise ValueError(
             f"unsupported binary filter spelling, cannot resolve a ceiling: {filter_expr!r}"
         )
-    return set(_BINARY_EQ_TERM.findall(filter_expr))
+    return selectors | set(_BINARY_EQ_TERM.findall(rest))
 
 
 def resolve(config: dict, binary: str, setting: str) -> object | None:
-    """Resolve `setting` for `binary` the way nextest does.
+    """Resolve `setting` for the test set `binary` the way nextest does.
 
     nextest evaluates precedence per setting: the first override that matches and
     configures that setting wins, and the profile default applies if none do.
@@ -266,7 +286,7 @@ def resolve(config: dict, binary: str, setting: str) -> object | None:
     for override in profile.get("overrides", []):
         if setting not in override:
             continue
-        if binary in binaries_matched(override.get("filter", "")):
+        if binary in selectors_matched(override.get("filter", "")):
             return override[setting]
     return profile.get(setting)
 
@@ -294,7 +314,7 @@ def check_config(config_path: Path, repo_root: Path | None = None) -> list[str]:
     profile = config.get("profile", {}).get("default", {})
     try:
         for override in profile.get("overrides", []):
-            binaries_matched(override.get("filter", ""))
+            selectors_matched(override.get("filter", ""))
     except ValueError as exc:
         # Every check below resolves settings per binary, so an unresolvable
         # filter would make the rest of this run meaningless rather than merely
@@ -399,7 +419,7 @@ def check_config(config_path: Path, repo_root: Path | None = None) -> list[str]:
 def has_override_setting(config: dict, binary: str, setting: str) -> bool:
     """Return whether an override — not the profile default — supplies `setting`."""
     return any(
-        setting in override and binary in binaries_matched(override.get("filter", ""))
+        setting in override and binary in selectors_matched(override.get("filter", ""))
         for override in config.get("profile", {}).get("default", {}).get("overrides", [])
     )
 

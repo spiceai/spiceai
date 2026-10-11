@@ -1,0 +1,13 @@
+# postgres.yaml on every supported PostgreSQL line in test/source_versions.json.
+# postgres.yaml itself runs daily on the bench workflow's default line. Its
+# `__test_reference.*` oracle reads the same PostgreSQL tables, so these runs
+# catch SQL that a line rejects or answers with an error, not a wrong row.
+schedule: weekly
+tests:
+  bench:
+    spicepod_path: federated/postgres.yaml
+    query_set: tpcds
+    query_overrides: postgresql
+    runner_type: spiceai-dev-runners
+    validate_results: true
+    postgres_version: all

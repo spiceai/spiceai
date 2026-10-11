@@ -123,7 +123,7 @@ pub use metadata::{
 };
 pub use metastore::sqlite::{SqliteAutoVacuum, SqliteMetastoreConfig, set_sqlite_metastore_config};
 #[cfg(feature = "partition-table-provider")]
-pub use partition_creator::CayennePartitionCreator;
+pub use partition_creator::{CayennePartitionCreator, partition_column_labels};
 pub use provider::RebuildableWrite;
 pub use provider::constants::{
     LOOKUP_INDEX_DIR_NAME, STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME,

@@ -22,7 +22,7 @@ limitations under the License.
 //! `runtime.query.memory_limit` controls — making `memory_limit` reflect real
 //! Cayenne RSS — and that this accounting never changes query results.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 
