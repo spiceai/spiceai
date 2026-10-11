@@ -31,7 +31,7 @@ limitations under the License.
 //! the workload that produces the tombstones, nothing ever removed them. The two
 //! tests below cover those two gates; each fails without its own half of the fix.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 

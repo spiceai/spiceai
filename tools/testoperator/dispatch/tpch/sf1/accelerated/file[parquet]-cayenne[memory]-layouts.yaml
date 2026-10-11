@@ -1,0 +1,15 @@
+# file[parquet]-cayenne[memory].yaml under acceleration layouts (see
+# file[parquet]-cayenne[file]-layouts.yaml). Cayenne partitions only
+# file-backed tables, so no layout here partitions.
+tests:
+  bench:
+    spicepod_path: accelerated/file[parquet]-cayenne[memory].yaml
+    ready_wait: 300
+    query_set: tpch
+    runner_type: spiceai-dev-runners
+    validate_results: true
+    layouts:
+      - primary_key,indexes
+      - sort,time_column
+      - primary_key,cluster
+      - primary_key,indexes,sort,time_column

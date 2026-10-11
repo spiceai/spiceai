@@ -28,10 +28,11 @@ use spicepod::{
 };
 use tracing::instrument;
 
+use test_framework::source_versions::{Source, source_image};
+
 use crate::docker::{ContainerRunnerBuilder, RunningContainer};
 
 const MONGODB_ROOT_PASSWORD: &str = "integration-test-pw";
-const MONGODB_IMAGE: &str = "docker.io/library/mongo:latest";
 const MONGODB_DOCKER_CONTAINER: &str = "runtime-integration-test-mongo";
 const MONGODB_CONTAINER_START_TIMEOUT: Duration = Duration::from_mins(3);
 const MONGODB_HOST_PORT_READY_TIMEOUT: Duration = Duration::from_mins(1);
@@ -191,7 +192,7 @@ pub fn make_mongodb_change_stream_dataset_inferred(path: &str, name: &str, port:
 #[instrument]
 pub async fn start_mongodb_docker_container() -> Result<RunningContainer, anyhow::Error> {
     let running_container = ContainerRunnerBuilder::new(MONGODB_DOCKER_CONTAINER)
-        .image(MONGODB_IMAGE.to_string())
+        .image(source_image(Source::MongoDb)?)
         .publish_port(27017)
         .add_env_var("MONGO_INITDB_ROOT_USERNAME", "root")
         .add_env_var("MONGO_INITDB_ROOT_PASSWORD", MONGODB_ROOT_PASSWORD)
@@ -223,7 +224,7 @@ pub async fn start_mongodb_docker_container() -> Result<RunningContainer, anyhow
 pub async fn start_mongodb_replica_set_docker_container() -> Result<RunningContainer, anyhow::Error>
 {
     let running_container = ContainerRunnerBuilder::new(&format!("{MONGODB_DOCKER_CONTAINER}-rs"))
-        .image(MONGODB_IMAGE.to_string())
+        .image(source_image(Source::MongoDb)?)
         .publish_port(27017)
         .command(["mongod", "--replSet", "rs0", "--bind_ip_all"])
         .healthcheck(HealthConfig {
