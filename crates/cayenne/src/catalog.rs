@@ -85,6 +85,21 @@ pub enum CatalogError {
         current: String,
     },
 
+    /// A compaction's commit found that protected snapshots it folded into its
+    /// output are no longer registered: another writer merged or removed them
+    /// while it ran, so committing would register the folded rows twice.
+    #[snafu(display(
+        "Table {table_id} no longer registers {missing} of the {folded} protected snapshots it compacted, so the compacted snapshot was not committed"
+    ))]
+    ProtectedSnapshotsReplaced {
+        /// The table the compaction ran on
+        table_id: String,
+        /// How many protected snapshots the compaction folded
+        folded: usize,
+        /// How many of them the catalog no longer registers
+        missing: usize,
+    },
+
     /// IO error
     #[snafu(display("IO error: {source}"))]
     Io {
@@ -646,7 +661,12 @@ pub trait MetadataCatalog: Send + Sync {
     /// because their `sequence_number` column records the delete-fence at
     /// creation, not the snapshot's own creation sequence.
     ///
-    /// `replaced_snapshot_id` is checked as in [`Self::commit_compaction`].
+    /// `replaced_snapshot_id` is checked as in [`Self::commit_compaction`]. Every
+    /// id in `protected_snapshot_ids_to_clear` must also still be registered: the
+    /// commit changes nothing and returns
+    /// [`CatalogError::ProtectedSnapshotsReplaced`] when one is not, because a
+    /// writer that merged or removed it since the rewrite folded it would
+    /// otherwise leave the rewritten rows registered twice.
     async fn commit_compaction_fenced(
         &self,
         table_id: &str,

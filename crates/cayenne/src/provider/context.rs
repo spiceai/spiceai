@@ -587,8 +587,9 @@ impl CayenneContext {
     }
 
     /// How primary-key deletions are recorded and applied for PK tables.
-    /// The default `auto` resolves to `position` (merge-on-read position-delete
-    /// vectors); `key` is the opt-out that keeps the above-scan key-based filter.
+    /// The default `auto` resolves to `key` for PK tables (key-based tombstones
+    /// pruned by seq-prefix bake) and to `position` for PK-less tables; `key`
+    /// or `position` can be pinned explicitly.
     #[must_use]
     pub(crate) fn deletion_mode(&self) -> DeletionMode {
         self.config.deletion_mode
@@ -632,6 +633,23 @@ impl CayenneContext {
     #[must_use]
     pub(crate) fn bake_deletion_index_trigger(&self) -> usize {
         self.live_actuators.bake_deletion_index_trigger()
+    }
+
+    /// The CONFIGURED deletion-index trigger — what the spicepod set, or
+    /// [`crate::provider::table::BAKE_DELETION_INDEX_TRIGGER`] — with the adaptive
+    /// actuator's movement deliberately excluded.
+    ///
+    /// The actuator lowers the trigger to bake more often, trading the bake's write
+    /// amplification for a cheaper per-row probe. That trade is only sound where the
+    /// reclaim is the incremental bake, which rewrites the settled protected prefix.
+    /// The `deletion_mode: position` reclaim is a full current-snapshot rewrite
+    /// instead, whose cost curve is nothing like the bake's — an adaptive floor of
+    /// `1_000` tombstones would ask a large table to re-encode itself continuously,
+    /// holding the write lock each time. That path reads the configured value, so an
+    /// operator still sets it, and the controller cannot make it pathological.
+    #[must_use]
+    pub(crate) fn configured_deletion_index_trigger(&self) -> usize {
+        self.config.bake_deletion_index_trigger
     }
 
     /// Apply-back-pressure gate for the seq-prefix bake: `true` when the CDC
