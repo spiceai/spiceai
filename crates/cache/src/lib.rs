@@ -1627,8 +1627,12 @@ impl QueryResultsCacheProvider {
                 // Table-function providers whose rows can change between
                 // executions (remote and search UDTFs, and SQL and WASM table
                 // functions not declared `immutable`) are planned as
-                // `Temporary` scans; never cache them.
-                if source.source.table_type() == datafusion::datasource::TableType::Temporary {
+                // `Temporary` scans; never cache them. A recursive CTE's work
+                // table is `Temporary` too, but it holds only the rows the
+                // query itself derives, so it does not decide.
+                if source.source.table_type() == datafusion::datasource::TableType::Temporary
+                    && !is_cte_work_table(source)
+                {
                     return false;
                 }
                 let Some(schema) = source.table_name.schema() else {
@@ -1652,6 +1656,16 @@ impl QueryResultsCacheProvider {
             _ => true,
         }
     }
+}
+
+/// Whether `scan` reads the work table of a recursive CTE, which `DataFusion`
+/// plans as a `Temporary` scan of the rows the recursion has derived so far.
+fn is_cte_work_table(scan: &datafusion::logical_expr::TableScan) -> bool {
+    datafusion::datasource::source_as_provider(&scan.source).is_ok_and(|provider| {
+        provider
+            .downcast_ref::<datafusion::datasource::cte_worktable::CteWorkTable>()
+            .is_some()
+    })
 }
 
 /// Time functions that `DataFusion` marks `Volatility::Stable` (the value is
@@ -2640,6 +2654,49 @@ mod tests {
                     "{table_type:?}: {sql}"
                 );
             }
+        }
+    }
+
+    /// A recursive CTE's work table is a `Temporary` scan of the rows the query
+    /// derives itself, so it leaves a recursive query cacheable; a volatile
+    /// function or a `Temporary` table function inside the recursion still
+    /// keeps it out.
+    #[tokio::test]
+    async fn test_recursive_cte_work_table_does_not_disable_the_cache() {
+        use datafusion::common::tree_node::TreeNode;
+        use datafusion::datasource::TableType;
+
+        let cache_provider =
+            QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
+                .expect("valid cache provider");
+
+        for (sql, cacheable) in [
+            (
+                "WITH RECURSIVE nums(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM nums WHERE n < 3) SELECT n FROM nums",
+                true,
+            ),
+            (
+                "WITH RECURSIVE nums(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM nums WHERE n < 3 AND random() < 2) SELECT n FROM nums",
+                false,
+            ),
+            (
+                "WITH RECURSIVE nums(n) AS (SELECT a FROM udtf() UNION ALL SELECT n + 1 FROM nums WHERE n < 3) SELECT n FROM nums",
+                false,
+            ),
+        ] {
+            let ctx = utils::tests::create_session_context();
+            ctx.register_udtf("udtf", Arc::new(TypedTableFunction(TableType::Temporary)));
+            let plan = ctx.state().create_logical_plan(sql).await.expect("plan");
+            assert!(
+                plan.exists(|node| Ok(matches!(node, LogicalPlan::RecursiveQuery(_))))
+                    .expect("infallible"),
+                "{sql} must plan as a recursive query, or this test checks nothing"
+            );
+            assert_eq!(
+                cache_provider.cache_is_enabled_for_plan(&plan),
+                cacheable,
+                "{sql}"
+            );
         }
     }
 
