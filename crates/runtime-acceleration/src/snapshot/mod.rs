@@ -856,7 +856,7 @@ impl<'a> SnapshotPathLayout<'a> {
     }
 
     /// `<dataset>_<timestamp>_<uuid>.<ext>`. The timestamp has one-second resolution, so
-    /// the UUIDv7 keeps two publishes in the same second from writing the same object.
+    /// the UUID keeps two publishes in the same second from writing the same object.
     fn snapshot_filename(&self, instant: DateTime<Utc>) -> String {
         format!(
             "{}_{}_{}{}",
