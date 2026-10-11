@@ -22,7 +22,11 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use arrow::datatypes::SchemaRef;
+use arrow::array::{Array, AsArray, RecordBatch};
+use arrow::compute::cast;
+use arrow::compute::kernels::cmp::not_distinct;
+use arrow::datatypes::{DataType, Float64Type, SchemaRef};
+use arrow::util::display::array_value_to_string;
 use data_components::cdc::{self, ChangeOperation};
 use datafusion::common::TableReference;
 use datafusion::error::{DataFusionError, Result};
@@ -33,6 +37,57 @@ use super::source_policy::{CdcPolicy, SchemaDecision};
 use super::{
     ChangeBatch, ChangeCapabilities, ChangePayload, Recovery, SchemaEvolutionSupport, WriteOptions,
 };
+
+/// Refuse a change whose numeric values the accelerated table's column types
+/// cannot hold exactly.
+///
+/// A change proceeds without evolving the table when the source schema widened
+/// but the policy or the engine does not evolve it mid-stream, and it is then
+/// cast to the table's current types. A cast that rounds or overflows (`1.5` into
+/// an `Int32` column) would store a value the source does not hold and
+/// acknowledge the change. Refusing keeps the source position instead, so the
+/// change is applied once the table is evolved, at the next restart.
+///
+/// Each numeric column whose type differs from the target's is cast to the
+/// target type and back; every value must come back unchanged. `-0.0` stored as
+/// `0` counts as unchanged, as in every SQL cast to an integer.
+fn ensure_numbers_cast_exactly(data: &RecordBatch, target: &SchemaRef) -> Result<()> {
+    for (index, field) in data.schema().fields().iter().enumerate() {
+        let Ok(target_field) = target.field_with_name(field.name()) else {
+            continue;
+        };
+        let (from, to) = (field.data_type(), target_field.data_type());
+        if from == to || !from.is_numeric() || !to.is_numeric() {
+            continue;
+        }
+        let column = data.column(index);
+        let restored = cast(&cast(column, to)?, from)?;
+        let unchanged = not_distinct(column, &restored)?;
+        if unchanged.true_count() == unchanged.len() {
+            continue;
+        }
+        let as_f64 = cast(column, &DataType::Float64)?;
+        let as_f64 = as_f64.as_primitive::<Float64Type>();
+        let restored_f64 = cast(&restored, &DataType::Float64)?;
+        let restored_f64 = restored_f64.as_primitive::<Float64Type>();
+        let lossy = (0..unchanged.len()).find(|&row| {
+            !unchanged.value(row)
+                && !(from.is_floating()
+                    && as_f64.is_valid(row)
+                    && restored_f64.is_valid(row)
+                    && as_f64.value(row) == 0.0
+                    && restored_f64.value(row) == 0.0)
+        });
+        if let Some(row) = lossy {
+            let value = array_value_to_string(column, row)?;
+            return Err(DataFusionError::Execution(format!(
+                "Failed to apply a change to column '{}': its value {value} ({from}) cannot be stored in the accelerated column's type {to} without loss, so the change is refused rather than stored rounded. The source column's type changed and the acceleration has not adopted it: with `on_schema_change: sync_all_columns`, restart Spice to apply the schema change. See: https://spiceai.org/docs/features/data-acceleration",
+                field.name()
+            )));
+        }
+    }
+    Ok(())
+}
 
 #[derive(Clone, Copy, Debug)]
 pub struct CoalescingLimits {
@@ -507,6 +562,9 @@ impl CdcBurst {
             {
                 target = Arc::clone(&plan.evolved_schema);
             }
+            if matches!(schema, SchemaDecision::Proceed) {
+                ensure_numbers_cast_exactly(&batch.data_batch(), &target)?;
+            }
             let mut options = self.options;
             if requires_durable_path(&batch, capabilities.deferred_deletes) {
                 options.recovery = Recovery::Durable;
@@ -605,4 +663,112 @@ fn concat(mut batches: Vec<cdc::ChangeBatch>) -> Result<cdc::ChangeBatch> {
 
 fn elapsed_ms(start: Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1000.0
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use arrow::array::{ArrayRef, Decimal128Array, Float64Array, Int32Array, Int64Array};
+    use arrow::datatypes::{Field, Schema};
+
+    use super::*;
+
+    fn check(source: ArrayRef, target: DataType) -> Result<(), String> {
+        let data = RecordBatch::try_new(
+            Arc::new(Schema::new(vec![Field::new(
+                "k",
+                source.data_type().clone(),
+                true,
+            )])),
+            vec![source],
+        )
+        .expect("batch");
+        let target = Arc::new(Schema::new(vec![Field::new("k", target, true)]));
+        ensure_numbers_cast_exactly(&data, &target).map_err(|e| e.to_string())
+    }
+
+    /// Regression test for #14718: a change cast to a narrower accelerated
+    /// column type is refused when the cast would change a value.
+    #[test]
+    fn a_change_proceeds_only_when_every_value_casts_exactly() {
+        let f64s = |v: Vec<Option<f64>>| -> ArrayRef { Arc::new(Float64Array::from(v)) };
+        assert_eq!(
+            check(
+                f64s(vec![Some(2.0), None, Some(-0.0), Some(-7.0)]),
+                DataType::Int32
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            check(
+                Arc::new(Int64Array::from(vec![i64::from(i32::MIN)])),
+                DataType::Int32
+            ),
+            Ok(())
+        );
+        assert_eq!(
+            check(Arc::new(Int32Array::from(vec![1, -1])), DataType::Int64),
+            Ok(())
+        );
+        assert_eq!(
+            check(
+                Arc::new(Int64Array::from(vec![12_345])),
+                DataType::Decimal128(10, 2)
+            ),
+            Ok(())
+        );
+
+        for (source, target, value, from) in [
+            (
+                f64s(vec![Some(2.0), Some(1.5)]),
+                DataType::Int32,
+                "1.5",
+                "Float64",
+            ),
+            (
+                f64s(vec![Some(f64::NAN)]),
+                DataType::Int32,
+                "NaN",
+                "Float64",
+            ),
+            (
+                f64s(vec![Some(f64::INFINITY)]),
+                DataType::Int64,
+                "inf",
+                "Float64",
+            ),
+            (
+                Arc::new(Int64Array::from(vec![i64::from(i32::MAX) + 1])) as ArrayRef,
+                DataType::Int32,
+                "2147483648",
+                "Int64",
+            ),
+            (
+                Arc::new(Int64Array::from(vec![9_007_199_254_740_993])) as ArrayRef,
+                DataType::Float64,
+                "9007199254740993",
+                "Int64",
+            ),
+            (
+                Arc::new(
+                    Decimal128Array::from(vec![12_345])
+                        .with_precision_and_scale(10, 2)
+                        .expect("decimal"),
+                ) as ArrayRef,
+                DataType::Decimal128(10, 1),
+                "123.45",
+                "Decimal128(10, 2)",
+            ),
+        ] {
+            let to = target.to_string();
+            let message = check(source, target).expect_err("lossy cast is refused");
+            assert!(
+                message.contains(&format!(
+                    "Failed to apply a change to column 'k': its value {value} ({from}) cannot be stored in the accelerated column's type {to} without loss"
+                )),
+                "{message}"
+            );
+        }
+    }
 }

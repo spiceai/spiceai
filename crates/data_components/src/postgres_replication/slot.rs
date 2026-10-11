@@ -20,6 +20,7 @@ limitations under the License.
 //! PUBLICATION` is not allowed on replication connections and the slot state
 //! queries live in normal catalog tables.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, Ordering};
 
 use snafu::ResultExt;
@@ -182,6 +183,11 @@ pub struct SharedMemberSetup {
     /// `GENERATED` columns of this member's table — see
     /// [`SlotInfo::generated_columns`].
     pub generated_columns: Vec<String>,
+    /// Each column's Postgres type OID as the catalog reports it now, the type
+    /// the dataset's registered schema was inferred from. It is the baseline a
+    /// pgoutput `Relation` message is diffed against: the first `Relation` the
+    /// stream sends can already describe a type changed since registration.
+    pub column_type_oids: HashMap<String, u32>,
     /// Every table in the shared publication as `(schema, table)`, read after
     /// this member was added. On a resuming slot this is the set of tables
     /// whose changes the slot is still accumulating, whether or not a dataset
@@ -244,6 +250,8 @@ pub async fn setup_shared_member(
                 validate_replica_identity(&client, schema_name, table_name).await?;
                 let generated_columns =
                     fetch_generated_columns(&client, schema_name, table_name).await?;
+                let column_type_oids =
+                    fetch_column_type_oids(&client, schema_name, table_name).await?;
                 let table_added =
                     ensure_publication(&client, &params.publication_name, schema_name, table_name)
                         .await?;
@@ -269,6 +277,7 @@ pub async fn setup_shared_member(
                     slot,
                     table_added,
                     generated_columns,
+                    column_type_oids,
                     publication_tables,
                     slot_restart_lsn,
                     current_wal_lsn,
@@ -377,6 +386,30 @@ async fn fetch_generated_columns(
         .await
         .context(SetupExecSnafu)?;
     Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
+}
+
+/// Read the type OID of each of the table's columns (`pg_attribute.atttypid`).
+async fn fetch_column_type_oids(
+    client: &tokio_postgres::Client,
+    schema_name: &str,
+    table_name: &str,
+) -> Result<HashMap<String, u32>> {
+    let rows = client
+        .query(
+            "SELECT a.attname, a.atttypid \
+             FROM pg_attribute a \
+             JOIN pg_class c ON c.oid = a.attrelid \
+             JOIN pg_namespace n ON n.oid = c.relnamespace \
+             WHERE n.nspname = $1 AND c.relname = $2 \
+               AND a.attnum > 0 AND NOT a.attisdropped",
+            &[&schema_name, &table_name],
+        )
+        .await
+        .context(SetupExecSnafu)?;
+    Ok(rows
+        .iter()
+        .map(|r| (r.get::<_, String>(0), r.get::<_, u32>(1)))
+        .collect())
 }
 
 /// Look up the named slot, creating it if absent. See [`setup_slot_and_publication`]

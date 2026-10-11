@@ -54,6 +54,98 @@ const PG_EPOCH_MICROS: i64 = 946_684_800_000_000;
 /// since the Postgres epoch; Arrow `Date32` is days since the Unix epoch.
 const PG_EPOCH_DAYS: i32 = 10_957;
 
+const PG_INT8_OID: u32 = 20;
+const PG_INT2_OID: u32 = 21;
+const PG_INT4_OID: u32 = 23;
+const PG_FLOAT4_OID: u32 = 700;
+const PG_FLOAT8_OID: u32 = 701;
+const PG_NUMERIC_OID: u32 = 1700;
+
+/// An integer or float decoded by its wire type, before conversion to the
+/// builder's type ([`FieldBuilder::append_converted_number`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum WireNumber {
+    Int(i64),
+    Float(f64),
+}
+
+impl std::fmt::Display for WireNumber {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Int(v) => write!(f, "{v}"),
+            Self::Float(v) => write!(f, "{v}"),
+        }
+    }
+}
+
+impl WireNumber {
+    /// The value as `T`, or `None` when `T` cannot hold it exactly: a float with
+    /// a fractional part, a non-finite float, or a value out of `T`'s range.
+    /// `-0.0` becomes `0`, as every SQL cast to an integer does.
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "the float is integral and below 2^127 in magnitude, so `as i128` is exact"
+    )]
+    fn to_int<T: TryFrom<i128>>(self) -> Option<T> {
+        let wide = match self {
+            Self::Int(v) => i128::from(v),
+            Self::Float(v) if v.is_finite() && v.fract() == 0.0 && v.abs() < 2f64.powi(127) => {
+                v as i128
+            }
+            Self::Float(_) => return None,
+        };
+        T::try_from(wide).ok()
+    }
+
+    /// The value as `f32`, or `None` when `f32` cannot hold it exactly.
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        reason = "each conversion is checked by converting back and comparing"
+    )]
+    fn to_f32(self) -> Option<f32> {
+        match self {
+            Self::Int(v) => {
+                let f = v as f32;
+                (f64::from(f) as i128 == i128::from(v)).then_some(f)
+            }
+            Self::Float(v) => {
+                let f = v as f32;
+                (f64::from(f) == v || v.is_nan()).then_some(f)
+            }
+        }
+    }
+
+    /// The value as `f64`, or `None` when `f64` cannot hold it exactly.
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_precision_loss,
+        reason = "the conversion is checked by converting back and comparing"
+    )]
+    fn to_f64(self) -> Option<f64> {
+        match self {
+            Self::Int(v) => {
+                let f = v as f64;
+                (f as i128 == i128::from(v)).then_some(f)
+            }
+            Self::Float(v) => Some(v),
+        }
+    }
+
+    /// The unscaled `Decimal128(precision, scale)` value, or `None` when the
+    /// decimal cannot hold it exactly. Only an integer converts: a float's
+    /// binary fraction has no exact decimal form in general.
+    fn to_decimal128(self, precision: u8, scale: i8) -> Option<i128> {
+        let Self::Int(v) = self else {
+            return None;
+        };
+        let scale = u32::try_from(scale).ok()?;
+        let unscaled = i128::from(v).checked_mul(10i128.checked_pow(scale)?)?;
+        let bound = 10i128.checked_pow(u32::from(precision))?;
+        (unscaled.abs() < bound).then_some(unscaled)
+    }
+}
+
 /// One logical change derived from a pgoutput message.
 #[derive(Debug, Clone)]
 pub struct DecodedChange {
@@ -230,7 +322,19 @@ pub fn build_change_batch(
                     // The source column's Postgres type OID drives binary-format
                     // decoding; the text path ignores it.
                     let type_oid = relation.columns[*source_idx].type_oid;
-                    data_builders[col_idx].append(value, change.op, type_oid)?;
+                    data_builders[col_idx]
+                        .append(value, change.op, type_oid)
+                        .map_err(|e| match e {
+                            super::Error::PgOutputDecode { message } => {
+                                super::Error::PgOutputDecode {
+                                    message: format!(
+                                        "column '{}': {message}",
+                                        dataset_schema.field(col_idx).name()
+                                    ),
+                                }
+                            }
+                            other => other,
+                        })?;
                 }
                 None => data_builders[col_idx].append_null(),
             }
@@ -1100,6 +1204,87 @@ impl FieldBuilder {
         Ok(())
     }
 
+    /// Decode a binary integer or float whose source type is not the builder's
+    /// own, and append it only when the builder's type holds the value exactly.
+    ///
+    /// The builder is typed from the dataset's working schema, which can differ
+    /// from the type a column has in the WAL: under `on_schema_change: block`
+    /// after the source column's type changed, or for WAL written before a
+    /// widening the dataset has already adopted. Decoding the bytes as the
+    /// builder's type would misread them, so they are decoded as the wire type.
+    /// A value the builder's type cannot represent exactly is an error rather
+    /// than a rounded or truncated row.
+    ///
+    /// Returns `None` when the wire type is the builder's own type, or is not a
+    /// number this conversion handles; the caller decodes the value as before.
+    fn append_converted_number(&mut self, raw: &[u8], type_oid: u32) -> Option<Result<()>> {
+        use postgres_protocol::types as pg;
+
+        let (builder_oid, target) = match self {
+            Self::Int16(_) => (PG_INT2_OID, DataType::Int16),
+            Self::Int32(_) => (PG_INT4_OID, DataType::Int32),
+            Self::Int64(_) => (PG_INT8_OID, DataType::Int64),
+            Self::Float32(_) => (PG_FLOAT4_OID, DataType::Float32),
+            Self::Float64(_) => (PG_FLOAT8_OID, DataType::Float64),
+            Self::Decimal128(_, precision, scale) => {
+                (PG_NUMERIC_OID, DataType::Decimal128(*precision, *scale))
+            }
+            _ => return None,
+        };
+        if builder_oid == type_oid {
+            return None;
+        }
+        let (wire_name, decoded) = match type_oid {
+            PG_INT2_OID => (
+                "int2",
+                pg::int2_from_sql(raw).map(|v| WireNumber::Int(v.into())),
+            ),
+            PG_INT4_OID => (
+                "int4",
+                pg::int4_from_sql(raw).map(|v| WireNumber::Int(v.into())),
+            ),
+            PG_INT8_OID => ("int8", pg::int8_from_sql(raw).map(WireNumber::Int)),
+            PG_FLOAT4_OID => (
+                "float4",
+                pg::float4_from_sql(raw).map(|v| WireNumber::Float(v.into())),
+            ),
+            PG_FLOAT8_OID => ("float8", pg::float8_from_sql(raw).map(WireNumber::Float)),
+            _ => return None,
+        };
+        let value = match decoded {
+            Ok(value) => value,
+            Err(e) => {
+                return Some(
+                    PgOutputDecodeSnafu {
+                        message: format!(
+                            "postgres_replication: binary {wire_name} decode failed (type oid {type_oid}): {e}"
+                        ),
+                    }
+                    .fail(),
+                );
+            }
+        };
+        let appended = match self {
+            Self::Int16(b) => value.to_int::<i16>().map(|v| b.append_value(v)),
+            Self::Int32(b) => value.to_int::<i32>().map(|v| b.append_value(v)),
+            Self::Int64(b) => value.to_int::<i64>().map(|v| b.append_value(v)),
+            Self::Float32(b) => value.to_f32().map(|v| b.append_value(v)),
+            Self::Float64(b) => value.to_f64().map(|v| b.append_value(v)),
+            Self::Decimal128(b, precision, scale) => value
+                .to_decimal128(*precision, *scale)
+                .map(|v| b.append_value(v)),
+            _ => None,
+        };
+        Some(appended.ok_or_else(|| super::Error::PgOutputDecode {
+            message: format!(
+                "postgres_replication: the {wire_name} value {value} (type oid {type_oid}) cannot be \
+                 stored in the dataset's `{target}` column without loss. The source column's type \
+                 changed since the dataset was registered; set `on_schema_change: sync_all_columns` \
+                 to adopt the wider type. See: https://spiceai.org/docs/components/data-connectors/postgres"
+            ),
+        }))
+    }
+
     /// Decode a binary (`send`-format) pgoutput value directly into the typed
     /// builder. Reached when Postgres tags the column `b` under the binary
     /// output protocol. `type_oid` names the source type for diagnostics.
@@ -1123,6 +1308,10 @@ impl FieldBuilder {
                  {detail}"
             ),
         };
+
+        if let Some(result) = self.append_converted_number(raw, type_oid) {
+            return result;
+        }
 
         match self {
             Self::Bool(b) => b.append_value(pg::bool_from_sql(raw).map_err(decode_err("bool"))?),
@@ -3011,6 +3200,140 @@ mod tests {
         )
         .expect("append binary value");
         fb.finish()
+    }
+
+    /// Append one binary value of wire type `type_oid` into a builder of `dt`,
+    /// returning the built array or the decode error's text.
+    fn bin_convert(dt: &DataType, type_oid: u32, raw: &[u8]) -> Result<ArrayRef, String> {
+        let mut fb = FieldBuilder::with_capacity(dt, 1).expect("builder");
+        fb.append(
+            Some(&PgValue::Binary(Bytes::copy_from_slice(raw))),
+            ChangeOp::Create,
+            type_oid,
+        )
+        .map_err(|e| e.to_string())?;
+        Ok(fb.finish())
+    }
+
+    /// Regression test for #14718: a numeric value whose wire type differs from
+    /// the column's type (the source column's type changed) is decoded as its
+    /// wire type, then stored only when the column's type holds it exactly.
+    #[test]
+    fn binary_number_of_another_type_converts_only_when_exact() {
+        let f8 = |v: f64| v.to_be_bytes().to_vec();
+        let f4 = |v: f32| v.to_be_bytes().to_vec();
+        let i8b = |v: i64| v.to_be_bytes().to_vec();
+        let i4 = |v: i32| v.to_be_bytes().to_vec();
+
+        let int32 = |r: Result<ArrayRef, String>| {
+            r.map(|a| a.as_primitive::<arrow::datatypes::Int32Type>().value(0))
+        };
+        assert_eq!(int32(bin_convert(&DataType::Int32, 701, &f8(2.0))), Ok(2));
+        assert_eq!(int32(bin_convert(&DataType::Int32, 701, &f8(-0.0))), Ok(0));
+        assert_eq!(int32(bin_convert(&DataType::Int32, 20, &i8b(-7))), Ok(-7));
+        assert_eq!(int32(bin_convert(&DataType::Int32, 700, &f4(3.0))), Ok(3));
+
+        let int64 = |r: Result<ArrayRef, String>| {
+            r.map(|a| a.as_primitive::<arrow::datatypes::Int64Type>().value(0))
+        };
+        assert_eq!(
+            int64(bin_convert(&DataType::Int64, 23, &i4(i32::MIN))),
+            Ok(i64::from(i32::MIN))
+        );
+        // 2^62 is exact in f64 and fits i64; 2^63 is exact in f64 and does not.
+        assert_eq!(
+            int64(bin_convert(&DataType::Int64, 701, &f8(2f64.powi(62)))),
+            Ok(1 << 62)
+        );
+
+        let float64 = |r: Result<ArrayRef, String>| {
+            r.map(|a| a.as_primitive::<arrow::datatypes::Float64Type>().value(0))
+        };
+        assert_eq!(
+            float64(bin_convert(&DataType::Float64, 23, &i4(-5))),
+            Ok(-5.0)
+        );
+        assert_eq!(
+            float64(bin_convert(&DataType::Float64, 700, &f4(0.1))),
+            Ok(f64::from(0.1f32))
+        );
+        assert_eq!(
+            float64(bin_convert(&DataType::Float64, 20, &i8b(1 << 53))),
+            Ok(9_007_199_254_740_992.0)
+        );
+        let neg_zero = float64(bin_convert(&DataType::Float64, 23, &i4(0))).expect("zero");
+        assert!(neg_zero == 0.0 && neg_zero.is_sign_positive());
+
+        let float32 = |r: Result<ArrayRef, String>| {
+            r.map(|a| a.as_primitive::<arrow::datatypes::Float32Type>().value(0))
+        };
+        assert_eq!(
+            float32(bin_convert(&DataType::Float32, 701, &f8(1.5))),
+            Ok(1.5)
+        );
+        assert_eq!(
+            float32(bin_convert(&DataType::Float32, 701, &f8(f64::INFINITY))),
+            Ok(f32::INFINITY)
+        );
+        assert!(
+            float32(bin_convert(&DataType::Float32, 701, &f8(f64::NAN)))
+                .expect("NaN")
+                .is_nan()
+        );
+        assert_eq!(
+            float32(bin_convert(&DataType::Float32, 23, &i4(16_777_216))),
+            Ok(16_777_216.0)
+        );
+
+        let decimal = |r: Result<ArrayRef, String>| {
+            r.map(|a| {
+                a.as_primitive::<arrow::datatypes::Decimal128Type>()
+                    .value(0)
+            })
+        };
+        assert_eq!(
+            decimal(bin_convert(&DataType::Decimal128(10, 2), 23, &i4(-42))),
+            Ok(-4200)
+        );
+
+        // Each of these loses information in the column's type, so it is an error
+        // naming the value and the type, not a rounded or truncated value.
+        for (dt, oid, raw, value) in [
+            (DataType::Int32, 701, f8(1.5), "1.5"),
+            (DataType::Int32, 701, f8(f64::NAN), "NaN"),
+            (DataType::Int32, 701, f8(f64::INFINITY), "inf"),
+            (
+                DataType::Int32,
+                20,
+                i8b(i64::from(i32::MAX) + 1),
+                "2147483648",
+            ),
+            (
+                DataType::Int64,
+                701,
+                f8(2f64.powi(63)),
+                "9223372036854776000",
+            ),
+            (DataType::Int16, 23, i4(40_000), "40000"),
+            (DataType::Float64, 20, i8b(i64::MAX), "9223372036854775807"),
+            (DataType::Float32, 23, i4(16_777_217), "16777217"),
+            (DataType::Float32, 701, f8(0.1), "0.1"),
+            (DataType::Decimal128(4, 2), 23, i4(100), "100"),
+            (DataType::Decimal128(10, 2), 701, f8(1.0), "1"),
+        ] {
+            let message = bin_convert(&dt, oid, &raw).expect_err("lossy conversion");
+            let wire = match oid {
+                20 => "int8",
+                23 => "int4",
+                _ => "float8",
+            };
+            assert!(
+                message.contains(&format!(
+                    "the {wire} value {value} (type oid {oid}) cannot be stored in the dataset's `{dt}` column without loss"
+                )),
+                "{dt} from oid {oid}: {message}"
+            );
+        }
     }
 
     /// Encode a Postgres binary `numeric` from its base-10000 digit groups.

@@ -16,8 +16,10 @@ limitations under the License.
 
 //! Stream-time schema reconciliation for pgoutput `Relation` messages.
 //!
-//! Postgres re-sends the `Relation` message whenever the source table's schema
-//! changes (and on every reconnect). With `on_schema_change` set to a policy
+//! Postgres sends a table's `Relation` message before the first change to it on
+//! a connection, and again before the first change after its schema changes.
+//! The baseline the first one is diffed against is the column types the dataset
+//! was registered from. With `on_schema_change` set to a policy
 //! other than `block`, [`RelationSchemaTracker`] diffs each `Relation` against
 //! the dataset's working schema:
 //!
@@ -89,6 +91,19 @@ impl RelationSchemaTracker {
         }
     }
 
+    /// Seed the per-column type OID baseline with the types the dataset's
+    /// schema was registered from (the source catalog at subscribe time).
+    ///
+    /// Without a seed, the first `Relation` is taken as the baseline. Postgres
+    /// sends that message only before the first change on the table, which can
+    /// come after the column's type has already changed, so the change would
+    /// never be diffed and its values would be decoded as the registered type.
+    #[must_use]
+    pub(crate) fn with_column_type_oids(mut self, column_oids: HashMap<String, u32>) -> Self {
+        self.column_oids = column_oids;
+        self
+    }
+
     /// The current working schema (dataset schema plus any adopted widening).
     pub(crate) fn working_schema(&self) -> &SchemaRef {
         &self.working_schema
@@ -97,9 +112,10 @@ impl RelationSchemaTracker {
     /// Reconcile one `Relation` message against the working schema, adopting
     /// widening changes per the policy or returning an actionable error.
     ///
-    /// The first observation of the stream only records the per-column OID
-    /// baseline — there is no prior OID to diff against, and the dataset
-    /// schema was inferred from this same relation at registration time.
+    /// Each column's OID is diffed against the baseline: the OIDs seeded by
+    /// [`Self::with_column_type_oids`], then those of the previous `Relation`.
+    /// With no seed, the first observation only records the baseline, since
+    /// there is no prior OID to diff against.
     pub(crate) fn observe_relation(&mut self, rel: &Relation) -> Result<RelationObservation> {
         let first_observation = self.column_oids.is_empty();
         let mut incompatibilities: Vec<String> = Vec::new();
@@ -199,10 +215,10 @@ impl RelationSchemaTracker {
             }
         }
 
-        // Added-column adoption only applies to columns that appear MID-STREAM
-        // (relative to the previous Relation message). Relation columns absent
-        // from the dataset schema on the FIRST observation may be a deliberate
-        // user subset — keep ignoring them, exactly like the legacy path.
+        // Added-column adoption only applies to columns absent from the baseline
+        // (the seeded OIDs, or the previous Relation message). Relation columns
+        // absent from the dataset schema but present in the baseline may be a
+        // deliberate user subset, and are ignored.
         for col in &rel.columns {
             if first_observation {
                 break;
@@ -369,6 +385,72 @@ mod tests {
             .expect("observe");
         assert!(!obs.schema_changed);
         assert_eq!(t.working_schema().fields().len(), 2);
+    }
+
+    /// Regression test for #14718: seeded with the registered column types, the
+    /// first `Relation` is diffed rather than taken as the baseline, so a type
+    /// change made before the stream's first change is still adopted.
+    #[test]
+    fn seeded_baseline_adopts_a_widening_in_the_first_relation() {
+        let mut t = tracker_with_schema(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("k", DataType::Int32, true),
+            ])),
+            SchemaEvolutionPolicy::SyncAllColumns,
+        )
+        .with_column_type_oids(HashMap::from([
+            ("id".to_string(), 23),
+            ("k".to_string(), 23),
+        ]));
+        let obs = t
+            .observe_relation(&relation(vec![("id", 23), ("k", 701)]))
+            .expect("int4 -> float8 widens");
+        assert!(obs.schema_changed);
+        assert_eq!(obs.summary, "widened `k`: Int32 -> Float64");
+        assert_eq!(t.working_schema().field(1).data_type(), &DataType::Float64);
+    }
+
+    /// A seeded column the dataset does not project is not "added" when the
+    /// first `Relation` carries it: the dataset deliberately left it out.
+    #[test]
+    fn seeded_baseline_does_not_adopt_an_unprojected_column() {
+        let mut t = tracker(SchemaEvolutionPolicy::AppendNewColumns).with_column_type_oids(
+            HashMap::from([
+                ("id".to_string(), 23),
+                ("name".to_string(), 25),
+                ("secret".to_string(), 25),
+            ]),
+        );
+        let obs = t
+            .observe_relation(&relation(vec![("id", 23), ("name", 25), ("secret", 25)]))
+            .expect("observe");
+        assert!(!obs.schema_changed, "{}", obs.summary);
+        assert_eq!(t.working_schema().fields().len(), 2);
+    }
+
+    /// Under `fail`, a type change already present in the first `Relation` fails.
+    #[test]
+    fn seeded_baseline_fails_a_type_change_under_fail() {
+        let mut t = tracker_with_schema(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("k", DataType::Int32, true),
+            ])),
+            SchemaEvolutionPolicy::Fail,
+        )
+        .with_column_type_oids(HashMap::from([
+            ("id".to_string(), 23),
+            ("k".to_string(), 23),
+        ]));
+        let msg = t
+            .observe_relation(&relation(vec![("id", 23), ("k", 701)]))
+            .expect_err("fail rejects the type change")
+            .to_string();
+        assert!(
+            msg.contains("the type of column `k` changed on source relation public.users (pg type oid 23 -> 701) and `on_schema_change: fail` is set"),
+            "{msg}"
+        );
     }
 
     #[test]
