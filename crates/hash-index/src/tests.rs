@@ -1271,6 +1271,36 @@ fn test_batch_lookup_mixed() {
 // =============================================================================
 
 #[test]
+fn test_rebuild_strict_rejects_a_repeated_key() {
+    let index = HashIndexBuilder::new(vec!["id".to_string()])
+        .build(&[])
+        .expect("failed to build index");
+
+    index
+        .rebuild_strict(&[vec![create_int64_batch(vec![1, 2, 3])]])
+        .expect("distinct keys rebuild");
+    assert_eq!(index.len(), 3);
+
+    let err = index
+        .rebuild_strict(&[
+            vec![create_int64_batch(vec![4, 5])],
+            vec![create_int64_batch(vec![4])],
+        ])
+        .expect_err("a repeated key must be rejected");
+    assert!(matches!(err, crate::Error::DuplicateKey), "{err}");
+    assert!(
+        index.is_empty(),
+        "a rejected rebuild must leave nothing to look up"
+    );
+
+    // The plain rebuild keeps the last row of a repeated key instead.
+    index
+        .rebuild(&[vec![create_int64_batch(vec![4, 4])]])
+        .expect("rebuild");
+    assert_eq!(index.len(), 1);
+}
+
+#[test]
 fn test_rebuild_index() {
     let batch1 = create_int64_batch(vec![1, 2, 3]);
     let partitions1 = vec![vec![batch1]];

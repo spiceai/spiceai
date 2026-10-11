@@ -214,19 +214,15 @@ impl Secrets {
         expander: Box<dyn crate::stores::scheduler_rpc::ClusterSecretExpander>,
         executor_id: String,
     ) -> Self {
-        let expander: Arc<dyn crate::stores::scheduler_rpc::ClusterSecretExpander> =
-            Arc::from(expander);
+        // A single store, so the `secrets:` walk asks the scheduler once per
+        // key. It is named `env` so `${ env:KEY }` references resolve too.
         let mut stores = IndexMap::new();
         stores.insert(
             "env".to_string(),
             Arc::new(SchedulerRPCSecretStore::new(
-                Arc::clone(&expander),
-                executor_id.clone(),
+                Arc::from(expander),
+                executor_id,
             )) as Arc<dyn SecretStore>,
-        );
-        stores.insert(
-            "scheduler_rpc".to_string(),
-            Arc::new(SchedulerRPCSecretStore::new(expander, executor_id)) as Arc<dyn SecretStore>,
         );
 
         Self {
@@ -1113,10 +1109,10 @@ mod tests {
             &self,
             executor_id: &str,
             key: &str,
-        ) -> Result<secrecy::SecretString, String> {
-            Ok(secrecy::SecretString::from(format!(
+        ) -> Result<Option<secrecy::SecretString>, String> {
+            Ok(Some(secrecy::SecretString::from(format!(
                 "{executor_id}:{key}:expanded"
-            )))
+            ))))
         }
     }
 

@@ -21,10 +21,10 @@ cayenne-property-tests = { max-threads = 2 }
 # shared scratch directory — `tpch_full_result_parity_vs_duckdb` and
 # `spicebench_sf1_tpch_scenario_parity_vs_duckdb` read the very same `tpch_sf1`
 # tree — so two of them running at once would race on `dbgen` output that neither
-# wrote atomically. The SSB fixture is shared the same way and by one more binary:
+# wrote atomically. The SSB fixture is shared the same way and by one more lane:
 # `standalone_duckdb_vs_sqlite_ssb` and `ssb_full_result_parity_vs_sqlite` both
 # check for `ssb_scale{scale}/lineorder.parquet` and generate it when absent, so
-# whichever loses the race reads a file the winner is still writing. Every binary
+# whichever loses the race reads a file the winner is still writing. Every lane
 # that touches the scratch tree therefore belongs in this group. Serializing it
 # also keeps one bundled DuckDB instance per machine, which is how #12098 ran this
 # lane when it hit allocator aborts under parallelism.
@@ -96,12 +96,12 @@ github-api-tests = { max-threads = 1 }
 # `.github/scripts/check_nextest_config.py` that holds this to the measurements,
 # so re-derive it there — the numbers above are its inputs, not its record.
 [[profile.default.overrides]]
-filter = 'binary(=mutation_property_test) | binary(=cdc_compaction_delete_race_test) | binary(=maintained_aggregate_filter_test)'
+filter = '(binary_id(=cayenne::integration) & test(/^mutation_property_test::/)) | (binary_id(=cayenne::integration) & test(/^cdc_compaction_delete_race_test::/)) | (binary_id(=cayenne::integration) & test(/^maintained_aggregate_filter_test::/))'
 test-group = 'cayenne-property-tests'
 retries = 0
 slow-timeout = { period = "120s", terminate-after = 12 }
 
-# The same wall-clock margin, for the long-running cayenne binaries that are NOT
+# The same wall-clock margin, for the long-running cayenne tests that are NOT
 # in the zero-retry group above. These keep the default retries, so a timeout is
 # recoverable rather than a hard gate failure — but recovering costs up to
 # 3 x 360s = 18 minutes of runner time for a test that only ever needed wall
@@ -123,10 +123,10 @@ slow-timeout = { period = "120s", terminate-after = 12 }
 # layout_pruning_ab 170.1s needs 978s, so both land here.
 #
 # Spelled out as its own block rather than folded into the filter above so that
-# `retries = 0` stays visibly scoped to the three convergence binaries that need
-# it. These binaries must NOT inherit it.
+# `retries = 0` stays visibly scoped to the three convergence test modules that
+# need it. These modules must NOT inherit it.
 [[profile.default.overrides]]
-filter = 'binary(=partition_chunking_test) | binary(=layout_pruning_ab_test)'
+filter = '(binary_id(=cayenne::integration) & test(/^partition_chunking_test::/)) | (binary_id(=cayenne::integration) & test(/^layout_pruning_ab_test::/))'
 slow-timeout = { period = "120s", terminate-after = 12 }
 
 # `mutation_model_test` is the same family but a third of the runtime: 107.1s
@@ -136,17 +136,17 @@ slow-timeout = { period = "120s", terminate-after = 12 }
 # Raising it with the others would buy nothing and cost something. Nothing,
 # because the ceiling is already above what the model predicts under the worst
 # contention measured plus headroom — the reason the other two moved. Something,
-# because this binary keeps the default retries: a genuine hang is killed once
+# because these tests keep the default retries: a genuine hang is killed once
 # per attempt, so every second added to the ceiling is spent four times over
 # (3 retries + the first try). Going to 12 would add 480s x 4 = 32 minutes to
-# the cost of catching one, on the binary least likely to need the room.
+# the cost of catching one, on the module least likely to need the room.
 #
 # The rule this follows is the one stated above: the ceiling is derived from the
 # measurement, not copied from a sibling. If a quiet-pool baseline here grows
 # past 167s (960 / 5.75), that is the signal to move it — and
 # `.github/scripts/check_nextest_config.py` is what will say so.
 [[profile.default.overrides]]
-filter = 'binary(=mutation_model_test)'
+filter = '(binary_id(=cayenne::integration) & test(/^mutation_model_test::/))'
 slow-timeout = { period = "120s", terminate-after = 8 }
 
 # Hold every GitHub test to the `github-api-tests` group — see its definition
@@ -169,7 +169,8 @@ retries = 0
 # slow pass come to 945s, and 1200s keeps 1.25x headroom over that. A genuine
 # hang is still killed, at 20 minutes instead of 6. Unlike the binary overrides
 # above, `.github/scripts/check_nextest_config.py` does not check this one: it
-# resolves `binary(=...)` filters only.
+# resolves `binary(=...)` filters and `binary_id(=...) & test(/^module::/)` module
+# selectors only.
 [[profile.default.overrides]]
 filter = 'test(=mysql::replication_e2e::mysql_binlog_replication_survives_a_dump_reconnect_cayenne) | test(=mysql::replication_e2e::mysql_binlog_replication_decodes_every_column_type_cayenne)'
 retries = 0
@@ -178,7 +179,7 @@ slow-timeout = { period = "120s", terminate-after = 10 }
 # Result-correctness parity lanes: Cayenne (and the Spice accelerators) against
 # standalone DuckDB/SQLite on the same rows.
 #
-# `retries = 0` for the same reason the convergence binaries have it: these
+# `retries = 0` for the same reason the convergence tests have it: these
 # compare two engines' answers to the same SQL over the same data, so a mismatch
 # is deterministic and a retry cannot turn a real one into a pass — it only pays
 # the ~250s runtime repeatedly before reporting the failure it already
@@ -188,15 +189,15 @@ slow-timeout = { period = "120s", terminate-after = 10 }
 # to rescue.
 #
 # `slow-timeout` raises the wall-clock ceiling from the global 360s (120s x 3) to
-# 1440s (120s x 12), matching the convergence binaries above. The slowest test is the SF1 TPC-DS + ClickBench comparison,
+# 1440s (120s x 12), matching the convergence tests above. The slowest test is the SF1 TPC-DS + ClickBench comparison,
 # measured at 127.7s locally with fixtures already generated; CI pays `dsdgen` on
 # every fresh runner on top of that, and contention on the shared pool has been
 # measured multiplying runtimes 4.6x. With `retries = 0` a wall-clock kill is an
 # unrecoverable merge-queue failure, so this needs room rather than the global
-# ceiling. See `.github/scripts/check_nextest_config.py`, which holds this
-# binary's baseline and fails if the ceiling stops clearing it.
+# ceiling. See `.github/scripts/check_nextest_config.py`, which holds these
+# modules' baselines and fails if the ceiling stops clearing it.
 [[profile.default.overrides]]
-filter = 'binary(=result_correctness_vs_duckdb_test) | binary(=result_correctness_standalone_engines_test) | binary(=result_correctness_vs_sqlite_test)'
+filter = '(binary_id(=cayenne::integration) & test(/^result_correctness_vs_duckdb_test::/)) | (binary_id(=cayenne::integration) & test(/^result_correctness_standalone_engines_test::/)) | (binary_id(=cayenne::integration) & test(/^result_correctness_vs_sqlite_test::/))'
 test-group = "result-correctness"
 retries = 0
 slow-timeout = { period = "120s", terminate-after = 12 }

@@ -162,6 +162,13 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
         );
     }
 
+    // `ai_if`, `ai_probability`, `ai_classify`, `ai_score` and `ai_decide`, answered by
+    // the decision and chat models in the evaluation store, with the planner rules that
+    // place their model calls. Registered once per runtime, so the rules are appended
+    // once.
+    runtime_decide::DecisionFunctions::new(runtime.evaluate_models(), runtime.status())
+        .register(ctx);
+
     in_tracing_context_async(register_user_functions(runtime, ctx)).await;
 }
 
@@ -721,6 +728,11 @@ mod deny_list_registration_tests {
             FLATTEN_JSON_UDTF_NAME,
             JSON_TREE_UDTF_NAME,
             RERANK_UDTF_NAME,
+            runtime_decide::AI_IF_NAME,
+            runtime_decide::AI_PROBABILITY_NAME,
+            runtime_decide::AI_CLASSIFY_NAME,
+            runtime_decide::AI_SCORE_NAME,
+            runtime_decide::AI_DECIDE_NAME,
         ]
         .iter()
         .map(ToString::to_string)
@@ -1164,8 +1176,10 @@ mod tests {
                 !support.supports(&make_named_expr(json_name.as_str()), None),
                 "{json_name} must stay denied for {backend}"
             );
+            // `upper` is a SQLite extra (ASCII-only case folding). `abs` is
+            // still a function both backends evaluate the same way.
             assert!(
-                support.supports(&make_named_expr("upper"), None),
+                support.supports(&make_named_expr("abs"), None),
                 "an ordinary function must still federate to {backend}"
             );
         }

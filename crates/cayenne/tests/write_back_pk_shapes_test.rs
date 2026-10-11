@@ -31,7 +31,7 @@ limitations under the License.
 //! Each test asserts the full round trip — the decoded array equals the key that
 //! was written — not merely that decoding succeeded.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 

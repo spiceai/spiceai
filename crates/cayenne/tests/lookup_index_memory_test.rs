@@ -19,6 +19,10 @@ limitations under the License.
 
 #![expect(clippy::expect_used, reason = "test setup and assertions")]
 
+#[expect(
+    dead_code,
+    reason = "shared helpers for every Cayenne test binary; this one uses only some"
+)]
 mod common;
 
 use arrow::array::Int64Array;

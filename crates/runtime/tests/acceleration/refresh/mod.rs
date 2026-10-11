@@ -1,6 +1,8 @@
-#[cfg(feature = "postgres-accel")]
+// Cayenne refreshes from a PostgreSQL source, so it needs the connector and
+// not the PostgreSQL-accelerator tests `postgres-accel` selects.
+#[cfg(feature = "postgres")]
 pub(crate) mod common;
-#[cfg(all(not(windows), feature = "postgres-accel"))]
+#[cfg(all(not(windows), feature = "postgres"))]
 mod refresh_cayenne;
 #[cfg(all(feature = "duckdb", feature = "postgres-accel"))]
 mod refresh_duckdb;

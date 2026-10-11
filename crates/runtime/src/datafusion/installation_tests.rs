@@ -39,7 +39,14 @@ use datafusion::{
     datasource::TableProvider,
 };
 use runtime_component::dataset::{DatasetSpec, TimeFormat};
-use std::{any::Any, sync::Arc, time::Duration};
+use std::{
+    any::Any,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 use tokio::sync::{Notify, Semaphore};
 
 #[derive(Debug)]
@@ -91,6 +98,43 @@ impl DataConnector for MetadataGate {
         } else {
             Ok(Arc::clone(&self.provider))
         })
+    }
+}
+
+/// A source whose acceleration setup fails until its failures are used up.
+#[derive(Debug)]
+struct FlakySetup {
+    provider: Arc<dyn TableProvider>,
+    failures: AtomicUsize,
+}
+
+#[async_trait]
+impl DataConnector for FlakySetup {
+    fn as_any(&self) -> &dyn Any {
+        self
+    }
+
+    async fn read_provider(
+        &self,
+        _: &dyn ConnectorContext,
+        _: &DatasetSpec,
+    ) -> DataConnectorResult<Arc<dyn TableProvider>> {
+        Ok(Arc::clone(&self.provider))
+    }
+
+    async fn on_accelerator_setup(
+        &self,
+        _: &DatasetSpec,
+        _: &mut dyn data_connector_api::accelerated::AcceleratorSetup,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if self
+            .failures
+            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+            .is_ok()
+        {
+            return Err("controlled transient setup failure".into());
+        }
+        Ok(())
     }
 }
 
@@ -414,4 +458,267 @@ fn invalid_initializations(storage: &std::path::Path) -> [InitializationCase; 4]
             expected_error: "extension",
         },
     ]
+}
+
+/// A Cayenne build that rejects its settings releases the dataset's generation: a
+/// retry reports the same cause, and a corrected configuration loads without a restart.
+#[cfg(not(windows))]
+#[tokio::test]
+async fn rejected_build_releases_the_generation() {
+    use crate::component::dataset::acceleration::{Engine, Mode};
+    use spicepod::partitioning::PartitionedBy;
+
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let runtime = Arc::new(Runtime::builder().build().await);
+        let df = runtime.datafusion();
+        let app = Arc::new(app::AppBuilder::new("rejected-build-test").build());
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![7]))],
+        )
+        .expect("source row");
+        let provider: Arc<dyn TableProvider> = Arc::new(
+            data_components::arrow::write::MemTable::try_new(schema, vec![vec![batch]])
+                .expect("Arrow source"),
+        );
+        let source = Arc::new(MetadataGate {
+            provider: Arc::clone(&provider),
+            entered: Notify::new(),
+            release: Semaphore::new(1),
+            fail: false,
+        });
+        let accelerator = runtime
+            .accelerator_engine_registry()
+            .get_accelerator_engine(Engine::Cayenne)
+            .await
+            .expect("registered Cayenne engine");
+        let load = |partition_by: Vec<PartitionedBy>| {
+            let mut builder = DatasetBuilder::try_new("test:memory".into(), "rejected_build_test")
+                .expect("dataset")
+                .with_app(Arc::clone(&app))
+                .with_runtime(Arc::clone(&runtime));
+            builder.acceleration = Some(Acceleration {
+                engine: Engine::Cayenne,
+                mode: Mode::Memory,
+                partition_by,
+                ..Acceleration::default()
+            });
+            let dataset = Arc::new(builder.build().expect("dataset configuration"));
+            let source = Arc::clone(&source) as Arc<dyn DataConnector>;
+            let federated_read_table = FederatedTable::new_unchecked(Arc::clone(&provider));
+            let accelerator = Arc::clone(&accelerator);
+            let df = Arc::clone(&df);
+            let secrets = runtime.secrets();
+            async move {
+                let bootstrap_status = df
+                    .initialize_accelerator(Arc::clone(&dataset), accelerator)
+                    .await?;
+                df.register_table(
+                    dataset,
+                    Table::Accelerated {
+                        source,
+                        federated_read_table,
+                        accelerated_table: None,
+                        secrets,
+                        bootstrap_status,
+                        initial_partition_filters: None,
+                    },
+                )
+                .await
+            }
+        };
+        let partitioned = || {
+            vec![PartitionedBy {
+                name: "expr0".into(),
+                expression: "bucket(2, id)".into(),
+            }]
+        };
+        for attempt in 0..2 {
+            let error = load(partitioned())
+                .await
+                .expect_err("memory mode refuses partition_by");
+            assert!(
+                matches!(error, super::Error::UnableToCreateDataAccelerator { .. }),
+                "attempt {attempt}: {error}"
+            );
+            assert!(
+                error
+                    .to_string()
+                    .contains("memory is not supported with partitioning"),
+                "attempt {attempt}: {error}"
+            );
+            assert!(!error.is_retriable(), "attempt {attempt}: {error}");
+        }
+        load(Vec::new())
+            .await
+            .expect("corrected configuration loads without a restart");
+        let name = TableReference::bare("rejected_build_test");
+        assert!(df.is_accelerated(&name).await);
+        df.remove_table(&name)
+            .await
+            .expect("drain and remove the generation");
+        df.ctx
+            .deregister_table(TableReference::partial("metadata", name.to_string()))
+            .expect("remove fixture metadata");
+    })
+    .await
+    .expect("rejected builds must finish");
+}
+
+/// A build that fails for a transient reason releases the dataset's generation, so a
+/// later attempt loads the dataset without a restart.
+#[tokio::test]
+async fn transient_build_failure_loads_on_retry() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let runtime = Arc::new(Runtime::builder().build().await);
+        let df = runtime.datafusion();
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![7]))],
+        )
+        .expect("source row");
+        let provider: Arc<dyn TableProvider> = Arc::new(
+            data_components::arrow::write::MemTable::try_new(schema, vec![vec![batch]])
+                .expect("Arrow source"),
+        );
+        let source = Arc::new(FlakySetup {
+            provider: Arc::clone(&provider),
+            failures: AtomicUsize::new(1),
+        });
+        let mut builder = DatasetBuilder::try_new("test:memory".into(), "transient_build_test")
+            .expect("dataset")
+            .with_app(Arc::new(
+                app::AppBuilder::new("transient-build-test").build(),
+            ))
+            .with_runtime(Arc::clone(&runtime));
+        builder.acceleration = Some(Acceleration::default());
+        let dataset = Arc::new(builder.build().expect("dataset configuration"));
+        let name = dataset.name.clone();
+        let accelerator = runtime
+            .accelerator_engine_registry()
+            .get_accelerator_engine(Acceleration::default().engine)
+            .await
+            .expect("registered default engine");
+        let register = |bootstrap_status| {
+            df.register_table(
+                Arc::clone(&dataset),
+                Table::Accelerated {
+                    source: Arc::clone(&source) as Arc<dyn DataConnector>,
+                    federated_read_table: FederatedTable::new_unchecked(Arc::clone(&provider)),
+                    accelerated_table: None,
+                    secrets: runtime.secrets(),
+                    bootstrap_status,
+                    initial_partition_filters: None,
+                },
+            )
+        };
+
+        let bootstrap = df
+            .initialize_accelerator(Arc::clone(&dataset), Arc::clone(&accelerator))
+            .await
+            .expect("initialize");
+        let error = register(bootstrap.clone())
+            .await
+            .expect_err("the first build fails");
+        assert!(
+            error
+                .to_string()
+                .contains("controlled transient setup failure"),
+            "{error}"
+        );
+        assert!(error.is_retriable(), "{error}");
+        assert!(bootstrap.needs_reinitialization());
+
+        let bootstrap = df
+            .initialize_accelerator(Arc::clone(&dataset), accelerator)
+            .await
+            .expect("a failed build leaves the generation free to initialize");
+        register(bootstrap)
+            .await
+            .expect("the retry loads without a restart");
+        assert!(df.is_accelerated(&name).await);
+        df.remove_table(&name)
+            .await
+            .expect("drain and remove the generation");
+    })
+    .await
+    .expect("the retry must finish");
+}
+
+/// A builder failure raised where the builder may already have started work keeps
+/// the dataset's generation fenced, because nothing proves that work stopped. Here
+/// a caching child fails to initialize because its parent refuses new children.
+#[tokio::test]
+async fn build_failure_after_ingestion_starts_keeps_the_generation_fenced() {
+    tokio::time::timeout(Duration::from_secs(30), async {
+        let runtime = Arc::new(Runtime::builder().build().await);
+        let df = runtime.datafusion();
+        let app = Arc::new(app::AppBuilder::new("fenced-build-test").build());
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let provider: Arc<dyn TableProvider> = Arc::new(
+            data_components::arrow::write::MemTable::try_new(schema, vec![vec![]])
+                .expect("Arrow source"),
+        );
+        let source = Arc::new(FlakySetup {
+            provider: Arc::clone(&provider),
+            failures: AtomicUsize::new(0),
+        });
+        let caching = |from: &str, name: &str| {
+            let mut builder = DatasetBuilder::try_new(from.into(), name)
+                .expect("dataset")
+                .with_app(Arc::clone(&app))
+                .with_runtime(Arc::clone(&runtime));
+            builder.acceleration = Some(Acceleration {
+                refresh_mode: Some(RefreshMode::Caching),
+                ..Acceleration::default()
+            });
+            Arc::new(builder.build().expect("dataset configuration"))
+        };
+        let register = |dataset| {
+            df.register_table(
+                dataset,
+                Table::Accelerated {
+                    source: Arc::clone(&source) as Arc<dyn DataConnector>,
+                    federated_read_table: FederatedTable::new_unchecked(Arc::clone(&provider)),
+                    accelerated_table: None,
+                    secrets: runtime.secrets(),
+                    bootstrap_status: runtime_acceleration::BootstrapStatus::none().into(),
+                    initial_partition_filters: None,
+                },
+            )
+        };
+
+        let parent = caching("https://example.com/parent", "fenced_parent");
+        register(Arc::clone(&parent))
+            .await
+            .expect("register the parent");
+        let installed = df.get_table(&parent.name).await.expect("parent table");
+        let parent_table = spice_table::find_layer::<crate::accelerated::AcceleratedTable>(
+            installed.as_ref(),
+            spice_table::LayerWalk::Read,
+        )
+        .expect("accelerated layer");
+        // A draining parent refuses new cache children.
+        let _drain = parent_table.begin_changes_drain();
+
+        let child = caching("localpod:fenced_parent", "fenced_child");
+        let error = register(Arc::clone(&child))
+            .await
+            .expect_err("the parent refuses the child");
+        assert!(error.to_string().contains("is stopping"), "{error}");
+        let error = df
+            .remove_table(&child.name)
+            .await
+            .expect_err("the child's generation is not released");
+        assert!(error.to_string().contains("nothing stopped"), "{error}");
+        let error = df
+            .remove_table(&child.name)
+            .await
+            .expect_err("the child's generation stays fenced");
+        assert!(error.to_string().contains("remains fenced"), "{error}");
+    })
+    .await
+    .expect("the fenced build must finish");
 }

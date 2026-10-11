@@ -1518,7 +1518,9 @@ fn with_spice_logical_optimizers(
         let _ = cte_materialization;
     }
     optimizer_rules.extend(trailing_rules);
-    state.with_optimizer_rules(optimizer_rules)
+    // Leaf-expression pushdown would move a model call below the filters that decide
+    // which rows it runs on; the decision functions' own rule runs last and places it.
+    state.with_optimizer_rules(runtime_decide::guard_async_calls(optimizer_rules))
 }
 
 #[cfg(not(windows))]

@@ -1032,6 +1032,22 @@ async fn federated_postgres_table_provider(
     )))
 }
 
+/// Rejects a `refresh_mode: changes` dataset that has no key to apply UPDATE and
+/// DELETE events by, when it loads instead of after its changes stream starts.
+fn ensure_changes_primary_key(
+    dataset: &DatasetSpec,
+    provider: &Arc<dyn TableProvider>,
+) -> DataConnectorResult<()> {
+    if replication::changes_dataset_lacks_primary_key(dataset, provider) {
+        return Err(DataConnectorError::InvalidConfigurationNoSource {
+            dataconnector: "postgres".to_string(),
+            connector_component: ConnectorComponent::from(dataset),
+            message: replication::missing_primary_key_message(dataset),
+        });
+    }
+    Ok(())
+}
+
 /// The `on_conflict` upsert target to bind to the write-back writer, or `None`
 /// for the ordinary append-only writer.
 ///
@@ -1275,10 +1291,10 @@ impl DataConnector for Postgres {
             )
             .await
         {
-            Ok(provider) => Some(Ok(enrich_with_postgres_metadata(
-                &self.pool, dataset, provider,
-            )
-            .await)),
+            Ok(provider) => {
+                let provider = enrich_with_postgres_metadata(&self.pool, dataset, provider).await;
+                Some(ensure_changes_primary_key(dataset, &provider).map(|()| provider))
+            }
             Err(e) => {
                 if let Some(err_source) = e.source() {
                     match err_source.downcast_ref::<dbconnection::Error>() {
@@ -1323,7 +1339,11 @@ impl DataConnector for Postgres {
     ) -> DataConnectorResult<Arc<dyn TableProvider>> {
         match federated_postgres_table_provider(Arc::clone(&self.pool), dataset.path().into()).await
         {
-            Ok(provider) => Ok(enrich_with_postgres_metadata(&self.pool, dataset, provider).await),
+            Ok(provider) => {
+                let provider = enrich_with_postgres_metadata(&self.pool, dataset, provider).await;
+                ensure_changes_primary_key(dataset, &provider)?;
+                Ok(provider)
+            }
             Err(e) => {
                 if let Some(err_source) = e.source() {
                     match err_source.downcast_ref::<dbconnection::Error>() {

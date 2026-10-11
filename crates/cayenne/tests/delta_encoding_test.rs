@@ -29,7 +29,7 @@ limitations under the License.
 
 #![allow(clippy::expect_used)]
 
-mod common;
+use crate::common;
 
 use std::path::Path;
 use std::sync::Arc;

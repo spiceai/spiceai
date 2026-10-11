@@ -29,6 +29,7 @@ use runtime_datafusion_udfs::inner_product::INNER_PRODUCT_UDF_NAME;
 
 mod bigquery;
 mod duckdb;
+mod duckdb_dialect;
 mod re2;
 
 pub use bigquery::SpiceBigQueryDialect;
@@ -37,11 +38,12 @@ pub(crate) const BTRIM_NAME: &str = "btrim";
 const TO_HEX_NAME: &str = "to_hex";
 const CONCAT_NAME: &str = "concat";
 const SHA256_NAME: &str = "sha256";
+const ENCODE_NAME: &str = "encode";
 
 pub(crate) const REGEXP_LIKE_NAME: &str = "regexp_like";
 pub(crate) const REGEXP_MATCH_NAME: &str = "regexp_match";
 pub(crate) const REGEXP_INSTR_NAME: &str = "regexp_instr";
-const REGEXP_REPLACE_NAME: &str = "regexp_replace";
+pub(crate) const REGEXP_REPLACE_NAME: &str = "regexp_replace";
 pub(crate) const REGEXP_COUNT_NAME: &str = "regexp_count";
 
 /// The scalar functions the `DuckDB` unparser dialect rewrites to native
@@ -136,6 +138,15 @@ fn duckdb_builtin_scalar_overrides() -> Vec<(&'static str, ScalarFnToSqlHandler)
             SHA256_NAME,
             Box::new(duckdb::sha256_to_digest_bytes) as ScalarFnToSqlHandler,
         ),
+        (
+            // DuckDB dialect: encode(string, encoding) — charset to BLOB
+            // DataFusion dialect: encode(binary, 'hex'|'base64') — bytes to text
+            // The sha256 rewrite yields a BLOB, so encode(unhex(sha256(x)), 'hex')
+            // is handed to DuckDB's charset encoder and fails with
+            // `No function matches ... encode(BLOB, STRING_LITERAL)`.
+            ENCODE_NAME,
+            Box::new(duckdb::encode_to_lowercase_hex) as ScalarFnToSqlHandler,
+        ),
     ]
 }
 
@@ -166,15 +177,19 @@ pub fn duckdb_native_function_names() -> Vec<&'static str> {
 }
 
 /// Creates a new instance of the `DuckDB` dialect with support for Spice
-/// internal UDFs ([`duckdb_scalar_overrides`]) and for the `DataFusion`
-/// built-ins `DuckDB` spells differently ([`duckdb_builtin_scalar_overrides`]).
+/// internal UDFs ([`duckdb_scalar_overrides`]), for the `DataFusion` built-ins
+/// `DuckDB` spells differently ([`duckdb_builtin_scalar_overrides`]), and for the
+/// ordered aggregates whose `ORDER BY` `DuckDB` takes inside the call
+/// ([`duckdb::ordered_aggregate_to_sql`]).
 #[must_use]
 pub fn new_duckdb_dialect() -> Arc<dyn Dialect> {
     let overrides = duckdb_scalar_overrides()
         .into_iter()
         .chain(duckdb_builtin_scalar_overrides())
         .collect();
-    let dialect = DuckDBDialect::new().with_custom_scalar_overrides(overrides);
+    let dialect = duckdb_dialect::SpiceDuckDBDialect::new(
+        DuckDBDialect::new().with_custom_scalar_overrides(overrides),
+    );
 
     Arc::new(dialect) as Arc<dyn Dialect>
 }
@@ -228,6 +243,45 @@ pub fn duckdb_can_translate(call: &ScalarFunction, scope: Option<&DFSchema>) -> 
     DUCKDB_DIALECT
         .scalar_function_to_sql_overrides(&unparser, call.func.name(), &call.args)
         .is_ok()
+}
+
+/// Whether this aggregate call can be handed to `DuckDB`.
+///
+/// `approx_distinct` is refused because `DuckDB` has no function of that name
+/// (`approx_count_distinct` is a different `HyperLogLog`). Mapping the two would
+/// change the number; evaluating locally matches the unaccelerated engine.
+///
+/// The clauses the unparser cannot carry are refused for every backend, by
+/// `runtime_udfs_api::aggregate_clauses_survive_unparsing`: `IGNORE NULLS`, and an
+/// `ORDER BY` the answer depends on. For `DuckDB` that `ORDER BY` still federates
+/// where [`duckdb_renders_aggregate_order_by`] says the dialect renders it. A
+/// decimal `avg`, which `DuckDB` answers as a `DOUBLE`, is refused by operand type
+/// in `crate::function_support::duckdb_can_evaluate_expression` (issue #14492).
+#[must_use]
+pub fn duckdb_can_translate_aggregate(call: &AggregateFunction) -> bool {
+    !call.func.name().eq_ignore_ascii_case("approx_distinct")
+}
+
+/// Whether the `DuckDB` dialect renders the argument-list `ORDER BY` of the
+/// aggregate of this name: inside the call, for the aggregates
+/// [`duckdb::ordered_aggregate_to_sql`] renders (`string_agg`, `array_agg`,
+/// `first_value`, `last_value`). The unparser drops every other one, so such an
+/// ordered aggregate would come back in whatever order `DuckDB` produced, and a
+/// memory accelerator and a file accelerator could disagree with each other.
+#[must_use]
+pub fn duckdb_renders_aggregate_order_by(name: &str) -> bool {
+    duckdb::renders_aggregate_order_by(name)
+}
+
+/// Whether this window call can be handed to `DuckDB`.
+///
+/// `approx_distinct` is refused for the same reason as in
+/// [`duckdb_can_translate_aggregate`]: `DuckDB` has no function of that name.
+/// `IGNORE NULLS`, which the unparser does not render on a window, is refused for
+/// every backend by `runtime_udfs_api::window_clauses_survive_unparsing`.
+#[must_use]
+pub fn duckdb_can_translate_window(call: &WindowFunction) -> bool {
+    !call.fun.name().eq_ignore_ascii_case("approx_distinct")
 }
 
 /// Whether `DuckDB` evaluates this non-function expression node the way
@@ -429,6 +483,7 @@ mod tests {
     use crate::function_support::bigquery_can_evaluate_expression;
     use arrow_schema::{DataType, Field, Schema};
     use datafusion::common::DFSchema;
+    use datafusion::functions::encoding::expr_fn::encode;
     use datafusion::functions::expr_fn::{concat, upper};
     use datafusion::functions::regex::expr_fn::{regexp_count, regexp_like, regexp_replace};
     use datafusion::logical_expr::expr::ScalarFunction;
@@ -1164,6 +1219,29 @@ mod tests {
         assert!(duckdb_can_translate(&call_of(upper(col("s"))), None));
     }
 
+    /// `encode(x, 'hex')` has a faithful `DuckDB` rendering; every other
+    /// encoding stays local so `DuckDB`'s charset `encode` is never asked to
+    /// hex-encode a `BLOB`.
+    #[test]
+    fn duckdb_translates_only_a_literal_hex_encode() {
+        assert!(
+            duckdb_can_translate(&call_of(encode(col("s"), lit("hex"))), None),
+            "encode(x, 'hex') renders as lower(hex(x)) and must federate"
+        );
+        assert!(
+            !duckdb_can_translate(&call_of(encode(col("s"), lit("HEX"))), None),
+            "DataFusion matches 'hex' case-sensitively; HEX must stay local"
+        );
+        assert!(
+            !duckdb_can_translate(&call_of(encode(col("s"), lit("base64"))), None),
+            "encode(x, 'base64') has no DuckDB rendering and must stay local"
+        );
+        assert!(
+            !duckdb_can_translate(&call_of(encode(col("s"), col("s"))), None),
+            "a non-literal encoding cannot be inspected and must stay local"
+        );
+    }
+
     /// The check must not *admit* a call the unparser cannot render, or the
     /// call still fails the query; and outside the type-dependent exception
     /// below it must not refuse one it can, or the pushdown is lost for
@@ -1196,6 +1274,9 @@ mod tests {
             regexp_count(col("s"), lit("a"), Some(lit(1)), Some(lit("i"))),
             regexp_count(col("s"), lit("a"), Some(lit(1)), Some(lit("m"))),
             upper(col("s")),
+            encode(col("s"), lit("hex")),
+            encode(col("s"), lit("HEX")),
+            encode(col("s"), lit("base64")),
         ] {
             let renders = unparser.expr_to_sql(&expr).is_ok();
             assert_eq!(

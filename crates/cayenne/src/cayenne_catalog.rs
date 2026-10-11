@@ -494,6 +494,27 @@ impl CayenneCatalog {
         Ok(())
     }
 
+    /// Delete a table's persisted exact statistics inside a caller-owned
+    /// transaction whose commit adds rows to the table without moving its
+    /// current snapshot. They no longer describe the visible rows, and
+    /// `DataFusion` may substitute an exact count directly into `COUNT(*)`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the statement fails.
+    pub async fn clear_table_statistics_in_txn(
+        &self,
+        txn: &mut dyn MetastoreTransaction,
+        table_id: &str,
+    ) -> CatalogResult<()> {
+        txn.execute(ExecuteParams {
+            sql: "DELETE FROM cayenne_table_statistics WHERE table_id = ?1",
+            params: vec![MetastoreValue::Text(table_id.to_string())],
+        })
+        .await?;
+        Ok(())
+    }
+
     /// Apply one deferred on-conflict payload in a caller-owned transaction.
     /// The caller commits this together with all participating snapshot pointers.
     ///
