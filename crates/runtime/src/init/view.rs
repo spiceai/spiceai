@@ -102,55 +102,112 @@ fn order_views_by_dependencies(validated_views: &[ValidatedView]) -> Option<Vec<
     }
 }
 
-/// Whether the view dependency graph (edges between views only, self-references
-/// ignored) contains a cycle.
-fn has_view_cycle(
-    dependencies: &HashMap<ResolvedTableReference, Vec<ResolvedTableReference>>,
-) -> bool {
-    let mut remaining: HashMap<&ResolvedTableReference, usize> = dependencies
+/// The tables a view's SQL reads: each resolved name, with the name as written.
+type TablesRead = HashMap<ResolvedTableReference, TableReference>;
+
+/// The tables a view's SQL reads: every table the planner looks up to plan it,
+/// including tables only a subquery reads, and no CTEs. `None` when the SQL
+/// does not resolve, in which case registering the view reports the error.
+fn view_reads(state: &datafusion::execution::SessionState, sql: &str) -> Option<TablesRead> {
+    let mut statements = DFParser::parse_sql_with_dialect(sql, &PostgreSqlDialect {}).ok()?;
+    if statements.len() != 1 {
+        return None;
+    }
+    let statement = statements.pop_front()?;
+    let tables = state.resolve_table_references(&statement).ok()?;
+    Some(
+        tables
+            .into_iter()
+            .map(|table| (resolve_table_reference(table.clone()), table))
+            .collect(),
+    )
+}
+
+/// Whether the views, linked by the views each one reads (a view reading itself
+/// is not a link), contain a cycle.
+fn has_view_cycle(reads: &HashMap<ResolvedTableReference, Option<TablesRead>>) -> bool {
+    // Kahn's algorithm: repeatedly take a view none of whose views is left.
+    let mut unresolved: HashMap<&ResolvedTableReference, usize> = HashMap::new();
+    let mut readers: HashMap<&ResolvedTableReference, Vec<&ResolvedTableReference>> =
+        HashMap::new();
+    for (view, tables) in reads {
+        let mut count = 0;
+        for table in tables.iter().flat_map(HashMap::keys) {
+            if table != view && reads.contains_key(table) {
+                count += 1;
+                readers.entry(table).or_default().push(view);
+            }
+        }
+        unresolved.insert(view, count);
+    }
+    let mut ready: Vec<&ResolvedTableReference> = unresolved
         .iter()
-        .map(|(view, deps)| {
-            let n = deps
-                .iter()
-                .filter(|d| *d != view && dependencies.contains_key(*d))
-                .collect::<HashSet<_>>()
-                .len();
-            (view, n)
-        })
+        .filter(|(_, count)| **count == 0)
+        .map(|(view, _)| *view)
         .collect();
-    let mut ready: Vec<&ResolvedTableReference> = remaining
-        .iter()
-        .filter(|(_, n)| **n == 0)
-        .map(|(v, _)| *v)
-        .collect();
-    let mut visited = 0;
-    while let Some(done) = ready.pop() {
-        visited += 1;
-        for (view, deps) in dependencies {
-            if view != done
-                && deps.iter().collect::<HashSet<_>>().contains(done)
-                && let Some(n) = remaining.get_mut(view)
-            {
-                *n -= 1;
-                if *n == 0 {
-                    ready.push(view);
+    let mut taken = 0;
+    while let Some(view) = ready.pop() {
+        taken += 1;
+        for reader in readers.get(view).into_iter().flatten() {
+            if let Some(count) = unresolved.get_mut(reader) {
+                *count -= 1;
+                if *count == 0 {
+                    ready.push(reader);
                 }
             }
         }
     }
-    visited < dependencies.len()
+    taken < reads.len()
+}
+
+/// How many names a view's waiting message lists before it summarizes the rest.
+const MAX_LISTED_WAITS: usize = 10;
+
+/// How long a startup view waits for what it reads before it logs what it is
+/// waiting for. The same cadence as the dataset load summary.
+const VIEW_WAIT_REPORT_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The line a startup view logs when it has to wait before it registers.
+///
+/// `pending` names what it is still waiting for. `unknown` is set when it waits
+/// for every dataset because it reads a table that is not a dataset or view
+/// loading at startup, naming the first such table if its SQL resolved.
+fn view_waiting_message(
+    view: &TableReference,
+    pending: &[String],
+    unknown: Option<Option<&TableReference>>,
+) -> String {
+    let mut listed = pending
+        .iter()
+        .take(MAX_LISTED_WAITS)
+        .map(|name| format!("'{name}'"))
+        .join(", ");
+    if pending.len() > MAX_LISTED_WAITS {
+        listed = format!("{listed} and {} more", pending.len() - MAX_LISTED_WAITS);
+    }
+    match unknown {
+        None => format!("View '{view}' is still waiting for {listed} to load before it registers."),
+        Some(Some(table)) => format!(
+            "View '{view}' is still waiting for every dataset to load before it registers, because it reads '{table}', which is not a dataset or view loading at startup. Still loading: {listed}."
+        ),
+        Some(None) => format!(
+            "View '{view}' is still waiting for every dataset to load before it registers. Still loading: {listed}."
+        ),
+    }
 }
 
 impl Runtime {
-    /// Loads the startup views. Each view is registered as soon as the datasets
-    /// and views it reads from have finished loading, so a dataset that keeps
-    /// failing holds back only the views that depend on it.
+    /// Loads the startup views. Each view registers as soon as the datasets and
+    /// views it reads from have finished loading, so a dataset that keeps
+    /// failing holds back only the views that read from it.
     ///
     /// `dataset_done` maps each startup dataset whose load is running to a token
-    /// cancelled when that load ends. A dependency that is a dataset without an
-    /// entry (it failed accelerator initialization, or is chained deeper behind
-    /// another dataset) is conservatively waited for by waiting on every startup
-    /// dataset, which is what all views did before.
+    /// cancelled when that load ends. A view that reads anything else — a
+    /// catalog table, a dataset that is not loading (it failed accelerator
+    /// initialization, waits on a snapshot, or is chained deeper behind another
+    /// dataset), or a view in a cycle — waits for every startup dataset instead,
+    /// which is what every view did before. A view a Spicepod change has already
+    /// taken over is left to that change.
     ///
     /// Returns the tasks loading the views.
     pub(crate) fn load_views(
@@ -173,97 +230,122 @@ impl Runtime {
                     .collect()
             });
 
-        let dependencies: HashMap<ResolvedTableReference, Vec<ResolvedTableReference>> =
-            validated_views
-                .iter()
-                .map(|vv| {
-                    (
-                        resolve_table_reference(vv.view.name.clone()),
-                        vv.dependencies
-                            .iter()
-                            .cloned()
-                            .map(resolve_table_reference)
-                            .collect(),
-                    )
-                })
-                .collect();
-        // Waiting on another view is only safe when the views, compared by resolved
-        // name, form no cycle: otherwise each view in the cycle waits on the other.
-        let wait_on_views = !has_view_cycle(&dependencies);
-        let dataset_names: HashSet<ResolvedTableReference> = app
+        let state = self.df.ctx.state();
+        let reads: HashMap<ResolvedTableReference, Option<TablesRead>> = validated_views
+            .iter()
+            .map(|vv| {
+                (
+                    resolve_table_reference(vv.view.name.clone()),
+                    view_reads(&state, &vv.view.sql),
+                )
+            })
+            .collect();
+        // Waiting on another view is only safe when the views form no cycle:
+        // otherwise each view in the cycle waits on the other.
+        let wait_on_views = !has_view_cycle(&reads);
+        let dataset_names: HashMap<ResolvedTableReference, TableReference> = app
             .datasets
             .iter()
             .filter_map(|ds| {
                 crate::component::dataset::Dataset::parse_table_reference(&ds.name).ok()
             })
-            .map(resolve_table_reference)
+            .map(|name| (resolve_table_reference(name.clone()), name))
             .collect();
 
         // Created for every view up front and compared by resolved name, so a view
         // that reads `public.v1` waits on `v1` whatever order they are spawned in.
-        let view_done: HashMap<ResolvedTableReference, CancellationToken> = validated_views
-            .iter()
-            .map(|vv| {
-                (
-                    resolve_table_reference(vv.view.name.clone()),
-                    CancellationToken::new(),
-                )
-            })
+        let view_done: HashMap<ResolvedTableReference, CancellationToken> = reads
+            .keys()
+            .map(|view| (view.clone(), CancellationToken::new()))
             .collect();
         let mut tasks = Vec::new();
 
         for view in views_in_dependency_order {
             let resolved = resolve_table_reference(view.name.clone());
-            let mut waits: Vec<(String, CancellationToken)> = Vec::new();
-            let mut wait_for_all = false;
-            for dep in dependencies.get(&resolved).into_iter().flatten() {
-                let view_token = view_done
-                    .get(dep)
-                    .filter(|_| wait_on_views && dep != &resolved);
-                if let Some(token) = view_token.or_else(|| dataset_done.get(dep)) {
-                    waits.push((dep.to_string(), token.clone()));
-                } else if dataset_names.contains(dep) {
-                    wait_for_all = true;
-                }
-            }
-            if wait_for_all {
-                waits.extend(
-                    dataset_done
-                        .iter()
-                        .map(|(name, token)| (name.to_string(), token.clone())),
-                );
-            }
-
             let done = view_done.get(&resolved).cloned().unwrap_or_default();
+            let Some(view_load) = self.view_loads.begin(&view.name) else {
+                tracing::debug!(
+                    "Not registering view '{}' at startup: a Spicepod change has already taken it over.",
+                    view.name
+                );
+                done.cancel();
+                continue;
+            };
+
+            let mut waits: Vec<(String, CancellationToken)> = Vec::new();
+            // Set when the view waits for every dataset: `Some(table)` names the
+            // first table it reads that is not loading at startup.
+            let mut unknown: Option<Option<TableReference>> = None;
+            match reads.get(&resolved) {
+                Some(Some(tables)) => {
+                    for (table, written) in
+                        tables.iter().sorted_by_key(|(table, _)| table.to_string())
+                    {
+                        let view_token = view_done
+                            .get(table)
+                            .filter(|_| wait_on_views && table != &resolved);
+                        match view_token.or_else(|| dataset_done.get(table)) {
+                            Some(token) => waits.push((written.to_string(), token.clone())),
+                            None => {
+                                unknown.get_or_insert_with(|| Some(written.clone()));
+                            }
+                        }
+                    }
+                }
+                _ => unknown = Some(None),
+            }
+            if unknown.is_some() {
+                waits.extend(dataset_done.iter().map(|(name, token)| {
+                    let name = dataset_names
+                        .get(name)
+                        .map_or_else(|| name.to_string(), ToString::to_string);
+                    (name, token.clone())
+                }));
+            }
 
             let runtime = Arc::clone(&self);
-            let view_load = self.view_loads.begin(&view.name);
             tasks.push(tokio::spawn(async move {
                 let done = done.drop_guard();
                 let superseded = view_load.token();
-                let pending: Vec<String> = waits
-                    .iter()
-                    .filter(|(_, token)| !token.is_cancelled())
-                    .map(|(name, _)| name.clone())
-                    .sorted()
-                    .dedup()
-                    .collect();
-                if !pending.is_empty() {
-                    let view_name = &view.name;
-                    tracing::info!(
-                        "View {view_name} is waiting for its dependencies to load: {}",
-                        pending.join(", ")
-                    );
+                let pending = || -> Vec<String> {
+                    waits
+                        .iter()
+                        .filter(|(_, token)| !token.is_cancelled())
+                        .map(|(name, _)| name.clone())
+                        .sorted()
+                        .dedup()
+                        .collect()
+                };
+                if !pending().is_empty() {
                     runtime
                         .status
                         .update_view(&view.name, status::ComponentStatus::Initializing);
                     let shutdown = runtime.status.shutdown_token();
-                    tokio::select! {
-                        _ = futures::future::join_all(
-                            waits.iter().map(|(_, token)| token.cancelled()),
-                        ) => {}
-                        () = shutdown.cancelled() => return,
-                        () = superseded.cancelled() => return,
+                    let loaded =
+                        futures::future::join_all(waits.iter().map(|(_, token)| token.cancelled()));
+                    tokio::pin!(loaded);
+                    // At a healthy startup every view waits briefly, so only a view
+                    // still waiting after `VIEW_WAIT_REPORT_AFTER` logs what holds it.
+                    let report = tokio::time::sleep(VIEW_WAIT_REPORT_AFTER);
+                    tokio::pin!(report);
+                    let mut reported = false;
+                    loop {
+                        tokio::select! {
+                            _ = &mut loaded => break,
+                            () = shutdown.cancelled() => return,
+                            () = superseded.cancelled() => return,
+                            () = &mut report, if !reported => {
+                                reported = true;
+                                tracing::info!(
+                                    "{}",
+                                    view_waiting_message(
+                                        &view.name,
+                                        &pending(),
+                                        unknown.as_ref().map(Option::as_ref)
+                                    )
+                                );
+                            }
+                        }
                     }
                 }
                 if superseded.is_cancelled() {
@@ -768,29 +850,98 @@ impl Runtime {
 }
 
 #[cfg(test)]
-mod view_cycle_tests {
+mod startup_view_wait_tests {
     use super::*;
 
     fn r(name: &str) -> ResolvedTableReference {
         resolve_table_reference(TableReference::parse_str(name))
     }
 
+    fn reads(views: &[(&str, &[&str])]) -> HashMap<ResolvedTableReference, Option<TablesRead>> {
+        views
+            .iter()
+            .map(|(view, tables)| {
+                (
+                    r(view),
+                    Some(
+                        tables
+                            .iter()
+                            .map(|table| (r(table), TableReference::parse_str(table)))
+                            .collect(),
+                    ),
+                )
+            })
+            .collect()
+    }
+
     #[test]
     fn detects_cycle_through_qualified_names() {
-        let deps = HashMap::from([
-            (r("a"), vec![r("public.b")]),
-            (r("b"), vec![r("spice.public.a")]),
-        ]);
-        assert!(has_view_cycle(&deps));
+        assert!(has_view_cycle(&reads(&[
+            ("a", &["public.b"]),
+            ("b", &["spice.public.a"]),
+        ])));
     }
 
     #[test]
     fn chain_and_self_reference_are_not_cycles() {
-        let deps = HashMap::from([
-            (r("a"), vec![r("orders"), r("a")]),
-            (r("b"), vec![r("public.a"), r("a")]),
-            (r("c"), vec![r("b")]),
-        ]);
-        assert!(!has_view_cycle(&deps));
+        assert!(!has_view_cycle(&reads(&[
+            ("a", &["orders", "a"]),
+            ("b", &["public.a", "a"]),
+            ("c", &["b"]),
+        ])));
+    }
+
+    #[test]
+    fn a_view_whose_sql_did_not_resolve_links_nothing() {
+        let mut views = reads(&[("a", &["b"])]);
+        views.insert(r("b"), None);
+        assert!(!has_view_cycle(&views));
+    }
+
+    /// A view waits on exactly what planning it looks up, so a table read only
+    /// by a subquery is waited for too, and a CTE is not mistaken for a table.
+    #[test]
+    fn view_reads_include_subquery_tables_and_exclude_ctes() {
+        let state = datafusion::prelude::SessionContext::new().state();
+        let tables = view_reads(
+            &state,
+            "WITH recent AS (SELECT * FROM orders) \
+             SELECT * FROM recent WHERE customer_id IN (SELECT id FROM public.customers) \
+             AND EXISTS (SELECT 1 FROM spice.public.flags)",
+        )
+        .expect("the SQL resolves");
+        let mut resolved: Vec<String> = tables.keys().map(ToString::to_string).collect();
+        resolved.sort();
+        assert_eq!(
+            resolved,
+            [
+                "spice.public.customers",
+                "spice.public.flags",
+                "spice.public.orders"
+            ]
+        );
+        assert_eq!(view_reads(&state, "SELECT 1; SELECT 2"), None);
+    }
+
+    #[test]
+    fn waiting_message_names_the_view_and_what_it_waits_for() {
+        let view = TableReference::bare("v_bad");
+        assert_eq!(
+            view_waiting_message(&view, &["bad".to_string()], None),
+            "View 'v_bad' is still waiting for 'bad' to load before it registers."
+        );
+        let pending: Vec<String> = (0..12).map(|i| format!("ds{i:02}")).collect();
+        assert_eq!(
+            view_waiting_message(
+                &view,
+                &pending,
+                Some(Some(&TableReference::parse_str("pg.public.events")))
+            ),
+            "View 'v_bad' is still waiting for every dataset to load before it registers, because it reads 'pg.public.events', which is not a dataset or view loading at startup. Still loading: 'ds00', 'ds01', 'ds02', 'ds03', 'ds04', 'ds05', 'ds06', 'ds07', 'ds08', 'ds09' and 2 more."
+        );
+        assert_eq!(
+            view_waiting_message(&view, &["bad".to_string()], Some(None)),
+            "View 'v_bad' is still waiting for every dataset to load before it registers. Still loading: 'bad'."
+        );
     }
 }

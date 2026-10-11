@@ -894,21 +894,35 @@ async fn test_failing_dataset_only_blocks_dependent_views() -> Result<(), anyhow
             std::fs::write("./test_view_failing_dep_bad.csv", "id\n1\n2\n3").expect("write file");
 
             let orders = Dataset::new("file:./test_view_failing_dep_orders.csv", "orders");
-            // The file connector is read-only, so a `read_write` dataset fails setup
-            // and keeps retrying.
-            let mut bad = Dataset::new("file:./test_view_failing_dep_bad.csv", "bad");
-            bad.access = spicepod::component::access::AccessMode::ReadWrite;
+            // A file that does not exist fails the load with a retriable error, so
+            // the load keeps retrying (a configuration error would fail it once,
+            // and the startup load would end).
+            let bad = Dataset::new("file:./test_view_failing_dep_missing.csv", "bad");
 
             let mut v_open = View::new("v_open".to_string());
             v_open.sql = Some("SELECT * FROM orders WHERE status = 'open'".to_string());
             let mut v_bad = View::new("v_bad".to_string());
             v_bad.sql = Some("SELECT COUNT(*) AS n FROM bad".to_string());
+            // Reads `bad` only through a subquery, which its waits must still cover.
+            let mut v_sub = View::new("v_sub".to_string());
+            v_sub.sql =
+                Some("SELECT id FROM orders WHERE id IN (SELECT id FROM bad)".to_string());
+            // A view over a view over a healthy dataset.
+            let mut v_chain = View::new("v_chain".to_string());
+            v_chain.sql = Some("SELECT COUNT(*) AS n FROM public.v_open".to_string());
+            // Redefined by the Spicepod change that fixes `bad`, while its startup
+            // registration is still waiting: only the new definition may register.
+            let mut v_redefined = View::new("v_redefined".to_string());
+            v_redefined.sql = Some("SELECT COUNT(*) AS n FROM bad".to_string());
 
             let app = app::AppBuilder::new("test_failing_dataset_only_blocks_dependent_views")
                 .with_dataset(orders.clone())
                 .with_dataset(bad)
                 .with_view(v_open.clone())
                 .with_view(v_bad.clone())
+                .with_view(v_sub.clone())
+                .with_view(v_chain.clone())
+                .with_view(v_redefined.clone())
                 .build();
 
             configure_test_datafusion();
@@ -940,19 +954,44 @@ async fn test_failing_dataset_only_blocks_dependent_views() -> Result<(), anyhow
                 .try_collect::<Vec<RecordBatch>>()
                 .await?;
             assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 1);
-
-            assert_ne!(
-                rt.status().get_view_statuses().get(&TableReference::bare("v_bad")),
-                Some(&runtime::status::ComponentStatus::Ready),
-                "v_bad depends on the failing dataset and must not be ready yet"
+            assert!(
+                wait_for_view_status(
+                    &rt,
+                    "v_chain",
+                    &runtime::status::ComponentStatus::Ready,
+                    std::time::Duration::from_mins(1),
+                )
+                .await,
+                "v_chain reads only v_open and must register while `bad` is failing, got {:?}",
+                rt.status().get_view_statuses().get(&TableReference::bare("v_chain"))
             );
 
-            // Fix `bad` the way a hot reload would: drop `access: read_write`.
+            for view in ["v_bad", "v_sub", "v_redefined"] {
+                assert!(
+                    wait_for_view_status(
+                        &rt,
+                        view,
+                        &runtime::status::ComponentStatus::Initializing,
+                        std::time::Duration::from_secs(30),
+                    )
+                    .await,
+                    "{view} reads the failing dataset, so it must be waiting to register, got {:?}",
+                    rt.status().get_view_statuses().get(&TableReference::bare(view))
+                );
+            }
+
+            // Fix `bad` the way a hot reload would: point it at a file that exists.
             let fixed = app::AppBuilder::new("test_failing_dataset_only_blocks_dependent_views")
                 .with_dataset(orders)
                 .with_dataset(Dataset::new("file:./test_view_failing_dep_bad.csv", "bad"))
                 .with_view(v_open)
                 .with_view(v_bad)
+                .with_view(v_sub)
+                .with_view(v_chain)
+                .with_view({
+                    v_redefined.sql = Some("SELECT COUNT(*) * 10 AS n FROM bad".to_string());
+                    v_redefined
+                })
                 .build();
             assert!(Arc::clone(&rt).apply_app(Arc::new(fixed)).await);
 
@@ -962,16 +1001,47 @@ async fn test_failing_dataset_only_blocks_dependent_views() -> Result<(), anyhow
                 .expect("the startup load must end once the failing dataset is replaced")
                 .expect("load task");
 
-            assert!(
-                wait_for_view_status(
-                    &rt,
-                    "v_bad",
-                    &runtime::status::ComponentStatus::Ready,
-                    std::time::Duration::from_mins(1),
-                )
-                .await,
-                "v_bad must register once `bad` loads, got {:?}",
-                rt.status().get_view_statuses().get(&TableReference::bare("v_bad"))
+            for view in ["v_bad", "v_sub", "v_redefined"] {
+                assert!(
+                    wait_for_view_status(
+                        &rt,
+                        view,
+                        &runtime::status::ComponentStatus::Ready,
+                        std::time::Duration::from_mins(1),
+                    )
+                    .await,
+                    "{view} must register once `bad` loads, got {:?}",
+                    rt.status().get_view_statuses().get(&TableReference::bare(view))
+                );
+            }
+            let rows = rt
+                .datafusion()
+                .query_builder("SELECT n FROM v_bad")
+                .build()
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?
+                .data
+                .try_collect::<Vec<RecordBatch>>()
+                .await?;
+            assert_eq!(
+                arrow::util::pretty::pretty_format_batches(&rows)?.to_string(),
+                "+---+\n| n |\n+---+\n| 3 |\n+---+"
+            );
+            let rows = rt
+                .datafusion()
+                .query_builder("SELECT n FROM v_redefined")
+                .build()
+                .run()
+                .await
+                .map_err(|e| anyhow::anyhow!(e))?
+                .data
+                .try_collect::<Vec<RecordBatch>>()
+                .await?;
+            assert_eq!(
+                arrow::util::pretty::pretty_format_batches(&rows)?.to_string(),
+                "+----+\n| n  |\n+----+\n| 30 |\n+----+",
+                "the Spicepod change redefined v_redefined, so its startup registration must not register the old definition"
             );
 
             // The superseded retry must not come back and flip `bad` to an error.
