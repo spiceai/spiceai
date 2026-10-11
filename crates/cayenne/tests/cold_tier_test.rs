@@ -20,7 +20,7 @@ limitations under the License.
 //! tier): whole-table promotion to a (local `file://`) cold store, cross-tier
 //! scan correctness, and the key-delete-after-promotion invariant.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
