@@ -213,8 +213,9 @@ docker stop spice-wal-rustfs
 Nothing collects a finished run's objects, so `wal_test_driver --purge` deletes
 every object under an `s3://` prefix; it refuses a bare bucket.
 
-`.github/workflows/object_store_wal.yml` runs on the self-hosted pools,
-`spiceai-dev-runners` for Linux and `spiceai-macos` for macOS. It runs for
+`.github/workflows/object_store_wal.yml` runs on the self-hosted pools:
+`spiceai-dev-runners` for Linux, and for macOS whichever Mac is free first in
+`spiceai-macos` or `spiceai-macos-large`. It runs for
 changes to this crate, its harness, the workflow, the workspace manifest and
 lockfile, or the toolchain, in pull requests and in the merge queue. Every leg
 runs in parallel, each with the mandatory SlateDB oracle:
