@@ -248,7 +248,19 @@ class ResolveTest(unittest.TestCase):
             }
         }
         self.assertEqual(check_nextest_config.resolve(config, module, "retries"), 5)
-        self.assertTrue(check_nextest_config.has_override_setting(config, module, "retries"))
+        # With only the whole-binary override left, it alone has to count as an
+        # override that supplies the setting.
+        whole_binary_only = {
+            "profile": {
+                "default": {
+                    "retries": 3,
+                    "overrides": [{"filter": "binary(=integration)", "retries": 5}],
+                }
+            }
+        }
+        self.assertTrue(
+            check_nextest_config.has_override_setting(whole_binary_only, module, "retries")
+        )
         # A whole-binary filter for a different binary does not match.
         config["profile"]["default"]["overrides"][0]["filter"] = "binary(=retention_oom)"
         self.assertEqual(check_nextest_config.resolve(config, module, "retries"), 0)
