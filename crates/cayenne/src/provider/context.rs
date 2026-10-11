@@ -586,10 +586,10 @@ impl CayenneContext {
         self.config.pk_conflict_detection
     }
 
-    /// How primary-key deletions are recorded and applied for PK tables.
-    /// The default `auto` resolves to `key` for PK tables (key-based tombstones
-    /// pruned by seq-prefix bake) and to `position` for PK-less tables; `key`
-    /// or `position` can be pinned explicitly.
+    /// How primary-key deletions are recorded and applied for PK tables, as
+    /// configured. The default `auto` lets each PK table choose as it grows (see
+    /// `PkDeletionMode`); a PK-less table always uses position deletes; `key` or
+    /// `position` can be pinned explicitly.
     #[must_use]
     pub(crate) fn deletion_mode(&self) -> DeletionMode {
         self.config.deletion_mode

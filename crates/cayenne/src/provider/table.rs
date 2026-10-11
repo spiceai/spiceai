@@ -62,6 +62,7 @@ use super::on_conflict::{
     RowCountExactnessTaintingDeletionSink, RowKeyDeletionDelta, ShardedApplyBatches,
     ShardedApplyResult, pk_deletion_snapshot_for_strategy,
 };
+use super::pk_deletion_mode::PkDeletionMode;
 use super::pk_index::{
     BoundedShardedPkIndexBuilder, COLD_PK_BLOOM_PER_FILE_MAX_BYTES, CachedPkIndex, CachedPkKeyset,
     CheckedOutShardedPkIndex, ColdPkExistence, PK_INDEX_PERSIST_MAX_BYTES, PendingPkExistence,
@@ -1913,6 +1914,10 @@ pub struct CayenneTableProvider {
     /// Strategy for primary key-based deletion filtering.
     /// Contains the deletion caches specific to each strategy variant.
     pub(crate) pk_deletion_strategy: PkDeletionStrategyWithCache,
+    /// Whether a primary-key table records position deletes or key deletes, as
+    /// configured or as `deletion_mode: auto` chooses it. Shared by every
+    /// `clone_for_write` copy, so a switch `auto` makes is seen by all of them.
+    pub(crate) pk_deletion_mode: PkDeletionMode,
     /// `RowConverter` for converting primary key columns to byte representation.
     ///
     /// `None` is load-bearing for the single-`Int64` strategy: deletion-vector
@@ -9426,6 +9431,8 @@ impl CayenneTableProvider {
             table_metadata.vortex_config.cold_tier_enabled(),
         )
         .await?;
+        let pk_deletion_mode =
+            Self::resolve_pk_deletion_mode(&catalog, &table_metadata, &context).await;
 
         let listing_table = Self::create_listing_table(
             &snapshot_dir_url,
@@ -9646,6 +9653,7 @@ impl CayenneTableProvider {
             time_retention_filter_builder,
             context,
             pk_deletion_strategy,
+            pk_deletion_mode,
             pk_row_converter,
             pk_column_indices,
             durable_write_back,
@@ -11352,6 +11360,18 @@ impl CayenneTableProvider {
             }
         };
 
+        // The same figures size an `auto` table against its position-delete
+        // bound, so a table that grew past it moves to key deletes even when no
+        // reclaim is due yet.
+        if let Some(auto) = self.pk_deletion_mode.auto()
+            && auto.uses_positions()
+        {
+            let table_bytes = Self::warm_table_bytes(&stats);
+            if !auto.fits(table_bytes) {
+                self.request_auto_switch_to_key(table_bytes);
+            }
+        }
+
         let to_gauge = |value: i64| u64::try_from(value).unwrap_or(0);
         telemetry::cayenne::track_table_storage(
             &telemetry::cayenne::CayenneTableStorage {
@@ -11871,6 +11891,7 @@ impl CayenneTableProvider {
             retention_filters: self.retention_filters.clone(),
             time_retention_filter_builder: self.time_retention_filter_builder.clone(),
             pk_deletion_strategy: self.pk_deletion_strategy.clone(),
+            pk_deletion_mode: self.pk_deletion_mode.clone(),
             pk_row_converter: self.pk_row_converter.as_ref().map(Arc::clone),
             pk_column_indices: self.pk_column_indices.clone(),
             durable_write_back: self.durable_write_back,
@@ -13399,12 +13420,157 @@ impl CayenneTableProvider {
     }
 
     /// Whether this table should capture file-local row positions for upsert
-    /// deletes: a PK table (`Int64Pk`/`RowConverterBased`) whose resolved
-    /// [`DeletionMode`] is `Position`. PK-less tables use the `PositionBased`
-    /// strategy directly and never reach this read-back.
+    /// deletes: a PK table (`Int64Pk`/`RowConverterBased`) whose deletion mode
+    /// — configured, or chosen by `auto` — is position. PK-less tables use the
+    /// `PositionBased` strategy directly and never reach this read-back.
     pub(crate) fn should_capture_positions(&self) -> bool {
+        !self.pk_deletion_strategy.is_position_based() && self.pk_deletion_mode.uses_positions()
+    }
+
+    /// Whether this table's position-delete rewrites hold writers off for their
+    /// whole duration: a PK table configured with `deletion_mode: position`.
+    ///
+    /// Such a table can carry position deletes with nothing else hiding their row
+    /// — a key repeated within one write is hidden by a position delete alone —
+    /// so a rewrite that let a writer in could drop one with the file it targets.
+    /// A table `auto` put on position deletes records none of those: it folds a
+    /// repeated key out of the files as key mode does, and every position delete
+    /// it records for an upsert carries a key tombstone for the same row (see
+    /// `apply_on_conflict_to_batch`). That twin is sequence-tagged, so the
+    /// writer-concurrent rewrite keeps it whenever it lands after the rewrite's
+    /// cutoff and it goes on hiding the row in the rewritten file, exactly as on a
+    /// key-mode table. PK-less tables answer `false` here and take their own
+    /// writer-exclusive path in the rewrite.
+    pub(crate) fn position_rewrites_exclude_writers(&self) -> bool {
+        self.hides_repeated_keys_with_position_deletes()
+    }
+
+    /// Whether a key repeated within one write is hidden by a position delete on
+    /// the superseded copy rather than folded out of the files: a PK table
+    /// configured with `deletion_mode: position`.
+    ///
+    /// Folding rewrites only the files of the write that holds the copies and
+    /// keeps per-file statistics exact, so a statistics-answered aggregate stays
+    /// one; a position delete is cheaper to write but leaves the statistics
+    /// counting the hidden copy. `auto` folds, as key mode does.
+    pub(crate) fn hides_repeated_keys_with_position_deletes(&self) -> bool {
         !self.pk_deletion_strategy.is_position_based()
-            && self.context.deletion_mode().resolved(true).is_position()
+            && matches!(self.pk_deletion_mode, PkDeletionMode::Position)
+    }
+
+    /// Resolve how this table records primary-key deletes when it opens.
+    ///
+    /// `auto` sizes the table from the manifest (the current and protected
+    /// snapshots' data files) to decide whether it starts on position deletes.
+    /// It does not adapt a table whose rows live in RAM, a partitioned table, or a
+    /// table with a datalake tier: those keep key deletes, as before.
+    async fn resolve_pk_deletion_mode(
+        catalog: &Arc<dyn MetadataCatalog>,
+        table_metadata: &TableMetadata,
+        context: &CayenneContext,
+    ) -> PkDeletionMode {
+        let has_primary_key = !table_metadata.primary_key.is_empty();
+        let mode = context.deletion_mode();
+        let adapts = !table_metadata.vortex_config.memory_mode
+            && table_metadata.partition_column.is_none()
+            && !context.is_coupled_writer()
+            && !table_metadata.vortex_config.cold_tier_enabled();
+        let table_bytes = if adapts
+            && matches!(
+                mode.resolved(has_primary_key),
+                crate::metadata::ResolvedDeletionMode::Adaptive
+            ) {
+            match catalog
+                .table_storage_stats(&table_metadata.table_id)
+                .await
+            {
+                Ok(stats) => Some(Self::warm_table_bytes(&stats)),
+                Err(error) => {
+                    tracing::debug!(
+                        target: "cayenne::compaction",
+                        table = table_metadata.table_name.as_str(),
+                        %error,
+                        "Could not size the table for `deletion_mode: auto`; starting it on key deletes"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        PkDeletionMode::for_table(
+            mode,
+            has_primary_key,
+            adapts,
+            table_bytes,
+            context.target_file_size_bytes(),
+        )
+    }
+
+    /// The on-disk bytes `auto` sizes a table by: the data files of its current
+    /// and protected snapshots, which is what a whole-table rewrite reads.
+    fn warm_table_bytes(stats: &crate::metadata::TableStorageStats) -> u64 {
+        u64::try_from(stats.current_bytes.saturating_add(stats.protected_bytes)).unwrap_or(0)
+    }
+
+    /// Ask the next compaction trigger to move an `auto` table that outgrew its
+    /// position-delete bound to key deletes, and schedule one. A no-op for a table
+    /// that is not `auto`, or already moved.
+    fn request_auto_switch_to_key(&self, table_bytes: u64) {
+        let Some(auto) = self.pk_deletion_mode.auto() else {
+            return;
+        };
+        if auto.request_switch_to_key() {
+            tracing::debug!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                table_bytes,
+                max_position_bytes = auto.max_position_bytes(),
+                "deletion_mode auto: table outgrew position deletes; switching to key deletes on the next compaction trigger"
+            );
+            self.schedule_post_write_compaction();
+        }
+    }
+
+    /// Move an `auto` table to key deletes now. The caller holds
+    /// `compaction_lock` exclusively, so no compaction pass is running under the
+    /// position-mode rules while the table changes mode; the passes that follow
+    /// read the new mode. Returns `true` when the table switched.
+    ///
+    /// A writer that read a row's position before the switch may still record a
+    /// position delete after it. That is safe for the reason
+    /// [`Self::position_rewrites_exclude_writers`] gives: the delete carries a key
+    /// tombstone that the key-mode passes now running keep until a rewrite
+    /// applies it.
+    fn switch_auto_to_key_deletes(&self, reason: &'static str) -> bool {
+        let Some(auto) = self.pk_deletion_mode.auto() else {
+            return false;
+        };
+        if !auto.switch_to_key() {
+            return false;
+        }
+        // Forget the positions the read-back captured, so no later upsert records
+        // a position delete: from here on every delete is a key delete.
+        let keyset_bytes = {
+            let mut guard = self.pk_keyset_cache.lock();
+            match guard.as_mut() {
+                Some(CachedPkIndex::Exact(keyset)) => {
+                    keyset.forget_positions();
+                    keyset.approx_bytes
+                }
+                Some(other) => other.approx_bytes(),
+                None => 0,
+            }
+        };
+        self.publish_single_keyset_bytes(keyset_bytes);
+        tracing::debug!(
+            target: "cayenne::compaction",
+            table = self.table_metadata.table_name.as_str(),
+            reason,
+            max_position_bytes = auto.max_position_bytes(),
+            "deletion_mode auto: switched the table to key deletes"
+        );
+        true
     }
 
     /// Force a synchronous position-capture pass now, if this table is in
@@ -13580,6 +13746,21 @@ impl CayenneTableProvider {
             .map_err(|err| CatalogError::InvalidOperationNoSource {
                 message: format!("Position capture: failed to list snapshot files: {err}"),
             })?;
+        // An `auto` table reads its rows back only while it is within its
+        // position-delete bound: past it, the read-back would scan a table that is
+        // about to move to key deletes, which never use a captured position.
+        if let Some(auto) = self.pk_deletion_mode.auto() {
+            let listed_bytes: u64 = listed
+                .file_groups
+                .iter()
+                .flat_map(|group| group.iter())
+                .map(|file| file.object_meta.size)
+                .sum();
+            if !auto.fits(listed_bytes) {
+                self.request_auto_switch_to_key(listed_bytes);
+                return Ok(());
+            }
+        }
         let object_store = state
             .runtime_env()
             .object_store(&table_url)
@@ -19946,6 +20127,37 @@ impl CayenneTableProvider {
             return Ok(false);
         }
 
+        // An `auto` table rewrites itself whole — the only rewrite this pass runs on
+        // a position-delete table, whichever trigger fired — only while it is within
+        // its position-delete bound. Past it, this pass moves the table to key
+        // deletes instead, and the seq-prefix bake reclaims the index from the next
+        // trigger on. The size is read here, under `compaction_lock`, because this
+        // pass is the one about to pay for the rewrite.
+        if let Some(auto) = self.pk_deletion_mode.auto()
+            && auto.uses_positions()
+        {
+            let over_bound = auto.switch_requested()
+                || match self
+                    .catalog
+                    .table_storage_stats(&self.table_metadata.table_id)
+                    .await
+                {
+                    Ok(stats) => !auto.fits(Self::warm_table_bytes(&stats)),
+                    // Unsized, the rewrite is not known to be cheap: take the bake.
+                    Err(_) => true,
+                };
+            if over_bound && self.switch_auto_to_key_deletes("table outgrew position deletes") {
+                // The whole-table rewrite this pass would have run is over the
+                // budget `auto` gives a position-delete reclaim.
+                maintenance_metrics::track_compaction(
+                    table_name,
+                    CompactionKind::SubsetCurrent,
+                    CompactionOutcome::DeclinedOverPassBudget,
+                );
+                return Ok(false);
+            }
+        }
+
         // Position-delete-mode tables: serialize against writers + visibility
         // flips for the whole pass, identical to the protected-snapshot subset
         // path. Their position tombstones are file-path scoped and the
@@ -19961,7 +20173,10 @@ impl CayenneTableProvider {
         // deletion index only this pass can clear. Taken AFTER `compaction_lock`,
         // the documented order (cold promotion takes the two the same way), so a
         // pass that loses the compaction lock never stalls a writer.
-        let position_guards = if self.should_capture_positions() {
+        //
+        // A table `auto` put on position deletes takes no guards: its rewrite runs
+        // alongside writers (see `position_rewrites_exclude_writers`).
+        let position_guards = if self.position_rewrites_exclude_writers() {
             Some(PositionRewriteGuards {
                 _write: self.write_lock_arc().lock_owned().await,
                 _visibility: self.visibility_lock_arc().lock_owned().await,
@@ -20579,6 +20794,11 @@ impl CayenneTableProvider {
         let cfg = self.context.compaction_picker_config();
         self.new_files_since_last_compaction.load(Ordering::Relaxed) >= cfg.trigger_files
             || self.protected_snapshot_maintenance_trigger().is_some()
+            // A pending `auto` switch to key deletes is performed by the trigger.
+            || self
+                .pk_deletion_mode
+                .auto()
+                .is_some_and(|auto| auto.switch_requested())
     }
 
     pub(crate) fn schedule_post_write_compaction(&self) {
@@ -22263,6 +22483,20 @@ impl CayenneTableProvider {
             // so an index this large is a `runtime.query.memory_limit` violation in
             // progress. Say so, and name the mode that would let the cheaper
             // seq-prefix bake keep the index small instead of an O(table) rewrite.
+            // `auto` reached here on position deletes only while it is within its
+            // bound, so the rewrite is small and runs alongside writers; the
+            // remedy the warning below names does not apply to it.
+            SnapshotMaintenanceTrigger::DeletionIndexSize {
+                deletion_index_len,
+                trigger_len,
+                over_memory_ceiling: true,
+            } if self.pk_deletion_mode.auto().is_some() => tracing::debug!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                deletion_index_len,
+                trigger_len,
+                "Running current-snapshot compaction because the deletion index is over its memory ceiling"
+            ),
             SnapshotMaintenanceTrigger::DeletionIndexSize {
                 deletion_index_len,
                 trigger_len,
@@ -23264,7 +23498,7 @@ impl CayenneTableProvider {
         // the new file — resurrecting it. `compaction_lock` (held here) and
         // `write_lock` (held by writers) are distinct, so writes DO interleave.
         let uses_position_deletes =
-            self.should_capture_positions() || self.pk_deletion_strategy.is_position_based();
+            self.position_rewrites_exclude_writers() || self.pk_deletion_strategy.is_position_based();
 
         // Position-delete tables: tombstones are file-scoped (a row position in a
         // named data file), not sequence-tagged, so they cannot be carried
@@ -23272,6 +23506,9 @@ impl CayenneTableProvider {
         // safe option is to exclude writers for the whole rewrite (mirrors
         // `compact_protected_snapshots_subset`), via a BLOCKING `write_lock`
         // acquire so the full-snapshot rewrite always makes progress (see below).
+        // A table `deletion_mode: auto` put on position deletes is the exception
+        // and takes the fenced scope below: each of its position deletes carries a
+        // sequence-tagged key tombstone (`position_rewrites_exclude_writers`).
         let _position_guards = match held_position_guards {
             Some(held) => Some(held),
             // Blocking acquire (not try_lock): the full-snapshot rewrite must
@@ -25355,9 +25592,24 @@ impl CayenneTableProvider {
                     CompactionKind::ProtectedSubset,
                     CompactionOutcome::DeclinedWriterActive,
                 );
-                if let Some(consecutive_skips) =
-                    self.position_compaction_skip_streak.lock().record_denial()
+                let starved = self.position_compaction_skip_streak.lock().record_denial();
+                if let Some(consecutive_skips) = starved
+                    && let Some(auto) = self.pk_deletion_mode.auto()
                 {
+                    // A table `auto` put on position deletes whose writers never
+                    // leave room for its compaction has outgrown position deletes:
+                    // move it to key deletes, whose merges run alongside writers.
+                    if auto.request_switch_to_key() {
+                        tracing::debug!(
+                            target: "cayenne::compaction",
+                            table = self.table_metadata.table_name.as_str(),
+                            consecutive_skips,
+                            starved_for_secs = POSITION_COMPACTION_SKIP_WARN_AFTER.as_secs(),
+                            "deletion_mode auto: protected-snapshot compaction starved by writers; switching to key deletes on the next compaction trigger"
+                        );
+                        self.schedule_post_write_compaction();
+                    }
+                } else if let Some(consecutive_skips) = starved {
                     tracing::warn!(
                         target: "cayenne::compaction",
                         table = self.table_metadata.table_name.as_str(),
@@ -25367,8 +25619,7 @@ impl CayenneTableProvider {
                          write lock across every recent attempt on this position-delete table. \
                          File count will grow unboundedly until writes pause; consider \
                          `cayenne_deletion_mode: key` for delete-heavy tables (key-delete \
-                         compaction runs concurrently with writers; `auto` already resolves \
-                         to key for tables with a primary key).",
+                         compaction runs concurrently with writers).",
                     );
                 } else {
                     tracing::trace!(
@@ -40122,6 +40373,16 @@ impl super::compaction::CompactionRunner for CayenneTableProvider {
         let Some(_pass) = super::compaction::try_track_compaction_pass() else {
             return Ok(false);
         };
+        // A switch to key deletes that an `auto` table requested where it could not
+        // take `compaction_lock` happens here, before any pass below reads the
+        // mode. A busy lock leaves the request pending for the next trigger.
+        if let Some(auto) = self.pk_deletion_mode.auto()
+            && auto.switch_requested()
+            && let Ok(_guard) = self.compaction_lock.try_write()
+            && self.maintenance_still_admitted()
+        {
+            self.switch_auto_to_key_deletes("table outgrew position deletes");
+        }
         // One trigger runs up to three passes, in this order:
         //
         // 1. Seq-prefix bake — shrinks the merge-on-read deletion index by
@@ -57719,10 +57980,11 @@ mod tests {
         );
     }
 
-    /// Primary-key tables with default `deletion_mode: Auto` resolve to `Key` mode,
-    /// so the seq-prefix bake pass executes and folds older protected snapshots.
+    /// A primary-key table on the default `deletion_mode: Auto` declines the
+    /// seq-prefix bake while it is on position deletes (a small table reclaims by
+    /// rewriting itself whole), and bakes once `auto` has moved it to key deletes.
     #[tokio::test]
-    async fn seq_prefix_bake_runs_on_auto_mode_pk_table() {
+    async fn seq_prefix_bake_runs_on_auto_mode_pk_table_once_on_key_deletes() {
         use arrow::datatypes::{DataType, Field, Schema};
         let ctx = SessionContext::new();
         let temp_dir = tempfile::tempdir().expect("temp dir");
@@ -57752,7 +58014,6 @@ mod tests {
             partition_column: None,
             vortex_config: VortexConfig {
                 inline_max_rows: 0,
-                // Default deletion_mode is Auto -> resolves to Key for PK tables.
                 deletion_mode: crate::metadata::DeletionMode::Auto,
                 compaction_background_interval_ms: 3_600_000,
                 ..VortexConfig::default()
@@ -57763,8 +58024,8 @@ mod tests {
             .await
             .expect("table created");
         assert!(
-            !provider.should_capture_positions(),
-            "auto mode on a PK table must resolve to key mode"
+            provider.should_capture_positions(),
+            "a small auto-mode PK table starts on position deletes"
         );
 
         for id in 0..6_i64 {
@@ -57780,13 +58041,28 @@ mod tests {
         }
         let before = provider.protected_snapshots.load_full().len();
 
+        assert!(
+            !provider
+                .bake_seq_prefix_protected_snapshots()
+                .await
+                .expect("a declined bake is a no-op"),
+            "the bake declines a table on position deletes"
+        );
+        assert_eq!(provider.protected_snapshots.load_full().len(), before);
+
+        {
+            let _guard = provider.compaction_lock.write().await;
+            assert!(provider.switch_auto_to_key_deletes("test"));
+        }
+        assert!(!provider.should_capture_positions());
+
         let baked = provider
             .bake_seq_prefix_protected_snapshots()
             .await
             .expect("bake should not error");
         assert!(
             baked,
-            "the seq-prefix bake must succeed on an auto-mode PK table"
+            "the seq-prefix bake must succeed on an auto-mode PK table on key deletes"
         );
         assert!(
             provider.protected_snapshots.load_full().len() < before,
@@ -57918,17 +58194,18 @@ mod tests {
         }
     }
 
-    /// Reopen a seeded table with `deletion_mode: Auto`, which resolves to KEY
-    /// mode for a primary-key table. The context carries the config in production
-    /// (the accelerator builds one from the spicepod params), so build it the same
-    /// way here — the stored `vortex_config_json` still says `position`.
+    /// Reopen a seeded table in KEY mode — `deletion_mode: key`, the mode `auto`
+    /// also moves a table to once it outgrows position deletes. The context
+    /// carries the config in production (the accelerator builds one from the
+    /// spicepod params), so build it the same way here — the stored
+    /// `vortex_config_json` still says `position`.
     async fn reopen_in_key_mode(
         seeded: &PositionedUpsertTable,
         table_name: &str,
         runtime_env: Arc<RuntimeEnv>,
     ) -> CayenneTableProvider {
         let key_config = VortexConfig {
-            deletion_mode: crate::metadata::DeletionMode::Auto,
+            deletion_mode: crate::metadata::DeletionMode::Key,
             inline_max_rows: 0,
             inline_max_bytes: 0,
             inline_max_buffer_bytes: 0,
@@ -57959,15 +58236,15 @@ mod tests {
                 .expect("reopen the table in key mode");
         assert!(
             !reopened.should_capture_positions(),
-            "premise: `auto` on a PK table must resolve to key mode after reopen"
+            "premise: the table must reopen in key mode"
         );
         reopened
     }
 
-    /// MIGRATION SAFETY for resolving `auto` to `key` on primary-key tables: a
-    /// table that recorded per-file POSITION deletion vectors while configured
-    /// `deletion_mode: position` is reopened in key mode (what `auto` now
-    /// resolves to) and must still apply them. If the reopen dropped them, every
+    /// MIGRATION SAFETY for a primary-key table moving from position to key
+    /// deletes: a table that recorded per-file POSITION deletion vectors while on
+    /// position deletes is reopened in key mode (an explicit `key`, or `auto` once
+    /// the table outgrows position deletes) and must still apply them. If the reopen dropped them, every
     /// row those vectors mask would come back — a silent resurrection on upgrade
     /// for any table that had run under position mode.
     ///
@@ -74588,6 +74865,7 @@ mod tests {
         );
     }
 
+    mod auto_deletion_mode;
     mod layered_upsert_state;
     mod repeated_keys;
 }

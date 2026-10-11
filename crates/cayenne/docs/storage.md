@@ -284,10 +284,10 @@ The same primitives produce visibly different trees depending on whether the wor
 
 | Deletion mode | Schema | When |
 |---------------|--------|------|
-| **Position-based** | `row_id: UInt64`, `deleted_at: Int64` (µs) | PK-less tables (always), or a `deletion_mode: position` PK table for a delete whose `(file path, file-local position)` is known |
-| **Key-based** | `row_key: Binary`, `deleted_at: Int64` (µs) | PK tables in `deletion_mode: key` (`auto` ⇒ key for PK tables) — and a `deletion_mode: position` PK table's fallback |
+| **Position-based** | `row_id: UInt64`, `deleted_at: Int64` (µs) | PK-less tables (always), or a PK table on position deletes (`deletion_mode: position`, or `auto` while the table is within its bound) for a delete whose `(file path, file-local position)` is known |
+| **Key-based** | `row_key: Binary`, `deleted_at: Int64` (µs) | PK tables on key deletes (`deletion_mode: key`, or `auto` once the table outgrows its bound) — and a position-delete PK table's fallback |
 
-The schema is chosen per *delete*, not per table: a `deletion_mode: position` PK table records a key-based vector for every delete without a known position — an unlocated or upserted row, and every filter-based `DELETE` — so it keeps a key deletion index too.
+The schema is chosen per *delete*, not per table: a position-delete PK table records a key-based vector for every delete without a known position — an unlocated or upserted row, and every filter-based `DELETE` — so it keeps a key deletion index too.
 
 **Staging WAL (`_wal.json`)** — makes a staged file list crash-safe via tmp + fsync + rename. On the next provider open, unreconciled WAL markers self-heal (atomic rename of staged Vortex files into the current snapshot, or rollback).
 

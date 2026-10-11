@@ -103,6 +103,7 @@ pub(crate) mod on_conflict;
 pub(crate) mod overwrite;
 pub(crate) mod overwrite_postpass;
 pub mod partitioned_wal;
+pub(crate) mod pk_deletion_mode;
 pub(crate) mod pk_index;
 pub(crate) mod pk_keyset_budget;
 pub(crate) mod pk_validation;

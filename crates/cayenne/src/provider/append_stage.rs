@@ -206,7 +206,7 @@ impl CayenneTableProvider {
             }
         };
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
-        let file_stats = (!self.should_capture_positions())
+        let file_stats = (!self.hides_repeated_keys_with_position_deletes())
             .then(|| FileStatsObserver::new(self.table_name(), &schema, None).map(Arc::new))
             .transpose()?;
         let start = Instant::now();

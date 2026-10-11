@@ -3239,7 +3239,7 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .one_of(&["auto", "none"])
             .default("auto"),
         ParameterSpec::component("deletion_mode")
-            .description("How primary-key deletions are recorded and applied. 'auto' (default) resolves to 'key' for every table with a primary key: key-based deletes are recorded by primary-key bytes and sequence number, compact concurrently with writers, and are pruned by the seq-prefix bake pass. It resolves to 'position' (merge-on-read) for a table without a primary key, which has no key to record: per-file row-position bitmaps are pushed into the Vortex scan, skipping deleted pages at the storage layer with no per-row CPU. 'key' applies deletes above the Vortex scan via a per-row RowConverter probe. 'position' explicitly opts a primary-key table into merge-on-read position deletes, where positions are captured via a row_idx() read-back after each write and any row whose position is not yet known falls back to a key-based delete.")
+            .description("How primary-key deletions are recorded and applied. 'auto' (default) chooses per table. A table with a primary key uses position deletes while it is no larger on disk than a quarter of its target file size (cayenne_target_file_size_mb): its deletes are reclaimed by rewriting the whole table alongside writers, which leaves one compact snapshot and no deletion filter to apply. Once the table grows past that, or its compaction cannot keep up with its writers, it switches to key deletes until the next restart. A refresh_mode: changes table with a primary key and a table with a datalake tier always use key deletes. A table without a primary key has no key to record and always uses position deletes: per-file row-position bitmaps pushed into the Vortex scan. 'key' records deletes by primary-key bytes and sequence number, applies them above the Vortex scan via a per-row probe, and prunes them with the incremental seq-prefix bake, concurrently with writers. 'position' pins a primary-key table to position deletes, captured via a row_idx() read-back after each write (a row whose position is not yet known falls back to a key-based delete); its whole-table reclaim rewrite holds writers off while it runs.")
             .one_of(&["auto", "key", "position"])
             .default("auto"),
         ParameterSpec::component("upload_concurrency")
@@ -7934,8 +7934,8 @@ mod tests {
         .expect("config should be valid");
         assert_eq!(config.deletion_mode, cayenne::metadata::DeletionMode::Auto);
 
-        // A non-CDC profile with a PK stays Auto at config time; Cayenne's own
-        // `DeletionMode::resolved` turns it into `key` for a primary-key table.
+        // A non-CDC profile with a PK stays Auto at config time; Cayenne itself
+        // chooses position or key deletes for the table as it grows.
         let ds = build("full_pk", RefreshMode::Full, vec![]);
         let config = CayenneAccelerator::get_vortex_config_with_footer_cache(
             "full_pk",

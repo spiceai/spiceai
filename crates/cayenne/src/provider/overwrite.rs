@@ -722,7 +722,7 @@ impl CayenneTableProvider {
         let target_size_bytes = self.target_file_size_bytes();
         // A key-deletion table rewrites files containing superseded copies.
         // Per-file statistics preserve exact counts for the surviving files.
-        let file_stats = (postpass.is_some() && !self.should_capture_positions())
+        let file_stats = (postpass.is_some() && !self.hides_repeated_keys_with_position_deletes())
             .then(|| {
                 FileStatsObserver::new(self.table_name(), &self.table_schema(), None).map(Arc::new)
             })
