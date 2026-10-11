@@ -323,20 +323,29 @@ pub fn build_change_batch(
                     let value = change.row.columns.get(*source_idx).and_then(Option::as_ref);
                     // The source column's Postgres type OID drives binary-format
                     // decoding; the text path ignores it.
-                    let type_oid = relation.columns[*source_idx].type_oid;
-                    data_builders[col_idx]
-                        .append(value, change.op, type_oid)
-                        .map_err(|e| match e {
-                            super::Error::PgOutputDecode { message } => {
-                                super::Error::PgOutputDecode {
-                                    message: format!(
-                                        "column '{}': {message}",
-                                        dataset_schema.field(col_idx).name()
-                                    ),
-                                }
+                    let column = &relation.columns[*source_idx];
+                    let appended = data_builders[col_idx].append(value, change.op, column.type_oid);
+                    match appended {
+                        Ok(()) => {}
+                        // A delete applies by primary key, so a non-key value of its
+                        // old row that the column's type cannot hold (the source type
+                        // changed) is carried as NULL rather than refusing the delete.
+                        Err(super::Error::PgOutputDecode { .. })
+                            if change.op == ChangeOp::Delete && !column.is_key =>
+                        {
+                            data_builders[col_idx].append_null();
+                        }
+                        Err(super::Error::PgOutputDecode { message }) => {
+                            return PgOutputDecodeSnafu {
+                                message: format!(
+                                    "column '{}': {message}",
+                                    dataset_schema.field(col_idx).name()
+                                ),
                             }
-                            other => other,
-                        })?;
+                            .fail();
+                        }
+                        Err(other) => return Err(other),
+                    }
                 }
                 None => data_builders[col_idx].append_null(),
             }

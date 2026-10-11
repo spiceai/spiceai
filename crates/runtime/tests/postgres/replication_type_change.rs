@@ -326,3 +326,44 @@ async fn duckdb_sync_all_columns_applies_a_delete_whose_old_row_no_longer_fits()
         })
         .await
 }
+
+/// Under `block`, a delete's old row is decoded with the registered types. With
+/// `REPLICA IDENTITY FULL` it carries every column, and after a type change its
+/// non-key values may not fit them; the delete applies by key regardless.
+#[cfg(not(target_os = "windows"))]
+#[tokio::test(flavor = "multi_thread")]
+async fn cayenne_block_applies_a_delete_whose_old_row_no_longer_fits() -> Result<(), anyhow::Error>
+{
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+    test_request_context()
+        .scope(async {
+            let container = common::start_postgres_docker_container_with_logical_wal().await?;
+            let port = container.host_port(5432)?;
+            let table = "type_change_cayenne_block_delete";
+            let (source, rt) = start(port, table, "cayenne", OnSchemaChange::Block).await?;
+            source
+                .simple_query(&format!("ALTER TABLE public.{table} REPLICA IDENTITY FULL"))
+                .await?;
+            source
+                .simple_query(&format!(
+                    "ALTER TABLE public.{table} ALTER COLUMN k TYPE double precision USING k + 0.5"
+                ))
+                .await?;
+            source
+                .simple_query(&format!("DELETE FROM public.{table} WHERE id = 1"))
+                .await?;
+            wait_for(
+                &rt,
+                &format!("SELECT id FROM {table} ORDER BY id"),
+                "+----+\n\
+                 | id |\n\
+                 +----+\n\
+                 | 2  |\n\
+                 | 3  |\n\
+                 +----+",
+            )
+            .await
+        })
+        .await
+}

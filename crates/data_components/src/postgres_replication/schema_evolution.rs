@@ -106,7 +106,23 @@ impl RelationSchemaTracker {
     /// come after the column's type has already changed, so the change would
     /// never be diffed and its values would be decoded as the registered type.
     #[must_use]
-    pub(crate) fn with_column_type_oids(mut self, column_oids: HashMap<String, u32>) -> Self {
+    ///
+    /// The catalog is read after the schema was inferred, so a type change can
+    /// land in between. A seeded numeric type wider than the registered one is
+    /// that change, not the baseline: it is seeded as unknown (OID 0), so the
+    /// first `Relation` reports it and it is adopted per the policy.
+    pub(crate) fn with_column_type_oids(mut self, mut column_oids: HashMap<String, u32>) -> Self {
+        for field in self.working_schema.fields() {
+            if let Some(oid) = column_oids.get_mut(field.name())
+                && map_pg_oid_to_arrow(*oid, -1).is_some_and(|seeded| {
+                    seeded.is_numeric()
+                        && field.data_type().is_numeric()
+                        && is_widening_cast(field.data_type(), &seeded)
+                })
+            {
+                *oid = 0;
+            }
+        }
         self.seed_pending = !column_oids.is_empty();
         self.column_oids = column_oids;
         self
@@ -459,6 +475,29 @@ mod tests {
             .expect_err("a later narrowing is an error")
             .to_string();
         assert!(msg.contains("not a lossless widening"), "{msg}");
+    }
+
+    /// The catalog can already reflect a widening the registered schema predates
+    /// (an `ALTER` between schema inference and the catalog read). The first
+    /// `Relation`, which reports the same type, is then still adopted.
+    #[test]
+    fn seeded_type_wider_than_registered_is_adopted_from_the_first_relation() {
+        let mut t = tracker_with_schema(
+            Arc::new(Schema::new(vec![
+                Field::new("id", DataType::Int32, false),
+                Field::new("k", DataType::Int32, true),
+            ])),
+            SchemaEvolutionPolicy::SyncAllColumns,
+        )
+        .with_column_type_oids(HashMap::from([
+            ("id".to_string(), 23),
+            ("k".to_string(), 701),
+        ]));
+        let obs = t
+            .observe_relation(&relation(vec![("id", 23), ("k", 701)]))
+            .expect("float8 widens Int32");
+        assert!(obs.schema_changed);
+        assert_eq!(obs.summary, "widened `k`: Int32 -> Float64");
     }
 
     /// A seeded column the dataset does not project is not "added" when the
