@@ -102,8 +102,9 @@ pub struct Runtime {
 
     /// Shared object-store location for runtime state (`file://`, `s3://`,
     /// `abfs://`, `abfss://`). Used for SQL results-cache warmup, cluster
-    /// source rate control, and distributed query state. A
-    /// `runtime.scheduler.state_location` overrides it for the scheduler.
+    /// source rate control, and distributed query state. Each feature writes
+    /// under its own folder: `results-cache/`, `rate-control/` and `cluster/`.
+    /// A `runtime.scheduler.state_location` overrides it for the scheduler.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<RuntimeState>,
 
@@ -118,28 +119,37 @@ pub struct Runtime {
 }
 
 impl Runtime {
-    /// Scheduler config with field-level fallback onto [`Self::state`].
-    ///
-    /// `runtime.scheduler.state_location` (and params) may be omitted when
-    /// `runtime.state` is set; other scheduler tuning fields are preserved.
+    /// Scheduler tuning config. When only `runtime.state` is set, the scheduler
+    /// runs with default tuning. [`Self::scheduler_state`] gives where the
+    /// scheduler keeps its state.
     #[must_use]
     pub fn resolved_scheduler(&self) -> Option<Scheduler> {
         match (&self.scheduler, &self.state) {
-            (Some(scheduler), state) => {
-                let mut resolved = scheduler.clone();
-                if resolved.state_location.is_none()
-                    && let Some(state) = state
-                {
-                    resolved.state_location = Some(state.location.clone());
-                    if resolved.params.is_none() {
-                        resolved.params.clone_from(&state.params);
-                    }
-                }
-                Some(resolved)
-            }
-            (None, Some(state)) => Some(Scheduler::from_shared_state(state)),
+            (Some(scheduler), _) => Some(scheduler.clone()),
+            (None, Some(_)) => Some(Scheduler::default()),
             (None, None) => None,
         }
+    }
+
+    /// Where the scheduler keeps cluster state: `runtime.scheduler.state_location`
+    /// when set, else `runtime.state`. `runtime.scheduler.params`, when set,
+    /// apply to either location.
+    #[must_use]
+    pub fn scheduler_state(&self) -> Option<StateLocation> {
+        let scheduler = self.scheduler.as_ref();
+        let params = scheduler.and_then(|scheduler| scheduler.params.as_ref());
+        if let Some(location) = scheduler.and_then(|scheduler| scheduler.state_location.as_ref()) {
+            return Some(StateLocation {
+                location: location.clone(),
+                params: params.cloned(),
+                source: StateSource::FeatureSetting,
+            });
+        }
+        self.state.as_ref().map(|state| StateLocation {
+            location: state.location.clone(),
+            params: params.or(state.params.as_ref()).cloned(),
+            source: StateSource::RuntimeState,
+        })
     }
 
     pub fn shutdown_timeout(&self) -> Result<Option<Duration>, Box<dyn Error + Send + Sync>> {
@@ -1372,12 +1382,46 @@ pub struct RuntimeState {
     pub params: Option<Params>,
 }
 
+/// An object-store location for one feature's shared state.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StateLocation {
+    /// Root URI (`file://`, `s3://`, `abfs://`, `abfss://`, `gs://`).
+    pub location: String,
+
+    /// Object store params for the location.
+    pub params: Option<Params>,
+
+    /// The setting that gave the location.
+    pub source: StateSource,
+}
+
+impl From<&RuntimeState> for StateLocation {
+    fn from(state: &RuntimeState) -> Self {
+        Self {
+            location: state.location.clone(),
+            params: state.params.clone(),
+            source: StateSource::RuntimeState,
+        }
+    }
+}
+
+/// The setting that gave a feature its state location.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StateSource {
+    /// `runtime.state`. Each feature keeps its objects in its own folder under
+    /// the location.
+    RuntimeState,
+    /// The feature's own setting, such as `runtime.scheduler.state_location`.
+    /// The feature keeps its objects at the location root.
+    FeatureSetting,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct Scheduler {
     /// Root URI for shared cluster state. Optional when [`Runtime::state`]
-    /// provides the location via [`Runtime::resolved_scheduler`].
+    /// provides the location (see [`Runtime::scheduler_state`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state_location: Option<String>,
 
@@ -1402,13 +1446,11 @@ pub struct Scheduler {
     pub partition_discovery_timeout: String,
 }
 
-impl Scheduler {
-    /// Build scheduler config that stores cluster state at the shared runtime location.
-    #[must_use]
-    pub fn from_shared_state(state: &RuntimeState) -> Self {
+impl Default for Scheduler {
+    fn default() -> Self {
         Self {
-            state_location: Some(state.location.clone()),
-            params: state.params.clone(),
+            state_location: None,
+            params: None,
             partition_assignment_interval: default_partition_assignment_interval(),
             max_partition_assignments_per_interval: default_max_partition_assignments_per_interval(
             ),
