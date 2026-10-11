@@ -889,15 +889,17 @@ async fn test_failing_dataset_only_blocks_dependent_views() -> Result<(), anyhow
 
     test_request_context()
         .scope(async {
-            std::fs::write("./test_view_failing_dep_orders.csv", "id,status\n1,open\n2,closed")
+            let temp_dir = tempfile::tempdir().expect("create temp dir");
+            let file = |name: &str| format!("file:{}", temp_dir.path().join(name).to_string_lossy());
+            std::fs::write(temp_dir.path().join("orders.csv"), "id,status\n1,open\n2,closed")
                 .expect("write file");
-            std::fs::write("./test_view_failing_dep_bad.csv", "id\n1\n2\n3").expect("write file");
+            std::fs::write(temp_dir.path().join("bad.csv"), "id\n1\n2\n3").expect("write file");
 
-            let orders = Dataset::new("file:./test_view_failing_dep_orders.csv", "orders");
+            let orders = Dataset::new(file("orders.csv"), "orders");
             // A file that does not exist fails the load with a retriable error, so
             // the load keeps retrying (a configuration error would fail it once,
             // and the startup load would end).
-            let bad = Dataset::new("file:./test_view_failing_dep_missing.csv", "bad");
+            let bad = Dataset::new(file("missing.csv"), "bad");
 
             let mut v_open = View::new("v_open".to_string());
             v_open.sql = Some("SELECT * FROM orders WHERE status = 'open'".to_string());
@@ -983,7 +985,7 @@ async fn test_failing_dataset_only_blocks_dependent_views() -> Result<(), anyhow
             // Fix `bad` the way a hot reload would: point it at a file that exists.
             let fixed = app::AppBuilder::new("test_failing_dataset_only_blocks_dependent_views")
                 .with_dataset(orders)
-                .with_dataset(Dataset::new("file:./test_view_failing_dep_bad.csv", "bad"))
+                .with_dataset(Dataset::new(file("bad.csv"), "bad"))
                 .with_view(v_open)
                 .with_view(v_bad)
                 .with_view(v_sub)
@@ -1055,8 +1057,6 @@ async fn test_failing_dataset_only_blocks_dependent_views() -> Result<(), anyhow
             );
 
             rt.shutdown().await;
-            std::fs::remove_file("./test_view_failing_dep_orders.csv").ok();
-            std::fs::remove_file("./test_view_failing_dep_bad.csv").ok();
             Ok(())
         })
         .await
