@@ -611,7 +611,7 @@ async fn deletion_mode_concurrent_harness() -> Result<(), Box<dyn std::error::Er
     );
     let answer = run_query(
         &ctx,
-        "SELECT COUNT(*) AS n, COUNT(DISTINCT id) AS keys FROM t",
+        "SELECT COUNT(*) AS n, COUNT(DISTINCT id) AS keys, SUM(generation) AS gens, SUM(qty) AS qty FROM t",
     )
     .await;
     eprintln!(
