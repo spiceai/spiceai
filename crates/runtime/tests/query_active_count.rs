@@ -52,8 +52,8 @@ use runtime_request_context::{Protocol, RequestContext};
 /// count must stay at exactly one however many overlap.
 const FAN_OUT: usize = 8;
 
-/// The one `MeterProvider` for this binary, installed before any instrument
-/// exists.
+/// The one `MeterProvider` for this test's process, installed before any
+/// instrument exists.
 static PROMETHEUS: LazyLock<prometheus::Registry> =
     LazyLock::new(install_prometheus_meter_provider);
 
