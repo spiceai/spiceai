@@ -702,9 +702,10 @@ impl RuntimeServer {
                 ));
             }
             ResolveOutcome::Missing => {
-                return Err(McpError::method_not_found::<
-                    rmcp::model::CallToolRequestMethod,
-                >());
+                return Err(McpError::invalid_params(
+                    format!("Unknown tool: {tool_name}"),
+                    None,
+                ));
             }
         };
 
