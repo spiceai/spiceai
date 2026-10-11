@@ -4329,13 +4329,11 @@ mod tests {
         }
         .build()
         .to_string();
-        assert!(
-            message.contains("'acceleration.write_mode: write_through'"),
-            "the rejection must offer write-through: {message}"
-        );
-        assert!(
-            !message.contains("write_mode: acceleration") && !message.contains("on_conflict"),
-            "the rejection must not offer a setting that cannot load: {message}"
+        // Write-through loads for a source that takes writes; a read-only
+        // source such as MySQL loads only with `access: read`.
+        assert_eq!(
+            message,
+            "Failed to register dataset orders (mysql): durable write-back needs a source that can apply a delivered row in one atomic step, and the mysql connector cannot yet. Delivering as a separate delete and insert lets the deleted state echo back over CDC, which can silently drop a committed write. Set 'acceleration.write_mode: write_through' to send writes to the source directly instead, or set 'access: read' if the source does not accept writes. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
         );
     }
 

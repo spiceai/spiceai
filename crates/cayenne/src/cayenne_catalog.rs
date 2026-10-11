@@ -11634,7 +11634,7 @@ mod tests {
             .expect_err("reopening with conflict detection on must be refused");
         assert_eq!(
             refused.to_string(),
-            "Failed to load table 'keyed': it was created with 'cayenne_pk_conflict_detection: none', so it can hold more than one row per primary key, and the setting is now 'auto'. An existing table keeps the setting it was created with. To rebuild it from the source with one row per primary key, restart once with 'acceleration.mode: file_create', then set 'mode' back to 'file'. Rows that exist only in the acceleration are not kept."
+            "Failed to load table 'keyed': it was created with 'cayenne_pk_conflict_detection: none', so it can hold more than one row per primary key, and the setting is now 'auto'. An existing table keeps the setting it was created with. To rebuild it from the source with one row per primary key, restart once with 'acceleration.mode: file_create', and with 'write_mode: write_through' if the dataset uses 'write_mode: write_back', then set both back. Rows that exist only in the acceleration are not kept."
         );
 
         // Reopening with the setting it was created with still works.
