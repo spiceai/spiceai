@@ -172,16 +172,19 @@ const VIEW_WAIT_REPORT_AFTER: std::time::Duration = std::time::Duration::from_se
 /// view's `FROM` clause.
 const SUBQUERY_DATASET_GRACE: std::time::Duration = std::time::Duration::from_mins(1);
 
+/// What a startup view waits for before it registers.
+#[derive(Clone, Copy)]
+enum ViewWait<'a> {
+    /// The datasets and views it reads.
+    WhatItReads,
+    /// Every startup dataset, because it reads a table that is not a dataset or
+    /// view loading at startup: the first such table, when its SQL resolved.
+    EveryDataset(Option<&'a TableReference>),
+}
+
 /// The line a startup view logs when it has to wait before it registers.
-///
-/// `pending` names what it is still waiting for. `unknown` is set when it waits
-/// for every dataset because it reads a table that is not a dataset or view
-/// loading at startup, naming the first such table if its SQL resolved.
-fn view_waiting_message(
-    view: &TableReference,
-    pending: &[String],
-    unknown: Option<Option<&TableReference>>,
-) -> String {
+/// `pending` names what it is still waiting for.
+fn view_waiting_message(view: &TableReference, pending: &[String], wait: ViewWait) -> String {
     let mut listed = pending
         .iter()
         .take(MAX_LISTED_WAITS)
@@ -190,12 +193,14 @@ fn view_waiting_message(
     if pending.len() > MAX_LISTED_WAITS {
         listed = format!("{listed} and {} more", pending.len() - MAX_LISTED_WAITS);
     }
-    match unknown {
-        None => format!("View '{view}' is still waiting for {listed} to load before it registers."),
-        Some(Some(table)) => format!(
+    match wait {
+        ViewWait::WhatItReads => {
+            format!("View '{view}' is still waiting for {listed} to load before it registers.")
+        }
+        ViewWait::EveryDataset(Some(table)) => format!(
             "View '{view}' is still waiting for every dataset to load before it registers, because it reads '{table}', which is not a dataset or view loading at startup. Still loading: {listed}."
         ),
-        Some(None) => format!(
+        ViewWait::EveryDataset(None) => format!(
             "View '{view}' is still waiting for every dataset to load before it registers. Still loading: {listed}."
         ),
     }
@@ -297,26 +302,24 @@ impl Runtime {
             };
 
             let mut waits: Vec<(String, CancellationToken)> = Vec::new();
-            // Set when the view waits for every dataset: `Some(table)` names the
-            // first table it reads that is not loading at startup.
-            let mut unknown: Option<Option<TableReference>> = None;
-            match reads.get(&resolved) {
-                Some(Some(tables)) => {
-                    for (table, written) in
-                        tables.iter().sorted_by_key(|(table, _)| table.to_string())
-                    {
-                        let view_token = view_done
-                            .get(table)
-                            .filter(|_| wait_on_views && table != &resolved);
-                        match view_token.or_else(|| dataset_done.get(table)) {
-                            Some(token) => waits.push((written.to_string(), token.clone())),
-                            None => {
-                                unknown.get_or_insert_with(|| Some(written.clone()));
-                            }
-                        }
+            let mut waits_for_every_dataset = false;
+            // The first table the view reads that is not loading at startup.
+            let mut not_loading: Option<TableReference> = None;
+            if let Some(Some(tables)) = reads.get(&resolved) {
+                for (table, written) in tables.iter().sorted_by_key(|(table, _)| table.to_string())
+                {
+                    let view_token = view_done
+                        .get(table)
+                        .filter(|_| wait_on_views && table != &resolved);
+                    if let Some(token) = view_token.or_else(|| dataset_done.get(table)) {
+                        waits.push((written.to_string(), token.clone()));
+                    } else {
+                        waits_for_every_dataset = true;
+                        not_loading.get_or_insert_with(|| written.clone());
                     }
                 }
-                _ => unknown = Some(None),
+            } else {
+                waits_for_every_dataset = true;
             }
             // Startup datasets the view reads only in a subquery, which
             // `register_view` does not wait for.
@@ -339,7 +342,7 @@ impl Runtime {
                     .collect(),
                 _ => Vec::new(),
             };
-            if unknown.is_some() {
+            if waits_for_every_dataset {
                 waits.extend(dataset_done.iter().map(|(name, token)| {
                     let name = dataset_names
                         .get(name)
@@ -386,7 +389,11 @@ impl Runtime {
                                     view_waiting_message(
                                         &view.name,
                                         &pending(),
-                                        unknown.as_ref().map(Option::as_ref)
+                                        if waits_for_every_dataset {
+                                            ViewWait::EveryDataset(not_loading.as_ref())
+                                        } else {
+                                            ViewWait::WhatItReads
+                                        }
                                     )
                                 );
                             }
@@ -988,7 +995,7 @@ mod startup_view_wait_tests {
     fn waiting_message_names_the_view_and_what_it_waits_for() {
         let view = TableReference::bare("v_bad");
         assert_eq!(
-            view_waiting_message(&view, &["bad".to_string()], None),
+            view_waiting_message(&view, &["bad".to_string()], ViewWait::WhatItReads),
             "View 'v_bad' is still waiting for 'bad' to load before it registers."
         );
         let pending: Vec<String> = (0..12).map(|i| format!("ds{i:02}")).collect();
@@ -996,12 +1003,12 @@ mod startup_view_wait_tests {
             view_waiting_message(
                 &view,
                 &pending,
-                Some(Some(&TableReference::parse_str("pg.public.events")))
+                ViewWait::EveryDataset(Some(&TableReference::parse_str("pg.public.events")))
             ),
             "View 'v_bad' is still waiting for every dataset to load before it registers, because it reads 'pg.public.events', which is not a dataset or view loading at startup. Still loading: 'ds00', 'ds01', 'ds02', 'ds03', 'ds04', 'ds05', 'ds06', 'ds07', 'ds08', 'ds09' and 2 more."
         );
         assert_eq!(
-            view_waiting_message(&view, &["bad".to_string()], Some(None)),
+            view_waiting_message(&view, &["bad".to_string()], ViewWait::EveryDataset(None)),
             "View 'v_bad' is still waiting for every dataset to load before it registers. Still loading: 'bad'."
         );
     }
