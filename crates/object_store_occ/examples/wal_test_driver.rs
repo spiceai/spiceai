@@ -76,6 +76,11 @@ fn open_store(location: &str) -> Result<Arc<dyn ObjectStore>> {
     let Some((bucket, prefix)) = object_store_location(location) else {
         return Ok(Arc::new(LocalConditionalPut::new(location)?));
     };
+    // The S3 client accepts an empty bucket name, and a purge through it then
+    // lists nothing and reports success.
+    if bucket.is_empty() {
+        return Err(format!("{location} names no bucket; expected s3://bucket[/prefix]").into());
+    }
     let store = AmazonS3Builder::from_env()
         .with_bucket_name(bucket)
         .build()?;

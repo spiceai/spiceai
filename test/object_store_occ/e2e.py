@@ -424,7 +424,9 @@ def export_store(executable, stores):
 
 
 def object_store_url(value):
-    if not value.startswith("s3://") or not value[len("s3://"):].strip("/"):
+    # The driver takes everything before the first slash as the bucket.
+    bucket = value[len("s3://"):].split("/", 1)[0] if value.startswith("s3://") else ""
+    if not bucket:
         raise argparse.ArgumentTypeError(f"expected s3://bucket[/prefix], not {value!r}")
     return value
 
