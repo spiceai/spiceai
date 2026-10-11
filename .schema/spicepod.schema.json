@@ -1498,7 +1498,7 @@
       "type": "object",
       "properties": {
         "allowed_hosts": {
-          "description": "Hostnames (and optional ports) permitted in the `Host` header of incoming MCP requests.\nUsed to prevent DNS-rebinding attacks. Accepts bare hostnames (`example.com`),\nhost-port pairs (`example.com:8090`), or full origin URLs (`https://example.com`).\nSet to `[\"*\"]` to disable host checking entirely.\nDefaults to rmcp defaults (`[\"localhost\", \"127.0.0.1\", \"::1\"]`).",
+          "description": "Hostnames (and optional ports) permitted in the `Host` header of incoming MCP requests.\nUsed to prevent DNS-rebinding attacks. Accepts bare hostnames (`example.com`),\nhost-port pairs (`example.com:8090`), or full origin URLs (`https://example.com`).\nSet to `[\"*\"]` to disable host checking entirely.\nUnset or empty uses the defaults (`[\"localhost\", \"127.0.0.1\", \"::1\"]`).",
           "type": [
             "array",
             "null"

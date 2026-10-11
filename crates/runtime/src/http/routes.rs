@@ -810,8 +810,9 @@ fn mcp_origin_cors<'a>(config: &'a config::Config, app_cors: &'a CorsConfig) -> 
 /// `runtime.cors`.
 ///
 /// Host (`Host` header):
-/// - If `runtime.mcp` is not set or `runtime.mcp.allowed_hosts` is `None`, rmcp defaults
-///   apply (`localhost`, `127.0.0.1`, `::1`).
+/// - If `runtime.mcp` is not set or `runtime.mcp.allowed_hosts` is `None` or empty, rmcp
+///   defaults apply (`localhost`, `127.0.0.1`, `::1`). rmcp treats an empty list as
+///   "allow all", so an empty list must not reach it.
 /// - If `runtime.mcp.allowed_hosts` contains `"*"`, host checking is disabled entirely.
 /// - Otherwise the provided list replaces the defaults entirely.
 ///
@@ -832,8 +833,10 @@ fn mcp_server_config(
     let config = StreamableHttpServerConfig::default().with_legacy_session_mode(true);
     let config = match mcp_config.and_then(|c| c.allowed_hosts.as_deref()) {
         Some(hosts) if hosts.iter().any(|h| h == "*") => config.disable_allowed_hosts(),
-        Some(hosts) => config.with_allowed_hosts(hosts.iter().map(String::as_str)),
-        None => config,
+        Some(hosts) if !hosts.is_empty() => {
+            config.with_allowed_hosts(hosts.iter().map(String::as_str))
+        }
+        Some(_) | None => config,
     };
 
     config.with_allowed_origins(cors_config.mcp_allowed_origins())
