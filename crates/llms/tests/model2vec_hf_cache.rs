@@ -123,8 +123,9 @@ fn a_cached_model_is_read_from_the_directory_hf_hub_cache_names() {
     std::fs::write(repo_dir.join("refs").join("main"), commit).expect("writes the ref");
     write_static_model(&snapshot);
 
-    // SAFETY: this binary holds exactly one test, so no other thread is reading
-    // or writing the environment while this runs.
+    // SAFETY: `require_process_per_test` above has established that this test
+    // runs in a process of its own, so no other thread is reading or writing the
+    // environment while this runs.
     unsafe {
         std::env::set_var("HF_HUB_CACHE", cache.path());
     }
