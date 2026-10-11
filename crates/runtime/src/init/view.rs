@@ -167,6 +167,11 @@ const MAX_LISTED_WAITS: usize = 10;
 /// waiting for. The same cadence as the dataset load summary.
 const VIEW_WAIT_REPORT_AFTER: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How long a startup view waits for a dataset it reads only in a subquery to
+/// be registered: the minute `register_view` gives each table in a view's
+/// `FROM` clause.
+const SUBQUERY_DATASET_GRACE: std::time::Duration = std::time::Duration::from_mins(1);
+
 /// The line a startup view logs when it has to wait before it registers.
 ///
 /// `pending` names what it is still waiting for. `unknown` is set when it waits
@@ -206,8 +211,10 @@ impl Runtime {
     /// catalog table, a dataset that is not loading (it failed accelerator
     /// initialization, waits on a snapshot, or is chained deeper behind another
     /// dataset), or a view in a cycle — waits for every startup dataset instead,
-    /// which is what every view did before. A view a Spicepod change has already
-    /// taken over is left to that change.
+    /// which is what every view did before. A dataset the view reads only in a
+    /// subquery also gets the minute `register_view` gives the tables in its
+    /// `FROM` clause to be registered once its load has ended. A view a Spicepod
+    /// change has already taken over is left to that change.
     ///
     /// Returns the tasks loading the views.
     pub(crate) fn load_views(
@@ -252,6 +259,23 @@ impl Runtime {
             .map(|name| (resolve_table_reference(name.clone()), name))
             .collect();
 
+        // The tables in each view's `FROM` clauses, which `register_view` itself
+        // waits to exist.
+        let from_tables: HashMap<ResolvedTableReference, HashSet<ResolvedTableReference>> =
+            validated_views
+                .iter()
+                .map(|vv| {
+                    (
+                        resolve_table_reference(vv.view.name.clone()),
+                        vv.dependencies
+                            .iter()
+                            .cloned()
+                            .map(resolve_table_reference)
+                            .collect(),
+                    )
+                })
+                .collect();
+
         // Created for every view up front and compared by resolved name, so a view
         // that reads `public.v1` waits on `v1` whatever order they are spawned in.
         let view_done: HashMap<ResolvedTableReference, CancellationToken> = reads
@@ -294,6 +318,27 @@ impl Runtime {
                 }
                 _ => unknown = Some(None),
             }
+            // Startup datasets the view reads only in a subquery, which
+            // `register_view` does not wait for.
+            let subquery_datasets: Vec<TableReference> = match reads.get(&resolved) {
+                Some(Some(tables)) => tables
+                    .keys()
+                    .filter(|table| {
+                        dataset_done.contains_key(*table)
+                            && !from_tables
+                                .get(&resolved)
+                                .is_some_and(|from| from.contains(*table))
+                    })
+                    .map(|table| {
+                        TableReference::full(
+                            Arc::clone(&table.catalog),
+                            Arc::clone(&table.schema),
+                            Arc::clone(&table.table),
+                        )
+                    })
+                    .collect(),
+                _ => Vec::new(),
+            };
             if unknown.is_some() {
                 waits.extend(dataset_done.iter().map(|(name, token)| {
                     let name = dataset_names
@@ -307,6 +352,7 @@ impl Runtime {
             tasks.push(tokio::spawn(async move {
                 let done = done.drop_guard();
                 let superseded = view_load.token();
+                let shutdown = runtime.status.shutdown_token();
                 let pending = || -> Vec<String> {
                     waits
                         .iter()
@@ -320,7 +366,6 @@ impl Runtime {
                     runtime
                         .status
                         .update_view(&view.name, status::ComponentStatus::Initializing);
-                    let shutdown = runtime.status.shutdown_token();
                     let loaded =
                         futures::future::join_all(waits.iter().map(|(_, token)| token.cancelled()));
                     tokio::pin!(loaded);
@@ -345,6 +390,22 @@ impl Runtime {
                                     )
                                 );
                             }
+                        }
+                    }
+                }
+                // A dataset's startup load can end before the dataset is
+                // registered: a Spicepod change that replaces it stops the load and
+                // registers the replacement itself. Planning the view before then
+                // fails it for good, so give each dataset it reads only in a
+                // subquery the grace its `FROM` tables get.
+                let deadline = tokio::time::Instant::now() + SUBQUERY_DATASET_GRACE;
+                for table in &subquery_datasets {
+                    while !runtime.df.table_exists(table) && tokio::time::Instant::now() < deadline
+                    {
+                        tokio::select! {
+                            () = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+                            () = shutdown.cancelled() => return,
+                            () = superseded.cancelled() => return,
                         }
                     }
                 }
