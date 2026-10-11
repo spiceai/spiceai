@@ -35,8 +35,8 @@ use super::dialect::{ColumnKinds, Oracle, translate};
 use super::inventory::{InventoryEntry, build_inventory};
 use super::report::RunResult;
 use super::{
-    CayenneHarness, LoadMode, ParityOutcome, compare_actual_results, execute_cayenne,
-    fixture_column_kinds,
+    CayenneHarness, CayenneLayout, LoadMode, ParityOutcome, compare_actual_results,
+    execute_cayenne, fixture_column_kinds,
 };
 
 /// A standalone engine answering the suites' queries.
@@ -257,21 +257,65 @@ pub async fn run_fixture_suite(
     modes: &[LoadMode],
     cayenne_query: impl Fn(&Query) -> Query,
 ) -> Vec<RunResult> {
+    run_fixture_suite_with_layouts(
+        engine,
+        parquet_dir,
+        tables,
+        suite,
+        queries,
+        modes,
+        &[None],
+        cayenne_query,
+    )
+    .await
+}
+
+/// [`run_fixture_suite`], with Cayenne loaded once per entry of `layouts` for
+/// every mode (`None` is Cayenne's default layout) and every load compared with
+/// the same oracle answer. A layout's rows are labelled `suite[layout]` after
+/// any mode label, which [`super::report`] reviews as `suite`.
+#[expect(clippy::too_many_arguments)]
+pub async fn run_fixture_suite_with_layouts(
+    engine: &dyn OracleEngine,
+    parquet_dir: &std::path::Path,
+    tables: &[&str],
+    suite: &str,
+    queries: &[Query],
+    modes: &[LoadMode],
+    layouts: &[Option<CayenneLayout>],
+    cayenne_query: impl Fn(&Query) -> Query,
+) -> Vec<RunResult> {
     let columns = fixture_column_kinds(parquet_dir, tables);
     let inventory = build_inventory();
     let lane = Lane::new(engine, &columns);
     let mut results = Vec::new();
     for &mode in modes {
-        let cayenne = CayenneHarness::from_parquet_dir(parquet_dir, tables, mode).await;
-        let label = if modes.len() > 1 {
-            format!("{suite}[{}]", mode.as_str())
-        } else {
-            suite.to_string()
-        };
-        results.extend(
-            lane.run_suite(&cayenne, suite, &label, queries, &inventory, &cayenne_query)
-                .await,
-        );
+        for layout in layouts {
+            let cayenne = CayenneHarness::from_parquet_dir_with_layout(
+                parquet_dir,
+                tables,
+                mode,
+                layout.clone(),
+            )
+            .await;
+            let mut label = if modes.len() > 1 {
+                format!("{suite}[{}]", mode.as_str())
+            } else {
+                suite.to_string()
+            };
+            if let Some(layout) = layout {
+                label = format!("{label}[{}]", layout.label());
+            }
+            results.extend(
+                lane.run_suite(&cayenne, suite, &label, queries, &inventory, &cayenne_query)
+                    .await,
+            );
+            if let Some((narrowed, selections)) = super::secondary_index_use(&cayenne) {
+                eprintln!(
+                    "{label}: secondary indexes narrowed {narrowed} scans and handed {selections} files a row selection"
+                );
+            }
+        }
     }
     results
 }

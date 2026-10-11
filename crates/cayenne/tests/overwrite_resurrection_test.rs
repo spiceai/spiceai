@@ -32,7 +32,7 @@ limitations under the License.
 #![allow(clippy::expect_used)]
 #![allow(clippy::clone_on_ref_ptr)]
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 

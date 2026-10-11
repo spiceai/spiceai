@@ -6,6 +6,7 @@ edition = { workspace = true }
 homepage = { workspace = true }
 license = "Apache-2.0"
 repository = { workspace = true }
+autotests = false
 rust-version = { workspace = true }
 version = { workspace = true }
 
@@ -85,3 +86,14 @@ name = "dynamic_filter_null_guard"
 
 [lints]
 workspace = true
+
+# Integration tests are modules of `integration` (`tests/integration.rs`).
+[[test]]
+name = "integration"
+path = "tests/integration.rs"
+
+# Installs a counting `#[global_allocator]` to compare what the footer cache
+# reports holding with the heap it frees.
+[[test]]
+name = "footer_cache_accounting"
+path = "tests/footer_cache_accounting.rs"

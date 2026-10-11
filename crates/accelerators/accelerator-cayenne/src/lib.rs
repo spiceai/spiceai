@@ -116,6 +116,27 @@ pub enum Error {
     PartitionedEvolutionUnsupported { dataset: Arc<str> },
 
     #[snafu(display(
+        "Failed to load dataset {dataset} (cayenne): its acceleration data was written {}, but the dataset now sets {}. \
+        Cayenne does not re-partition existing acceleration data. \
+        To keep using the existing data, {}. \
+        To apply the new 'partition_by' instead, stop Spice, delete the acceleration data directory '{data_dir}' and the Cayenne metastore directory '{metadata_dir}', then start Spice to reload the dataset from the source. \
+        Other Cayenne datasets that use this metastore also reload from their sources. \
+        See: https://spiceai.org/docs/features/data-acceleration/partitioning",
+        stored_partitioning(stored),
+        configured_partition_by(configured),
+        restore_partition_by(stored)
+    ))]
+    PartitionByChanged {
+        dataset: Arc<str>,
+        /// The partition columns the stored data was written with; empty when it is unpartitioned.
+        stored: Vec<String>,
+        /// The dataset's `partition_by` expressions.
+        configured: Vec<String>,
+        data_dir: String,
+        metadata_dir: String,
+    },
+
+    #[snafu(display(
         "Failed to configure dataset {table_name} (cayenne): The acceleration data directory '{data_dir}' contains the Cayenne metastore directory '{metadata_dir}'. \
         Recreating this dataset deletes its data directory, which would take the metastore — the catalog for every Cayenne dataset in this instance — with it. \
         Set 'cayenne_metadata_dir' to a directory outside the data directory, or rename the dataset. \
@@ -3957,6 +3978,9 @@ impl DataAccelerator for CayenneAccelerator {
             .await
             .boxed()?;
 
+        ensure_stored_partitioning_matches(&cayenne_table, source, &partition_by, &dir_path)
+            .await?;
+
         // If partitioning is requested, wrap with PartitionTableProvider
         if partition_by.is_empty() {
             // Non-partitioned table - wrap in PolyTableProvider for proper deletion/retention support.
@@ -4176,6 +4200,7 @@ impl DataAccelerator for CayenneAccelerator {
                 Error::InvalidConfiguration { .. }
                     | Error::InvalidScanConcurrency { .. }
                     | Error::UnsupportedDataTypes { .. }
+                    | Error::PartitionByChanged { .. }
             )
         )
     }
@@ -4455,6 +4480,85 @@ fn requests_schema_evolution(source: &dyn AccelerationSource) -> bool {
                 | OnSchemaChange::SyncAllColumns
                 | OnSchemaChange::DropAndRecreate
         )
+    })
+}
+
+fn stored_partitioning(stored: &[String]) -> String {
+    if stored.is_empty() {
+        "without 'partition_by'".to_string()
+    } else {
+        format!("partitioned by [{}]", stored.join(", "))
+    }
+}
+
+fn configured_partition_by(configured: &[String]) -> String {
+    if configured.is_empty() {
+        "no 'partition_by'".to_string()
+    } else {
+        format!("'partition_by: [{}]'", configured.join(", "))
+    }
+}
+
+fn restore_partition_by(stored: &[String]) -> &'static str {
+    if stored.is_empty() {
+        "remove 'partition_by'"
+    } else {
+        "restore the 'partition_by' it was written with"
+    }
+}
+
+/// Refuses acceleration data stored under a different partitioning than the
+/// dataset's `partition_by`. An unpartitioned table keeps its rows in the table
+/// itself and a partitioned one in per-partition tables, and each reads only its
+/// own, so opening data stored the other way would serve none of its rows.
+async fn ensure_stored_partitioning_matches(
+    table: &cayenne::CayenneTableProvider,
+    source: &dyn AccelerationSource,
+    partition_by: &[PartitionedBy],
+    data_dir: &str,
+) -> Result<()> {
+    let configured = cayenne::partition_column_labels(partition_by);
+    let partitions = table
+        .catalog()
+        .get_partitions(&table.metadata().table_id)
+        .await
+        .boxed()
+        .context(AccelerationCreationFailedSnafu)?;
+    let stored = if partitions.is_empty() {
+        if configured.is_empty()
+            || !table
+                .holds_rows()
+                .await
+                .boxed()
+                .context(AccelerationCreationFailedSnafu)?
+        {
+            return Ok(());
+        }
+        Vec::new()
+    } else {
+        match partitions
+            .into_iter()
+            .find(|partition| partition.partition_columns != configured)
+        {
+            Some(partition) => partition.partition_columns,
+            None => return Ok(()),
+        }
+    };
+    Err(Error::PartitionByChanged {
+        dataset: Arc::from(source.name().to_string()),
+        stored,
+        configured: source
+            .acceleration()
+            .map(|acceleration| {
+                acceleration
+                    .partition_by
+                    .iter()
+                    .map(|partition| partition.expression.clone())
+                    .collect()
+            })
+            .unwrap_or_default(),
+        data_dir: data_dir.to_string(),
+        metadata_dir: CayenneAccelerator::resolve_metadata_dir(source.acceleration()),
     })
 }
 
