@@ -123,9 +123,12 @@ fn view_reads(state: &datafusion::execution::SessionState, sql: &str) -> Option<
     )
 }
 
-/// Whether the views, linked by the views each one reads (a view reading itself
-/// is not a link), contain a cycle.
-fn has_view_cycle(reads: &HashMap<ResolvedTableReference, Option<TablesRead>>) -> bool {
+/// The views in a cycle of views reading each other, and the views that read,
+/// directly or not, a view in one: the views Kahn's algorithm never takes. A
+/// view reading itself is not a cycle.
+fn views_in_or_behind_cycles(
+    reads: &HashMap<ResolvedTableReference, Option<TablesRead>>,
+) -> HashSet<ResolvedTableReference> {
     // Kahn's algorithm: repeatedly take a view none of whose views is left.
     let mut unresolved: HashMap<&ResolvedTableReference, usize> = HashMap::new();
     let mut readers: HashMap<&ResolvedTableReference, Vec<&ResolvedTableReference>> =
@@ -145,9 +148,9 @@ fn has_view_cycle(reads: &HashMap<ResolvedTableReference, Option<TablesRead>>) -
         .filter(|(_, count)| **count == 0)
         .map(|(view, _)| *view)
         .collect();
-    let mut taken = 0;
+    let mut taken: HashSet<&ResolvedTableReference> = HashSet::new();
     while let Some(view) = queue.pop() {
-        taken += 1;
+        taken.insert(view);
         for reader in readers.get(view).into_iter().flatten() {
             if let Some(count) = unresolved.get_mut(reader) {
                 *count -= 1;
@@ -157,7 +160,11 @@ fn has_view_cycle(reads: &HashMap<ResolvedTableReference, Option<TablesRead>>) -
             }
         }
     }
-    taken < reads.len()
+    reads
+        .keys()
+        .filter(|view| !taken.contains(view))
+        .cloned()
+        .collect()
 }
 
 /// How many names a view's waiting message lists before it summarizes the rest.
@@ -215,7 +222,7 @@ impl Runtime {
     /// cancelled when that load ends. A view that reads anything else — a
     /// catalog table, a dataset that is not loading (it failed accelerator
     /// initialization, waits on a snapshot, or is chained deeper behind another
-    /// dataset), or a view in a cycle — waits for every startup dataset instead,
+    /// dataset), or a view in or behind a cycle of views — waits for every startup dataset instead,
     /// which is what every view did before. Each dataset the view reads only in
     /// a subquery also gets up to a minute to be registered once its load has
     /// ended, as `register_view` waits for a missing `FROM` table. A view a
@@ -252,9 +259,11 @@ impl Runtime {
                 )
             })
             .collect();
-        // Waiting on another view is only safe when the views form no cycle:
-        // otherwise each view in the cycle waits on the other.
-        let wait_on_views = !has_view_cycle(&reads);
+        // A view in a cycle that waited on the views it reads would wait on
+        // itself, and a view behind one on a view that never registers, so those
+        // views wait for every startup dataset instead. Every other view reads
+        // only views outside any cycle, and waits on them.
+        let in_or_behind_cycles = views_in_or_behind_cycles(&reads);
         let dataset_names: HashMap<ResolvedTableReference, TableReference> = app
             .datasets
             .iter()
@@ -291,6 +300,7 @@ impl Runtime {
 
         for view in views_in_dependency_order {
             let resolved = resolve_table_reference(view.name.clone());
+            let wait_on_views = !in_or_behind_cycles.contains(&resolved);
             let done = view_done.get(&resolved).cloned().unwrap_or_default();
             let Some(view_load) = self.view_loads.begin(&view.name) else {
                 tracing::debug!(
@@ -942,28 +952,57 @@ mod startup_view_wait_tests {
             .collect()
     }
 
+    fn flagged(views: &HashMap<ResolvedTableReference, Option<TablesRead>>) -> Vec<String> {
+        let mut flagged: Vec<String> = views_in_or_behind_cycles(views)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        flagged.sort();
+        flagged
+    }
+
     #[test]
     fn detects_cycle_through_qualified_names() {
-        assert!(has_view_cycle(&reads(&[
-            ("a", &["public.b"]),
-            ("b", &["spice.public.a"]),
-        ])));
+        assert_eq!(
+            flagged(&reads(&[("a", &["public.b"]), ("b", &["spice.public.a"])])),
+            ["spice.public.a", "spice.public.b"]
+        );
     }
 
     #[test]
     fn chain_and_self_reference_are_not_cycles() {
-        assert!(!has_view_cycle(&reads(&[
-            ("a", &["orders", "a"]),
-            ("b", &["public.a", "a"]),
-            ("c", &["b"]),
-        ])));
+        assert!(
+            flagged(&reads(&[
+                ("a", &["orders", "a"]),
+                ("b", &["public.a", "a"]),
+                ("c", &["b"]),
+            ]))
+            .is_empty()
+        );
     }
 
     #[test]
     fn a_view_whose_sql_did_not_resolve_links_nothing() {
         let mut views = reads(&[("a", &["b"])]);
         views.insert(r("b"), None);
-        assert!(!has_view_cycle(&views));
+        assert!(flagged(&views).is_empty());
+    }
+
+    /// Only the views in a cycle, and those reading one, give up waiting on the
+    /// views they read: an unrelated cycle elsewhere in the Spicepod must not
+    /// leave a view that reads another view only in a subquery to race it.
+    #[test]
+    fn only_views_in_or_behind_a_cycle_are_flagged() {
+        assert_eq!(
+            flagged(&reads(&[
+                ("a", &["b"]),
+                ("b", &["a"]),
+                ("behind", &["public.a"]),
+                ("reader", &["v1", "orders"]),
+                ("v1", &["orders"]),
+            ])),
+            ["spice.public.a", "spice.public.b", "spice.public.behind"]
+        );
     }
 
     /// A view waits on exactly what planning it looks up, so a table read only
