@@ -1025,11 +1025,9 @@ impl Query {
                 // Plans containing non-Immutable functions (e.g. `random()`,
                 // `now()`, Stable remote UDFs) are never served from or stored
                 // in the results cache, matching the text-query path.
-                let plan_cacheable = Query::should_cache_results(
-                    &self.df,
-                    &logical_plan,
-                    CacheStatus::CacheMiss,
-                ) == CacheStatus::CacheMiss;
+                let plan_cacheable =
+                    Query::should_cache_results(&self.df, &logical_plan, CacheStatus::CacheMiss)
+                        == CacheStatus::CacheMiss;
                 if plan_cacheable
                     && mode != DistributedSubmitMode::Resume
                     && results_cache_mode == ResultsCacheMode::Default
@@ -3706,8 +3704,26 @@ mod tests {
         assert_eq!(query.cache_status, CacheStatus::CacheMiss);
     }
 
+    /// `Query::run` on a submitted plan stores its result but never looks it
+    /// up, so a second submission is a `CacheMiss` either way. What the plan
+    /// path controls is whether it stores, so count the stored entries.
     #[tokio::test]
     async fn from_logical_plan_does_not_cache_volatile_plans() {
+        async fn run_plan(df: &Arc<DataFusion>, sql: &str) -> CacheStatus {
+            let plan = df
+                .ctx
+                .state()
+                .create_logical_plan(sql)
+                .await
+                .expect("logical plan");
+            let mut query = Query::from_logical_plan(df, plan)
+                .run()
+                .await
+                .expect("Query::run");
+            while let Some(Ok(_)) = query.data.next().await {}
+            query.cache_status
+        }
+
         let config = SQLResultsCacheConfig::default();
         let cache_provider = Arc::new(
             QueryResultsCacheProvider::try_new(&config, Box::new([])).expect("cache provider new"),
@@ -3718,49 +3734,38 @@ mod tests {
                 Arc::new(AcceleratorEngineRegistry::new()),
                 Handle::current(),
             )
-            .with_caching(Arc::new(Caching::new().with_results_cache(cache_provider)))
+            .with_caching(Arc::new(
+                Caching::new().with_results_cache(Arc::clone(&cache_provider)),
+            ))
             .build(),
         );
 
+        let mut statuses = Vec::new();
         for _ in 0..2 {
-            let plan = df
-                .ctx
-                .state()
-                .create_logical_plan("SELECT random() AS r")
-                .await
-                .expect("logical plan");
-            let mut query = Query::from_logical_plan(&df, plan)
-                .run()
-                .await
-                .expect("Query::run");
-            while let Some(Ok(_)) = query.data.next().await {}
-            assert_eq!(query.cache_status, CacheStatus::CacheDisabled);
+            statuses.push(run_plan(&df, "SELECT random() AS r").await);
         }
-
-        // An equivalent SQL text query must not replay a plan-submitted result either.
-        let mut query = QueryBuilder::new("SELECT random() AS r", Arc::clone(&df))
-            .build()
-            .run()
-            .await
-            .expect("Query::run");
-        while let Some(Ok(_)) = query.data.next().await {}
-        assert_ne!(query.cache_status, CacheStatus::CacheHit);
+        cache_provider.run_pending_tasks().await;
+        assert_eq!(
+            cache_provider.item_count().await,
+            0,
+            "a volatile plan's result must not be stored"
+        );
+        assert_eq!(
+            statuses,
+            [CacheStatus::CacheDisabled, CacheStatus::CacheDisabled]
+        );
 
         // Immutable plans submitted directly are still cached.
-        for expected in [CacheStatus::CacheMiss, CacheStatus::CacheHit] {
-            let plan = df
-                .ctx
-                .state()
-                .create_logical_plan("SELECT 1 + 1 AS two")
-                .await
-                .expect("logical plan");
-            let mut query = Query::from_logical_plan(&df, plan)
-                .run()
-                .await
-                .expect("Query::run");
-            while let Some(Ok(_)) = query.data.next().await {}
-            assert_eq!(query.cache_status, expected);
-        }
+        assert_eq!(
+            run_plan(&df, "SELECT 1 + 1 AS two").await,
+            CacheStatus::CacheMiss
+        );
+        cache_provider.run_pending_tasks().await;
+        assert_eq!(
+            cache_provider.item_count().await,
+            1,
+            "an immutable plan's result must be stored"
+        );
     }
 
     #[tokio::test]

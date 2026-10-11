@@ -2242,6 +2242,93 @@ mod tests {
         }
     }
 
+    /// Registers `name()`, a `from: sql` table function whose one `v` row is
+    /// drawn from `random()`, parsed from YAML in the shape a spicepod
+    /// declares it. `volatility: None` leaves the key out, so the declaration
+    /// takes the spicepod default (`volatile`).
+    async fn register_random_sql_table_function(
+        df: &DataFusion,
+        name: &str,
+        volatility: Option<&str>,
+    ) {
+        use runtime_datafusion_udfs::user_functions::{BuiltFunction, build_function};
+
+        let volatility = volatility.map_or_else(String::new, |v| format!("volatility: {v}\n"));
+        let decl: spicepod::component::function::Function = yaml::from_str(&format!(
+            "
+name: {name}
+from: sql
+kind: table
+{volatility}signature:
+  returns:
+    - {{ name: v, type: int64 }}
+body: SELECT CAST(random() * 1000000000000 AS BIGINT) AS v
+"
+        ))
+        .expect("the function declaration should parse");
+        let BuiltFunction::Table(udtf) = build_function(&decl)
+            .await
+            .expect("the function should build")
+        else {
+            panic!("a `kind: table` declaration should build a table function");
+        };
+        df.ctx.register_udtf(name, udtf);
+    }
+
+    /// A SQL table function's body is planned only inside its provider's
+    /// `scan`, so the plan the results cache checks holds a `TableScan` of the
+    /// function and never the `random()` in its body. A table function not
+    /// declared `immutable` (the default is `volatile`) must never be served
+    /// from, or stored in, the results cache, whether the query scans it
+    /// directly or in a scalar subquery. The same body declared `immutable`
+    /// is still cached, so the declaration is what decides.
+    #[tokio::test]
+    async fn test_results_cache_skips_non_immutable_sql_table_functions() {
+        for key_type in [
+            spicepod::component::caching::CacheKeyType::Plan,
+            spicepod::component::caching::CacheKeyType::Sql,
+        ] {
+            let df = prepare_runtime(Some(SQLResultsCacheConfig {
+                item_ttl: Some("10m".to_string()),
+                cache_key_type: key_type,
+                ..Default::default()
+            }))
+            .await;
+            register_random_sql_table_function(&df, "default_rows", None).await;
+            register_random_sql_table_function(&df, "stable_rows", Some("stable")).await;
+            register_random_sql_table_function(&df, "immutable_rows", Some("immutable")).await;
+
+            for sql in [
+                "SELECT v FROM default_rows()",
+                "SELECT v FROM stable_rows()",
+                "SELECT (SELECT max(v) FROM default_rows())",
+            ] {
+                let (first_status, first) =
+                    run_i64_query(&df, sql, ResultsCacheMode::Default).await;
+                let (second_status, second) =
+                    run_i64_query(&df, sql, ResultsCacheMode::Default).await;
+                assert_eq!(
+                    (first_status, second_status),
+                    (CacheStatus::CacheDisabled, CacheStatus::CacheDisabled),
+                    "{key_type:?}: a non-immutable table function must not use the results cache: {sql}"
+                );
+                // Each run executes the body again. Two independent draws of
+                // `random() * 1e12` collide with probability about 1e-12.
+                assert_ne!(
+                    first, second,
+                    "{key_type:?}: the second run must not replay the first run's rows: {sql}"
+                );
+            }
+
+            let sql = "SELECT v FROM immutable_rows()";
+            let (status, first) = run_i64_query(&df, sql, ResultsCacheMode::Default).await;
+            assert_eq!(status, CacheStatus::CacheMiss, "{key_type:?}");
+            let (status, second) = run_i64_query(&df, sql, ResultsCacheMode::Default).await;
+            assert_eq!(status, CacheStatus::CacheHit, "{key_type:?}");
+            assert_eq!(first, second, "{key_type:?}");
+        }
+    }
+
     /// A one-row table whose value is the cache namespace of the request that
     /// planned the scan. It reads the namespace the way the caching accelerator
     /// scopes its rows: from the `RequestContext` that `Query::run_internal`
