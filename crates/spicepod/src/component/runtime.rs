@@ -103,7 +103,9 @@ pub struct Runtime {
     /// Shared object-store location for runtime state (`file://`, `s3://`,
     /// `abfs://`, `abfss://`). Used for SQL results-cache warmup, cluster
     /// source rate control, and distributed query state. A
-    /// `runtime.scheduler.state_location` overrides it for the scheduler.
+    /// `runtime.scheduler.state_location` overrides it for the scheduler, and a
+    /// `runtime.source_rate_control.state_location` for cluster source rate
+    /// control.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub state: Option<RuntimeState>,
 
@@ -1422,8 +1424,18 @@ impl Scheduler {
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct SourceRateControl {
+    /// Root URI for cluster source rate-control state. Overrides
+    /// `runtime.state.location` for source rate control.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_location: Option<String>,
+
+    /// Object store params for `state_location`. Ignored without
+    /// `state_location`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub params: Option<Params>,
+
     /// How often each runtime refreshes and persists per-source rate-control
-    /// state at `runtime.state.location`.
+    /// state in object storage.
     #[serde(default = "default_rate_control_refresh_interval")]
     pub refresh_interval: String,
 
@@ -1435,6 +1447,8 @@ pub struct SourceRateControl {
 impl Default for SourceRateControl {
     fn default() -> Self {
         Self {
+            state_location: None,
+            params: None,
             refresh_interval: default_rate_control_refresh_interval(),
             github_concurrent_connections_limit: None,
         }

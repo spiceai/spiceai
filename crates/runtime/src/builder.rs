@@ -964,10 +964,17 @@ async fn build_http_rate_control_registry(
     secrets: Arc<RwLock<Secrets>>,
     io_runtime: Handle,
 ) -> Arc<dataconnector::http_rate_control::HttpRateControlRegistry> {
-    let _ = (source_rate_control, &secrets, &io_runtime);
-    // `runtime.state` also serves the scheduler and results-cache warmup, so
-    // setting it is not a request for cluster rate control: no warning.
-    if runtime_state.is_some() {
+    let _ = (&secrets, &io_runtime);
+    if source_rate_control
+        .and_then(|config| config.state_location.as_ref())
+        .is_some()
+    {
+        tracing::warn!(
+            "Cluster HTTP rate control requires a Spice.ai Enterprise build. `runtime.source_rate_control.state_location` is ignored, and HTTP rate limits apply to each instance on its own."
+        );
+    } else if runtime_state.is_some() {
+        // `runtime.state` also serves the scheduler and results-cache warmup, so
+        // setting it is not a request for cluster rate control: no warning.
         tracing::debug!(
             "Cluster HTTP rate control requires a Spice.ai Enterprise build. HTTP rate limits apply to each instance on its own."
         );
@@ -975,9 +982,10 @@ async fn build_http_rate_control_registry(
     Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default())
 }
 
-/// Persists HTTP rate-control state at `runtime.state.location`, so instances
+/// Persists HTTP rate-control state at `runtime.source_rate_control.state_location`
+/// (with its `params`) when set, else at `runtime.state.location`, so instances
 /// that share that location share each origin's request budget. Without
-/// `runtime.state`, rate control stays in memory.
+/// either, rate control stays in memory.
 #[cfg(feature = "rate-control")]
 async fn build_http_rate_control_registry(
     source_rate_control: Option<&SpicepodSourceRateControl>,
@@ -985,7 +993,15 @@ async fn build_http_rate_control_registry(
     secrets: Arc<RwLock<Secrets>>,
     io_runtime: Handle,
 ) -> Arc<dataconnector::http_rate_control::HttpRateControlRegistry> {
-    let Some(state) = runtime_state else {
+    let rate_control_state = source_rate_control.and_then(|config| {
+        config
+            .state_location
+            .as_deref()
+            .map(|location| (location, config.params.as_ref()))
+    });
+    let Some((location, params)) = rate_control_state
+        .or_else(|| runtime_state.map(|state| (state.location.as_str(), state.params.as_ref())))
+    else {
         return Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::default());
     };
 
@@ -996,16 +1012,15 @@ async fn build_http_rate_control_registry(
     match crate::object_store_state::build_object_store(
         secrets,
         io_runtime,
-        &state.location,
-        state.params.as_ref(),
+        location,
+        params,
         "rate-control state",
     )
     .await
     {
         Ok((store, base_prefix)) => {
             tracing::info!(
-                "Initialized persisted HTTP governor rate-control state with location: {}",
-                state.location
+                "Initialized persisted HTTP governor rate-control state with location: {location}"
             );
             let registry = Arc::new(dataconnector::http_rate_control::HttpRateControlRegistry::with_persisted_governor_state(
                 store,

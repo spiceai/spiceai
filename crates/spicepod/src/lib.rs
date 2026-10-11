@@ -1249,25 +1249,31 @@ mod version_tests {
         );
     }
 
-    /// Cluster rate control stores its state at `runtime.state.location`, so
-    /// `source_rate_control` has no location or object store params of its own.
     #[test]
-    fn test_runtime_source_rate_control_rejects_its_own_state_location() {
-        for field in [
-            "state_location: file:///tmp/spice-source-rate-control",
-            "params:\n                allow_http: true",
-        ] {
-            let yaml = format!(
-                "
+    fn test_runtime_source_rate_control_accepts_its_own_state_location() {
+        let yaml = r"
             source_rate_control:
-              {field}
-        "
-            );
-            assert!(
-                yaml::from_str::<Runtime>(&yaml).is_err(),
-                "source_rate_control must reject `{field}`"
-            );
-        }
+              state_location: s3://my-bucket/spice-rate-control
+              params:
+                s3_region: us-east-1
+        ";
+        let runtime: Runtime = yaml::from_str(yaml).expect("Should parse Runtime");
+        let source_rate_control = runtime
+            .source_rate_control
+            .expect("source_rate_control section should exist");
+        assert_eq!(
+            source_rate_control.state_location.as_deref(),
+            Some("s3://my-bucket/spice-rate-control")
+        );
+        assert_eq!(
+            source_rate_control
+                .params
+                .expect("params should exist")
+                .as_string_map()
+                .get("s3_region")
+                .map(String::as_str),
+            Some("us-east-1")
+        );
     }
 
     #[test]

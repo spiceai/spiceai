@@ -154,8 +154,9 @@ fn start_time_only_changes(
             Process,
             *scheduler != current.scheduler,
         ),
-        // `refresh_interval` is read once at startup; a GitHub connector the
-        // reload recreates re-reads `github_concurrent_connections_limit`.
+        // `state_location`, `params` and `refresh_interval` are read once at
+        // startup; a GitHub connector the reload recreates re-reads
+        // `github_concurrent_connections_limit`.
         (
             "runtime.source_rate_control",
             ProcessAndRecreatedComponents,

@@ -50,7 +50,7 @@ fn app_with_file_rate_control(state_location: &str, refresh_interval: &str) -> A
             }),
             source_rate_control: Some(SourceRateControl {
                 refresh_interval: refresh_interval.to_string(),
-                github_concurrent_connections_limit: None,
+                ..SourceRateControl::default()
             }),
             ..Default::default()
         })
@@ -82,6 +82,29 @@ fn state_url(state_dir: &Path) -> String {
     Url::from_directory_path(state_dir)
         .expect("state dir should convert to file URL")
         .to_string()
+}
+
+/// Every file under `state_dir`, as a path relative to it.
+fn state_objects(state_dir: &Path) -> Vec<String> {
+    let mut objects = Vec::new();
+    let mut pending = vec![state_dir.to_path_buf()];
+    while let Some(dir) = pending.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries {
+            let path = entry.expect("state dir entry should be readable").path();
+            if path.is_dir() {
+                pending.push(path);
+            } else {
+                let relative = path
+                    .strip_prefix(state_dir)
+                    .expect("entry should be under the state dir");
+                objects.push(relative.to_string_lossy().into_owned());
+            }
+        }
+    }
+    objects
 }
 
 /// What two replicas driven as hard as they can acquired from one cluster
@@ -249,6 +272,78 @@ async fn replicas_with_different_limits_are_held_to_the_lowest() {
         observed_rps >= f64::from(lower) * 0.7,
         "replicas at {lower} and {higher} RPS sent {observed_rps:.1} RPS combined, below 70% of {lower} (a={count_a} b={count_b})"
     );
+}
+
+/// `runtime.source_rate_control.state_location` turns cluster rate control on
+/// by itself and takes precedence over `runtime.state`. The state object for
+/// an origin sits at `<spicepod>/<origin>-<hash>` directly under it.
+#[tokio::test]
+async fn source_rate_control_state_location_overrides_runtime_state() {
+    for with_runtime_state in [false, true] {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let rate_control_dir = temp_dir.path().join("rate-control-state");
+        let runtime_state_dir = temp_dir.path().join("runtime-state");
+        let app = AppBuilder::new(APP_NAME)
+            .with_runtime(SpicepodRuntime {
+                state: with_runtime_state.then(|| RuntimeState {
+                    location: state_url(&runtime_state_dir),
+                    params: None,
+                }),
+                source_rate_control: Some(SourceRateControl {
+                    state_location: Some(state_url(&rate_control_dir)),
+                    refresh_interval: "1s".to_string(),
+                    ..SourceRateControl::default()
+                }),
+                ..Default::default()
+            })
+            .build();
+        let runtime = Arc::new(Runtime::builder().with_app(app.clone()).build().await);
+        let dataset = dataset_for_runtime(&app, &runtime);
+
+        let controller = runtime
+            .http_rate_control_registry()
+            .shared_rate_controller_for_component(
+                &Url::parse(ORIGIN_URL).expect("origin URL parse"),
+                &rps_config(10),
+                dataset.app.name.as_str(),
+                &ConnectorComponent::from(&dataset),
+                "https",
+            )
+            .await
+            .expect("controller should build")
+            .controller
+            .expect("a rate-limited origin builds a controller");
+        controller
+            .refresh_and_persist_state_snapshot()
+            .await
+            .expect("lease the first window");
+
+        // The persistence task may be mid-write, so skip the store's
+        // `<object>#<n>` staging files.
+        let rate_control_objects = |state_dir: &Path| {
+            state_objects(state_dir)
+                .into_iter()
+                .filter(|object| {
+                    object.starts_with(&format!("{APP_NAME}/")) && !object.contains('#')
+                })
+                .collect::<Vec<_>>()
+        };
+        let expected_prefix = format!("{APP_NAME}/rate-control-cluster.example.com_443-");
+        let objects = rate_control_objects(&rate_control_dir);
+        assert!(
+            matches!(
+                objects.as_slice(),
+                [object] if object.starts_with(&expected_prefix)
+                    && Path::new(object).extension().is_some_and(|ext| ext == "json")
+            ),
+            "expected one {expected_prefix}*.json object under the rate-control location (runtime.state set: {with_runtime_state}), found {objects:?}"
+        );
+        assert_eq!(
+            rate_control_objects(&runtime_state_dir),
+            Vec::<String>::new(),
+            "runtime.state must hold no rate-control state when the override is set"
+        );
+    }
 }
 
 /// Two replicas sharing one budget through the object store, with adaptive
