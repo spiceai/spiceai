@@ -286,3 +286,43 @@ async fn duckdb_sync_all_columns_never_stores_a_rounded_value() -> Result<(), an
         })
         .await
 }
+
+/// A delete carries the old row, which under `REPLICA IDENTITY FULL` holds every
+/// column. A keyed delete uses only the primary key, so an old value the
+/// acceleration's narrower column type cannot hold does not refuse it.
+#[tokio::test(flavor = "multi_thread")]
+async fn duckdb_sync_all_columns_applies_a_delete_whose_old_row_no_longer_fits()
+-> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    register_test_connectors().await;
+    test_request_context()
+        .scope(async {
+            let container = common::start_postgres_docker_container_with_logical_wal().await?;
+            let port = container.host_port(5432)?;
+            let table = "type_change_duckdb_delete";
+            let (source, rt) = start(port, table, "duckdb", OnSchemaChange::SyncAllColumns).await?;
+            source
+                .simple_query(&format!("ALTER TABLE public.{table} REPLICA IDENTITY FULL"))
+                .await?;
+            source
+                .simple_query(&format!(
+                    "ALTER TABLE public.{table} ALTER COLUMN k TYPE double precision USING k + 0.5"
+                ))
+                .await?;
+            source
+                .simple_query(&format!("DELETE FROM public.{table} WHERE id = 1"))
+                .await?;
+            wait_for(
+                &rt,
+                &format!("SELECT id FROM {table} ORDER BY id"),
+                "+----+\n\
+                 | id |\n\
+                 +----+\n\
+                 | 2  |\n\
+                 | 3  |\n\
+                 +----+",
+            )
+            .await
+        })
+        .await
+}

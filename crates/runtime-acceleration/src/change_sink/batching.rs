@@ -22,9 +22,9 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use arrow::array::{Array, ArrayRef, AsArray, RecordBatch};
-use arrow::compute::cast;
+use arrow::array::{Array, ArrayRef, AsArray, BooleanArray, RecordBatch};
 use arrow::compute::kernels::cmp::not_distinct;
+use arrow::compute::{cast, filter_record_batch};
 use arrow::datatypes::{DataType, Float64Type, SchemaRef};
 use arrow::util::display::array_value_to_string;
 use data_components::cdc::{self, ChangeOperation};
@@ -563,7 +563,8 @@ impl CdcBurst {
             {
                 target = Arc::clone(&plan.evolved_schema);
             }
-            if matches!(schema, SchemaDecision::Proceed)
+            if upserts
+                && matches!(schema, SchemaDecision::Proceed)
                 && !batch
                     .data_schema()
                     .fields()
@@ -574,7 +575,22 @@ impl CdcBurst {
                             && incoming.data_type() == current.data_type()
                     })
             {
-                ensure_numbers_cast_exactly(&batch.data_batch(), &target)?;
+                // A delete applies by primary key, which is never widened in
+                // place, so only the rows that write their values are checked.
+                let writes: BooleanArray = (0..batch.record.num_rows())
+                    .map(|row| {
+                        Some(matches!(
+                            batch.op(row),
+                            ChangeOperation::Create
+                                | ChangeOperation::Update
+                                | ChangeOperation::Read
+                        ))
+                    })
+                    .collect();
+                ensure_numbers_cast_exactly(
+                    &filter_record_batch(&batch.data_batch(), &writes)?,
+                    &target,
+                )?;
             }
             let mut options = self.options;
             if requires_durable_path(&batch, capabilities.deferred_deletes) {
