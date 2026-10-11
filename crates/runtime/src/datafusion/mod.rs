@@ -32,7 +32,9 @@ use crate::accelerated::{
 };
 use crate::catalogconnector::deferred::DeferredCatalogProvider;
 use crate::component::access::AccessMode;
-use crate::component::dataset::acceleration::{Acceleration, Engine, Mode, RefreshMode};
+use crate::component::dataset::acceleration::{
+    Acceleration, Engine, Mode, RefreshMode, ZeroResultsAction,
+};
 use crate::component::dataset::{Dataset, OnSchemaChange, ReadyState};
 use crate::component::view::View;
 use crate::dataaccelerator::ReloadProviderFactory;
@@ -282,6 +284,15 @@ pub enum Error {
 
     #[snafu(display("{source}"))]
     RetentionSql { source: retention_sql::Error },
+
+    #[snafu(display(
+        "Failed to register dataset '{dataset_name}' ({connector}): `on_zero_results: use_source` cannot be combined with this retention configuration, so the dataset was not loaded. Cause: the fallback source scan cannot apply the inverse of the retention predicate ({source}) and would return rows retention already removed. Remove `on_zero_results: use_source`, or use a `retention_sql` / `retention_period` predicate that can be evaluated as a filter on the source columns. See: https://spiceai.org/docs/components/data-accelerators"
+    ))]
+    RetentionUseSourceUntranslatable {
+        dataset_name: String,
+        connector: String,
+        source: crate::accelerated::FallbackRetentionKeepError,
+    },
 
     #[snafu(display("Unable to get table: {}", format_datafusion_error(source)))]
     UnableToGetTable { source: DataFusionError },
@@ -597,6 +608,7 @@ impl Error {
             // Invalid `refresh_sql` / `retention_sql` in the Spicepod.
             Self::RefreshSql { .. }
                 | Self::RetentionSql { .. }
+                | Self::RetentionUseSourceUntranslatable { .. }
                 // `time_column`/`time_format` disagree with the source schema.
                 | Self::InvalidTimeColumnTimeFormat { .. }
                 | Self::AppendRequiresTimeColumn { .. }
@@ -4128,7 +4140,7 @@ impl DataFusion {
             .time_period(dataset.retention_period())
             .check_interval(dataset.retention_check_interval())
             .enabled(acceleration_settings.retention_check_enabled)
-            .delete_expr(retention_delete_expr);
+            .delete_expr(retention_delete_expr.clone());
 
         // Caching mode decides what bounds the accelerator in the block below, and
         // can install a policy derived from the caching parameters over this one — so
@@ -4147,6 +4159,60 @@ impl DataFusion {
         // `time_column`, no period or expression — and the caching branch below
         // has to tell "bounded" from "configured to be bounded".
         let declared_retention_runs = retention.is_some();
+
+        if matches!(
+            acceleration_settings.on_zero_results,
+            ZeroResultsAction::UseSource
+        ) && !matches!(refresh_mode, RefreshMode::Caching)
+        {
+            match crate::accelerated::FallbackRetentionKeep::from_configured(
+                retention.as_ref(),
+                retention_delete_expr.clone(),
+            ) {
+                Ok(keep) => {
+                    // Cayenne hides expired `time_column` values at scan time
+                    // whether or not the retention ticker runs. Other engines
+                    // only need the extra cutoff when no scheduled worker
+                    // inverts `retention_period`.
+                    let apply_time_column_keep =
+                        !declared_retention_runs || acceleration_settings.engine == Engine::Cayenne;
+                    // Cayenne's scan-time builder keeps only whole seconds
+                    // (`Duration::as_secs`). Using the full duration here would
+                    // keep rows between `floor(period)` and `period` that
+                    // Cayenne already hides.
+                    let time_period = match (
+                        acceleration_settings.engine == Engine::Cayenne,
+                        dataset.retention_period(),
+                    ) {
+                        (true, Some(period)) => Some(Duration::from_secs(period.as_secs())),
+                        (_, period) => period,
+                    };
+                    let keep = crate::accelerated::FallbackRetentionKeep::with_time_column_keep(
+                        keep,
+                        apply_time_column_keep,
+                        time_period,
+                        dataset.time_column.clone(),
+                        dataset.time_format,
+                    );
+                    if let Some(keep) = keep {
+                        keep.validate(&source_table_provider.schema()).context(
+                            RetentionUseSourceUntranslatableSnafu {
+                                dataset_name: dataset.name.to_string(),
+                                connector: dataset.source().to_string(),
+                            },
+                        )?;
+                        accelerated_table_builder.fallback_retention_keep(Some(keep));
+                    }
+                }
+                Err(source) => {
+                    return Err(Error::RetentionUseSourceUntranslatable {
+                        dataset_name: dataset.name.to_string(),
+                        connector: dataset.source().to_string(),
+                        source,
+                    });
+                }
+            }
+        }
 
         accelerated_table_builder.retention(retention);
 
@@ -7212,6 +7278,24 @@ mod tests {
     use crate::builder::RuntimeBuilder;
 
     use super::*;
+
+    #[test]
+    fn retention_use_source_untranslatable_names_the_combination() {
+        let err = Error::RetentionUseSourceUntranslatable {
+            dataset_name: "events".to_string(),
+            connector: "file".to_string(),
+            source: crate::accelerated::FallbackRetentionKeepError::ComputedOnly,
+        };
+        let message = err.to_string();
+        assert!(
+            message.contains("`on_zero_results: use_source`")
+                && message.contains("'events'")
+                && message.contains("(file)")
+                && message.contains("would return rows retention already removed")
+                && message.contains("https://spiceai.org/docs/components/data-accelerators"),
+            "the load refusal must name the dataset, the combination, the impact, and the docs: {message}"
+        );
+    }
 
     /// Every way of naming a dataset must give the same lock. The OpenTelemetry ingest uses
     /// the bare name and a Flight `DoPut` uses the fully-qualified one; separate locks would

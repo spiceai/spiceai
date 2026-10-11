@@ -18,7 +18,7 @@ limitations under the License.
 
 //! Integration tests for Cayenne partition pruning with `partition_by`
 
-mod common;
+use crate::common;
 
 use arrow::array::{Int64Array, StringArray};
 

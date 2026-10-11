@@ -169,6 +169,38 @@
         }
       }
     },
+    "/v1/config": {
+      "get": {
+        "tags": [
+          "Iceberg"
+        ],
+        "summary": "Get Iceberg API config",
+        "description": "This endpoint returns the Iceberg Catalog API configuration, including details about overrides, defaults, and available endpoints.",
+        "operationId": "get_config",
+        "responses": {
+          "200": {
+            "description": "API configuration retrieved successfully",
+            "content": {
+              "application/json": {
+                "schema": {},
+                "example": {
+                  "overrides": {},
+                  "defaults": {},
+                  "endpoints": [
+                    "GET /v1/{prefix}/namespaces",
+                    "GET /v1/{prefix}/namespaces/{namespace}",
+                    "HEAD /v1/{prefix}/namespaces/{namespace}",
+                    "GET /v1/{prefix}/namespaces/{namespace}/tables",
+                    "GET /v1/{prefix}/namespaces/{namespace}/tables/{table}",
+                    "HEAD /v1/{prefix}/namespaces/{namespace}/tables/{table}"
+                  ]
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/v1/datasets": {
       "get": {
         "tags": [
@@ -652,319 +684,6 @@
         }
       }
     },
-    "/v1/iceberg/config": {
-      "get": {
-        "tags": [
-          "Iceberg"
-        ],
-        "summary": "Get Iceberg API config",
-        "description": "This endpoint returns the Iceberg Catalog API configuration, including details about overrides, defaults, and available endpoints.",
-        "operationId": "get_config",
-        "responses": {
-          "200": {
-            "description": "API configuration retrieved successfully",
-            "content": {
-              "application/json": {
-                "schema": {},
-                "example": {
-                  "overrides": {},
-                  "defaults": {},
-                  "endpoints": [
-                    "GET /v1/iceberg/namespaces",
-                    "HEAD /v1/iceberg/namespaces/{namespace}",
-                    "GET /v1/iceberg/namespaces/{namespace}/tables",
-                    "HEAD /v1/iceberg/namespaces/{namespace}/tables/{table}",
-                    "GET /v1/iceberg/namespaces/{namespace}/tables/{table}"
-                  ]
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/v1/iceberg/namespaces": {
-      "get": {
-        "tags": [
-          "Iceberg"
-        ],
-        "summary": "List Iceberg namespaces",
-        "description": "This endpoint retrieves namespaces available in the Iceberg catalog.\nIf a `parent` namespace is provided, it will list the child namespaces under the specified parent.",
-        "operationId": "get_iceberg_namespaces",
-        "parameters": [
-          {
-            "name": "parent",
-            "in": "query",
-            "description": "The parent namespace from which to retrieve child namespaces.",
-            "required": false,
-            "schema": {
-              "$ref": "#/components/schemas/Namespace"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Namespaces retrieved successfully",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/NamespacesResponse"
-                },
-                "example": {
-                  "namespaces": [
-                    {
-                      "parts": [
-                        "catalog_a"
-                      ]
-                    },
-                    {
-                      "parts": [
-                        "catalog_b",
-                        "schema_1"
-                      ]
-                    }
-                  ]
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Bad request",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/IcebergResponseError"
-                },
-                "example": {
-                  "error": {
-                    "message": "Invalid namespace request",
-                    "type": "BadRequestException",
-                    "code": 400
-                  }
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Namespace not found",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/IcebergResponseError"
-                },
-                "example": {
-                  "error": {
-                    "message": "Namespace provided does not exist",
-                    "type": "NoSuchNamespaceException",
-                    "code": 404
-                  }
-                }
-              }
-            }
-          },
-          "500": {
-            "description": "Internal server error",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/IcebergResponseError"
-                },
-                "example": {
-                  "error": {
-                    "message": "Internal Server Error: DF_SCHEMA_NOT_FOUND",
-                    "type": "InternalServerError",
-                    "code": 500
-                  }
-                }
-              }
-            }
-          }
-        }
-      }
-    },
-    "/v1/iceberg/namespaces/{namespace}": {
-      "get": {
-        "tags": [
-          "Iceberg"
-        ],
-        "summary": "Check if a namespace exists.",
-        "description": "This endpoint returns a 200 OK response if the namespace exists, otherwise it returns a 404 Not Found response.",
-        "operationId": "get_namespace",
-        "responses": {
-          "200": {
-            "description": "Namespace exists"
-          },
-          "400": {
-            "description": "Invalid namespace format"
-          },
-          "404": {
-            "description": "Namespace does not exist"
-          }
-        }
-      },
-      "head": {
-        "tags": [
-          "Iceberg"
-        ],
-        "summary": "Check Namespace exists",
-        "description": "This endpoint returns a 200 OK response if the namespace exists, otherwise it returns a 404 Not Found response.",
-        "operationId": "head_namespace",
-        "responses": {
-          "200": {
-            "description": "Namespace exists"
-          },
-          "400": {
-            "description": "Invalid namespace format"
-          },
-          "404": {
-            "description": "Namespace does not exist"
-          }
-        }
-      }
-    },
-    "/v1/iceberg/namespaces/{namespace}/tables": {
-      "get": {
-        "tags": [
-          "Iceberg"
-        ],
-        "operationId": "list_tables",
-        "responses": {
-          "200": {
-            "description": "Tables retrieved successfully",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ListTablesResponse"
-                },
-                "example": {
-                  "identifiers": [
-                    {
-                      "namespace": {
-                        "parts": [
-                          "catalog_a"
-                        ]
-                      },
-                      "name": "table_1"
-                    },
-                    {
-                      "namespace": {
-                        "parts": [
-                          "catalog_b",
-                          "schema_1"
-                        ]
-                      },
-                      "name": "table_2"
-                    }
-                  ]
-                }
-              }
-            }
-          },
-          "400": {
-            "description": "Invalid namespace format"
-          },
-          "404": {
-            "description": "Namespace does not exist"
-          }
-        }
-      }
-    },
-    "/v1/iceberg/namespaces/{namespace}/tables/{table}": {
-      "get": {
-        "tags": [
-          "Iceberg"
-        ],
-        "summary": "Get a table.",
-        "description": "This endpoint returns the table if it exists, otherwise it returns a 404 Not Found response.",
-        "operationId": "get_table",
-        "parameters": [
-          {
-            "name": "namespace",
-            "in": "path",
-            "description": "The namespace of the table.",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "table",
-            "in": "path",
-            "description": "The name of the table.",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Table exists",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/LoadTableResponse"
-                }
-              }
-            }
-          },
-          "404": {
-            "description": "Table does not exist"
-          },
-          "500": {
-            "description": "An internal server error occurred while getting the table",
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/IcebergResponseError"
-                },
-                "example": {
-                  "error": {
-                    "message": "Request failed. An internal server error occurred while getting the table.",
-                    "r#type": "InternalServerError",
-                    "code": 500
-                  }
-                }
-              }
-            }
-          }
-        }
-      },
-      "head": {
-        "tags": [
-          "Iceberg"
-        ],
-        "summary": "Check if a table exists.",
-        "description": "This endpoint returns a 200 OK response if the table exists, otherwise it returns a 404 Not Found response.",
-        "operationId": "head_table",
-        "parameters": [
-          {
-            "name": "namespace",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "$ref": "#/components/schemas/NamespacePath"
-            }
-          },
-          {
-            "name": "table",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "description": "Table exists"
-          },
-          "404": {
-            "description": "Table does not exist"
-          }
-        }
-      }
-    },
     "/v1/mcp": {
       "get": {
         "tags": [
@@ -1184,6 +903,326 @@
                 }
               }
             }
+          }
+        }
+      }
+    },
+    "/v1/namespaces": {
+      "get": {
+        "tags": [
+          "Iceberg"
+        ],
+        "summary": "List Iceberg namespaces",
+        "description": "This endpoint retrieves namespaces available in the Iceberg catalog.\nIf a `parent` namespace is provided, it will list the child namespaces under the specified parent.",
+        "operationId": "get_iceberg_namespaces",
+        "parameters": [
+          {
+            "name": "parent",
+            "in": "query",
+            "description": "The parent namespace from which to retrieve child namespaces.",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/Namespace"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Namespaces retrieved successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/NamespacesResponse"
+                },
+                "example": {
+                  "namespaces": [
+                    {
+                      "parts": [
+                        "catalog_a"
+                      ]
+                    },
+                    {
+                      "parts": [
+                        "catalog_b",
+                        "schema_1"
+                      ]
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IcebergResponseError"
+                },
+                "example": {
+                  "error": {
+                    "message": "Invalid namespace request",
+                    "type": "BadRequestException",
+                    "code": 400
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Namespace not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IcebergResponseError"
+                },
+                "example": {
+                  "error": {
+                    "message": "Namespace provided does not exist",
+                    "type": "NoSuchNamespaceException",
+                    "code": 404
+                  }
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Internal server error",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IcebergResponseError"
+                },
+                "example": {
+                  "error": {
+                    "message": "Internal Server Error: DF_SCHEMA_NOT_FOUND",
+                    "type": "InternalServerError",
+                    "code": 500
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/namespaces/{namespace}": {
+      "get": {
+        "tags": [
+          "Iceberg"
+        ],
+        "summary": "Load an Iceberg namespace",
+        "description": "Returns the namespace if it exists. Spice does not store namespace properties, so `properties` is `null`.",
+        "operationId": "get_namespace",
+        "responses": {
+          "200": {
+            "description": "Namespace exists",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/GetNamespaceResponse"
+                },
+                "example": {
+                  "namespace": [
+                    "spice",
+                    "public"
+                  ],
+                  "properties": null
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid namespace format"
+          },
+          "404": {
+            "description": "Namespace does not exist"
+          }
+        }
+      },
+      "head": {
+        "tags": [
+          "Iceberg"
+        ],
+        "summary": "Check Namespace exists",
+        "description": "This endpoint returns a 200 OK response if the namespace exists, otherwise it returns a 404 Not Found response.",
+        "operationId": "head_namespace",
+        "responses": {
+          "200": {
+            "description": "Namespace exists"
+          },
+          "400": {
+            "description": "Invalid namespace format"
+          },
+          "404": {
+            "description": "Namespace does not exist"
+          }
+        }
+      }
+    },
+    "/v1/namespaces/{namespace}/tables": {
+      "get": {
+        "tags": [
+          "Iceberg"
+        ],
+        "operationId": "list_tables",
+        "responses": {
+          "200": {
+            "description": "Tables retrieved successfully",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ListTablesResponse"
+                },
+                "example": {
+                  "identifiers": [
+                    {
+                      "namespace": {
+                        "parts": [
+                          "catalog_a"
+                        ]
+                      },
+                      "name": "table_1"
+                    },
+                    {
+                      "namespace": {
+                        "parts": [
+                          "catalog_b",
+                          "schema_1"
+                        ]
+                      },
+                      "name": "table_2"
+                    }
+                  ]
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid namespace format"
+          },
+          "404": {
+            "description": "Namespace does not exist"
+          }
+        }
+      }
+    },
+    "/v1/namespaces/{namespace}/tables/{table}": {
+      "get": {
+        "tags": [
+          "Iceberg"
+        ],
+        "summary": "Load a table.",
+        "description": "A table Spice reads unchanged from an Iceberg table (a federated `iceberg:`\nor `glue:` dataset, a table in an Iceberg or Glue catalog, or an Iceberg DDL\ntable) is returned as that Iceberg table: its current metadata and metadata\nlocation, loaded from its catalog on every request, so an Iceberg client\nreads the snapshot Spice's next query reads. A column added to the table\noutside Spice reaches the client at once, while Spice keeps the columns the\ntable had when it was registered until it is reloaded. Any other table\n(accelerated, with columns Spice computes such as embeddings, a view, or a\nsource that is not Iceberg) is refused with `400`, naming the reason: query\nit with SQL through Spice instead.",
+        "operationId": "get_table",
+        "parameters": [
+          {
+            "name": "namespace",
+            "in": "path",
+            "description": "The namespace of the table.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "table",
+            "in": "path",
+            "description": "The name of the table.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The Iceberg table Spice reads the table from",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LoadTableResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "The table cannot be read as an Iceberg table",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IcebergResponseError"
+                },
+                "example": {
+                  "error": {
+                    "message": "Failed to load table 'spice.public.orders' as an Iceberg table: it is accelerated, so Spice answers queries from its acceleration rather than from an Iceberg table that Iceberg clients can read directly. Query it with SQL through Spice instead, over HTTP (`/v1/sql`) or Arrow Flight SQL. See: https://spiceai.org/docs/api/HTTP/get-table",
+                    "type": "BadRequestException",
+                    "code": 400
+                  }
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Table does not exist",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IcebergResponseError"
+                },
+                "example": {
+                  "error": {
+                    "message": "Table 'spice.public.orders' does not exist",
+                    "type": "NoSuchTableException",
+                    "code": 404
+                  }
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The table's Iceberg catalog could not be reached",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IcebergResponseError"
+                }
+              }
+            }
+          }
+        }
+      },
+      "head": {
+        "tags": [
+          "Iceberg"
+        ],
+        "summary": "Check if a table exists.",
+        "description": "This endpoint returns a 200 OK response if the table exists, otherwise it returns a 404 Not Found response.",
+        "operationId": "head_table",
+        "parameters": [
+          {
+            "name": "namespace",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/NamespacePath"
+            }
+          },
+          {
+            "name": "table",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Table exists"
+          },
+          "404": {
+            "description": "Table does not exist"
           }
         }
       }
@@ -7722,6 +7761,31 @@
           }
         }
       },
+      "GetNamespaceResponse": {
+        "type": "object",
+        "description": "The Iceberg REST `GetNamespaceResponse`.",
+        "required": [
+          "namespace"
+        ],
+        "properties": {
+          "namespace": {
+            "$ref": "#/components/schemas/Namespace"
+          },
+          "properties": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Always `null`: Spice does not store namespace properties, and the spec\nasks a server without them to return `null` rather than `{}`.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          }
+        }
+      },
       "GrammarSyntax": {
         "type": "string",
         "enum": [
@@ -7773,7 +7837,9 @@
         "type": "string",
         "enum": [
           "NoSuchNamespaceException",
+          "NoSuchTableException",
           "BadRequestException",
+          "ServiceUnavailableException",
           "InternalServerError"
         ]
       },
@@ -8939,12 +9005,20 @@
       },
       "LoadTableResponse": {
         "type": "object",
+        "description": "The Iceberg REST `LoadTableResult`: the table's metadata and where it is\nstored. No `config` or `storage-credentials`: a client reads the table's\nfiles with its own credentials.",
         "required": [
           "metadata"
         ],
         "properties": {
           "metadata": {
-            "$ref": "#/components/schemas/TableMetadata"
+            "type": "object",
+            "description": "Iceberg table metadata, see `<https://iceberg.apache.org/spec/#table-metadata>`."
+          },
+          "metadata-location": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         }
       },
@@ -12036,12 +12110,6 @@
           }
         ]
       },
-      "TableFormatVersion": {
-        "type": "string",
-        "enum": [
-          "V2"
-        ]
-      },
       "TableIdentifier": {
         "type": "object",
         "required": [
@@ -12054,79 +12122,6 @@
           },
           "namespace": {
             "$ref": "#/components/schemas/Namespace"
-          }
-        }
-      },
-      "TableMetadata": {
-        "type": "object",
-        "required": [
-          "format-version",
-          "table-uuid",
-          "location",
-          "schemas",
-          "last-updated-ms",
-          "last-column-id",
-          "last-sequence-number",
-          "current-schema-id",
-          "partition-specs",
-          "default-spec-id",
-          "last-partition-id",
-          "sort-orders",
-          "default-sort-order-id"
-        ],
-        "properties": {
-          "current-schema-id": {
-            "type": "integer",
-            "format": "int32",
-            "minimum": 0
-          },
-          "default-sort-order-id": {
-            "type": "integer",
-            "format": "int32",
-            "minimum": 0
-          },
-          "default-spec-id": {
-            "type": "integer",
-            "format": "int32",
-            "minimum": 0
-          },
-          "format-version": {
-            "$ref": "#/components/schemas/TableFormatVersion"
-          },
-          "last-column-id": {
-            "type": "integer",
-            "format": "int32"
-          },
-          "last-partition-id": {
-            "type": "integer",
-            "format": "int32",
-            "minimum": 0
-          },
-          "last-sequence-number": {
-            "type": "integer",
-            "format": "int64",
-            "minimum": 0
-          },
-          "last-updated-ms": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "location": {
-            "type": "string"
-          },
-          "partition-specs": {
-            "type": "object"
-          },
-          "schemas": {
-            "type": "object",
-            "description": "Iceberg schemas, see `<https://apache.github.io/iceberg/spec/#schemas>`."
-          },
-          "sort-orders": {
-            "type": "object"
-          },
-          "table-uuid": {
-            "type": "string",
-            "example": "2b9da507-2c07-4bb3-9f0b-8df66a5e9e53"
           }
         }
       },
