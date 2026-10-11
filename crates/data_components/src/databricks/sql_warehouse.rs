@@ -2094,6 +2094,10 @@ impl crate::Read for DatabricksSqlWarehouse {
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
         let dialect = Arc::new(databricks_dialect());
 
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "installs `deny_spice_functions_for_table_providers()` with `with_function_support` below"
+        )]
         let table_provider = Arc::new(
             SqlTable::new("databricks", &self.pool, table_reference, None)
                 .await

@@ -314,6 +314,33 @@ mod rrf_vector_search_tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn test_nested_named_limit() -> Result<ExitCode> {
+        let (df, embedding_models) = make_test_session().await?;
+
+        let fruit_df = make_fruit_dataframe(&df).await?;
+        let fruit_embedding_table = df_as_embedding_table(Arc::clone(&embedding_models), fruit_df);
+
+        df.ctx.register_table("foo", fruit_embedding_table)?;
+
+        let results = test_query!(
+            df.ctx,
+            "select * from rrf(vector_search(foo, 'crispy', limit => 1), vector_search(foo, 'crispy', limit => 1))"
+        );
+
+        let num_rows: usize = results
+            .iter()
+            .map(arrow::record_batch::RecordBatch::num_rows)
+            .sum();
+        assert_eq!(num_rows, 1);
+        assert_eq!(
+            extract_column!(results, "content", as_string_array).value(0),
+            "apple fruit sweet red crispy"
+        );
+
+        Ok(ExitCode::SUCCESS)
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn test_fuse_queries() -> Result<ExitCode> {
         let (df, embedding_models) = make_test_session().await?;
 

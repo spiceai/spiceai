@@ -377,7 +377,7 @@ fn model_source_from_pattern(name: &str) -> String {
 
 fn model_source_from_description(name: &str) -> String {
     if name == "typesafe" {
-        "Model source for TypeSafe System One evaluation (Jev). Accepts `typesafe`, `typesafe:<model_id>`, or `typesafe/<model_id>`. Chat completions are not supported; use POST /v1/evaluate.".to_string()
+        "Model source for TypeSafe System One evaluation (Jev). Accepts `typesafe`, `typesafe:<model_id>`, or `typesafe/<model_id>`. Chat completions are not supported; use POST /v1/decisions or the SQL decision functions.".to_string()
     } else {
         format!("Model source for {name} provider. Format: {name}:<model_id>")
     }

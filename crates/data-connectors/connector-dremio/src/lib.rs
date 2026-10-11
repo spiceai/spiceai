@@ -171,6 +171,10 @@ impl DataConnectorFactory for DremioFactory {
             let flight_client = FlightClient::try_new(endpoint, credentials, None, None)
                 .await
                 .context(UnableToCreateFlightClientSnafu)?;
+            #[expect(
+                clippy::disallowed_methods,
+                reason = "installs `deny_spice_specific_functions()` on the next line"
+            )]
             let flight_factory =
                 FlightFactory::new("dremio", flight_client, Arc::new(DremioDialect {}))
                     .with_function_support(deny_spice_specific_functions().as_ref().clone());

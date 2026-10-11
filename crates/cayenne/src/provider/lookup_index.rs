@@ -30,11 +30,9 @@ limitations under the License.
 //! A file no run covers — written before a restart, or by a write whose run
 //! could not be built — is read in full, and a lookup that meets one asks for
 //! a background build that reads back only the files not yet covered, paced
-//! so it takes a bounded share of a core. With the hidden
-//! `SPICE_CAYENNE_INDEX_PERSISTENCE=enabled` switch (for testing), each run also
-//! persists as a file under the table's `_lookup_index` directory, registered
-//! in the metastore, so a reopened table loads its runs instead of reading its
-//! files back; otherwise nothing is persisted.
+//! so it takes a bounded share of a core. Each run also persists as a file
+//! under the table's `_lookup_index` directory, registered in the metastore,
+//! so a reopened table loads its runs instead of reading its files back.
 //!
 //! Declared with the acceleration's `indexes`, one key per entry:
 //!
@@ -2565,10 +2563,6 @@ impl vortex_datafusion::VortexWriteObserver for RunObserver {
 /// sorts the write's keys: about 140 ms for 1.2M rows and 3.5 s for 20M,
 /// measured in `spiced`.
 const DEFER_FINISH_ROWS: usize = 1 << 20;
-
-/// Whether a table's secondary index runs persist as run files. Hidden,
-/// for testing: `SPICE_CAYENNE_INDEX_PERSISTENCE=enabled`.
-pub(crate) const PERSISTENCE_ENV: &str = "SPICE_CAYENNE_INDEX_PERSISTENCE";
 
 /// Serializes persistence for one durable table location across provider opens.
 /// The weak owner fences work queued by providers that have been replaced.

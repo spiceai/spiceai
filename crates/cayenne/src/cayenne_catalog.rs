@@ -985,6 +985,36 @@ impl CayenneCatalog {
                 .map(|id| sql_text_literal(id))
                 .collect::<Vec<_>>()
                 .join(", ");
+            // CAS guard, the counterpart of `swap_protected_snapshots_in_txn`'s:
+            // every protected snapshot this rewrite folded must still be
+            // registered. The rewrite's output already holds their rows, so if a
+            // concurrent writer swapped one for a merged snapshot (or removed it)
+            // after the rewrite captured its fence, the snapshot that replaced it
+            // would stay registered beside the output and its rows would be read
+            // twice. A second provider instance for the same table is one way that
+            // happens — its `compaction_lock` is its own, so nothing in memory
+            // serializes its protected-snapshot merge against this rewrite — and
+            // a retention delete that empties a protected snapshot is another.
+            let folded = protected_snapshot_ids_to_clear.len();
+            let count_values = txn
+                .query_row_values(QueryRowParams {
+                    sql: &format!(
+                        "SELECT COUNT(*) FROM cayenne_snapshot_sequence \
+                         WHERE table_id = {table_id_literal} AND snapshot_id IN ({id_list})"
+                    ),
+                    params: vec![],
+                })
+                .await?;
+            let registered =
+                usize::try_from(i64::from_value(metastore_value_at(&count_values, 0)?)?)
+                    .unwrap_or(0);
+            if registered != folded {
+                return Err(CatalogError::ProtectedSnapshotsReplaced {
+                    table_id: table_id.to_string(),
+                    folded,
+                    missing: folded.saturating_sub(registered),
+                });
+            }
             format!(
                 "DELETE FROM cayenne_snapshot_sequence \
                  WHERE table_id = {table_id_literal} AND snapshot_id IN ({id_list}); "
@@ -1514,6 +1544,19 @@ impl CayenneCatalog {
         match self.get_table(table_name).await {
             Ok(mut stored_metadata) => {
                 log_runtime_footer_cache_drift(table_name, &stored_metadata, options);
+
+                // Rows written with the check off may share a key, and the
+                // stored-configuration fallback below would keep the table's
+                // stored key handling while the spicepod asks for the check,
+                // so the table must be rebuilt.
+                if stored_metadata.vortex_config.pk_conflict_detection == PkConflictDetection::None
+                    && options.vortex_config.pk_conflict_detection == PkConflictDetection::Auto
+                    && !stored_metadata.primary_key.is_empty()
+                {
+                    return Err(CatalogError::PkConflictDetectionEnabledOnExistingTable {
+                        table_name: table_name.to_string(),
+                    });
+                }
 
                 // Datalake (cold tier) config is runtime-toggleable, not table
                 // identity: reconcile it here instead of comparing it in
@@ -11573,6 +11616,78 @@ mod tests {
         );
 
         // Cleanup
+        let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
+        let _ = std::fs::remove_file(db_path);
+        let _ = std::fs::remove_file(format!("{db_path}-shm"));
+        let _ = std::fs::remove_file(format!("{db_path}-wal"));
+    }
+
+    /// Regression test for #14889: a table created with conflict detection off
+    /// may hold several rows per key, so reopening it with the check on must
+    /// fail rather than fall back to the stored configuration, which keeps the
+    /// check off.
+    #[tokio::test]
+    async fn reopening_a_none_table_with_auto_is_refused() {
+        use crate::metadata::{PkConflictDetection, VortexConfig};
+        use datafusion_table_providers::util::column_reference::ColumnReference;
+
+        let (_table_root, base_path) = test_table_root();
+        let test_db = format!("sqlite://./.test_pkd_reopen_{}.db", uuid::Uuid::now_v7());
+        let catalog = CayenneCatalog::new(&test_db).expect("Failed to create catalog");
+        catalog.init().await.expect("Failed to initialize catalog");
+        let schema = Arc::new(arrow_schema::Schema::new(vec![arrow_schema::Field::new(
+            "id",
+            arrow_schema::DataType::Int64,
+            false,
+        )]));
+        let options = |table: &str, key: &[&str], detection| CreateTableOptions {
+            table_name: table.to_string(),
+            schema: Arc::clone(&schema),
+            primary_key: key.iter().map(ToString::to_string).collect(),
+            on_conflict: (detection == PkConflictDetection::Auto && !key.is_empty())
+                .then(|| OnConflict::Upsert(ColumnReference::new(vec!["id".to_string()]))),
+            base_path: base_path.clone(),
+            partition_column: None,
+            vortex_config: VortexConfig {
+                pk_conflict_detection: detection,
+                ..VortexConfig::default()
+            },
+        };
+
+        let keyed = catalog
+            .create_table(options("keyed", &["id"], PkConflictDetection::None))
+            .await
+            .expect("create a keyed table with conflict detection off");
+        let refused = catalog
+            .create_table(options("keyed", &["id"], PkConflictDetection::Auto))
+            .await
+            .expect_err("reopening with conflict detection on must be refused");
+        assert_eq!(
+            refused.to_string(),
+            "Failed to load table 'keyed': it was created with 'cayenne_pk_conflict_detection: none', so it can hold more than one row per primary key, and the setting is now 'auto'. An existing table keeps the setting it was created with. To rebuild it from the source with one row per primary key, restart once with 'acceleration.mode: file_create', and with 'write_mode: write_through' if the dataset uses 'write_mode: write_back', then set both back. Rows that exist only in the acceleration are not kept."
+        );
+
+        // Reopening with the setting it was created with still works.
+        assert_eq!(
+            catalog
+                .create_table(options("keyed", &["id"], PkConflictDetection::None))
+                .await
+                .expect("reopen with the stored setting"),
+            keyed
+        );
+        // Without a primary key the setting has nothing to check.
+        let unkeyed = catalog
+            .create_table(options("unkeyed", &[], PkConflictDetection::None))
+            .await
+            .expect("create an unkeyed table with conflict detection off");
+        assert_eq!(
+            catalog
+                .create_table(options("unkeyed", &[], PkConflictDetection::Auto))
+                .await
+                .expect("an unkeyed table reopens with auto"),
+            unkeyed
+        );
+
         let db_path = test_db.strip_prefix("sqlite://").unwrap_or(&test_db);
         let _ = std::fs::remove_file(db_path);
         let _ = std::fs::remove_file(format!("{db_path}-shm"));

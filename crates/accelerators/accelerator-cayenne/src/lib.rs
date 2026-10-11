@@ -116,6 +116,27 @@ pub enum Error {
     PartitionedEvolutionUnsupported { dataset: Arc<str> },
 
     #[snafu(display(
+        "Failed to load dataset {dataset} (cayenne): its acceleration data was written {}, but the dataset now sets {}. \
+        Cayenne does not re-partition existing acceleration data. \
+        To keep using the existing data, {}. \
+        To apply the new 'partition_by' instead, stop Spice, delete the acceleration data directory '{data_dir}' and the Cayenne metastore directory '{metadata_dir}', then start Spice to reload the dataset from the source. \
+        Other Cayenne datasets that use this metastore also reload from their sources. \
+        See: https://spiceai.org/docs/features/data-acceleration/partitioning",
+        stored_partitioning(stored),
+        configured_partition_by(configured),
+        restore_partition_by(stored)
+    ))]
+    PartitionByChanged {
+        dataset: Arc<str>,
+        /// The partition columns the stored data was written with; empty when it is unpartitioned.
+        stored: Vec<String>,
+        /// The dataset's `partition_by` expressions.
+        configured: Vec<String>,
+        data_dir: String,
+        metadata_dir: String,
+    },
+
+    #[snafu(display(
         "Failed to configure dataset {table_name} (cayenne): The acceleration data directory '{data_dir}' contains the Cayenne metastore directory '{metadata_dir}'. \
         Recreating this dataset deletes its data directory, which would take the metastore — the catalog for every Cayenne dataset in this instance — with it. \
         Set 'cayenne_metadata_dir' to a directory outside the data directory, or rename the dataset. \
@@ -1052,6 +1073,19 @@ fn build_workload_profile(
     )
 }
 
+/// Whether opening the dataset's stored table failed on a setting the table
+/// cannot change, which no retry with the same Spicepod can clear. The catalog
+/// error arrives wrapped by the table-provider build, so the whole chain is
+/// searched.
+fn rejects_stored_table(error: &(dyn std::error::Error + 'static)) -> bool {
+    std::iter::successors(Some(error), |error| error.source()).any(|error| {
+        matches!(
+            error.downcast_ref::<cayenne::CatalogError>(),
+            Some(cayenne::CatalogError::PkConflictDetectionEnabledOnExistingTable { .. })
+        )
+    })
+}
+
 /// The `SQLite`/Turso database a Cayenne metastore lives in, inside its metadata
 /// directory. Every metastore connection string in this file ends in this name.
 const METASTORE_DB_FILE: &str = "cayenne.db";
@@ -1832,8 +1866,7 @@ impl CayenneAccelerator {
             // both cases. Gated strictly: only an unresolved `auto`, only the
             // changes/CDC refresh mode, and only when a primary key exists
             // (key mode requires one) — explicit `position`/`key` configs and
-            // every non-CDC profile keep today's position resolution
-            // (merge-on-read pushdown, zero per-row scan CPU).
+            // every non-CDC profile keep their config as-is.
             if config.deletion_mode == cayenne::metadata::DeletionMode::Auto
                 && acceleration.refresh_mode == Some(RefreshMode::Changes)
                 && workload.has_primary_key
@@ -2061,11 +2094,13 @@ impl CayenneAccelerator {
             }
             // The datalake (cold) tier requires key-based deletes: position
             // deletes are file-path scoped and cannot survive the warm→cold
-            // rewrite. An unresolved `auto` resolves to `key` here (otherwise
-            // it resolves to `position` for non-CDC tables and the tier is
-            // silently inert); an EXPLICIT `position` is left as-is and
-            // rejected with a structured error at registration
-            // (`validate_datalake_table_options`) — never silently overridden.
+            // rewrite. Pinning an unresolved `auto` to `key` here is redundant
+            // with the engine's own resolution (a primary key already resolves
+            // to `key`, and this branch requires one), but it keeps the stored
+            // config self-describing for a datalake table. An EXPLICIT
+            // `position` is left as-is and rejected with a structured error at
+            // registration (`validate_datalake_table_options`) — never silently
+            // overridden.
             // Must run AFTER cayenne_datalake_location is parsed above.
             if config.cold_tier_enabled()
                 && workload.has_primary_key
@@ -2709,11 +2744,10 @@ impl CayenneAccelerator {
             table_name,
         );
 
-        // Durable federated write-back (#11838): a write_back + on_conflict +
-        // refresh_mode:changes Cayenne dataset resolves to WriteMode::WriteBack
-        // (on_conflict with a non-`changes` refresh forces AcceleratorOnly). When
-        // so configured, every committed write durably marks its PKs so the
-        // delivery worker reconciles them to the federated source.
+        // Durable federated write-back (#11838): a `write_mode: write_back` +
+        // `refresh_mode: changes` Cayenne dataset. When so configured, every
+        // committed write durably marks its PKs so the delivery worker
+        // reconciles them to the federated source.
         // `resolves_to_durable_write_back` is shared with the registration gate
         // that requires the source connector to advertise a safe delivery
         // primitive, so marking can never be switched on for a dataset the gate
@@ -3069,7 +3103,7 @@ fn declares_unique_index(source: &dyn AccelerationSource) -> bool {
 /// duplicate rows.
 fn unique_index_warning(table_name: &str) -> String {
     format!(
-        "Dataset '{table_name}' (cayenne): a `unique` entry in `indexes` speeds up lookups but does not constrain writes, so duplicate rows are not rejected. Set `primary_key` with `on_conflict` to deduplicate on a column set. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+        "Dataset '{table_name}' (cayenne): a `unique` entry in `indexes` speeds up lookups but does not constrain writes, so duplicate rows are not rejected. Set `primary_key`, with `cayenne_pk_conflict_detection` left at its default `auto`, to keep one row per value of a column set. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
     )
 }
 
@@ -3201,11 +3235,11 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .description("Encoding effort for fresh delta writes (CDC/append snapshot files), zstd-style. 'auto' (default) size-gates: deltas smaller than a quarter of the target file size encode with a light scheme set (skipping the per-file encoder-strategy search and FSST training) and are re-encoded by compaction; larger or unknown-size writes use the full default. Explicit levels 0..=10 pin the effort (0 = uncompressed canonical, 7 = the full default cascade i.e. the explicit opt-out, 8..=10 reserved). Compaction and rewrite outputs always use the full default encoding regardless of this setting.")
             .default("auto"),
         ParameterSpec::component("pk_conflict_detection")
-            .description("Whether Cayenne scans existing primary keys on insert. 'auto' (default) detects conflicts and applies on_conflict behavior. 'none' skips conflict detection and is only safe when the source enforces primary-key uniqueness and the ingestion path cannot replay existing rows, such as steady-state append-only CDC after bootstrap.")
+            .description("Whether Cayenne scans existing primary keys on insert. 'auto' (default) detects conflicts and keeps one row per primary key. 'none' skips conflict detection and is only safe when the source enforces primary-key uniqueness and no row reaches the table twice; a full or append refresh does not guarantee that (an append without a time_column re-appends stored rows). 'none' is refused on a dataset that rewrites stored keys: refresh_mode: changes, or a writable dataset whose writes go to Cayenne (write_mode: write_back, write_mode: acceleration, or a sink source). A table created with 'none' keeps it: switching to 'auto' is refused until the acceleration is rebuilt, for example by one restart with mode: file_create.")
             .one_of(&["auto", "none"])
             .default("auto"),
         ParameterSpec::component("deletion_mode")
-            .description("How primary-key deletions are recorded and applied. 'auto' (default) resolves to 'key' for refresh_mode: changes tables with a primary key (key-based deletes compact concurrently with writers and ride the in-memory CDC tier, where position-delete compaction must serialize with continuous writes), and to 'position' (merge-on-read) everywhere else: per-file row-position bitmaps are pushed into the Vortex scan, skipping deleted pages at the storage layer with no per-row CPU. For a primary-key table positions are captured via a row_idx() read-back after each write, with key-based fallback for any row whose position is not yet known; a table without a primary key uses the existing position-based strategy. 'key' applies deletes above the Vortex scan via a per-row RowConverter probe; 'position' explicitly opts a CDC table back into merge-on-read.")
+            .description("How primary-key deletions are recorded and applied. 'auto' (default) resolves to 'key' for every table with a primary key: key-based deletes are recorded by primary-key bytes and sequence number, compact concurrently with writers, and are pruned by the seq-prefix bake pass. It resolves to 'position' (merge-on-read) for a table without a primary key, which has no key to record: per-file row-position bitmaps are pushed into the Vortex scan, skipping deleted pages at the storage layer with no per-row CPU. 'key' applies deletes above the Vortex scan via a per-row RowConverter probe. 'position' explicitly opts a primary-key table into merge-on-read position deletes, where positions are captured via a row_idx() read-back after each write and any row whose position is not yet known falls back to a key-based delete.")
             .one_of(&["auto", "key", "position"])
             .default("auto"),
         ParameterSpec::component("upload_concurrency")
@@ -3957,6 +3991,9 @@ impl DataAccelerator for CayenneAccelerator {
             .await
             .boxed()?;
 
+        ensure_stored_partitioning_matches(&cayenne_table, source, &partition_by, &dir_path)
+            .await?;
+
         // If partitioning is requested, wrap with PartitionTableProvider
         if partition_by.is_empty() {
             // Non-partitioned table - wrap in PolyTableProvider for proper deletion/retention support.
@@ -4176,8 +4213,9 @@ impl DataAccelerator for CayenneAccelerator {
                 Error::InvalidConfiguration { .. }
                     | Error::InvalidScanConcurrency { .. }
                     | Error::UnsupportedDataTypes { .. }
+                    | Error::PartitionByChanged { .. }
             )
-        )
+        ) || rejects_stored_table(error)
     }
 
     fn prefix(&self) -> &'static str {
@@ -4253,6 +4291,10 @@ impl DataAccelerator for CayenneAccelerator {
         previous_provider: Arc<dyn TableProvider>,
         provider_factory: data_accelerator_api::ReloadProviderFactory,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
+        // The factory reopens the same table on the same catalog, so the
+        // previous instance's maintenance must stop before the new one starts:
+        // nothing in memory serializes two instances' compaction (#11581).
+        change_sink::quiesce_table_maintenance(&previous_provider).await;
         drop(previous_provider);
         provider_factory().await
     }
@@ -4458,6 +4500,85 @@ fn requests_schema_evolution(source: &dyn AccelerationSource) -> bool {
     })
 }
 
+fn stored_partitioning(stored: &[String]) -> String {
+    if stored.is_empty() {
+        "without 'partition_by'".to_string()
+    } else {
+        format!("partitioned by [{}]", stored.join(", "))
+    }
+}
+
+fn configured_partition_by(configured: &[String]) -> String {
+    if configured.is_empty() {
+        "no 'partition_by'".to_string()
+    } else {
+        format!("'partition_by: [{}]'", configured.join(", "))
+    }
+}
+
+fn restore_partition_by(stored: &[String]) -> &'static str {
+    if stored.is_empty() {
+        "remove 'partition_by'"
+    } else {
+        "restore the 'partition_by' it was written with"
+    }
+}
+
+/// Refuses acceleration data stored under a different partitioning than the
+/// dataset's `partition_by`. An unpartitioned table keeps its rows in the table
+/// itself and a partitioned one in per-partition tables, and each reads only its
+/// own, so opening data stored the other way would serve none of its rows.
+async fn ensure_stored_partitioning_matches(
+    table: &cayenne::CayenneTableProvider,
+    source: &dyn AccelerationSource,
+    partition_by: &[PartitionedBy],
+    data_dir: &str,
+) -> Result<()> {
+    let configured = cayenne::partition_column_labels(partition_by);
+    let partitions = table
+        .catalog()
+        .get_partitions(&table.metadata().table_id)
+        .await
+        .boxed()
+        .context(AccelerationCreationFailedSnafu)?;
+    let stored = if partitions.is_empty() {
+        if configured.is_empty()
+            || !table
+                .holds_rows()
+                .await
+                .boxed()
+                .context(AccelerationCreationFailedSnafu)?
+        {
+            return Ok(());
+        }
+        Vec::new()
+    } else {
+        match partitions
+            .into_iter()
+            .find(|partition| partition.partition_columns != configured)
+        {
+            Some(partition) => partition.partition_columns,
+            None => return Ok(()),
+        }
+    };
+    Err(Error::PartitionByChanged {
+        dataset: Arc::from(source.name().to_string()),
+        stored,
+        configured: source
+            .acceleration()
+            .map(|acceleration| {
+                acceleration
+                    .partition_by
+                    .iter()
+                    .map(|partition| partition.expression.clone())
+                    .collect()
+            })
+            .unwrap_or_default(),
+        data_dir: data_dir.to_string(),
+        metadata_dir: CayenneAccelerator::resolve_metadata_dir(source.acceleration()),
+    })
+}
+
 /// Force partition child tables to encode serially (one write shard).
 ///
 /// Two reasons, both specific to partitioned datasets:
@@ -4514,6 +4635,28 @@ mod tests {
     /// fine and then fails on the first batch with "Invalid comparison operation:
     /// Timestamp(µs) > Utf8", which takes the maintained aggregate stale on its
     /// first delta and silently drops every query back to a base-table scan.
+    /// The refusal to reopen a `none` table under `auto` reaches the runtime
+    /// wrapped by the table-provider build, and must still classify as a
+    /// configuration rejection so the dataset is not retried.
+    #[test]
+    fn a_wrapped_stored_table_refusal_is_a_configuration_rejection() {
+        let wrapped = |catalog_error: cayenne::CatalogError| Error::AccelerationCreationFailed {
+            source: Box::new(Error::AccelerationCreationFailed {
+                source: Box::new(catalog_error),
+            }),
+        };
+        assert!(rejects_stored_table(&wrapped(
+            cayenne::CatalogError::PkConflictDetectionEnabledOnExistingTable {
+                table_name: "checking".to_string(),
+            }
+        )));
+        assert!(!rejects_stored_table(&wrapped(
+            cayenne::CatalogError::TableNotFound {
+                table_name: "checking".to_string(),
+            }
+        )));
+    }
+
     #[test]
     fn a_timestamp_filter_against_a_string_literal_evaluates() {
         use arrow::array::{Int32Array, TimestampMicrosecondArray};
@@ -5112,7 +5255,9 @@ mod tests {
             "the warning must say what a `unique` entry will not do: {warning}"
         );
         assert!(
-            warning.contains("primary_key") && warning.contains("on_conflict"),
+            warning.contains("primary_key")
+                && warning.contains("cayenne_pk_conflict_detection")
+                && !warning.contains("on_conflict"),
             "the warning must give the actionable alternative: {warning}"
         );
     }
@@ -7717,10 +7862,9 @@ mod tests {
         assert_eq!(config.inline_max_rows, 0);
     }
 
-    /// `deletion_mode: auto` resolves to `key` ONLY for `refresh_mode`: changes
-    /// datasets whose workload has a primary key; explicit configs and every
-    /// other profile keep their value (and Auto's downstream position
-    /// resolution) untouched.
+    /// `deletion_mode: auto` is pre-resolved to `key` in runtime config for
+    /// `refresh_mode: changes` datasets whose workload has a primary key;
+    /// explicit configs and every other profile keep their value untouched.
     #[tokio::test]
     async fn test_deletion_mode_auto_resolves_to_key_for_cdc_pk_tables() {
         let build = |name: &str, refresh_mode: RefreshMode, params: Vec<(String, String)>| {
@@ -7790,7 +7934,8 @@ mod tests {
         .expect("config should be valid");
         assert_eq!(config.deletion_mode, cayenne::metadata::DeletionMode::Auto);
 
-        // A non-CDC profile with a PK stays Auto (position downstream).
+        // A non-CDC profile with a PK stays Auto at config time; Cayenne's own
+        // `DeletionMode::resolved` turns it into `key` for a primary-key table.
         let ds = build("full_pk", RefreshMode::Full, vec![]);
         let config = CayenneAccelerator::get_vortex_config_with_footer_cache(
             "full_pk",
