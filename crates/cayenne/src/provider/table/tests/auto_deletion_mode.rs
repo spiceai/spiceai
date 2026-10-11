@@ -395,6 +395,122 @@ async fn an_auto_table_past_its_bound_switches_to_key_deletes() {
     assert_eq!(latest, expected, "every seed key shows its latest row");
 }
 
+/// An auto table within its size bound moves to key deletes once its whole-table
+/// reclaims take more than a fiftieth of the time. Reclaims are judged only over a
+/// full window, so back-to-back reclaims inside one leave the table on position
+/// deletes; judged, they move it, and later upserts record key deletes only.
+#[tokio::test]
+async fn an_auto_table_whose_reclaims_take_too_much_of_the_time_switches_to_key_deletes() {
+    let name = "auto_busy_reclaims";
+    let (provider, _catalog, _tmp) = table(name, DeletionMode::Auto, 256).await;
+    let auto = Arc::clone(provider.pk_deletion_mode.auto().expect("an auto table"));
+    let keys: Vec<i64> = (0..16).collect();
+    write(&provider, &keys, 100).await;
+
+    // Inside a window that has not closed, nothing is judged, however busy.
+    auto.set_reclaim_window(std::time::Duration::from_secs(3_600));
+    for value in [200, 300] {
+        write(&provider, &keys, value).await;
+        assert!(
+            provider
+                .rewrite_current_snapshot_for_reclaim_tracked(None)
+                .await
+                .expect("reclaim pass"),
+            "the reclaim of a table within its bound commits"
+        );
+    }
+    assert!(
+        provider.should_capture_positions(),
+        "reclaims inside an open window do not move the table"
+    );
+
+    // Close the window at the next reclaim: back-to-back reclaims took far more
+    // than a fiftieth of the time since the table opened.
+    auto.set_reclaim_window(std::time::Duration::ZERO);
+    write(&provider, &keys, 400).await;
+    assert!(
+        provider
+            .rewrite_current_snapshot_for_reclaim_tracked(None)
+            .await
+            .expect("reclaim pass"),
+        "the judged reclaim itself commits"
+    );
+    assert!(
+        !provider.should_capture_positions(),
+        "the table is on key deletes once its reclaims took too much of the time"
+    );
+
+    write(&provider, &keys, 500).await;
+    let ctx = SessionContext::new();
+    let rows = collect_id_value_pairs(&ctx, &provider, name).await;
+    let expected: Vec<(i64, i64)> = keys.iter().map(|id| (*id, 500)).collect();
+    assert_eq!(rows, expected, "every key shows its latest row, once");
+}
+
+/// A writer that checked the keyset out while the table was on position deletes
+/// and returns it after the switch to key deletes records no position delete with
+/// it: the upsert path reads the table's mode, not the positions the keyset still
+/// carries.
+#[tokio::test]
+async fn a_keyset_checked_out_before_the_switch_records_no_position_delete_after_it() {
+    let name = "auto_checkout_across_switch";
+    let (provider, _catalog, _tmp) = table(name, DeletionMode::Auto, 256).await;
+    let keys: Vec<i64> = (0..16).collect();
+    write(&provider, &keys, 100).await;
+    provider
+        .rewrite_current_snapshot_for_compaction_tracked(None)
+        .await
+        .expect("fold the seed into the current snapshot");
+    capture_positions(&provider).await;
+
+    // A writer holds the keyset, located, across the switch.
+    let (index, checkout) = provider.take_cached_pk_index();
+    let located = match index.as_ref() {
+        Some(CachedPkIndex::Exact(keyset)) => keys
+            .iter()
+            .filter(|id| {
+                let schema = Arc::clone(&provider.table_metadata.schema);
+                let batch = id_value_batch(schema, &[**id], &[0]);
+                let pk_indices = provider
+                    .primary_key_indices()
+                    .expect("pk indices")
+                    .expect("primary key");
+                let rows = provider
+                    .build_pk_converter(&pk_indices)
+                    .expect("converter")
+                    .convert_columns(&[Arc::clone(batch.column(0))])
+                    .expect("convert key");
+                matches!(
+                    keyset.location_by_digest(pk_digest(&rows.row(0).owned())),
+                    Some(RowLocation::FilePositioned { .. })
+                )
+            })
+            .count(),
+        _ => 0,
+    };
+    assert_eq!(
+        located,
+        keys.len(),
+        "premise: the checked-out keyset locates every key"
+    );
+    assert!(
+        provider.switch_auto_to_key_deletes("test"),
+        "the table switches to key deletes"
+    );
+    provider.store_cached_pk_index(index.expect("an exact keyset"), checkout);
+
+    write(&provider, &keys, 200).await;
+    assert_eq!(
+        position_deletes(&provider),
+        0,
+        "an upsert after the switch records key deletes only"
+    );
+    let ctx = SessionContext::new();
+    let rows = collect_id_value_pairs(&ctx, &provider, name).await;
+    let expected: Vec<(i64, i64)> = keys.iter().map(|id| (*id, 200)).collect();
+    assert_eq!(rows, expected, "every key shows its latest row, once");
+}
+
 /// A key repeated within one write is folded out of an auto table's files, as key
 /// mode does, so statistics stay exact; an explicit `deletion_mode: position`
 /// table hides the superseded copy with a position delete instead.

@@ -23425,6 +23425,18 @@ impl CayenneTableProvider {
         let result = self
             .rewrite_current_snapshot_holding_bounded(held_position_guards, reclaim)
             .await;
+        // An `auto` table keeps reclaiming by rewriting itself whole only while
+        // those rewrites take a small share of the time (`RECLAIM_SHARE_DENOMINATOR`).
+        // Every pass counts, committed or not: the time was spent either way.
+        if reclaim
+            && let Some(auto) = self.pk_deletion_mode.auto()
+            && auto.uses_positions()
+            && auto.record_reclaim(pass_start.elapsed(), Instant::now())
+        {
+            // The caller holds `compaction_lock`, as every caller of this rewrite
+            // does.
+            self.switch_auto_to_key_deletes("its whole-table reclaims took too much of the time");
+        }
         let table = self.table_metadata.table_name.clone();
         let result_label = if result.is_ok() {
             "completed"
