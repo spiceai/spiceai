@@ -68,12 +68,13 @@ use std::sync::Arc;
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use cayenne::metadata::CreateTableOptions;
-use cayenne::{CayenneCatalog, CayenneTableProvider, MetadataCatalog};
+use cayenne::{CayenneCatalog, CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
 use datafusion::datasource::TableProvider;
 use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::prelude::{ParquetReadOptions, SessionContext};
 use datafusion_expr::dml::InsertOp;
 use datafusion_physical_plan::collect;
+use test_framework::layout::{Layout, LayoutFeature, TableKeys};
 use test_framework::queries::validation::{
     QueryValidationFailReason, QueryValidationResult, RowOrder,
     compare_query_result_batches_with_sort_check, has_top_level_limit, has_top_level_order_by,
@@ -284,12 +285,188 @@ impl LoadMode {
     }
 }
 
+/// A physical layout for the tables a lane loads into Cayenne: each table's
+/// primary key, secondary indexes, and sort or clustering order, from the
+/// benchmark's layout keys (`test_framework::layout`, the same keys
+/// `testoperator --layout` configures through a Spicepod). The lanes create
+/// Cayenne tables directly, so only what Cayenne's own table options carry
+/// applies: `primary_key`, `indexes`, `sort` and `cluster`.
+///
+/// A query's answer must not depend on the layout, so each lane compares every
+/// layout's answers with the same oracle answer.
+#[derive(Debug, Clone)]
+pub struct CayenneLayout {
+    layout: Layout,
+    tables: &'static [TableKeys],
+}
+
+impl CayenneLayout {
+    /// # Panics
+    ///
+    /// When `layout` does not parse, names a feature the lanes cannot configure,
+    /// or combines `sort` with `cluster`, which Cayenne refuses.
+    #[must_use]
+    pub fn new(layout: &str, tables: &'static [TableKeys]) -> Self {
+        let layout: Layout = layout.parse().expect("valid layout");
+        for feature in layout.features() {
+            assert!(
+                matches!(
+                    feature,
+                    LayoutFeature::PrimaryKey
+                        | LayoutFeature::Indexes
+                        | LayoutFeature::Sort
+                        | LayoutFeature::Cluster
+                ),
+                "the Cayenne lanes create tables directly and cannot configure '{feature}'; testoperator --layout covers it end to end"
+            );
+        }
+        assert!(
+            !(layout.contains(LayoutFeature::Sort) && layout.contains(LayoutFeature::Cluster)),
+            "Cayenne does not combine sort columns with clustering"
+        );
+        Self { layout, tables }
+    }
+
+    /// The layout as a report label, e.g. `primary_key,sort`.
+    #[must_use]
+    pub fn label(&self) -> String {
+        self.layout.to_string()
+    }
+
+    /// Panics unless `provider` was created the way this layout asks for
+    /// `table`: the check that keeps a layout run from comparing Cayenne's
+    /// default layout under the layout's label.
+    fn assert_applied(&self, table: &str, provider: &CayenneTableProvider) {
+        let (primary_key, config, indexes) = self.table_options(table);
+        let metadata = provider.metadata();
+        assert_eq!(
+            metadata.primary_key, primary_key,
+            "layout '{}': table '{table}' has the wrong primary key",
+            self.layout
+        );
+        assert_eq!(
+            metadata.vortex_config.sort_columns, config.sort_columns,
+            "layout '{}': table '{table}' has the wrong sort columns",
+            self.layout
+        );
+        assert_eq!(
+            metadata.vortex_config.cluster_by, config.cluster_by,
+            "layout '{}': table '{table}' has the wrong clustering columns",
+            self.layout
+        );
+        assert_eq!(
+            provider.lookup_index_counters().is_some(),
+            !indexes.is_empty(),
+            "layout '{}': table '{table}' should declare secondary indexes exactly when the layout gives it some",
+            self.layout
+        );
+    }
+
+    /// The primary key, Vortex configuration and secondary indexes to create
+    /// `table` with.
+    fn table_options(
+        &self,
+        table: &str,
+    ) -> (
+        Vec<String>,
+        cayenne::metadata::VortexConfig,
+        Vec<Vec<String>>,
+    ) {
+        let keys = self
+            .tables
+            .iter()
+            .find(|keys| keys.table == table)
+            .unwrap_or_else(|| {
+                panic!(
+                    "table '{table}' has no layout keys, so layout '{}' would not apply to it",
+                    self.layout
+                )
+            });
+        let columns =
+            |columns: &[&str]| columns.iter().map(ToString::to_string).collect::<Vec<_>>();
+        let mut config = cayenne::metadata::VortexConfig::default();
+        if self.layout.contains(LayoutFeature::Sort) {
+            config.sort_columns = columns(keys.sort);
+            config.sort_columns_origin = cayenne::metadata::SortColumnsOrigin::User;
+        }
+        if self.layout.contains(LayoutFeature::Cluster) {
+            config.cluster_by = columns(keys.cluster);
+        }
+        let primary_key = if self.layout.contains(LayoutFeature::PrimaryKey) {
+            columns(keys.primary_key)
+        } else {
+            Vec::new()
+        };
+        let indexes = if self.layout.contains(LayoutFeature::Indexes) {
+            keys.indexes.iter().map(|index| columns(index)).collect()
+        } else {
+            Vec::new()
+        };
+        (primary_key, config, indexes)
+    }
+}
+
+/// Secondary-index probes summed over a harness's tables: how many scans the
+/// layout's indexes narrowed (`full` + `partial` coverage) and how many files
+/// they handed a row selection, or `None` when no table declares an index.
+#[must_use]
+pub fn secondary_index_use(harness: &CayenneHarness) -> Option<(u64, u64)> {
+    let counters: Vec<_> = harness
+        .tables
+        .values()
+        .filter_map(|table| table.lookup_index_counters())
+        .collect();
+    (!counters.is_empty()).then(|| {
+        counters.iter().fold((0, 0), |(probes, selections), c| {
+            (
+                probes + c.full + c.partial,
+                selections + c.access_plans_attached,
+            )
+        })
+    })
+}
+
+/// The layouts the oracle lanes load a benchmark suite under besides Cayenne's
+/// default: a keyed, indexed table sorted other than in generated order, and a
+/// keyed table clustered on two columns. Between them they reach the primary-key,
+/// secondary-index, sort and clustering paths a Spicepod can configure.
+pub const KEYED_LAYOUTS: &[&str] = &["primary_key,indexes,sort", "primary_key,cluster"];
+
+/// [`KEYED_LAYOUTS`] without the primary key, for the reduced `hits` fixture,
+/// whose ranking columns repeat by design so no column set is a key.
+pub const UNKEYED_LAYOUTS: &[&str] = &["indexes,sort", "cluster"];
+
+/// Cayenne's default layout (`None`) followed by each of `layouts` on
+/// `query_set`'s tables, for [`oracle_lane::run_fixture_suite_with_layouts`].
+///
+/// # Panics
+///
+/// When `query_set` has no layout keys.
+#[must_use]
+pub fn with_layouts(
+    query_set: &test_framework::queries::QuerySet,
+    layouts: &[&str],
+) -> Vec<Option<CayenneLayout>> {
+    let tables = test_framework::layout::benchmark_tables(query_set)
+        .unwrap_or_else(|| panic!("{query_set:?} has no layout keys"));
+    std::iter::once(None)
+        .chain(
+            layouts
+                .iter()
+                .map(|layout| Some(CayenneLayout::new(layout, tables))),
+        )
+        .collect()
+}
+
 /// Build a Cayenne catalog + temp data dir.
 pub struct CayenneHarness {
     pub _temp_dir: tempfile::TempDir,
     pub catalog: Arc<dyn MetadataCatalog>,
     pub data_path: PathBuf,
     pub tables: BTreeMap<String, Arc<CayenneTableProvider>>,
+    /// The layout every table loaded from now on is created with; `None` is
+    /// Cayenne's defaults (no key, no indexes, no sort or clustering).
+    pub layout: Option<CayenneLayout>,
 }
 
 impl CayenneHarness {
@@ -307,7 +484,30 @@ impl CayenneHarness {
             catalog: catalog as Arc<dyn MetadataCatalog>,
             data_path,
             tables: BTreeMap::new(),
+            layout: None,
         }
+    }
+
+    /// The primary key, Vortex configuration and secondary indexes to create
+    /// `table` with: [`Self::layout`]'s, or Cayenne's defaults without one.
+    fn table_options(
+        &self,
+        table: &str,
+    ) -> (
+        Vec<String>,
+        cayenne::metadata::VortexConfig,
+        Vec<Vec<String>>,
+    ) {
+        self.layout.as_ref().map_or_else(
+            || {
+                (
+                    Vec::new(),
+                    cayenne::metadata::VortexConfig::default(),
+                    Vec::new(),
+                )
+            },
+            |layout| layout.table_options(table),
+        )
     }
 
     /// Create a Cayenne table from a parquet file (schema inferred via DataFusion).
@@ -337,23 +537,30 @@ impl CayenneHarness {
             .join(format!("{table_name}_{}", mode.as_str()));
         std::fs::create_dir_all(&table_path).expect("table data dir");
 
+        // `CayenneTableProvider::create_table`, plus the layout's secondary
+        // indexes, which only the builder takes.
+        let (primary_key, vortex_config, secondary_indexes) = self.table_options(table_name);
         let table = Arc::new(
-            CayenneTableProvider::create_table(
+            CayenneTableProviderBuilder::new(
                 Arc::clone(&self.catalog),
-                CreateTableOptions {
-                    table_name: table_name.to_string(),
-                    schema: Arc::clone(&schema),
-                    primary_key: vec![],
-                    on_conflict: None,
-                    base_path: table_path.to_string_lossy().to_string(),
-                    partition_column: None,
-                    vortex_config: cayenne::metadata::VortexConfig::default(),
-                },
                 Arc::new(RuntimeEnv::default()),
             )
+            .with_secondary_indexes(secondary_indexes)
+            .create(CreateTableOptions {
+                table_name: table_name.to_string(),
+                schema: Arc::clone(&schema),
+                primary_key,
+                on_conflict: None,
+                base_path: table_path.to_string_lossy().to_string(),
+                partition_column: None,
+                vortex_config,
+            })
             .await
             .expect("create cayenne table"),
         );
+        if let Some(layout) = &self.layout {
+            layout.assert_applied(table_name, &table);
+        }
 
         match mode {
             LoadMode::Full => {
@@ -493,7 +700,18 @@ impl CayenneHarness {
     /// A harness holding `{table}.parquet` from `parquet_dir` for each table,
     /// loaded the given way.
     pub async fn from_parquet_dir(parquet_dir: &Path, tables: &[&str], mode: LoadMode) -> Self {
+        Self::from_parquet_dir_with_layout(parquet_dir, tables, mode, None).await
+    }
+
+    /// Like [`Self::from_parquet_dir`], with every table created under `layout`.
+    pub async fn from_parquet_dir_with_layout(
+        parquet_dir: &Path,
+        tables: &[&str],
+        mode: LoadMode,
+        layout: Option<CayenneLayout>,
+    ) -> Self {
         let mut harness = Self::new().await;
+        harness.layout = layout;
         for table in tables {
             harness
                 .load_parquet_table_with_mode(

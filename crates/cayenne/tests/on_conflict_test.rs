@@ -19,7 +19,7 @@ limitations under the License.
 
 //! Tests for primary key on-conflict handling in Cayenne.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 
