@@ -395,26 +395,22 @@ impl Runtime {
         // Each `localpod` dataset loads after the dataset it reads from, and a `localpod`
         // dataset reading from another `localpod` dataset loads after that one, so every chain
         // hangs off the load of a non-`localpod` dataset.
-        // Startup datasets chained behind a parent's load, with the parent they
-        // finish with, and the done-token of each such parent.
-        let mut localpod_children: Vec<(ResolvedTableReference, ResolvedTableReference)> =
-            Vec::new();
-        let mut parent_tokens: HashMap<ResolvedTableReference, CancellationToken> = HashMap::new();
+        // The done-token of each startup dataset that loads in a chain: the parent of
+        // each chain, and every `localpod` dataset in a chain component startup waits
+        // for. Each is cancelled when that dataset's own load ends, not when the
+        // chain does, so a view waits only for the datasets it reads.
+        let mut chain_done: HashMap<ResolvedTableReference, CancellationToken> = HashMap::new();
         let roots: Vec<_> = localpod_by_parent
             .extract_if(|parent, _| dataset_futures.contains_key(parent))
             .collect();
         for (parent, children) in roots {
             let parent_background = background_roots.contains(&parent);
-            if !parent_background {
-                parent_tokens.entry(parent.clone()).or_default();
-                for (ds, _) in &children {
-                    localpod_children
-                        .push((resolve_table_reference(ds.name.clone()), parent.clone()));
-                }
-            }
             // Signalled once the parent's load ends, however it ends, so a chain running in
             // the background starts only after its parent.
             let parent_done = tokio_util::sync::CancellationToken::new();
+            if !parent_background {
+                chain_done.insert(parent.clone(), parent_done.clone());
+            }
             let mut chains = Vec::new();
             for (ds, bootstrap_status) in children {
                 let background = parent_background
@@ -425,6 +421,7 @@ impl Runtime {
                     bootstrap_status,
                     &mut localpod_by_parent,
                     ReplacesRegistration::No,
+                    (!background).then_some(&mut chain_done),
                 );
                 if background {
                     let parent_done = parent_done.clone();
@@ -482,19 +479,13 @@ impl Runtime {
         // each view waits only on the datasets it reads from rather than on every
         // dataset in the Spicepod: one dataset still retrying must not keep views
         // over healthy datasets from registering.
-        let mut dataset_done: HashMap<ResolvedTableReference, CancellationToken> = HashMap::new();
-        for (child, parent) in &localpod_children {
-            if let Some(token) = parent_tokens.get(parent) {
-                dataset_done.insert(child.clone(), token.clone());
-            }
-        }
+        let mut dataset_done = chain_done;
         for (resolved, (ds, dataset_load_future)) in dataset_futures {
             let background = background_roots.contains(&resolved);
             let done = if background {
                 None
             } else {
-                let token = parent_tokens.get(&resolved).cloned().unwrap_or_default();
-                dataset_done.insert(resolved.clone(), token.clone());
+                let token = dataset_done.entry(resolved.clone()).or_default().clone();
                 Some(token)
             };
             let handle = tokio::spawn(async move {
@@ -2874,6 +2865,7 @@ impl Runtime {
                         bootstrap_status,
                         &mut localpod_by_parent,
                         ReplacesRegistration::Yes,
+                        None,
                     )
                 })
                 .collect();
@@ -2933,6 +2925,11 @@ impl Runtime {
     /// queued behind it, recursively, so a child never binds before its parent registers. Each
     /// dataset's children are taken out of `localpod_by_parent` as its chain is built, so a
     /// `localpod` cycle — which can never load — is built once and ends.
+    ///
+    /// When `loaded` is given, each dataset in the chain gets a token in it,
+    /// cancelled as soon as that dataset's own load ends, however it ends, and
+    /// before the datasets reading from it load: a view over one `localpod`
+    /// dataset must not wait for a sibling that keeps failing.
     fn localpod_load_chain(
         self: Arc<Self>,
         ds: Arc<Dataset>,
@@ -2942,9 +2939,11 @@ impl Runtime {
             Vec<(Arc<Dataset>, AcceleratorBootstrap)>,
         >,
         replaces_registration: ReplacesRegistration,
+        mut loaded: Option<&mut HashMap<ResolvedTableReference, CancellationToken>>,
     ) -> Pin<Box<dyn Future<Output = ()> + Send>> {
+        let resolved = resolve_table_reference(ds.name.clone());
         let children: Vec<_> = localpod_by_parent
-            .remove(&resolve_table_reference(ds.name.clone()))
+            .remove(&resolved)
             .unwrap_or_default()
             .into_iter()
             .map(|(child, child_status)| {
@@ -2953,18 +2952,23 @@ impl Runtime {
                     child_status,
                     localpod_by_parent,
                     replaces_registration,
+                    loaded.as_deref_mut(),
                 )
             })
             .collect();
+        let done = loaded.map(|loaded| loaded.entry(resolved).or_default().clone());
         let load_semaphore = Arc::clone(&self.dataset_load_semaphore);
         // Registered now rather than once the parent has loaded, so a Spicepod
         // change can supersede the load while it waits.
         let load = self.dataset_loads.begin(&ds.name);
         Box::pin(async move {
             let name = ds.name.clone();
-            Arc::clone(&self)
-                .load_dataset(ds, bootstrap_status, load_semaphore, load)
-                .await;
+            {
+                let _done = done.map(CancellationToken::drop_guard);
+                Arc::clone(&self)
+                    .load_dataset(ds, bootstrap_status, load_semaphore, load)
+                    .await;
+            }
             // The registration this dataset reads through has just been replaced, so mark its
             // results-cache clock again, as `update_dataset` does after its swap: a result read
             // from the previous registration after the mark above must not be stored as fresh.
