@@ -104,9 +104,12 @@ fn order_views_by_dependencies(validated_views: &[ValidatedView]) -> Option<Vec<
 
 /// Whether the view dependency graph (edges between views only, self-references
 /// ignored) contains a cycle.
-fn has_view_cycle(
+/// The views that are on a cycle or read (transitively) from one: whatever a
+/// topological pass over the view graph cannot order. Only these must not wait
+/// on other views; every other view's view dependencies all terminate.
+fn views_behind_cycles(
     dependencies: &HashMap<ResolvedTableReference, Vec<ResolvedTableReference>>,
-) -> bool {
+) -> HashSet<ResolvedTableReference> {
     let mut remaining: HashMap<&ResolvedTableReference, usize> = dependencies
         .iter()
         .map(|(view, deps)| {
@@ -123,9 +126,9 @@ fn has_view_cycle(
         .filter(|(_, n)| **n == 0)
         .map(|(v, _)| *v)
         .collect();
-    let mut visited = 0;
+    let mut visited: HashSet<&ResolvedTableReference> = HashSet::new();
     while let Some(done) = ready.pop() {
-        visited += 1;
+        visited.insert(done);
         for (view, deps) in dependencies {
             if view != done
                 && deps.iter().collect::<HashSet<_>>().contains(done)
@@ -138,7 +141,11 @@ fn has_view_cycle(
             }
         }
     }
-    visited < dependencies.len()
+    dependencies
+        .keys()
+        .filter(|view| !visited.contains(view))
+        .cloned()
+        .collect()
 }
 
 impl Runtime {
@@ -188,9 +195,10 @@ impl Runtime {
                     )
                 })
                 .collect();
-        // Waiting on another view is only safe when the views, compared by resolved
-        // name, form no cycle: otherwise each view in the cycle waits on the other.
-        let wait_on_views = !has_view_cycle(&dependencies);
+        // Waiting on another view is only safe outside a cycle (compared by resolved
+        // name): inside one, each view would wait on the other. Scoped per view, so a
+        // cycle elsewhere does not stop unrelated acyclic chains from waiting.
+        let behind_cycles = views_behind_cycles(&dependencies);
         let dataset_names: HashSet<ResolvedTableReference> = app
             .datasets
             .iter()
@@ -220,7 +228,7 @@ impl Runtime {
             for dep in dependencies.get(&resolved).into_iter().flatten() {
                 let view_token = view_done
                     .get(dep)
-                    .filter(|_| wait_on_views && dep != &resolved);
+                    .filter(|_| !behind_cycles.contains(&resolved) && dep != &resolved);
                 if let Some(token) = view_token.or_else(|| dataset_done.get(dep)) {
                     waits.push((dep.to_string(), token.clone()));
                 } else if dataset_names.contains(dep) {
@@ -782,7 +790,21 @@ mod view_cycle_tests {
             (r("a"), vec![r("public.b")]),
             (r("b"), vec![r("spice.public.a")]),
         ]);
-        assert!(has_view_cycle(&deps));
+        assert_eq!(views_behind_cycles(&deps), HashSet::from([r("a"), r("b")]));
+    }
+
+    #[test]
+    fn a_cycle_does_not_disable_waits_for_unrelated_chains() {
+        let deps = HashMap::from([
+            (r("a"), vec![r("b")]),
+            (r("b"), vec![r("a")]),
+            (r("downstream"), vec![r("upstream")]),
+            (r("upstream"), vec![r("orders")]),
+        ]);
+        let behind = views_behind_cycles(&deps);
+        assert!(!behind.contains(&r("downstream")));
+        assert!(!behind.contains(&r("upstream")));
+        assert!(behind.contains(&r("a")) && behind.contains(&r("b")));
     }
 
     #[test]
@@ -792,6 +814,6 @@ mod view_cycle_tests {
             (r("b"), vec![r("public.a"), r("a")]),
             (r("c"), vec![r("b")]),
         ]);
-        assert!(!has_view_cycle(&deps));
+        assert!(views_behind_cycles(&deps).is_empty());
     }
 }

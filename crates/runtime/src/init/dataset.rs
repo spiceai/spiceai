@@ -398,26 +398,23 @@ impl Runtime {
         // Each `localpod` dataset loads after the dataset it reads from, and a `localpod`
         // dataset reading from another `localpod` dataset loads after that one, so every chain
         // hangs off the load of a non-`localpod` dataset.
-        // Startup datasets chained behind a parent's load, with the parent they
-        // finish with, and the done-token of each such parent.
-        let mut localpod_children: Vec<(ResolvedTableReference, ResolvedTableReference)> =
-            Vec::new();
+        // Startup datasets chained directly behind a parent's load, each with its own
+        // done-token, and the done-token of each such parent (signalled when the
+        // parent's own load ends, not when its chains do).
+        let mut localpod_children: Vec<(ResolvedTableReference, CancellationToken)> = Vec::new();
         let mut parent_tokens: HashMap<ResolvedTableReference, CancellationToken> = HashMap::new();
         let roots: Vec<_> = localpod_by_parent
             .extract_if(|parent, _| dataset_futures.contains_key(parent))
             .collect();
         for (parent, children) in roots {
             let parent_background = background_roots.contains(&parent);
-            if !parent_background {
-                parent_tokens.entry(parent.clone()).or_default();
-                for (ds, _) in &children {
-                    localpod_children
-                        .push((resolve_table_reference(ds.name.clone()), parent.clone()));
-                }
-            }
             // Signalled once the parent's load ends, however it ends, so a chain running in
-            // the background starts only after its parent.
+            // the background starts only after its parent, and a view over the parent
+            // does not wait for the parent's slower `localpod` children.
             let parent_done = tokio_util::sync::CancellationToken::new();
+            if !parent_background {
+                parent_tokens.insert(parent.clone(), parent_done.clone());
+            }
             let mut chains = Vec::new();
             for (ds, bootstrap_status) in children {
                 let background = parent_background
@@ -444,7 +441,13 @@ impl Runtime {
                         .await;
                     background_chains.push((name, chain));
                 } else {
-                    chains.push(chain);
+                    let chain_done = CancellationToken::new();
+                    localpod_children
+                        .push((resolve_table_reference(name.clone()), chain_done.clone()));
+                    chains.push(Box::pin(async move {
+                        let _chain_done = chain_done.drop_guard();
+                        chain.await;
+                    }) as PendingDatasetLoad);
                 }
             }
             if let Some((_, parent_future)) = dataset_futures.get_mut(&parent) {
@@ -486,10 +489,8 @@ impl Runtime {
         // dataset in the Spicepod: one dataset still retrying must not keep views
         // over healthy datasets from registering.
         let mut dataset_done: HashMap<ResolvedTableReference, CancellationToken> = HashMap::new();
-        for (child, parent) in &localpod_children {
-            if let Some(token) = parent_tokens.get(parent) {
-                dataset_done.insert(child.clone(), token.clone());
-            }
+        for (child, token) in localpod_children {
+            dataset_done.insert(child, token);
         }
         for (resolved, (ds, dataset_load_future)) in dataset_futures {
             let background = background_roots.contains(&resolved);
