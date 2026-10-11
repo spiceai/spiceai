@@ -248,10 +248,10 @@ pub async fn setup_shared_member(
             let (client, conn_task) = connect_setup(params).await?;
             let outcome = async {
                 validate_replica_identity(&client, schema_name, table_name).await?;
-                let generated_columns =
-                    fetch_generated_columns(&client, schema_name, table_name).await?;
-                let column_type_oids =
-                    fetch_column_type_oids(&client, schema_name, table_name).await?;
+                let SourceColumns {
+                    generated_columns,
+                    column_type_oids,
+                } = fetch_source_columns(&client, schema_name, table_name).await?;
                 let table_added =
                     ensure_publication(&client, &params.publication_name, schema_name, table_name)
                         .await?;
@@ -357,46 +357,33 @@ async fn do_setup(
     history: &HistoryLatch,
 ) -> Result<SlotInfo> {
     validate_replica_identity(client, schema_name, table_name).await?;
-    let generated_columns = fetch_generated_columns(client, schema_name, table_name).await?;
+    let generated_columns = fetch_source_columns(client, schema_name, table_name)
+        .await?
+        .generated_columns;
     ensure_publication(client, &params.publication_name, schema_name, table_name).await?;
     let mut slot = ensure_slot(client, params, history).await?;
     slot.generated_columns = generated_columns;
     Ok(slot)
 }
 
-/// List the table's `GENERATED` columns (`pg_attribute.attgenerated`).
-/// Postgres omits these from pgoutput `Relation` messages, so the WAL path
-/// needs to know which dataset columns to expect to be absent.
-async fn fetch_generated_columns(
-    client: &tokio_postgres::Client,
-    schema_name: &str,
-    table_name: &str,
-) -> Result<Vec<String>> {
-    let rows = client
-        .query(
-            "SELECT a.attname \
-             FROM pg_attribute a \
-             JOIN pg_class c ON c.oid = a.attrelid \
-             JOIN pg_namespace n ON n.oid = c.relnamespace \
-             WHERE n.nspname = $1 AND c.relname = $2 \
-               AND a.attnum > 0 AND NOT a.attisdropped \
-               AND a.attgenerated::text <> ''",
-            &[&schema_name, &table_name],
-        )
-        .await
-        .context(SetupExecSnafu)?;
-    Ok(rows.iter().map(|r| r.get::<_, String>(0)).collect())
+/// What the source catalog (`pg_attribute`) says about the table's columns.
+struct SourceColumns {
+    /// The `GENERATED` columns. Postgres omits these from pgoutput `Relation`
+    /// messages, so the WAL path needs to know which dataset columns to expect
+    /// to be absent.
+    generated_columns: Vec<String>,
+    /// Each column's type OID.
+    column_type_oids: HashMap<String, u32>,
 }
 
-/// Read the type OID of each of the table's columns (`pg_attribute.atttypid`).
-async fn fetch_column_type_oids(
+async fn fetch_source_columns(
     client: &tokio_postgres::Client,
     schema_name: &str,
     table_name: &str,
-) -> Result<HashMap<String, u32>> {
+) -> Result<SourceColumns> {
     let rows = client
         .query(
-            "SELECT a.attname, a.atttypid \
+            "SELECT a.attname, a.atttypid, a.attgenerated::text <> '' \
              FROM pg_attribute a \
              JOIN pg_class c ON c.oid = a.attrelid \
              JOIN pg_namespace n ON n.oid = c.relnamespace \
@@ -406,10 +393,18 @@ async fn fetch_column_type_oids(
         )
         .await
         .context(SetupExecSnafu)?;
-    Ok(rows
-        .iter()
-        .map(|r| (r.get::<_, String>(0), r.get::<_, u32>(1)))
-        .collect())
+    let mut columns = SourceColumns {
+        generated_columns: Vec::new(),
+        column_type_oids: HashMap::with_capacity(rows.len()),
+    };
+    for row in &rows {
+        let name: String = row.get(0);
+        if row.get::<_, bool>(2) {
+            columns.generated_columns.push(name.clone());
+        }
+        columns.column_type_oids.insert(name, row.get(1));
+    }
+    Ok(columns)
 }
 
 /// Look up the named slot, creating it if absent. See [`setup_slot_and_publication`]

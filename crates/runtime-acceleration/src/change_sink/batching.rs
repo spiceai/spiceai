@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
-use arrow::array::{Array, AsArray, RecordBatch};
+use arrow::array::{Array, ArrayRef, AsArray, RecordBatch};
 use arrow::compute::cast;
 use arrow::compute::kernels::cmp::not_distinct;
 use arrow::datatypes::{DataType, Float64Type, SchemaRef};
@@ -66,19 +66,20 @@ fn ensure_numbers_cast_exactly(data: &RecordBatch, target: &SchemaRef) -> Result
         if unchanged.true_count() == unchanged.len() {
             continue;
         }
-        let as_f64 = cast(column, &DataType::Float64)?;
-        let as_f64 = as_f64.as_primitive::<Float64Type>();
-        let restored_f64 = cast(&restored, &DataType::Float64)?;
-        let restored_f64 = restored_f64.as_primitive::<Float64Type>();
-        let lossy = (0..unchanged.len()).find(|&row| {
-            !unchanged.value(row)
-                && !(from.is_floating()
-                    && as_f64.is_valid(row)
-                    && restored_f64.is_valid(row)
-                    && as_f64.value(row) == 0.0
-                    && restored_f64.value(row) == 0.0)
-        });
-        if let Some(row) = lossy {
+        // `not_distinct` orders floats totally, so `-0.0` restored as `0.0`
+        // reads as changed; it is the one difference an integer cast may make.
+        let is_zero = |array: &ArrayRef, row: usize| -> Result<bool> {
+            let value = cast(&array.slice(row, 1), &DataType::Float64)?;
+            let value = value.as_primitive::<Float64Type>();
+            Ok(value.is_valid(0) && value.value(0) == 0.0)
+        };
+        let zero_kept = |row: usize| -> Result<bool> {
+            Ok(from.is_floating() && is_zero(column, row)? && is_zero(&restored, row)?)
+        };
+        for row in (0..unchanged.len()).filter(|&row| !unchanged.value(row)) {
+            if zero_kept(row)? {
+                continue;
+            }
             let value = array_value_to_string(column, row)?;
             return Err(DataFusionError::Execution(format!(
                 "Failed to apply a change to column '{}': its value {value} ({from}) cannot be stored in the accelerated column's type {to} without loss, so the change is refused rather than stored rounded. The source column's type changed and the acceleration has not adopted it: with `on_schema_change: sync_all_columns`, restart Spice to apply the schema change. See: https://spiceai.org/docs/features/data-acceleration",
@@ -562,7 +563,9 @@ impl CdcBurst {
             {
                 target = Arc::clone(&plan.evolved_schema);
             }
-            if matches!(schema, SchemaDecision::Proceed) {
+            if matches!(schema, SchemaDecision::Proceed)
+                && batch.data_schema().fields() != target.fields()
+            {
                 ensure_numbers_cast_exactly(&batch.data_batch(), &target)?;
             }
             let mut options = self.options;

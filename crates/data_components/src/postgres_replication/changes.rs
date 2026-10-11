@@ -97,23 +97,17 @@ impl WireNumber {
         T::try_from(wide).ok()
     }
 
-    /// The value as `f32`, or `None` when `f32` cannot hold it exactly.
+    /// The value as `f32`, or `None` when `f32` cannot hold it exactly. Every
+    /// `f32` is an `f64`, so a value `f64` cannot hold is not an `f32` either.
     #[expect(
         clippy::cast_possible_truncation,
-        clippy::cast_precision_loss,
-        reason = "each conversion is checked by converting back and comparing"
+        reason = "the conversion is checked by converting back and comparing"
     )]
     fn to_f32(self) -> Option<f32> {
-        match self {
-            Self::Int(v) => {
-                let f = v as f32;
-                (f64::from(f) as i128 == i128::from(v)).then_some(f)
-            }
-            Self::Float(v) => {
-                let f = v as f32;
-                (f64::from(f) == v || v.is_nan()).then_some(f)
-            }
-        }
+        self.to_f64().and_then(|v| {
+            let f = v as f32;
+            (f64::from(f) == v || v.is_nan()).then_some(f)
+        })
     }
 
     /// The value as `f64`, or `None` when `f64` cannot hold it exactly.
@@ -1215,9 +1209,10 @@ impl FieldBuilder {
     /// A value the builder's type cannot represent exactly is an error rather
     /// than a rounded or truncated row.
     ///
-    /// Returns `None` when the wire type is the builder's own type, or is not a
-    /// number this conversion handles; the caller decodes the value as before.
-    fn append_converted_number(&mut self, raw: &[u8], type_oid: u32) -> Option<Result<()>> {
+    /// Returns `false`, appending nothing, when the wire type is the builder's
+    /// own type or is not a number this conversion handles; the caller then
+    /// decodes the value as the builder's type.
+    fn append_converted_number(&mut self, raw: &[u8], type_oid: u32) -> Result<bool> {
         use postgres_protocol::types as pg;
 
         let (builder_oid, target) = match self {
@@ -1229,45 +1224,39 @@ impl FieldBuilder {
             Self::Decimal128(_, precision, scale) => {
                 (PG_NUMERIC_OID, DataType::Decimal128(*precision, *scale))
             }
-            _ => return None,
+            _ => return Ok(false),
         };
         if builder_oid == type_oid {
-            return None;
+            return Ok(false);
         }
         let (wire_name, decoded) = match type_oid {
             PG_INT2_OID => (
                 "int2",
-                pg::int2_from_sql(raw).map(|v| WireNumber::Int(v.into())),
+                pg::int2_from_sql(raw).map(i64::from).map(WireNumber::Int),
             ),
             PG_INT4_OID => (
                 "int4",
-                pg::int4_from_sql(raw).map(|v| WireNumber::Int(v.into())),
+                pg::int4_from_sql(raw).map(i64::from).map(WireNumber::Int),
             ),
             PG_INT8_OID => ("int8", pg::int8_from_sql(raw).map(WireNumber::Int)),
             PG_FLOAT4_OID => (
                 "float4",
-                pg::float4_from_sql(raw).map(|v| WireNumber::Float(v.into())),
+                pg::float4_from_sql(raw)
+                    .map(f64::from)
+                    .map(WireNumber::Float),
             ),
             PG_FLOAT8_OID => ("float8", pg::float8_from_sql(raw).map(WireNumber::Float)),
-            _ => return None,
+            _ => return Ok(false),
         };
-        let value = match decoded {
-            Ok(value) => value,
-            Err(e) => {
-                return Some(
-                    PgOutputDecodeSnafu {
-                        message: format!(
-                            "postgres_replication: binary {wire_name} decode failed (type oid {type_oid}): {e}"
-                        ),
-                    }
-                    .fail(),
-                );
-            }
-        };
+        let value = decoded.map_err(|e| super::Error::PgOutputDecode {
+            message: format!(
+                "postgres_replication: binary {wire_name} decode failed (type oid {type_oid}): {e}"
+            ),
+        })?;
         let appended = match self {
-            Self::Int16(b) => value.to_int::<i16>().map(|v| b.append_value(v)),
-            Self::Int32(b) => value.to_int::<i32>().map(|v| b.append_value(v)),
-            Self::Int64(b) => value.to_int::<i64>().map(|v| b.append_value(v)),
+            Self::Int16(b) => value.to_int().map(|v| b.append_value(v)),
+            Self::Int32(b) => value.to_int().map(|v| b.append_value(v)),
+            Self::Int64(b) => value.to_int().map(|v| b.append_value(v)),
             Self::Float32(b) => value.to_f32().map(|v| b.append_value(v)),
             Self::Float64(b) => value.to_f64().map(|v| b.append_value(v)),
             Self::Decimal128(b, precision, scale) => value
@@ -1275,14 +1264,14 @@ impl FieldBuilder {
                 .map(|v| b.append_value(v)),
             _ => None,
         };
-        Some(appended.ok_or_else(|| super::Error::PgOutputDecode {
+        appended.map(|()| true).ok_or_else(|| super::Error::PgOutputDecode {
             message: format!(
                 "postgres_replication: the {wire_name} value {value} (type oid {type_oid}) cannot be \
                  stored in the dataset's `{target}` column without loss. The source column's type \
                  changed since the dataset was registered; set `on_schema_change: sync_all_columns` \
                  to adopt the wider type. See: https://spiceai.org/docs/components/data-connectors/postgres"
             ),
-        }))
+        })
     }
 
     /// Decode a binary (`send`-format) pgoutput value directly into the typed
@@ -1309,8 +1298,8 @@ impl FieldBuilder {
             ),
         };
 
-        if let Some(result) = self.append_converted_number(raw, type_oid) {
-            return result;
+        if self.append_converted_number(raw, type_oid)? {
+            return Ok(());
         }
 
         match self {

@@ -1203,16 +1203,7 @@ async fn start_alter_type_stream(
     table: &str,
     policy: SchemaEvolutionPolicy,
 ) -> Result<(tokio_postgres::Client, ChangesStream), anyhow::Error> {
-    let mut cfg = tokio_postgres::Config::new();
-    cfg.host("localhost")
-        .port(port)
-        .user("postgres")
-        .password(common::PG_PASSWORD)
-        .dbname("postgres");
-    let (source, connection) = cfg.connect(NoTls).await?;
-    tokio::spawn(async move {
-        let _: Result<(), tokio_postgres::Error> = connection.await;
-    });
+    let source = common::connect(port).await?;
     source
         .simple_query(&format!(
             "CREATE TABLE public.{table} (id bigint PRIMARY KEY, k integer); \

@@ -39,27 +39,12 @@ use secrecy::ExposeSecret;
 use spicepod::acceleration::{Acceleration, OnConflictBehavior, RefreshMode};
 use spicepod::component::dataset::{Dataset, OnSchemaChange};
 use spicepod::param::Params;
-use tokio_postgres::NoTls;
 
 use crate::postgres::common;
 use crate::utils::{register_test_connectors, runtime_ready_check, test_request_context};
 use crate::{configure_test_datafusion, init_tracing};
 
 const CHANGE_PROPAGATION_TIMEOUT: Duration = Duration::from_secs(30);
-
-async fn connect(port: u16) -> Result<tokio_postgres::Client, anyhow::Error> {
-    let mut cfg = tokio_postgres::Config::new();
-    cfg.host("localhost")
-        .port(port)
-        .user("postgres")
-        .password(common::PG_PASSWORD)
-        .dbname("postgres");
-    let (client, connection) = cfg.connect(NoTls).await?;
-    tokio::spawn(async move {
-        let _: Result<(), tokio_postgres::Error> = connection.await;
-    });
-    Ok(client)
-}
 
 async fn run_query(rt: &Runtime, sql: &str) -> Result<String, anyhow::Error> {
     let result = rt
@@ -102,7 +87,7 @@ async fn start(
     engine: &str,
     policy: OnSchemaChange,
 ) -> Result<(tokio_postgres::Client, Arc<Runtime>), anyhow::Error> {
-    let source = connect(port).await?;
+    let source = common::connect(port).await?;
     source
         .simple_query(&format!(
             "CREATE TABLE public.{table} (id bigint PRIMARY KEY, k integer); \
