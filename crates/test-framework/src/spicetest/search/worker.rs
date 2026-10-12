@@ -458,10 +458,11 @@ mod tests {
 
     #[test]
     fn sql_search_hits_reject_missing_id_and_non_numeric_score() {
-        assert!(serde_json::from_str::<Vec<SqlSearchHit>>(r#"[{"id":1}]"#).is_err());
-        assert!(
-            serde_json::from_str::<Vec<SqlSearchHit>>(r#"[{"_id":1,"_score":"high"}]"#).is_err()
-        );
-        assert!(serde_json::from_str::<Vec<SqlSearchHit>>(r#"[{"_id":null}]"#).is_err());
+        serde_json::from_str::<Vec<SqlSearchHit>>(r#"[{"id":1}]"#)
+            .expect_err("a hit without `_id` is rejected");
+        serde_json::from_str::<Vec<SqlSearchHit>>(r#"[{"_id":1,"_score":"high"}]"#)
+            .expect_err("a non-numeric `_score` is rejected");
+        serde_json::from_str::<Vec<SqlSearchHit>>(r#"[{"_id":null}]"#)
+            .expect_err("a null `_id` is rejected");
     }
 }

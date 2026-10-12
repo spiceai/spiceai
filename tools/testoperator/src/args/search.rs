@@ -169,7 +169,7 @@ mod tests {
         let arg = SqlPipelineArg::parse(&path.to_string_lossy()).expect("file parses");
         std::fs::remove_file(&path).expect("remove pipeline");
 
-        assert_eq!(arg, SqlPipelineArg::File(path.clone()));
+        assert_eq!(arg, SqlPipelineArg::File(path));
         assert_eq!(
             arg.name(),
             format!("testoperator-sql-pipeline-{}", std::process::id())
@@ -198,8 +198,9 @@ mod tests {
                 "{value} looks like a path, so it must not run as SQL"
             );
         }
-        assert!(SqlPipelineArg::parse("  \n").is_err());
+        SqlPipelineArg::parse("  \n").expect_err("an empty value is rejected");
         // A directory is not a pipeline file.
-        assert!(SqlPipelineArg::parse(&std::env::temp_dir().to_string_lossy()).is_err());
+        SqlPipelineArg::parse(&std::env::temp_dir().to_string_lossy())
+            .expect_err("a directory is rejected");
     }
 }
