@@ -317,6 +317,10 @@ async fn key_mode_deletion_index_still_reclaims(
 /// keeps it on position deletes and reclaims the index the way a position table
 /// does — by rewriting the whole table, which is cheap at this size and leaves
 /// one compact snapshot — and the index stays bounded.
+///
+/// `auto` paces those rewrites to a tenth of the time, so rounds written back to
+/// back can run ahead of them: the index grows past the trigger until the pace
+/// lets the next rewrite run, and then comes back under it.
 async fn default_mode_small_table_reclaims_by_rewriting_itself(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -325,18 +329,34 @@ async fn default_mode_small_table_reclaims_by_rewriting_itself(
 
     let observed = drive_rounds(&table, &schema).await?;
 
+    assert!(
+        observed.windows(2).any(|pair| pair[1] < pair[0]),
+        "the index never shrank while the rounds ran, so no rewrite reclaimed it: {observed:?}"
+    );
     let rows_per_round = usize::try_from(ROWS_PER_ROUND).expect("row count fits in usize");
     let bound = RECLAIM_TRIGGER + rows_per_round;
-    let peak = observed.iter().copied().max().unwrap_or(0);
-    assert!(
-        peak <= bound,
-        "a default-mode primary-key table's deletion index grew past its steady state: peak {peak} > {bound}, observations {observed:?}"
-    );
-    assert!(
-        observed.iter().any(|len| *len >= RECLAIM_TRIGGER)
-            || observed.windows(2).any(|pair| pair[1] < pair[0]),
-        "the index never crossed the reclaim trigger and never shrank, so this test proved nothing: {observed:?}"
-    );
+    common::lookup_index::poll_until(
+        Duration::from_secs(30),
+        Duration::from_millis(20),
+        async || {
+            table
+                .compact_current_snapshot_small_files()
+                .await
+                .expect("reclaim pass");
+            table
+                .drain_in_flight_maintenance()
+                .await
+                .expect("drain maintenance");
+            let len = table.deletion_index_len();
+            if len <= bound { Ok(len) } else { Err(len) }
+        },
+        |len| {
+            format!(
+                "a default-mode primary-key table's deletion index stayed past its steady state: {len} > {bound}, observations {observed:?}"
+            )
+        },
+    )
+    .await;
     // Reclaimed by the whole-table rewrite: a small `auto` table is on position
     // deletes, and the seq-prefix bake declines those.
     assert_eq!(

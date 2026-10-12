@@ -20031,10 +20031,13 @@ impl CayenneTableProvider {
     /// rows before it rewrites, and leaves a table whose rows are all protected to
     /// the bake. An explicit `deletion_mode: key` table keeps the bake alone.
     ///
-    /// That key-delete reclaim is paced to a small share of the time
-    /// ([`AutoDeletionMode::reclaim_due`]), because the table can be any size:
-    /// until the next one is due, the index grows past the trigger. Over the memory
-    /// ceiling, nothing waits. A position-delete table is not paced.
+    /// An `auto` table's whole-table reclaims, on position or key deletes, are paced
+    /// to a small share of the time ([`AutoDeletionMode::reclaim_due`]): on key
+    /// deletes the table can be any size, and on position deletes a high write rate
+    /// can call for a reclaim often enough for the rewrites to crowd out writes.
+    /// Until the next one is due, the index grows past the trigger. Over the memory
+    /// ceiling, nothing waits. An explicit `deletion_mode: position` table is not
+    /// paced.
     ///
     /// Cheap on the common path: an explicit key-delete or primary-key-less table
     /// returns before any index is read.
@@ -20064,8 +20067,7 @@ impl CayenneTableProvider {
         if deletion_index_len < trigger_len && !over_memory_ceiling {
             return None;
         }
-        if key_reclaim
-            && !over_memory_ceiling
+        if !over_memory_ceiling
             && let Some(auto) = auto
             && !auto.reclaim_due(Instant::now())
         {

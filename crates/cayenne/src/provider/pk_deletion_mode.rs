@@ -36,10 +36,10 @@ limitations under the License.
 //! folds only protected snapshots, so it cannot apply a key delete to a row in the
 //! current snapshot, and its clean-prefix check then keeps it from pruning any
 //! delete at or below that row's sequence. So an `auto` table on key deletes whose
-//! current snapshot holds rows reclaims by rewriting itself whole too, paced to a
-//! small share of the time ([`RECLAIM_SHARE_DENOMINATOR`]) because such a table can
-//! be any size; one whose rows are all in protected snapshots leaves them to the
-//! bake.
+//! current snapshot holds rows reclaims by rewriting itself whole too; one whose
+//! rows are all in protected snapshots leaves them to the bake. Every whole-table
+//! reclaim of an `auto` table, on either kind of delete, is paced to a small share
+//! of the time ([`RECLAIM_SHARE_DENOMINATOR`]).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -49,21 +49,27 @@ use parking_lot::Mutex;
 
 use crate::metadata::{DeletionMode, ResolvedDeletionMode};
 
-/// An `auto` table on key deletes takes at most this fraction (one tenth) of the
-/// time rewriting itself whole: after each whole-table reclaim the next one waits,
-/// the deletion index growing past its trigger meanwhile, until 9 times that
-/// reclaim's duration has passed since it ended. Each reclaim is followed by a
-/// wait nine times as long, so however their durations change, rewriting takes at
-/// most a tenth of any run of reclaims and their waits. Over the deletion index's
-/// memory ceiling it does not wait.
+/// An `auto` table takes at most this fraction (one tenth) of the time rewriting
+/// itself whole, on position or key deletes. After each whole-table reclaim the
+/// next one waits, the deletion index growing past its trigger meanwhile, until 9
+/// times that reclaim's duration has passed since it ended. Each reclaim is
+/// followed by a wait nine times as long, so however their durations change,
+/// rewriting takes at most a tenth of any run of reclaims and their waits. Over
+/// the deletion index's memory ceiling it does not wait.
 ///
-/// The pace bounds what a table of any size can spend on whole-table rewrites
-/// when the bake cannot reach its rows. It costs reads in the meantime, because
-/// the index grows past the trigger: a 1M-row table under 8,000 upserts a second
-/// read at a 10 ms P99 rewriting at every trigger, with a rewrite running 4.3% of
-/// the time, and at 16–19 ms paced to a fiftieth. A tenth leaves such a table
-/// unpaced and still bounds a large one. A position-delete table, which `auto`
-/// keeps small, is not paced.
+/// On key deletes the pace bounds what a table of any size can spend on
+/// whole-table rewrites when the bake cannot reach its rows. On position deletes
+/// it bounds a small table under a high write rate on a small host. At 32,000
+/// upserts a second on four CPUs, a 250K-row table rewrote itself every 1.8 s for
+/// 236 ms, 13% of the time, and its write P99 was 16% above key deletes'. Paced to
+/// a tenth, it was 8% below, and its read P99s ranged from 16% faster to 8% slower
+/// than key deletes', against 15–22% faster unpaced. The pace costs reads while it
+/// holds a reclaim back, because the index grows past the trigger: a 1M-row table
+/// under 8,000 upserts a second read at a 10 ms P99 rewriting at every trigger,
+/// with a rewrite running 4.3% of the time, and at 16–19 ms paced to a fiftieth. A
+/// tenth leaves that table unpaced, as it does every position-delete table
+/// measured at 8,000 upserts a second on 16 cores, which rewrote for 44–145 ms
+/// every ~6.25 s.
 pub(crate) const RECLAIM_SHARE_DENOMINATOR: u32 = 10;
 
 /// How a primary-key table records the delete of a row right now.

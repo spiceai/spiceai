@@ -433,11 +433,11 @@ async fn an_auto_table_past_its_bound_switches_to_key_deletes() {
     assert_eq!(latest, expected, "every seed key shows its latest row");
 }
 
-/// An auto table on key deletes paces its whole-table reclaims: one that is not
-/// yet due leaves the index past its trigger, and runs once it is. A table on
-/// position deletes, which auto keeps small, reclaims at every trigger.
+/// An auto table paces its whole-table reclaims on position and on key deletes:
+/// one that is not yet due leaves the index past its trigger, and runs once it
+/// is.
 #[tokio::test]
-async fn an_auto_table_paces_only_its_key_delete_whole_table_reclaims() {
+async fn an_auto_table_paces_its_whole_table_reclaims_on_either_kind_of_delete() {
     for on_key_deletes in [false, true] {
         let name = format!("auto_paced_reclaims_{on_key_deletes}");
         let (provider, _catalog, _tmp) = table(&name, DeletionMode::Auto, 256).await;
@@ -467,29 +467,26 @@ async fn an_auto_table_paces_only_its_key_delete_whole_table_reclaims() {
             pending >= 2,
             "premise: the index is past its trigger ({pending})"
         );
-        let reclaimed = provider
-            .compact_current_snapshot_small_files()
-            .await
-            .expect("reclaim pass");
-        assert_eq!(
-            reclaimed, !on_key_deletes,
-            "on key deletes the reclaim waits; on position deletes it runs (key deletes: {on_key_deletes})"
+        assert!(
+            !provider
+                .compact_current_snapshot_small_files()
+                .await
+                .expect("reclaim pass"),
+            "a reclaim that is not due waits (key deletes: {on_key_deletes})"
         );
-        if on_key_deletes {
-            assert_eq!(
-                deletion_index_entries(&provider),
-                pending,
-                "the deferred reclaim left the index as it was"
-            );
-            auto.forget_reclaim_pace();
-            assert!(
-                provider
-                    .compact_current_snapshot_small_files()
-                    .await
-                    .expect("due reclaim pass"),
-                "a due reclaim runs"
-            );
-        }
+        assert_eq!(
+            deletion_index_entries(&provider),
+            pending,
+            "the deferred reclaim left the index as it was (key deletes: {on_key_deletes})"
+        );
+        auto.forget_reclaim_pace();
+        assert!(
+            provider
+                .compact_current_snapshot_small_files()
+                .await
+                .expect("due reclaim pass"),
+            "a due reclaim runs (key deletes: {on_key_deletes})"
+        );
         assert_eq!(
             deletion_index_entries(&provider),
             0,
