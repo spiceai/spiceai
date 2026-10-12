@@ -217,7 +217,9 @@ every object under an `s3://` prefix; it refuses a bare bucket.
 `spiceai-dev-runners` for Linux, and for macOS whichever Mac is free first in
 `spiceai-macos` or `spiceai-macos-large`. It runs for
 changes to this crate, its harness, the workflow, the workspace manifest and
-lockfile, or the toolchain, in pull requests and in the merge queue. Every leg
+lockfile, or the toolchain, in pull requests and in the merge queue. A pull
+request from a fork or from Dependabot runs no leg, since its code would run on
+those persistent runners before review; the merge queue runs them. Every leg
 runs in parallel, each with the mandatory SlateDB oracle:
 
 | Store | Linux | macOS |

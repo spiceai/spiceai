@@ -22,6 +22,13 @@ concurrency:
 jobs:
   plan:
     name: Plan WAL E2E legs
+    # Every leg runs the change's code on persistent self-hosted runners in a
+    # public repository, so a pull request from a fork or from Dependabot runs
+    # none before review. The merge queue runs them once a maintainer queues it.
+    if: >-
+      github.event_name != 'pull_request' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+      github.event.pull_request.user.login != 'dependabot[bot]')
     runs-on: spiceai-dev-runners
     # A merge group's checkout takes the full history, sized for a cold runner
     # cloning from scratch.
@@ -112,7 +119,7 @@ jobs:
   qualify:
     name: WAL E2E (${{ matrix.os }}, ${{ matrix.store }})
     needs: plan
-    if: needs.plan.outputs.legs != '[]'
+    if: needs.plan.result == 'success' && needs.plan.outputs.legs != '[]'
     strategy:
       fail-fast: false
       matrix:
