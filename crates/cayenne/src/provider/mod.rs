@@ -112,6 +112,7 @@ pub(crate) mod query_admission;
 pub(crate) mod retention;
 pub(crate) mod runtime_restricted_scan;
 pub(crate) mod scan;
+pub(crate) mod scan_file_statistics;
 pub(crate) mod sink;
 pub(crate) mod staged_upsert;
 pub(crate) mod staging_wal;
@@ -155,6 +156,7 @@ pub use pk_keyset_budget::{
 pub use query_admission::set_query_admission_governor;
 pub use retention::TimeRetentionFilterBuilder;
 pub use scan::CayenneAccelerationExec;
+pub use scan_file_statistics::ScanFileStatisticsCounters;
 pub use staged_upsert::{CayenneStagedUpsert, PreparedTxnCommit, TransactionWriteToken};
 pub use staging_wal::{CayenneStagedAppend, PartitionedWalObjectStore, PreparedStagedAppend};
 pub use table::{

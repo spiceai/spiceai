@@ -102,6 +102,13 @@ pub mod lookup_index {
     pub use crate::provider::lookup_index::{LookupIndexCounters, LookupIndexVerification};
 }
 
+/// Per-file scan statistics accounting, so a check can prove concurrent cold
+/// scans shared their footer reads and metastore writes. Not a stable API.
+#[doc(hidden)]
+pub mod scan_file_statistics {
+    pub use crate::provider::ScanFileStatisticsCounters;
+}
+
 pub mod row_converter;
 pub(crate) mod schema;
 pub mod stats;

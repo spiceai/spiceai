@@ -490,6 +490,12 @@ required-features = ["rate-control"]
 name = "metrics"
 path = "tests/metrics.rs"
 
+# Runs in `make nextest`, which must not load `integration`, and installs the
+# process-global tracing subscriber its log assertions read.
+[[test]]
+name = "cayenne_runtime_tuning"
+path = "tests/cayenne_runtime_tuning.rs"
+
 # Installs a counting `#[global_allocator]` to compare the results cache's
 # reported size with the heap it holds.
 [[test]]
