@@ -429,7 +429,7 @@ fn describe_datasets(datasets: &[String]) -> String {
 
 /// The engine that created `entry`: the engine recorded on the entry, then the one
 /// recorded for its dataset, then the engine the snapshot file's extension names —
-/// each writer names its snapshots `<dataset>_<timestamp>.<engine>`.
+/// each writer ends its snapshot names with `.<engine>`.
 fn recorded_snapshot_engine(entry: &SnapshotEntry, dataset: &DatasetMetadata) -> Option<String> {
     entry
         .snapshot_engine
@@ -855,11 +855,14 @@ impl<'a> SnapshotPathLayout<'a> {
         }
     }
 
+    /// `<dataset>_<timestamp>_<uuid>.<ext>`. The timestamp has one-second resolution, so
+    /// the UUID keeps two publishes in the same second from writing the same object.
     fn snapshot_filename(&self, instant: DateTime<Utc>) -> String {
         format!(
-            "{}_{}{}",
+            "{}_{}_{}{}",
             self.dataset_name,
             instant.format(SNAPSHOT_TIMESTAMP_FORMAT),
+            uuid::Uuid::now_v7().simple(),
             self.engine.snapshot_extension()
         )
     }
@@ -868,6 +871,7 @@ impl<'a> SnapshotPathLayout<'a> {
         format!("dataset={}", self.dataset_name)
     }
 
+    /// Every call names a new object.
     fn build_location(&self, base: &ObjectPath, instant: DateTime<Utc>) -> ObjectPath {
         let month_partition = format!("month={}", instant.format("%Y-%m"));
         let day_partition = format!("day={}", instant.format("%Y-%m-%d"));
@@ -3323,8 +3327,7 @@ impl SnapshotManager {
 
         // Whether `metadata` already holds this publish: an earlier attempt whose write
         // landed but whose response was lost. Every recorded field must match, including the
-        // publish's own timestamp, so a separate publish of identical bytes to the same
-        // second-resolution path is not mistaken for this one.
+        // object name, which is unique to this publish.
         let already_published = |metadata: Option<&SnapshotMetadata>| {
             metadata
                 .and_then(|metadata| metadata.datasets.get(dataset_name))
@@ -5584,12 +5587,12 @@ mod tests {
             .unwrap_or_default()
     }
 
-    /// A `file://` location keeps accepting snapshots after the first: every later publish
-    /// updates `metadata.json` at the version it read, which a plain `LocalFileSystem`
-    /// refuses with `NotImplemented`.
-    #[tokio::test]
-    async fn file_location_publishes_more_than_once() {
-        let dir = TempDir::new().expect("tempdir");
+    /// A manager that publishes `<dir>/accelerated.db` to a `file://` location in `dir`,
+    /// with the location's store and the path of its `metadata.json`.
+    async fn file_location_manager(
+        dir: &TempDir,
+        schema: &SchemaRef,
+    ) -> (SnapshotManager, Arc<dyn ObjectStore>, Path) {
         let location =
             Url::from_directory_path(dir.path().join("snapshots")).expect("directory url");
         let config = spicepod::component::snapshot::Snapshots {
@@ -5609,29 +5612,93 @@ mod tests {
         .expect("a file location builds a store");
 
         let local_path = dir.path().join("accelerated.db");
-        let schema = sample_schema();
-        let mut manager = build_manager_over(Arc::clone(&store), local_path.clone(), &schema);
+        let mut manager = build_manager_over(Arc::clone(&store), local_path, schema);
         manager.snapshots_location = snapshots_location.clone();
         manager.snapshot_location_uri = location.to_string();
+        (manager, store, snapshots_location.join(METADATA_FILE_NAME))
+    }
+
+    /// A `file://` location keeps accepting snapshots after the first: every later publish
+    /// updates `metadata.json` at the version it read, which a plain `LocalFileSystem`
+    /// refuses with `NotImplemented`.
+    #[tokio::test]
+    async fn file_location_publishes_more_than_once() {
+        let dir = TempDir::new().expect("tempdir");
+        let schema = sample_schema();
+        let (manager, store, metadata_path) = file_location_manager(&dir, &schema).await;
 
         for content in [
             b"first".as_slice(),
             b"second".as_slice(),
             b"third".as_slice(),
         ] {
-            std::fs::write(&local_path, content).expect("write accelerator file");
+            std::fs::write(dir.path().join("accelerated.db"), content)
+                .expect("write accelerator file");
             publish(&manager, &schema)
                 .await
                 .expect("publish to a file location")
                 .expect("snapshot created");
         }
 
-        let entries = dataset_entries(
-            store.as_ref(),
-            &snapshots_location.clone().join(METADATA_FILE_NAME),
-        )
-        .await;
+        let entries = dataset_entries(store.as_ref(), &metadata_path).await;
         assert_eq!(entries.len(), 3, "every publish is recorded: {entries:?}");
+    }
+
+    /// Two publishes of one dataset in the same second each keep their own object, so
+    /// every recorded entry still names the bytes its checksum describes.
+    #[tokio::test]
+    async fn publishes_in_the_same_second_keep_their_own_objects() {
+        let dir = TempDir::new().expect("tempdir");
+        let schema = sample_schema();
+        let (manager, store, metadata_path) = file_location_manager(&dir, &schema).await;
+
+        // Publish until the last two snapshots share a second, the resolution of the
+        // timestamp in a snapshot's name.
+        let mut entries = Vec::new();
+        for publish_number in 0..10 {
+            std::fs::write(
+                dir.path().join("accelerated.db"),
+                format!("publish {publish_number}"),
+            )
+            .expect("write accelerator file");
+            publish(&manager, &schema)
+                .await
+                .expect("publish to a file location")
+                .expect("snapshot created");
+            entries = dataset_entries(store.as_ref(), &metadata_path).await;
+            if let [.., previous, last] = entries.as_slice()
+                && previous.timestamp_ms / 1000 == last.timestamp_ms / 1000
+            {
+                break;
+            }
+        }
+        let [.., previous, last] = entries.as_slice() else {
+            panic!("expected at least two snapshots: {entries:?}");
+        };
+        assert_eq!(
+            previous.timestamp_ms / 1000,
+            last.timestamp_ms / 1000,
+            "no two publishes shared a second: {entries:?}"
+        );
+
+        for entry in &entries {
+            let path = manager
+                .snapshot_uri_to_object_path(&entry.snapshot, None)
+                .expect("snapshot object path");
+            let stored = store
+                .get(&path)
+                .await
+                .expect("snapshot object stored")
+                .bytes()
+                .await
+                .expect("read snapshot object");
+            assert_eq!(
+                compute_sha256_hex(&stored),
+                entry.snapshot_checksum,
+                "snapshot {} names an object that holds another publish's bytes: {entries:?}",
+                entry.snapshot_id
+            );
+        }
     }
 
     /// A store that accepts write conditions and ignores them is refused before anything
