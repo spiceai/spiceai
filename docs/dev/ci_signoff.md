@@ -280,9 +280,55 @@ Options:
 ```bash
 scripts/signoff -f            # sign off even with an uncommitted/unpushed tree
 scripts/signoff --no-verify   # attest without running the checks (honor system)
+scripts/signoff --note TEXT   # add TEXT to the description (with --no-verify: where the checks ran)
+scripts/signoff verify        # run the checks on HEAD, post no status (HEAD need not be pushed)
 scripts/signoff status        # does HEAD have its own sign-off?
 scripts/signoff --help        # full usage
 ```
+
+### Sign off several PRs with one run (`scripts/signoff-batch`)
+
+A full sign-off takes hours. `scripts/signoff-batch` runs the checks once for a
+set of PRs, and then attests each PR:
+
+```
+  trunk T ──┬── #a + T ──┐
+            ├── #b + T ──┼──▶ batch = T + #a' + #b' + #c' ──▶ scripts/signoff verify
+            └── #c + T ──┘                                         │
+                                                         pass ─────┴───── fail
+                                                           │                │
+                            push each #x' (no force push), │                │ push nothing; name the
+                            then signoff -f --no-verify    ▼                ▼ PRs that change the
+                            --note "... in batch with ..."                    failing crates
+```
+
+```bash
+scripts/signoff-batch 15040 15041 '#15047'   # merged in this order
+scripts/signoff-batch --plan 15040 15041     # build and check out the batch, then stop
+```
+
+1. The script pins `trunk` to one commit, T, and merges T into each PR head. These
+   merges are local until the checks pass.
+2. It merges the updated heads onto T, in the order given. A conflict with
+   `trunk`, or between two PRs, stops the run and names the files and PRs.
+3. It runs `scripts/signoff verify` on the batch, in a worktree that later runs
+   reuse, so the build cache stays warm. The default worktree is
+   `<checkout>-signoff-batch`; set `--worktree` or `SIGNOFF_BATCH_WORKTREE` to
+   change it. The log goes to `.git/signoff-batch/<batch>.log`.
+4. If the checks pass, the script asks for confirmation (skip it with `--yes`).
+   Then it pushes each updated head and attests it. The description names the
+   other PRs and T. If a push is rejected because the branch moved during the
+   run, the script does not attest that PR.
+
+If the checks fail, the script pushes and attests nothing. It reads the log for
+crates that did not compile or had failing tests, and lists the PRs that change
+each crate or one of its workspace dependencies. The batch stays checked out, so
+you can inspect it or run the batch again without a suspect PR.
+
+A passing batch does not prove that each PR passes alone, because one PR can
+depend on another PR in the batch. The engineer who chooses the batch is
+responsible for that. The merge queue still runs the full suite on each PR
+before it reaches `trunk`.
 
 ### Remote sign-off (self-hosted runner)
 

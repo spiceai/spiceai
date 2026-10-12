@@ -1,0 +1,475 @@
+#!/usr/bin/env python3
+# Copyright 2024-2026 The Spice.ai OSS Authors
+#
+# scripts/signoff-batch — sign off several PRs with one run of the checks.
+#
+#   1. Pin trunk to one commit (T) and merge it into each PR head, locally.
+#   2. Merge those heads onto T, in the order given: the batch commit.
+#   3. Run `scripts/signoff verify` on the batch, in a worktree that is reused
+#      across runs so its build cache stays warm.
+#   4. Pass: push each updated head (a plain push, never a force push), then
+#      attest it with `scripts/signoff -f --no-verify --note "..."`.
+#      Fail: push nothing. Name the PRs that touch the crates that failed.
+#
+#   trunk T ──┬── #a + T ──┐
+#             ├── #b + T ──┼──▶ batch = T + #a' + #b' + #c' ──▶ signoff verify
+#             └── #c + T ──┘
+#
+# A passing batch does not prove that each PR passes alone: one PR can depend on
+# another PR in the batch. The engineer who batches the PRs owns that judgment.
+# The merge queue still runs the full suite on each PR before it reaches trunk.
+#
+# Usage:
+#   scripts/signoff-batch 15040 15041 '#15047' https://github.com/o/r/pull/14699
+#   scripts/signoff-batch --plan 15040 15041   # do steps 1-2, check out, stop
+#   scripts/signoff-batch --help
+#
+# Environment:
+#   SIGNOFF_BATCH_WORKTREE  Worktree for the batch build (default: a sibling of
+#                           the main checkout, <checkout>-signoff-batch)
+#   SIGNOFF_REMOTE          Git remote (default: origin), as for scripts/signoff
+#   SIGNOFF_BRANCH          Base branch (default: trunk), as for scripts/signoff
+#
+# Requires git 2.38+ (merge-tree --write-tree), gh, and python 3.11+.
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import subprocess
+import sys
+import tempfile
+from collections.abc import Iterable, Sequence
+from dataclasses import dataclass, field
+from pathlib import Path
+
+REMOTE = os.environ.get("SIGNOFF_REMOTE", "origin")
+TRUNK = os.environ.get("SIGNOFF_BRANCH", "trunk")
+BATCH_BRANCH = "signoff-batch"
+# GitHub caps a status description at 140 characters, and scripts/signoff puts
+# "Signed off by <login> — " (up to 63) in front of the note.
+NOTE_MAX_CHARS = 75
+
+
+class BatchError(Exception):
+    """A condition that stops the batch before anything is pushed."""
+
+
+# --- data -------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PullRequest:
+    number: int
+    branch: str
+    title: str
+    base: str
+    # The head commit as fetched from the remote, which is what gets merged.
+    head: str
+
+
+@dataclass(frozen=True)
+class UpdatedHead:
+    pr: PullRequest
+    # `pr.head` with trunk merged in; equal to `pr.head` when it already had T.
+    sha: str
+
+    @property
+    def needs_push(self) -> bool:
+        return self.sha != self.pr.head
+
+
+@dataclass(frozen=True)
+class Batch:
+    trunk: str
+    heads: tuple[UpdatedHead, ...]
+    sha: str
+
+
+@dataclass(frozen=True)
+class Merge:
+    tree: str
+    conflicts: tuple[str, ...]
+
+
+@dataclass(frozen=True)
+class Crate:
+    name: str
+    # Manifest directory, relative to the repository root ("" for the root crate).
+    path: str
+    workspace_deps: frozenset[str]
+
+
+@dataclass
+class Attribution:
+    """PRs that may have caused one failing crate to fail."""
+
+    crate: str
+    direct: list[int] = field(default_factory=list)
+    via_dependency: list[int] = field(default_factory=list)
+
+
+# --- git and gh -------------------------------------------------------------
+
+
+def run(args: Sequence[str], cwd: Path, check: bool = True) -> subprocess.CompletedProcess[str]:
+    result = subprocess.run(list(args), cwd=cwd, text=True, capture_output=True)
+    if check and result.returncode != 0:
+        raise BatchError(f"`{' '.join(args)}` failed:\n{result.stderr.strip()}")
+    return result
+
+
+def git(repo: Path, *args: str) -> str:
+    return run(["git", *args], cwd=repo).stdout.strip()
+
+
+def is_ancestor(repo: Path, ancestor: str, descendant: str) -> bool:
+    return run(["git", "merge-base", "--is-ancestor", ancestor, descendant], repo, check=False).returncode == 0
+
+
+def merge_tree(repo: Path, ours: str, theirs: str) -> Merge:
+    result = run(
+        ["git", "merge-tree", "--write-tree", "--name-only", "--no-messages", ours, theirs],
+        repo,
+        check=False,
+    )
+    if result.returncode not in (0, 1):
+        raise BatchError(f"git merge-tree {ours[:12]} {theirs[:12]} failed:\n{result.stderr.strip()}")
+    lines = result.stdout.splitlines()
+    return Merge(tree=lines[0], conflicts=tuple(line for line in lines[1:] if line))
+
+
+def commit_tree(repo: Path, tree: str, parents: Iterable[str], message: str) -> str:
+    args = ["commit-tree", tree]
+    for parent in parents:
+        args += ["-p", parent]
+    return git(repo, *args, "-m", message)
+
+
+def changed_files(repo: Path, base: str, head: str) -> set[str]:
+    out = git(repo, "diff", "--name-only", "--no-renames", f"{base}...{head}")
+    return set(out.splitlines()) if out else set()
+
+
+def parse_pr_arg(arg: str) -> int:
+    match = re.fullmatch(r"#?(\d+)|.*/pull/(\d+)/?", arg.strip())
+    if not match:
+        raise BatchError(f"not a PR number or URL: {arg!r}")
+    return int(match.group(1) or match.group(2))
+
+
+def lookup_pr(repo: Path, number: int) -> tuple[str, str, str]:
+    """Return (branch, title, base) for an open PR whose branch can be pushed to."""
+    fields = "number,headRefName,baseRefName,title,state,isCrossRepository"
+    data = json.loads(run(["gh", "pr", "view", str(number), "--json", fields], repo).stdout)
+    if data["state"] != "OPEN":
+        raise BatchError(f"#{number} is {data['state'].lower()}, not open")
+    if data["isCrossRepository"]:
+        raise BatchError(f"#{number} comes from a fork; its branch cannot be pushed to from here")
+    return data["headRefName"], data["title"], data["baseRefName"]
+
+
+# --- steps ------------------------------------------------------------------
+
+
+def fetch(repo: Path, numbers: Sequence[int]) -> tuple[str, list[PullRequest]]:
+    found = {n: lookup_pr(repo, n) for n in numbers}
+    refspecs = [f"+refs/heads/{TRUNK}:refs/remotes/{REMOTE}/{TRUNK}"]
+    refspecs += [f"+refs/heads/{b}:refs/remotes/{REMOTE}/{b}" for b, _, _ in found.values()]
+    git(repo, "fetch", "--quiet", "--no-tags", REMOTE, *refspecs)
+    trunk = git(repo, "rev-parse", f"refs/remotes/{REMOTE}/{TRUNK}")
+    prs = [
+        PullRequest(n, branch, title, base, git(repo, "rev-parse", f"refs/remotes/{REMOTE}/{branch}"))
+        for n, (branch, title, base) in found.items()
+    ]
+    return trunk, prs
+
+
+def update_head(repo: Path, trunk: str, pr: PullRequest) -> UpdatedHead:
+    if is_ancestor(repo, trunk, pr.head):
+        return UpdatedHead(pr, pr.head)
+    merge = merge_tree(repo, pr.head, trunk)
+    if merge.conflicts:
+        raise BatchError(
+            f"#{pr.number} ({pr.branch}) conflicts with {TRUNK} in:\n"
+            + "".join(f"  {path}\n" for path in merge.conflicts)
+            + f"Merge {TRUNK} into it and resolve the conflict, then run the batch again."
+        )
+    sha = commit_tree(repo, merge.tree, (pr.head, trunk), f"Merge branch '{TRUNK}' into {pr.branch}")
+    return UpdatedHead(pr, sha)
+
+
+def build_batch(repo: Path, trunk: str, heads: Sequence[UpdatedHead]) -> Batch:
+    tip = trunk
+    merged: list[UpdatedHead] = []
+    for head in heads:
+        # A PR stacked on another PR in the batch can already be in the tip.
+        if not is_ancestor(repo, head.sha, tip):
+            merge = merge_tree(repo, tip, head.sha)
+            if merge.conflicts:
+                raise BatchError(conflict_report(repo, trunk, head, merged, merge.conflicts))
+            tip = commit_tree(repo, merge.tree, (tip, head.sha), f"{BATCH_BRANCH}: merge #{head.pr.number} ({head.pr.branch})")
+        merged.append(head)
+    return Batch(trunk, tuple(merged), tip)
+
+
+def conflict_report(
+    repo: Path, trunk: str, head: UpdatedHead, earlier: Sequence[UpdatedHead], conflicts: Sequence[str]
+) -> str:
+    lines = [f"#{head.pr.number} ({head.pr.branch}) conflicts with PRs earlier in the batch:"]
+    earlier_files = [(e.pr.number, changed_files(repo, trunk, e.sha)) for e in earlier]
+    for path in conflicts:
+        owners = [f"#{number}" for number, files in earlier_files if path in files]
+        lines.append(f"  {path}  (also changed by {', '.join(owners) or 'an earlier PR'})")
+    lines.append("Leave one of them out of the batch, or merge one into the other first.")
+    return "\n".join(lines)
+
+
+def prepare_worktree(repo: Path, worktree: Path, commit: str) -> None:
+    common = Path(git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")).resolve()
+    if not worktree.exists():
+        git(repo, "worktree", "add", "--quiet", "-B", BATCH_BRANCH, str(worktree), commit)
+        return
+    probe = run(["git", "rev-parse", "--path-format=absolute", "--git-common-dir"], worktree, check=False)
+    if probe.returncode != 0 or Path(probe.stdout.strip()).resolve() != common:
+        raise BatchError(f"{worktree} exists but is not a worktree of {repo}")
+    if git(worktree, "status", "--porcelain"):
+        raise BatchError(f"{worktree} has local changes; clean it before a batch run")
+    git(worktree, "checkout", "--quiet", "-B", BATCH_BRANCH, commit)
+
+
+def choose_signoff(worktree: Path) -> Path:
+    """The batch tree's scripts/signoff, so a PR that changes the gate runs its own
+    gate. A tree older than `verify` falls back to the copy beside this script."""
+    for candidate in (worktree / "scripts/signoff", Path(__file__).resolve().parent / "signoff"):
+        if candidate.is_file() and "cmd_verify" in candidate.read_text():
+            if candidate.parent.parent != worktree:
+                print(f"warning: the batch's scripts/signoff has no `verify`; using {candidate}", file=sys.stderr)
+            return candidate
+    raise BatchError("no scripts/signoff with a `verify` command found")
+
+
+def verify(signoff: Path, worktree: Path, log_path: Path, skip_targeted: bool) -> tuple[bool, str]:
+    """Run `scripts/signoff verify` in the worktree. Return (passed, check summary)."""
+    args = [str(signoff), "verify"] + (["--skip-targeted"] if skip_targeted else [])
+    summary = ""
+    log_path.parent.mkdir(parents=True, exist_ok=True)
+    with log_path.open("w") as log, subprocess.Popen(
+        args, cwd=worktree, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, bufsize=1
+    ) as proc:
+        assert proc.stdout is not None
+        for line in proc.stdout:
+            sys.stdout.write(line)
+            log.write(line)
+            if match := re.match(r"✓ Verified \S+ — (.*) in \d+s", line):
+                summary = match.group(1)
+    return proc.returncode == 0, summary or "lint+test passed"
+
+
+def compose_note(summary: str, trunk: str, pr: PullRequest, batch: Batch) -> str:
+    others = [f"#{h.pr.number}" for h in batch.heads if h.pr.number != pr.number]
+    on_trunk = f"on {TRUNK} {trunk[:10]}"
+    if not others:
+        return f"{summary} {on_trunk} (signoff-batch)"
+    note = f"{summary} in batch with {' '.join(others)} {on_trunk}"
+    if len(note) <= NOTE_MAX_CHARS:
+        return note
+    return f"{summary} in batch with {len(others)} other PRs {on_trunk}"
+
+
+def attest(repo: Path, signoff: Path, sha: str, note: str) -> subprocess.CompletedProcess[str]:
+    # signoff attests HEAD. A worktree without a checkout gives it a HEAD at the
+    # PR head without writing ~28k files; -f skips the clean-tree check.
+    with tempfile.TemporaryDirectory(prefix="signoff-batch-attest-") as tmp:
+        path = Path(tmp) / "head"
+        git(repo, "worktree", "add", "--quiet", "--no-checkout", "--detach", str(path), sha)
+        try:
+            return run([str(signoff), "-f", "--no-verify", "--note", note], path, check=False)
+        finally:
+            git(repo, "worktree", "remove", "--force", str(path))
+
+
+# --- failure attribution ----------------------------------------------------
+
+# `error: could not compile `runtime` (lib test) due to 2 previous errors`
+COMPILE_ERROR = re.compile(r"error: could not compile `([^`]+)`")
+# nextest: `        FAIL [   0.004s] (12/340) runtime::integration some::test`
+NEXTEST_FAIL = re.compile(
+    r"^\s*(?:FAIL|SIGSEGV|SIGABRT|SIGBUS|SIGKILL|TIMEOUT|LEAK-FAIL|ABORT)\s+\[[^\]]*\]\s+(?:\(\s*\d+/\d+\)\s+)?(\S+)"
+)
+
+
+def failing_crates(log: str) -> list[str]:
+    found: dict[str, None] = {}
+    for line in log.splitlines():
+        if match := COMPILE_ERROR.search(line) or NEXTEST_FAIL.match(line):
+            found.setdefault(match.group(1).split("::")[0], None)
+    return list(found)
+
+
+def workspace_crates(worktree: Path) -> dict[str, Crate]:
+    result = run(["cargo", "metadata", "--no-deps", "--format-version", "1"], worktree, check=False)
+    if result.returncode != 0:
+        return {}
+    meta = json.loads(result.stdout)
+    root = Path(meta["workspace_root"])
+    crates = {}
+    for pkg in meta["packages"]:
+        rel = Path(pkg["manifest_path"]).parent.relative_to(root).as_posix()
+        deps = frozenset(d["name"] for d in pkg["dependencies"] if d.get("path"))
+        crates[pkg["name"]] = Crate(pkg["name"], "" if rel == "." else rel, deps)
+    return crates
+
+
+def crate_for_file(crates: dict[str, Crate], path: str) -> str | None:
+    best: Crate | None = None
+    for crate in crates.values():
+        if (not crate.path or path.startswith(crate.path + "/")) and (best is None or len(crate.path) > len(best.path)):
+            best = crate
+    return best.name if best else None
+
+
+def dependency_closure(crates: dict[str, Crate], name: str) -> set[str]:
+    seen, stack = set(), [name]
+    while stack:
+        current = stack.pop()
+        if current in seen or current not in crates:
+            continue
+        seen.add(current)
+        stack.extend(crates[current].workspace_deps)
+    return seen
+
+
+def attribute(failing: Sequence[str], touched: dict[int, set[str]], crates: dict[str, Crate]) -> list[Attribution]:
+    out = []
+    for name in failing:
+        closure = dependency_closure(crates, name) - {name}
+        entry = Attribution(name)
+        for number, names in touched.items():
+            if name in names:
+                entry.direct.append(number)
+            elif names & closure:
+                entry.via_dependency.append(number)
+        out.append(entry)
+    return out
+
+
+def report_failure(repo: Path, worktree: Path, batch: Batch, log_path: Path) -> None:
+    print(f"\n✗ Batch checks failed. Nothing was pushed or attested.\n  Log: {log_path}", file=sys.stderr)
+    print(f"  Batch: {worktree} (branch {BATCH_BRANCH})", file=sys.stderr)
+    failing = failing_crates(log_path.read_text())
+    crates = workspace_crates(worktree) if failing else {}
+    if not failing or not crates:
+        print("  Could not tell which crates failed from the log; read the log.", file=sys.stderr)
+        return
+    touched = {
+        h.pr.number: {c for f in changed_files(repo, batch.trunk, h.sha) if (c := crate_for_file(crates, f))}
+        for h in batch.heads
+    }
+    print("\nFailing crates and the PRs that change them:", file=sys.stderr)
+    for entry in attribute(failing, touched, crates):
+        direct = " ".join(f"#{n}" for n in entry.direct) or "-"
+        via = " ".join(f"#{n}" for n in entry.via_dependency) or "-"
+        print(f"  {entry.crate}: changed by {direct}; changes a dependency: {via}", file=sys.stderr)
+    print(
+        "\nNo PR named? Then the failure may come from trunk, or from PRs combined.\n"
+        "Run the batch again without a suspect to confirm.",
+        file=sys.stderr,
+    )
+
+
+# --- main -------------------------------------------------------------------
+
+
+def default_worktree(repo: Path) -> Path:
+    if env := os.environ.get("SIGNOFF_BATCH_WORKTREE"):
+        return Path(env)
+    main = Path(git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir")).parent
+    return main.parent / f"{main.name}-signoff-batch"
+
+
+def confirm(prompt: str, yes: bool) -> bool:
+    if yes:
+        return True
+    if not sys.stdin.isatty():
+        raise BatchError("not a terminal; pass --yes to push and attest without a prompt")
+    return input(f"{prompt} [y/N] ").strip().lower() in ("y", "yes")
+
+
+def print_plan(batch: Batch) -> None:
+    print(f"\n{TRUNK} pinned at {batch.trunk[:12]}. Batch {batch.sha[:12]}:")
+    for h in batch.heads:
+        action = f"merge {TRUNK}: {h.pr.head[:10]} -> {h.sha[:10]}" if h.needs_push else f"has {TRUNK}: {h.sha[:10]}"
+        stacked = f" (base: {h.pr.base})" if h.pr.base != TRUNK else ""
+        print(f"  #{h.pr.number:<6} {h.pr.branch:<40} {action}{stacked}")
+        print(f"          {h.pr.title[:80]}")
+
+
+def main(argv: Sequence[str]) -> int:
+    parser = argparse.ArgumentParser(
+        prog="scripts/signoff-batch",
+        description="Merge several PRs onto trunk, run the sign-off checks once, and attest each PR if they pass.",
+    )
+    parser.add_argument("prs", nargs="+", metavar="PR", help="PR number, #number, or URL; merged in this order")
+    parser.add_argument("--plan", action="store_true", help="build and check out the batch, then stop")
+    parser.add_argument("--yes", action="store_true", help="push and attest without a prompt")
+    parser.add_argument("--skip-targeted", action="store_true", help="pass --skip-targeted to scripts/signoff verify")
+    parser.add_argument("--worktree", type=Path, help="batch worktree (default: $SIGNOFF_BATCH_WORKTREE or <checkout>-signoff-batch)")
+    args = parser.parse_args(argv)
+
+    try:
+        repo = Path(git(Path.cwd(), "rev-parse", "--show-toplevel"))
+        numbers = list(dict.fromkeys(parse_pr_arg(a) for a in args.prs))
+        worktree = (args.worktree or default_worktree(repo)).resolve()
+
+        trunk, prs = fetch(repo, numbers)
+        heads = [update_head(repo, trunk, pr) for pr in prs]
+        batch = build_batch(repo, trunk, heads)
+        print_plan(batch)
+        prepare_worktree(repo, worktree, batch.sha)
+        print(f"\nChecked out in {worktree} (branch {BATCH_BRANCH}).")
+        if args.plan:
+            return 0
+
+        common = Path(git(repo, "rev-parse", "--path-format=absolute", "--git-common-dir"))
+        log_path = common / "signoff-batch" / f"{batch.sha[:12]}.log"
+        signoff = choose_signoff(worktree)
+        passed, summary = verify(signoff, worktree, log_path, args.skip_targeted)
+        if not passed:
+            report_failure(repo, worktree, batch, log_path)
+            return 1
+
+        to_push = [h for h in batch.heads if h.needs_push]
+        print(f"\n✓ Batch checks passed: {summary}.")
+        if not confirm(f"Push {len(to_push)} trunk merge(s) and attest {len(batch.heads)} PR(s)?", args.yes):
+            print("Stopped. Nothing was pushed or attested.")
+            return 1
+
+        failed = []
+        for h in batch.heads:
+            if h.needs_push:
+                push = run(["git", "push", "--quiet", REMOTE, f"{h.sha}:refs/heads/{h.pr.branch}"], repo, check=False)
+                if push.returncode != 0:
+                    # Usually the branch moved during the run: its new head was not checked.
+                    failed.append(f"#{h.pr.number}: push rejected, not attested\n{push.stderr.strip()}")
+                    continue
+            result = attest(repo, signoff, h.sha, compose_note(summary, trunk, h.pr, batch))
+            if result.returncode != 0:
+                failed.append(f"#{h.pr.number}: attestation failed\n{(result.stdout + result.stderr).strip()}")
+                continue
+            print(f"  ✓ #{h.pr.number} attested at {h.sha[:12]}")
+        for message in failed:
+            print(f"  ✗ {message}", file=sys.stderr)
+        return 1 if failed else 0
+    except BatchError as err:
+        print(f"✗ {err}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("\n✗ Interrupted.", file=sys.stderr)
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))
