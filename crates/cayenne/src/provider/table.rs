@@ -31562,7 +31562,13 @@ impl CayenneTableProvider {
     }
 
     async fn build_current_scan_view_with_statistics(&self) -> datafusion_common::Result<()> {
-        let view = self.scan_view_at_current_input(self.scan_view_reuse).await?;
+        // The table as it is now, whatever its reuse mode: a lag-tolerant table
+        // would otherwise be handed a view captured before this write, and
+        // publishing that as the newest view would hide the write from the scans
+        // that follow.
+        let view = self
+            .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
+            .await?;
         let raw = &view.raw;
         let ctx = self.create_session_context();
         let state = ctx.state();
@@ -55399,6 +55405,49 @@ mod tests {
         assert!(
             Arc::ptr_eq(&latest_scan_view(&provider), &view),
             "the first scan after an overwrite must use the view the overwrite built"
+        );
+    }
+
+    /// Once an append (an `append` refresh) has completed, the listing of the
+    /// files it published is already built, so the next scan builds none and
+    /// still sees the appended rows.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn append_prepares_its_files_for_scans() {
+        let (provider, ctx, _dir) = shared_listing_table("shared_listing_append", 0).await;
+        overwrite_ids(&ctx, &provider, 100, 1).await;
+        let before = latest_scan_view(&provider);
+
+        insert_batch_with_context(
+            &ctx,
+            &provider,
+            id_value_batch(provider.table_schema(), &[5_000], &[42]),
+        )
+        .await;
+        let view = latest_scan_view(&provider);
+        assert!(
+            !Arc::ptr_eq(&view, &before),
+            "the append prepared a scan view of the files it published"
+        );
+        let prepared = view
+            .raw
+            .warm_files
+            .with_statistics
+            .get()
+            .expect("the append built the listing of its files");
+        assert_eq!(prepared.files.len(), before.raw.warm_files.files.len() + 1);
+        let builds = snapshot_listing_builds(&provider);
+
+        let lookup = |id| {
+            let provider = Arc::clone(&provider);
+            let ctx = ctx.clone();
+            async move { query_pk_i64(provider as Arc<dyn TableProvider>, &ctx, id, "value").await }
+        };
+        assert_eq!(lookup(5_000).await, vec![42], "the appended row");
+        assert_eq!(lookup(7).await, vec![71], "and the rows before it");
+        assert_eq!(
+            snapshot_listing_builds(&provider),
+            builds,
+            "the first scan after an append must not build a listing"
         );
     }
 

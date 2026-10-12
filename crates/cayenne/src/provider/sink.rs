@@ -303,11 +303,35 @@ impl DataSink for CayenneDataSink {
             // Overwrite path: `CayenneTableProvider::begin_overwrite` acquires the
             // table write lock internally and the lock is held inside the
             // returned `PreparedOverwrite` until `finish`/`rollback`. Acquiring
-            // it again here would deadlock.
-            self.write_all_overwrite(normalized, context)
+            // it again here would deadlock. Its publish prepares the new
+            // snapshot's scan view itself.
+            return self
+                .write_all_overwrite(normalized, context)
                 .await
-                .map_err(Into::into)
-        } else if let Some(write_guard) = self.lock_for_first_load().await {
+                .map_err(Into::into);
+        }
+        let rows = self.write_all_file_append(normalized, context).await?;
+        // The append published new files, which every scan from here on lists.
+        // Build that listing now, before the refresh reports completion, as an
+        // overwrite does for its new snapshot. Not for a table that lists its
+        // files from the manifest: the append's files reach the manifest only
+        // with the post-write maintenance pass, so a listing built now would be
+        // missing them.
+        if !self.context.scan_from_manifest() {
+            self.table.prepare_scan_view_for_reads().await;
+        }
+        Ok(rows)
+    }
+}
+
+impl CayenneDataSink {
+    /// Append `normalized` to a file-backed table, as one write or in segments.
+    async fn write_all_file_append(
+        &self,
+        normalized: SendableRecordBatchStream,
+        context: &Arc<TaskContext>,
+    ) -> DFResult<u64> {
+        if let Some(write_guard) = self.lock_for_first_load().await {
             // A refresh appending into a table that holds no rows has nothing to
             // check its keys against, so it is written as one append without the
             // conflict check or the segments: segments would each check their
@@ -366,9 +390,7 @@ impl DataSink for CayenneDataSink {
                 .map_err(Into::into)
         }
     }
-}
 
-impl CayenneDataSink {
     /// Resolve the transaction active on this write's request
     /// context, if any.
     ///
