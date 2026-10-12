@@ -586,6 +586,7 @@ pub(crate) fn routes(
         let mcp_auth_message = "MCP endpoint (/v1/mcp) requires `runtime.auth` to be configured. Configure an API key provider in your Spicepod (see https://spiceai.org/docs/reference/runtime#auth) and retry with credentials.";
         let mcp_router = Router::new()
             .nest_service("/v1/mcp", mcp_service)
+            .route_layer(middleware::from_fn(reject_repeated_mcp_routing_headers))
             .route_layer(RequestBodyLimitLayer::new(MCP_REQUEST_BODY_LIMIT))
             .route_layer(middleware::from_fn(move |req, next| {
                 require_auth_configured(mcp_auth_required, mcp_auth_message, req, next)
@@ -1151,6 +1152,52 @@ async fn check_shutdown(
 /// Used to gate routes whose behavior is unsafe anonymously (`/v1/tools/*`: the raw
 /// request body is handed to `tool.call`, which for built-ins like `sql` and
 /// `websearch` is equivalent to arbitrary query / outbound fetch).
+/// Streamable HTTP headers that rmcp checks against the JSON-RPC body.
+#[cfg(feature = "mcp")]
+const MCP_ROUTING_HEADERS: [&str; 3] = ["mcp-method", "mcp-name", "mcp-protocol-version"];
+#[cfg(feature = "mcp")]
+const MCP_PARAM_HEADER_PREFIX: &str = "mcp-param-";
+
+#[cfg(feature = "mcp")]
+fn repeated_mcp_routing_header(headers: &http::HeaderMap) -> Option<&http::HeaderName> {
+    headers.keys().find(|name| {
+        (MCP_ROUTING_HEADERS.contains(&name.as_str())
+            || name.as_str().starts_with(MCP_PARAM_HEADER_PREFIX))
+            && headers.get_all(*name).iter().nth(1).is_some()
+    })
+}
+
+/// rmcp checks only the first copy of a repeated routing header, so a proxy
+/// that routes on a later copy could see a different method or tool from the
+/// one Spice runs. Reject repeats as a header mismatch (HTTP 400, `-32020`).
+#[cfg(feature = "mcp")]
+async fn reject_repeated_mcp_routing_headers(
+    req: axum::http::Request<Body>,
+    next: Next,
+) -> axum::response::Response {
+    #[derive(serde::Deserialize)]
+    struct RequestIdOnly {
+        id: Option<rmcp::model::RequestId>,
+    }
+
+    let Some(name) = repeated_mcp_routing_header(req.headers()).cloned() else {
+        return next.run(req).await;
+    };
+    let id = axum::body::to_bytes(req.into_body(), MCP_REQUEST_BODY_LIMIT)
+        .await
+        .ok()
+        .and_then(|body| serde_json::from_slice::<RequestIdOnly>(&body).ok())
+        .and_then(|request| request.id);
+    let error = rmcp::model::JsonRpcError::new(
+        id,
+        rmcp::model::ErrorData::header_mismatch(
+            format!("{name} header must not be repeated"),
+            None,
+        ),
+    );
+    (http::StatusCode::BAD_REQUEST, axum::Json(error)).into_response()
+}
+
 async fn require_auth_configured(
     auth_configured: bool,
     message: &'static str,
