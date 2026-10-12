@@ -289,7 +289,7 @@ impl PreparedOverwrite {
     }
 
     /// The steps of [`Self::finish`], run on their own task.
-    async fn publish(mut self) -> Result<u64> {
+    async fn publish(self) -> Result<u64> {
         // Publish the new snapshot as a single atomic visibility flip under the listing
         // fence (snapshot id + deletion caches + inline cache + listing swap), so a
         // concurrent scan never observes a torn state. Full rationale on
@@ -404,14 +404,7 @@ impl PreparedOverwrite {
 
         // All visibility-related updates above happen under exclusive table access; the
         // retention pass takes this same lock, so it can only proceed once this drops.
-        drop(self.write_guard.take());
-        drop(self.checkpoint_guard.take());
-
-        // Every scan that starts from here on reads the new snapshot. Build its scan
-        // view and file statistics now, before the refresh reports completion, so
-        // the queries a completed refresh lets through do not all stall on the
-        // first listing of a snapshot they reach together.
-        self.table.prepare_scan_view_for_reads().await;
+        let _ = self.write_guard;
 
         Ok(self.row_count)
     }
@@ -1353,12 +1346,7 @@ mod tests {
     /// Every id the table currently serves, sorted. Reads through a fresh
     /// `SessionContext` so nothing about the plan is cached between calls.
     async fn scan_ids(provider: &CayenneTableProvider) -> Vec<i64> {
-        // Queries share the table's runtime environment, and with it the footer
-        // cache its listings fill, as they do in the runtime.
-        let ctx = SessionContext::new_with_config_rt(
-            datafusion::prelude::SessionConfig::new(),
-            Arc::clone(provider.context().runtime_env()),
-        );
+        let ctx = SessionContext::new();
         let batches = ctx
             .read_table(Arc::new(provider.clone_for_write()))
             .expect("read_table")

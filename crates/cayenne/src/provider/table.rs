@@ -31544,22 +31544,51 @@ impl CayenneTableProvider {
     }
 
     /// Build the scan view of the table as it is now, with its files' statistics,
-    /// so the scans that follow a write that published a new snapshot find both
-    /// ready instead of building them. Called after the publish, once the write
-    /// has released its locks and before it reports completion: queries that a
-    /// completed refresh lets through then plan against a ready view.
+    /// so the scans that follow a refresh find both ready instead of building
+    /// them. A refresh calls this once its write has finished, index maintenance
+    /// included, and before it reports completion: the queries a completed
+    /// refresh lets through then plan against a ready view.
     ///
-    /// Best-effort. The write is already committed and visible, and a scan that
-    /// arrives first builds the same view and listing itself, so a failure here
-    /// costs only that scan's latency and never fails the write.
-    pub(crate) async fn prepare_scan_view_for_reads(&self) {
+    /// Best-effort, and safe to cancel. The write is already committed and
+    /// visible, and a scan that arrives first builds the same view and listing
+    /// itself, so a failure here costs only that scan's latency.
+    ///
+    /// A table that lists its files from the manifest (`scan_from_manifest`) is
+    /// skipped: an append's files reach the manifest only with the post-write
+    /// maintenance pass, so a listing built now could miss them.
+    pub async fn prepare_scan_view_for_reads(&self) {
+        if self.context.scan_from_manifest() {
+            return;
+        }
         if let Err(error) = self.build_current_scan_view_with_statistics().await {
             tracing::debug!(
                 table = %self.table_metadata.table_name,
                 %error,
-                "Did not prepare the scan view after publishing a snapshot; the next scan builds it"
+                "Did not prepare the scan view after a write; the next scan builds it"
             );
         }
+    }
+
+    /// Whether the table's newest scan view is of its current snapshot and its
+    /// files' statistics are already listed, so the next scan builds neither.
+    /// Exposed so the refresh path's tests can assert it prepared the table.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn scan_view_is_prepared(&self) -> bool {
+        self.scan_view_cache
+            .latest_complete
+            .load_full()
+            .is_some_and(|completed| {
+                completed.view.raw.current_snapshot_id == self.get_current_snapshot_id()
+                    && completed.order == self.scan_input_version.load(Ordering::Acquire)
+                    && completed
+                        .view
+                        .raw
+                        .warm_files
+                        .with_statistics
+                        .get()
+                        .is_some()
+            })
     }
 
     /// Plan a full scan of the table as it is now: the scan builds the scan view
@@ -55358,20 +55387,22 @@ mod tests {
         }
     }
 
-    /// Once an overwrite (a full refresh) has completed, its new snapshot's scan
-    /// view and statistics listing are already built: the scans that the refresh
+    /// Preparing the table after an overwrite (a full refresh) builds the new
+    /// snapshot's scan view and statistics listing: the scans that the refresh
     /// lets through build neither.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn overwrite_prepares_the_new_snapshot_for_scans() {
+    async fn prepared_overwrite_needs_no_listing_build() {
         let (provider, ctx, _dir) = shared_listing_table("shared_listing_overwrite", 0).await;
         overwrite_ids(&ctx, &provider, 100, 1).await;
         overwrite_ids(&ctx, &provider, 100, 2).await;
+        assert!(!provider.scan_view_is_prepared());
+        provider.prepare_scan_view_for_reads().await;
+        assert!(provider.scan_view_is_prepared());
         let snapshot_id = provider.get_current_snapshot_id();
 
         let view = latest_scan_view(&provider);
         assert_eq!(view.raw.current_snapshot_id, snapshot_id);
-        let prepared =
-            shared_listing(&view).expect("the overwrite built the new snapshot's listing");
+        let prepared = shared_listing(&view).expect("preparation built the new snapshot's listing");
         assert_listing_in_snapshot(prepared, &snapshot_id);
         let builds = snapshot_listing_builds(&provider);
 
@@ -55387,17 +55418,18 @@ mod tests {
         );
         assert!(
             Arc::ptr_eq(&latest_scan_view(&provider), &view),
-            "the first scan after an overwrite must use the view the overwrite built"
+            "the first scan after preparation must use the prepared view"
         );
     }
 
-    /// Once an append (an `append` refresh) has completed, the listing of the
-    /// files it published is already built, so the next scan builds none and
-    /// still sees the appended rows.
+    /// Preparing the table after an append (an `append` refresh) builds the
+    /// listing of the files it published, so the next scan builds none and still
+    /// sees the appended rows.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn append_prepares_its_files_for_scans() {
+    async fn prepared_append_needs_no_listing_build() {
         let (provider, ctx, _dir) = shared_listing_table("shared_listing_append", 0).await;
         overwrite_ids(&ctx, &provider, 100, 1).await;
+        provider.prepare_scan_view_for_reads().await;
         let before = latest_scan_view(&provider);
 
         insert_batch_with_context(
@@ -55406,12 +55438,14 @@ mod tests {
             id_value_batch(provider.table_schema(), &[5_000], &[42]),
         )
         .await;
+        provider.prepare_scan_view_for_reads().await;
         let view = latest_scan_view(&provider);
         assert!(
             !Arc::ptr_eq(&view, &before),
-            "the append prepared a scan view of the files it published"
+            "preparation built a scan view of the files the append published"
         );
-        let prepared = shared_listing(&view).expect("the append built the listing of its files");
+        let prepared =
+            shared_listing(&view).expect("preparation built the listing of the appended files");
         assert_eq!(prepared.len(), before.raw.warm_files.files.len() + 1);
         let builds = snapshot_listing_builds(&provider);
 
@@ -55429,6 +55463,43 @@ mod tests {
             snapshot_listing_builds(&provider),
             builds,
             "the first scan after an append must not build a listing"
+        );
+    }
+
+    /// A table that reuses scan views within a lag (read-only `changes`) is
+    /// prepared as it is now: preparing after an append must not publish the
+    /// pre-append view as the newest, which would hide the append from the
+    /// scans that follow.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn preparing_a_lag_tolerant_table_does_not_hide_a_write() {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("value", DataType::Int64, false),
+        ]));
+        let ctx = SessionContext::new();
+        let (mut provider, _dir) = create_cayenne_table_with_config(
+            "shared_listing_lag",
+            Arc::clone(&schema),
+            VortexConfig {
+                inline_max_rows: 0,
+                ..VortexConfig::default()
+            },
+            vec![],
+            ctx.runtime_env(),
+        )
+        .await;
+        provider.scan_view_reuse = ScanViewReuse::WithinLag(Duration::from_secs(3_600));
+        let provider = Arc::new(provider);
+        provider.init_scan_view_cache();
+        overwrite_ids(&ctx, &provider, 100, 1).await;
+        provider.prepare_scan_view_for_reads().await;
+
+        insert_batch_with_context(&ctx, &provider, id_value_batch(schema, &[5_000], &[42])).await;
+        provider.prepare_scan_view_for_reads().await;
+        assert_eq!(
+            lookup_value(&provider, &ctx, 5_000).await,
+            vec![42],
+            "a scan after preparation must see the append"
         );
     }
 

@@ -22,12 +22,14 @@ limitations under the License.
 //! the one file that holds its key. This bench measures what the scans that
 //! reach a new snapshot together pay for that.
 //!
-//! Each round overwrites a file-backed table (many small files, so the listing
-//! has real work to do), then immediately plans `CONCURRENT_SCANS` concurrent
+//! Each round refreshes a file-backed table (many small files, so the listing
+//! has real work to do) the way an accelerated dataset's full refresh does: an
+//! overwrite, then `prepare_scan_view_for_reads`, which the refresh calls before
+//! it reports completion. It then immediately plans `CONCURRENT_SCANS` concurrent
 //! `WHERE id = ?` scans and records each one's latency (`post_refresh_scan`).
 //! Then it plans the same number of sequential scans against the settled
-//! snapshot (`steady_scan`), and records how long the overwrite itself took to
-//! complete (`refresh`). Every round checks that a lookup returns the round's
+//! snapshot (`steady_scan`), and records how long the refresh took to complete,
+//! preparation included (`refresh`). Every round checks that a lookup returns the round's
 //! rows, so a fast answer from the wrong snapshot fails the run.
 //!
 //! Reports P50, P99, P99.9 and max per series.
@@ -247,6 +249,7 @@ async fn run(rounds: usize) {
         let round = i64::try_from(round).expect("round fits i64");
         let start = Instant::now();
         overwrite(&table, &ctx, round).await;
+        table.prepare_scan_view_for_reads().await;
         refresh.push(start.elapsed());
 
         let scans: Vec<_> = (0..CONCURRENT_SCANS)
