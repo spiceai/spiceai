@@ -435,7 +435,62 @@ pub fn counter_increase(samples: &mut [(i64, f64)]) -> Option<f64> {
     Some(increase)
 }
 
+/// [`counter_increase`] for integer counters, summed exactly in `i128` so increments past
+/// 2^53 are not lost to `f64` rounding. Every `i64` or `u64` delta fits in `i128`, and the sum
+/// saturates only after more samples than memory can hold.
+#[must_use]
+pub fn integer_counter_increase<T: Copy + Ord + Into<i128>>(
+    samples: &mut [(i64, T)],
+) -> Option<i128> {
+    if samples.len() < 2 {
+        return None;
+    }
+    samples.sort_unstable();
+    let mut increase: i128 = 0;
+    for pair in samples.windows(2) {
+        let (prev, next): (i128, i128) = (pair[0].1.into(), pair[1].1.into());
+        increase = increase.saturating_add(if next >= prev { next - prev } else { next });
+    }
+    Some(increase)
+}
+
+/// How `increase`/`rate` hold counter values: integer counters keep exact integer arithmetic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CounterKind {
+    Float,
+    Signed,
+    Unsigned,
+}
+
+impl CounterKind {
+    fn of(value: &DataType) -> Self {
+        if value.is_signed_integer() {
+            Self::Signed
+        } else if value.is_unsigned_integer() {
+            Self::Unsigned
+        } else {
+            Self::Float
+        }
+    }
+
+    fn value_type(self) -> DataType {
+        match self {
+            Self::Float => DataType::Float64,
+            Self::Signed => DataType::Int64,
+            Self::Unsigned => DataType::UInt64,
+        }
+    }
+
+    fn list_type(self) -> DataType {
+        DataType::List(Arc::new(Field::new_list_field(self.value_type(), true)))
+    }
+}
+
 /// `increase` (`per_second = false`) or `rate` (`per_second = true`).
+///
+/// Integer counters are coerced to `Int64` or `UInt64` (not `Float64`) and their deltas are
+/// summed exactly, so `increase` returns the same integer type and `rate` converts only the
+/// final increase to `Float64`.
 #[derive(Debug, PartialEq, Eq, Hash)]
 pub struct CounterGrowth {
     signature: Signature,
@@ -494,25 +549,38 @@ impl AggregateUDFImpl for CounterGrowth {
                 );
             }
         };
-        Ok(vec![DataType::Float64, time])
+        Ok(vec![CounterKind::of(value).value_type(), time])
     }
 
-    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
-        Ok(DataType::Float64)
+    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+        if self.per_second {
+            return Ok(DataType::Float64);
+        }
+        Ok(arg_types.first().map_or(DataType::Float64, |value| {
+            CounterKind::of(value).value_type()
+        }))
     }
 
-    fn accumulator(&self, _acc_args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
+    fn accumulator(&self, acc_args: AccumulatorArgs) -> Result<Box<dyn Accumulator>> {
+        let kind = acc_args
+            .expr_fields
+            .first()
+            .map_or(CounterKind::Float, |f| CounterKind::of(f.data_type()));
         Ok(Box::new(CounterGrowthAccumulator {
             per_second: self.per_second,
-            samples: Vec::new(),
+            samples: CounterSamples::new(kind),
         }))
     }
 
     fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
+        let kind = args
+            .input_fields
+            .first()
+            .map_or(CounterKind::Float, |f| CounterKind::of(f.data_type()));
         Ok(vec![
             Field::new(
                 format_state_name(args.name, "values"),
-                f64_list_type(),
+                kind.list_type(),
                 true,
             )
             .into(),
@@ -521,10 +589,113 @@ impl AggregateUDFImpl for CounterGrowth {
     }
 }
 
+/// `(time, value)` samples in the counter's own type.
+#[derive(Debug)]
+enum CounterSamples {
+    Float(Vec<(i64, f64)>),
+    Signed(Vec<(i64, i64)>),
+    Unsigned(Vec<(i64, u64)>),
+}
+
+impl CounterSamples {
+    fn new(kind: CounterKind) -> Self {
+        match kind {
+            CounterKind::Float => Self::Float(Vec::new()),
+            CounterKind::Signed => Self::Signed(Vec::new()),
+            CounterKind::Unsigned => Self::Unsigned(Vec::new()),
+        }
+    }
+
+    fn kind(&self) -> CounterKind {
+        match self {
+            Self::Float(_) => CounterKind::Float,
+            Self::Signed(_) => CounterKind::Signed,
+            Self::Unsigned(_) => CounterKind::Unsigned,
+        }
+    }
+
+    fn capacity(&self) -> usize {
+        match self {
+            Self::Float(s) => s.capacity(),
+            Self::Signed(s) => s.capacity(),
+            Self::Unsigned(s) => s.capacity(),
+        }
+    }
+
+    fn times(&self) -> Vec<Option<i64>> {
+        match self {
+            Self::Float(s) => s.iter().map(|s| Some(s.0)).collect(),
+            Self::Signed(s) => s.iter().map(|s| Some(s.0)).collect(),
+            Self::Unsigned(s) => s.iter().map(|s| Some(s.0)).collect(),
+        }
+    }
+
+    /// Times of the earliest and latest sample; only valid once sorted by `evaluate`.
+    fn time_span(&self) -> Option<(i64, i64)> {
+        fn span<T>(s: &[(i64, T)]) -> Option<(i64, i64)> {
+            Some((s.first()?.0, s.last()?.0))
+        }
+        match self {
+            Self::Float(s) => span(s),
+            Self::Signed(s) => span(s),
+            Self::Unsigned(s) => span(s),
+        }
+    }
+
+    /// Appends each `(value, time)` pair where both are non-null; `values` is already cast to
+    /// this kind's value type. A `NaN` float sample is skipped.
+    fn push_array(&mut self, values: &dyn Array, times: &[Option<i64>]) {
+        match self {
+            Self::Float(s) => {
+                for (v, t) in values.as_primitive::<Float64Type>().iter().zip(times) {
+                    if let (Some(v), Some(t)) = (v, *t)
+                        && !v.is_nan()
+                    {
+                        s.push((t, v));
+                    }
+                }
+            }
+            Self::Signed(s) => {
+                for (v, t) in values.as_primitive::<Int64Type>().iter().zip(times) {
+                    if let (Some(v), Some(t)) = (v, *t) {
+                        s.push((t, v));
+                    }
+                }
+            }
+            Self::Unsigned(s) => {
+                for (v, t) in values.as_primitive::<UInt64Type>().iter().zip(times) {
+                    if let (Some(v), Some(t)) = (v, *t) {
+                        s.push((t, v));
+                    }
+                }
+            }
+        }
+    }
+
+    fn values_scalar(&self) -> ScalarValue {
+        let array: ArrayRef = match self {
+            Self::Float(s) => {
+                Arc::new(ListArray::from_iter_primitive::<Float64Type, _, _>([Some(
+                    s.iter().map(|s| Some(s.1)).collect::<Vec<_>>(),
+                )]))
+            }
+            Self::Signed(s) => Arc::new(ListArray::from_iter_primitive::<Int64Type, _, _>([Some(
+                s.iter().map(|s| Some(s.1)).collect::<Vec<_>>(),
+            )])),
+            Self::Unsigned(s) => {
+                Arc::new(ListArray::from_iter_primitive::<UInt64Type, _, _>([Some(
+                    s.iter().map(|s| Some(s.1)).collect::<Vec<_>>(),
+                )]))
+            }
+        };
+        ScalarValue::List(Arc::new(array.as_list::<i32>().clone()))
+    }
+}
+
 #[derive(Debug)]
 struct CounterGrowthAccumulator {
     per_second: bool,
-    samples: Vec<(i64, f64)>,
+    samples: CounterSamples,
 }
 
 impl Accumulator for CounterGrowthAccumulator {
@@ -532,15 +703,9 @@ impl Accumulator for CounterGrowthAccumulator {
         let [value, time] = values else {
             return exec_err!("increase/rate expect 2 arguments");
         };
-        let value = f64_values(value)?;
-        let time = nanos_values(time)?;
-        for (v, t) in value.iter().zip(time.iter()) {
-            if let (Some(v), Some(t)) = (v, t)
-                && !v.is_nan()
-            {
-                self.samples.push((t, v));
-            }
-        }
+        let value = cast(value, &self.samples.kind().value_type())?;
+        let time: Vec<Option<i64>> = nanos_values(time)?.iter().collect();
+        self.samples.push_array(value.as_ref(), &time);
         Ok(())
     }
 
@@ -548,46 +713,69 @@ impl Accumulator for CounterGrowthAccumulator {
         let [values, times] = states else {
             return exec_err!("increase/rate expect 2 state fields");
         };
-        let values = f64_lists(values)?;
+        let values = cast(values, &self.samples.kind().list_type())?;
+        let values = values.as_list::<i32>();
         let times = cast(times, &i64_list_type())?;
         let times = times.as_list::<i32>();
-        for (i, values) in values.into_iter().enumerate() {
-            let Some(values) = values else { continue };
-            if times.is_null(i) {
+        for i in 0..values.len() {
+            if values.is_null(i) || times.is_null(i) {
                 continue;
             }
-            let row = times.value(i);
-            let row = row.as_primitive::<Int64Type>();
-            for (t, v) in row.iter().zip(values) {
-                if let Some(t) = t {
-                    self.samples.push((t, v));
-                }
-            }
+            let row_times = times.value(i);
+            let row_times: Vec<Option<i64>> =
+                row_times.as_primitive::<Int64Type>().iter().collect();
+            self.samples
+                .push_array(values.value(i).as_ref(), &row_times);
         }
         Ok(())
     }
 
     fn state(&mut self) -> Result<Vec<ScalarValue>> {
-        let values: Vec<f64> = self.samples.iter().map(|s| s.1).collect();
         let times: ArrayRef = Arc::new(ListArray::from_iter_primitive::<Int64Type, _, _>([Some(
-            self.samples.iter().map(|s| Some(s.0)).collect::<Vec<_>>(),
+            self.samples.times(),
         )]));
         Ok(vec![
-            list_scalar(Some(&values)),
+            self.samples.values_scalar(),
             ScalarValue::List(Arc::new(times.as_list::<i32>().clone())),
         ])
     }
 
     fn evaluate(&mut self) -> Result<ScalarValue> {
-        let Some(increase) = counter_increase(&mut self.samples) else {
-            return Ok(ScalarValue::Float64(None));
+        let name = if self.per_second {
+            RATE_UDAF_NAME
+        } else {
+            INCREASE_UDAF_NAME
+        };
+        // `increase` in the counter's own type; `rate` only needs it as `f64`.
+        let (increase, increase_f64) = match &mut self.samples {
+            CounterSamples::Float(s) => {
+                let increase = counter_increase(s);
+                (ScalarValue::Float64(increase), increase)
+            }
+            CounterSamples::Signed(s) => {
+                let increase = integer_counter_increase(s);
+                let exact = match increase.map(i64::try_from).transpose() {
+                    Ok(exact) => exact,
+                    Err(_) => return exec_err!("{name}: the counter increase overflows Int64"),
+                };
+                (ScalarValue::Int64(exact), increase.map(i128_to_f64))
+            }
+            CounterSamples::Unsigned(s) => {
+                let increase = integer_counter_increase(s);
+                let exact = match increase.map(u64::try_from).transpose() {
+                    Ok(exact) => exact,
+                    Err(_) => return exec_err!("{name}: the counter increase overflows UInt64"),
+                };
+                (ScalarValue::UInt64(exact), increase.map(i128_to_f64))
+            }
         };
         if !self.per_second {
-            return Ok(ScalarValue::Float64(Some(increase)));
+            return Ok(increase);
         }
-        // Sorted by `counter_increase`.
-        let first = self.samples[0].0;
-        let last = self.samples[self.samples.len() - 1].0;
+        let (Some(increase), Some((first, last))) = (increase_f64, self.samples.time_span()) else {
+            return Ok(ScalarValue::Float64(None));
+        };
+        // Sorted by the increase above.
         let span_nanos = last.saturating_sub(first);
         if span_nanos <= 0 {
             return Ok(ScalarValue::Float64(None));
@@ -603,6 +791,15 @@ impl Accumulator for CounterGrowthAccumulator {
     fn size(&self) -> usize {
         size_of_val(self) + self.samples.capacity() * size_of_val(&(0i64, 0f64))
     }
+}
+
+/// An exact integer increase as `f64`, rounded only once at the end for `rate`.
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "a per-second rate is a float; the increase itself was summed exactly"
+)]
+fn i128_to_f64(value: i128) -> f64 {
+    value as f64
 }
 
 #[cfg(test)]
@@ -681,6 +878,102 @@ mod tests {
         assert_eq!(counter_increase(&mut samples), Some(6.0));
         assert_eq!(counter_increase(&mut [(1, 1.0)]), None);
         assert_eq!(counter_increase(&mut [(1, 1.0), (2, 1.0)]), Some(0.0));
+    }
+
+    /// 2^53: the first integer above it, 2^53 + 1, has no `f64` representation.
+    const TWO_POW_53: i64 = 9_007_199_254_740_992;
+
+    #[test]
+    fn integer_counter_increase_is_exact_past_2_pow_53() {
+        // As f64 both samples round to 2^53 and the +1 would be lost.
+        let mut signed = vec![(2, TWO_POW_53 + 1), (1, TWO_POW_53)];
+        assert_eq!(integer_counter_increase(&mut signed), Some(1));
+        // Reset from 2^53 + 3 to 2^53 + 1: the new value is all growth.
+        let mut reset = vec![(1, TWO_POW_53), (2, TWO_POW_53 + 3), (3, TWO_POW_53 + 1)];
+        assert_eq!(
+            integer_counter_increase(&mut reset),
+            Some(3 + i128::from(TWO_POW_53) + 1)
+        );
+        let mut unsigned = vec![(1, u64::MAX - 1), (2, u64::MAX)];
+        assert_eq!(integer_counter_increase(&mut unsigned), Some(1));
+        assert_eq!(integer_counter_increase(&mut [(1, 1_i64)]), None);
+    }
+
+    async fn query_scalar(ctx: &SessionContext, sql: &str) -> ScalarValue {
+        let batches = ctx
+            .sql(sql)
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect("run");
+        let batch = batches.first().expect("a batch");
+        ScalarValue::try_from_array(batch.column(batch.num_columns() - 1), 0).expect("scalar")
+    }
+
+    #[tokio::test]
+    async fn integer_increase_and_rate_are_exact_past_2_pow_53() {
+        let ctx = ctx();
+        let rows = format!(
+            "(VALUES (0, {a}), (1000000000, {b})) AS t(ts, v)",
+            a = TWO_POW_53,
+            b = TWO_POW_53 + 1
+        );
+        assert_eq!(
+            query_scalar(&ctx, &format!("SELECT increase(v, ts) FROM {rows}")).await,
+            ScalarValue::Int64(Some(1))
+        );
+        assert_eq!(
+            query_scalar(
+                &ctx,
+                &format!("SELECT increase(arrow_cast(v, 'UInt64'), ts) FROM {rows}")
+            )
+            .await,
+            ScalarValue::UInt64(Some(1))
+        );
+        assert_eq!(
+            query_scalar(&ctx, &format!("SELECT rate(v, ts) FROM {rows}")).await,
+            ScalarValue::Float64(Some(1.0))
+        );
+        assert_eq!(
+            query_scalar(
+                &ctx,
+                "SELECT increase(v, ts) FROM (VALUES (1, 1)) AS t(ts, v)"
+            )
+            .await,
+            ScalarValue::Int64(None)
+        );
+    }
+
+    #[test]
+    fn integer_counter_state_merges_exactly() {
+        let signed = || CounterGrowthAccumulator {
+            per_second: false,
+            samples: CounterSamples::new(CounterKind::Signed),
+        };
+        let mut parts = [signed(), signed()];
+        for (acc, (t, v)) in parts
+            .iter_mut()
+            .zip([(1_i64, TWO_POW_53), (2, TWO_POW_53 + 1)])
+        {
+            let values: ArrayRef = Arc::new(Int64Array::from(vec![v]));
+            let times: ArrayRef = Arc::new(Int64Array::from(vec![t]));
+            acc.update_batch(&[values, times]).expect("update");
+        }
+        let mut merged = signed();
+        for acc in &mut parts {
+            let state: Vec<ArrayRef> = acc
+                .state()
+                .expect("state")
+                .into_iter()
+                .map(|s| s.to_array().expect("array"))
+                .collect();
+            merged.merge_batch(&state).expect("merge");
+        }
+        assert_eq!(
+            merged.evaluate().expect("evaluate"),
+            ScalarValue::Int64(Some(1))
+        );
     }
 
     #[tokio::test]
