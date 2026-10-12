@@ -53,7 +53,8 @@ pub const OTLP_METRICS_PARAM_ALL: &str = "all";
 /// Whether a dataset's `otlp_metrics` param value routes every metric to it.
 #[must_use]
 pub fn is_otlp_metrics_store_param(value: &str) -> bool {
-    value.trim().eq_ignore_ascii_case(OTLP_METRICS_PARAM_ALL)
+    // Matches the sink connector's `one_of_ignore_ascii_case` check of the same param.
+    value.eq_ignore_ascii_case(OTLP_METRICS_PARAM_ALL)
 }
 
 fn list_of(item: DataType) -> DataType {
@@ -1061,7 +1062,8 @@ mod tests {
     #[test]
     fn store_param_accepts_only_all() {
         assert!(is_otlp_metrics_store_param("all"));
-        assert!(is_otlp_metrics_store_param(" ALL "));
+        assert!(is_otlp_metrics_store_param("ALL"));
+        assert!(!is_otlp_metrics_store_param(" all "));
         assert!(!is_otlp_metrics_store_param("none"));
         assert!(!is_otlp_metrics_store_param(""));
     }
