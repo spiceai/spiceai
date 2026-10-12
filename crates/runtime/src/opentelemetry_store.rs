@@ -309,6 +309,8 @@ impl StoreBuilders {
         self.scope_name.append_option(non_empty(ctx.scope_name));
         self.scope_version
             .append_option(non_empty(ctx.scope_version));
+        self.scope_attributes
+            .append_option(non_empty(ctx.scope_attributes));
         self.value_double.append_option(values.value_double);
         self.value_int.append_option(values.value_int);
         self.count.append_option(values.count);
