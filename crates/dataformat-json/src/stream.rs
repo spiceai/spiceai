@@ -317,36 +317,49 @@ impl<R: Read + Send> ArrayToNdjson<R> {
         }
     }
 
-    /// Read (and buffer) bytes until we find the first non-whitespace byte,
-    /// then return it **without** removing it from the buffer.
+    /// Read bytes until the first non-whitespace byte and return it without
+    /// removing it from the buffer.
+    ///
+    /// Whitespace before a delimiter is discarded. The next deserializer does
+    /// not replay this buffer, and shifting a kept prefix off one byte at a
+    /// time revisits the whole run for every byte. The scan stops on the
+    /// delimiter, so bytes after it stay in the inner reader.
     fn peek_next_non_ws_byte(&mut self) -> io::Result<u8> {
         let mut tee = match self.shared.lock() {
             Ok(tee) => tee,
             Err(e) => e.into_inner(),
         };
+
+        // serde leaves at most one lookahead byte. A longer prefix is whitespace
+        // already pulled into the buffer, as when an empty array is rejected
+        // only after its spaces have been read. Drop that prefix in one move.
+        if let Some(index) = tee.buf.iter().position(|b| !is_json_whitespace(*b)) {
+            if index > 0 {
+                tee.drain_front(index);
+            }
+            return Ok(tee.buf[0]);
+        }
+        tee.buf.clear();
+
+        let mut byte = [0u8; 1];
         loop {
-            /* -------- 1. look in the bytes we already have -------- */
-            // The element's own bytes have already been drained, so whatever
-            // is left in tee.buf starts just after it: serde's lookahead, plus
-            // anything read here on an earlier pass.
-            if let Some(&b) = tee.buf.iter().find(|b| !is_json_whitespace(**b)) {
-                return Ok(b); // found it – return without consuming
+            match tee.inner.read(&mut byte) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "EOF while peeking next byte",
+                    ));
+                }
+                Ok(_) if is_json_whitespace(byte[0]) => {}
+                Ok(_) => {
+                    tee.buf.push(byte[0]);
+                    return Ok(byte[0]);
+                }
+                // A signal does not say the input ended or that the next byte
+                // is invalid. The tail scan resumes for the same reason.
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
             }
-
-            /* -------- 2. need more data: read one byte from the source -------- */
-            let mut byte = [0u8; 1];
-            if tee.inner.read(&mut byte)? == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "EOF while peeking next byte",
-                ));
-            }
-
-            // Keep the rolling buffer in sync so serde can still “see” the byte later.
-            tee.buf.push(byte[0]);
-
-            // Loop: if the byte we just read was whitespace,
-            // we’ll read again until we hit a non-WS byte.
         }
     }
 
@@ -359,22 +372,16 @@ impl<R: Read + Send> ArrayToNdjson<R> {
             Err(e) => e.into_inner(),
         };
 
-        // 1️⃣  Drop leading whitespace that we may have read while peeking.
-        while let Some(&b) = tee.buf.first() {
-            if !is_json_whitespace(b) {
-                break;
-            }
-            tee.drain_front(1);
-        }
-
-        // 2️⃣  Now the first byte must be the delimiter itself.
-        if tee.buf.is_empty() {
+        // One removal. Dropping the prefix a byte at a time shifts the tail on
+        // every byte, so a long whitespace run costs time proportional to its
+        // square.
+        let Some(index) = tee.buf.iter().position(|b| !is_json_whitespace(*b)) else {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "buffer ended while trying to consume delimiter",
             ));
-        }
-        tee.drain_front(1); // discard ',' or ']'
+        };
+        tee.drain_front(index + 1);
 
         Ok(())
     }
@@ -4909,6 +4916,168 @@ mod tests {
                     .expect("JSON whitespace must remain acceptable everywhere"),
                 vec!["1"]
             );
+        }
+
+        /// A reader that returns at most `chunk` bytes, so a scan that pulls
+        /// past a delimiter cannot hide behind `Cursor`'s large reads.
+        struct Chunked {
+            body: Vec<u8>,
+            at: usize,
+            chunk: usize,
+        }
+
+        impl Read for Chunked {
+            fn read(&mut self, dst: &mut [u8]) -> io::Result<usize> {
+                if self.at >= self.body.len() || dst.is_empty() {
+                    return Ok(0);
+                }
+                let n = self.chunk.min(dst.len()).min(self.body.len() - self.at);
+                dst[..n].copy_from_slice(&self.body[self.at..self.at + n]);
+                self.at += n;
+                Ok(n)
+            }
+        }
+
+        fn lines_from(body: &[u8], chunk: usize) -> io::Result<Vec<String>> {
+            let mut out = String::new();
+            ArrayToNdjson::try_new(Chunked {
+                body: body.to_vec(),
+                at: 0,
+                chunk,
+            })?
+            .read_to_string(&mut out)?;
+            Ok(out.lines().map(ToOwned::to_owned).collect())
+        }
+
+        /// Delimiter whitespace is not an element and not trailing content.
+        /// The bytes after the run still decide the verdict: the next row, the
+        /// closing bracket, or a byte that does not belong to the array.
+        #[test]
+        fn whitespace_before_a_delimiter_keeps_the_bytes_after_it() {
+            let gap = b" \t\r\n".repeat(64);
+            let mut between = br#"[{"a":1}"#.to_vec();
+            between.extend_from_slice(&gap);
+            between.push(b',');
+            between.extend_from_slice(&gap);
+            between.extend_from_slice(br#"{"b":2}]"#);
+            let mut number = br"[1".to_vec();
+            number.extend_from_slice(&gap);
+            number.extend_from_slice(br",2]");
+            let mut trailing = br#"[{"a":1}"#.to_vec();
+            trailing.extend_from_slice(&gap);
+            trailing.extend_from_slice(br"]x");
+            let mut open = br#"[{"a":1}"#.to_vec();
+            open.extend_from_slice(&gap);
+            let mut empty = vec![b'['];
+            empty.extend_from_slice(&gap);
+            empty.push(b']');
+
+            for chunk in [1_usize, 2, 3, 7, 64, 4096] {
+                assert_eq!(
+                    lines_from(&between, chunk).expect("gap between elements"),
+                    vec![r#"{"a":1}"#, r#"{"b":2}"#],
+                    "chunk {chunk}"
+                );
+                assert_eq!(
+                    lines_from(&number, chunk).expect("gap after a number"),
+                    vec!["1", "2"],
+                    "chunk {chunk}"
+                );
+                assert!(
+                    lines_from(&empty, chunk)
+                        .expect("gap in an empty array")
+                        .is_empty(),
+                    "chunk {chunk}"
+                );
+                let err = lines_from(&trailing, chunk)
+                    .expect_err("content after the gap must not be dropped");
+                assert!(
+                    err.to_string().contains("after the closing ']'"),
+                    "chunk {chunk}: {err}"
+                );
+                let err = lines_from(&open, chunk)
+                    .expect_err("a gap with no delimiter is still a short read");
+                assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "chunk {chunk}");
+                assert_eq!(
+                    err.to_string(),
+                    "EOF while peeking next byte",
+                    "chunk {chunk}"
+                );
+            }
+            // The row is withheld: a later read must not turn the failure into
+            // a clean end, and must not hand the element back.
+            super::bare_scalar_elements::assert_stays_failed(&open, 0);
+            super::bare_scalar_elements::assert_stays_failed(&trailing, 0);
+
+            // Form feed is not JSON whitespace on this scan either.
+            let mut form_feed = br#"[{"a":1}"#.to_vec();
+            form_feed.push(0x0c);
+            form_feed.push(b']');
+            assert!(lines_from(&form_feed, 3).is_err());
+        }
+
+        /// The delimiter scan reads the source itself, so a signal there is
+        /// not a verdict on the body.
+        #[test]
+        fn an_interrupted_delimiter_scan_is_resumed() {
+            let interrupted = |body: &[u8]| {
+                let mut out = String::new();
+                ArrayToNdjson::try_new(InterruptsEveryRead {
+                    body: body.to_vec(),
+                    at: 0,
+                    interrupt_next: false,
+                })?
+                .read_to_string(&mut out)?;
+                Ok::<_, io::Error>(out.lines().map(ToOwned::to_owned).collect::<Vec<_>>())
+            };
+
+            assert_eq!(
+                interrupted(b"[{} \t\r\n ]").expect("whitespace before ']' must still parse"),
+                vec!["{}"]
+            );
+            let err = interrupted(b"[{} \t\r\n ]x")
+                .expect_err("trailing content behind an interrupted scan must be reported");
+            assert!(
+                err.to_string().contains("after the closing ']'"),
+                "expected the trailing-content verdict, got: {err}"
+            );
+        }
+
+        /// Skipping delimiter whitespace has to be linear in the run. The
+        /// limit is wide enough for an unoptimized build and still smaller
+        /// than a scan that revisits the run for every byte.
+        #[test]
+        fn a_long_run_of_delimiter_whitespace_is_skipped() {
+            const SPACES: usize = 8 * 1024 * 1024;
+            let limit = std::time::Duration::from_secs(120);
+
+            let mut between = br#"[{"a":1}"#.to_vec();
+            between.resize(between.len() + SPACES, b' ');
+            between.extend_from_slice(br#",{"b":2}]"#);
+            let started = std::time::Instant::now();
+            let lines = ndjson_lines(&between).expect("whitespace before ',' must still parse");
+            let elapsed = started.elapsed();
+            assert_eq!(lines, vec![r#"{"a":1}"#, r#"{"b":2}"#]);
+            assert!(
+                elapsed < limit,
+                "skipping {SPACES} delimiter bytes took {elapsed:?}"
+            );
+            eprintln!("delimiter whitespace {SPACES} bytes: {elapsed:?}");
+
+            let mut empty = Vec::with_capacity(SPACES + 2);
+            empty.push(b'[');
+            empty.resize(empty.len() + SPACES, b' ');
+            empty.push(b']');
+            let started = std::time::Instant::now();
+            let lines =
+                ndjson_lines(&empty).expect("whitespace in an empty array must still parse");
+            let elapsed = started.elapsed();
+            assert!(lines.is_empty());
+            assert!(
+                elapsed < limit,
+                "skipping {SPACES} empty-array bytes took {elapsed:?}"
+            );
+            eprintln!("empty-array whitespace {SPACES} bytes: {elapsed:?}");
         }
     }
 
