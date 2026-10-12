@@ -200,10 +200,13 @@ impl AutoDeletionMode {
     /// table's bake could serve, position deletes read faster with 1.8 MB, 4.8 MB
     /// and 7.8 MB of table data (P99 scans 5–12% and P99 point lookups 9–16%
     /// faster, 15–30% more reads, writes even), and slower at the P99 with 11.4 MB
-    /// and 16 MB (scans 20–25%). The bound is measured against what a whole-table
-    /// rewrite reads, which includes the upserts it is about to fold, so 1/32 of the
-    /// default target keeps position deletes inside the range where they won; the
-    /// target it derives from follows the storage the table is on.
+    /// and 16 MB (scans 20–25%), sizes measured once compaction had re-encoded the
+    /// table. The bound is measured against what a whole-table rewrite reads, which
+    /// includes the upserts it is about to fold and freshly written files, encoded
+    /// lightly until compaction re-encodes them (in that harness about twice their
+    /// compacted size). So it never admits a table past the size where position
+    /// deletes won, and a freshly loaded table qualifies only up to about half of
+    /// it; the target it derives from follows the storage the table is on.
     /// A larger target does not raise the bound past what was measured.
     pub(crate) fn max_position_bytes_for(target_file_size_bytes: usize) -> u64 {
         u64::try_from(target_file_size_bytes / 32)

@@ -991,3 +991,56 @@ async fn only_a_table_kept_compacted_reports_outgrowing_it() {
         );
     }
 }
+
+/// A whole-table rewrite persists the primary-key keyset checkpoint for its new
+/// snapshot before its commit makes that snapshot current. The commit drops the
+/// in-memory keyset, so a write right after it loads this checkpoint instead of
+/// scanning every key. Persisted after the commit, a write in between paid that
+/// scan: 36–52 ms of write latency per rewrite on a 500K-row table.
+#[tokio::test]
+async fn a_whole_table_rewrite_persists_the_keyset_checkpoint_before_it_commits() {
+    let name = "auto_checkpoint_before_commit";
+    let (provider, catalog, _tmp) = table(name, DeletionMode::Auto, 256).await;
+    let keys: Vec<i64> = (0..16).collect();
+    write(&provider, &keys, 100).await;
+    write(&provider, &keys, 200).await;
+    let table_id = provider.table_metadata.table_id.clone();
+    let before = provider.get_current_snapshot_id();
+    let at_commit: Arc<std::sync::Mutex<Option<Option<String>>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    {
+        let at_commit = Arc::clone(&at_commit);
+        let catalog = Arc::clone(&catalog);
+        let table_id = table_id.clone();
+        *provider.test_pre_rewrite_commit_hook.lock() = Some(Box::new(move || {
+            let at_commit = Arc::clone(&at_commit);
+            let catalog = Arc::clone(&catalog);
+            let table_id = table_id.clone();
+            Box::pin(async move {
+                let tag = catalog
+                    .get_pk_index(&table_id)
+                    .await
+                    .expect("read the checkpoint")
+                    .map(|(snapshot_id, _)| snapshot_id);
+                *at_commit.lock().expect("observation lock") = Some(tag);
+            })
+        }));
+    }
+    assert!(
+        provider
+            .compact_current_snapshot_small_files()
+            .await
+            .expect("reclaim pass"),
+        "premise: the whole-table reclaim commits"
+    );
+    let after = provider.get_current_snapshot_id();
+    assert_ne!(
+        before, after,
+        "premise: the rewrite made a new current snapshot"
+    );
+    assert_eq!(
+        at_commit.lock().expect("observation lock").clone(),
+        Some(Some(after)),
+        "just before the commit, the checkpoint already named the new snapshot"
+    );
+}
