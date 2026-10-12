@@ -3052,15 +3052,6 @@ impl SnapshotDirPins {
     }
 }
 
-impl std::fmt::Debug for SnapshotDirPins {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("SnapshotDirPins")
-            .field("in_flight", &self.scan_refs.lock().len())
-            .field("retired", &self.retired.lock().len())
-            .finish_non_exhaustive()
-    }
-}
-
 impl CayenneTableProviderBuilder {
     /// Create a new builder with the required catalog and shared `RuntimeEnv`.
     #[must_use]
@@ -7196,19 +7187,10 @@ impl CayenneTableProvider {
         let mut entries = match tokio::fs::read_dir(&table_dir).await {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(source) => return Err(CatalogError::IoError { source }),
+            Err(error) => return Err(error.into()),
         };
-        while let Some(entry) = entries
-            .next_entry()
-            .await
-            .map_err(|source| CatalogError::IoError { source })?
-        {
-            if entry
-                .file_type()
-                .await
-                .map_err(|source| CatalogError::IoError { source })?
-                .is_dir()
-            {
+        while let Some(entry) = entries.next_entry().await? {
+            if entry.file_type().await?.is_dir() {
                 on_disk.push(entry.file_name().to_string_lossy().into_owned());
             }
         }
@@ -7223,19 +7205,16 @@ impl CayenneTableProvider {
             "Retired the snapshot directories the table's snapshot no longer references; each is deleted once no query reads it"
         );
         self.retire_snapshot_dirs(unreferenced.iter().map(String::as_str));
-        self.sweep_retired_snapshot_dirs();
         self.follow_up_retired_snapshot_dirs();
         Ok(unreferenced)
     }
 
-    /// The uuid-named entries of `on_disk` outside `live`, sorted. Reserved
-    /// `_`-prefixed and non-uuid names are never candidates.
+    /// The uuid-named entries of `on_disk` outside `live`, sorted. Anything
+    /// else — reserved `_`-prefixed directories included — is never a candidate.
     fn unreferenced_snapshot_dir_ids(on_disk: Vec<String>, live: &HashSet<String>) -> Vec<String> {
         let mut unreferenced: Vec<String> = on_disk
             .into_iter()
-            .filter(|name| !Self::is_reserved_table_dir(std::ffi::OsStr::new(name)))
-            .filter(|name| uuid::Uuid::parse_str(name).is_ok())
-            .filter(|name| !live.contains(name))
+            .filter(|name| uuid::Uuid::parse_str(name).is_ok() && !live.contains(name))
             .collect();
         unreferenced.sort();
         unreferenced
@@ -74886,18 +74865,6 @@ mod tests {
             }
         }
 
-        async fn wait_until_absent(path: &Path) {
-            let deadline = Instant::now() + Duration::from_secs(10);
-            while path.exists() {
-                assert!(
-                    Instant::now() < deadline,
-                    "{} should have been deleted",
-                    path.display()
-                );
-                tokio::time::sleep(Duration::from_millis(20)).await;
-            }
-        }
-
         /// Plan a scan without executing it: the plan pins the dirs it will read.
         async fn plan_scan(
             ctx: &SessionContext,
@@ -74913,28 +74880,10 @@ mod tests {
             ctx: &SessionContext,
             plan: Arc<dyn ExecutionPlan>,
         ) -> Vec<(i64, i64)> {
-            use arrow::array::Int64Array;
             let batches = collect(plan, ctx.task_ctx())
                 .await
                 .expect("execute the scan");
-            let mut pairs = Vec::new();
-            for batch in &batches {
-                let ids = batch
-                    .column(batch.schema().index_of("id").expect("id"))
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .expect("id is Int64")
-                    .clone();
-                let values = batch
-                    .column(batch.schema().index_of("value").expect("value"))
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .expect("value is Int64")
-                    .clone();
-                for row in 0..batch.num_rows() {
-                    pairs.push((ids.value(row), values.value(row)));
-                }
-            }
+            let mut pairs = collect_id_value_pairs_from_batches(&batches);
             pairs.sort_unstable();
             pairs
         }
@@ -75018,7 +74967,7 @@ mod tests {
             );
             elapse_grace(&replacement);
             replacement.sweep_retired_snapshot_dirs();
-            wait_until_absent(&replacement.snapshot_dir_path_for(&first)).await;
+            wait_until_removed(&replacement.snapshot_dir_path_for(&first)).await;
             assert_eq!(
                 snapshot_dirs(&replacement),
                 BTreeSet::from([second.clone()])
@@ -75087,7 +75036,7 @@ mod tests {
             );
             elapse_grace(&replacement);
             replacement.sweep_retired_snapshot_dirs();
-            wait_until_absent(&replacement.snapshot_dir_path_for(&first)).await;
+            wait_until_removed(&replacement.snapshot_dir_path_for(&first)).await;
             assert_eq!(snapshot_dirs(&replacement), BTreeSet::from([second]));
             assert_eq!(
                 id_value_pairs_of(&ctx, plan_scan(&ctx, &replacement).await).await,
@@ -75166,7 +75115,7 @@ mod tests {
             elapse_grace(&replacement);
             replacement.sweep_retired_snapshot_dirs();
             for checkpoint in &checkpoints {
-                wait_until_absent(&replacement.snapshot_dir_path_for(checkpoint)).await;
+                wait_until_removed(&replacement.snapshot_dir_path_for(checkpoint)).await;
             }
             let mut expected_after = merged;
             expected_after.insert(current);
@@ -75209,7 +75158,7 @@ mod tests {
             );
             elapse_grace(&provider);
             provider.sweep_retired_snapshot_dirs();
-            wait_until_absent(&table_dir.join(&leaked)).await;
+            wait_until_removed(&table_dir.join(&leaked)).await;
             let mut remaining: Vec<String> = std::fs::read_dir(&table_dir)
                 .expect("list")
                 .map(|entry| {

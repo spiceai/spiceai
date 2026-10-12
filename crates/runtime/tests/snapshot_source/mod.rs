@@ -1170,19 +1170,7 @@ async fn custom_paths_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
 
     let data_dir = dir.path().join("reader").join(modules);
     let metadata_dir = dir.path().join("reader").join("metadata");
-    let mut dataset = reader_dataset(rustfs, modules, &prefix);
-    if let Some(acceleration) = dataset.acceleration.as_mut() {
-        acceleration.params = Some(Params::from_string_map(HashMap::from([
-            (
-                "cayenne_file_path".to_string(),
-                data_dir.display().to_string(),
-            ),
-            (
-                "cayenne_metadata_dir".to_string(),
-                metadata_dir.display().to_string(),
-            ),
-        ])));
-    }
+    let dataset = reader_dataset_at(rustfs, modules, &prefix, &data_dir, &metadata_dir);
     let reader = Arc::new(
         Runtime::builder()
             .with_app(

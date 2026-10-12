@@ -427,14 +427,17 @@ pub struct CayenneAccelerator {
     /// factory creates, keyed by dataset. An entry lives only for that one
     /// create: inserted before the factory runs, removed when the reload
     /// completes or is dropped (`InheritedPinsEntry`).
-    inherited_snapshot_dir_pins: parking_lot::Mutex<HashMap<String, cayenne::SnapshotDirPins>>,
+    inherited_snapshot_dir_pins:
+        parking_lot::Mutex<HashMap<datafusion::common::TableReference, cayenne::SnapshotDirPins>>,
 }
 
 /// Removes a dataset's hand-off entry when dropped, so a reload the refresh
 /// runner cancels mid-create leaves no pins for a later create to inherit.
 struct InheritedPinsEntry<'a> {
-    slot: &'a parking_lot::Mutex<HashMap<String, cayenne::SnapshotDirPins>>,
-    dataset: String,
+    slot: &'a parking_lot::Mutex<
+        HashMap<datafusion::common::TableReference, cayenne::SnapshotDirPins>,
+    >,
+    dataset: datafusion::common::TableReference,
 }
 
 impl Drop for InheritedPinsEntry<'_> {
@@ -2905,7 +2908,7 @@ impl CayenneAccelerator {
         if let Some(pins) = self
             .inherited_snapshot_dir_pins
             .lock()
-            .remove(&source.name().to_string())
+            .remove(source.name())
         {
             builder = builder.with_snapshot_dir_pins(pins);
         }
@@ -4353,7 +4356,7 @@ impl DataAccelerator for CayenneAccelerator {
             // and `maintain_after_snapshot_restore` reclaims nothing either.
             return provider_factory().await;
         };
-        let dataset = source.name().to_string();
+        let dataset = source.name().clone();
         self.inherited_snapshot_dir_pins
             .lock()
             .insert(dataset.clone(), pins);
@@ -4378,13 +4381,7 @@ impl DataAccelerator for CayenneAccelerator {
             return;
         };
         match table.retire_unreferenced_snapshot_dirs().await {
-            Ok(retired) if retired.is_empty() => {}
-            Ok(retired) => tracing::debug!(
-                dataset = %source.name(),
-                retired = retired.len(),
-                "Retired the local snapshot directories that dataset '{}' no longer references; they are deleted once no query reads them",
-                source.name()
-            ),
+            Ok(_) => {}
             Err(error) => tracing::debug!(
                 dataset = %source.name(),
                 %error,
@@ -6226,7 +6223,7 @@ mod tests {
             if accelerator
                 .inherited_snapshot_dir_pins
                 .lock()
-                .contains_key("ds")
+                .contains_key(&datafusion::common::TableReference::bare("ds"))
             {
                 break;
             }
@@ -6263,7 +6260,10 @@ mod tests {
             let accelerator = Arc::clone(&factory_accelerator);
             let taken = Arc::clone(&factory_taken);
             Box::pin(async move {
-                *taken.lock() = accelerator.inherited_snapshot_dir_pins.lock().remove("ds");
+                *taken.lock() = accelerator
+                    .inherited_snapshot_dir_pins
+                    .lock()
+                    .remove(&datafusion::common::TableReference::bare("ds"));
                 let (replacement, tmp) = cayenne_table("ds").await;
                 std::mem::forget(tmp);
                 Ok(replacement)
