@@ -417,7 +417,7 @@ impl ClusterService for ClusterServiceImpl {
             );
             // Same status/message shape as a miss so callers cannot distinguish
             // "not in spicepod" from "not in any store" for unallowlisted keys.
-            return Err(Status::invalid_argument(format!(
+            return Err(Status::not_found(format!(
                 "Unable to expand secret {}",
                 request.key
             )));
@@ -446,7 +446,7 @@ impl ClusterService for ClusterServiceImpl {
             lookup.map_err(|e| Status::internal(format!("Failed to get secret: {e}")))?
         else {
             tracing::error!(target: "task_history", "Secret not found");
-            return Err(Status::invalid_argument(format!(
+            return Err(Status::not_found(format!(
                 "Unable to expand secret {}",
                 request.key
             )));
@@ -1543,6 +1543,20 @@ mod tests {
         }
     }
 
+    /// Fixed-map secret store that records every key it is asked for.
+    struct RecordingSecretStore {
+        values: HashMap<String, String>,
+        lookups: Arc<parking_lot::Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl SecretStore for RecordingSecretStore {
+        async fn get_secret(&self, key: &str) -> AnyErrorResult<Option<SecretString>> {
+            self.lookups.lock().push(key.to_string());
+            Ok(self.values.get(key).map(|v| SecretString::from(v.clone())))
+        }
+    }
+
     fn secrets_with(entries: &[(&str, &str)]) -> Secrets {
         let mut secrets = Secrets::new();
         secrets.register_store(
@@ -1823,7 +1837,7 @@ mod tests {
             .await
             .expect_err("unreferenced secret must be denied");
 
-        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert_eq!(err.code(), tonic::Code::NotFound);
         assert!(
             err.message().contains("Unable to expand secret"),
             "unexpected message: {}",
@@ -1922,7 +1936,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn expand_secret_referenced_but_missing_from_store_is_invalid_argument() {
+    async fn expand_secret_referenced_but_missing_from_store_is_not_found() {
         let app = app_with_secret_ref("pg_pass", "${ secrets:PG_PASS }");
         // Allowlisted key is referenced by the app but not present in any store.
         let secrets = secrets_with(&[]);
@@ -1936,8 +1950,92 @@ mod tests {
             .await
             .expect_err("missing allowlisted secret must fail");
 
-        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert_eq!(err.code(), tonic::Code::NotFound);
         assert!(err.message().contains("Unable to expand secret PG_PASS"));
+    }
+
+    #[tokio::test]
+    async fn executor_secrets_treat_keys_the_scheduler_declines_as_not_found() {
+        let mut ds = Dataset::new("memory:data", "orders");
+        ds.params = Some(Params::from_string_map(HashMap::from([
+            ("pg_pass".to_string(), "${ secrets:PG_PASS }".to_string()),
+            ("pg_user".to_string(), "${ secrets:PG_USER }".to_string()),
+        ])));
+        let app = Arc::new(AppBuilder::new("test").with_dataset(ds).build());
+        let lookups = Arc::new(parking_lot::Mutex::new(Vec::new()));
+        let mut secrets = Secrets::new();
+        secrets.register_store(
+            "fake",
+            Arc::new(RecordingSecretStore {
+                values: HashMap::from([
+                    ("PG_PASS".to_string(), "correct-horse".to_string()),
+                    ("s3_region".to_string(), "us-west-2".to_string()),
+                ]),
+                lookups: Arc::clone(&lookups),
+            }),
+        );
+        let service = make_test_service_with(Some(app), secrets, true).await;
+        let (client, shutdown) = serve_test_service(service).await;
+        let executor_secrets = Secrets::new_for_cluster_executor(
+            Box::new(crate::cluster::ClusterSecretExpanderImpl::new(client)),
+            "executor-1".to_string(),
+        );
+
+        // Not referenced by the app, so the scheduler declines it even though
+        // its store has a value.
+        assert!(matches!(
+            executor_secrets.get_secret("s3_region").await,
+            Ok(None)
+        ));
+        // Referenced by the app, but in no store.
+        assert!(matches!(
+            executor_secrets.get_secret("PG_USER").await,
+            Ok(None)
+        ));
+        let value = executor_secrets
+            .get_secret("PG_PASS")
+            .await
+            .expect("referenced secret lookup should succeed")
+            .expect("referenced secret should resolve");
+        assert_eq!(value.expose_secret(), "correct-horse");
+        // The declined key never reaches the store, and each key is
+        // requested once.
+        assert_eq!(
+            *lookups.lock(),
+            vec!["PG_USER".to_string(), "PG_PASS".to_string()]
+        );
+
+        shutdown.cancel();
+    }
+
+    #[tokio::test]
+    async fn executor_secrets_report_unreachable_scheduler_as_error() {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener should bind");
+        let address = listener
+            .local_addr()
+            .expect("listener should have a local address");
+        drop(listener);
+        let channel = Channel::from_shared(format!("http://{address}"))
+            .expect("loopback URI should parse")
+            .connect_lazy();
+        let executor_secrets = Secrets::new_for_cluster_executor(
+            Box::new(crate::cluster::ClusterSecretExpanderImpl::new(
+                ClusterServiceClient::new(channel),
+            )),
+            "executor-1".to_string(),
+        );
+
+        let err = executor_secrets
+            .get_secret("s3_region")
+            .await
+            .expect_err("an unreachable scheduler must be an error, not a missing key");
+        assert!(
+            err.to_string()
+                .contains("Failed to expand secret from scheduler"),
+            "unexpected error: {err}"
+        );
     }
 
     /// Back-to-back requests a transport test issues: well past any burst a

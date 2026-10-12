@@ -67,8 +67,11 @@ use utoipa::{
 use utoipa_swagger_ui::SwaggerUi;
 
 use super::response_outcome;
+use super::server_timing;
 use super::v1;
+use crate::server_timing::{SERVER_TIMING, field_value as server_timing_field};
 use runtime_metrics::http as metrics;
+use telemetry::timing::RecordedDuration;
 
 use axum::{
     Extension,
@@ -105,7 +108,7 @@ use tower_http::limit::RequestBodyLimitLayer;
         v1::status::get,
         v1::spicepods::get,
         v1::embeddings::post,
-        v1::evaluate::post,
+        v1::decisions::post,
         v1::search::post,
         v1::chat::post,
         v1::responses::post,
@@ -130,14 +133,24 @@ use tower_http::limit::RequestBodyLimitLayer;
         DatasetQueryParams,
         DatasetFilter,
         Format,
-        evaluate_api::EvaluateRequest,
-        evaluate_api::EvaluateResponse,
-        evaluate_api::Question,
-        evaluate_api::Answer,
-        evaluate_api::EntryType,
-        evaluate_api::NonNullEntry,
-        evaluate_api::NullableEntry,
-        evaluate_api::NoulCriteria,
+        evaluate_api::openai::DecisionRequest,
+        evaluate_api::openai::DecisionInput,
+        evaluate_api::openai::DecisionInputMessage,
+        evaluate_api::openai::DecisionInputRole,
+        evaluate_api::openai::DecisionMessageType,
+        evaluate_api::openai::DecisionMessageContent,
+        evaluate_api::openai::DecisionInputPart,
+        evaluate_api::openai::DecisionQuestion,
+        evaluate_api::openai::ChoiceOption,
+        evaluate_api::openai::ChoiceValue,
+        evaluate_api::openai::ScoreLevel,
+        evaluate_api::openai::DecisionResponse,
+        evaluate_api::openai::DecisionAnswer,
+        evaluate_api::openai::ChoiceProbability,
+        evaluate_api::openai::LevelProbability,
+        evaluate_api::openai::DecisionUsage,
+        evaluate_api::openai::InputTokensDetails,
+        evaluate_api::openai::OutputTokensDetails,
     ))
 )]
 pub(crate) struct ApiDoc;
@@ -489,8 +502,8 @@ pub(crate) fn routes(
             )
             .route("/v1/embeddings", post(v1::embeddings::post))
             .route(
-                "/v1/evaluate",
-                post(v1::evaluate::post).layer(ModelContextLayer),
+                "/v1/decisions",
+                post(v1::decisions::post).layer(ModelContextLayer),
             )
             .route("/v1/search", post(v1::search::post))
             .merge(tools_router)
@@ -674,6 +687,10 @@ async fn track_metrics(
 
     let request_dimensions = request_context.to_dimensions();
 
+    // Read before the request is handed on: whether a `/v1/sql` stream can carry
+    // its `Server-Timing` total as a trailer depends on the request.
+    let accepts_trailers = server_timing::request_accepts_trailers(req.version(), &headers);
+
     let start = Instant::now();
     let path: Arc<str> = if let Some(matched_path) = req.extensions().get::<MatchedPath>() {
         Arc::from(matched_path.as_str())
@@ -722,21 +739,55 @@ async fn track_metrics(
     metrics::REQUESTS.add(1, &labels);
     metrics::REQUESTS_DURATION_MS.record(latency_ms, &labels);
 
+    let (mut parts, body) = response.into_parts();
+
+    // A `/v1/sql` response reports the server time it already recorded above
+    // (head) or below (end of body), never a second measurement, so the field
+    // and the histograms agree. A streamed body's trailer value is the
+    // end-of-body sample, set by the callback when the body completes.
+    let trailer_total = match parts.extensions.get::<server_timing::ServerTiming>() {
+        Some(server_timing::ServerTiming::Header) => {
+            parts
+                .headers
+                .insert(SERVER_TIMING, server_timing_field(latency_ms));
+            None
+        }
+        Some(server_timing::ServerTiming::Trailer) if accepts_trailers => {
+            parts
+                .headers
+                .insert(http::header::TRAILER, server_timing::TRAILER_DECLARATION);
+            Some(RecordedDuration::default())
+        }
+        Some(server_timing::ServerTiming::Trailer) | None => None,
+    };
+
     // The metrics above describe the response *head*. For a streaming response
     // the head is `200 OK` before the first batch exists, so a query that fails
     // partway through would otherwise be counted as a success. Observe the end
     // of the body as well, and report the terminal outcome and the true
     // end-to-end duration under their own instruments so the `status` series
     // keeps its existing meaning.
-    let (parts, body) = response.into_parts();
+    let completed_total = trailer_total.clone();
     let body = axum::body::Body::new(response_outcome::OutcomeTrackedBody::new(
         body,
         move |outcome| {
+            let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
             labels.push(KeyValue::new("outcome", outcome.as_label()));
             metrics::RESPONSES.add(1, &labels);
-            metrics::RESPONSES_DURATION_MS.record(start.elapsed().as_secs_f64() * 1000.0, &labels);
+            metrics::RESPONSES_DURATION_MS.record(elapsed_ms, &labels);
+            if outcome == response_outcome::ResponseOutcome::Complete
+                && let Some(completed_total) = completed_total
+            {
+                completed_total.set(elapsed_ms);
+            }
         },
     ));
+    let body = match trailer_total {
+        Some(total) => {
+            axum::body::Body::new(server_timing::ServerTimingTrailerBody::new(body, total))
+        }
+        None => body,
+    };
 
     axum::response::Response::from_parts(parts, body)
 }
@@ -972,6 +1023,7 @@ fn cors_layer(cors_config: &CorsConfig) -> CorsLayer {
     .expose_headers([
         HeaderName::from_static("mcp-session-id"),
         HeaderName::from_static("mcp-protocol-version"),
+        SERVER_TIMING,
     ])
     .allow_origin(allowed_origins)
 }

@@ -149,6 +149,7 @@ pub(crate) mod secrets {
     pub use runtime_secrets::*;
 }
 pub mod cluster;
+mod server_timing;
 pub mod spice_metrics;
 // The status tracker lives in `runtime-status`. Aliased so `runtime::status::…`
 // (used by tests, `spiced` and grouped `crate::{status, …}` imports) still resolves.
@@ -349,7 +350,7 @@ pub enum Error {
     },
 
     #[snafu(display(
-        "Failed to register dataset {dataset_name} ({connector}): durable write-back needs a source that can apply a delivered row in one atomic step, and the {connector} connector cannot yet. Delivering as a separate delete and insert lets the deleted state echo back over CDC, which can silently drop a committed write. Remove 'on_conflict' to keep writes on the accelerator, or use a different 'acceleration.write_mode'. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
+        "Failed to register dataset {dataset_name} ({connector}): durable write-back needs a source that can apply a delivered row in one atomic step, and the {connector} connector cannot yet. Delivering as a separate delete and insert lets the deleted state echo back over CDC, which can silently drop a committed write. Set 'acceleration.write_mode: write_through' to send writes to the source directly instead, and also set 'access: read' if the source does not accept writes. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
     ))]
     DurableWriteBackUnsupportedBySource {
         dataset_name: String,
@@ -363,6 +364,17 @@ pub enum Error {
         dataset_name: String,
         connector: String,
         retention_setting: String,
+    },
+
+    #[snafu(display(
+        "Failed to register dataset {dataset_name} ({connector}): '{param}: none' turns off the primary-key check Cayenne uses to replace a stored row, but {consequence}. {advice} See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+    ))]
+    PkConflictDetectionDisabled {
+        dataset_name: String,
+        connector: String,
+        param: String,
+        consequence: String,
+        advice: String,
     },
 
     #[snafu(display(
@@ -741,6 +753,8 @@ pub struct Runtime {
     /// The dataset loads still retrying, so a Spicepod change can stop the load
     /// of a configuration it replaces or removes.
     dataset_loads: Arc<init::dataset_loads::DatasetLoads>,
+    /// Startup view registrations still waiting, cancelled when a Spicepod change replaces or removes the view.
+    view_loads: Arc<init::view_loads::ViewLoads>,
 
     /// Handle for resolving the spicepod `TelemetryConfig` for anonymous
     /// telemetry. For executors this is set after the app definition is

@@ -347,8 +347,8 @@ mod tests {
             &self,
             executor_id: &str,
             key: &str,
-        ) -> std::result::Result<SecretString, String> {
-            Ok(SecretString::from(format!("{executor_id}:{key}")))
+        ) -> std::result::Result<Option<SecretString>, String> {
+            Ok(Some(SecretString::from(format!("{executor_id}:{key}"))))
         }
     }
 

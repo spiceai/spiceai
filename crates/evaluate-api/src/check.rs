@@ -76,6 +76,10 @@ fn first_mismatch(
         let Some(question) = asked.get(id) else {
             return Err(format!("answer for question '{id}', which was not asked"));
         };
+        // A refusal answers any kind of question: the model declined, and says so.
+        if matches!(answer, Answer::Refusal {}) {
+            continue;
+        }
         let (expected, got) = (question_kind(question), answer_kind(answer));
         if expected != got {
             return Err(format!(
@@ -321,6 +325,7 @@ fn answer_kind(answer: &Answer) -> &'static str {
         Answer::Noul { .. } => "noul",
         Answer::Choice { .. } => "choice",
         Answer::Score { .. } => "score",
+        Answer::Refusal {} => "refusal",
     }
 }
 

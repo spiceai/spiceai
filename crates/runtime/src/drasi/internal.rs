@@ -118,8 +118,7 @@ impl InternalForwarders {
         };
 
         let op_code = match update_type {
-            UpdateType::Append => "c",
-            UpdateType::Changes => "u",
+            UpdateType::Append | UpdateType::Changes => "u",
             // An overwrite replaces the table wholesale without naming the rows
             // it removed, so it cannot be expressed as a set of Drasi element
             // changes — the same limitation truncate has on the CDC path.
