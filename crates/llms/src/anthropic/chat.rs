@@ -15,9 +15,11 @@ limitations under the License.
 */
 #![allow(deprecated)] // `function_call` argument is deprecated but no builder pattern alternative is available.
 #![allow(clippy::missing_errors_doc)]
+use std::pin::Pin;
 use std::time::SystemTime;
 
 use crate::anthropic::types::{EffortLevel, OutputConfig, OutputFormat};
+use crate::anthropic::types_stream::MessageCreateStreamResponse;
 use crate::chat::Chat;
 use crate::chat::nsql::SqlGeneration;
 use crate::chat::nsql::structured_output::StructuredOutputSqlGeneration;
@@ -37,7 +39,7 @@ use async_openai::types::chat::{
     CreateChatCompletionResponse, FinishReason, FunctionCall, FunctionName, ReasoningEffort,
     ResponseFormat, ResponseFormatJsonSchema, Role, StopConfiguration, ToolChoiceOptions,
 };
-use futures::StreamExt;
+use futures::{Stream, StreamExt};
 use serde_json::json;
 
 use super::types::{
@@ -67,16 +69,27 @@ impl Chat for Anthropic {
         anth_req.stream = Some(true);
         let controls = forwarded_sampling_controls(&anth_req);
 
-        let stream = self
+        let opened = self
             .client
             .chat()
             .path("/messages")?
             .create_stream_byot(anth_req)
-            .await?;
+            .await;
 
-        // A streaming request naming a model Anthropic does not serve still returns 200 from
-        // `create_stream_byot` and delivers the `not_found_error` as a stream item, so the
-        // explanation is mapped over the items rather than over this call — and upstream of
+        // `create_stream_byot` fails to open the stream on a non-2xx status. That refusal is
+        // delivered as the stream's only item instead, so it takes the same explanation and
+        // error formatting as one Anthropic sends mid-stream.
+        let stream: Pin<
+            Box<dyn Stream<Item = Result<MessageCreateStreamResponse, OpenAIError>> + Send>,
+        > = match opened {
+            Ok(stream) => Box::pin(stream),
+            Err(refusal @ OpenAIError::ApiError(_)) => {
+                Box::pin(futures::stream::once(async move { Err(refusal) }))
+            }
+            Err(e) => return Err(e),
+        };
+
+        // The `not_found_error` explanation is mapped over the stream items, upstream of
         // `transform_stream`, which rewrites the error type its own way. A refused sampling
         // control is explained inside `transform_stream` instead, which is handed what that
         // takes: see `StreamErrorContext`.

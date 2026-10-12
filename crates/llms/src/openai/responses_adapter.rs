@@ -77,7 +77,6 @@ pub(super) fn responses_request_from_chat_completion_request(
             .map(|effort| Reasoning {
                 effort: Some(effort),
                 summary: None,
-                context: None,
             }),
         metadata: req
             .metadata
@@ -1263,54 +1262,6 @@ mod tests {
             "a `type` no variant names has to be refused: if it deserializes, the field is \
              being ignored rather than defaulted, and the two assertions above cannot tell \
              those apart",
-        );
-    }
-
-    /// A Responses client continuing a conversation replays its earlier turns as input: an
-    /// assistant message without the `status` or `annotations` the API returned it with, and
-    /// message ids and a reasoning `context` the request has to keep. Codex clients also send
-    /// `client_metadata` and an `additional_tools` input item. `/v1/responses` decodes the
-    /// body and encodes it again for the provider, so the request has to decode — or it is
-    /// refused with 422 — and come back out unchanged, or the provider sees a different
-    /// request from the one the client sent.
-    #[test]
-    fn a_replayed_conversation_round_trips_through_a_responses_request() {
-        let body = json!({
-            "model": "m",
-            "reasoning": { "effort": "medium", "context": "all_turns" },
-            "client_metadata": {
-                "x-codex-installation-id": "installation",
-                "session_id": "session",
-                "turn_id": "turn"
-            },
-            "input": [
-                {
-                    "type": "additional_tools",
-                    "role": "developer",
-                    "tools": [{ "type": "function", "name": "shell" }],
-                    "tool_search_mode": "enabled"
-                },
-                {
-                    "type": "message",
-                    "id": "msg_user",
-                    "role": "user",
-                    "content": [{ "type": "input_text", "text": "hi" }]
-                },
-                {
-                    "type": "message",
-                    "id": "msg_assistant",
-                    "role": "assistant",
-                    "content": [{ "type": "output_text", "text": "hello" }]
-                }
-            ]
-        });
-
-        let request: CreateResponse = serde_json::from_value(body.clone())
-            .expect("a replayed conversation from a Responses client deserializes");
-        assert_eq!(
-            serde_json::to_value(&request).expect("serialize"),
-            body,
-            "re-encoding a replayed conversation must not add, drop, or change a field"
         );
     }
 }

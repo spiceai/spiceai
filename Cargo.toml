@@ -205,7 +205,7 @@ arrow-json = "59.3.0"
 arrow-odbc = "25.3" # 25.2+ accepts arrow ">=29, <60", so it resolves to the workspace Arrow 59
 arrow-row = "59.3.0"
 arrow-schema = "59.3.0"
-async-openai = { git = "https://github.com/spiceai/async-openai", rev = "b7f69df79e512414a0b4f6a277345a5f20c54226", features = [
+async-openai = { git = "https://github.com/spiceai/async-openai", rev = "c380f5f9cd5b15f6bb29e6f73470baa3c725cae6", features = [
     "byot",
     "embedding",
     "chat-completion",
