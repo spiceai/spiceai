@@ -94,14 +94,19 @@ pub fn series_ids(attributes: &ListArray) -> Result<StringArray, ArrowError> {
 }
 
 fn identity(parts: &[(String, u8, Vec<u8>)]) -> String {
+    // Length-prefixed framing: delimiter bytes can appear inside binary/map
+    // payloads, so a raw `0xff`/`0xfe` separator is not injective. Prefix each
+    // field with its length (and the attribute count) so distinct attribute
+    // sets cannot collide.
     let mut hasher = blake3::Hasher::new();
+    hasher.update(&u64::try_from(parts.len()).unwrap_or(u64::MAX).to_le_bytes());
     for (key, kind, payload) in parts {
-        hasher.update(key.as_bytes());
-        hasher.update(&[0xff]);
+        let key_bytes = key.as_bytes();
+        hasher.update(&u64::try_from(key_bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
+        hasher.update(key_bytes);
         hasher.update(&[*kind]);
-        hasher.update(&[0xff]);
+        hasher.update(&u64::try_from(payload.len()).unwrap_or(u64::MAX).to_le_bytes());
         hasher.update(payload);
-        hasher.update(&[0xfe]);
     }
     hasher.finalize().to_hex().to_string()
 }
@@ -277,5 +282,74 @@ mod tests {
         let ids = ids(&[None, Some(vec![])]);
         assert_eq!(ids[0], ids[1]);
         assert!(!ids[0].is_empty());
+    }
+
+    /// Binary attribute lists whose payloads embed former delimiter bytes.
+    fn binary_attributes(rows: &[Vec<(&str, &[u8])>]) -> ListArray {
+        let mut keys = StringBuilder::new();
+        let mut types = UInt8Builder::new();
+        let mut strings = StringBuilder::new();
+        let mut ints = Int64Builder::new();
+        let mut doubles = Float64Builder::new();
+        let mut bools = BooleanBuilder::new();
+        let mut bytes = BinaryBuilder::new();
+        let mut serialized = BinaryBuilder::new();
+        let mut offsets = Vec::with_capacity(rows.len() + 1);
+        offsets.push(0_i32);
+        let mut list_nulls = Vec::with_capacity(rows.len());
+
+        for row in rows {
+            list_nulls.push(true);
+            for (key, value) in row {
+                keys.append_value(*key);
+                types.append_value(AttributeValueType::Bytes.to_u8());
+                strings.append_null();
+                ints.append_null();
+                doubles.append_null();
+                bools.append_null();
+                bytes.append_value(*value);
+                serialized.append_null();
+            }
+            offsets.push(i32::try_from(keys.len()).expect("attribute count fits"));
+        }
+
+        let arrays: Vec<ArrayRef> = vec![
+            Arc::new(keys.finish()),
+            Arc::new(types.finish()),
+            Arc::new(strings.finish()),
+            Arc::new(ints.finish()),
+            Arc::new(doubles.finish()),
+            Arc::new(bools.finish()),
+            Arc::new(bytes.finish()),
+            Arc::new(serialized.finish()),
+        ];
+        let values = StructArray::try_new(attribute_struct_fields().into(), arrays, None)
+            .expect("attribute struct");
+        let field: Field = attribute_list_field();
+        let nulls = NullBuffer::from(list_nulls);
+        ListArray::try_new(
+            Arc::new(field),
+            OffsetBuffer::new(offsets.into()),
+            Arc::new(values),
+            Some(nulls),
+        )
+        .expect("attribute list")
+    }
+
+    #[test]
+    fn binary_payloads_cannot_forge_attribute_boundaries() {
+        // Old delimiter framing hashed these to the same BLAKE3 digest:
+        // one attr `a = x\xfeb\xff\x07\xffy` vs two attrs `a = x`, `b = y`.
+        let colliding_payload = b"x\xfeb\xff\x07\xffy";
+        let list = binary_attributes(&[
+            vec![("a", colliding_payload)],
+            vec![("a", b"x".as_slice()), ("b", b"y".as_slice())],
+        ]);
+        let ids = series_ids(&list).expect("derives ids");
+        assert_ne!(
+            ids.value(0),
+            ids.value(1),
+            "length-prefixed framing must keep these attribute sets distinct"
+        );
     }
 }

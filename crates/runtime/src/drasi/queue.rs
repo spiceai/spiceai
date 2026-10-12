@@ -224,14 +224,18 @@ impl DeliveryQueue {
     /// the sink ahead of it — redelivery is a full-state replace, so the
     /// stop-the-line ordering has to hold from the moment of overflow.
     pub(crate) async fn enqueue(&self, batch: QueuedBatch) {
-        let overflow = match self.jobs.try_send(batch) {
-            Ok(()) => {
+        // Reserve capacity first, bump depth, then publish through the permit.
+        // `try_send` would make the batch visible before the increment; delivery
+        // could then decrement first and leave the gauge stuck at 1.
+        let overflow = match self.jobs.try_reserve() {
+            Ok(permit) => {
                 add_depth(&self.depth);
+                permit.send(batch);
                 return;
             }
-            Err(
-                mpsc::error::TrySendError::Full(batch) | mpsc::error::TrySendError::Closed(batch),
-            ) => batch,
+            Err(mpsc::error::TrySendError::Full(()) | mpsc::error::TrySendError::Closed(())) => {
+                batch
+            }
         };
 
         let Some(store) = &self.store else {
