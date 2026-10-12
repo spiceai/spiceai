@@ -26,10 +26,18 @@ limitations under the License.
 //! which rewrites only the settled prefix of its protected snapshots — cheap at any
 //! size, but it leaves the table in several snapshots behind a deletion filter.
 //!
-//! `auto` therefore keeps a table in position mode while rewriting it whole stays
-//! cheap — the table is small ([`AutoDeletionMode::max_position_bytes`]) and its
-//! rewrites take a small share of the time ([`RECLAIM_SHARE_DENOMINATOR`]) — and
-//! moves it to key mode once either stops holding.
+//! `auto` therefore keeps a table in position mode while it is small enough to
+//! rewrite whole ([`AutoDeletionMode::max_position_bytes`]), and moves it to key
+//! mode once it is not. Either way it paces its whole-table rewrites so they take
+//! a small share of the time ([`RECLAIM_SHARE_DENOMINATOR`]).
+//!
+//! A table whose rows sit in its current snapshot — which is where every
+//! whole-table rewrite leaves them — needs that rewrite whatever its mode: the bake
+//! folds only protected snapshots, so it cannot apply a key delete to a row in the
+//! current snapshot, and its clean-prefix check then keeps it from pruning any
+//! delete at or below that row's sequence. So an `auto` table on key deletes whose
+//! current snapshot holds rows reclaims by rewriting itself whole too, at the same
+//! pace; one whose rows are all in protected snapshots leaves them to the bake.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -39,20 +47,19 @@ use parking_lot::Mutex;
 
 use crate::metadata::{DeletionMode, ResolvedDeletionMode};
 
-/// An `auto` table moves to key deletes once its whole-table reclaims take more
-/// than this fraction (one fiftieth) of the time, judged over [`RECLAIM_WINDOW`].
+/// An `auto` table's whole-table reclaims take at most this fraction (one
+/// fiftieth) of the time: a reclaim waits, its deletion index growing past the
+/// trigger meanwhile, until 49 times the last reclaims' duration has passed since
+/// the previous one ended. Over the deletion index's memory ceiling it does not
+/// wait.
 ///
 /// A reclaim rewrites the whole table on the same cores as the table's reads and
 /// writes, so how often it runs, not only how long, decides what it costs them:
 /// a 46 MB table rewritten in 270 ms every 6 s kept a reclaim running 4.3% of the
-/// time, and its P99 reads and writes were slower than the incremental bake's,
-/// while a 9 MB table at 1.5% read faster than on key deletes at every
-/// percentile. A fiftieth sits between the two.
+/// time, and its P99 reads and writes were slower than on key deletes, while a
+/// 9 MB table at 1.5% read faster than on key deletes at every percentile. A
+/// fiftieth sits between the two.
 pub(crate) const RECLAIM_SHARE_DENOMINATOR: u32 = 50;
-
-/// The shortest span an `auto` table's reclaim share is judged over, so a burst
-/// of writes does not move a table that is cheap to reclaim the rest of the time.
-pub(crate) const RECLAIM_WINDOW: Duration = Duration::from_secs(30);
 
 /// How a primary-key table records the delete of a row right now.
 #[derive(Clone, Debug)]
@@ -72,8 +79,8 @@ impl PkDeletionMode {
     /// all: it may not for a table whose rows live in RAM (`mode: memory`), a
     /// partitioned table, or a table with a datalake tier, which keep key deletes.
     /// `table_bytes` is the table's on-disk size when it was opened, `None` when it
-    /// could not be read; an unknown size starts the table in key mode, the choice
-    /// that cannot cost it a whole-table rewrite.
+    /// could not be read; an unknown size starts the table in key mode, which
+    /// rewrites the table whole only where the bake cannot hold its index.
     pub(crate) fn for_table(
         mode: DeletionMode,
         has_primary_key: bool,
@@ -118,8 +125,8 @@ impl PkDeletionMode {
 /// reclaim and the protected-snapshot merges — runs alongside writers, as on a
 /// key-delete table (see `CayenneTableProvider::position_rewrites_exclude_writers`).
 ///
-/// The switch goes one way. A table that outgrows either bound stays on key
-/// deletes for the life of this provider; the next open sizes it again.
+/// The switch goes one way. A table that outgrows the bound stays on key deletes
+/// for the life of this provider; the next open sizes it again.
 #[derive(Debug)]
 pub(crate) struct AutoDeletionMode {
     /// Whether the table still records position deletes.
@@ -129,19 +136,17 @@ pub(crate) struct AutoDeletionMode {
     switch_requested: AtomicBool,
     /// See [`Self::max_position_bytes`].
     max_position_bytes: u64,
-    /// The reclaim time in the window being judged (see [`Self::record_reclaim`]).
-    reclaims: Mutex<ReclaimWindow>,
+    /// See [`Self::reclaim_due`].
+    reclaims: Mutex<ReclaimPace>,
 }
 
-#[derive(Debug)]
-struct ReclaimWindow {
-    /// When the window opened: when the table started on position deletes, or
-    /// when the previous window was judged.
-    opened: Instant,
-    /// Wall time the table's whole-table reclaims took since `opened`.
+#[derive(Debug, Default)]
+struct ReclaimPace {
+    /// When the previous whole-table reclaim ended; `None` before the first.
+    last_end: Option<Instant>,
+    /// How long a whole-table reclaim takes: the mean of the last one and the
+    /// estimate before it, so one slow pass does not stall the next for long.
     busy: Duration,
-    /// The shortest span the window is judged over: [`RECLAIM_WINDOW`].
-    min_span: Duration,
 }
 
 impl AutoDeletionMode {
@@ -152,11 +157,7 @@ impl AutoDeletionMode {
             position: AtomicBool::new(position),
             switch_requested: AtomicBool::new(false),
             max_position_bytes,
-            reclaims: Mutex::new(ReclaimWindow {
-                opened: Instant::now(),
-                busy: Duration::ZERO,
-                min_span: RECLAIM_WINDOW,
-            }),
+            reclaims: Mutex::new(ReclaimPace::default()),
         }
     }
 
@@ -184,32 +185,35 @@ impl AutoDeletionMode {
         table_bytes <= self.max_position_bytes
     }
 
-    /// Record a whole-table reclaim that took `busy` and ended at `ended`.
-    ///
-    /// Returns `true` when the table should move to key deletes: over a window of
-    /// at least [`RECLAIM_WINDOW`], ending with this reclaim, its reclaims took
-    /// more than one [`RECLAIM_SHARE_DENOMINATOR`]th of the time. A window is
-    /// judged at the first reclaim that ends past its minimum span, and the next
-    /// one opens there.
-    pub(crate) fn record_reclaim(&self, busy: Duration, ended: Instant) -> bool {
-        let mut window = self.reclaims.lock();
-        window.busy = window.busy.saturating_add(busy);
-        let span = ended.saturating_duration_since(window.opened);
-        if span < window.min_span {
-            return false;
-        }
-        let over = window.busy.saturating_mul(RECLAIM_SHARE_DENOMINATOR) > span;
-        window.opened = ended;
-        window.busy = Duration::ZERO;
-        over
+    /// Whether a whole-table reclaim may start at `now` with the table's reclaims
+    /// still taking at most one [`RECLAIM_SHARE_DENOMINATOR`]th of the time: the
+    /// first always may, and each later one once the time since the previous one
+    /// ended is at least `RECLAIM_SHARE_DENOMINATOR - 1` times a reclaim's
+    /// duration.
+    pub(crate) fn reclaim_due(&self, now: Instant) -> bool {
+        let pace = self.reclaims.lock();
+        pace.last_end.is_none_or(|last_end| {
+            now.saturating_duration_since(last_end)
+                >= pace.busy.saturating_mul(RECLAIM_SHARE_DENOMINATOR - 1)
+        })
     }
 
-    /// Judge the reclaim share over windows of `min_span` instead of
-    /// [`RECLAIM_WINDOW`], so a test can exercise the switch without waiting it
-    /// out.
+    /// Record a whole-table reclaim that took `busy` and ended at `ended`.
+    pub(crate) fn record_reclaim(&self, busy: Duration, ended: Instant) {
+        let mut pace = self.reclaims.lock();
+        pace.busy = if pace.last_end.is_some() {
+            pace.busy.saturating_add(busy) / 2
+        } else {
+            busy
+        };
+        pace.last_end = Some(ended);
+    }
+
+    /// Forget the pace, so the next reclaim is due at once: lets a test run
+    /// reclaims back to back.
     #[cfg(test)]
-    pub(crate) fn set_reclaim_window(&self, min_span: Duration) {
-        self.reclaims.lock().min_span = min_span;
+    pub(crate) fn forget_reclaim_pace(&self) {
+        *self.reclaims.lock() = ReclaimPace::default();
     }
 
     /// Ask the next compaction trigger to move the table to key deletes. Returns
@@ -275,39 +279,31 @@ mod tests {
     }
 
     #[test]
-    fn a_reclaim_share_is_judged_only_over_a_full_window() {
+    fn the_first_reclaim_is_due_at_once() {
         let auto = AutoDeletionMode::new(Some(1), BOUND);
-        let opened = auto.reclaims.lock().opened;
-        // Back-to-back reclaims inside the first window: nothing is judged yet.
-        assert!(!auto.record_reclaim(Duration::from_secs(10), opened + Duration::from_secs(10)));
-        assert!(!auto.record_reclaim(Duration::from_secs(19), opened + Duration::from_secs(29)));
-        // The window closes at the first reclaim past it: 30 s of 31 s is over.
-        assert!(auto.record_reclaim(Duration::from_secs(1), opened + Duration::from_secs(31)));
+        assert!(auto.reclaim_due(Instant::now()));
     }
 
     #[test]
-    fn a_reclaim_share_at_most_a_fiftieth_keeps_position_deletes() {
+    fn a_reclaim_waits_until_reclaims_take_at_most_a_fiftieth_of_the_time() {
         let auto = AutoDeletionMode::new(Some(1), BOUND);
-        let opened = auto.reclaims.lock().opened;
-        // 600 ms of reclaims in a 30 s window is exactly a fiftieth: not over.
-        assert!(!auto.record_reclaim(Duration::from_millis(300), opened + Duration::from_secs(15)));
-        assert!(!auto.record_reclaim(Duration::from_millis(300), opened + Duration::from_secs(30)));
-        // The next window opened at 30 s; 601 ms of the following 30 s is over.
-        assert!(!auto.record_reclaim(Duration::from_millis(300), opened + Duration::from_secs(45)));
-        assert!(auto.record_reclaim(Duration::from_millis(301), opened + Duration::from_secs(60)));
+        let ended = Instant::now();
+        auto.record_reclaim(Duration::from_millis(100), ended);
+        // 49 × 100 ms after it ended, and not a moment before.
+        assert!(!auto.reclaim_due(ended + Duration::from_millis(4_899)));
+        assert!(auto.reclaim_due(ended + Duration::from_millis(4_900)));
     }
 
     #[test]
-    fn a_judged_window_starts_the_next_one_empty() {
+    fn one_slow_reclaim_moves_the_pace_by_half() {
         let auto = AutoDeletionMode::new(Some(1), BOUND);
-        let opened = auto.reclaims.lock().opened;
-        // A heavy window that is judged within its share only because it is long.
-        assert!(!auto.record_reclaim(Duration::from_secs(2), opened + Duration::from_secs(120)));
-        // Its busy time does not carry into the next window.
-        assert!(!auto.record_reclaim(
-            Duration::from_millis(100),
-            opened + Duration::from_secs(151)
-        ));
+        let first = Instant::now();
+        auto.record_reclaim(Duration::from_millis(100), first);
+        let second = first + Duration::from_secs(10);
+        // A 2.1 s pass after a 100 ms one: the estimate is their mean, 1.1 s.
+        auto.record_reclaim(Duration::from_millis(2_100), second);
+        assert!(!auto.reclaim_due(second + Duration::from_millis(53_899)));
+        assert!(auto.reclaim_due(second + Duration::from_millis(53_900)));
     }
 
     #[test]

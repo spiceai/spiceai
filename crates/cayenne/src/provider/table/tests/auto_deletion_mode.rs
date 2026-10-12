@@ -282,16 +282,14 @@ async fn an_upsert_racing_an_auto_tables_rewrite_stays_superseded() {
     );
 }
 
-/// Past its bound, an auto table's reclaim moves it to key deletes instead of
-/// rewriting it whole. The switch forgets the positions the read-back captured,
-/// and the upsert path stops recording position deletes, so a later upsert of a
-/// key that was located records only a key tombstone; position deletes recorded
-/// before the switch keep applying.
+/// The switch to key deletes forgets the positions the read-back captured, and the
+/// upsert path stops recording position deletes, so a later upsert of a key that
+/// was located records only a key tombstone; position deletes recorded before the
+/// switch keep applying.
 #[tokio::test]
-async fn an_auto_table_past_its_bound_switches_to_key_deletes() {
-    let name = "auto_outgrown";
-    // 1 MiB target file size: a 256 KiB bound.
-    let (provider, catalog, _tmp) = table(name, DeletionMode::Auto, 1).await;
+async fn the_switch_to_key_deletes_forgets_captured_positions() {
+    let name = "auto_switch_forgets_positions";
+    let (provider, _catalog, _tmp) = table(name, DeletionMode::Auto, 256).await;
     // Keys 0..8 are upserted while the table is on position deletes; keys 8..16
     // stay located, unupserted, until after the switch.
     let upserted: Vec<i64> = (0..8).collect();
@@ -340,6 +338,51 @@ async fn an_auto_table_past_its_bound_switches_to_key_deletes() {
         "premise: the unupserted keys are located"
     );
 
+    assert!(provider.switch_auto_to_key_deletes(), "the table switches");
+    assert!(
+        !provider.should_capture_positions(),
+        "the table is on key deletes now"
+    );
+    assert_eq!(
+        located_positions(&provider),
+        0,
+        "the switch forgets every captured position"
+    );
+
+    write(&provider, &located, 300).await;
+    assert_eq!(
+        position_deletes(&provider),
+        positions_before,
+        "no position delete is recorded after the switch"
+    );
+    let ctx = SessionContext::new();
+    let rows = collect_id_value_pairs(&ctx, &provider, name).await;
+    let expected: Vec<(i64, i64)> = upserted
+        .iter()
+        .map(|id| (*id, 200))
+        .chain(located.iter().map(|id| (*id, 300)))
+        .collect();
+    assert_eq!(rows, expected, "every key shows its latest row, once");
+}
+
+/// Past its bound, an auto table's reclaim pass moves it to key deletes. Its rows
+/// are in the current snapshot — the seed was folded there — where the bake cannot
+/// reach them, so the same pass reclaims the index with a whole-table rewrite, as
+/// a key-delete table, alongside writers.
+#[tokio::test]
+async fn an_auto_table_past_its_bound_switches_to_key_deletes() {
+    let name = "auto_outgrown";
+    // 1 MiB target file size: a 256 KiB bound.
+    let (provider, catalog, _tmp) = table(name, DeletionMode::Auto, 1).await;
+    let upserted: Vec<i64> = (0..8).collect();
+    let seed: Vec<i64> = (0..16).collect();
+    write(&provider, &seed, 100).await;
+    provider
+        .rewrite_current_snapshot_for_compaction_tracked(None)
+        .await
+        .expect("fold the seed into the current snapshot");
+    write(&provider, &upserted, 200).await;
+
     // Grow the table past its bound.
     let grow: Vec<i64> = (1_000..61_000).collect();
     write_incompressible(&provider, &grow).await;
@@ -352,36 +395,39 @@ async fn an_auto_table_past_its_bound_switches_to_key_deletes() {
         bytes > 256 * 1024,
         "premise: the grown table ({bytes} B) must be past the 256 KiB bound"
     );
+    assert!(
+        deletion_index_entries(&provider) >= 2,
+        "premise: the index is past its trigger"
+    );
 
     assert!(
-        !provider
+        provider
             .compact_current_snapshot_small_files()
             .await
             .expect("reclaim pass"),
-        "past its bound the pass switches the table instead of rewriting it"
-    );
-    assert_eq!(
-        provider.last_small_file_compact_path(),
-        LastSmallFileCompactPath::None,
-        "the pass switched the table instead of rewriting it"
+        "the pass reclaims the rows in the current snapshot"
     );
     assert!(
         !provider.should_capture_positions(),
-        "the table is on key deletes now"
+        "past its bound the table is on key deletes"
     );
     assert_eq!(
-        located_positions(&provider),
+        provider.last_small_file_compact_path(),
+        LastSmallFileCompactPath::Full,
+        "the reclaim rewrote the table whole"
+    );
+    assert_eq!(
+        deletion_index_entries(&provider),
         0,
-        "the switch forgets every captured position"
+        "the reclaim cleared the index"
     );
 
-    // An upsert of the formerly located keys records key deletes only; the
-    // position deletes from before the switch still apply.
+    let located: Vec<i64> = (8..16).collect();
     write(&provider, &located, 300).await;
     assert_eq!(
         position_deletes(&provider),
-        positions_before,
-        "no position delete is recorded after the switch"
+        0,
+        "no position delete is recorded on key deletes"
     );
     let ctx = SessionContext::new();
     let rows = collect_id_value_pairs(&ctx, &provider, name).await;
@@ -395,56 +441,213 @@ async fn an_auto_table_past_its_bound_switches_to_key_deletes() {
     assert_eq!(latest, expected, "every seed key shows its latest row");
 }
 
-/// An auto table within its size bound moves to key deletes once its whole-table
-/// reclaims take more than a fiftieth of the time. Reclaims are judged only over a
-/// full window, so back-to-back reclaims inside one leave the table on position
-/// deletes; judged, they move it, and later upserts record key deletes only.
+/// An auto table's whole-table reclaims are paced: one that is not yet due leaves
+/// the index past its trigger, and runs once it is.
 #[tokio::test]
-async fn an_auto_table_whose_reclaims_take_too_much_of_the_time_switches_to_key_deletes() {
-    let name = "auto_busy_reclaims";
+async fn an_auto_tables_whole_table_reclaims_are_paced() {
+    let name = "auto_paced_reclaims";
     let (provider, _catalog, _tmp) = table(name, DeletionMode::Auto, 256).await;
     let auto = Arc::clone(provider.pk_deletion_mode.auto().expect("an auto table"));
     let keys: Vec<i64> = (0..16).collect();
     write(&provider, &keys, 100).await;
-
-    // Inside a window that has not closed, nothing is judged, however busy.
-    auto.set_reclaim_window(std::time::Duration::from_secs(3_600));
-    for value in [200, 300] {
-        write(&provider, &keys, value).await;
-        assert!(
-            provider
-                .rewrite_current_snapshot_for_reclaim_tracked(None)
-                .await
-                .expect("reclaim pass"),
-            "the reclaim of a table within its bound commits"
-        );
-    }
-    assert!(
-        provider.should_capture_positions(),
-        "reclaims inside an open window do not move the table"
-    );
-
-    // Close the window at the next reclaim: back-to-back reclaims took far more
-    // than a fiftieth of the time since the table opened.
-    auto.set_reclaim_window(std::time::Duration::ZERO);
-    write(&provider, &keys, 400).await;
+    write(&provider, &keys, 200).await;
     assert!(
         provider
-            .rewrite_current_snapshot_for_reclaim_tracked(None)
+            .compact_current_snapshot_small_files()
+            .await
+            .expect("first reclaim pass"),
+        "the first reclaim is due at once"
+    );
+
+    // As if the last reclaim had taken a minute: the next is due in 49.
+    auto.record_reclaim(
+        std::time::Duration::from_secs(60),
+        std::time::Instant::now(),
+    );
+    write(&provider, &keys, 300).await;
+    let pending = deletion_index_entries(&provider);
+    assert!(
+        pending >= 2,
+        "premise: the index is past its trigger ({pending})"
+    );
+    assert!(
+        !provider
+            .compact_current_snapshot_small_files()
+            .await
+            .expect("paced reclaim pass"),
+        "a reclaim that is not yet due does not run"
+    );
+    assert_eq!(
+        deletion_index_entries(&provider),
+        pending,
+        "the deferred reclaim left the index as it was"
+    );
+
+    auto.forget_reclaim_pace();
+    assert!(
+        provider
+            .compact_current_snapshot_small_files()
+            .await
+            .expect("due reclaim pass"),
+        "a due reclaim runs"
+    );
+    assert_eq!(
+        deletion_index_entries(&provider),
+        0,
+        "the reclaim cleared the index"
+    );
+    let ctx = SessionContext::new();
+    let rows = collect_id_value_pairs(&ctx, &provider, name).await;
+    let expected: Vec<(i64, i64)> = keys.iter().map(|id| (*id, 300)).collect();
+    assert_eq!(rows, expected, "every key shows its latest row, once");
+}
+
+/// An auto table on key deletes whose rows sit in its current snapshot — where
+/// every whole-table rewrite leaves them — reclaims by rewriting itself whole: the
+/// bake folds only protected snapshots, so it declines, and without this the index
+/// would keep every delete of those rows for the life of the table.
+#[tokio::test]
+async fn an_auto_table_on_key_deletes_reclaims_rows_the_bake_cannot_reach() {
+    let name = "auto_key_current_snapshot";
+    let (provider, _catalog, _tmp) = table(name, DeletionMode::Auto, 256).await;
+    let keys: Vec<i64> = (0..16).collect();
+    write(&provider, &keys, 100).await;
+    provider
+        .rewrite_current_snapshot_for_compaction_tracked(None)
+        .await
+        .expect("fold the seed into the current snapshot");
+    assert!(
+        provider.switch_auto_to_key_deletes(),
+        "premise: on key deletes"
+    );
+
+    // Enough protected snapshots for the bake to pick a prefix.
+    for value in 200..206 {
+        write(&provider, &keys, value).await;
+    }
+    let pending = deletion_index_entries(&provider);
+    assert!(
+        pending >= 2,
+        "premise: the index is past its trigger ({pending})"
+    );
+    assert!(
+        !provider
+            .bake_seq_prefix_protected_snapshots()
+            .await
+            .expect("bake pass"),
+        "premise: the bake cannot reach rows in the current snapshot"
+    );
+    assert_eq!(
+        deletion_index_entries(&provider),
+        pending,
+        "premise: the bake left the index as it was"
+    );
+
+    assert!(
+        provider
+            .compact_current_snapshot_small_files()
             .await
             .expect("reclaim pass"),
-        "the judged reclaim itself commits"
+        "the table rewrites itself whole"
+    );
+    assert_eq!(
+        deletion_index_entries(&provider),
+        0,
+        "the reclaim cleared the index"
     );
     assert!(
         !provider.should_capture_positions(),
-        "the table is on key deletes once its reclaims took too much of the time"
+        "the reclaim did not move the table back to position deletes"
     );
-
-    write(&provider, &keys, 500).await;
     let ctx = SessionContext::new();
     let rows = collect_id_value_pairs(&ctx, &provider, name).await;
-    let expected: Vec<(i64, i64)> = keys.iter().map(|id| (*id, 500)).collect();
+    let expected: Vec<(i64, i64)> = keys.iter().map(|id| (*id, 205)).collect();
     assert_eq!(rows, expected, "every key shows its latest row, once");
+}
+
+/// An auto table on key deletes whose rows are all in protected snapshots leaves
+/// its index to the bake: the trigger fires, but the pass finds the current
+/// snapshot empty and does not rewrite the table.
+#[tokio::test]
+async fn an_auto_table_on_key_deletes_leaves_reachable_rows_to_the_bake() {
+    let name = "auto_key_protected_rows";
+    let (provider, _catalog, _tmp) = table(name, DeletionMode::Auto, 256).await;
+    assert!(
+        provider.switch_auto_to_key_deletes(),
+        "premise: on key deletes"
+    );
+    let keys: Vec<i64> = (0..16).collect();
+    for value in 100..103 {
+        write(&provider, &keys, value).await;
+    }
+    provider
+        .drain_in_flight_maintenance()
+        .await
+        .expect("settle maintenance");
+    assert!(
+        provider
+            .list_snapshot_files_with_sizes(&provider.get_current_snapshot_id())
+            .await
+            .expect("list the current snapshot")
+            .is_empty(),
+        "premise: every row is in a protected snapshot"
+    );
+    assert!(
+        provider.deletion_index_reclaim_trigger().is_some(),
+        "premise: the trigger fires"
+    );
+    assert!(
+        !provider
+            .compact_current_snapshot_small_files()
+            .await
+            .expect("reclaim pass"),
+        "a table whose rows the bake can reach is not rewritten whole"
+    );
+    assert_eq!(
+        provider.last_small_file_compact_path(),
+        LastSmallFileCompactPath::None,
+        "the pass left the table to the bake"
+    );
+    let ctx = SessionContext::new();
+    let rows = collect_id_value_pairs(&ctx, &provider, name).await;
+    let expected: Vec<(i64, i64)> = keys.iter().map(|id| (*id, 102)).collect();
+    assert_eq!(rows, expected, "every key shows its latest row, once");
+}
+
+/// The whole-table reclaim trigger fires for an auto table on key deletes at the
+/// bake's trigger, and never for an explicit `deletion_mode: key` table, which
+/// keeps the bake alone.
+#[tokio::test]
+async fn the_whole_table_reclaim_trigger_covers_auto_on_key_deletes_not_explicit_key() {
+    let (auto_key, _catalog, _tmp) = table("auto_key_trigger", DeletionMode::Auto, 256).await;
+    assert!(
+        auto_key.switch_auto_to_key_deletes(),
+        "premise: on key deletes"
+    );
+    install_int64_deletes(&auto_key, &[(0, 10)]);
+    assert_eq!(
+        auto_key.deletion_index_reclaim_trigger(),
+        None,
+        "below the trigger nothing fires"
+    );
+    install_int64_deletes(&auto_key, &[(0, 10), (1, 11)]);
+    assert_eq!(
+        auto_key.deletion_index_reclaim_trigger(),
+        Some(SnapshotMaintenanceTrigger::DeletionIndexSize {
+            deletion_index_len: 2,
+            trigger_len: 2,
+            over_memory_ceiling: false,
+        }),
+        "at the trigger an auto table on key deletes may rewrite itself whole"
+    );
+
+    let (key, _key_catalog, _key_tmp) = table("explicit_key_trigger", DeletionMode::Key, 256).await;
+    install_int64_deletes(&key, &[(0, 10), (1, 11), (2, 12)]);
+    assert_eq!(
+        key.deletion_index_reclaim_trigger(),
+        None,
+        "an explicit key table keeps the bake alone"
+    );
 }
 
 /// A writer that checked the keyset out while the table was on position deletes
@@ -494,7 +697,7 @@ async fn a_keyset_checked_out_before_the_switch_records_no_position_delete_after
         "premise: the checked-out keyset locates every key"
     );
     assert!(
-        provider.switch_auto_to_key_deletes("test"),
+        provider.switch_auto_to_key_deletes(),
         "the table switches to key deletes"
     );
     provider.store_cached_pk_index(index.expect("an exact keyset"), checkout);
