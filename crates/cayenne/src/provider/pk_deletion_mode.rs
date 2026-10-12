@@ -65,8 +65,9 @@ use crate::metadata::{DeletionMode, ResolvedDeletionMode};
 /// a Linux virtual machine held to four CPUs, a 250K-row table rewrote itself
 /// every 1.8 s for 236 ms, 13% of the time, and its write P99 was 16% above key
 /// deletes'; paced to a tenth, its writes were even with key deletes'. On a
-/// runtime with fewer than 8 CPU cores the accelerator resolves `auto` to key
-/// deletes before the table opens (`CpuBudget::cayenne_keeps_small_tables_compacted`).
+/// runtime with fewer than 8 CPU cores the accelerator, and a Cayenne catalog for
+/// its own tables, resolve `auto` to key deletes before the table opens
+/// (`CpuBudget::cayenne_keeps_small_tables_compacted`).
 ///
 /// The pace costs reads while it holds a reclaim back, because the index grows
 /// past the trigger: a 1M-row table under 8,000 upserts a second read at a 10 ms

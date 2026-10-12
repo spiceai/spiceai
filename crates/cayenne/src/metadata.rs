@@ -507,7 +507,8 @@ pub enum DeletionMode {
     /// size on disk, and never more than 8 MiB — and switches to [`Self::Key`]
     /// deletes once it outgrows that. The switch holds until the table is next
     /// opened, which sizes it again. On a runtime with fewer than 8 CPU cores
-    /// the accelerator resolves `Auto` to [`Self::Key`] before the table opens.
+    /// the accelerator, and a Cayenne catalog for its own tables, resolve `Auto`
+    /// to [`Self::Key`] before the table opens.
     /// A table on object storage, in `mode: memory`, partitioned, or with a
     /// cold tier uses key deletes throughout.
     /// While it uses position deletes, `Auto` rewrites alongside writers rather
