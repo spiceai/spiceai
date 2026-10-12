@@ -96,7 +96,7 @@ use cache::{CacheProvider, Caching, QueryResultsCacheProvider, key::RawCacheKey}
 use data_components::poly::PolyTableProvider;
 use datafusion::catalog::CatalogProvider;
 use datafusion::catalog::SchemaProvider;
-use datafusion::common::{Constraint, Constraints, ToDFSchema};
+use datafusion::common::{Constraint, Constraints, ParamValues, ToDFSchema};
 use datafusion::common::{ResolvedTableReference, TableReference};
 use datafusion::datasource::TableProvider;
 use datafusion::error::DataFusionError;
@@ -126,6 +126,9 @@ use runtime_acceleration::snapshot::AccelerationLayout;
 use runtime_acceleration::snapshot::SnapshotManager;
 use runtime_async::ManagedTokioRuntime;
 use runtime_datafusion::schema_provider::{EnsureSchemaError, ensure_schema_exists};
+use runtime_datafusion::table_function_params::{
+    TableFunctionPlaceholders, bind_table_function_args,
+};
 use runtime_query_engine::query_engine::Error as QueryEngineError;
 use runtime_table_partition::provider::PartitionTableProvider;
 use snafu::prelude::*;
@@ -6373,12 +6376,20 @@ impl DataFusion {
         self.ctx.deregister_udtf(TEXT_SEARCH_UDTF_NAME);
     }
 
-    /// Create or get a logical plan from the query
+    /// Create or get a logical plan from the query.
+    ///
+    /// `parameters` are bound into the arguments of the table functions in
+    /// `sql` before it is planned (see [`table_function_params`]). The caller
+    /// binds them into the rest of the plan. A plan with values in its
+    /// table-function arguments is specific to those values, so it is never
+    /// cached. Thus a cached plan never has such arguments, and a cache hit
+    /// does not have to parse `sql` to find out.
     pub(crate) async fn get_or_create_logical_plan(
         &self,
         session: &SessionState,
         cache_key_opt: Option<&RawCacheKey>,
         sql: &str,
+        parameters: Option<&ParamValues>,
     ) -> Result<LogicalPlan, DataFusionError> {
         let plans_cache = if let Some(cache_key) = cache_key_opt {
             let plans_cache = self.plans_cache_provider();
@@ -6394,9 +6405,12 @@ impl DataFusion {
             None
         };
 
-        let plan = self.create_logical_plan(session, sql).await?;
+        let (plan, placeholders) = self
+            .create_logical_plan_with_params(session, sql, parameters)
+            .await?;
 
-        if let Some(cache) = plans_cache
+        if placeholders == TableFunctionPlaceholders::Absent
+            && let Some(cache) = plans_cache
             && let Some(cache_key) = cache_key_opt
         {
             tracing::trace!("caching plan for {sql}");
@@ -6409,16 +6423,70 @@ impl DataFusion {
     /// Route SQL through the planner, which intercepts DDL extensions and
     /// Cayenne DML at the statement level, or falls back to `DataFusion`'s
     /// standard planner.
-    #[cfg(not(windows))]
     pub(crate) async fn create_logical_plan(
         &self,
         session: &SessionState,
         sql: &str,
     ) -> Result<LogicalPlan, DataFusionError> {
-        let statement = planner::parse_sql_statement(sql, session)?;
+        let (plan, _) = self
+            .create_logical_plan_with_params(session, sql, None)
+            .await?;
+        Ok(plan)
+    }
+
+    /// [`Self::create_logical_plan`], with `parameters` bound into the
+    /// arguments of the table functions in `sql`.
+    ///
+    /// `DataFusion` calls a table function while it plans, before parameter
+    /// values are bound into the plan, so a placeholder argument would reach
+    /// the table function unbound. Placeholders in other positions are left in
+    /// the plan for [`LogicalPlan::with_param_values`].
+    pub(crate) async fn create_logical_plan_with_params(
+        &self,
+        session: &SessionState,
+        sql: &str,
+        parameters: Option<&ParamValues>,
+    ) -> Result<(LogicalPlan, TableFunctionPlaceholders), DataFusionError> {
+        let mut statement = Self::parse_statement(session, sql)?;
+        let placeholders = bind_table_function_args(&mut statement, parameters)?;
         self.resolve_pending_initializations_for_statement(session, &statement)
             .await?;
+        let plan = self.plan_statement(session, sql, statement).await?;
+        Ok((plan, placeholders))
+    }
 
+    /// Whether a table-function argument in `sql` is a parameter placeholder.
+    /// The schema of such a statement is known only when its values are bound.
+    ///
+    /// `false` when `sql` does not parse: planning then reports the error.
+    pub(crate) fn has_table_function_placeholders(&self, sql: &str) -> bool {
+        // Parsed against the session's state in place: copying the state
+        // copies every registered function.
+        let state = self.ctx.state_ref();
+        let state = state.read();
+        Self::parse_statement(&state, sql)
+            .and_then(|mut statement| bind_table_function_args(&mut statement, None))
+            .is_ok_and(|placeholders| placeholders == TableFunctionPlaceholders::Present)
+    }
+
+    #[cfg(not(windows))]
+    fn parse_statement(session: &SessionState, sql: &str) -> Result<Statement, DataFusionError> {
+        planner::parse_sql_statement(sql, session)
+    }
+
+    #[cfg(windows)]
+    fn parse_statement(session: &SessionState, sql: &str) -> Result<Statement, DataFusionError> {
+        let dialect = session.config().options().sql_parser.dialect;
+        session.sql_to_statement(sql, &dialect)
+    }
+
+    #[cfg(not(windows))]
+    async fn plan_statement(
+        &self,
+        session: &SessionState,
+        sql: &str,
+        statement: Statement,
+    ) -> Result<LogicalPlan, DataFusionError> {
         let ctx = planner::PlannerContext {
             catalog_mode: if self.has_cayenne_catalog() {
                 planner::CatalogMode::Cayenne
@@ -6438,15 +6506,12 @@ impl DataFusion {
     /// On Windows the `planner` module is not available, so delegate
     /// directly to DataFusion's standard logical planner.
     #[cfg(windows)]
-    pub(crate) async fn create_logical_plan(
+    async fn plan_statement(
         &self,
         session: &SessionState,
-        sql: &str,
+        _sql: &str,
+        statement: Statement,
     ) -> Result<LogicalPlan, DataFusionError> {
-        let dialect = session.config().options().sql_parser.dialect;
-        let statement = session.sql_to_statement(sql, &dialect)?;
-        self.resolve_pending_initializations_for_statement(session, &statement)
-            .await?;
         session.statement_to_plan(statement).await
     }
 
@@ -6466,7 +6531,7 @@ impl DataFusion {
         let key = cache::key::CacheKey::Query(sql, None)
             .as_raw_key(Box::new(std::hash::DefaultHasher::new()));
         let session = self.ctx.state();
-        self.get_or_create_logical_plan(&session, Some(&key), sql)
+        self.get_or_create_logical_plan(&session, Some(&key), sql, None)
             .await?;
         Ok(())
     }
@@ -7699,7 +7764,7 @@ mod tests {
 
         let session = df.ctx.state();
 
-        df.get_or_create_logical_plan(&session, Some(&raw_cache_key), SQL)
+        df.get_or_create_logical_plan(&session, Some(&raw_cache_key), SQL, None)
             .await
             .expect("logical plan");
 
@@ -7712,7 +7777,7 @@ mod tests {
         drop(cache_provider);
 
         // Reusing the same query should no longer at to the cache
-        df.get_or_create_logical_plan(&session, Some(&raw_cache_key), SQL)
+        df.get_or_create_logical_plan(&session, Some(&raw_cache_key), SQL, None)
             .await
             .expect("logical plan");
 
@@ -7721,6 +7786,104 @@ mod tests {
         };
         cache_provider.checkpoint().await; // Ensure entry gets logged
         assert_eq!(cache_provider.item_count().await, 1);
+    }
+
+    /// Returns its one string argument as a single row. Like the search table
+    /// functions, it accepts only a literal argument.
+    #[derive(Debug)]
+    struct EchoTableFunc;
+
+    impl datafusion::catalog::TableFunctionImpl for EchoTableFunc {
+        fn call(&self, args: &[Expr]) -> datafusion::error::Result<Arc<dyn TableProvider>> {
+            let [Expr::Literal(datafusion::scalar::ScalarValue::Utf8(Some(value)), _)] = args
+            else {
+                return datafusion::common::plan_err!(
+                    "echo takes one string literal, got {args:?}"
+                );
+            };
+            let schema = Arc::new(Schema::new(vec![Field::new(
+                "value",
+                DataType::Utf8,
+                false,
+            )]));
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![Arc::new(arrow::array::StringArray::from(vec![
+                    value.clone(),
+                ]))],
+            )?;
+            Ok(Arc::new(MemTable::try_new(schema, vec![vec![batch]])?))
+        }
+    }
+
+    /// A parameter in a table-function argument is bound before planning, and
+    /// the plan that holds its value is not reused for other values.
+    #[tokio::test]
+    async fn table_function_args_accept_parameters() {
+        use datafusion::scalar::ScalarValue;
+
+        static SQL: &str = "SELECT value FROM echo($1) WHERE value <> $2";
+        let raw_cache_key =
+            CacheKey::Query(SQL, None).as_raw_key(Box::new(std::hash::DefaultHasher::new()));
+
+        let runtime = RuntimeBuilder::new().build().await;
+        let plan_cache_provider = Arc::new(SimpleCache::new(
+            512,
+            Duration::from_hours(1),
+            std::hash::BuildHasherDefault::<twox_hash::XxHash3_64>::default(),
+        ));
+        let df = Arc::new(
+            DataFusion::builder(
+                status::RuntimeStatus::new(),
+                runtime.accelerator_engine_registry(),
+                Handle::current(),
+            )
+            .with_caching(Arc::new(
+                Caching::new().with_plans_cache(plan_cache_provider),
+            ))
+            .build(),
+        );
+        df.ctx.register_udtf("echo", Arc::new(EchoTableFunc));
+        let session = df.ctx.state();
+
+        for value in ["fox", "dog"] {
+            let params = ParamValues::from(vec![ScalarValue::from(value), ScalarValue::from("")]);
+            let plan = df
+                .get_or_create_logical_plan(&session, Some(&raw_cache_key), SQL, Some(&params))
+                .await
+                .expect("plan with parameters")
+                .with_param_values(params)
+                .expect("bind the remaining parameters");
+            let batches = df
+                .ctx
+                .execute_logical_plan(plan)
+                .await
+                .expect("execute")
+                .collect()
+                .await
+                .expect("collect");
+            let column = batches[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<arrow::array::StringArray>()
+                .expect("string column");
+            assert_eq!(column.value(0), value);
+        }
+
+        let Some(cache_provider) = df.plans_cache_provider() else {
+            unreachable!("Cache provider should be available");
+        };
+        cache_provider.checkpoint().await;
+        assert_eq!(
+            cache_provider.item_count().await,
+            0,
+            "a plan that holds parameter values must not be cached"
+        );
+
+        assert!(df.has_table_function_placeholders(SQL));
+        assert!(
+            !df.has_table_function_placeholders("SELECT value FROM echo('fox') WHERE value <> $1")
+        );
     }
 
     #[cfg(all(feature = "duckdb", feature = "snapshots",))]

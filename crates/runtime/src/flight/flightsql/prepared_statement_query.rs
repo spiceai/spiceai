@@ -212,12 +212,14 @@ pub(crate) async fn do_action_create_prepared_statement(
     // For a `BEGIN … COMMIT` body, advertise the final statement's schema (the
     // body is executed as a transaction at do_get, not planned as one here).
     let schema_sql = schema_statement(&query);
-    let (dataset_schema, parameter_schema) = match Service::get_arrow_schema(
-        datafusion,
-        &schema_sql,
-    )
-    .await
-    {
+    let schemas = if datafusion.has_table_function_placeholders(&schema_sql) {
+        // A table function is planned with its argument values, which are
+        // bound only at execution.
+        Ok((arrow_schema::Schema::empty(), None))
+    } else {
+        Service::get_arrow_schema(datafusion, &schema_sql).await
+    };
+    let (dataset_schema, parameter_schema) = match schemas {
         Ok(schemas) => schemas,
         Err(e) => {
             // Check if this is a type inference error related to parameters
@@ -282,8 +284,17 @@ pub(crate) async fn get_flight_info(
     // we'll omit the schema from FlightInfo. The actual schema will be determined during execution.
     // For a `BEGIN … COMMIT` body, advertise the final statement's schema.
     let schema_sql = schema_statement(&sql);
-    let maybe_arrow_schema = match Service::get_arrow_schema(datafusion, &schema_sql).await {
-        Ok((schema, _)) => Some(schema),
+    let schema = if datafusion.has_table_function_placeholders(&schema_sql) {
+        // A table function is planned with its argument values, which are
+        // bound only at execution.
+        Ok(None)
+    } else {
+        Service::get_arrow_schema(datafusion, &schema_sql)
+            .await
+            .map(|(schema, _)| Some(schema))
+    };
+    let maybe_arrow_schema = match schema {
+        Ok(schema) => schema,
         Err(e) => {
             let err_msg = e.to_string();
             if err_msg.contains("Cannot get result type")
