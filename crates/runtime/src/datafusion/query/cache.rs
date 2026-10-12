@@ -710,7 +710,7 @@ impl Query {
     /// The key a cached [`LogicalPlan`] lives under: the SQL text and the
     /// cache namespace, never the parameter values bound into it.
     ///
-    /// [`DataFusion::create_logical_plan`] is never given the parameters — it
+    /// [`DataFusion::create_logical_plan_with_params`] is never given the parameters — it
     /// plans the placeholders, and [`Self::get_plan`] binds the values into the
     /// plan it hands back — so one SQL text has exactly one plan whatever is
     /// bound into it. The exception is a placeholder in a table-function

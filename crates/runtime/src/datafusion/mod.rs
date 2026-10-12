@@ -6422,20 +6422,8 @@ impl DataFusion {
 
     /// Route SQL through the planner, which intercepts DDL extensions and
     /// Cayenne DML at the statement level, or falls back to `DataFusion`'s
-    /// standard planner.
-    pub(crate) async fn create_logical_plan(
-        &self,
-        session: &SessionState,
-        sql: &str,
-    ) -> Result<LogicalPlan, DataFusionError> {
-        let (plan, _) = self
-            .create_logical_plan_with_params(session, sql, None)
-            .await?;
-        Ok(plan)
-    }
-
-    /// [`Self::create_logical_plan`], with `parameters` bound into the
-    /// arguments of the table functions in `sql`.
+    /// standard planner. Binds `parameters` into the arguments of the table
+    /// functions in `sql`.
     ///
     /// `DataFusion` calls a table function while it plans, before parameter
     /// values are bound into the plan, so a placeholder argument would reach
