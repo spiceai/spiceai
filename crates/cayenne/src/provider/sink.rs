@@ -322,8 +322,8 @@ impl DataSink for CayenneDataSink {
                 .into_empty_table()
                 .write(normalized, write_guard)
                 .await?;
-            // The load recorded no primary-key index; warm the one the next
-            // refresh validates against now, rather than on that refresh's path.
+            // Warming returns after briefly taking the write lock when the load
+            // installed a bloom; smaller loads still warm their exact index.
             let table = self.table.clone_for_write();
             tokio::spawn(async move {
                 if let Err(error) = table.warm_pk_index().await {

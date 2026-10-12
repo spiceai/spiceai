@@ -1268,6 +1268,7 @@ impl<'a> AppendMutationWriter<'a> {
             stats,
             row_count: rows,
             superseded: superseded_rows,
+            first_load_pk_bloom,
         } = self
             .table
             .stage_resolved_append(data, resolver, write, scope)
@@ -1289,6 +1290,7 @@ impl<'a> AppendMutationWriter<'a> {
             validated_keys,
             superseded: superseded_rows,
             into_empty_table: self.into_empty_table,
+            first_load_pk_bloom,
         }
         .commit()
         .await

@@ -3316,7 +3316,20 @@ pub(crate) fn ensure_outcome_known(outcome_unknown: &AtomicBool, table: &str) ->
     Ok(())
 }
 
+// Integration tests link the library without cfg(test). Keep the observation
+// seam in debug builds only, without adding production counters or metrics.
+#[cfg(debug_assertions)]
+static TEST_PK_REBUILDS: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<String, u64>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
 pub(crate) fn record_cayenne_write_phase(table_name: &str, phase: &'static str, start: Instant) {
+    #[cfg(debug_assertions)]
+    if phase == "keyset_rebuild" {
+        let mut counts = TEST_PK_REBUILDS.lock();
+        let count = counts.entry(table_name.to_string()).or_default();
+        *count = count.saturating_add(1);
+    }
     let elapsed = start.elapsed();
     tracing::debug!(
         table = table_name,
@@ -12452,7 +12465,7 @@ impl CayenneTableProvider {
 
     /// Effective byte budget for the table-wide PK keyset cache
     /// (`pk_keyset_cache`).
-    fn effective_single_keyset_budget(&self) -> usize {
+    pub(crate) fn effective_single_keyset_budget(&self) -> usize {
         self.effective_pk_keyset_budget(self.pk_keyset_bytes_single.load(Ordering::Relaxed))
     }
 
@@ -12588,6 +12601,32 @@ impl CayenneTableProvider {
             telemetry::KeyValue::new("site", site),
             telemetry::KeyValue::new("kind", Self::pk_index_kind_label(is_bloom)),
         ]);
+    }
+
+    /// Debug-build integration-test observation: table-wide bloom presence and
+    /// completed keyset rebuild phases. Not a stable API.
+    #[cfg(debug_assertions)]
+    #[doc(hidden)]
+    #[must_use]
+    pub fn first_load_pk_test_observation(&self) -> (bool, u64) {
+        let bloom = self
+            .pk_keyset_cache
+            .lock()
+            .as_ref()
+            .is_some_and(|index| index.bloom_density().is_some());
+        let rebuilds = TEST_PK_REBUILDS
+            .lock()
+            .get(self.table_name())
+            .copied()
+            .unwrap_or(0);
+        (bloom, rebuilds)
+    }
+
+    /// The first load holds the write guard and bypasses validation, so no
+    /// validation checkout is open. Use the normal store path for accounting.
+    pub(crate) fn install_first_load_pk_bloom(&self, bloom: PkBloom) {
+        let (_, checkout) = self.take_cached_pk_index();
+        self.store_cached_pk_index(CachedPkIndex::Bloom(bloom), checkout);
     }
 
     pub(crate) fn store_cached_pk_index(&self, index: CachedPkIndex, checkout: PkCheckoutGuard) {
@@ -13937,7 +13976,7 @@ impl CayenneTableProvider {
     }
 
     /// Build a `RowConverter` for the primary key columns.
-    fn build_pk_converter(&self, pk_indices: &[usize]) -> Result<RowConverter> {
+    pub(crate) fn build_pk_converter(&self, pk_indices: &[usize]) -> Result<RowConverter> {
         let table_schema = self.table_schema();
         let mut sort_fields = Vec::with_capacity(pk_indices.len());
         for idx in pk_indices {
