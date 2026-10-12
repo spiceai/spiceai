@@ -211,15 +211,6 @@ pub(crate) async fn rollback_indexes<'a>(
     }
 }
 
-/// Runs [`Index::on_write_complete`] for every index after a successful write, and
-/// reports the first failure from an index that declares a finalize failure fatal.
-///
-/// Every index is finalized even once one has failed — stopping early would leave
-/// more indexes stale than the failure requires. A failure on an index with
-/// [`Index::write_complete_failure_is_fatal`] unset is best-effort: it is logged and
-/// the write still succeeds, because that index rebuilds on the next refresh. A fatal
-/// one fails the write, since reporting success would let the index serve stale or
-/// missing results for data the caller believes was indexed.
 /// Builds each Cayenne table's scan view and file listing for the data a refresh
 /// just wrote, so the queries the refresh releases when it completes do not all
 /// stall listing the new files at once.
@@ -239,6 +230,15 @@ pub(crate) async fn prepare_tables_for_reads(
     }
 }
 
+/// Runs [`Index::on_write_complete`] for every index after a successful write, and
+/// reports the first failure from an index that declares a finalize failure fatal.
+///
+/// Every index is finalized even once one has failed — stopping early would leave
+/// more indexes stale than the failure requires. A failure on an index with
+/// [`Index::write_complete_failure_is_fatal`] unset is best-effort: it is logged and
+/// the write still succeeds, because that index rebuilds on the next refresh. A fatal
+/// one fails the write, since reporting success would let the index serve stale or
+/// missing results for data the caller believes was indexed.
 pub(crate) async fn finalize_indexes<'a>(
     sink: &str,
     indexes: impl Iterator<Item = &'a Arc<dyn Index + Send + Sync>>,
