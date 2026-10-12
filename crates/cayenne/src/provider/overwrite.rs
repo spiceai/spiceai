@@ -74,7 +74,7 @@ use tokio::sync::{OwnedMutexGuard, OwnedSemaphorePermit};
 
 use super::Result;
 use super::column_stats::ColumnStatsAccumulator;
-use super::delta_encoding::{ShardRouting, WritePolicy};
+use super::delta_encoding::{ShardRouting, WriteClass, WritePolicy};
 use super::mutation_writer::InlineBatchBuffer;
 use super::overwrite_postpass::CopyOrder;
 use super::table::{
@@ -987,11 +987,15 @@ impl CayenneTableProvider {
         // file, though not necessarily in the order it held them, since the
         // scan may split a large file into ranges. Merging every file's
         // survivors into one stream would feed the rewrite from a single task,
-        // however many encoders it had. Each write holds one encode permit, and
-        // as many files fold at once as maintenance may hold, so the permits
-        // reserved for deltas stay free whatever the write's class. A coupled
-        // writer (a partition child) takes no permits and keeps to one encode
-        // stream, so it folds one file at a time: its siblings fold alongside.
+        // however many encoders it had. Each write holds one encode permit. A
+        // maintenance fold (a load into an empty table) runs as many files at
+        // once as maintenance may hold, and the maintenance gate bounds that
+        // across every table. A delta fold takes its permits outside that
+        // gate, so it runs no more files at once than the table's own writes
+        // have shards, the permits one sharded write of the survivors would
+        // hold. A coupled writer (a partition child) takes no permits and
+        // keeps to one encode stream, so it folds one file at a time: its
+        // siblings fold alongside.
         let policy = WritePolicy {
             class: write.write_policy.class,
             fan_out: EncodeFanOut::PerCaller,
@@ -999,7 +1003,7 @@ impl CayenneTableProvider {
         };
         let in_flight = if self.context().is_coupled_writer() {
             1
-        } else {
+        } else if write.write_policy.class == WriteClass::Maintenance {
             super::write_budget::encode_budget_snapshot()
                 .and_then(|budget| usize::try_from(budget.total).ok())
                 .map_or(
@@ -1007,6 +1011,8 @@ impl CayenneTableProvider {
                     super::write_budget::maintenance_gate_cap,
                 )
                 .max(1)
+        } else {
+            self.snapshot_write_concurrency(write.target_partitions)
         };
         let folds: Vec<FileFold<'_>> = superseded
             .iter()
