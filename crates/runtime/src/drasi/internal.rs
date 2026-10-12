@@ -234,9 +234,9 @@ fn declared_primary_key(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::drasi::dead_letter::DeadLetterStore;
     use arrow::datatypes::{DataType, Field, Schema};
     use datafusion::common::Constraint;
+    use runtime_drasi::dead_letter::DeadLetterStore;
     use std::sync::Arc;
 
     fn schema() -> SchemaRef {
@@ -567,7 +567,7 @@ mod tests {
             DeadLetterStore::open(
                 dir.path().join("task_history"),
                 table_ref("task_history").to_string(),
-                crate::drasi::dead_letter::DEFAULT_MAX_BATCHES,
+                runtime_drasi::dead_letter::DEFAULT_MAX_BATCHES,
             )
             .await
             .expect("opens the dead-letter store"),
