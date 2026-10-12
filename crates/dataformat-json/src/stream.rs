@@ -1230,7 +1230,12 @@ impl ArrayToNdjsonPush {
                 // more bytes. Any other error means the payload is not a JSON
                 // array at all — an NDJSON or object body read as one is a
                 // configuration mistake, not a short read.
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                    // A partial BOM has to stay. Anything else checked on this
+                    // path is a BOM already recognized, whitespace, or both.
+                    self.discard_checked_prologue();
+                    return Ok(());
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -1257,11 +1262,16 @@ impl ArrayToNdjsonPush {
                             self.state = ParsingState::ExpectingElement;
                         }
                         Err(_) => {
+                            self.discard_leading_whitespace();
                             return Ok(());
                         }
                     }
                 }
                 ParsingState::ExpectingElement => {
+                    self.discard_leading_whitespace();
+                    if self.buffer.is_empty() {
+                        return Ok(());
+                    }
                     let cursor = io::Cursor::new(&self.buffer);
                     let mut stream = Deserializer::from_reader(cursor).into_iter::<Box<RawValue>>();
                     match stream.next() {
@@ -1341,7 +1351,9 @@ impl ArrayToNdjsonPush {
                             ));
                         }
                         Err(_) => {
-                            // Not enough data to determine what's next
+                            // The delimiter has not arrived. The bytes checked
+                            // are whitespace; keep them from being scanned again.
+                            self.discard_leading_whitespace();
                             return Ok(());
                         }
                     }
@@ -1385,6 +1397,42 @@ impl ArrayToNdjsonPush {
         match first_non_whitespace(&self.buffer) {
             Some(byte) => Err(trailing_content_error(byte)),
             None => Ok(()),
+        }
+    }
+
+    /// Drop a prologue that has been checked and does not contain `[`.
+    ///
+    /// A one- or two-byte BOM prefix is kept: the next chunk may complete it.
+    /// A finished BOM and the whitespace after it will not become part of the
+    /// array, so keeping them would make every later chunk scan them again.
+    fn discard_checked_prologue(&mut self) {
+        if self.buffer == [0xEF] || self.buffer == [0xEF, 0xBB] {
+            return;
+        }
+        let after_bom = usize::from(self.buffer.starts_with(&[0xEF, 0xBB, 0xBF])) * 3;
+        if self.buffer[after_bom..]
+            .iter()
+            .all(|byte| is_json_whitespace(*byte))
+        {
+            self.buffer.clear();
+        }
+    }
+
+    /// Drop JSON whitespace this scan has already checked.
+    ///
+    /// A later push appends and scans from the front of the buffer. Leaving a
+    /// checked run there makes every new chunk revisit it.
+    fn discard_leading_whitespace(&mut self) {
+        let Some(start) = self
+            .buffer
+            .iter()
+            .position(|byte| !is_json_whitespace(*byte))
+        else {
+            self.buffer.clear();
+            return;
+        };
+        if start > 0 {
+            self.buffer.drain(..start);
         }
     }
 
@@ -5092,6 +5140,55 @@ mod tests {
     fn load_fixture(name: &str) -> Vec<u8> {
         let path = format!("{TEST_DATA_DIR}{name}");
         std::fs::read(&path).unwrap_or_else(|e| panic!("Failed to read fixture {path}: {e}"))
+    }
+
+    fn push_chunked(body: &[u8], chunk: usize) -> io::Result<Vec<String>> {
+        let mut adapter = ArrayToNdjsonPush::new();
+        let started = std::time::Instant::now();
+        for piece in body.chunks(chunk) {
+            adapter.push_bytes(piece)?;
+        }
+        adapter.finish()?;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "chunk {chunk} took {elapsed:?}"
+        );
+        let mut out = String::new();
+        while let ReadResult::Ready(data) = adapter.try_read() {
+            out.push_str(&String::from_utf8_lossy(&data));
+        }
+        Ok(out.lines().map(ToOwned::to_owned).collect())
+    }
+
+    /// Whitespace before a pushed delimiter is not part of the row. Skipping
+    /// it has to stay linear when the bytes arrive a chunk at a time.
+    #[test]
+    fn push_reader_skips_delimiter_whitespace_without_revisiting_it() {
+        let mut between = br#"[{"a":1}"#.to_vec();
+        between.resize(between.len() + 1024 * 1024, b' ');
+        between.extend_from_slice(br#",{"b":2}]"#);
+        assert_eq!(
+            push_chunked(&between, 4096).expect("gap before comma"),
+            vec![r#"{"a":1}"#, r#"{"b":2}"#]
+        );
+
+        let mut empty = vec![b'['];
+        empty.resize(empty.len() + 1024 * 1024, b' ');
+        empty.push(b']');
+        assert!(
+            push_chunked(&empty, 4096)
+                .expect("gap in an empty array")
+                .is_empty()
+        );
+
+        let mut small = br"[1".to_vec();
+        small.extend_from_slice(&b" \t\r\n".repeat(32));
+        small.extend_from_slice(br",2]");
+        assert_eq!(
+            push_chunked(&small, 1).expect("one-byte chunks"),
+            vec!["1", "2"]
+        );
     }
 
     mod file_jsonl_tests {
