@@ -323,21 +323,35 @@ async fn vector_search_returns_top_k_on_a_chunked_column() -> Result<(), anyhow:
         assert_top_k(&got, &want, "chunked with a filter");
 
         // A filter on a column the search adds, such as the matched chunk `_value`, applies to
-        // the `k` rows the search returns, so it can only drop rows from them.
+        // the `k` rows the search returns, so it can only drop rows from them. The predicate
+        // drops exactly one of the top `k`, so ignoring the filter, applying it before the
+        // top-k cut, or dropping every row each returns a different set.
         let top = expected_top_k(2, |body| cosine(&q, &stub_embedding(body)));
+        let body_of = |id: i64| {
+            DOCS.iter()
+                .flat_map(|rows| rows.iter())
+                .find(|(row_id, _)| *row_id == id)
+                .map(|(_, body)| *body)
+        };
+        let want: Vec<(i64, f64)> = top
+            .iter()
+            .filter(|(id, _)| !body_of(*id).is_some_and(|b| b.starts_with("HTTP/2 stream")))
+            .copied()
+            .collect();
+        assert_eq!(
+            want.len(),
+            top.len() - 1,
+            "fixture: the `_value` predicate must drop exactly one of the top k {top:?}"
+        );
         let got = ids_and_scores(
             &rt,
             &format!(
                 "SELECT id, _score FROM vector_search(docs, '{QUERY}', 2) \
-                 WHERE _value NOT LIKE 'HTTP/2%'"
+                 WHERE _value NOT LIKE 'HTTP/2 stream%'"
             ),
         )
         .await?;
-        let top_ids: Vec<i64> = top.iter().map(|(id, _)| *id).collect();
-        assert!(
-            got.iter().all(|(id, _)| top_ids.contains(id)),
-            "chunked with a `_value` filter: expected a subset of the top k {top:?}, got {got:?}"
-        );
+        assert_top_k(&got, &want, "chunked with a `_value` filter");
 
         // An enclosing operator that needs no order still sees only `k` rows, chunked or not
         // (the unchunked shape is #14818).
