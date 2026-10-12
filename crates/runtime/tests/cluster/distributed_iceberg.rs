@@ -266,3 +266,165 @@ async fn test_distributed_iceberg_dataset_scan() -> Result<(), anyhow::Error> {
         })
         .await
 }
+
+/// Runs `sql` as a Ballista job, so the plan is serialized and shipped to an
+/// executor. A plain `harness.query` runs on the scheduler alone. An Iceberg scan
+/// crosses to the executor only as a serializable `IcebergScanExec`, so the job
+/// succeeding is what shows the scan was rebuilt there.
+async fn distributed_query(
+    harness: &ClusterHarness,
+    sql: &str,
+    job_id: &str,
+) -> Result<Vec<RecordBatch>, anyhow::Error> {
+    use futures::TryStreamExt as _;
+    let handle = runtime::datafusion::query::QueryBuilder::new(sql, harness.scheduler.datafusion())
+        .build()
+        .submit_distributed(job_id)
+        .await
+        .map_err(|e| anyhow::anyhow!("submitting {job_id} failed: {e}"))?;
+    handle
+        .into_stream()
+        .await
+        .map_err(|e| anyhow::anyhow!("{job_id} failed: {e}"))?
+        .try_collect::<Vec<_>>()
+        .await
+        .map_err(|e| anyhow::anyhow!("{job_id} stream failed: {e}"))
+}
+
+/// The `id` column of `batches`, in order.
+fn ids(batches: &[RecordBatch]) -> Vec<i64> {
+    use arrow::array::AsArray as _;
+    batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_primitive::<arrow::datatypes::Int64Type>()
+                .iter()
+                .flatten()
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+// =============================================================================
+// Test: distributed scan of an Iceberg dataset read from a pinned metadata file
+// =============================================================================
+//
+// A dataset with `iceberg_metadata_path` is read through a catalog that serves
+// only the pinned table; the executor must resolve that same provider to replay
+// the scan. The table is written to the local filesystem, which the in-process
+// scheduler and executor share, so this runs without credentials. Pinning a
+// version older than the latest keeps the row check non-vacuous.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(not(target_os = "windows"))]
+async fn test_distributed_pinned_iceberg_dataset_scan() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    test_request_context()
+        .scope(async move {
+            configure_test_datafusion();
+
+            let warehouse = tempfile::tempdir()?;
+            let table_root = crate::iceberg::metadata_file::write_table(
+                warehouse.path(),
+                &[&[1], &[2, 3], &[4]],
+            )
+            .await?;
+            let files = crate::iceberg::metadata_file::metadata_file_names(&table_root)?;
+            let dataset = crate::iceberg::metadata_file::pinned_dataset(
+                &table_root,
+                "pinned",
+                "iceberg_metadata_path",
+                &format!("/metadata/{}", files[2]),
+            );
+
+            let harness = ClusterHarness::builder()
+                .scheduler(
+                    AppBuilder::new("distributed_pinned_iceberg")
+                        .with_dataset(dataset.clone())
+                        .build(),
+                )
+                .executor_with_app(
+                    AppBuilder::new("executor_pinned_iceberg")
+                        .with_dataset(dataset)
+                        .build(),
+                )
+                .start()
+                .await?;
+
+            run_with_harness(harness, |harness| {
+                Box::pin(async move {
+                    harness.wait_for_executors(Duration::from_secs(30)).await?;
+
+                    let batches = distributed_query(
+                        harness,
+                        "SELECT id FROM pinned ORDER BY id",
+                        "pinned_iceberg_scan",
+                    )
+                    .await?;
+                    assert_eq!(ids(&batches), vec![1, 2, 3]);
+                    Ok(())
+                })
+            })
+            .await
+        })
+        .await
+}
+
+// The same distributed scan over a table AWS Glue manages on S3, pinned to the
+// metadata file Glue records for it.
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(not(target_os = "windows"))]
+async fn test_distributed_pinned_glue_iceberg_dataset_scan() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+
+    if iceberg_account_id().is_none() {
+        tracing::warn!(
+            "skipping test_distributed_pinned_glue_iceberg_dataset_scan: AWS_ICEBERG_ACCOUNT_ID not set"
+        );
+        return Ok(());
+    }
+
+    test_request_context()
+        .scope(async move {
+            configure_test_datafusion();
+
+            let location =
+                crate::iceberg::metadata_file::glue_metadata_location("tpch_sf1", "customer")
+                    .await?;
+            let dataset =
+                crate::iceberg::metadata_file::pinned_glue_dataset(&location, "customer_pinned")?;
+
+            let harness = ClusterHarness::builder()
+                .scheduler(
+                    AppBuilder::new("distributed_pinned_glue_iceberg")
+                        .with_dataset(dataset.clone())
+                        .build(),
+                )
+                .executor_with_app(
+                    AppBuilder::new("executor_pinned_glue_iceberg")
+                        .with_dataset(dataset)
+                        .build(),
+                )
+                .start()
+                .await?;
+
+            run_with_harness(harness, |harness| {
+                Box::pin(async move {
+                    harness.wait_for_executors(Duration::from_secs(30)).await?;
+
+                    let batches = distributed_query(
+                        harness,
+                        "SELECT c_custkey FROM customer_pinned",
+                        "pinned_glue_iceberg_scan",
+                    )
+                    .await?;
+                    assert_eq!(total_rows(&batches), 150_000);
+                    Ok(())
+                })
+            })
+            .await
+        })
+        .await
+}

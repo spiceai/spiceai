@@ -180,7 +180,7 @@ async fn run_iceberg_test(
     Ok(rt)
 }
 
-fn make_iceberg_dataset(
+pub(crate) fn make_iceberg_dataset(
     namespace: &str,
     table: &str,
     name: &str,
