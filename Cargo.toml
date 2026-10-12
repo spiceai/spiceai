@@ -211,6 +211,7 @@ async-openai = { git = "https://github.com/spiceai/async-openai", rev = "c380f5f
     "chat-completion",
     "responses",
     "model",
+    "middleware",
 ] } # branch: spiceai
 async-stream = "0.3.5"
 async-trait = "0.1.89"

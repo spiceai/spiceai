@@ -49,7 +49,7 @@ impl OpenAiModelLister {
             .with_api_base(&api_base);
 
         Ok(Self {
-            client: Client::with_config(config),
+            client: crate::provider::client_without_retry(config),
         })
     }
 
@@ -61,7 +61,7 @@ impl OpenAiModelLister {
             .with_api_base(api_base.unwrap_or(API_BASE));
 
         Self {
-            client: Client::with_config(config),
+            client: crate::provider::client_without_retry(config),
         }
     }
 }

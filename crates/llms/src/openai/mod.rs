@@ -195,7 +195,7 @@ pub fn new_azure_client_with_chat_backend(
     }
 
     Openai {
-        client: Client::with_config(cfg),
+        client: crate::provider::client_without_retry(cfg),
         model,
         rate_controller: default_rate_controller(),
         chat_backend,
@@ -251,7 +251,7 @@ pub fn new_openai_client_with_chat_backend(
     }
 
     Openai {
-        client: Client::with_config(cfg),
+        client: crate::provider::client_without_retry(cfg),
         model,
         rate_controller: usage_tier.map_or_else(default_rate_controller, Into::into),
         chat_backend,
@@ -264,7 +264,7 @@ pub fn new_openai_client_with_config<C: async_openai::config::Config + Clone>(
     cfg: C,
 ) -> Openai<C> {
     Openai {
-        client: Client::with_config(cfg),
+        client: crate::provider::client_without_retry(cfg),
         model,
         rate_controller: default_rate_controller(),
         chat_backend: ChatBackend::ChatCompletions,
