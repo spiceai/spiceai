@@ -36,6 +36,7 @@ use secrecy::ExposeSecret;
 use snafu::ResultExt;
 use std::{
     collections::HashMap,
+    process::Stdio,
     sync::{
         Arc, LazyLock, Mutex as StdMutex, RwLock as StdRwLock,
         atomic::{AtomicU64, Ordering},
@@ -43,7 +44,8 @@ use std::{
     time::{Duration, Instant},
 };
 use tokio::{
-    process::Command,
+    io::{AsyncBufReadExt, BufReader},
+    process::{ChildStderr, Command},
     sync::RwLock,
     time::{MissedTickBehavior, interval},
 };
@@ -59,14 +61,13 @@ use super::{
 
 const HEARTBEAT_INTERVAL_SECONDS: u64 = 30; // 30 seconds
 
-/// Glob patterns for detecting dangerous path components
+/// Glob patterns for detecting dangerous path components.
+/// Absolute paths (e.g. `/opt/homebrew/bin/uvx`, `C:\tools\uvx.exe`) are allowed.
 const DANGEROUS_PATH_PATTERNS: &[&str] = &[
-    "*/..*",  // Unix parent directory traversal (anywhere in path)
-    "..*",    // Parent at start (Unix) - matches paths starting with ..
-    "*\\..*", // Windows parent directory traversal (backslash-dot-dot)
-    "*\\\\*", // Windows UNC path or backslash (absolute paths)
-    "/*",     // Unix absolute path (starts with /)
-    "?:*",    // Windows drive letter (C:, D:, etc.)
+    "*/..*",     // Unix parent directory traversal (anywhere in path)
+    "..*",       // Parent at start (Unix) - matches paths starting with ..
+    "*\\..*",    // Windows parent directory traversal (backslash-dot-dot)
+    "\\\\\\\\*", // Windows UNC path (remote executable)
 ];
 
 /// Parent variables a stdio MCP server inherits; Spicepod `env` adds to these.
@@ -103,6 +104,16 @@ static DANGEROUS_PATH_GLOB_SET: LazyLock<GlobSet> = LazyLock::new(|| {
     })
 });
 
+/// Log each line the MCP server writes to stderr at debug level, tagged with the tool name.
+fn forward_stderr(tool_name: String, stderr: ChildStderr) {
+    tokio::spawn(async move {
+        let mut lines = BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            tracing::debug!(tool = %tool_name, "MCP server stderr: {line}");
+        }
+    });
+}
+
 /// Check if a hostname is localhost
 fn is_localhost(host: &str) -> bool {
     matches!(
@@ -131,6 +142,59 @@ pub(crate) struct McpToolCatalog {
     /// fetch must not overwrite a later successful publish when
     /// `ttlMs` is 0 and every `all`/`get` refetches.
     refresh: Arc<ListRefresh>,
+    reconnector: Arc<Reconnector>,
+}
+
+/// Replaces a dead client and republishes its tool list. Shared by the
+/// heartbeat and by tool calls that fail on a closed transport.
+pub(crate) struct Reconnector {
+    cfg: MCPConfig,
+    name: String,
+    client: Arc<RwLock<McpClient>>,
+    tool_cache: Arc<StdRwLock<ToolListCache>>,
+    schemas: Arc<StdRwLock<Option<Arc<McpSchemaSnapshot>>>>,
+    refresh: Arc<ListRefresh>,
+}
+
+impl Reconnector {
+    /// Returns whether a new client is now installed.
+    pub(crate) async fn reconnect(&self) -> bool {
+        let new_client = match McpToolCatalog::create_client(&self.cfg, &self.name).await {
+            Ok(client) => client,
+            Err(e) => {
+                tracing::warn!("Failed to reconnect MCP client for {}: {e}", self.name);
+                return false;
+            }
+        };
+        // List from the new client *before* taking the write
+        // lock. Holding `client.write()` across that await
+        // stalls every concurrent `client.read()` (tool call)
+        // for the full upstream RTT. Reserve the generation
+        // only while swapping, after those readers drain.
+        let listed = list_tools_from_client(&new_client).await;
+        let my_gen = self
+            .refresh
+            .swap_and_reserve(&self.client, new_client)
+            .await;
+        // Keep the last successful cache on list failure.
+        // Clearing it would make `try_get` miss and let rmcp
+        // cache `get_tool == None` for that name forever.
+        if let Ok((listed, complete, ttl_ms)) = listed {
+            self.refresh.publish_listed(
+                my_gen,
+                &ListedPublish {
+                    tool_cache: &self.tool_cache,
+                    schemas: &self.schemas,
+                    catalog_name: &self.name,
+                    tools: &listed,
+                    replace: complete,
+                    ttl_ms,
+                },
+            );
+        }
+        tracing::info!("Successfully reconnected MCP client for {}", self.name);
+        true
+    }
 }
 
 /// Serializes listed-cache publishes and discards superseded fetches.
@@ -334,11 +398,10 @@ impl Drop for McpToolCatalog {
 
 impl McpToolCatalog {
     pub async fn try_new(cfg: MCPConfig, name: &str, description: Option<String>) -> Result<Self> {
-        let client = Self::create_client(&cfg).await?;
+        let client = Self::create_client(&cfg, name).await?;
         let client = Arc::new(RwLock::new(client));
 
         let client_clone = Arc::clone(&client);
-        let cfg_clone = cfg.clone();
         let name_clone = name.to_string();
         let tool_cache = Arc::new(StdRwLock::new(ToolListCache::default()));
         let tool_cache_clone = Arc::clone(&tool_cache);
@@ -350,6 +413,15 @@ impl McpToolCatalog {
             publish: StdMutex::new(()),
         });
         let refresh_clone = Arc::clone(&refresh);
+        let reconnector = Arc::new(Reconnector {
+            cfg,
+            name: name.to_string(),
+            client: Arc::clone(&client),
+            tool_cache: Arc::clone(&tool_cache),
+            schemas: Arc::clone(&schemas),
+            refresh: Arc::clone(&refresh),
+        });
+        let reconnector_clone = Arc::clone(&reconnector);
 
         let heartbeat_task = tokio::spawn(async move {
             let mut interval = interval(Duration::from_secs(HEARTBEAT_INTERVAL_SECONDS));
@@ -376,36 +448,11 @@ impl McpToolCatalog {
                     client_guard.heartbeat().await
                 };
                 if let Err(ref e) = heartbeat_result {
-                    tracing::warn!("MCP client heartbeat failed, attempting reconnection");
-                    tracing::debug!("MCP client heartbeat failed with error: {e}");
-                    if let Ok(new_client) = Self::create_client(&cfg_clone).await {
-                        // List from the new client *before* taking the write
-                        // lock. Holding `client.write()` across that await
-                        // stalls every concurrent `client.read()` (tool call)
-                        // for the full upstream RTT. Reserve the generation
-                        // only while swapping, after those readers drain.
-                        let listed = list_tools_from_client(&new_client).await;
-                        let my_gen = refresh_clone
-                            .swap_and_reserve(&client_clone, new_client)
-                            .await;
-                        // Keep the last successful cache on list failure.
-                        // Clearing it would make `try_get` miss and let rmcp
-                        // cache `get_tool == None` for that name forever.
-                        if let Ok((listed, complete, ttl_ms)) = listed {
-                            refresh_clone.publish_listed(
-                                my_gen,
-                                &ListedPublish {
-                                    tool_cache: &tool_cache_clone,
-                                    schemas: &schemas_clone,
-                                    catalog_name: &name_clone,
-                                    tools: &listed,
-                                    replace: complete,
-                                    ttl_ms,
-                                },
-                            );
-                        }
-                        tracing::info!("Successfully reconnected MCP client for {}", name_clone);
-                    }
+                    tracing::warn!(
+                        "MCP client heartbeat failed for tool '{name_clone}', attempting reconnection"
+                    );
+                    tracing::debug!("MCP client heartbeat failed for '{name_clone}': {e}");
+                    reconnector_clone.reconnect().await;
                 } else if listed_cache_is_stale(&tool_cache_clone) {
                     // `try_get` will not serve an expired page. Republish
                     // before the next Streamable HTTP `Mcp-Param-*` check
@@ -434,6 +481,7 @@ impl McpToolCatalog {
             tool_cache,
             schemas,
             refresh,
+            reconnector,
         };
         // Fill the sync schema cache before the catalog is registered so
         // Streamable HTTP `get_tool` can validate `Mcp-Param-*` on the first
@@ -503,7 +551,7 @@ impl McpToolCatalog {
         tool
     }
 
-    async fn create_client(cfg: &MCPConfig) -> Result<McpClient> {
+    async fn create_client(cfg: &MCPConfig, tool_name: &str) -> Result<McpClient> {
         match cfg {
             MCPConfig::Stdio { command, args, env } => {
                 // Security constants
@@ -544,8 +592,8 @@ impl McpToolCatalog {
                     }
                 }
 
-                let transport =
-                    TokioChildProcess::new(Command::new(command.as_str()).configure(|c| {
+                let (transport, stderr) =
+                    TokioChildProcess::builder(Command::new(command.as_str()).configure(|c| {
                         c.env_clear()
                             .envs(
                                 INHERITED_STDIO_ENV_VARS.iter().filter_map(|key| {
@@ -555,8 +603,15 @@ impl McpToolCatalog {
                             .envs(env)
                             .args(args);
                     }))
-                    .boxed()
-                    .context(UnderlyingTransportSnafu)?;
+                    .stderr(Stdio::piped())
+                    .spawn()
+                    .map_err(|e| Error::CouldNotConstructTool {
+                        name: "mcp_stdio".to_string(),
+                        e: format!("Failed to start MCP command '{command}': {e}"),
+                    })?;
+                if let Some(stderr) = stderr {
+                    forward_stderr(tool_name.to_string(), stderr);
+                }
 
                 Ok(McpClient::Stdio(
                     ().serve_with_lifecycle(transport, client_lifecycle())
@@ -647,17 +702,33 @@ impl McpToolCatalog {
 
     #[cfg(test)]
     fn for_test(name: &str, cache: ToolListCache, client: McpClient) -> Self {
+        let client = Arc::new(RwLock::new(client));
+        let tool_cache = Arc::new(StdRwLock::new(cache));
+        let schemas = Arc::new(StdRwLock::new(None));
+        let refresh = Arc::new(ListRefresh {
+            generation: AtomicU64::new(0),
+            published: AtomicU64::new(0),
+            publish: StdMutex::new(()),
+        });
         Self {
-            client: Arc::new(RwLock::new(client)),
+            client: Arc::clone(&client),
             name: name.to_string(),
             description: None,
             heartbeat_task: tokio::spawn(async {}),
-            tool_cache: Arc::new(StdRwLock::new(cache)),
-            schemas: Arc::new(StdRwLock::new(None)),
-            refresh: Arc::new(ListRefresh {
-                generation: AtomicU64::new(0),
-                published: AtomicU64::new(0),
-                publish: StdMutex::new(()),
+            tool_cache: Arc::clone(&tool_cache),
+            schemas: Arc::clone(&schemas),
+            refresh: Arc::clone(&refresh),
+            reconnector: Arc::new(Reconnector {
+                cfg: MCPConfig::Stdio {
+                    command: String::new(),
+                    args: Vec::new(),
+                    env: HashMap::new(),
+                },
+                name: name.to_string(),
+                client,
+                tool_cache,
+                schemas,
+                refresh,
             }),
         }
     }
@@ -1037,6 +1108,7 @@ impl SpiceToolCatalog for McpToolCatalog {
                     Arc::clone(&self.client),
                     self.with_spicepod_description(t),
                     self.name.clone(),
+                    Arc::clone(&self.reconnector),
                 )) as Arc<dyn SpiceModelTool>
             })
             .collect()
@@ -1075,6 +1147,7 @@ impl SpiceToolCatalog for McpToolCatalog {
             Arc::clone(&self.client),
             self.with_spicepod_description(tool),
             self.name.clone(),
+            Arc::clone(&self.reconnector),
         )))
     }
 
@@ -1092,6 +1165,7 @@ impl SpiceToolCatalog for McpToolCatalog {
             Arc::clone(&self.client),
             self.with_spicepod_description(spec),
             self.name.clone(),
+            Arc::clone(&self.reconnector),
         )))
     }
 
@@ -1107,6 +1181,7 @@ impl SpiceToolCatalog for McpToolCatalog {
                     Arc::clone(&self.client),
                     self.with_spicepod_description(spec.clone()),
                     self.name.clone(),
+                    Arc::clone(&self.reconnector),
                 )) as Arc<dyn SpiceModelTool>
             })
             .collect()
@@ -1135,17 +1210,19 @@ mod tests {
     }
 
     #[test]
-    fn test_dangerous_patterns_reject_absolute_paths() {
+    fn test_dangerous_patterns_allow_absolute_paths() {
         // Unix absolute paths
-        assert!(DANGEROUS_PATH_GLOB_SET.is_match("/etc/passwd"));
-        assert!(DANGEROUS_PATH_GLOB_SET.is_match("/var/log/secrets"));
+        assert!(!DANGEROUS_PATH_GLOB_SET.is_match("/opt/homebrew/bin/uvx"));
+        assert!(!DANGEROUS_PATH_GLOB_SET.is_match("/usr/local/bin/node"));
+        // Traversal is still rejected inside an absolute path
+        assert!(DANGEROUS_PATH_GLOB_SET.is_match("/opt/../etc/passwd"));
     }
 
     #[test]
-    fn test_dangerous_patterns_reject_windows_absolute_paths() {
+    fn test_dangerous_patterns_allow_windows_drive_paths_but_reject_unc() {
         // Windows drive letters
-        assert!(DANGEROUS_PATH_GLOB_SET.is_match("C:\\Windows\\System32"));
-        assert!(DANGEROUS_PATH_GLOB_SET.is_match("D:\\secrets"));
+        assert!(!DANGEROUS_PATH_GLOB_SET.is_match("C:\\Windows\\System32"));
+        assert!(!DANGEROUS_PATH_GLOB_SET.is_match("D:\\tools\\uvx.exe"));
 
         // Windows UNC paths
         assert!(DANGEROUS_PATH_GLOB_SET.is_match("\\\\server\\share"));

@@ -18593,6 +18593,7 @@ dependencies = [
  "secrecy",
  "serde",
  "serde_json",
+ "shell-words",
  "snafu",
  "spicepod",
  "tokio",

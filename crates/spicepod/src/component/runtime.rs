@@ -990,7 +990,7 @@ fn default_allowed_origins() -> Vec<String> {
 /// Localhost origins used when `runtime.cors.allowed_origins` is `"*"` or
 /// empty. `"*"` is not a valid RFC 6454 origin; expanding it here keeps the
 /// rmcp allow-list non-empty so default spicepods enforce the 2026-07-28
-/// Origin check. Entries omit a port so rmcp matches any port on that host.
+/// Origin check. Entries omit a port so any port on that host matches.
 const DEFAULT_MCP_ALLOWED_ORIGINS: &[&str] = &[
     "http://localhost",
     "http://127.0.0.1",
@@ -1009,29 +1009,57 @@ impl Default for CorsConfig {
     }
 }
 
+/// The `Origin` allow-list for `/v1/mcp`, derived from
+/// [`CorsConfig::allowed_origins`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McpOrigins<'a> {
+    /// `"*"` or an empty list: the localhost defaults, on any port.
+    LocalhostDefaults,
+    /// A concrete list: an `Origin` must match the scheme, host and port of
+    /// one entry. An omitted default port (80, 443) equals the explicit one.
+    Explicit(&'a [String]),
+}
+
+impl McpOrigins<'_> {
+    /// The allow-list entries. The localhost defaults carry no port.
+    #[must_use]
+    pub fn entries(self) -> Vec<String> {
+        match self {
+            Self::LocalhostDefaults => DEFAULT_MCP_ALLOWED_ORIGINS
+                .iter()
+                .map(ToString::to_string)
+                .collect(),
+            Self::Explicit(origins) => origins.to_vec(),
+        }
+    }
+}
+
 impl CorsConfig {
-    /// Origins to install on rmcp Streamable HTTP.
+    /// The `/v1/mcp` `Origin` policy.
     ///
     /// `"*"` is not a valid RFC 6454 origin. CORS treats it as allow-all for
     /// browser HTTP, but MCP Streamable HTTP must validate `Origin` (DNS
     /// rebinding). Both `"*"` (the CORS default) and an empty list expand to
-    /// localhost defaults so the rmcp list is never empty — empty accepts
-    /// every `Origin`.
+    /// localhost defaults so the allow-list is never empty — an empty rmcp
+    /// list accepts every `Origin`.
     ///
     /// A concrete list is the 2026-07-28 Streamable HTTP origin policy:
     /// a mismatched `Origin` is 403. Requests with no `Origin` still pass.
     #[must_use]
-    pub fn mcp_allowed_origins(&self) -> Vec<String> {
+    pub fn mcp_origins(&self) -> McpOrigins<'_> {
         if self.allowed_origins.iter().any(|origin| origin == "*")
             || self.allowed_origins.is_empty()
         {
-            DEFAULT_MCP_ALLOWED_ORIGINS
-                .iter()
-                .map(ToString::to_string)
-                .collect()
+            McpOrigins::LocalhostDefaults
         } else {
-            self.allowed_origins.clone()
+            McpOrigins::Explicit(&self.allowed_origins)
         }
+    }
+
+    /// Origins to install on rmcp Streamable HTTP. See [`Self::mcp_origins`].
+    #[must_use]
+    pub fn mcp_allowed_origins(&self) -> Vec<String> {
+        self.mcp_origins().entries()
     }
 }
 
