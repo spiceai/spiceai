@@ -378,8 +378,8 @@ pub enum CompressionStrategy {
 ///   pre-feature write behavior (`7` is the explicit opt-out of `auto`;
 ///   `8`–`10` are reserved for future heavier-effort search).
 ///
-/// Maintenance writes (compaction outputs, sorted rewrites, overwrites) are
-/// NOT affected by this setting — they always use the full default encoding,
+/// Maintenance writes (compaction outputs, sorted rewrites, overwrites, and a
+/// load into an empty table) are NOT affected by this setting — they always use the full default encoding,
 /// because their output is the long-lived artifact whose encoding quality
 /// pays for scan throughput and storage footprint.
 ///
