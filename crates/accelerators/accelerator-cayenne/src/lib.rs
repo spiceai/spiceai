@@ -425,9 +425,22 @@ pub struct CayenneAccelerator {
     compaction_semaphore: Arc<tokio::sync::Semaphore>,
     /// Pins a snapshot reload hands from the replaced provider to the one the
     /// factory creates, keyed by dataset. An entry lives only for that one
-    /// create: inserted before the factory runs, removed after, whatever the
-    /// outcome.
+    /// create: inserted before the factory runs, removed when the reload
+    /// completes or is dropped (`InheritedPinsEntry`).
     inherited_snapshot_dir_pins: parking_lot::Mutex<HashMap<String, cayenne::SnapshotDirPins>>,
+}
+
+/// Removes a dataset's hand-off entry when dropped, so a reload the refresh
+/// runner cancels mid-create leaves no pins for a later create to inherit.
+struct InheritedPinsEntry<'a> {
+    slot: &'a parking_lot::Mutex<HashMap<String, cayenne::SnapshotDirPins>>,
+    dataset: String,
+}
+
+impl Drop for InheritedPinsEntry<'_> {
+    fn drop(&mut self) {
+        self.slot.lock().remove(&self.dataset);
+    }
 }
 
 /// `(available, total)` permits of the fleet-wide compaction budget.
@@ -4344,10 +4357,11 @@ impl DataAccelerator for CayenneAccelerator {
         self.inherited_snapshot_dir_pins
             .lock()
             .insert(dataset.clone(), pins);
-        let created = provider_factory().await;
-        // Cleared on every outcome, so a failed create leaves nothing behind.
-        self.inherited_snapshot_dir_pins.lock().remove(&dataset);
-        created
+        let _entry = InheritedPinsEntry {
+            slot: &self.inherited_snapshot_dir_pins,
+            dataset,
+        };
+        provider_factory().await
     }
 
     /// Reclaim the snapshot directories the restored snapshot no longer
@@ -4371,9 +4385,10 @@ impl DataAccelerator for CayenneAccelerator {
                 "Retired the local snapshot directories that dataset '{}' no longer references; they are deleted once no query reads them",
                 source.name()
             ),
-            Err(error) => tracing::warn!(
-                "Failed to reclaim the superseded local snapshot directories of dataset '{}', so its local disk usage keeps the previous snapshot until the next snapshot reload retries. Cause: {error}",
-                source.name()
+            Err(error) => tracing::debug!(
+                dataset = %source.name(),
+                %error,
+                "Failed to retire the superseded snapshot directories; the next snapshot reload retries"
             ),
         }
     }
