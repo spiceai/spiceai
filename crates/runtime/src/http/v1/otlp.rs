@@ -56,6 +56,60 @@ fn error(status: StatusCode, message: impl Into<String>) -> Response {
     (status, message.into()).into_response()
 }
 
+/// `google.rpc.Status`, the body OTLP/HTTP requires on every 4xx/5xx response. `details` is
+/// left out; it is optional.
+#[derive(Clone, PartialEq, prost::Message)]
+struct RpcStatus {
+    #[prost(int32, tag = "1")]
+    code: i32,
+    #[prost(string, tag = "2")]
+    message: String,
+}
+
+/// gRPC code for an HTTP error status, for the `code` of a `google.rpc.Status` body.
+fn grpc_code_for(status: StatusCode) -> tonic::Code {
+    match status {
+        StatusCode::BAD_REQUEST | StatusCode::UNSUPPORTED_MEDIA_TYPE => {
+            tonic::Code::InvalidArgument
+        }
+        StatusCode::PAYLOAD_TOO_LARGE | StatusCode::TOO_MANY_REQUESTS => {
+            tonic::Code::ResourceExhausted
+        }
+        StatusCode::SERVICE_UNAVAILABLE => tonic::Code::Unavailable,
+        StatusCode::FORBIDDEN => tonic::Code::PermissionDenied,
+        StatusCode::UNAUTHORIZED => tonic::Code::Unauthenticated,
+        _ => tonic::Code::Internal,
+    }
+}
+
+/// An error response whose body is a `google.rpc.Status` in the request's encoding, with the
+/// matching `Content-Type`, as OTLP/HTTP requires.
+fn status_error(
+    encoding_kind: Encoding,
+    status: StatusCode,
+    code: tonic::Code,
+    message: impl Into<String>,
+) -> Response {
+    let rpc_status = RpcStatus {
+        code: i32::from(code),
+        message: message.into(),
+    };
+    let (content_type, body) = match encoding_kind {
+        Encoding::Protobuf => (PROTOBUF_CONTENT_TYPE, rpc_status.encode_to_vec()),
+        Encoding::Json => (
+            JSON_CONTENT_TYPE,
+            serde_json::json!({ "code": rpc_status.code, "message": rpc_status.message })
+                .to_string()
+                .into_bytes(),
+        ),
+    };
+    let mut response = (status, body).into_response();
+    response
+        .headers_mut()
+        .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    response
+}
+
 #[expect(
     clippy::result_large_err,
     reason = "the error is the HTTP response returned to the client as-is"
@@ -84,11 +138,9 @@ fn content_encoding(headers: &HeaderMap) -> Result<Encoding, Response> {
 }
 
 /// The body with any `Content-Encoding` removed.
-#[expect(
-    clippy::result_large_err,
-    reason = "the error is the HTTP response returned to the client as-is"
-)]
-pub(crate) fn decompress(headers: &HeaderMap, body: Bytes) -> Result<Bytes, Response> {
+///
+/// An error is the HTTP status and message, which the caller encodes for the request.
+pub(crate) fn decompress(headers: &HeaderMap, body: Bytes) -> Result<Bytes, (StatusCode, String)> {
     let encoding = headers
         .get(header::CONTENT_ENCODING)
         .and_then(|v| v.to_str().ok())
@@ -103,13 +155,13 @@ pub(crate) fn decompress(headers: &HeaderMap, body: Bytes) -> Result<Bytes, Resp
                 .take(MAX_DECOMPRESSED_BODY_BYTES + 1)
                 .read_to_end(&mut decoded)
                 .map_err(|e| {
-                    error(
+                    (
                         StatusCode::BAD_REQUEST,
                         format!("Failed to decompress gzip body: {e}"),
                     )
                 })?;
             if read as u64 > MAX_DECOMPRESSED_BODY_BYTES {
-                return Err(error(
+                return Err((
                     StatusCode::PAYLOAD_TOO_LARGE,
                     format!(
                         "Decompressed body exceeds the {MAX_DECOMPRESSED_BODY_BYTES} byte limit."
@@ -118,7 +170,7 @@ pub(crate) fn decompress(headers: &HeaderMap, body: Bytes) -> Result<Bytes, Resp
             }
             Ok(Bytes::from(decoded))
         }
-        other => Err(error(
+        other => Err((
             StatusCode::UNSUPPORTED_MEDIA_TYPE,
             format!("Unsupported Content-Encoding '{other}'. Use gzip or no encoding."),
         )),
@@ -225,17 +277,33 @@ pub(crate) async fn handle(
         Ok(kind) => kind,
         Err(resp) => return resp,
     };
+    // From here the request's encoding is known, so errors are `google.rpc.Status` bodies.
+    // An unsupported Content-Type above has no encoding to answer in and stays plain text.
     let body = match decompress(headers, body) {
         Ok(body) => body,
-        Err(resp) => return resp,
+        Err((status, message)) => {
+            return status_error(encoding_kind, status, grpc_code_for(status), message);
+        }
     };
     let request = match decode(encoding_kind, &body) {
         Ok(request) => request,
-        Err(message) => return error(StatusCode::BAD_REQUEST, message),
+        Err(message) => {
+            return status_error(
+                encoding_kind,
+                StatusCode::BAD_REQUEST,
+                tonic::Code::InvalidArgument,
+                message,
+            );
+        }
     };
     match service.export(tonic::Request::new(request)).await {
         Ok(response) => encode_response(encoding_kind, response.get_ref()),
-        Err(status) => error(status_code_for(status.code()), status.message().to_string()),
+        Err(status) => status_error(
+            encoding_kind,
+            status_code_for(status.code()),
+            status.code(),
+            status.message(),
+        ),
     }
 }
 
@@ -324,9 +392,44 @@ mod tests {
 
     #[test]
     fn unknown_content_encoding_is_rejected() {
-        let resp = decompress(&headers(JSON_CONTENT_TYPE, Some("br")), Bytes::new())
+        let (status, _) = decompress(&headers(JSON_CONTENT_TYPE, Some("br")), Bytes::new())
             .expect_err("rejected");
-        assert_eq!(resp.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+    }
+
+    #[test]
+    fn error_bodies_are_rpc_status_in_the_request_encoding() {
+        let resp = status_error(
+            Encoding::Protobuf,
+            StatusCode::SERVICE_UNAVAILABLE,
+            tonic::Code::Unavailable,
+            "retry",
+        );
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(
+            resp.headers()[header::CONTENT_TYPE],
+            HeaderValue::from_static(PROTOBUF_CONTENT_TYPE)
+        );
+        let resp = status_error(
+            Encoding::Json,
+            StatusCode::BAD_REQUEST,
+            tonic::Code::InvalidArgument,
+            "bad",
+        );
+        assert_eq!(
+            resp.headers()[header::CONTENT_TYPE],
+            HeaderValue::from_static(JSON_CONTENT_TYPE)
+        );
+        let decoded = RpcStatus::decode(
+            RpcStatus {
+                code: i32::from(tonic::Code::Unavailable),
+                message: "retry".to_string(),
+            }
+            .encode_to_vec()
+            .as_slice(),
+        )
+        .expect("decodes");
+        assert_eq!(decoded.code, 14);
     }
 
     #[test]
