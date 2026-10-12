@@ -45,6 +45,7 @@ use spicepod::component::runtime::Runtime as SpicepodRuntime;
 use spicepod::component::runtime::RuntimeReadyState as SpicepodRuntimeReadyState;
 use spicepod::component::runtime::SourceRateControl as SpicepodSourceRateControl;
 use spicepod::component::runtime::TelemetryConfig;
+use spicepod::component::runtime::{RENAMED_RUNTIME_TUNING_PARAMS, renamed_runtime_param_warning};
 use std::{collections::HashMap, net::SocketAddr, str::FromStr, sync::Arc, time::Duration};
 use telemetry::metrics_reader::MetricsReader;
 use telemetry::timing::TimeMeasurement;
@@ -61,21 +62,6 @@ const CAYENNE_SORT_MERGE_MEMORY_POOL_FRACTION_PARAM: &str =
     "cayenne_sort_merge_memory_pool_fraction";
 const CAYENNE_FILTER_PROPAGATION_PARAM: &str = "cayenne_filter_propagation";
 const CAYENNE_OPTIMIZER_RULES_PARAM: &str = "cayenne_optimizer_rules";
-
-/// Goal-driven adaptive-tuning SLO setpoints, settable GLOBALLY here at
-/// `runtime.params` and overridden per-dataset via the matching
-/// `acceleration.params` key (see `accelerator_cayenne`). `cayenne_goal_qph`
-/// is the exception: QPH is a system-wide metric (a join spans datasets), so it
-/// is global-only and a per-dataset value is ignored. Declared here so the keys
-/// are part of the recognized `runtime.params` vocabulary and don't false-warn as
-/// unknown; the values are resolved (and validated) where the per-dataset Cayenne
-/// config is built. NOTE: `cayenne_goal_convergence_window` is deliberately NOT
-/// here — it paces HOW the loop chases these SLOs (a control-cadence/benchmarking
-/// knob), not a target outcome, so it stays a per-dataset advanced override.
-const CAYENNE_GOAL_REPLICATION_LAG_PARAM: &str = "cayenne_goal_replication_lag";
-const CAYENNE_GOAL_FRESHNESS_PARAM: &str = "cayenne_goal_freshness";
-const CAYENNE_GOAL_QUERY_LATENCY_PARAM: &str = "cayenne_goal_query_latency";
-const CAYENNE_GOAL_QPH_PARAM: &str = "cayenne_goal_qph";
 
 /// Process-global `SQLite` metastore pragma tuning keys (cache, mmap, busy
 /// timeout, WAL autocheckpoint, `auto_vacuum`). Consumed once at startup in
@@ -123,10 +109,6 @@ const KNOWN_CAYENNE_RUNTIME_PARAMS: &[&str] = &[
     CAYENNE_METASTORE_WAL_TRUNCATE_THRESHOLD_MB_PARAM,
     CAYENNE_METASTORE_AUTO_VACUUM_PARAM,
     CAYENNE_METASTORE_INCREMENTAL_VACUUM_PAGES_PARAM,
-    CAYENNE_GOAL_REPLICATION_LAG_PARAM,
-    CAYENNE_GOAL_FRESHNESS_PARAM,
-    CAYENNE_GOAL_QUERY_LATENCY_PARAM,
-    CAYENNE_GOAL_QPH_PARAM,
 ];
 
 /// Recognized `runtime.params` keys that don't belong to a larger prefix
@@ -158,9 +140,11 @@ fn known_runtime_params() -> Vec<&'static str> {
             + crate::accelerated::refresh_task::changes::CDC_RUNTIME_PARAMS.len()
             + dataconnector::http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS.len()
             + crate::cluster::CLUSTER_GRPC_RUNTIME_PARAMS.len()
+            + spicepod::component::runtime::TUNING_TARGET_PARAMS.len()
             + MISC_RUNTIME_PARAMS.len(),
     );
     known.extend_from_slice(KNOWN_CAYENNE_RUNTIME_PARAMS);
+    known.extend_from_slice(spicepod::component::runtime::TUNING_TARGET_PARAMS);
     known.extend_from_slice(crate::accelerated::refresh_task::changes::CDC_RUNTIME_PARAMS);
     known.extend_from_slice(dataconnector::http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS);
     known.extend_from_slice(crate::cluster::CLUSTER_GRPC_RUNTIME_PARAMS);
@@ -673,18 +657,16 @@ impl RuntimeBuilder {
         {
             Some(ClusterRole::Scheduler) => {
                 // For a real object store, cluster_state.bootstrap() is called by start_scheduler_registry.
-                if let Some(scheduler_config) = shared_app
+                if let Some(scheduler_state) = shared_app
                     .read()
                     .await
                     .as_ref()
-                    .and_then(|app| app.runtime.resolved_scheduler())
-                    && let Some(state_location) = scheduler_config.state_location.as_deref()
+                    .and_then(|app| app.runtime.scheduler_state())
                 {
                     match crate::cluster::scheduler_registry::build_object_store_internal(
                         Arc::clone(&secrets),
                         io_runtime.clone(),
-                        state_location,
-                        &scheduler_config,
+                        &scheduler_state,
                     )
                     .await
                     {
@@ -889,6 +871,7 @@ impl RuntimeBuilder {
                 dataset_parallelism.unwrap_or(tokio::sync::Semaphore::MAX_PERMITS),
             )),
             dataset_loads: Arc::default(),
+            view_loads: Arc::default(),
             telemetry_config: self.telemetry_config,
             snapshot_sources: Arc::default(),
         };
@@ -996,9 +979,8 @@ async fn build_http_rate_control_registry(
     match crate::object_store_state::build_object_store(
         secrets,
         io_runtime,
-        &state.location,
-        state.params.as_ref(),
-        "rate-control state",
+        &state.into(),
+        crate::object_store_state::StateFeature::RateControl,
     )
     .await
     {
@@ -1179,6 +1161,15 @@ fn warn_on_unknown_runtime_params(params: &HashMap<String, String>) {
     let known = known_runtime_params();
     for key in params.keys() {
         if known.contains(&key.as_str()) {
+            continue;
+        }
+        // A renamed key gets one message naming its replacement, not a second
+        // "not recognized" one.
+        if let Some((old, new)) = RENAMED_RUNTIME_TUNING_PARAMS
+            .iter()
+            .find(|(old, _)| *old == key.as_str())
+        {
+            tracing::warn!("{}", renamed_runtime_param_warning(old, new));
             continue;
         }
         if let Some(suggestion) = util::levenshtein::closest_match(key, &known) {
@@ -3656,6 +3647,7 @@ mod test {
             .iter()
             .chain(crate::accelerated::refresh_task::changes::CDC_RUNTIME_PARAMS)
             .chain(dataconnector::http_rate_control::HTTP_RATE_CONTROL_RUNTIME_PARAMS)
+            .chain(spicepod::component::runtime::TUNING_TARGET_PARAMS)
             .chain(MISC_RUNTIME_PARAMS);
         for key in family_keys {
             assert!(
@@ -3672,6 +3664,18 @@ mod test {
             known.len(),
             "duplicate keys in known_runtime_params()"
         );
+    }
+
+    #[test]
+    fn renamed_tuning_params_are_not_known_runtime_params() {
+        let known = known_runtime_params();
+        for (old, new) in RENAMED_RUNTIME_TUNING_PARAMS {
+            assert!(
+                !known.contains(old),
+                "`{old}` is no longer read, so it must not be recognized"
+            );
+            assert!(known.contains(new), "`{new}` must be recognized");
+        }
     }
 
     #[test]

@@ -18,6 +18,7 @@ use clap::{ArgAction, Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use test_framework::anyhow;
+use test_framework::layout::Layout;
 use test_framework::queries::{QueryOverrides, QuerySet};
 
 use super::CommonArgs;
@@ -92,6 +93,15 @@ pub struct DatasetTestArgs {
     /// Reference schema containing known good tables for validation (e.g., "arrow" to validate against arrow.customer instead of customer)
     #[arg(long)]
     pub(crate) reference_schema: Option<String>,
+
+    /// Configure this acceleration layout on every accelerated dataset before
+    /// `spiced` starts: features from `primary_key`, `indexes`, `sort`,
+    /// `cluster`, `time_column` and `partition`, joined by commas, on each
+    /// benchmark table's columns from `test_framework::layout`. The
+    /// `__test_reference.*` clones that `--validate` compares against carry no
+    /// acceleration, so the layout never reaches the oracle.
+    #[arg(long)]
+    pub(crate) layout: Option<Layout>,
 
     /// Whether to disable results caching, by supplying the cache control header through flight
     #[arg(long, action = ArgAction::Set, default_value_t = false, default_missing_value = "true", num_args = 0..=1, require_equals = false)]

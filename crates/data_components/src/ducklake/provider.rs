@@ -143,6 +143,10 @@ impl DuckLakeCatalogProvider {
         federation: DuckLakeFederation,
     ) -> Self {
         // Create a table factory that uses the same pool (with ducklake already attached)
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "installs the catalog's `DuckLakeFederation` deny-list below"
+        )]
         let duckdb_factory = Arc::new(
             DuckDBTableFactory::new(Arc::clone(&pool))
                 .with_dialect(federation.dialect)

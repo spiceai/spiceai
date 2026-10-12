@@ -17,6 +17,12 @@ name: Substrait compliance
 # required check (`scripts/signoff` REQUIRED_CHECKS), so the queue does not
 # wait on it and a low pass rate does not block a merge. A harness/build
 # crash still fails the job.
+#
+# Mode B, nightly and on dispatch only, runs the same plans through a trunk
+# spiced's FlightSQL `CommandStatementSubstraitPlan` endpoint, once per
+# acceleration engine and then once per acceleration layout of that engine.
+# It is not report-only: the default layout must pass every case Mode A
+# passes, and each layout every case the default layout passes.
 
 on:
   push:
@@ -151,3 +157,147 @@ jobs:
           name: spiceio-substrait-compliance-logs
           path: ${{ runner.temp }}/spiceio.log
           if-no-files-found: ignore
+
+  mode_b_tpch:
+    name: Mode B TPC-H (${{ matrix.engine }}, ${{ matrix.mode }})
+    # Nightly and on manual dispatch only. Mode B serves the suite from a trunk
+    # spiced (`setup-spiced` takes the newest build among the last 10 trunk
+    # commits) and restarts it for every layout, so it is too slow for the
+    # merge queue. `scripts/run-mode-b.sh` holds the default layout to Mode A
+    # over the same tables, and each layout to the default layout: a case that
+    # passes there and not here fails the job.
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: spiceai-macos
+    timeout-minutes: 180
+    strategy:
+      fail-fast: false
+      # One at a time: the harness starts spiced on its default ports, and two
+      # rows on one host would collide on them.
+      max-parallel: 1
+      matrix:
+        # Each engine's layouts are the ones its TPC-H SF 1 runs take in
+        # tools/testoperator/dispatch/tpch/sf1/accelerated/*-layouts.yaml.
+        include:
+          - engine: cayenne
+            mode: file
+            layouts: >-
+              primary_key indexes sort cluster time_column partition
+              primary_key,indexes primary_key,sort,time_column
+              primary_key,indexes,cluster,partition
+              primary_key,indexes,sort,time_column,partition
+          - engine: cayenne
+            mode: memory
+            layouts: >-
+              primary_key,indexes sort,time_column primary_key,cluster
+              primary_key,indexes,sort,time_column
+          - engine: duckdb
+            mode: file
+            layouts: >-
+              primary_key indexes sort primary_key,indexes primary_key,sort
+              primary_key,indexes,sort,time_column
+          - engine: duckdb
+            mode: memory
+            layouts: primary_key,indexes primary_key,indexes,sort,time_column
+          - engine: arrow
+            mode: memory
+            layouts: >-
+              primary_key indexes sort partition
+              primary_key,indexes,sort,time_column,partition
+          - engine: sqlite
+            mode: file
+            layouts: primary_key primary_key,time_column
+          # The parquet files federated, with no acceleration to lay out.
+          - engine: none
+            mode: file
+            layouts: ''
+    env:
+      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
+    steps:
+      - name: Checkout spiceai
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # The same suite pin as Mode A; see that job.
+      - name: Checkout spiceai/substrait-compliance
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: spiceai/substrait-compliance
+          ref: 43d31411c69ef7594887c7d759037bcf8244eeed
+          path: tools/substrait-compliance/.ibm
+          persist-credentials: false
+
+      - name: Set up Rust
+        uses: ./.github/actions/setup-rust
+
+      - name: Install Protoc
+        uses: ./.github/actions/install-protoc
+
+      - name: Set up spiceio
+        if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
+        id: setup-spiceio
+        uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
+        with:
+          smb-url: smb://runner@192.168.3.148/ai_platform_dev
+          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
+          token: ${{ github.token }}
+          bucket: sccache
+          region: us-west-1
+          immutable-objects: "true"
+          otel-endpoint: spicehq/spiceio
+          otel-api-key: ${{ secrets.SCP_SPICEHQ_SPICEIO_API_KEY }}
+          otel-region: us-west-2
+          instance-id: ci-${{ github.run_id }}-${{ github.job }}
+          machine: ${{ runner.name }}
+
+      - name: Set up sccache
+        uses: ./.github/actions/setup-sccache
+        with:
+          spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
+
+      - name: Install MinIO
+        uses: ./.github/actions/setup-minio
+        with:
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
+
+      - name: Setup spiced
+        id: setup-spiced
+        uses: ./.github/actions/setup-spiced
+
+      - name: Build the harness
+        run: cargo build -p spice-substrait-compliance
+
+      - name: Run Mode B TPC-H at SF 1
+        env:
+          ENGINE: ${{ matrix.engine }}
+          MODE: ${{ matrix.mode }}
+          LAYOUTS: ${{ matrix.layouts }}
+        run: |
+          # spiced inherits this step's environment, and the compiler cache's
+          # endpoint would redirect its object-store traffic.
+          unset AWS_ENDPOINT_URL
+          echo "spiced ${{ steps.setup-spiced.outputs.spiced_commit }}: $(spiced --version)"
+          # LAYOUTS is a space-separated list, one argument per layout.
+          # shellcheck disable=SC2086
+          tools/substrait-compliance/scripts/run-mode-b.sh \
+            target/debug/spice-substrait-compliance "$(command -v spiced)" \
+            "$ENGINE" "$MODE" tools/substrait-compliance/results/mode-b $LAYOUTS
+
+      - name: Show sccache stats
+        if: always() && env.SCCACHE_SETUP == 'true'
+        run: |
+          sccache --show-stats || echo "::warning::sccache --show-stats failed, so the cache server is not answering either. Read a build failure in this job as a possible cache-backend outage rather than a code failure."
+
+      - name: Upload JSON and CSV reports
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        with:
+          name: substrait-compliance-mode-b-tpch-${{ matrix.engine }}-${{ matrix.mode }}
+          path: tools/substrait-compliance/results/mode-b
+          if-no-files-found: warn
+
+      - name: Kill spiceio
+        if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
+        run: kill ${{ steps.setup-spiceio.outputs.pid }} || true

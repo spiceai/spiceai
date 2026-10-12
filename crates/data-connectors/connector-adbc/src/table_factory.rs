@@ -129,6 +129,10 @@ where
 {
     /// Builds the factory with the driver's function-support policy installed
     /// and the `query_federation` setting applied.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the driver's deny-list is installed on the factory below: `with_function_support(function_support_for_driver(..))`"
+    )]
     pub(crate) fn new(pool: Arc<ADBCPool<D>>, federation_enabled: bool, driver_name: &str) -> Self {
         Self {
             factory: AdbcTableFactory::new(pool)
