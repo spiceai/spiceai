@@ -1475,6 +1475,37 @@ async fn a_type_change_between_registration_and_join_is_still_adopted() -> Resul
     Ok(())
 }
 
+/// Under `block`, an `integer` column changed to `oid` keeps the registered
+/// `Int32` type, and an `oid` value that type holds is applied as it.
+#[tokio::test(flavor = "multi_thread")]
+async fn block_applies_an_oid_value_into_the_registered_integer_column() -> Result<(), anyhow::Error>
+{
+    let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
+
+    let container = common::start_postgres_docker_container_with_logical_wal().await?;
+    let port = container.host_port(5432)?;
+    let table = "alter_type_oid_block";
+    let (source, mut stream) =
+        start_alter_type_stream(port, table, SchemaEvolutionPolicy::Block).await?;
+    source
+        .simple_query(&format!(
+            "ALTER TABLE public.{table} ALTER COLUMN k TYPE oid USING k::oid; \
+             INSERT INTO public.{table} VALUES (4, 42);"
+        ))
+        .await?;
+    let envelope = next_change_envelope(&mut stream, "oid insert under block").await?;
+    let (id, k) = single_change_value(&envelope);
+    assert_eq!(id, 4);
+    assert_eq!(
+        k.data_type(),
+        &DataType::Int32,
+        "block keeps the registered type"
+    );
+    assert_eq!(k.as_primitive::<arrow::datatypes::Int32Type>().value(0), 42);
+    envelope.commit().await?;
+    Ok(())
+}
+
 pub(super) async fn drop_replication_slot_when_inactive(
     source: &tokio_postgres::Client,
     slot: &str,

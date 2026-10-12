@@ -1298,6 +1298,14 @@ impl FieldBuilder {
                 pg::int4_from_sql(raw).map(i64::from).map(WireNumber::Int),
             ),
             PG_INT8_OID => ("int8", pg::int8_from_sql(raw).map(WireNumber::Int)),
+            PG_CHAR_OID => (
+                "\"char\"",
+                pg::char_from_sql(raw).map(i64::from).map(WireNumber::Int),
+            ),
+            PG_OID_OID => (
+                "oid",
+                pg::oid_from_sql(raw).map(i64::from).map(WireNumber::Int),
+            ),
             PG_FLOAT4_OID => (
                 "float4",
                 pg::float4_from_sql(raw)
@@ -3434,6 +3442,24 @@ mod tests {
             Ok(16_777_216.0)
         );
 
+        // `"char"` and `oid` values convert into integer columns, exactly.
+        let int32 = |r: Result<ArrayRef, String>| {
+            r.map(|a| a.as_primitive::<arrow::datatypes::Int32Type>().value(0))
+        };
+        assert_eq!(
+            int32(bin_convert(&DataType::Int32, 26, &42u32.to_be_bytes())),
+            Ok(42)
+        );
+        assert_eq!(
+            int64(bin_convert(&DataType::Int64, 26, &u32::MAX.to_be_bytes())),
+            Ok(i64::from(u32::MAX))
+        );
+        assert_eq!(int32(bin_convert(&DataType::Int32, 18, &[7u8])), Ok(7));
+        assert!(
+            bin_convert(&DataType::Int32, 26, &u32::MAX.to_be_bytes())
+                .expect_err("above i32::MAX")
+                .contains("the oid value 4294967295 (type oid 26) cannot be stored")
+        );
         // `"char"` and `oid` columns take exact integers of another width too.
         let int8 = |r: Result<ArrayRef, String>| {
             r.map(|a| a.as_primitive::<arrow::datatypes::Int8Type>().value(0))
