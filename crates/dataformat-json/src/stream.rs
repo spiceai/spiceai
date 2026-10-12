@@ -1116,6 +1116,9 @@ pub struct ArrayToNdjsonPush {
     buffer: Vec<u8>,       // Accumulates pushed bytes
     pending: VecDeque<u8>, // Ready NDJSON output
     state: ParsingState,   // Current parsing state
+    /// First unread byte in `buffer`. Consumed bytes stay put until the
+    /// end of a push, so each element does not copy the tail.
+    buf_start: usize,
     /// Bytes of `buffer` already classified for the unfinished element.
     element_at: usize,
     element_depth: u32,
@@ -1143,6 +1146,7 @@ impl ArrayToNdjsonPush {
             buffer: Vec::new(),
             pending: VecDeque::new(),
             state: ParsingState::ExpectingArrayStart,
+            buf_start: 0,
             element_at: 0,
             element_depth: 0,
             element_in_string: false,
@@ -1160,7 +1164,9 @@ impl ArrayToNdjsonPush {
     /// Returns an error if the pushed data contains invalid JSON syntax.
     pub fn push_bytes(&mut self, data: &[u8]) -> io::Result<()> {
         self.buffer.extend_from_slice(data);
-        self.process_buffer()
+        let result = self.process_unread();
+        self.compact_once();
+        result
     }
 
     /// Try to read processed NDJSON data
@@ -1225,19 +1231,45 @@ impl ArrayToNdjsonPush {
 
     /// Process accumulated buffer data using `serde_json::StreamDeserializer`
     #[expect(clippy::cast_possible_truncation)]
-    fn process_buffer(&mut self) -> io::Result<()> {
+    fn unread(&self) -> &[u8] {
+        &self.buffer[self.buf_start..]
+    }
+
+    fn consume_front(&mut self, n: usize) {
+        self.buf_start += n;
+    }
+
+    fn drop_unread(&mut self) {
+        self.buffer.clear();
+        self.buf_start = 0;
+        self.element_at = 0;
+    }
+
+    /// Move unread bytes to the front once. Doing this per element copies the
+    /// tail once per element; doing it per push copies it once.
+    fn compact_once(&mut self) {
+        if self.buf_start == 0 {
+            return;
+        }
+        let start = self.buf_start;
+        self.buffer.drain(..start);
+        self.element_at = self.element_at.saturating_sub(start);
+        self.buf_start = 0;
+    }
+
+    fn process_unread(&mut self) -> io::Result<()> {
         if matches!(self.state, ParsingState::Complete) {
             return self.take_trailing_whitespace();
         }
 
         // Skip whitespace and consume opening bracket if not done yet
         if matches!(self.state, ParsingState::ExpectingArrayStart) {
-            let mut cursor = io::Cursor::new(&self.buffer);
+            let mut cursor = io::Cursor::new(self.unread());
             match skip_ws_until(&mut cursor, b'[') {
                 Ok(()) => {
                     let consumed = cursor.position() as usize;
-                    if consumed <= self.buffer.len() {
-                        self.buffer.drain(..consumed);
+                    if consumed <= self.unread().len() {
+                        self.consume_front(consumed);
                         self.state = ParsingState::ExpectingFirstElement;
                     }
                 }
@@ -1258,17 +1290,17 @@ impl ArrayToNdjsonPush {
         loop {
             match self.state {
                 ParsingState::ExpectingFirstElement => {
-                    if self.buffer.is_empty() {
+                    if self.unread().is_empty() {
                         return Ok(());
                     }
 
-                    let mut cursor = io::Cursor::new(&self.buffer);
+                    let mut cursor = io::Cursor::new(self.unread());
                     // If the buffer contains only a closing bracket and we're expecting a first element, we're done
                     match Self::next_non_ws_byte(&mut cursor) {
                         Ok(b']') => {
                             // End of array
                             let consumed = cursor.position() as usize;
-                            self.buffer.drain(..consumed);
+                            self.consume_front(consumed);
                             self.state = ParsingState::Complete;
                             return self.take_trailing_whitespace();
                         }
@@ -1285,7 +1317,7 @@ impl ArrayToNdjsonPush {
                 ParsingState::ExpectingElement => {
                     if !self.element_started {
                         self.discard_leading_whitespace();
-                        if self.buffer.is_empty() {
+                        if self.unread().is_empty() {
                             return Ok(());
                         }
                     }
@@ -1294,7 +1326,7 @@ impl ArrayToNdjsonPush {
                     if !self.advance_element_scan() {
                         return Ok(());
                     }
-                    let cursor = io::Cursor::new(&self.buffer);
+                    let cursor = io::Cursor::new(self.unread());
                     let mut stream = Deserializer::from_reader(cursor).into_iter::<Box<RawValue>>();
                     match stream.next() {
                         Some(Ok(element)) => {
@@ -1307,7 +1339,7 @@ impl ArrayToNdjsonPush {
                             // Filter and add to pending
                             filter_element_bytes(element_bytes, &mut self.pending);
 
-                            self.buffer.drain(..consumed);
+                            self.consume_front(consumed);
                             self.reset_element_scan();
 
                             self.state = ParsingState::ExpectingCommaOrClosingBracket;
@@ -1326,18 +1358,18 @@ impl ArrayToNdjsonPush {
                     }
                 }
                 ParsingState::ExpectingCommaOrClosingBracket => {
-                    let mut cursor = io::Cursor::new(&self.buffer);
+                    let mut cursor = io::Cursor::new(self.unread());
                     match Self::next_non_ws_byte(&mut cursor) {
                         Ok(b',') => {
                             // Consume comma and continue
                             let consumed = cursor.position() as usize;
-                            self.buffer.drain(..consumed);
+                            self.consume_front(consumed);
                             self.state = ParsingState::ExpectingElement;
                         }
                         Ok(b']') => {
                             // End of array
                             let consumed = cursor.position() as usize;
-                            self.buffer.drain(..consumed);
+                            self.consume_front(consumed);
                             self.state = ParsingState::Complete;
                             return self.take_trailing_whitespace();
                         }
@@ -1379,7 +1411,7 @@ impl ArrayToNdjsonPush {
     /// become anything else, so nothing is lost by discarding it.
     fn take_trailing_whitespace(&mut self) -> io::Result<()> {
         self.ensure_only_trailing_whitespace()?;
-        self.buffer.clear();
+        self.drop_unread();
         Ok(())
     }
 
@@ -1387,11 +1419,11 @@ impl ArrayToNdjsonPush {
     /// rather than accumulated.
     #[cfg(test)]
     fn buffered_len(&self) -> usize {
-        self.buffer.len()
+        self.unread().len()
     }
 
     fn ensure_only_trailing_whitespace(&self) -> io::Result<()> {
-        match first_non_whitespace(&self.buffer) {
+        match first_non_whitespace(self.unread()) {
             Some(byte) => Err(trailing_content_error(byte)),
             None => Ok(()),
         }
@@ -1403,15 +1435,19 @@ impl ArrayToNdjsonPush {
     /// A finished BOM and the whitespace after it will not become part of the
     /// array, so keeping them would make every later chunk scan them again.
     fn discard_checked_prologue(&mut self) {
-        if self.buffer == [0xEF] || self.buffer == [0xEF, 0xBB] {
-            return;
-        }
-        let after_bom = usize::from(self.buffer.starts_with(&[0xEF, 0xBB, 0xBF])) * 3;
-        if self.buffer[after_bom..]
-            .iter()
-            .all(|byte| is_json_whitespace(*byte))
-        {
-            self.buffer.clear();
+        let drop_all = {
+            let unread = self.unread();
+            if unread == [0xEF] || unread == [0xEF, 0xBB] {
+                false
+            } else {
+                let after_bom = usize::from(unread.starts_with(&[0xEF, 0xBB, 0xBF])) * 3;
+                unread[after_bom..]
+                    .iter()
+                    .all(|byte| is_json_whitespace(*byte))
+            }
+        };
+        if drop_all {
+            self.drop_unread();
         }
     }
 
@@ -1420,21 +1456,24 @@ impl ArrayToNdjsonPush {
     /// A later push appends and scans from the front of the buffer. Leaving a
     /// checked run there makes every new chunk revisit it.
     fn discard_leading_whitespace(&mut self) {
-        let Some(start) = self
-            .buffer
+        let start = self
+            .unread()
             .iter()
-            .position(|byte| !is_json_whitespace(*byte))
-        else {
-            self.buffer.clear();
+            .position(|byte| !is_json_whitespace(*byte));
+        let Some(start) = start else {
+            self.drop_unread();
             return;
         };
         if start > 0 {
-            self.buffer.drain(..start);
+            self.consume_front(start);
+        }
+        if !self.element_started {
+            self.element_at = self.buf_start;
         }
     }
 
     fn reset_element_scan(&mut self) {
-        self.element_at = 0;
+        self.element_at = self.buf_start;
         self.element_depth = 0;
         self.element_in_string = false;
         self.element_escape = false;
@@ -1515,7 +1554,7 @@ impl ArrayToNdjsonPush {
     }
 
     /// Get the next non-whitespace byte
-    fn next_non_ws_byte(cursor: &mut io::Cursor<&Vec<u8>>) -> io::Result<u8> {
+    fn next_non_ws_byte(cursor: &mut io::Cursor<&[u8]>) -> io::Result<u8> {
         let mut byte = [0u8; 1];
         loop {
             if cursor.read(&mut byte)? == 0 {
@@ -5327,6 +5366,30 @@ mod tests {
             "rejected element took {elapsed:?}"
         );
         eprintln!("rejected element 1 MiB elapsed={elapsed:?}");
+    }
+
+    /// One push of many small elements must not copy the tail once per element.
+    #[test]
+    fn push_reader_does_not_copy_the_tail_once_per_element() {
+        let elem = br#"{"id":1},"#;
+        let mut body = vec![b'['];
+        while body.len() + elem.len() + 1 < 2 * 1024 * 1024 {
+            body.extend_from_slice(elem);
+        }
+        if body.last() == Some(&b',') {
+            body.pop();
+        }
+        body.push(b']');
+        let mut adapter = ArrayToNdjsonPush::new();
+        let started = std::time::Instant::now();
+        adapter.push_bytes(&body).expect("single push");
+        adapter.finish().expect("finish");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "single-chunk array took {elapsed:?}"
+        );
+        eprintln!("single-chunk 2 MiB elapsed={elapsed:?}");
     }
 
     mod file_jsonl_tests {
