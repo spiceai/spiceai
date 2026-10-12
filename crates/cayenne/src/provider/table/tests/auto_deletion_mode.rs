@@ -139,7 +139,7 @@ async fn a_small_auto_table_uses_position_deletes_and_a_large_one_key_deletes() 
     assert!(!key.position_rewrites_exclude_writers());
 
     // A table that is already past its bound when it opens starts on key deletes.
-    // The 1 MiB target file size makes the bound 256 KiB.
+    // The 1 MiB target file size makes the bound 64 KiB.
     let (seeded, catalog, tmp) = table("auto_reopened_large", DeletionMode::Auto, 1).await;
     let ids: Vec<i64> = (0..60_000).collect();
     write_incompressible(&seeded, &ids).await;
@@ -149,8 +149,8 @@ async fn a_small_auto_table_uses_position_deletes_and_a_large_one_key_deletes() 
         .expect("storage stats");
     let bytes = CayenneTableProvider::warm_table_bytes(&stats);
     assert!(
-        bytes > 256 * 1024,
-        "premise: the seeded table ({bytes} B) must be past the 256 KiB bound"
+        bytes > 64 * 1024,
+        "premise: the seeded table ({bytes} B) must be past the 64 KiB bound"
     );
     seeded
         .drain_in_flight_maintenance()
@@ -372,7 +372,7 @@ async fn the_switch_to_key_deletes_forgets_captured_positions() {
 #[tokio::test]
 async fn an_auto_table_past_its_bound_switches_to_key_deletes() {
     let name = "auto_outgrown";
-    // 1 MiB target file size: a 256 KiB bound.
+    // 1 MiB target file size: a 64 KiB bound.
     let (provider, catalog, _tmp) = table(name, DeletionMode::Auto, 1).await;
     let upserted: Vec<i64> = (0..8).collect();
     let seed: Vec<i64> = (0..16).collect();
@@ -392,8 +392,8 @@ async fn an_auto_table_past_its_bound_switches_to_key_deletes() {
         .expect("storage stats");
     let bytes = CayenneTableProvider::warm_table_bytes(&stats);
     assert!(
-        bytes > 256 * 1024,
-        "premise: the grown table ({bytes} B) must be past the 256 KiB bound"
+        bytes > 64 * 1024,
+        "premise: the grown table ({bytes} B) must be past the 64 KiB bound"
     );
     assert!(
         deletion_index_entries(&provider) >= 2,
@@ -441,65 +441,73 @@ async fn an_auto_table_past_its_bound_switches_to_key_deletes() {
     assert_eq!(latest, expected, "every seed key shows its latest row");
 }
 
-/// An auto table's whole-table reclaims are paced: one that is not yet due leaves
-/// the index past its trigger, and runs once it is.
+/// An auto table on key deletes paces its whole-table reclaims: one that is not
+/// yet due leaves the index past its trigger, and runs once it is. A table on
+/// position deletes, which auto keeps small, reclaims at every trigger.
 #[tokio::test]
-async fn an_auto_tables_whole_table_reclaims_are_paced() {
-    let name = "auto_paced_reclaims";
-    let (provider, _catalog, _tmp) = table(name, DeletionMode::Auto, 256).await;
-    let auto = Arc::clone(provider.pk_deletion_mode.auto().expect("an auto table"));
-    let keys: Vec<i64> = (0..16).collect();
-    write(&provider, &keys, 100).await;
-    write(&provider, &keys, 200).await;
-    assert!(
+async fn an_auto_table_paces_only_its_key_delete_whole_table_reclaims() {
+    for on_key_deletes in [false, true] {
+        let name = format!("auto_paced_reclaims_{on_key_deletes}");
+        let (provider, _catalog, _tmp) = table(&name, DeletionMode::Auto, 256).await;
+        let auto = Arc::clone(provider.pk_deletion_mode.auto().expect("an auto table"));
+        let keys: Vec<i64> = (0..16).collect();
+        write(&provider, &keys, 100).await;
         provider
-            .compact_current_snapshot_small_files()
+            .rewrite_current_snapshot_for_compaction_tracked(None)
             .await
-            .expect("first reclaim pass"),
-        "the first reclaim is due at once"
-    );
+            .expect("fold the seed into the current snapshot");
+        if on_key_deletes {
+            assert!(
+                provider.switch_auto_to_key_deletes(),
+                "premise: on key deletes"
+            );
+        }
 
-    // As if the last reclaim had taken a minute: the next is due in 49.
-    auto.record_reclaim(
-        std::time::Duration::from_secs(60),
-        std::time::Instant::now(),
-    );
-    write(&provider, &keys, 300).await;
-    let pending = deletion_index_entries(&provider);
-    assert!(
-        pending >= 2,
-        "premise: the index is past its trigger ({pending})"
-    );
-    assert!(
-        !provider
+        // As if the last whole-table reclaim had taken a minute: a paced one is
+        // due in 49.
+        auto.record_reclaim(
+            std::time::Duration::from_secs(60),
+            std::time::Instant::now(),
+        );
+        write(&provider, &keys, 200).await;
+        let pending = deletion_index_entries(&provider);
+        assert!(
+            pending >= 2,
+            "premise: the index is past its trigger ({pending})"
+        );
+        let reclaimed = provider
             .compact_current_snapshot_small_files()
             .await
-            .expect("paced reclaim pass"),
-        "a reclaim that is not yet due does not run"
-    );
-    assert_eq!(
-        deletion_index_entries(&provider),
-        pending,
-        "the deferred reclaim left the index as it was"
-    );
-
-    auto.forget_reclaim_pace();
-    assert!(
-        provider
-            .compact_current_snapshot_small_files()
-            .await
-            .expect("due reclaim pass"),
-        "a due reclaim runs"
-    );
-    assert_eq!(
-        deletion_index_entries(&provider),
-        0,
-        "the reclaim cleared the index"
-    );
-    let ctx = SessionContext::new();
-    let rows = collect_id_value_pairs(&ctx, &provider, name).await;
-    let expected: Vec<(i64, i64)> = keys.iter().map(|id| (*id, 300)).collect();
-    assert_eq!(rows, expected, "every key shows its latest row, once");
+            .expect("reclaim pass");
+        assert_eq!(
+            reclaimed, !on_key_deletes,
+            "on key deletes the reclaim waits; on position deletes it runs (key deletes: {on_key_deletes})"
+        );
+        if on_key_deletes {
+            assert_eq!(
+                deletion_index_entries(&provider),
+                pending,
+                "the deferred reclaim left the index as it was"
+            );
+            auto.forget_reclaim_pace();
+            assert!(
+                provider
+                    .compact_current_snapshot_small_files()
+                    .await
+                    .expect("due reclaim pass"),
+                "a due reclaim runs"
+            );
+        }
+        assert_eq!(
+            deletion_index_entries(&provider),
+            0,
+            "the reclaim cleared the index"
+        );
+        let ctx = SessionContext::new();
+        let rows = collect_id_value_pairs(&ctx, &provider, &name).await;
+        let expected: Vec<(i64, i64)> = keys.iter().map(|id| (*id, 200)).collect();
+        assert_eq!(rows, expected, "every key shows its latest row, once");
+    }
 }
 
 /// An auto table on key deletes whose rows sit in its current snapshot — where

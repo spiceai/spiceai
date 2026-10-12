@@ -26,18 +26,20 @@ limitations under the License.
 //! which rewrites only the settled prefix of its protected snapshots — cheap at any
 //! size, but it leaves the table in several snapshots behind a deletion filter.
 //!
-//! `auto` therefore keeps a table in position mode while it is small enough to
-//! rewrite whole ([`AutoDeletionMode::max_position_bytes`]), and moves it to key
-//! mode once it is not. Either way it paces its whole-table rewrites so they take
-//! a small share of the time ([`RECLAIM_SHARE_DENOMINATOR`]).
+//! `auto` therefore keeps a table in position mode while it is small enough that
+//! rewriting it whole reads faster than the bake
+//! ([`AutoDeletionMode::max_position_bytes_for`]), and moves it to key mode once it
+//! is not.
 //!
 //! A table whose rows sit in its current snapshot — which is where every
 //! whole-table rewrite leaves them — needs that rewrite whatever its mode: the bake
 //! folds only protected snapshots, so it cannot apply a key delete to a row in the
 //! current snapshot, and its clean-prefix check then keeps it from pruning any
 //! delete at or below that row's sequence. So an `auto` table on key deletes whose
-//! current snapshot holds rows reclaims by rewriting itself whole too, at the same
-//! pace; one whose rows are all in protected snapshots leaves them to the bake.
+//! current snapshot holds rows reclaims by rewriting itself whole too, paced to a
+//! small share of the time ([`RECLAIM_SHARE_DENOMINATOR`]) because such a table can
+//! be any size; one whose rows are all in protected snapshots leaves them to the
+//! bake.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -47,18 +49,17 @@ use parking_lot::Mutex;
 
 use crate::metadata::{DeletionMode, ResolvedDeletionMode};
 
-/// An `auto` table's whole-table reclaims take at most this fraction (one
-/// fiftieth) of the time: a reclaim waits, its deletion index growing past the
-/// trigger meanwhile, until 49 times the last reclaims' duration has passed since
-/// the previous one ended. Over the deletion index's memory ceiling it does not
-/// wait.
+/// An `auto` table on key deletes takes at most this fraction (one fiftieth) of
+/// the time rewriting itself whole: such a reclaim waits, the deletion index
+/// growing past its trigger meanwhile, until 49 times the recent whole-table
+/// reclaims' duration has passed since the previous one ended. Over the deletion
+/// index's memory ceiling it does not wait.
 ///
-/// A reclaim rewrites the whole table on the same cores as the table's reads and
-/// writes, so how often it runs, not only how long, decides what it costs them:
-/// a 46 MB table rewritten in 270 ms every 6 s kept a reclaim running 4.3% of the
-/// time, and its P99 reads and writes were slower than on key deletes, while a
-/// 9 MB table at 1.5% read faster than on key deletes at every percentile. A
-/// fiftieth sits between the two.
+/// The pace bounds what a table of any size can spend on whole-table rewrites
+/// when the bake cannot reach its rows. It costs reads in the meantime, because
+/// the index grows past the trigger: a 1M-row table under 8,000 upserts a second
+/// read at a 19 ms P99 paced against 10 ms rewriting at every trigger. So a
+/// position-delete table, which `auto` keeps small, is not paced.
 pub(crate) const RECLAIM_SHARE_DENOMINATOR: u32 = 50;
 
 /// How a primary-key table records the delete of a row right now.
@@ -162,12 +163,17 @@ impl AutoDeletionMode {
     }
 
     /// The bound for a table whose target file size is `target_file_size_bytes`:
-    /// a quarter of it, the size below which the compactor already counts a file
-    /// as small and rewrites it as routine maintenance. A table no larger than one
-    /// small file costs no more to rewrite whole than the compactor already spends,
-    /// and the target size it derives from follows the storage the table is on.
+    /// a sixteenth of it, 16 MiB at the default 256 MiB target.
+    ///
+    /// Under one writer upserting 8,000 keys a second, against key deletes the
+    /// table's bake could serve, position deletes read faster at 3 MB and 9 MB on
+    /// disk (P99 scans 5–10% and P99 point lookups 10–17% faster, 22–30% more
+    /// reads) and 25% slower at the P99 at 46 MB, where rewriting the table whole
+    /// at every trigger kept a rewrite running 4.3% of the time. A sixteenth of the
+    /// default target keeps position deletes in the range where they won; the
+    /// target it derives from follows the storage the table is on.
     pub(crate) fn max_position_bytes_for(target_file_size_bytes: usize) -> u64 {
-        u64::try_from(target_file_size_bytes / 4).unwrap_or(u64::MAX)
+        u64::try_from(target_file_size_bytes / 16).unwrap_or(u64::MAX)
     }
 
     /// Largest on-disk size, in bytes, at which the table keeps position deletes.
@@ -240,10 +246,10 @@ mod tests {
     use super::*;
 
     const TARGET: usize = 256 * 1024 * 1024;
-    const BOUND: u64 = 64 * 1024 * 1024;
+    const BOUND: u64 = 16 * 1024 * 1024;
 
     #[test]
-    fn the_bound_is_a_quarter_of_the_target_file_size() {
+    fn the_bound_is_a_sixteenth_of_the_target_file_size() {
         assert_eq!(AutoDeletionMode::max_position_bytes_for(TARGET), BOUND);
         assert_eq!(AutoDeletionMode::max_position_bytes_for(0), 0);
     }
