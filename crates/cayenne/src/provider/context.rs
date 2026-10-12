@@ -488,6 +488,14 @@ impl CayenneContext {
             && self.config.sort_columns_origin == crate::metadata::SortColumnsOrigin::User
     }
 
+    /// Whether the operator asked for a file layout: explicit `cluster_by`
+    /// columns or a user-configured sort order. An inferred sort order is not a
+    /// request, since observed filter columns outrank it.
+    #[must_use]
+    pub fn has_requested_layout(&self) -> bool {
+        self.has_cluster_by() || self.sort_columns_are_authoritative()
+    }
+
     /// Sort columns that schema inference supplied, if any — the lowest-priority
     /// rung of the layout precedence chain (below observed filter columns).
     /// Empty when the sort order is user-configured or absent.
