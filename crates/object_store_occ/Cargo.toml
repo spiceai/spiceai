@@ -23,7 +23,7 @@ uuid = { workspace = true, features = ["v4", "v7"] }
 
 [dev-dependencies]
 tempfile.workspace = true
-tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time"] }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "time", "fs"] }
 
 [lints]
 workspace = true
