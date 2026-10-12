@@ -1229,8 +1229,6 @@ impl ArrayToNdjsonPush {
         ))
     }
 
-    /// Process accumulated buffer data using `serde_json::StreamDeserializer`
-    #[expect(clippy::cast_possible_truncation)]
     fn unread(&self) -> &[u8] {
         &self.buffer[self.buf_start..]
     }
@@ -1257,6 +1255,8 @@ impl ArrayToNdjsonPush {
         self.buf_start = 0;
     }
 
+    /// Process accumulated buffer data using `serde_json::StreamDeserializer`.
+    #[expect(clippy::cast_possible_truncation)]
     fn process_unread(&mut self) -> io::Result<()> {
         if matches!(self.state, ParsingState::Complete) {
             return self.take_trailing_whitespace();
