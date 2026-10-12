@@ -436,6 +436,9 @@ async fn deletion_mode_concurrent_harness() -> Result<(), Box<dyn std::error::Er
     let pattern = env_string("HARNESS_PATTERN", "slice");
     let trigger = env_usize("HARNESS_TRIGGER", 50_000);
     let seed_batch = env_usize("HARNESS_SEED_BATCH", 100_000);
+    // `append` seeds through upserts, into protected snapshots; `overwrite` seeds
+    // through one replace, into the current snapshot, as a full refresh does.
+    let seed_op = env_string("HARNESS_SEED_OP", "append");
 
     let fixture = common::TestFixture::new(common::BackendType::Sqlite).await?;
     let schema = schema();
@@ -470,15 +473,23 @@ async fn deletion_mode_concurrent_harness() -> Result<(), Box<dyn std::error::Er
     );
 
     let mut next = 0usize;
+    let mut seed_batches = Vec::new();
     while next < rows {
         let end = (next + seed_batch).min(rows);
         let ids: Vec<i64> = (next as i64..end as i64).collect();
-        common::insert_batch(&table, rows_batch(&schema, &ids, 0)).await?;
+        if seed_op == "overwrite" {
+            seed_batches.push(rows_batch(&schema, &ids, 0));
+        } else {
+            common::insert_batch(&table, rows_batch(&schema, &ids, 0)).await?;
+        }
         next = end;
+    }
+    if seed_op == "overwrite" {
+        common::write_batches(&table, seed_batches, InsertOp::Overwrite).await?;
     }
     table.drain_in_flight_maintenance().await?;
     eprintln!(
-        "HARNESS mode={mode_label} metric=seed data_bytes={}",
+        "HARNESS mode={mode_label} metric=seed data_bytes={} seed_op={seed_op}",
         dir_bytes(&fixture.data_path)
     );
 

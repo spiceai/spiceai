@@ -137,6 +137,16 @@ enum Mode {
     Key,
     /// Explicit `deletion_mode: position` (merge-on-read position deletes).
     Position,
+    /// The default `deletion_mode: auto`, with the default target file size: these
+    /// tables stay inside its position-delete bound, so the whole run is on
+    /// position deletes, reclaimed by whole-table rewrites that race the writers
+    /// (the reclaim trigger is two tombstones).
+    Auto,
+    /// `deletion_mode: auto` with a 1 MiB target file size, a 32 KiB bound that
+    /// every run crosses under live writers: position deletes and whole-table
+    /// reclaims first, then key deletes and the reclaims of rows the bake cannot
+    /// reach.
+    AutoCrossing,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -256,6 +266,17 @@ fn config(
         },
         Mode::Position => VortexConfig {
             deletion_mode: DeletionMode::Position,
+            ..base
+        },
+        Mode::Auto => VortexConfig {
+            deletion_mode: DeletionMode::Auto,
+            target_vortex_file_size_mb: VortexConfig::default().target_vortex_file_size_mb,
+            bake_deletion_index_trigger: 2,
+            ..base
+        },
+        Mode::AutoCrossing => VortexConfig {
+            deletion_mode: DeletionMode::Auto,
+            bake_deletion_index_trigger: 2,
             ..base
         },
     }
@@ -1367,8 +1388,16 @@ async fn prop_sequential_key_impl(f: TestFixture) -> TestResult<()> {
 async fn prop_sequential_position_impl(f: TestFixture) -> TestResult<()> {
     run_workload(f, sequential(Mode::Position)).await
 }
+async fn prop_sequential_auto_impl(f: TestFixture) -> TestResult<()> {
+    run_workload(f, sequential(Mode::Auto)).await
+}
+async fn prop_sequential_auto_crossing_impl(f: TestFixture) -> TestResult<()> {
+    run_workload(f, sequential(Mode::AutoCrossing)).await
+}
 test_with_backends!(prop_sequential_key_impl);
 test_with_backends!(prop_sequential_position_impl);
+test_with_backends!(prop_sequential_auto_impl);
+test_with_backends!(prop_sequential_auto_crossing_impl);
 
 // --- Memory-CDC convergence + count-exactness (mem-tier checkpoint + bake) ---
 //
@@ -1507,7 +1536,7 @@ async fn prop_concurrent_cold_sqlite() -> TestResult<()> {
 // cause instead of surfacing as a rare seed-dependent walk failure. Run in both
 // deletion modes, which take different prune paths (key index vs position).
 async fn reupsert_after_overwrite_delete_is_visible_impl(f: TestFixture) -> TestResult<()> {
-    for mode in [Mode::Key, Mode::Position] {
+    for mode in [Mode::Key, Mode::Position, Mode::Auto, Mode::AutoCrossing] {
         let name = format!("reupsert_min_{mode:?}");
         let (table, ctx) = create_table(&f, &name, mode, Durability::File, None, false).await?;
 
@@ -1611,6 +1640,58 @@ async fn prop_concurrent_mixed_dense_bloom_position_sqlite() -> TestResult<()> {
     .map_err(|e| -> Box<dyn std::error::Error> { e })
 }
 
+// The same concurrent stresses on the default `deletion_mode: auto`: whole-table
+// reclaims that run alongside the writers, and (crossing) the switch to key
+// deletes under them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prop_concurrent_upsert_only_auto_sqlite() -> TestResult<()> {
+    common::run_with_backend(BackendType::Sqlite, |f| {
+        run_workload(f, concurrent_upsert_only(Mode::Auto))
+    })
+    .await
+    .map_err(|e| -> Box<dyn std::error::Error> { e })
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prop_concurrent_mixed_auto_sqlite() -> TestResult<()> {
+    common::run_with_backend(BackendType::Sqlite, |f| {
+        run_workload(f, concurrent_mixed(Mode::Auto))
+    })
+    .await
+    .map_err(|e| -> Box<dyn std::error::Error> { e })
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prop_concurrent_mixed_auto_crossing_sqlite() -> TestResult<()> {
+    common::run_with_backend(BackendType::Sqlite, |f| {
+        run_workload(f, concurrent_mixed(Mode::AutoCrossing))
+    })
+    .await
+    .map_err(|e| -> Box<dyn std::error::Error> { e })
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prop_concurrent_mixed_dense_auto_sqlite() -> TestResult<()> {
+    common::run_with_backend(BackendType::Sqlite, |f| {
+        run_workload(f, concurrent_mixed_dense(Mode::Auto, None))
+    })
+    .await
+    .map_err(|e| -> Box<dyn std::error::Error> { e })
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prop_concurrent_mixed_dense_auto_crossing_sqlite() -> TestResult<()> {
+    common::run_with_backend(BackendType::Sqlite, |f| {
+        run_workload(f, concurrent_mixed_dense(Mode::AutoCrossing, None))
+    })
+    .await
+    .map_err(|e| -> Box<dyn std::error::Error> { e })
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prop_concurrent_mixed_dense_bloom_auto_sqlite() -> TestResult<()> {
+    common::run_with_backend(BackendType::Sqlite, |f| {
+        run_workload(f, concurrent_mixed_dense(Mode::Auto, Some(0)))
+    })
+    .await
+    .map_err(|e| -> Box<dyn std::error::Error> { e })
+}
+
 // ============================================================================
 // Snapshot-isolation under concurrent reads (overwrite torn-publish class)
 // ============================================================================
@@ -1708,6 +1789,14 @@ async fn prop_concurrent_reads_observe_consistent_snapshot_key_sqlite() -> TestR
 async fn prop_concurrent_reads_observe_consistent_snapshot_position_sqlite() -> TestResult<()> {
     common::run_with_backend(BackendType::Sqlite, |f| async move {
         run_concurrent_reads_mode(&f, Mode::Position).await
+    })
+    .await
+    .map_err(|e| -> Box<dyn std::error::Error> { e })
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prop_concurrent_reads_observe_consistent_snapshot_auto_sqlite() -> TestResult<()> {
+    common::run_with_backend(BackendType::Sqlite, |f| async move {
+        run_concurrent_reads_mode(&f, Mode::Auto).await
     })
     .await
     .map_err(|e| -> Box<dyn std::error::Error> { e })

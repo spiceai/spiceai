@@ -80,15 +80,13 @@ impl PkDeletionMode {
     ///
     /// `adapts` says whether `auto` may choose position deletes for this table at
     /// all: it may not for a table whose rows live in RAM (`mode: memory`), a
-    /// partitioned table, or a table with a datalake tier, which keep key deletes.
-    /// `table_bytes` is the table's on-disk size when it was opened, `None` when it
-    /// could not be read; an unknown size starts the table in key mode, which
-    /// rewrites the table whole only where the bake cannot hold its index.
+    /// partitioned table, a table with a datalake tier, or one on object storage,
+    /// which keep key deletes. An `auto` table starts on position deletes until it
+    /// is sized ([`AutoDeletionMode::size_at_open`]).
     pub(crate) fn for_table(
         mode: DeletionMode,
         has_primary_key: bool,
         adapts: bool,
-        table_bytes: Option<u64>,
         target_file_size_bytes: usize,
     ) -> Self {
         match mode.resolved(has_primary_key) {
@@ -96,7 +94,6 @@ impl PkDeletionMode {
             ResolvedDeletionMode::Position => Self::Position,
             ResolvedDeletionMode::Adaptive if !adapts => Self::Key,
             ResolvedDeletionMode::Adaptive => Self::Auto(Arc::new(AutoDeletionMode::new(
-                table_bytes,
                 AutoDeletionMode::max_position_bytes_for(target_file_size_bytes),
             ))),
         }
@@ -141,6 +138,9 @@ pub(crate) struct AutoDeletionMode {
     max_position_bytes: u64,
     /// See [`Self::reclaim_due`].
     reclaims: Mutex<ReclaimPace>,
+    /// Whether a whole-table reclaim has committed while the table was on
+    /// position deletes (see [`Self::was_kept_compacted`]).
+    kept_compacted: AtomicBool,
 }
 
 #[derive(Debug, Default)]
@@ -152,20 +152,49 @@ struct ReclaimPace {
     busy: Duration,
 }
 
+/// The largest bound `auto` keeps position deletes within, whatever the target file
+/// size: the size up to which they were measured to read faster (see
+/// [`AutoDeletionMode::max_position_bytes_for`]).
+pub(crate) const MAX_POSITION_BYTES: u64 = 8 * 1024 * 1024;
+
 impl AutoDeletionMode {
-    /// A table at most this many on-disk bytes keeps position deletes.
-    pub(crate) fn new(table_bytes: Option<u64>, max_position_bytes: u64) -> Self {
-        let position = table_bytes.is_some_and(|bytes| bytes <= max_position_bytes);
+    /// A table at most `max_position_bytes` on-disk bytes keeps position deletes.
+    /// It starts on them; [`Self::size_at_open`] moves it to key deletes when the
+    /// table is past the bound, or cannot be sized, when it is opened.
+    pub(crate) fn new(max_position_bytes: u64) -> Self {
         Self {
-            position: AtomicBool::new(position),
+            position: AtomicBool::new(true),
             switch_requested: AtomicBool::new(false),
             max_position_bytes,
             reclaims: Mutex::new(ReclaimPace::default()),
+            kept_compacted: AtomicBool::new(false),
         }
     }
 
+    /// Choose the starting mode for a table of `table_bytes` on-disk bytes (`None`
+    /// when it could not be sized), before anything has written to it. Not a
+    /// switch: nothing has recorded a position yet.
+    pub(crate) fn size_at_open(&self, table_bytes: Option<u64>) {
+        if !table_bytes.is_some_and(|bytes| self.fits(bytes)) {
+            self.position.store(false, Ordering::Release);
+        }
+    }
+
+    /// Record that a whole-table reclaim committed while the table was on
+    /// position deletes.
+    pub(crate) fn record_kept_compacted(&self) {
+        self.kept_compacted.store(true, Ordering::Release);
+    }
+
+    /// Whether the table was kept fully compacted at some point: a whole-table
+    /// reclaim committed while it was on position deletes. A table that outgrew
+    /// the bound during its first load never was.
+    pub(crate) fn was_kept_compacted(&self) -> bool {
+        self.kept_compacted.load(Ordering::Acquire)
+    }
+
     /// The bound for a table whose target file size is `target_file_size_bytes`:
-    /// 1/32 of it, 8 MiB at the default 256 MiB target.
+    /// 1/32 of it, and at most [`MAX_POSITION_BYTES`] (8 MiB, the default's 1/32).
     ///
     /// Under one writer upserting 8,000 keys a second, against key deletes the
     /// table's bake could serve, position deletes read faster with 1.8 MB, 4.8 MB
@@ -175,8 +204,11 @@ impl AutoDeletionMode {
     /// rewrite reads, which includes the upserts it is about to fold, so 1/32 of the
     /// default target keeps position deletes inside the range where they won; the
     /// target it derives from follows the storage the table is on.
+    /// A larger target does not raise the bound past what was measured.
     pub(crate) fn max_position_bytes_for(target_file_size_bytes: usize) -> u64 {
-        u64::try_from(target_file_size_bytes / 32).unwrap_or(u64::MAX)
+        u64::try_from(target_file_size_bytes / 32)
+            .unwrap_or(u64::MAX)
+            .min(MAX_POSITION_BYTES)
     }
 
     /// Largest on-disk size, in bytes, at which the table keeps position deletes.
@@ -251,26 +283,42 @@ mod tests {
     const TARGET: usize = 256 * 1024 * 1024;
     const BOUND: u64 = 8 * 1024 * 1024;
 
+    /// An `auto` table opened at `table_bytes` (`None`: could not be sized).
+    fn opened(table_bytes: Option<u64>) -> AutoDeletionMode {
+        let auto = AutoDeletionMode::new(BOUND);
+        auto.size_at_open(table_bytes);
+        auto
+    }
+
     #[test]
-    fn the_bound_is_a_thirty_second_of_the_target_file_size() {
+    fn the_bound_is_a_thirty_second_of_the_target_file_size_up_to_8_mib() {
         assert_eq!(AutoDeletionMode::max_position_bytes_for(TARGET), BOUND);
+        assert_eq!(
+            AutoDeletionMode::max_position_bytes_for(64 * 1024 * 1024),
+            2 * 1024 * 1024
+        );
         assert_eq!(AutoDeletionMode::max_position_bytes_for(0), 0);
+        // A larger target, such as an object store's, does not raise it.
+        assert_eq!(
+            AutoDeletionMode::max_position_bytes_for(1024 * 1024 * 1024),
+            BOUND
+        );
     }
 
     #[test]
     fn a_table_starts_on_position_deletes_only_within_the_bound() {
-        assert!(AutoDeletionMode::new(Some(0), BOUND).uses_positions());
-        assert!(AutoDeletionMode::new(Some(BOUND), BOUND).uses_positions());
-        assert!(!AutoDeletionMode::new(Some(BOUND + 1), BOUND).uses_positions());
+        assert!(opened(Some(0)).uses_positions());
+        assert!(opened(Some(BOUND)).uses_positions());
+        assert!(!opened(Some(BOUND + 1)).uses_positions());
         assert!(
-            !AutoDeletionMode::new(None, BOUND).uses_positions(),
+            !opened(None).uses_positions(),
             "an unknown size must start on key deletes"
         );
     }
 
     #[test]
     fn the_switch_to_key_is_one_way_and_reported_once() {
-        let auto = AutoDeletionMode::new(Some(1), BOUND);
+        let auto = opened(Some(1));
         assert!(auto.request_switch_to_key());
         assert!(
             !auto.request_switch_to_key(),
@@ -288,14 +336,22 @@ mod tests {
     }
 
     #[test]
+    fn a_table_is_kept_compacted_only_once_a_reclaim_recorded_it() {
+        let auto = opened(Some(1));
+        assert!(!auto.was_kept_compacted());
+        auto.record_kept_compacted();
+        assert!(auto.was_kept_compacted());
+    }
+
+    #[test]
     fn the_first_reclaim_is_due_at_once() {
-        let auto = AutoDeletionMode::new(Some(1), BOUND);
+        let auto = opened(Some(1));
         assert!(auto.reclaim_due(Instant::now()));
     }
 
     #[test]
     fn a_reclaim_waits_until_reclaims_take_at_most_a_tenth_of_the_time() {
-        let auto = AutoDeletionMode::new(Some(1), BOUND);
+        let auto = opened(Some(1));
         let ended = Instant::now();
         auto.record_reclaim(Duration::from_millis(100), ended);
         // 9 × 100 ms after it ended, and not a moment before.
@@ -305,7 +361,7 @@ mod tests {
 
     #[test]
     fn one_slow_reclaim_moves_the_pace_by_half() {
-        let auto = AutoDeletionMode::new(Some(1), BOUND);
+        let auto = opened(Some(1));
         let first = Instant::now();
         auto.record_reclaim(Duration::from_millis(100), first);
         let second = first + Duration::from_secs(10);
@@ -317,31 +373,33 @@ mod tests {
 
     #[test]
     fn fits_is_inclusive_of_the_bound() {
-        let auto = AutoDeletionMode::new(Some(0), BOUND);
+        let auto = opened(Some(0));
         assert!(auto.fits(BOUND));
         assert!(!auto.fits(BOUND + 1));
     }
 
     #[test]
     fn for_table_resolves_each_configuration() {
-        let resolve = |mode, has_pk, adapts, bytes| {
-            PkDeletionMode::for_table(mode, has_pk, adapts, bytes, TARGET).uses_positions()
+        let resolve = |mode, has_pk, adapts| {
+            PkDeletionMode::for_table(mode, has_pk, adapts, TARGET).uses_positions()
         };
-        // Explicit modes ignore size and eligibility.
-        assert!(!resolve(DeletionMode::Key, true, true, Some(0)));
-        assert!(resolve(DeletionMode::Position, true, true, Some(u64::MAX)));
-        // `auto` adapts by size on an eligible primary-key table.
-        assert!(resolve(DeletionMode::Auto, true, true, Some(BOUND)));
-        assert!(!resolve(DeletionMode::Auto, true, true, Some(BOUND + 1)));
+        // Explicit modes ignore eligibility.
+        assert!(!resolve(DeletionMode::Key, true, true));
+        assert!(resolve(DeletionMode::Position, true, true));
+        // `auto` on an eligible primary-key table starts on position deletes, until
+        // it is sized.
+        assert!(resolve(DeletionMode::Auto, true, true));
         // `auto` on a table it does not adapt keeps key deletes.
-        assert!(!resolve(DeletionMode::Auto, true, false, Some(0)));
+        assert!(!resolve(DeletionMode::Auto, true, false));
         assert!(matches!(
-            PkDeletionMode::for_table(DeletionMode::Auto, true, false, Some(0), TARGET),
+            PkDeletionMode::for_table(DeletionMode::Auto, true, false, TARGET),
             PkDeletionMode::Key
         ));
-        assert!(matches!(
-            PkDeletionMode::for_table(DeletionMode::Auto, true, true, Some(0), TARGET),
-            PkDeletionMode::Auto(_)
-        ));
+        let PkDeletionMode::Auto(auto) =
+            PkDeletionMode::for_table(DeletionMode::Auto, true, true, TARGET)
+        else {
+            panic!("an eligible primary-key table is auto");
+        };
+        assert_eq!(auto.max_position_bytes(), BOUND);
     }
 }

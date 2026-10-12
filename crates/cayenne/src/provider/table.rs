@@ -9431,8 +9431,7 @@ impl CayenneTableProvider {
             table_metadata.vortex_config.cold_tier_enabled(),
         )
         .await?;
-        let pk_deletion_mode =
-            Self::resolve_pk_deletion_mode(&catalog, &table_metadata, &context).await;
+        let pk_deletion_mode = Self::resolve_pk_deletion_mode(&table_metadata, &context);
 
         let listing_table = Self::create_listing_table(
             &snapshot_dir_url,
@@ -9842,6 +9841,12 @@ impl CayenneTableProvider {
         // compaction. Best-effort: it leaves the manifest empty on failure and
         // the scan falls back to directory listing.
         provider.backfill_snapshot_manifest_if_empty().await;
+
+        // Size an `auto` table for its starting mode, before anything writes to
+        // it: past the bound, or unsized, it starts on key deletes.
+        if let Some(auto) = provider.pk_deletion_mode.auto() {
+            auto.size_at_open(provider.warm_listed_bytes().await.ok());
+        }
 
         // Startup replay for the orphaned-DV sweep. A publication that raises the
         // surviving-sequence floor and the in-memory signal that follows it cannot
@@ -11360,16 +11365,17 @@ impl CayenneTableProvider {
             }
         };
 
-        // The same figures size an `auto` table against its position-delete
-        // bound, so a table that grew past it moves to key deletes even when no
-        // reclaim is due yet.
+        // Size an `auto` table against its position-delete bound on the same
+        // cadence, so a table that grew past it moves to key deletes even when no
+        // reclaim is due yet. From its snapshot directories, not the figures
+        // above: those still count a protected snapshot a merge replaced until its
+        // registration is swept, and read about twice the table during a load.
         if let Some(auto) = self.pk_deletion_mode.auto()
             && auto.uses_positions()
+            && let Ok(table_bytes) = self.warm_listed_bytes().await
+            && !auto.fits(table_bytes)
         {
-            let table_bytes = Self::warm_table_bytes(&stats);
-            if !auto.fits(table_bytes) {
-                self.request_auto_switch_to_key(table_bytes);
-            }
+            self.request_auto_switch_to_key(table_bytes);
         }
 
         let to_gauge = |value: i64| u64::try_from(value).unwrap_or(0);
@@ -13465,50 +13471,40 @@ impl CayenneTableProvider {
     /// snapshots' data files) to decide whether it starts on position deletes.
     /// It does not adapt a table whose rows live in RAM, a partitioned table, or a
     /// table with a datalake tier: those keep key deletes, as before.
-    async fn resolve_pk_deletion_mode(
-        catalog: &Arc<dyn MetadataCatalog>,
+    fn resolve_pk_deletion_mode(
         table_metadata: &TableMetadata,
         context: &CayenneContext,
     ) -> PkDeletionMode {
         let has_primary_key = !table_metadata.primary_key.is_empty();
-        let mode = context.deletion_mode();
+        // `auto` rewrites a table whole only where that was measured to pay: on
+        // local storage. A whole-table rewrite of a table on object storage reads
+        // and writes it over the network, which was not measured, so such a table
+        // keeps key deletes.
         let adapts = !table_metadata.vortex_config.memory_mode
             && table_metadata.partition_column.is_none()
             && !context.is_coupled_writer()
-            && !table_metadata.vortex_config.cold_tier_enabled();
-        let table_bytes = if adapts
-            && matches!(
-                mode.resolved(has_primary_key),
-                crate::metadata::ResolvedDeletionMode::Adaptive
-            ) {
-            match catalog.table_storage_stats(&table_metadata.table_id).await {
-                Ok(stats) => Some(Self::warm_table_bytes(&stats)),
-                Err(error) => {
-                    tracing::debug!(
-                        target: "cayenne::compaction",
-                        table = table_metadata.table_name.as_str(),
-                        %error,
-                        "Could not size the table for `deletion_mode: auto`; starting it on key deletes"
-                    );
-                    None
-                }
-            }
-        } else {
-            None
-        };
+            && !table_metadata.vortex_config.cold_tier_enabled()
+            && !table_metadata.path.starts_with("s3://");
         PkDeletionMode::for_table(
-            mode,
+            context.deletion_mode(),
             has_primary_key,
             adapts,
-            table_bytes,
             context.target_file_size_bytes(),
         )
     }
 
     /// The on-disk bytes `auto` sizes a table by: the data files of its current
-    /// and protected snapshots, which is what a whole-table rewrite reads.
-    fn warm_table_bytes(stats: &crate::metadata::TableStorageStats) -> u64 {
-        u64::try_from(stats.current_bytes.saturating_add(stats.protected_bytes)).unwrap_or(0)
+    /// and protected snapshots, which is what a whole-table rewrite reads, listed
+    /// from their directories. The metastore's storage figures are not used: they
+    /// still count a protected snapshot that a merge replaced until its
+    /// registration is swept, and read about twice the table during a load.
+    pub(crate) async fn warm_listed_bytes(&self) -> Result<u64> {
+        let files = self
+            .list_compaction_candidate_files_with_sizes(&self.get_current_snapshot_id())
+            .await?;
+        Ok(files
+            .iter()
+            .fold(0_u64, |total, (_, size)| total.saturating_add(*size)))
     }
 
     /// Ask the next compaction trigger to move an `auto` table that outgrew its
@@ -13541,11 +13537,6 @@ impl CayenneTableProvider {
     /// tombstone that the key-mode passes now running keep until a rewrite
     /// applies it.
     fn switch_auto_to_key_deletes(&self) -> bool {
-        self.switch_auto_to_key_deletes_because(&KeyDeletesBecause::Outgrew)
-    }
-
-    /// [`Self::switch_auto_to_key_deletes`], for `because`.
-    fn switch_auto_to_key_deletes_because(&self, because: &KeyDeletesBecause) -> bool {
         let Some(auto) = self.pk_deletion_mode.auto() else {
             return false;
         };
@@ -13566,24 +13557,25 @@ impl CayenneTableProvider {
             }
         };
         self.publish_single_keyset_bytes(keyset_bytes);
-        match because {
-            KeyDeletesBecause::Outgrew => tracing::info!(
+        // The user sees this change only for a table that was kept fully
+        // compacted: a table that passes the bound during its first load was never
+        // rewritten whole, so its reads do not change.
+        if auto.was_kept_compacted() {
+            tracing::info!(
                 target: "cayenne::compaction",
                 "{}",
                 auto_switched_to_key_deletes_message(
                     self.table_metadata.table_name.as_str(),
                     auto.max_position_bytes(),
                 )
-            ),
-            // Not growth, and nothing the user acts on: a whole-table rewrite of a
-            // table that cannot be sized is not known to be cheap, so it takes key
-            // deletes, which is where an unsized table starts at open too.
-            KeyDeletesBecause::Unsized(error) => tracing::debug!(
+            );
+        } else {
+            tracing::debug!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
-                %error,
-                "deletion_mode auto: could not size the table, so it moved to key deletes"
-            ),
+                max_position_bytes = auto.max_position_bytes(),
+                "deletion_mode auto: the table outgrew position deletes before it was rewritten whole; it uses key deletes"
+            );
         }
         true
     }
@@ -20190,24 +20182,32 @@ impl CayenneTableProvider {
         if let Some(auto) = self.pk_deletion_mode.auto()
             && auto.uses_positions()
         {
-            let because = if auto.switch_requested() {
-                Some(KeyDeletesBecause::Outgrew)
+            let outgrew = if auto.switch_requested() {
+                true
             } else {
-                match self
-                    .catalog
-                    .table_storage_stats(&self.table_metadata.table_id)
-                    .await
-                {
-                    Ok(stats) if !auto.fits(Self::warm_table_bytes(&stats)) => {
-                        Some(KeyDeletesBecause::Outgrew)
+                match self.warm_listed_bytes().await {
+                    Ok(table_bytes) => !auto.fits(table_bytes),
+                    // Unsized, the rewrite is not known to be cheap, and an I/O
+                    // error says nothing about the table's size: skip this pass
+                    // and size it again on the next.
+                    Err(error) => {
+                        tracing::debug!(
+                            target: "cayenne::compaction",
+                            table = self.table_metadata.table_name.as_str(),
+                            %error,
+                            "Skipping current-snapshot compaction: could not size the table for `deletion_mode: auto`; will retry on the next trigger",
+                        );
+                        maintenance_metrics::track_compaction(
+                            table_name,
+                            CompactionKind::SubsetCurrent,
+                            CompactionOutcome::DeclinedSizingFailed,
+                        );
+                        return Ok(false);
                     }
-                    Ok(_) => None,
-                    // Unsized, the rewrite is not known to be cheap: take the bake.
-                    Err(error) => Some(KeyDeletesBecause::Unsized(error.to_string())),
                 }
             };
-            if let Some(because) = because {
-                self.switch_auto_to_key_deletes_because(&because);
+            if outgrew {
+                self.switch_auto_to_key_deletes();
             }
         }
         // A deletion-index trigger computed before this pass took `compaction_lock`
@@ -23497,6 +23497,9 @@ impl CayenneTableProvider {
         // Every pass counts, committed or not: the time was spent either way.
         if reclaim && let Some(auto) = self.pk_deletion_mode.auto() {
             auto.record_reclaim(pass_start.elapsed(), Instant::now());
+            if matches!(result, Ok(true)) && auto.uses_positions() {
+                auto.record_kept_compacted();
+            }
         }
         let table = self.table_metadata.table_name.clone();
         let result_label = if result.is_ok() {
@@ -23940,16 +23943,28 @@ impl CayenneTableProvider {
                     total.saturating_add(*size)
                 });
             }
-            let because = match sizing_error {
-                Some(error) => Some(KeyDeletesBecause::Unsized(error)),
-                None if !auto.fits(captured_bytes) => Some(KeyDeletesBecause::Outgrew),
-                None => None,
-            };
-            if let Some(because) = because {
+            if let Some(error) = sizing_error {
+                // An I/O error says nothing about the table's size: decline this
+                // rewrite, keep the mode, and size it again on the next trigger.
+                drop(stream);
+                tracing::debug!(
+                    target: "cayenne::compaction",
+                    table = self.table_metadata.table_name.as_str(),
+                    %error,
+                    "Skipping whole-table reclaim: could not size what it captured; will retry on the next trigger",
+                );
+                maintenance_metrics::track_compaction(
+                    table_name,
+                    CompactionKind::Full,
+                    CompactionOutcome::DeclinedSizingFailed,
+                );
+                return Ok(false);
+            }
+            if !auto.fits(captured_bytes) {
                 drop(stream);
                 // The caller holds `compaction_lock`, as every caller of this
                 // rewrite does.
-                self.switch_auto_to_key_deletes_because(&because);
+                self.switch_auto_to_key_deletes();
                 maintenance_metrics::track_compaction(
                     table_name,
                     CompactionKind::Full,
@@ -40555,17 +40570,9 @@ fn format_bytes_per_sec(bytes_per_sec: f64) -> String {
     }
 }
 
-/// Why `deletion_mode: auto` moved a table from position to key deletes.
-enum KeyDeletesBecause {
-    /// A size check found the table past its position-delete bound.
-    Outgrew,
-    /// The table could not be sized, so a whole-table rewrite was not known to be
-    /// cheap. Carries the error.
-    Unsized(String),
-}
-
 /// The line a table logs, once, when `deletion_mode: auto` moves it from position
-/// to key deletes because it grew past the size it keeps fully compacted.
+/// to key deletes because it grew past the size it keeps fully compacted, after
+/// it had been kept so.
 fn auto_switched_to_key_deletes_message(dataset: &str, max_position_bytes: u64) -> String {
     const MIB: u64 = 1024 * 1024;
     let bound = if max_position_bytes >= MIB && max_position_bytes.is_multiple_of(MIB) {
@@ -40574,7 +40581,7 @@ fn auto_switched_to_key_deletes_message(dataset: &str, max_position_bytes: u64) 
         format!("{} KiB", max_position_bytes.div_ceil(1024))
     };
     format!(
-        "Dataset '{dataset}' grew past {bound} on disk, the largest size at which Cayenne applies its updates and deletes by rewriting it whole, so it now applies them incrementally. See: https://spiceai.org/docs/components/data-accelerators/cayenne#deletion-strategies"
+        "Dataset '{dataset}' grew past {bound} on disk, the largest size Cayenne keeps fully compacted, so its reads now filter recent updates and deletes until background compaction folds them in. See: https://spiceai.org/docs/components/data-accelerators/cayenne#deletion-strategies"
     )
 }
 

@@ -143,11 +143,7 @@ async fn a_small_auto_table_uses_position_deletes_and_a_large_one_key_deletes() 
     let (seeded, catalog, tmp) = table("auto_reopened_large", DeletionMode::Auto, 1).await;
     let ids: Vec<i64> = (0..60_000).collect();
     write_incompressible(&seeded, &ids).await;
-    let stats = catalog
-        .table_storage_stats(&seeded.table_metadata.table_id)
-        .await
-        .expect("storage stats");
-    let bytes = CayenneTableProvider::warm_table_bytes(&stats);
+    let bytes = seeded.warm_listed_bytes().await.expect("size the table");
     assert!(
         bytes > 32 * 1024,
         "premise: the seeded table ({bytes} B) must be past the 32 KiB bound"
@@ -373,7 +369,7 @@ async fn the_switch_to_key_deletes_forgets_captured_positions() {
 async fn an_auto_table_past_its_bound_switches_to_key_deletes() {
     let name = "auto_outgrown";
     // 1 MiB target file size: a 32 KiB bound.
-    let (provider, catalog, _tmp) = table(name, DeletionMode::Auto, 1).await;
+    let (provider, _catalog, _tmp) = table(name, DeletionMode::Auto, 1).await;
     let upserted: Vec<i64> = (0..8).collect();
     let seed: Vec<i64> = (0..16).collect();
     write(&provider, &seed, 100).await;
@@ -386,11 +382,7 @@ async fn an_auto_table_past_its_bound_switches_to_key_deletes() {
     // Grow the table past its bound.
     let grow: Vec<i64> = (1_000..61_000).collect();
     write_incompressible(&provider, &grow).await;
-    let stats = catalog
-        .table_storage_stats(&provider.table_metadata.table_id)
-        .await
-        .expect("storage stats");
-    let bytes = CayenneTableProvider::warm_table_bytes(&stats);
+    let bytes = provider.warm_listed_bytes().await.expect("size the table");
     assert!(
         bytes > 32 * 1024,
         "premise: the grown table ({bytes} B) must be past the 32 KiB bound"
@@ -896,16 +888,106 @@ async fn a_reclaim_leaves_no_reinsert_marker_at_or_below_its_cutoff() {
 fn the_key_deletes_switch_line_names_the_dataset_the_bound_and_the_docs() {
     assert_eq!(
         auto_switched_to_key_deletes_message("orders", 8 * 1024 * 1024),
-        "Dataset 'orders' grew past 8 MiB on disk, the largest size at which Cayenne \
-         applies its updates and deletes by rewriting it whole, so it now applies them \
-         incrementally. See: \
+        "Dataset 'orders' grew past 8 MiB on disk, the largest size Cayenne keeps \
+         fully compacted, so its reads now filter recent updates and deletes until \
+         background compaction folds them in. See: \
          https://spiceai.org/docs/components/data-accelerators/cayenne#deletion-strategies"
     );
     assert_eq!(
         auto_switched_to_key_deletes_message("sales.orders", 32 * 1024),
-        "Dataset 'sales.orders' grew past 32 KiB on disk, the largest size at which \
-         Cayenne applies its updates and deletes by rewriting it whole, so it now \
-         applies them incrementally. See: \
+        "Dataset 'sales.orders' grew past 32 KiB on disk, the largest size Cayenne \
+         keeps fully compacted, so its reads now filter recent updates and deletes \
+         until background compaction folds them in. See: \
          https://spiceai.org/docs/components/data-accelerators/cayenne#deletion-strategies"
     );
+}
+
+/// An auto table is sized by its live snapshot directories, not the metastore's
+/// storage figures. Those still count a protected snapshot that a merge replaced
+/// until its registration is swept: in the timing harness they read a 4.8 MB
+/// table as 9.4 MB during its load and moved it past an 8 MiB bound. A snapshot
+/// the metastore still registers but the table no longer reads stands in for one
+/// here.
+#[tokio::test]
+async fn an_auto_table_is_sized_by_its_live_snapshots_not_the_storage_figures() {
+    let name = "auto_sized_live";
+    // 1 MiB target file size: a 32 KiB bound.
+    let (provider, catalog, _tmp) = table(name, DeletionMode::Auto, 1).await;
+    let auto = Arc::clone(provider.pk_deletion_mode.auto().expect("an auto table"));
+    let keys: Vec<i64> = (0..16).collect();
+    write(&provider, &keys, 100).await;
+    let table_id = provider.table_metadata.table_id.clone();
+    catalog
+        .set_snapshot_sequence(&table_id, "replaced-protected-snapshot", 1)
+        .await
+        .expect("register the replaced snapshot");
+    catalog
+        .upsert_snapshot_file(&crate::metadata::SnapshotFile {
+            table_id: table_id.clone(),
+            snapshot_id: "replaced-protected-snapshot".to_string(),
+            file_path: "replaced.vortex".to_string(),
+            row_count: 1_000,
+            file_size_bytes: 1024 * 1024,
+            min_sequence: 1,
+            max_sequence: 1,
+            digest: None,
+        })
+        .await
+        .expect("register its file");
+    let listed = provider.warm_listed_bytes().await.expect("size the table");
+    let stats = catalog
+        .table_storage_stats(&table_id)
+        .await
+        .expect("storage stats");
+    let counted = u64::try_from(stats.current_bytes + stats.protected_bytes).expect("bytes");
+    let bound = auto.max_position_bytes();
+    assert!(
+        listed <= bound && counted > bound,
+        "premise: the live snapshots ({listed} B) fit the {bound} B bound while the storage figures ({counted} B) do not"
+    );
+
+    assert!(provider.sample_storage_metrics().await, "the sample ran");
+    assert!(
+        !auto.switch_requested() && provider.should_capture_positions(),
+        "a table within its bound stays on position deletes"
+    );
+}
+
+/// Only a table that was kept fully compacted reports outgrowing it at `info`: one
+/// that a whole-table reclaim rewrote while it was on position deletes. A table
+/// that passes the bound before any such reclaim — a large table's first load —
+/// was never rewritten whole, so its reads do not change and it says so only at
+/// `debug`.
+#[tokio::test]
+async fn only_a_table_kept_compacted_reports_outgrowing_it() {
+    for reclaim_first in [false, true] {
+        let name = format!("auto_kept_compacted_{reclaim_first}");
+        // 1 MiB target file size: a 32 KiB bound.
+        let (provider, _catalog, _tmp) = table(&name, DeletionMode::Auto, 1).await;
+        let auto = Arc::clone(provider.pk_deletion_mode.auto().expect("an auto table"));
+        let keys: Vec<i64> = (0..16).collect();
+        write(&provider, &keys, 100).await;
+        if reclaim_first {
+            write(&provider, &keys, 200).await;
+            assert!(
+                provider
+                    .compact_current_snapshot_small_files()
+                    .await
+                    .expect("reclaim pass"),
+                "premise: a whole-table reclaim committed on position deletes"
+            );
+        }
+        let grow: Vec<i64> = (1_000..61_000).collect();
+        write_incompressible(&provider, &grow).await;
+        assert!(
+            provider.warm_listed_bytes().await.expect("size the table") > 32 * 1024,
+            "premise: the table is past its bound"
+        );
+        assert!(provider.switch_auto_to_key_deletes(), "the table switches");
+        assert_eq!(
+            auto.was_kept_compacted(),
+            reclaim_first,
+            "kept compacted exactly when a reclaim rewrote it whole (reclaim first: {reclaim_first})"
+        );
+    }
 }
