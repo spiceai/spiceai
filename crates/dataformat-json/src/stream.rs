@@ -186,8 +186,10 @@ impl<R: Read + Send> ArrayToNdjson<R> {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, e));
             }
             None => {
-                self.eof = true;
-                return Ok(());
+                // A complete array consumes its `]` explicitly. End of input
+                // between elements is truncation, not the end of the array.
+                self.malformed = true;
+                return Err(truncated_array_error());
             }
         }
 
@@ -315,36 +317,49 @@ impl<R: Read + Send> ArrayToNdjson<R> {
         }
     }
 
-    /// Read (and buffer) bytes until we find the first non-whitespace byte,
-    /// then return it **without** removing it from the buffer.
+    /// Read bytes until the first non-whitespace byte and return it without
+    /// removing it from the buffer.
+    ///
+    /// Whitespace before a delimiter is discarded. The next deserializer does
+    /// not replay this buffer, and shifting a kept prefix off one byte at a
+    /// time revisits the whole run for every byte. The scan stops on the
+    /// delimiter, so bytes after it stay in the inner reader.
     fn peek_next_non_ws_byte(&mut self) -> io::Result<u8> {
         let mut tee = match self.shared.lock() {
             Ok(tee) => tee,
             Err(e) => e.into_inner(),
         };
+
+        // serde leaves at most one lookahead byte. A longer prefix is whitespace
+        // already pulled into the buffer, as when an empty array is rejected
+        // only after its spaces have been read. Drop that prefix in one move.
+        if let Some(index) = tee.buf.iter().position(|b| !is_json_whitespace(*b)) {
+            if index > 0 {
+                tee.drain_front(index);
+            }
+            return Ok(tee.buf[0]);
+        }
+        tee.buf.clear();
+
+        let mut byte = [0u8; 1];
         loop {
-            /* -------- 1. look in the bytes we already have -------- */
-            // The element's own bytes have already been drained, so whatever
-            // is left in tee.buf starts just after it: serde's lookahead, plus
-            // anything read here on an earlier pass.
-            if let Some(&b) = tee.buf.iter().find(|b| !is_json_whitespace(**b)) {
-                return Ok(b); // found it – return without consuming
+            match tee.inner.read(&mut byte) {
+                Ok(0) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::UnexpectedEof,
+                        "EOF while peeking next byte",
+                    ));
+                }
+                Ok(_) if is_json_whitespace(byte[0]) => {}
+                Ok(_) => {
+                    tee.buf.push(byte[0]);
+                    return Ok(byte[0]);
+                }
+                // A signal does not say the input ended or that the next byte
+                // is invalid. The tail scan resumes for the same reason.
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                Err(e) => return Err(e),
             }
-
-            /* -------- 2. need more data: read one byte from the source -------- */
-            let mut byte = [0u8; 1];
-            if tee.inner.read(&mut byte)? == 0 {
-                return Err(io::Error::new(
-                    io::ErrorKind::UnexpectedEof,
-                    "EOF while peeking next byte",
-                ));
-            }
-
-            // Keep the rolling buffer in sync so serde can still “see” the byte later.
-            tee.buf.push(byte[0]);
-
-            // Loop: if the byte we just read was whitespace,
-            // we’ll read again until we hit a non-WS byte.
         }
     }
 
@@ -357,22 +372,16 @@ impl<R: Read + Send> ArrayToNdjson<R> {
             Err(e) => e.into_inner(),
         };
 
-        // 1️⃣  Drop leading whitespace that we may have read while peeking.
-        while let Some(&b) = tee.buf.first() {
-            if !is_json_whitespace(b) {
-                break;
-            }
-            tee.drain_front(1);
-        }
-
-        // 2️⃣  Now the first byte must be the delimiter itself.
-        if tee.buf.is_empty() {
+        // One removal. Dropping the prefix a byte at a time shifts the tail on
+        // every byte, so a long whitespace run costs time proportional to its
+        // square.
+        let Some(index) = tee.buf.iter().position(|b| !is_json_whitespace(*b)) else {
             return Err(io::Error::new(
                 io::ErrorKind::UnexpectedEof,
                 "buffer ended while trying to consume delimiter",
             ));
-        }
-        tee.drain_front(1); // discard ',' or ']'
+        };
+        tee.drain_front(index + 1);
 
         Ok(())
     }
@@ -438,6 +447,14 @@ fn first_non_whitespace(bytes: &[u8]) -> Option<u8> {
     bytes.iter().find(|b| !is_json_whitespace(**b)).copied()
 }
 
+/// The error both readers report when the array is still open at end of input.
+fn truncated_array_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        "Failed to read JSON array: the input ended before the closing ']' — the file is truncated. Rows read so far are only part of the file. Re-fetch the complete file, or set the dataset's 'format' to match its contents.",
+    )
+}
+
 /// The error both readers report for content that follows the array's `]`.
 ///
 /// Reaching `]` ends the array but not necessarily the input. A body holding
@@ -487,10 +504,13 @@ fn filter_element_bytes(element_bytes: &[u8], output: &mut VecDeque<u8>) {
 /// Read until (and including) `expect`, skipping a leading UTF-8 BOM and
 /// any ASCII whitespace.
 fn skip_ws_until<R: Read>(r: &mut R, expect: u8) -> io::Result<()> {
+    skip_ws_until_with_bom_state(r, expect, &mut 0)
+}
+
+fn skip_ws_until_with_bom_state<R: Read>(r: &mut R, expect: u8, bom: &mut u8) -> io::Result<()> {
     let mut byte = [0u8; 1];
     // State machine for UTF-8 BOM detection: 0 = initial, 1 = seen 0xEF,
-    // 2 = seen 0xEF 0xBB, 3 = BOM consumed.
-    let mut bom: u8 = 0;
+    // 2 = seen 0xEF 0xBB, 3 = no further BOM allowed.
     loop {
         if r.read(&mut byte)? == 0 {
             return Err(io::Error::new(
@@ -499,18 +519,18 @@ fn skip_ws_until<R: Read>(r: &mut R, expect: u8) -> io::Result<()> {
             ));
         }
         // Try to match a leading UTF-8 BOM before anything else.
-        if bom < 3 {
-            match (bom, byte[0]) {
+        if *bom < 3 {
+            match (*bom, byte[0]) {
                 (0, 0xEF) => {
-                    bom = 1;
+                    *bom = 1;
                     continue;
                 }
                 (1, 0xBB) => {
-                    bom = 2;
+                    *bom = 2;
                     continue;
                 }
                 (2, 0xBF) => {
-                    bom = 3;
+                    *bom = 3;
                     continue;
                 }
                 // Incomplete BOM prefix — the bytes read so far aren't
@@ -526,7 +546,7 @@ fn skip_ws_until<R: Read>(r: &mut R, expect: u8) -> io::Result<()> {
                     ));
                 }
                 _ => {
-                    bom = 3;
+                    *bom = 3;
                 } // No BOM; fall through to normal check
             }
         }
@@ -1099,11 +1119,29 @@ pub struct ArrayToNdjsonPush {
     buffer: Vec<u8>,       // Accumulates pushed bytes
     pending: VecDeque<u8>, // Ready NDJSON output
     state: ParsingState,   // Current parsing state
+    failure: Option<io::Error>,
+    /// First unread byte in `buffer`. Consumed bytes stay put until the
+    /// end of a push, so each element does not copy the tail.
+    buf_start: usize,
+    /// Bytes of `buffer` already classified for the unfinished element.
+    element_at: usize,
+    element_depth: u32,
+    element_in_string: bool,
+    element_escape: bool,
+    element_state: ElementScanState,
+}
+
+#[derive(Debug)]
+enum ElementScanState {
+    NotStarted,
+    SelfDelimited,
+    Scalar,
+    Complete,
 }
 
 #[derive(Debug)]
 enum ParsingState {
-    ExpectingArrayStart,
+    ExpectingArrayStart { bom: u8 },
     ExpectingFirstElement,
     ExpectingElement,
     ExpectingCommaOrClosingBracket,
@@ -1117,7 +1155,14 @@ impl ArrayToNdjsonPush {
         Self {
             buffer: Vec::new(),
             pending: VecDeque::new(),
-            state: ParsingState::ExpectingArrayStart,
+            state: ParsingState::ExpectingArrayStart { bom: 0 },
+            failure: None,
+            buf_start: 0,
+            element_at: 0,
+            element_depth: 0,
+            element_in_string: false,
+            element_escape: false,
+            element_state: ElementScanState::NotStarted,
         }
     }
 
@@ -1125,17 +1170,27 @@ impl ArrayToNdjsonPush {
     ///
     /// # Errors
     ///
-    /// Returns an error if the pushed data contains invalid JSON syntax.
+    /// Returns an error if the pushed data contains invalid JSON syntax or an
+    /// earlier push has failed.
     pub fn push_bytes(&mut self, data: &[u8]) -> io::Result<()> {
+        if let Some(error) = &self.failure {
+            return Err(io::Error::new(error.kind(), error.to_string()));
+        }
         self.buffer.extend_from_slice(data);
-        self.process_buffer()
+        let result = self.process_unread();
+        if let Err(error) = &result {
+            self.failure = Some(io::Error::new(error.kind(), error.to_string()));
+            self.drop_unread();
+        }
+        self.compact_once();
+        result
     }
 
     /// Try to read processed NDJSON data
     ///
     pub fn try_read(&mut self) -> ReadResult {
         if self.pending.is_empty() {
-            if matches!(self.state, ParsingState::Complete) {
+            if self.is_complete() {
                 return ReadResult::Eof;
             }
 
@@ -1156,33 +1211,30 @@ impl ArrayToNdjsonPush {
     /// Check if the adapter has finished processing (reached end of array)
     #[must_use]
     pub fn is_complete(&self) -> bool {
-        matches!(self.state, ParsingState::Complete)
+        self.failure.is_none() && matches!(self.state, ParsingState::Complete)
     }
 
     /// Signal that no more bytes will arrive.
     ///
-    /// Every state other than [`ParsingState::Complete`] means the array was
-    /// still open when the input ran out, so the elements already emitted are
-    /// a prefix of the file rather than the whole of it. Without this call the
-    /// adapter has no end-of-input transition at all: a body cut short mid-way
-    /// simply stops producing rows, and the short result is indistinguishable
-    /// from a complete one.
+    /// An earlier push failure is reported again. An array that is still open
+    /// when the input ends is rejected rather than treated as a complete prefix.
     ///
     /// # Errors
     ///
     /// Returns [`io::ErrorKind::UnexpectedEof`] if the array was never opened
-    /// or never closed.
+    /// or never closed, or preserves the error from an earlier failed push.
     pub fn finish(&self) -> io::Result<()> {
+        if let Some(error) = &self.failure {
+            return Err(io::Error::new(error.kind(), error.to_string()));
+        }
         let detail = match self.state {
             ParsingState::Complete => return self.ensure_only_trailing_whitespace(),
-            ParsingState::ExpectingArrayStart => {
+            ParsingState::ExpectingArrayStart { .. } => {
                 "the input ended before the opening '[' — the body is empty or contains only whitespace"
             }
             ParsingState::ExpectingFirstElement
             | ParsingState::ExpectingElement
-            | ParsingState::ExpectingCommaOrClosingBracket => {
-                "the input ended before the closing ']' — the file is truncated"
-            }
+            | ParsingState::ExpectingCommaOrClosingBracket => return Err(truncated_array_error()),
         };
 
         Err(io::Error::new(
@@ -1193,21 +1245,47 @@ impl ArrayToNdjsonPush {
         ))
     }
 
-    /// Process accumulated buffer data using `serde_json::StreamDeserializer`
+    fn unread(&self) -> &[u8] {
+        &self.buffer[self.buf_start..]
+    }
+
+    fn consume_front(&mut self, n: usize) {
+        self.buf_start += n;
+    }
+
+    fn drop_unread(&mut self) {
+        self.buffer.clear();
+        self.buf_start = 0;
+        self.element_at = 0;
+    }
+
+    /// Move unread bytes to the front once. Doing this per element copies the
+    /// tail once per element; doing it per push copies it once.
+    fn compact_once(&mut self) {
+        if self.buf_start == 0 {
+            return;
+        }
+        let start = self.buf_start;
+        self.buffer.drain(..start);
+        self.element_at = self.element_at.saturating_sub(start);
+        self.buf_start = 0;
+    }
+
+    /// Process accumulated buffer data using `serde_json::StreamDeserializer`.
     #[expect(clippy::cast_possible_truncation)]
-    fn process_buffer(&mut self) -> io::Result<()> {
+    fn process_unread(&mut self) -> io::Result<()> {
         if matches!(self.state, ParsingState::Complete) {
             return self.take_trailing_whitespace();
         }
 
         // Skip whitespace and consume opening bracket if not done yet
-        if matches!(self.state, ParsingState::ExpectingArrayStart) {
-            let mut cursor = io::Cursor::new(&self.buffer);
-            match skip_ws_until(&mut cursor, b'[') {
+        if let ParsingState::ExpectingArrayStart { bom } = &mut self.state {
+            let mut cursor = io::Cursor::new(&self.buffer[self.buf_start..]);
+            match skip_ws_until_with_bom_state(&mut cursor, b'[', bom) {
                 Ok(()) => {
                     let consumed = cursor.position() as usize;
-                    if consumed <= self.buffer.len() {
-                        self.buffer.drain(..consumed);
+                    if consumed <= self.unread().len() {
+                        self.consume_front(consumed);
                         self.state = ParsingState::ExpectingFirstElement;
                     }
                 }
@@ -1215,7 +1293,12 @@ impl ArrayToNdjsonPush {
                 // more bytes. Any other error means the payload is not a JSON
                 // array at all — an NDJSON or object body read as one is a
                 // configuration mistake, not a short read.
-                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
+                Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
+                    // BOM progress stays in the parser state, so no checked
+                    // prologue bytes need to be retained or scanned again.
+                    self.drop_unread();
+                    return Ok(());
+                }
                 Err(e) => return Err(e),
             }
         }
@@ -1223,17 +1306,17 @@ impl ArrayToNdjsonPush {
         loop {
             match self.state {
                 ParsingState::ExpectingFirstElement => {
-                    if self.buffer.is_empty() {
+                    if self.unread().is_empty() {
                         return Ok(());
                     }
 
-                    let mut cursor = io::Cursor::new(&self.buffer);
+                    let mut cursor = io::Cursor::new(self.unread());
                     // If the buffer contains only a closing bracket and we're expecting a first element, we're done
                     match Self::next_non_ws_byte(&mut cursor) {
                         Ok(b']') => {
                             // End of array
                             let consumed = cursor.position() as usize;
-                            self.buffer.drain(..consumed);
+                            self.consume_front(consumed);
                             self.state = ParsingState::Complete;
                             return self.take_trailing_whitespace();
                         }
@@ -1242,28 +1325,29 @@ impl ArrayToNdjsonPush {
                             self.state = ParsingState::ExpectingElement;
                         }
                         Err(_) => {
+                            self.discard_leading_whitespace();
                             return Ok(());
                         }
                     }
                 }
                 ParsingState::ExpectingElement => {
-                    let cursor = io::Cursor::new(&self.buffer);
+                    if matches!(self.element_state, ElementScanState::NotStarted) {
+                        self.discard_leading_whitespace();
+                        if self.unread().is_empty() {
+                            return Ok(());
+                        }
+                    }
+                    // An unfinished element is classified once. serde runs when
+                    // the closing byte arrives, not on every earlier chunk.
+                    if !self.advance_element_scan() {
+                        return Ok(());
+                    }
+                    let cursor = io::Cursor::new(self.unread());
                     let mut stream = Deserializer::from_reader(cursor).into_iter::<Box<RawValue>>();
                     match stream.next() {
                         Some(Ok(element)) => {
                             // Calculate how many bytes were consumed
                             let consumed = stream.byte_offset();
-
-                            // A scalar has no closing delimiter, so serde ends
-                            // it at the end of the buffer and reports success:
-                            // `[123` yields `123` even though the next push
-                            // could make it `123456`. Emitting now would emit a
-                            // value the file never contained. Objects, arrays
-                            // and strings all end on a delimiter, so only a
-                            // scalar running to the buffer's end is ambiguous.
-                            if consumed == self.buffer.len() && self.may_be_truncated() {
-                                return Ok(());
-                            }
 
                             // Successfully parsed an element
                             let element_bytes = element.get().as_bytes();
@@ -1271,30 +1355,16 @@ impl ArrayToNdjsonPush {
                             // Filter and add to pending
                             filter_element_bytes(element_bytes, &mut self.pending);
 
-                            self.buffer.drain(..consumed);
+                            self.consume_front(consumed);
+                            self.reset_element_scan();
 
                             self.state = ParsingState::ExpectingCommaOrClosingBracket;
                         }
                         Some(Err(e)) => {
-                            // Waiting on every error drops the malformed element
-                            // and every one after it: each later push re-parses
-                            // the same bytes from the same offset and fails the
-                            // same way, so nothing is ever emitted again.
-                            //
-                            // `Category::Eof` is most of the "the buffer stops
-                            // part-way through an element" case — a truncated
-                            // object, string or literal — but not all of it. A
-                            // buffer ending inside a numeric literal (`-`, `1.`,
-                            // `1e`) is reported as `Category::Syntax`, because
-                            // what serde has read is not a number and it cannot
-                            // know more is coming. So a syntax error only counts
-                            // as malformed once the buffer ends on a byte that
-                            // no continuation could extend into a value.
-                            if e.classify() == Category::Eof || self.may_be_truncated() {
-                                return Ok(());
-                            }
-
-                            // This is a real syntax error
+                            // The scan already found the element's closing byte,
+                            // so another chunk cannot turn this verdict into a
+                            // different one. Waiting and parsing again would
+                            // repeat the same failure on every later push.
                             return Err(io::Error::new(io::ErrorKind::InvalidData, e));
                         }
                         None => {
@@ -1304,18 +1374,18 @@ impl ArrayToNdjsonPush {
                     }
                 }
                 ParsingState::ExpectingCommaOrClosingBracket => {
-                    let mut cursor = io::Cursor::new(&self.buffer);
+                    let mut cursor = io::Cursor::new(self.unread());
                     match Self::next_non_ws_byte(&mut cursor) {
                         Ok(b',') => {
                             // Consume comma and continue
                             let consumed = cursor.position() as usize;
-                            self.buffer.drain(..consumed);
+                            self.consume_front(consumed);
                             self.state = ParsingState::ExpectingElement;
                         }
                         Ok(b']') => {
                             // End of array
                             let consumed = cursor.position() as usize;
-                            self.buffer.drain(..consumed);
+                            self.consume_front(consumed);
                             self.state = ParsingState::Complete;
                             return self.take_trailing_whitespace();
                         }
@@ -1326,7 +1396,9 @@ impl ArrayToNdjsonPush {
                             ));
                         }
                         Err(_) => {
-                            // Not enough data to determine what's next
+                            // The delimiter has not arrived. The bytes checked
+                            // are whitespace; keep them from being scanned again.
+                            self.discard_leading_whitespace();
                             return Ok(());
                         }
                     }
@@ -1355,7 +1427,7 @@ impl ArrayToNdjsonPush {
     /// become anything else, so nothing is lost by discarding it.
     fn take_trailing_whitespace(&mut self) -> io::Result<()> {
         self.ensure_only_trailing_whitespace()?;
-        self.buffer.clear();
+        self.drop_unread();
         Ok(())
     }
 
@@ -1363,34 +1435,120 @@ impl ArrayToNdjsonPush {
     /// rather than accumulated.
     #[cfg(test)]
     fn buffered_len(&self) -> usize {
-        self.buffer.len()
+        self.unread().len()
     }
 
     fn ensure_only_trailing_whitespace(&self) -> io::Result<()> {
-        match first_non_whitespace(&self.buffer) {
+        match first_non_whitespace(self.unread()) {
             Some(byte) => Err(trailing_content_error(byte)),
             None => Ok(()),
         }
     }
 
-    /// Whether the buffer ends part-way through a token, so that bytes still
-    /// to arrive could change how it parses.
+    /// Drop JSON whitespace this scan has already checked.
     ///
-    /// Only scalars need this. A truncated object, array or string leaves
-    /// serde inside a structure it knows is unterminated, which it reports as
-    /// `Category::Eof`; a truncated number or literal looks to serde like a
-    /// complete but invalid value, and is reported as `Category::Syntax`. The
-    /// bytes those tokens are built from are exactly the ones tested here, so
-    /// a buffer ending on any other byte — `]`, `}`, `,` — has stopped at a
-    /// boundary no continuation can move.
-    fn may_be_truncated(&self) -> bool {
-        self.buffer
-            .last()
-            .is_some_and(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'+' | b'.'))
+    /// A later push appends and scans from the front of the buffer. Leaving a
+    /// checked run there makes every new chunk revisit it.
+    fn discard_leading_whitespace(&mut self) {
+        let start = self
+            .unread()
+            .iter()
+            .position(|byte| !is_json_whitespace(*byte));
+        let Some(start) = start else {
+            self.drop_unread();
+            return;
+        };
+        if start > 0 {
+            self.consume_front(start);
+        }
+        if matches!(self.element_state, ElementScanState::NotStarted) {
+            self.element_at = self.buf_start;
+        }
+    }
+
+    fn reset_element_scan(&mut self) {
+        self.element_at = self.buf_start;
+        self.element_depth = 0;
+        self.element_in_string = false;
+        self.element_escape = false;
+        self.element_state = ElementScanState::NotStarted;
+    }
+
+    /// Classify newly arrived bytes of the current element.
+    ///
+    /// Returns whether the element has its closing byte. Bytes already
+    /// classified are not read again. A scalar stays open until a byte that
+    /// cannot extend it arrives, and that byte is left for the delimiter scan.
+    fn advance_element_scan(&mut self) -> bool {
+        if matches!(self.element_state, ElementScanState::Complete) {
+            return true;
+        }
+        while self.element_at < self.buffer.len() {
+            let byte = self.buffer[self.element_at];
+            if matches!(self.element_state, ElementScanState::NotStarted) {
+                self.element_state = ElementScanState::SelfDelimited;
+                self.element_at += 1;
+                match byte {
+                    b'{' | b'[' => self.element_depth = 1,
+                    b'"' => self.element_in_string = true,
+                    b'-' | b'0'..=b'9' | b't' | b'f' | b'n' => {
+                        self.element_state = ElementScanState::Scalar;
+                    }
+                    // `]`, `,`, or other junk is not a value. serde reports it
+                    // on this push; waiting would hide a trailing comma.
+                    _ => {
+                        self.element_state = ElementScanState::Complete;
+                        return true;
+                    }
+                }
+                continue;
+            }
+            if self.element_in_string {
+                self.element_at += 1;
+                if self.element_escape {
+                    self.element_escape = false;
+                    continue;
+                }
+                if byte == b'\\' {
+                    self.element_escape = true;
+                    continue;
+                }
+                if byte == b'"' {
+                    self.element_in_string = false;
+                    if self.element_depth == 0 {
+                        self.element_state = ElementScanState::Complete;
+                        return true;
+                    }
+                }
+                continue;
+            }
+            if matches!(self.element_state, ElementScanState::Scalar) {
+                if byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.') {
+                    self.element_at += 1;
+                    continue;
+                }
+                self.element_state = ElementScanState::Complete;
+                return true;
+            }
+            self.element_at += 1;
+            match byte {
+                b'"' => self.element_in_string = true,
+                b'{' | b'[' => self.element_depth += 1,
+                b'}' | b']' => {
+                    self.element_depth -= 1;
+                    if self.element_depth == 0 {
+                        self.element_state = ElementScanState::Complete;
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
     }
 
     /// Get the next non-whitespace byte
-    fn next_non_ws_byte(cursor: &mut io::Cursor<&Vec<u8>>) -> io::Result<u8> {
+    fn next_non_ws_byte(cursor: &mut io::Cursor<&[u8]>) -> io::Result<u8> {
         let mut byte = [0u8; 1];
         loop {
             if cursor.read(&mut byte)? == 0 {
@@ -2230,16 +2388,8 @@ mod tests {
             }
         }
 
-        /// The other half of the fix: a buffer that merely stops part-way
-        /// through an element is still "wait for more bytes".
-        ///
-        /// The whole fix rests on `Category::Eof` covering every incomplete
-        /// buffer, so this splits each body at every byte offset — including
-        /// offsets inside an escape sequence and inside a multi-byte UTF-8
-        /// character, where a misclassification would turn a valid streamed
-        /// read into a spurious hard error. Splitting on bytes rather than
-        /// `char`s is deliberate: a chunk boundary from an object store lands
-        /// wherever it lands.
+        /// An unfinished element waits across every byte split, including
+        /// splits inside escape sequences and multi-byte UTF-8 characters.
         #[test]
         fn a_truncated_element_still_waits_for_more_bytes() {
             for (body, expected) in [
@@ -2310,11 +2460,8 @@ mod tests {
             }
         }
 
-        /// `Category::Eof` does not cover every incomplete buffer: serde
-        /// reports a buffer that stops inside a numeric literal as a syntax
-        /// error, because what it has read is not a number. Treating every
-        /// syntax error as fatal would therefore fail a valid array whose
-        /// chunk boundary happened to land mid-number.
+        /// Incomplete literals wait for more bytes; an invalid literal in a
+        /// closed element fails on the push that closes it.
         #[test]
         fn a_syntax_error_at_a_truncation_boundary_waits_for_more_bytes() {
             for head in [
@@ -2545,6 +2692,56 @@ mod tests {
             }
             assert_eq!(read_all_push(&mut adapter), vec![r#"{"a":1}"#.to_string()]);
             assert!(adapter.is_complete());
+        }
+
+        #[test]
+        fn prologue_validity_does_not_depend_on_push_boundaries() {
+            for prologue in [
+                &b""[..],
+                &b" \t\r\n"[..],
+                &UTF8_BOM[..],
+                &b"\xEF\xBB\xBF \t\r\n"[..],
+                &b"\xEF\xBB\xBF\xEF\xBB\xBF"[..],
+                &b" \xEF\xBB\xBF"[..],
+                &b"\xEF\xBB\xBF \xEF\xBB\xBF"[..],
+                &b"\xEF"[..],
+                &b"\xEF\xBB"[..],
+            ] {
+                let mut body = prologue.to_vec();
+                body.extend_from_slice(br#"[{"a":1}]"#);
+                // The supported BOM is a single prefix at byte zero. Let serde
+                // judge the remaining document independently of the adapter.
+                let expected = serde_json::from_slice::<Vec<serde_json::Value>>(
+                    body.strip_prefix(&UTF8_BOM).unwrap_or(&body),
+                );
+                for first in 0..=body.len() {
+                    for second in first..=body.len() {
+                        let mut adapter = ArrayToNdjsonPush::new();
+                        let result = adapter
+                            .push_bytes(&body[..first])
+                            .and_then(|()| adapter.push_bytes(&body[first..second]))
+                            .and_then(|()| adapter.push_bytes(&body[second..]))
+                            .and_then(|()| adapter.finish());
+                        if let Ok(expected) = &expected {
+                            result.unwrap_or_else(|error| {
+                                panic!(
+                                    "valid prologue {prologue:?}, splits {first}/{second}: {error}"
+                                )
+                            });
+                            let actual: Vec<serde_json::Value> = read_all_push(&mut adapter)
+                                .iter()
+                                .map(|row| serde_json::from_str(row).expect("valid output row"))
+                                .collect();
+                            assert_eq!(&actual, expected);
+                            assert_eq!(adapter.try_read(), ReadResult::Eof);
+                        } else {
+                            let error = result.expect_err("misplaced or malformed BOM");
+                            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                            assert_eq!(adapter.try_read(), ReadResult::NotReady);
+                        }
+                    }
+                }
+            }
         }
 
         /// A `json_format: array` dataset pointed at an NDJSON or object body
@@ -4543,10 +4740,6 @@ mod tests {
 
         /// An array cut short mid-scalar has no closing `]`, and must be
         /// reported rather than read as a complete one.
-        ///
-        /// A body ending on the separator instead — `[1,` — is the separate
-        /// truncation gap tracked by #12755, which the reader shares with
-        /// object elements (`[{"a":1},`) and is not scalar-specific.
         #[test]
         fn a_truncated_array_is_still_reported() {
             for body in [&br"[1,2"[..], &br"[1"[..], &br"[1.5"[..]] {
@@ -4567,6 +4760,23 @@ mod tests {
                     "{} must be reported as cut short",
                     String::from_utf8_lossy(body)
                 );
+            }
+        }
+
+        /// End of input while the next element has not started is still an open
+        /// array. `[` and `[1,` must not read as an empty or one-row result.
+        #[test]
+        fn an_open_array_at_end_of_input_is_reported() {
+            for (body, reads_before_failure) in [
+                (&b"["[..], 0),
+                (&b"[ \n\t"[..], 0),
+                (&br"[1,"[..], 1),
+                (&br#"[{"a":1},"#[..], 1),
+            ] {
+                let err = ndjson_lines(body).expect_err("an open array must not read clean");
+                assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+                assert!(err.to_string().contains("before the closing ']'"));
+                assert_stays_failed(body, reads_before_failure);
             }
         }
 
@@ -4889,6 +5099,171 @@ mod tests {
                 vec!["1"]
             );
         }
+
+        /// A reader that returns at most `chunk` bytes, so a scan that pulls
+        /// past a delimiter cannot hide behind `Cursor`'s large reads.
+        struct Chunked {
+            body: Vec<u8>,
+            at: usize,
+            chunk: usize,
+        }
+
+        impl Read for Chunked {
+            fn read(&mut self, dst: &mut [u8]) -> io::Result<usize> {
+                if self.at >= self.body.len() || dst.is_empty() {
+                    return Ok(0);
+                }
+                let n = self.chunk.min(dst.len()).min(self.body.len() - self.at);
+                dst[..n].copy_from_slice(&self.body[self.at..self.at + n]);
+                self.at += n;
+                Ok(n)
+            }
+        }
+
+        fn lines_from(body: &[u8], chunk: usize) -> io::Result<Vec<String>> {
+            let mut out = String::new();
+            ArrayToNdjson::try_new(Chunked {
+                body: body.to_vec(),
+                at: 0,
+                chunk,
+            })?
+            .read_to_string(&mut out)?;
+            Ok(out.lines().map(ToOwned::to_owned).collect())
+        }
+
+        /// Delimiter whitespace is not an element and not trailing content.
+        /// The bytes after the run still decide the verdict: the next row, the
+        /// closing bracket, or a byte that does not belong to the array.
+        #[test]
+        fn whitespace_before_a_delimiter_keeps_the_bytes_after_it() {
+            let gap = b" \t\r\n".repeat(64);
+            let mut between = br#"[{"a":1}"#.to_vec();
+            between.extend_from_slice(&gap);
+            between.push(b',');
+            between.extend_from_slice(&gap);
+            between.extend_from_slice(br#"{"b":2}]"#);
+            let mut number = br"[1".to_vec();
+            number.extend_from_slice(&gap);
+            number.extend_from_slice(br",2]");
+            let mut trailing = br#"[{"a":1}"#.to_vec();
+            trailing.extend_from_slice(&gap);
+            trailing.extend_from_slice(br"]x");
+            let mut open = br#"[{"a":1}"#.to_vec();
+            open.extend_from_slice(&gap);
+            let mut empty = vec![b'['];
+            empty.extend_from_slice(&gap);
+            empty.push(b']');
+
+            for chunk in [1_usize, 2, 3, 7, 64, 4096] {
+                assert_eq!(
+                    lines_from(&between, chunk).expect("gap between elements"),
+                    vec![r#"{"a":1}"#, r#"{"b":2}"#],
+                    "chunk {chunk}"
+                );
+                assert_eq!(
+                    lines_from(&number, chunk).expect("gap after a number"),
+                    vec!["1", "2"],
+                    "chunk {chunk}"
+                );
+                assert!(
+                    lines_from(&empty, chunk)
+                        .expect("gap in an empty array")
+                        .is_empty(),
+                    "chunk {chunk}"
+                );
+                let err = lines_from(&trailing, chunk)
+                    .expect_err("content after the gap must not be dropped");
+                assert!(
+                    err.to_string().contains("after the closing ']'"),
+                    "chunk {chunk}: {err}"
+                );
+                let err = lines_from(&open, chunk)
+                    .expect_err("a gap with no delimiter is still a short read");
+                assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof, "chunk {chunk}");
+                assert_eq!(
+                    err.to_string(),
+                    "EOF while peeking next byte",
+                    "chunk {chunk}"
+                );
+            }
+            // The row is withheld: a later read must not turn the failure into
+            // a clean end, and must not hand the element back.
+            super::bare_scalar_elements::assert_stays_failed(&open, 0);
+            super::bare_scalar_elements::assert_stays_failed(&trailing, 0);
+
+            // Form feed is not JSON whitespace on this scan either.
+            let mut form_feed = br#"[{"a":1}"#.to_vec();
+            form_feed.push(0x0c);
+            form_feed.push(b']');
+            let err = lines_from(&form_feed, 3)
+                .expect_err("form feed cannot separate an element from its delimiter");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(err.to_string(), "expected ',' or ']' but found '\u{c}'");
+        }
+
+        /// The delimiter scan reads the source itself, so a signal there is
+        /// not a verdict on the body.
+        #[test]
+        fn an_interrupted_delimiter_scan_is_resumed() {
+            let interrupted = |body: &[u8]| {
+                let mut out = String::new();
+                ArrayToNdjson::try_new(InterruptsEveryRead {
+                    body: body.to_vec(),
+                    at: 0,
+                    interrupt_next: false,
+                })?
+                .read_to_string(&mut out)?;
+                Ok::<_, io::Error>(out.lines().map(ToOwned::to_owned).collect::<Vec<_>>())
+            };
+
+            assert_eq!(
+                interrupted(b"[{} \t\r\n ]").expect("whitespace before ']' must still parse"),
+                vec!["{}"]
+            );
+            let err = interrupted(b"[{} \t\r\n ]x")
+                .expect_err("trailing content behind an interrupted scan must be reported");
+            assert!(
+                err.to_string().contains("after the closing ']'"),
+                "expected the trailing-content verdict, got: {err}"
+            );
+        }
+
+        /// Skipping delimiter whitespace has to be linear in the run. The
+        /// limit is wide enough for an unoptimized build and still smaller
+        /// than a scan that revisits the run for every byte.
+        #[test]
+        fn a_long_run_of_delimiter_whitespace_is_skipped() {
+            const SPACES: usize = 8 * 1024 * 1024;
+            let limit = std::time::Duration::from_secs(120);
+
+            let mut between = br#"[{"a":1}"#.to_vec();
+            between.resize(between.len() + SPACES, b' ');
+            between.extend_from_slice(br#",{"b":2}]"#);
+            let started = std::time::Instant::now();
+            let lines = ndjson_lines(&between).expect("whitespace before ',' must still parse");
+            let elapsed = started.elapsed();
+            assert_eq!(lines, vec![r#"{"a":1}"#, r#"{"b":2}"#]);
+            assert!(
+                elapsed < limit,
+                "skipping {SPACES} delimiter bytes took {elapsed:?}"
+            );
+            eprintln!("delimiter whitespace {SPACES} bytes: {elapsed:?}");
+
+            let mut empty = Vec::with_capacity(SPACES + 2);
+            empty.push(b'[');
+            empty.resize(empty.len() + SPACES, b' ');
+            empty.push(b']');
+            let started = std::time::Instant::now();
+            let lines =
+                ndjson_lines(&empty).expect("whitespace in an empty array must still parse");
+            let elapsed = started.elapsed();
+            assert!(lines.is_empty());
+            assert!(
+                elapsed < limit,
+                "skipping {SPACES} empty-array bytes took {elapsed:?}"
+            );
+            eprintln!("empty-array whitespace {SPACES} bytes: {elapsed:?}");
+        }
     }
 
     // ----------------------------------------------------------------
@@ -4902,6 +5277,224 @@ mod tests {
     fn load_fixture(name: &str) -> Vec<u8> {
         let path = format!("{TEST_DATA_DIR}{name}");
         std::fs::read(&path).unwrap_or_else(|e| panic!("Failed to read fixture {path}: {e}"))
+    }
+
+    fn push_chunked(body: &[u8], chunk: usize) -> io::Result<Vec<String>> {
+        let mut adapter = ArrayToNdjsonPush::new();
+        let started = std::time::Instant::now();
+        for piece in body.chunks(chunk) {
+            adapter.push_bytes(piece)?;
+        }
+        adapter.finish()?;
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "chunk {chunk} took {elapsed:?}"
+        );
+        let mut out = String::new();
+        while let ReadResult::Ready(data) = adapter.try_read() {
+            out.push_str(&String::from_utf8_lossy(&data));
+        }
+        Ok(out.lines().map(ToOwned::to_owned).collect())
+    }
+
+    /// Whitespace before a pushed delimiter is not part of the row. Skipping
+    /// it has to stay linear when the bytes arrive a chunk at a time.
+    #[test]
+    fn push_reader_skips_delimiter_whitespace_without_revisiting_it() {
+        let mut between = br#"[{"a":1}"#.to_vec();
+        between.resize(between.len() + 1024 * 1024, b' ');
+        between.extend_from_slice(br#",{"b":2}]"#);
+        assert_eq!(
+            push_chunked(&between, 4096).expect("gap before comma"),
+            vec![r#"{"a":1}"#, r#"{"b":2}"#]
+        );
+
+        let mut empty = vec![b'['];
+        empty.resize(empty.len() + 1024 * 1024, b' ');
+        empty.push(b']');
+        assert!(
+            push_chunked(&empty, 4096)
+                .expect("gap in an empty array")
+                .is_empty()
+        );
+
+        let mut small = br"[1".to_vec();
+        small.extend_from_slice(&b" \t\r\n".repeat(32));
+        small.extend_from_slice(br",2]");
+        assert_eq!(
+            push_chunked(&small, 1).expect("one-byte chunks"),
+            vec!["1", "2"]
+        );
+    }
+
+    /// An element that arrives a chunk at a time is parsed when it closes,
+    /// not from its first byte on every earlier chunk. A completed element is
+    /// still available on the push that closed it.
+    #[test]
+    fn push_reader_parses_a_closed_element_once() {
+        let mut split = ArrayToNdjsonPush::new();
+        split.push_bytes(br#"[{"a":"#).expect("first push");
+        split.push_bytes(br#"1},{"b":2}]"#).expect("closing push");
+        let mut out = String::new();
+        while let ReadResult::Ready(data) = split.try_read() {
+            out.push_str(&String::from_utf8_lossy(&data));
+        }
+        split.finish().expect("split finish");
+        let values: Vec<serde_json::Value> = out
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("row"))
+            .collect();
+        assert_eq!(values[0]["a"], 1);
+        assert_eq!(values[1]["b"], 2);
+
+        let mut body = br#"[{"a":1"#.to_vec();
+        body.extend(std::iter::repeat_n(b' ', 1024 * 1024));
+        body.extend_from_slice(br#"},{"b":2}]"#);
+        let mut adapter = ArrayToNdjsonPush::new();
+        let started = std::time::Instant::now();
+        for piece in body.chunks(4096) {
+            adapter.push_bytes(piece).expect("push");
+        }
+        let elapsed = started.elapsed();
+        adapter.finish().expect("finish");
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "closed element took {elapsed:?}"
+        );
+        let mut out = String::new();
+        while let ReadResult::Ready(data) = adapter.try_read() {
+            out.push_str(&String::from_utf8_lossy(&data));
+        }
+        let values: Vec<serde_json::Value> = out
+            .lines()
+            .map(|line| serde_json::from_str(line).expect("row"))
+            .collect();
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0]["a"], 1);
+        assert_eq!(values[1]["b"], 2);
+        eprintln!("closed element 1 MiB elapsed={elapsed:?}");
+    }
+
+    /// A closed element that serde rejects is reported on that push.
+    /// Later chunks must not parse the same element again.
+    #[test]
+    fn push_reader_reports_a_rejected_element_without_reparsing_it() {
+        let mut body = br#"[{"k":""#.to_vec();
+        body.extend(std::iter::repeat_n(b'a', 1024 * 1024));
+        body.extend_from_slice(br#""x}"#);
+        body.extend(std::iter::repeat_n(b'a', 1024 * 1024));
+        body.push(b']');
+        let mut adapter = ArrayToNdjsonPush::new();
+        let started = std::time::Instant::now();
+        let mut first_error: Option<io::Error> = None;
+        for piece in body.chunks(4096) {
+            let result = adapter.push_bytes(piece);
+            if let Some(expected) = &first_error {
+                let err = result.expect_err("later chunks must preserve the failure");
+                assert_eq!(err.kind(), expected.kind());
+                assert_eq!(err.to_string(), expected.to_string());
+                assert_eq!(
+                    adapter.buffered_len(),
+                    0,
+                    "failed input must not accumulate"
+                );
+            } else if let Err(err) = result {
+                assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+                first_error = Some(err);
+            }
+        }
+        let elapsed = started.elapsed();
+        let first_error = first_error.expect("the rejected element must be reported");
+        let err = adapter
+            .finish()
+            .expect_err("finish must preserve the failure");
+        assert_eq!(err.kind(), first_error.kind());
+        assert_eq!(err.to_string(), first_error.to_string());
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "rejected element took {elapsed:?}"
+        );
+        eprintln!("rejected element 1 MiB elapsed={elapsed:?}");
+    }
+
+    #[test]
+    fn push_reader_preserves_the_first_error_after_later_pushes() {
+        for (body, expected_rows) in [
+            (&b"x"[..], ReadResult::NotReady),
+            (
+                &br#"[{"id":1},{"broken":}]"#[..],
+                ReadResult::Ready(b"{\"id\":1}\n".to_vec()),
+            ),
+            (
+                &br#"[{"id":1}x]"#[..],
+                ReadResult::Ready(b"{\"id\":1}\n".to_vec()),
+            ),
+            (
+                &br#"[{"id":1}]x"#[..],
+                ReadResult::Ready(b"{\"id\":1}\n".to_vec()),
+            ),
+        ] {
+            let mut adapter = ArrayToNdjsonPush::new();
+            let first = adapter.push_bytes(body).expect_err("invalid JSON input");
+            assert_eq!(first.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(adapter.try_read(), expected_rows);
+            for later in [&b""[..], &b"[]"[..], &br#",{"id":2}]"#[..]] {
+                let err = adapter
+                    .push_bytes(later)
+                    .expect_err("a failed adapter cannot resume parsing");
+                assert_eq!(err.kind(), first.kind());
+                assert_eq!(err.to_string(), first.to_string());
+                assert_eq!(adapter.buffered_len(), 0);
+                assert_eq!(adapter.try_read(), ReadResult::NotReady);
+                assert!(!adapter.is_complete());
+            }
+            let err = adapter
+                .finish()
+                .expect_err("finish must preserve the failure");
+            assert_eq!(err.kind(), first.kind());
+            assert_eq!(err.to_string(), first.to_string());
+        }
+    }
+
+    /// One push of many small elements must not copy the tail once per element.
+    #[test]
+    fn push_reader_does_not_copy_the_tail_once_per_element() {
+        let elem = br#"{"id":1},"#;
+        let mut body = vec![b'['];
+        while body.len() + elem.len() + 1 < 2 * 1024 * 1024 {
+            body.extend_from_slice(elem);
+        }
+        if body.last() == Some(&b',') {
+            body.pop();
+        }
+        body.push(b']');
+        let expected_rows = (body.len() - 1) / elem.len();
+        for chunk_size in [body.len(), 4096] {
+            let mut adapter = ArrayToNdjsonPush::new();
+            let started = std::time::Instant::now();
+            for chunk in body.chunks(chunk_size) {
+                adapter.push_bytes(chunk).expect("push array chunk");
+            }
+            adapter.finish().expect("finish");
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed < std::time::Duration::from_secs(2),
+                "chunk size {chunk_size} took {elapsed:?}"
+            );
+            eprintln!("2 MiB chunk_size={chunk_size} elapsed={elapsed:?}");
+            let ReadResult::Ready(rows) = adapter.try_read() else {
+                panic!("expected all rows before end of stream");
+            };
+            assert_eq!(rows.len(), expected_rows * elem.len());
+            assert!(
+                rows.chunks_exact(elem.len())
+                    .all(|row| row == b"{\"id\":1}\n"),
+                "emitted row differs from input"
+            );
+            assert!(matches!(adapter.try_read(), ReadResult::Eof));
+            assert_eq!(adapter.buffered_len(), 0);
+        }
     }
 
     mod file_jsonl_tests {
