@@ -1124,9 +1124,15 @@ pub struct ArrayToNdjsonPush {
     element_depth: u32,
     element_in_string: bool,
     element_escape: bool,
-    element_started: bool,
-    element_scalar: bool,
-    element_complete: bool,
+    element_state: ElementScanState,
+}
+
+#[derive(Debug)]
+enum ElementScanState {
+    NotStarted,
+    SelfDelimited,
+    Scalar,
+    Complete,
 }
 
 #[derive(Debug)]
@@ -1151,9 +1157,7 @@ impl ArrayToNdjsonPush {
             element_depth: 0,
             element_in_string: false,
             element_escape: false,
-            element_started: false,
-            element_scalar: false,
-            element_complete: false,
+            element_state: ElementScanState::NotStarted,
         }
     }
 
@@ -1315,7 +1319,7 @@ impl ArrayToNdjsonPush {
                     }
                 }
                 ParsingState::ExpectingElement => {
-                    if !self.element_started {
+                    if matches!(self.element_state, ElementScanState::NotStarted) {
                         self.discard_leading_whitespace();
                         if self.unread().is_empty() {
                             return Ok(());
@@ -1467,7 +1471,7 @@ impl ArrayToNdjsonPush {
         if start > 0 {
             self.consume_front(start);
         }
-        if !self.element_started {
+        if matches!(self.element_state, ElementScanState::NotStarted) {
             self.element_at = self.buf_start;
         }
     }
@@ -1477,9 +1481,7 @@ impl ArrayToNdjsonPush {
         self.element_depth = 0;
         self.element_in_string = false;
         self.element_escape = false;
-        self.element_started = false;
-        self.element_scalar = false;
-        self.element_complete = false;
+        self.element_state = ElementScanState::NotStarted;
     }
 
     /// Classify newly arrived bytes of the current element.
@@ -1488,22 +1490,24 @@ impl ArrayToNdjsonPush {
     /// classified are not read again. A scalar stays open until a byte that
     /// cannot extend it arrives, and that byte is left for the delimiter scan.
     fn advance_element_scan(&mut self) -> bool {
-        if self.element_complete {
+        if matches!(self.element_state, ElementScanState::Complete) {
             return true;
         }
         while self.element_at < self.buffer.len() {
             let byte = self.buffer[self.element_at];
-            if !self.element_started {
-                self.element_started = true;
+            if matches!(self.element_state, ElementScanState::NotStarted) {
+                self.element_state = ElementScanState::SelfDelimited;
                 self.element_at += 1;
                 match byte {
                     b'{' | b'[' => self.element_depth = 1,
                     b'"' => self.element_in_string = true,
-                    b'-' | b'0'..=b'9' | b't' | b'f' | b'n' => self.element_scalar = true,
+                    b'-' | b'0'..=b'9' | b't' | b'f' | b'n' => {
+                        self.element_state = ElementScanState::Scalar;
+                    }
                     // `]`, `,`, or other junk is not a value. serde reports it
                     // on this push; waiting would hide a trailing comma.
                     _ => {
-                        self.element_complete = true;
+                        self.element_state = ElementScanState::Complete;
                         return true;
                     }
                 }
@@ -1522,18 +1526,18 @@ impl ArrayToNdjsonPush {
                 if byte == b'"' {
                     self.element_in_string = false;
                     if self.element_depth == 0 {
-                        self.element_complete = true;
+                        self.element_state = ElementScanState::Complete;
                         return true;
                     }
                 }
                 continue;
             }
-            if self.element_scalar {
+            if matches!(self.element_state, ElementScanState::Scalar) {
                 if byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.') {
                     self.element_at += 1;
                     continue;
                 }
-                self.element_complete = true;
+                self.element_state = ElementScanState::Complete;
                 return true;
             }
             self.element_at += 1;
@@ -1543,7 +1547,7 @@ impl ArrayToNdjsonPush {
                 b'}' | b']' => {
                     self.element_depth -= 1;
                     if self.element_depth == 0 {
-                        self.element_complete = true;
+                        self.element_state = ElementScanState::Complete;
                         return true;
                     }
                 }
@@ -5380,16 +5384,32 @@ mod tests {
             body.pop();
         }
         body.push(b']');
-        let mut adapter = ArrayToNdjsonPush::new();
-        let started = std::time::Instant::now();
-        adapter.push_bytes(&body).expect("single push");
-        adapter.finish().expect("finish");
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed < std::time::Duration::from_secs(2),
-            "single-chunk array took {elapsed:?}"
-        );
-        eprintln!("single-chunk 2 MiB elapsed={elapsed:?}");
+        let expected_rows = (body.len() - 1) / elem.len();
+        for chunk_size in [body.len(), 4096] {
+            let mut adapter = ArrayToNdjsonPush::new();
+            let started = std::time::Instant::now();
+            for chunk in body.chunks(chunk_size) {
+                adapter.push_bytes(chunk).expect("push array chunk");
+            }
+            adapter.finish().expect("finish");
+            let elapsed = started.elapsed();
+            assert!(
+                elapsed < std::time::Duration::from_secs(2),
+                "chunk size {chunk_size} took {elapsed:?}"
+            );
+            eprintln!("2 MiB chunk_size={chunk_size} elapsed={elapsed:?}");
+            let ReadResult::Ready(rows) = adapter.try_read() else {
+                panic!("expected all rows before end of stream");
+            };
+            assert_eq!(rows.len(), expected_rows * elem.len());
+            assert!(
+                rows.chunks_exact(elem.len())
+                    .all(|row| row == b"{\"id\":1}\n"),
+                "emitted row differs from input"
+            );
+            assert!(matches!(adapter.try_read(), ReadResult::Eof));
+            assert_eq!(adapter.buffered_len(), 0);
+        }
     }
 
     mod file_jsonl_tests {
