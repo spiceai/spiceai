@@ -408,6 +408,8 @@ def print_plan(batch: Batch) -> None:
 
 
 def main(argv: Sequence[str]) -> int:
+    # Keep the plan and the check output in order when stdout is a file.
+    sys.stdout.reconfigure(line_buffering=True)
     parser = argparse.ArgumentParser(
         prog="scripts/signoff-batch",
         description="Merge several PRs onto trunk, run the sign-off checks once, and attest each PR if they pass.",
