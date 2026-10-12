@@ -67,6 +67,12 @@ pub enum CacheKey<'a> {
     LogicalPlan(&'a LogicalPlan),
     Query(&'a str, Option<&'a ParamValues>),
     Search(&'a SearchKey),
+    /// A caller-supplied key (`Spice-Cache-Key` / `client_supplied`). This is an
+    /// explicit opt-in: the caller asserts that equal keys mean equal results.
+    /// A hit on this key is served before planning, so the volatility /
+    /// cacheability checks in `QueryResultsCacheProvider::cache_is_enabled_for_plan`
+    /// do not apply to the lookup; callers must not reuse a key across
+    /// different queries or for queries with volatile functions.
     ClientSupplied(&'a str),
     // Embedding keys could either be the full request (for distinguising between dimension count, encoding format, etc)
     // or just the individual input for less complex requests (e.g. via `.embed()` for some models instead of `.embed_request()`)
