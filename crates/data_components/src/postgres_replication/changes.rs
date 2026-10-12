@@ -1328,9 +1328,11 @@ impl FieldBuilder {
             ),
         })?;
         let appended = match self {
+            Self::Int8(b) => value.to_int().map(|v| b.append_value(v)),
             Self::Int16(b) => value.to_int().map(|v| b.append_value(v)),
             Self::Int32(b) => value.to_int().map(|v| b.append_value(v)),
             Self::Int64(b) => value.to_int().map(|v| b.append_value(v)),
+            Self::UInt32(b) => value.to_int().map(|v| b.append_value(v)),
             Self::Float32(b) => value.to_f32().map(|v| b.append_value(v)),
             Self::Float64(b) => value.to_f64().map(|v| b.append_value(v)),
             Self::Decimal128(b, precision, scale) => value
@@ -3432,6 +3434,19 @@ mod tests {
             Ok(16_777_216.0)
         );
 
+        // `"char"` and `oid` columns take exact integers of another width too.
+        let int8 = |r: Result<ArrayRef, String>| {
+            r.map(|a| a.as_primitive::<arrow::datatypes::Int8Type>().value(0))
+        };
+        assert_eq!(
+            int8(bin_convert(&DataType::Int8, 21, &2i16.to_be_bytes())),
+            Ok(2)
+        );
+        let uint32 = |r: Result<ArrayRef, String>| {
+            r.map(|a| a.as_primitive::<arrow::datatypes::UInt32Type>().value(0))
+        };
+        assert_eq!(uint32(bin_convert(&DataType::UInt32, 23, &i4(7))), Ok(7));
+
         let decimal = |r: Result<ArrayRef, String>| {
             r.map(|a| {
                 a.as_primitive::<arrow::datatypes::Decimal128Type>()
@@ -3462,6 +3477,8 @@ mod tests {
                 "9223372036854776000",
             ),
             (DataType::Int16, 23, i4(40_000), "40000"),
+            (DataType::Int8, 21, 300i16.to_be_bytes().to_vec(), "300"),
+            (DataType::UInt32, 23, i4(-1), "-1"),
             (DataType::Float64, 20, i8b(i64::MAX), "9223372036854775807"),
             (DataType::Float32, 23, i4(16_777_217), "16777217"),
             (DataType::Float32, 701, f8(0.1), "0.1"),
@@ -3471,6 +3488,7 @@ mod tests {
             let message = bin_convert(&dt, oid, &raw).expect_err("lossy conversion");
             let wire = match oid {
                 20 => "int8",
+                21 => "int2",
                 23 => "int4",
                 _ => "float8",
             };
