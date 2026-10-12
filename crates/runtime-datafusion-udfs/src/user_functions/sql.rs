@@ -255,6 +255,7 @@ fn build_scalar_table_arg_udf(decl: &Function, body: &str) -> Result<Arc<ScalarU
         table_args,
         output_schema,
         body: body.to_string(),
+        table_type: super::table_type_for_volatility(decl.volatility),
     });
     let udf_impl = SqlScalarTableArgUdf {
         id: NEXT_UDF_ID.fetch_add(1, Ordering::Relaxed),
@@ -419,6 +420,7 @@ pub async fn build_table_udtf(decl: &Function, body: &str) -> Result<Arc<dyn Tab
         table_args,
         output_schema,
         body: body.to_string(),
+        table_type: super::table_type_for_volatility(decl.volatility),
     }))
 }
 
@@ -448,6 +450,8 @@ struct SqlTableFunc {
     table_args: Vec<TableArgSpec>,
     output_schema: SchemaRef,
     body: String,
+    /// See [`super::table_type_for_volatility`].
+    table_type: TableType,
 }
 
 impl Debug for SqlTableFunc {
@@ -477,6 +481,7 @@ impl TableFunctionImpl for SqlTableFunc {
             schema: Arc::clone(&self.output_schema),
             body: self.body.clone(),
             args,
+            table_type: self.table_type,
         }))
     }
 }
@@ -489,6 +494,7 @@ struct SqlTableProvider {
     schema: SchemaRef,
     body: String,
     args: Vec<ScalarValue>,
+    table_type: TableType,
 }
 
 #[async_trait::async_trait]
@@ -498,7 +504,7 @@ impl TableProvider for SqlTableProvider {
     }
 
     fn table_type(&self) -> TableType {
-        TableType::Base
+        self.table_type
     }
 
     async fn scan(
