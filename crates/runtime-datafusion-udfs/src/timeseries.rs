@@ -746,32 +746,37 @@ impl Accumulator for CounterGrowthAccumulator {
         } else {
             INCREASE_UDAF_NAME
         };
-        // `increase` in the counter's own type; `rate` only needs it as `f64`.
-        let (increase, increase_f64) = match &mut self.samples {
+        // `increase` returns the counter's own type, so only it can overflow; `rate` takes the
+        // exact increase as `f64`.
+        let increase_f64 = match &mut self.samples {
             CounterSamples::Float(s) => {
                 let increase = counter_increase(s);
-                (ScalarValue::Float64(increase), increase)
+                if !self.per_second {
+                    return Ok(ScalarValue::Float64(increase));
+                }
+                increase
             }
             CounterSamples::Signed(s) => {
                 let increase = integer_counter_increase(s);
-                let exact = match increase.map(i64::try_from).transpose() {
-                    Ok(exact) => exact,
-                    Err(_) => return exec_err!("{name}: the counter increase overflows Int64"),
-                };
-                (ScalarValue::Int64(exact), increase.map(i128_to_f64))
+                if !self.per_second {
+                    return match increase.map(i64::try_from).transpose() {
+                        Ok(exact) => Ok(ScalarValue::Int64(exact)),
+                        Err(_) => exec_err!("{name}: the counter increase overflows Int64"),
+                    };
+                }
+                increase.map(i128_to_f64)
             }
             CounterSamples::Unsigned(s) => {
                 let increase = integer_counter_increase(s);
-                let exact = match increase.map(u64::try_from).transpose() {
-                    Ok(exact) => exact,
-                    Err(_) => return exec_err!("{name}: the counter increase overflows UInt64"),
-                };
-                (ScalarValue::UInt64(exact), increase.map(i128_to_f64))
+                if !self.per_second {
+                    return match increase.map(u64::try_from).transpose() {
+                        Ok(exact) => Ok(ScalarValue::UInt64(exact)),
+                        Err(_) => exec_err!("{name}: the counter increase overflows UInt64"),
+                    };
+                }
+                increase.map(i128_to_f64)
             }
         };
-        if !self.per_second {
-            return Ok(increase);
-        }
         let (Some(increase), Some((first, last))) = (increase_f64, self.samples.time_span()) else {
             return Ok(ScalarValue::Float64(None));
         };
@@ -943,6 +948,37 @@ mod tests {
             .await,
             ScalarValue::Int64(None)
         );
+    }
+
+    #[tokio::test]
+    async fn integer_rate_does_not_overflow_where_increase_would() {
+        let ctx = ctx();
+        // MAX, reset to MAX: the increase is 2 * i64::MAX, past Int64, but the rate is a float.
+        let rows = format!(
+            "(VALUES (0, 0), (1000000000, {max}), (2000000000, {max_minus_1}), (3000000000, {max}))
+                AS t(ts, v)",
+            max = i64::MAX,
+            max_minus_1 = i64::MAX - 1
+        );
+        let err = ctx
+            .sql(&format!("SELECT increase(v, ts) FROM {rows}"))
+            .await
+            .expect("plan")
+            .collect()
+            .await
+            .expect_err("increase overflows Int64");
+        assert!(err.to_string().contains("overflows Int64"), "{err}");
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "expected value for a float rate"
+        )]
+        let expected = (2.0 * i64::MAX as f64) / 3.0;
+        let ScalarValue::Float64(Some(rate)) =
+            query_scalar(&ctx, &format!("SELECT rate(v, ts) FROM {rows}")).await
+        else {
+            panic!("rate is a Float64");
+        };
+        assert!((rate - expected).abs() / expected < 1e-12, "{rate}");
     }
 
     #[test]
