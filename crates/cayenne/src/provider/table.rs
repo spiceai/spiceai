@@ -13430,8 +13430,9 @@ impl CayenneTableProvider {
     /// — configured, or chosen by `auto` — is position. PK-less tables use the
     /// `PositionBased` strategy directly and never reach this read-back.
     ///
-    /// Public so integration tests (e.g. AutoCrossing non-vacuity) can observe
-    /// the live mode without relying only on model convergence.
+    /// Exposed so tests can observe which deletes an `auto` table records.
+    #[doc(hidden)]
+    #[must_use]
     pub fn should_capture_positions(&self) -> bool {
         !self.pk_deletion_strategy.is_position_based() && self.pk_deletion_mode.uses_positions()
     }
@@ -13502,8 +13503,12 @@ impl CayenneTableProvider {
     /// still count a protected snapshot that a merge replaced until its
     /// registration is swept, and read about twice the table during a load.
     ///
-    /// Public so integration tests can assert a table crossed `auto`'s
-    /// position-delete bound without inventing sizes.
+    /// Exposed so tests can size a table against `auto`'s bound.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if a snapshot directory of the table cannot be listed.
+    #[doc(hidden)]
     pub async fn warm_listed_bytes(&self) -> Result<u64> {
         let files = self
             .list_compaction_candidate_files_with_sizes(&self.get_current_snapshot_id())
