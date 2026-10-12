@@ -44,10 +44,7 @@ use std::time::{Duration, Instant};
 use arrow::array::{BinaryArray, Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
 use cayenne::metadata::{CreateTableOptions, VortexConfig};
-use cayenne::{
-    CayenneCatalog, CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog,
-    ScanViewReuse,
-};
+use cayenne::{CayenneCatalog, CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::memory::MemorySourceConfig;
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
@@ -215,7 +212,6 @@ async fn run(rounds: usize) {
             Arc::clone(&catalog) as Arc<dyn MetadataCatalog>,
             Arc::clone(&runtime_env),
         )
-        .with_scan_view_reuse(ScanViewReuse::UntilInvalidated)
         .create(CreateTableOptions {
             table_name: TABLE_NAME.to_string(),
             schema: schema(),
@@ -237,10 +233,7 @@ async fn run(rounds: usize) {
         .expect("create table"),
     );
     table.init_scan_view_cache();
-    let ctx = Arc::new(SessionContext::new_with_config_rt(
-        SessionConfig::new(),
-        Arc::clone(&runtime_env),
-    ));
+    let ctx = SessionContext::new_with_config_rt(SessionConfig::new(), Arc::clone(&runtime_env));
 
     // Settle one snapshot first so the first timed round is not the table's
     // first-ever listing.
@@ -259,7 +252,7 @@ async fn run(rounds: usize) {
         let scans: Vec<_> = (0..CONCURRENT_SCANS)
             .map(|scan| {
                 let table = Arc::clone(&table);
-                let ctx = Arc::clone(&ctx);
+                let ctx = ctx.clone();
                 let id = i64::try_from(scan).expect("scan fits i64") * 997 % ROWS;
                 tokio::spawn(async move { plan_lookup(&table, &ctx, id).await })
             })

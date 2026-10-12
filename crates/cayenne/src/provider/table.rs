@@ -1812,6 +1812,20 @@ type TestSchemaStatisticsLockProbe = (
 #[cfg(test)]
 type TestPostCaptureHook = Box<dyn FnOnce() -> futures::future::BoxFuture<'static, ()> + Send>;
 
+/// Test-only counters and fault injection for the statistics listing.
+#[cfg(test)]
+#[derive(Default)]
+struct TestListingSeams {
+    /// Listings built with statistics rather than served from a cache, so a
+    /// test can tell a shared or carried-forward listing from a rebuild.
+    builds: AtomicU64,
+    /// Scans that asked a capture's shared listing for their files, so a test
+    /// can release a held build once every scan has joined it.
+    shared_requests: AtomicU64,
+    /// Fail the next listing build. Consumed on first use.
+    fail_next: AtomicBool,
+}
+
 /// Test-only synchronous hook fired at the start of the checkpoint's fold-and-union
 /// task, on the blocking pool. See `CayenneTableProvider::test_checkpoint_union_hook`.
 #[cfg(test)]
@@ -2079,18 +2093,9 @@ pub struct CayenneTableProvider {
     /// otherwise re-store a stale file set. Consumed on first fire.
     #[cfg(test)]
     test_post_snapshot_list_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
-    /// Test-only count of snapshot listings built with statistics rather than
-    /// served from a cache, so a test can tell a shared or carried-forward
-    /// listing from a rebuild.
+    /// Test-only counters and fault injection for the statistics listing.
     #[cfg(test)]
-    test_snapshot_listing_builds: Arc<AtomicU64>,
-    /// Test-only count of scans that asked a capture's shared listing for their
-    /// files, so a test can release a held build once every scan has joined it.
-    #[cfg(test)]
-    test_shared_listing_requests: Arc<AtomicU64>,
-    /// Test-only: fail the next statistics listing build. Consumed on first use.
-    #[cfg(test)]
-    test_fail_next_snapshot_listing: Arc<AtomicBool>,
+    test_listing: Arc<TestListingSeams>,
     /// Test-only seam fired by `load_existing_pk_index` after its fenced capture
     /// and before its scans, so a test can run a checkpoint in the window a keyset
     /// rebuild reads the table after that capture. Consumed on first fire.
@@ -9654,11 +9659,7 @@ impl CayenneTableProvider {
             #[cfg(test)]
             test_post_snapshot_list_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
-            test_snapshot_listing_builds: Arc::new(AtomicU64::new(0)),
-            #[cfg(test)]
-            test_shared_listing_requests: Arc::new(AtomicU64::new(0)),
-            #[cfg(test)]
-            test_fail_next_snapshot_listing: Arc::new(AtomicBool::new(false)),
+            test_listing: Arc::default(),
             #[cfg(test)]
             test_post_keyset_capture_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
@@ -11965,11 +11966,7 @@ impl CayenneTableProvider {
             #[cfg(test)]
             test_post_snapshot_list_hook: Arc::clone(&self.test_post_snapshot_list_hook),
             #[cfg(test)]
-            test_snapshot_listing_builds: Arc::clone(&self.test_snapshot_listing_builds),
-            #[cfg(test)]
-            test_shared_listing_requests: Arc::clone(&self.test_shared_listing_requests),
-            #[cfg(test)]
-            test_fail_next_snapshot_listing: Arc::clone(&self.test_fail_next_snapshot_listing),
+            test_listing: Arc::clone(&self.test_listing),
             #[cfg(test)]
             test_post_keyset_capture_hook: Arc::clone(&self.test_post_keyset_capture_hook),
             #[cfg(test)]
@@ -31106,7 +31103,11 @@ impl CayenneTableProvider {
                     .await?,
             )
         };
-        Ok(CapturedSnapshotFiles::new(dir_generation, listing_epoch, files))
+        Ok(CapturedSnapshotFiles::new(
+            dir_generation,
+            listing_epoch,
+            files,
+        ))
     }
 
     /// Resolve the cold-tier manifest that belongs to `snapshot_id`, for a caller
@@ -31561,43 +31562,18 @@ impl CayenneTableProvider {
         }
     }
 
+    /// Plan a full scan of the table as it is now: the scan builds the scan view
+    /// and its files' statistics exactly as a query's would. `CurrentScanView`
+    /// makes it capture the table as it is now, whatever its reuse mode, since a
+    /// lag-tolerant table would otherwise be handed a view from before this
+    /// write and publishing that as the newest would hide the write.
     async fn build_current_scan_view_with_statistics(&self) -> datafusion_common::Result<()> {
-        // The table as it is now, whatever its reuse mode: a lag-tolerant table
-        // would otherwise be handed a view captured before this write, and
-        // publishing that as the newest view would hide the write from the scans
-        // that follow.
-        let view = self
-            .scan_view_at_current_input(ScanViewReuse::UntilInvalidated)
-            .await?;
-        let raw = &view.raw;
-        let ctx = self.create_session_context();
-        let state = ctx.state();
-        let table_url = Self::snapshot_listing_url(
-            &self.table_metadata.path,
-            &self.table_metadata.table_id,
-            &raw.current_snapshot_id,
-        )?;
-        let options = Self::create_listing_options(
-            self.context.file_format(),
-            &self.pk_deletion_strategy,
-            state.config(),
-        )
-        .with_collect_stat(true);
-        let request = SnapshotScanListingRequest {
-            state: &state,
-            table_url: &table_url,
-            options: &options,
-            partition_filters: &[],
-            data_filters: &[],
-            snapshot_id: &raw.current_snapshot_id,
-            limit: None,
-            scan_schema: Self::snapshot_scan_schema(&raw.file_statistics_schema, &options),
-            file_statistics_schema: Arc::clone(&raw.file_statistics_schema),
-            captured_files: Some(&raw.warm_files),
-        };
-        self.snapshot_files_with_stats(&request, true, raw.warm_files.dir_generation)
-            .await
-            .map(|_| ())
+        let mut config =
+            util::session_state::session_config().with_extension(Arc::new(CurrentScanView));
+        config.options_mut().execution.collect_statistics = true;
+        let ctx =
+            SessionContext::new_with_config_rt(config, Arc::clone(self.context.runtime_env()));
+        self.scan(&ctx.state(), None, &[], None).await.map(|_| ())
     }
 
     fn mem_tier_deletion_maps(
@@ -37046,17 +37022,10 @@ impl CayenneTableProvider {
         .await
     }
 
-    /// Return the snapshot's files with statistics.
-    ///
-    /// Scans that share a captured file set — every scan of one [`ScanView`] —
-    /// share one build of it through the capture's cell: after a new snapshot is
-    /// published, the scans that reach it together wait on a single listing
-    /// rather than each listing every file. A failed build is not stored, so a
-    /// later scan builds it again. The cell is used only while the capture's
-    /// directory generation and listing-cache epoch are still the table's, and a
-    /// build that a generation or epoch change overtakes is returned to the scan
-    /// that built it without being stored, so a shared listing only ever serves
-    /// the generation and epoch it was built for.
+    /// Return the snapshot's files with statistics. Scans that share a captured
+    /// file set — every scan of one [`ScanView`] — share one build of it, used
+    /// only while the capture's directory generation and listing-cache epoch are
+    /// still the table's; see [`SharedListingError`] for what is not stored.
     async fn snapshot_files_with_stats(
         &self,
         request: &SnapshotScanListingRequest<'_>,
@@ -37068,7 +37037,8 @@ impl CayenneTableProvider {
             && self.captured_files_are_current(captured)
         {
             #[cfg(test)]
-            self.test_shared_listing_requests
+            self.test_listing
+                .shared_requests
                 .fetch_add(1, Ordering::Relaxed);
             let shared = captured
                 .with_statistics
@@ -37147,11 +37117,7 @@ impl CayenneTableProvider {
         }
 
         #[cfg(test)]
-        if collect_stats
-            && self
-                .test_fail_next_snapshot_listing
-                .swap(false, Ordering::AcqRel)
-        {
+        if collect_stats && self.test_listing.fail_next.swap(false, Ordering::AcqRel) {
             return Err(datafusion_common::DataFusionError::Execution(
                 "injected snapshot listing failure".to_string(),
             ));
@@ -37201,8 +37167,7 @@ impl CayenneTableProvider {
         let files = Arc::new(file_group.into_inner());
         #[cfg(test)]
         if collect_stats {
-            self.test_snapshot_listing_builds
-                .fetch_add(1, Ordering::Relaxed);
+            self.test_listing.builds.fetch_add(1, Ordering::Relaxed);
         }
         #[cfg(test)]
         self.run_test_post_snapshot_list_hook().await;
@@ -55297,6 +55262,19 @@ mod tests {
         (provider, ctx, temp_dir)
     }
 
+    /// [`shared_listing_table`] holding ids `0..100` (`value = id * 10 + 1`), at a
+    /// listing-cache epoch no publish or scan has listed yet, which a new scan
+    /// view keys to.
+    async fn unlisted_shared_listing_table(
+        name: &str,
+    ) -> (Arc<CayenneTableProvider>, SessionContext, tempfile::TempDir) {
+        let (provider, ctx, dir) = shared_listing_table(name, 0).await;
+        overwrite_ids(&ctx, &provider, 100, 1).await;
+        provider.drop_cached_snapshot_listing();
+        provider.notify_scan_input_change();
+        (provider, ctx, dir)
+    }
+
     /// Replace the table's rows with ids `0..rows`, each with value `id * 10 + tag`,
     /// through the `INSERT OVERWRITE` path a full refresh takes.
     async fn overwrite_ids(
@@ -55305,13 +55283,9 @@ mod tests {
         rows: i64,
         tag: i64,
     ) {
-        let batch = id_value_batch_for_range(provider.table_schema(), 0, rows);
-        let values = Int64Array::from_iter_values((0..rows).map(|id| id * 10 + tag));
-        let batch = RecordBatch::try_new(
-            batch.schema(),
-            vec![Arc::clone(batch.column(0)), Arc::new(values)],
-        )
-        .expect("overwrite batch");
+        let ids: Vec<i64> = (0..rows).collect();
+        let values: Vec<i64> = ids.iter().map(|id| id * 10 + tag).collect();
+        let batch = id_value_batch(provider.table_schema(), &ids, &values);
         let plan = provider
             .insert_into(
                 &ctx.state(),
@@ -55326,20 +55300,30 @@ mod tests {
             .expect("overwrite completes");
     }
 
-    /// Plan (without executing) a `WHERE id = ?` scan, which lists the current
-    /// snapshot's files with their statistics.
-    async fn plan_id_lookup(
-        provider: &CayenneTableProvider,
+    /// `SELECT value WHERE id = ?`.
+    async fn lookup_value(
+        provider: &Arc<CayenneTableProvider>,
         ctx: &SessionContext,
         id: i64,
-    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
-        provider
-            .scan(&ctx.state(), None, &[col("id").eq(lit_i64(id))], None)
-            .await
+    ) -> Vec<i64> {
+        query_pk_i64(
+            Arc::clone(provider) as Arc<dyn TableProvider>,
+            ctx,
+            id,
+            "value",
+        )
+        .await
     }
 
     fn snapshot_listing_builds(provider: &CayenneTableProvider) -> u64 {
-        provider.test_snapshot_listing_builds.load(Ordering::Relaxed)
+        provider.test_listing.builds.load(Ordering::Relaxed)
+    }
+
+    fn shared_listing_requests(provider: &CayenneTableProvider) -> u64 {
+        provider
+            .test_listing
+            .shared_requests
+            .load(Ordering::Relaxed)
     }
 
     fn latest_scan_view(provider: &CayenneTableProvider) -> Arc<ScanView> {
@@ -55351,6 +55335,15 @@ mod tests {
                 .expect("a completed scan view")
                 .view,
         )
+    }
+
+    /// The listing with statistics `view`'s scans share, if one was built.
+    fn shared_listing(view: &ScanView) -> Option<&Arc<Vec<PartitionedFile>>> {
+        view.raw
+            .warm_files
+            .with_statistics
+            .get()
+            .map(|listing| &listing.files)
     }
 
     /// Every file a listing returned lies in `snapshot_id`'s directory.
@@ -55377,23 +55370,13 @@ mod tests {
 
         let view = latest_scan_view(&provider);
         assert_eq!(view.raw.current_snapshot_id, snapshot_id);
-        let prepared = view
-            .raw
-            .warm_files
-            .with_statistics
-            .get()
-            .expect("the overwrite built the new snapshot's listing");
-        assert_listing_in_snapshot(&prepared.files, &snapshot_id);
+        let prepared =
+            shared_listing(&view).expect("the overwrite built the new snapshot's listing");
+        assert_listing_in_snapshot(prepared, &snapshot_id);
         let builds = snapshot_listing_builds(&provider);
 
         assert_eq!(
-            query_pk_i64(
-                Arc::clone(&provider) as Arc<dyn TableProvider>,
-                &ctx,
-                7,
-                "value"
-            )
-            .await,
+            lookup_value(&provider, &ctx, 7).await,
             vec![72],
             "the first lookup after the overwrite reads the new rows"
         );
@@ -55428,22 +55411,20 @@ mod tests {
             !Arc::ptr_eq(&view, &before),
             "the append prepared a scan view of the files it published"
         );
-        let prepared = view
-            .raw
-            .warm_files
-            .with_statistics
-            .get()
-            .expect("the append built the listing of its files");
-        assert_eq!(prepared.files.len(), before.raw.warm_files.files.len() + 1);
+        let prepared = shared_listing(&view).expect("the append built the listing of its files");
+        assert_eq!(prepared.len(), before.raw.warm_files.files.len() + 1);
         let builds = snapshot_listing_builds(&provider);
 
-        let lookup = |id| {
-            let provider = Arc::clone(&provider);
-            let ctx = ctx.clone();
-            async move { query_pk_i64(provider as Arc<dyn TableProvider>, &ctx, id, "value").await }
-        };
-        assert_eq!(lookup(5_000).await, vec![42], "the appended row");
-        assert_eq!(lookup(7).await, vec![71], "and the rows before it");
+        assert_eq!(
+            lookup_value(&provider, &ctx, 5_000).await,
+            vec![42],
+            "the appended row"
+        );
+        assert_eq!(
+            lookup_value(&provider, &ctx, 7).await,
+            vec![71],
+            "and the rows before it"
+        );
         assert_eq!(
             snapshot_listing_builds(&provider),
             builds,
@@ -55456,14 +55437,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_scans_share_one_listing_build() {
         const SCANS: u64 = 8;
-        let (provider, ctx, _dir) = shared_listing_table("shared_listing_concurrent", 0).await;
-        overwrite_ids(&ctx, &provider, 100, 1).await;
-        // A state no publish or scan has listed: a new listing-cache epoch, which a
-        // new scan view keys to.
-        provider.drop_cached_snapshot_listing();
-        provider.notify_scan_input_change();
+        let (provider, ctx, _dir) =
+            unlisted_shared_listing_table("shared_listing_concurrent").await;
         let builds = snapshot_listing_builds(&provider);
-        let requests = provider.test_shared_listing_requests.load(Ordering::Relaxed);
+        let requests = shared_listing_requests(&provider);
 
         // Hold the first build until every scan has asked for the listing.
         let (release, released) = tokio::sync::oneshot::channel::<()>();
@@ -55476,14 +55453,11 @@ mod tests {
             .map(|_| {
                 let provider = Arc::clone(&provider);
                 let ctx = ctx.clone();
-                tokio::spawn(async move {
-                    query_pk_i64(provider as Arc<dyn TableProvider>, &ctx, 7, "value").await
-                })
+                tokio::spawn(async move { lookup_value(&provider, &ctx, 7).await })
             })
             .collect();
         tokio::time::timeout(Duration::from_secs(30), async {
-            while provider.test_shared_listing_requests.load(Ordering::Relaxed) - requests < SCANS
-            {
+            while shared_listing_requests(&provider) - requests < SCANS {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         })
@@ -55491,7 +55465,7 @@ mod tests {
         .unwrap_or_else(|_| {
             panic!(
                 "every scan must ask the shared listing for its files; {} of {SCANS} did",
-                provider.test_shared_listing_requests.load(Ordering::Relaxed) - requests
+                shared_listing_requests(&provider) - requests
             )
         });
         release.send(()).expect("the held build is waiting");
@@ -55509,16 +55483,15 @@ mod tests {
     /// next scan of the same view builds the listing again and succeeds.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn failed_listing_build_is_rebuilt_by_the_next_scan() {
-        let (provider, ctx, _dir) = shared_listing_table("shared_listing_failure", 0).await;
-        overwrite_ids(&ctx, &provider, 100, 1).await;
-        provider.drop_cached_snapshot_listing();
-        provider.notify_scan_input_change();
+        let (provider, ctx, _dir) = unlisted_shared_listing_table("shared_listing_failure").await;
         let builds = snapshot_listing_builds(&provider);
 
         provider
-            .test_fail_next_snapshot_listing
+            .test_listing
+            .fail_next
             .store(true, Ordering::Release);
-        let error = plan_id_lookup(&provider, &ctx, 7)
+        let error = provider
+            .scan(&ctx.state(), None, &[col("id").eq(lit_i64(7))], None)
             .await
             .expect_err("the injected listing failure fails the scan");
         assert!(
@@ -55529,21 +55502,12 @@ mod tests {
         );
         let view = latest_scan_view(&provider);
         assert!(
-            view.raw.warm_files.with_statistics.get().is_none(),
+            shared_listing(&view).is_none(),
             "a failed listing must not be stored in the view"
         );
         assert!(provider.cached_snapshot_listing.load_full().is_none());
 
-        assert_eq!(
-            query_pk_i64(
-                Arc::clone(&provider) as Arc<dyn TableProvider>,
-                &ctx,
-                7,
-                "value"
-            )
-            .await,
-            vec![71]
-        );
+        assert_eq!(lookup_value(&provider, &ctx, 7).await, vec![71]);
         assert!(
             Arc::ptr_eq(&latest_scan_view(&provider), &view),
             "the retry scans the same view"
@@ -55553,17 +55517,14 @@ mod tests {
             1,
             "the scan after a failure builds the listing once"
         );
-        assert!(view.raw.warm_files.with_statistics.get().is_some());
+        assert!(shared_listing(&view).is_some());
     }
 
     /// A listing whose build a listing-cache invalidation overtook still answers
     /// the scan that built it, but is not stored for the view's later scans.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn listing_overtaken_by_an_invalidation_is_not_stored() {
-        let (provider, ctx, _dir) = shared_listing_table("shared_listing_overtaken", 0).await;
-        overwrite_ids(&ctx, &provider, 100, 1).await;
-        provider.drop_cached_snapshot_listing();
-        provider.notify_scan_input_change();
+        let (provider, ctx, _dir) = unlisted_shared_listing_table("shared_listing_overtaken").await;
         let builds = snapshot_listing_builds(&provider);
 
         let invalidating = Arc::clone(&provider);
@@ -55573,20 +55534,13 @@ mod tests {
             })
         }));
         assert_eq!(
-            query_pk_i64(
-                Arc::clone(&provider) as Arc<dyn TableProvider>,
-                &ctx,
-                7,
-                "value"
-            )
-            .await,
+            lookup_value(&provider, &ctx, 7).await,
             vec![71],
             "the overtaken listing still answers its own scan"
         );
         assert_eq!(snapshot_listing_builds(&provider) - builds, 1);
-        let view = latest_scan_view(&provider);
         assert!(
-            view.raw.warm_files.with_statistics.get().is_none(),
+            shared_listing(&latest_scan_view(&provider)).is_none(),
             "a listing an invalidation overtook must not be stored in the view"
         );
         assert!(provider.cached_snapshot_listing.load_full().is_none());
@@ -55599,26 +55553,9 @@ mod tests {
     async fn new_view_of_unchanged_files_reuses_their_listing() {
         let (provider, ctx, _dir) = shared_listing_table("shared_listing_carry", 50).await;
         overwrite_ids(&ctx, &provider, 1_000, 1).await;
-        assert_eq!(
-            query_pk_i64(
-                Arc::clone(&provider) as Arc<dyn TableProvider>,
-                &ctx,
-                7,
-                "value"
-            )
-            .await,
-            vec![71]
-        );
+        assert_eq!(lookup_value(&provider, &ctx, 7).await, vec![71]);
         let before = latest_scan_view(&provider);
-        let listed = Arc::clone(
-            &before
-                .raw
-                .warm_files
-                .with_statistics
-                .get()
-                .expect("the snapshot was listed")
-                .files,
-        );
+        let listed = Arc::clone(shared_listing(&before).expect("the snapshot was listed"));
         let builds = snapshot_listing_builds(&provider);
 
         insert_batch_with_context(
@@ -55628,24 +55565,12 @@ mod tests {
         )
         .await;
         assert_eq!(
-            query_pk_i64(
-                Arc::clone(&provider) as Arc<dyn TableProvider>,
-                &ctx,
-                5_000,
-                "value"
-            )
-            .await,
+            lookup_value(&provider, &ctx, 5_000).await,
             vec![42],
-            "the scan sees the inline row"
+            "the inline row"
         );
         assert_eq!(
-            query_pk_i64(
-                Arc::clone(&provider) as Arc<dyn TableProvider>,
-                &ctx,
-                7,
-                "value"
-            )
-            .await,
+            lookup_value(&provider, &ctx, 7).await,
             vec![71],
             "and the snapshot's rows"
         );
@@ -55654,15 +55579,13 @@ mod tests {
             !Arc::ptr_eq(&after, &before),
             "the append must mint a new scan view"
         );
-        assert_eq!(after.raw.current_snapshot_id, before.raw.current_snapshot_id);
-        let reused = after
-            .raw
-            .warm_files
-            .with_statistics
-            .get()
-            .expect("the new view's scans listed its files");
+        assert_eq!(
+            after.raw.current_snapshot_id,
+            before.raw.current_snapshot_id
+        );
+        let reused = shared_listing(&after).expect("the new view's scans listed its files");
         assert!(
-            Arc::ptr_eq(&reused.files, &listed),
+            Arc::ptr_eq(reused, &listed),
             "the new view must reuse the snapshot's listing"
         );
         assert_eq!(
@@ -55677,61 +55600,44 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn shared_listing_never_serves_another_snapshot_generation_or_epoch() {
         let (provider, ctx, _dir) = shared_listing_table("shared_listing_identity", 0).await;
-        let lookup = || {
-            let provider = Arc::clone(&provider);
-            let ctx = ctx.clone();
-            async move { query_pk_i64(provider as Arc<dyn TableProvider>, &ctx, 7, "value").await }
-        };
         overwrite_ids(&ctx, &provider, 100, 1).await;
-        assert_eq!(lookup().await, vec![71]);
+        assert_eq!(lookup_value(&provider, &ctx, 7).await, vec![71]);
         let first = latest_scan_view(&provider);
         let first_snapshot = provider.get_current_snapshot_id();
 
         // A new snapshot gets its own listing.
         overwrite_ids(&ctx, &provider, 100, 2).await;
-        assert_eq!(lookup().await, vec![72]);
+        assert_eq!(lookup_value(&provider, &ctx, 7).await, vec![72]);
         let second = latest_scan_view(&provider);
         let second_snapshot = provider.get_current_snapshot_id();
         assert_ne!(first_snapshot, second_snapshot);
-        let first_files = &first
-            .raw
-            .warm_files
-            .with_statistics
-            .get()
-            .expect("first snapshot listed")
-            .files;
-        let second_files = &second
-            .raw
-            .warm_files
-            .with_statistics
-            .get()
-            .expect("second snapshot listed")
-            .files;
-        assert_listing_in_snapshot(first_files, &first_snapshot);
-        assert_listing_in_snapshot(second_files, &second_snapshot);
+        assert_listing_in_snapshot(
+            shared_listing(&first).expect("first snapshot listed"),
+            &first_snapshot,
+        );
+        assert_listing_in_snapshot(
+            shared_listing(&second).expect("second snapshot listed"),
+            &second_snapshot,
+        );
 
         // Invalidate the listing cache without anything else changing, so scans
         // keep being served the same view. Its listing belongs to the previous
         // epoch and must not answer them; each scan builds its own instead.
-        for (what, invalidate) in [
-            (
-                "listing-cache epoch",
-                Box::new(|provider: &CayenneTableProvider| provider.drop_cached_snapshot_listing())
-                    as Box<dyn Fn(&CayenneTableProvider)>,
-            ),
-            (
-                "directory generation",
-                Box::new(|provider: &CayenneTableProvider| {
-                    provider
-                        .current_dir_generation
-                        .fetch_add(1, Ordering::AcqRel);
-                }),
-            ),
-        ] {
+        let invalidations: [(&str, fn(&CayenneTableProvider)); 2] = [
+            ("listing-cache epoch", |provider| {
+                provider.drop_cached_snapshot_listing()
+            }),
+            ("directory generation", |provider| {
+                provider
+                    .current_dir_generation
+                    .fetch_add(1, Ordering::AcqRel);
+            }),
+        ];
+        for (what, invalidate) in invalidations {
             invalidate(&provider);
             for scan in 1..=2 {
                 let builds = snapshot_listing_builds(&provider);
-                assert_eq!(lookup().await, vec![72]);
+                assert_eq!(lookup_value(&provider, &ctx, 7).await, vec![72]);
                 assert!(
                     Arc::ptr_eq(&latest_scan_view(&provider), &second),
                     "the scan is served the view whose {what} moved"
