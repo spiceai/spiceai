@@ -148,6 +148,11 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
     ctx.register_udtf(JSON_TREE_UDTF_NAME, Arc::new(JsonTreeTableFunc::new()));
     ctx.register_udf(JsonTreeScalar::new().into());
 
+    // OTLP metrics store time-series aggregates (#15060).
+    ctx.register_udaf(runtime_datafusion_udfs::timeseries::HistogramQuantile::new().into());
+    ctx.register_udaf(runtime_datafusion_udfs::timeseries::CounterGrowth::increase().into());
+    ctx.register_udaf(runtime_datafusion_udfs::timeseries::CounterGrowth::rate().into());
+
     #[cfg(feature = "models")]
     {
         ctx.register_udf(embed::Embed::new(runtime.embeds()).into());
@@ -698,6 +703,7 @@ mod deny_list_registration_tests {
         inner_product::INNER_PRODUCT_UDF_NAME,
         l2_distance::{L2_DISTANCE_UDF_NAME, L2_SQUARED_DISTANCE_UDF_NAME},
         l2_norm::L2_NORM_UDF_NAME,
+        timeseries::{HISTOGRAM_QUANTILE_UDAF_NAME, INCREASE_UDAF_NAME, RATE_UDAF_NAME},
         truncate::TRUNCATE_SCALAR_UDF_NAME,
     };
     use runtime_datafusion_udfs::{
@@ -727,6 +733,9 @@ mod deny_list_registration_tests {
             L2_SQUARED_DISTANCE_UDF_NAME,
             L2_NORM_UDF_NAME,
             TRUNCATE_SCALAR_UDF_NAME,
+            HISTOGRAM_QUANTILE_UDAF_NAME,
+            INCREASE_UDAF_NAME,
+            RATE_UDAF_NAME,
             OBJ_DESCRIPTION_UDF_NAME,
             COL_DESCRIPTION_UDF_NAME,
             EMBED_UDF_NAME,

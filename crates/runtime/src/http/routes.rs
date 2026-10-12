@@ -103,6 +103,7 @@ use tower_http::limit::RequestBodyLimitLayer;
         v1::datasets::acceleration,
         v1::datasets::refresh,
         v1::cdc::post,
+        v1::otlp::post,
         v1::catalogs::get,
         v1::ready::get,
         v1::status::get,
@@ -420,6 +421,8 @@ pub(crate) fn routes(
         .route("/v1/functions", get(v1::functions::list))
         .route("/v1/datasets", get(v1::datasets::get))
         .route("/v1/datasets/{name}/cdc", post(v1::cdc::post))
+        // OTLP/HTTP metrics receiver; same handler as the gRPC receiver on the Flight port.
+        .route("/v1/metrics", post(v1::otlp::post))
         .route(
             "/v1/datasets/{name}/acceleration/refresh",
             post(v1::datasets::refresh),
@@ -593,7 +596,12 @@ pub(crate) fn routes(
         authenticated_router = mcp_router.merge(authenticated_router);
     }
 
+    let otlp_metrics_service = Arc::new(crate::opentelemetry::build_metrics_service(
+        rt.datafusion(),
+        Some(Arc::downgrade(rt)),
+    ));
     authenticated_router = authenticated_router
+        .layer(Extension(otlp_metrics_service))
         .layer(Extension(Arc::clone(rt)))
         // Handlers that report a model's load state take the status on its own, so they can be
         // exercised without building a `Runtime`.
