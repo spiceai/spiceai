@@ -67,7 +67,7 @@ use std::{
 };
 
 use runtime_datafusion_udfs::cosine_distance::COSINE_DISTANCE_UDF_NAME;
-use search::{SEARCH_SCORE_COLUMN_NAME, generation::util::append_fields};
+use search::{SEARCH_MATCH_COLUMN_NAME, SEARCH_SCORE_COLUMN_NAME, generation::util::append_fields};
 use snafu::ResultExt;
 
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
@@ -638,7 +638,10 @@ impl TableFunctionImpl for VectorSearchTableFunc {
                 )
                 .search(args.query)?
             };
-            return alias_value_to_match(Arc::clone(&table));
+            return Ok(Arc::new(TopKByScoreProvider {
+                candidates: alias_value_to_match(table)?,
+                limit: args.limit,
+            }));
         }
 
         Ok(Arc::new(VectorSearchUDTFProvider {
@@ -734,19 +737,6 @@ impl VectorSearchUDTFProvider {
                 size,
             ),
         )
-    }
-
-    /// Determine whether and how to pick between
-    ///   1. The query-provided limit (i.e. passed through in the SQL/Logical plan)
-    ///   2. The limit provided in `vector_search` args
-    fn limit_to_use(&self, limit: Option<usize>) -> usize {
-        match (self.args.limit, limit) {
-            (Some(l), None) | (None, Some(l)) => l,
-            (None, None) => 1000, // Default limit when none specified
-
-            // Equivalent to using always using pre_limit, unless `limit` < `pre_limit`.
-            (Some(a), Some(b)) => min(a, b),
-        }
     }
 }
 
@@ -955,7 +945,7 @@ impl TableProvider for VectorSearchUDTFProvider {
         let final_plan = scan
             .project(base_expr)?
             .sort(vec![SortExpr::new(score_expr, false, false)])?
-            .limit(0, Some(self.limit_to_use(limit)))?
+            .limit(0, Some(resolve_limit(self.args.limit, limit)))?
             // Keep the score calculation and helper columns in a subquery,
             // then project the user-visible output schema.
             .alias("tbl")?
@@ -963,6 +953,23 @@ impl TableProvider for VectorSearchUDTFProvider {
             .build()?;
 
         state.create_physical_plan(&final_plan).await
+    }
+}
+
+/// The number of rows `vector_search` returns when neither its `limit` argument nor the
+/// enclosing query bounds it.
+const DEFAULT_VECTOR_SEARCH_LIMIT: usize = 1000;
+
+/// Pick the number of rows a `vector_search` scan returns from
+///   1. the `limit` argument of `vector_search`, and
+///   2. the limit the enclosing query pushed into the scan,
+///
+/// taking the smaller when both are set.
+fn resolve_limit(requested: Option<usize>, scan_limit: Option<usize>) -> usize {
+    match (requested, scan_limit) {
+        (Some(l), None) | (None, Some(l)) => l,
+        (None, None) => DEFAULT_VECTOR_SEARCH_LIMIT,
+        (Some(a), Some(b)) => min(a, b),
     }
 }
 
@@ -985,6 +992,75 @@ fn alias_value_to_match(
         })
         .collect::<Vec<Expr>>();
     Ok(Arc::new(ViewTable::new(bldr.project(cols)?.build()?, None)))
+}
+
+/// A [`TableProvider`] that returns a candidate table's best `limit` rows by `_score`.
+///
+/// The chunked and multi-vector `vector_search` paths take their candidates from
+/// [`ChunkedNonIndexVectorGeneration`], whose plan ends in a join that adds the base table's
+/// columns back. An `ORDER BY` under a join does not order the join's output, so the candidates
+/// carry neither the score order nor `k`; this provider applies both above them. A filter that
+/// reads neither `_score` nor `_match` is applied before the limit, as the unchunked path and the
+/// index-backed providers apply it, so `k` counts the rows the filter keeps.
+#[derive(Debug)]
+struct TopKByScoreProvider {
+    candidates: Arc<dyn TableProvider>,
+    limit: Option<usize>,
+}
+
+#[async_trait::async_trait]
+impl TableProvider for TopKByScoreProvider {
+    fn schema(&self) -> SchemaRef {
+        self.candidates.schema()
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::View
+    }
+
+    fn supports_filters_pushdown(
+        &self,
+        filters: &[&Expr],
+    ) -> DataFusionResult<Vec<TableProviderFilterPushDown>> {
+        Ok(filters
+            .iter()
+            .map(|f| {
+                let reads_search_output = f.column_refs().iter().any(|c| {
+                    c.name() == SEARCH_SCORE_COLUMN_NAME || c.name() == SEARCH_MATCH_COLUMN_NAME
+                });
+                if reads_search_output {
+                    TableProviderFilterPushDown::Unsupported
+                } else {
+                    TableProviderFilterPushDown::Exact
+                }
+            })
+            .collect())
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> DataFusionResult<Arc<dyn ExecutionPlan>> {
+        let mut plan = LogicalPlanBuilder::scan(
+            "tbl",
+            Arc::new(DefaultTableSource::new(Arc::clone(&self.candidates))),
+            None,
+        )?;
+        if let Some(f) = filters.iter().cloned().reduce(Expr::and) {
+            plan = plan.filter(f)?;
+        }
+        plan = plan
+            .sort(vec![ident(SEARCH_SCORE_COLUMN_NAME).sort(false, false)])?
+            .limit(0, Some(resolve_limit(self.limit, limit)))?;
+        if let Some(projection) = projection {
+            let schema = self.schema();
+            plan = plan.project(projection.iter().map(|&i| ident(schema.field(i).name())))?;
+        }
+        state.create_physical_plan(&plan.build()?).await
+    }
 }
 
 /// Split UDTF `args` into positional and named arguments.
