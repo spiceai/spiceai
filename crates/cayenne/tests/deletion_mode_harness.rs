@@ -132,6 +132,27 @@ fn summarize(label: &str, mode: &str, samples: &mut [f64]) {
     );
 }
 
+/// Each table's P99, reported as the smallest, the median and the largest across
+/// tables, so one table falling behind shows even when the pooled P99 does not.
+fn summarize_per_table(label: &str, mode: &str, per_table: &mut [Vec<f64>]) {
+    let mut p99s: Vec<f64> = per_table
+        .iter_mut()
+        .filter(|samples| !samples.is_empty())
+        .map(|samples| {
+            samples.sort_by(f64::total_cmp);
+            percentile(samples, 99.0)
+        })
+        .collect();
+    p99s.sort_by(f64::total_cmp);
+    eprintln!(
+        "HARNESS mode={mode} metric={label}_per_table tables={} p99_min_ms={:.3} p99_median_ms={:.3} p99_max_ms={:.3}",
+        p99s.len(),
+        p99s.first().copied().unwrap_or(f64::NAN),
+        percentile(&p99s, 50.0),
+        p99s.last().copied().unwrap_or(f64::NAN),
+    );
+}
+
 async fn run_query(ctx: &SessionContext, sql: &str) -> Vec<RecordBatch> {
     ctx.sql(sql)
         .await
@@ -707,9 +728,11 @@ async fn deletion_mode_concurrent_harness() -> Result<(), Box<dyn std::error::Er
 /// keys every `HARNESS_WRITE_INTERVAL_MS`, the writers staggered across the
 /// interval. One reader starts a round of the four queries every
 /// `HARNESS_READ_INTERVAL_MS` (default 60), on the next table in turn. Write and
-/// read latencies are pooled across tables, and the final answer sums every
-/// table's. Compaction runs as under `spiced`; see
-/// [`install_compaction_runtime_from_env`].
+/// read latencies are pooled across tables, and each table's P99 is reported as
+/// well (the smallest, median and largest across tables). The final answer sums
+/// every table's. Compaction runs as under `spiced`, on its runtime (see
+/// [`install_compaction_runtime_from_env`]) and under its process-wide budget of
+/// one compaction per core.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "timing harness; run explicitly with HARNESS_* variables"]
 async fn deletion_mode_many_tables_harness() -> Result<(), Box<dyn std::error::Error>> {
@@ -731,7 +754,9 @@ async fn deletion_mode_many_tables_harness() -> Result<(), Box<dyn std::error::E
     let schema = schema();
     let ctx = SessionContext::new();
     let mut providers = Vec::with_capacity(tables);
-    let compactions = Arc::new(tokio::sync::Semaphore::new(2));
+    // The process-wide compaction budget `spiced` hands every Cayenne table: one
+    // permit per core.
+    let compactions = cayenne::compaction_budget();
     for index in 0..tables {
         let name = format!("t{index}");
         let options = CreateTableOptions {
@@ -815,6 +840,8 @@ async fn deletion_mode_many_tables_harness() -> Result<(), Box<dyn std::error::E
             let mut rng = SplitMix(seed ^ 0xA5A5);
             let (mut agg, mut filter, mut point, mut count) =
                 (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            // Per table: aggregate, filter, point lookup, `COUNT(*)`.
+            let mut by_table = vec![[Vec::new(), Vec::new(), Vec::new(), Vec::new()]; tables];
             let mut next_round = Instant::now();
             let mut round = 0usize;
             while Instant::now() < deadline {
@@ -823,7 +850,8 @@ async fn deletion_mode_many_tables_harness() -> Result<(), Box<dyn std::error::E
                     tokio::time::sleep(next_round - now).await;
                 }
                 next_round += Duration::from_millis(read_interval_ms.max(1));
-                let name = format!("t{}", round % tables);
+                let table = round % tables;
+                let name = format!("t{table}");
                 round += 1;
                 let begin = Instant::now();
                 run_query(
@@ -831,36 +859,63 @@ async fn deletion_mode_many_tables_harness() -> Result<(), Box<dyn std::error::E
                     &format!("SELECT SUM(amount), SUM(qty), COUNT(payload) FROM {name}"),
                 )
                 .await;
-                agg.push(begin.elapsed().as_secs_f64() * 1e3);
+                let ms = begin.elapsed().as_secs_f64() * 1e3;
+                agg.push(ms);
+                by_table[table][0].push(ms);
                 let begin = Instant::now();
                 run_query(
                     &ctx,
                     &format!("SELECT COUNT(payload) FROM {name} WHERE qty < 50"),
                 )
                 .await;
-                filter.push(begin.elapsed().as_secs_f64() * 1e3);
+                let ms = begin.elapsed().as_secs_f64() * 1e3;
+                filter.push(ms);
+                by_table[table][1].push(ms);
                 let key = rng.below(rows as u64);
                 let begin = Instant::now();
                 run_query(&ctx, &format!("SELECT * FROM {name} WHERE id = {key}")).await;
-                point.push(begin.elapsed().as_secs_f64() * 1e3);
+                let ms = begin.elapsed().as_secs_f64() * 1e3;
+                point.push(ms);
+                by_table[table][2].push(ms);
                 let begin = Instant::now();
                 run_query(&ctx, &format!("SELECT COUNT(*) FROM {name}")).await;
-                count.push(begin.elapsed().as_secs_f64() * 1e3);
+                let ms = begin.elapsed().as_secs_f64() * 1e3;
+                count.push(ms);
+                by_table[table][3].push(ms);
             }
-            (agg, filter, point, count)
+            (agg, filter, point, count, by_table)
         })
     };
 
     let mut write_ms = Vec::new();
+    let mut write_by_table = Vec::with_capacity(tables);
     for writer in writers {
-        write_ms.extend(writer.await?);
+        let table_ms = writer.await?;
+        write_ms.extend_from_slice(&table_ms);
+        write_by_table.push(table_ms);
     }
-    let (mut agg, mut filter, mut point, mut count) = reader.await?;
+    let (mut agg, mut filter, mut point, mut count, mut by_table) = reader.await?;
     summarize("c_write", &mode_label, &mut write_ms);
     summarize("c_scan_agg", &mode_label, &mut agg);
     summarize("c_scan_filter", &mode_label, &mut filter);
     summarize("c_point_lookup", &mode_label, &mut point);
     summarize("c_count_star", &mode_label, &mut count);
+    summarize_per_table("c_write", &mode_label, &mut write_by_table);
+    for (query, label) in [
+        "c_scan_agg",
+        "c_scan_filter",
+        "c_point_lookup",
+        "c_count_star",
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut per_table: Vec<Vec<f64>> = by_table
+            .iter_mut()
+            .map(|queries| std::mem::take(&mut queries[query]))
+            .collect();
+        summarize_per_table(label, &mode_label, &mut per_table);
+    }
     let mut rewritten_whole = 0usize;
     for table in &providers {
         table.drain_in_flight_maintenance().await?;
