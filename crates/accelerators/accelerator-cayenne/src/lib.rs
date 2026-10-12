@@ -6173,6 +6173,119 @@ mod tests {
         );
     }
 
+    /// A Cayenne table in its own temp dir, as the provider a reload replaces.
+    async fn cayenne_table(name: &str) -> (Arc<dyn TableProvider>, tempfile::TempDir) {
+        use cayenne::{CayenneTableProviderBuilder, metadata::CreateTableOptions};
+        let tmp = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = tmp.path().join("metadata");
+        std::fs::create_dir_all(&metadata_dir).expect("metadata dir");
+        let catalog = Arc::new(
+            cayenne::CayenneCatalog::new(format!("sqlite://{}/cayenne.db", metadata_dir.display()))
+                .expect("catalog"),
+        ) as Arc<dyn cayenne::MetadataCatalog>;
+        catalog.init().await.expect("catalog initialized");
+        let provider = CayenneTableProviderBuilder::new(
+            catalog,
+            datafusion::prelude::SessionContext::new().runtime_env(),
+        )
+        .create(CreateTableOptions {
+            table_name: name.to_string(),
+            schema: Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+            primary_key: vec![],
+            on_conflict: None,
+            base_path: tmp.path().join("data").to_string_lossy().into_owned(),
+            partition_column: None,
+            vortex_config: cayenne::metadata::VortexConfig::default(),
+        })
+        .await
+        .expect("table created");
+        (Arc::new(provider), tmp)
+    }
+
+    /// The refresh runner drops an in-flight reload when another request
+    /// arrives. A reload dropped after it parked the replaced provider's pins
+    /// but before the factory took them must leave nothing for a later create
+    /// to inherit.
+    #[tokio::test]
+    async fn a_dropped_reload_leaves_no_pins_to_inherit() {
+        let accelerator = CayenneAccelerator::new();
+        let source = TestAccelerationSource::new("ds");
+        let (previous, _tmp) = cayenne_table("ds").await;
+        let never_creates: data_accelerator_api::ReloadProviderFactory =
+            Arc::new(|| Box::pin(std::future::pending()));
+
+        let mut reload =
+            Box::pin(accelerator.reload_from_snapshot(&source, previous, never_creates));
+        // Poll until the pins are parked and the factory is pending.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            assert!(
+                futures::poll!(reload.as_mut()).is_pending(),
+                "the factory never completes"
+            );
+            if accelerator
+                .inherited_snapshot_dir_pins
+                .lock()
+                .contains_key("ds")
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the pins are never parked"
+            );
+            tokio::task::yield_now().await;
+        }
+        drop(reload);
+        assert!(
+            accelerator.inherited_snapshot_dir_pins.lock().is_empty(),
+            "a dropped reload clears its hand-off entry"
+        );
+    }
+
+    /// A completed reload hands the replaced provider's pins to the provider the
+    /// factory creates, and leaves nothing behind.
+    #[tokio::test]
+    async fn a_completed_reload_hands_the_pins_over_and_clears_the_slot() {
+        let accelerator = Arc::new(CayenneAccelerator::new());
+        let source = TestAccelerationSource::new("ds");
+        let (previous, _tmp) = cayenne_table("ds").await;
+        let previous_pins =
+            find_concrete::<cayenne::CayenneTableProvider>(previous.as_ref(), LayerWalk::Write)
+                .expect("a Cayenne provider")
+                .snapshot_dir_pins();
+
+        // The factory takes the parked pins, as `create_cayenne_table_provider` does.
+        let taken: Arc<parking_lot::Mutex<Option<cayenne::SnapshotDirPins>>> = Arc::default();
+        let factory_accelerator = Arc::clone(&accelerator);
+        let factory_taken = Arc::clone(&taken);
+        let factory: data_accelerator_api::ReloadProviderFactory = Arc::new(move || {
+            let accelerator = Arc::clone(&factory_accelerator);
+            let taken = Arc::clone(&factory_taken);
+            Box::pin(async move {
+                *taken.lock() = accelerator.inherited_snapshot_dir_pins.lock().remove("ds");
+                let (replacement, tmp) = cayenne_table("ds").await;
+                std::mem::forget(tmp);
+                Ok(replacement)
+            })
+        });
+        accelerator
+            .reload_from_snapshot(&source, previous, factory)
+            .await
+            .expect("the reload completes");
+        assert!(
+            taken
+                .lock()
+                .as_ref()
+                .is_some_and(|pins| pins.is_shared_with(&previous_pins)),
+            "the factory received the replaced provider's pins"
+        );
+        assert!(
+            accelerator.inherited_snapshot_dir_pins.lock().is_empty(),
+            "a completed reload clears its hand-off entry"
+        );
+    }
+
     /// `mode: file_create` must refuse the configuration at open time, before the
     /// recreate reaches `remove_dir_all`. Regression test for #13055 / #13068.
     #[tokio::test]

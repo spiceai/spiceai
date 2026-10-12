@@ -3042,6 +3042,16 @@ pub struct SnapshotDirPins {
     retired: Arc<ParkingMutex<HashMap<String, Instant>>>,
 }
 
+impl SnapshotDirPins {
+    /// Whether both share the same maps, i.e. one was opened over the other.
+    #[must_use]
+    pub fn is_shared_with(&self, other: &Self) -> bool {
+        Arc::ptr_eq(&self.scan_refs, &other.scan_refs)
+            && Arc::ptr_eq(&self.last_listed, &other.last_listed)
+            && Arc::ptr_eq(&self.retired, &other.retired)
+    }
+}
+
 impl std::fmt::Debug for SnapshotDirPins {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("SnapshotDirPins")
