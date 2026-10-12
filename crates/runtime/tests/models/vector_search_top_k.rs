@@ -35,7 +35,9 @@ use spicepod::component::embeddings::{EmbeddingChunkConfig, Embeddings};
 use spicepod::param::Params;
 use spicepod::semantic::{Column, ColumnLevelEmbeddingConfig};
 
-use crate::utils::{register_test_connectors, runtime_ready_check, test_request_context};
+use crate::utils::{
+    register_test_connectors, run_query, runtime_ready_check, test_request_context,
+};
 use crate::{configure_test_datafusion, init_tracing};
 
 const MODEL: &str = "stub";
@@ -110,7 +112,8 @@ const DOCS: [&[(i64, &str)]; 2] = [
     ],
 ];
 
-/// The same rows as [`DOCS`], each body split into a list of words, for a multi-vector column.
+/// Write [`DOCS`] twice: as CSV files for the `body` text column, and as Parquet files whose
+/// `tags` list column holds each body split into words, for the multi-vector cases.
 fn write_datasets(dir: &std::path::Path) -> Result<(), anyhow::Error> {
     let chunked = dir.join("chunked");
     let multi = dir.join("multi");
@@ -180,25 +183,13 @@ fn dataset(from: String, name: &str, format: &str, column: &str, chunked: bool) 
     ds
 }
 
-async fn query(rt: &Arc<Runtime>, sql: &str) -> Result<Vec<RecordBatch>, anyhow::Error> {
-    let mut result = rt
-        .datafusion()
-        .query_builder(sql)
-        .build()
-        .run()
-        .await
-        .with_context(|| format!("query failed: {sql}"))?;
-    let mut batches = Vec::new();
-    while let Some(batch) = futures::StreamExt::next(&mut result.data).await {
-        batches.push(batch?);
-    }
-    Ok(batches)
-}
-
 /// `(id, _score)` for every row, in the order the query returned them.
 async fn ids_and_scores(rt: &Arc<Runtime>, sql: &str) -> Result<Vec<(i64, f64)>, anyhow::Error> {
     let mut rows = Vec::new();
-    for batch in query(rt, sql).await? {
+    for batch in run_query(rt, sql)
+        .await
+        .with_context(|| format!("query failed: {sql}"))?
+    {
         let ids = batch
             .column_by_name("id")
             .and_then(|c| c.as_any().downcast_ref::<Int64Array>())
@@ -334,7 +325,7 @@ async fn vector_search_returns_top_k_on_a_chunked_column() -> Result<(), anyhow:
         // An enclosing operator that needs no order still sees only `k` rows, chunked or not
         // (the unchunked shape is #14818).
         for table in ["docs", "plain"] {
-            let counted = query(
+            let counted = run_query(
                 &rt,
                 &format!("SELECT COUNT(*) AS c FROM vector_search({table}, '{QUERY}', 2)"),
             )

@@ -1000,8 +1000,8 @@ fn alias_value_to_match(
 /// [`ChunkedNonIndexVectorGeneration`], whose plan ends in a join that adds the base table's
 /// columns back. An `ORDER BY` under a join does not order the join's output, so the candidates
 /// carry neither the score order nor `k`; this provider applies both above them. A filter that
-/// reads neither `_score` nor `_match` is applied before the limit, as the unchunked path and the
-/// index-backed providers apply it, so `k` counts the rows the filter keeps.
+/// reads neither `_score` nor `_match` is applied before the limit, as [`VectorSearchUDTFProvider`]
+/// applies it, so `k` counts the rows the filter keeps.
 #[derive(Debug)]
 struct TopKByScoreProvider {
     candidates: Arc<dyn TableProvider>,
