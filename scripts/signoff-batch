@@ -370,9 +370,14 @@ def report_failure(repo: Path, worktree: Path, batch: Batch, log_path: Path) -> 
     }
     print("\nFailing crates and the PRs that change them:", file=sys.stderr)
     for entry in attribute(failing, touched, crates):
-        direct = " ".join(f"#{n}" for n in entry.direct) or "-"
-        via = " ".join(f"#{n}" for n in entry.via_dependency) or "-"
-        print(f"  {entry.crate}: changed by {direct}; changes a dependency: {via}", file=sys.stderr)
+        direct = " ".join(f"#{n}" for n in entry.direct)
+        via = " ".join(f"#{n}" for n in entry.via_dependency)
+        if direct:
+            # A PR that edits the failing crate is the first suspect; one that
+            # only edits a dependency is listed but is less likely.
+            print(f"  {entry.crate}: changed by {direct}" + (f" (less likely, changes a dependency: {via})" if via else ""), file=sys.stderr)
+        else:
+            print(f"  {entry.crate}: no PR changes it; changes a dependency: {via or '-'}", file=sys.stderr)
     print(
         "\nNo PR named? Then the failure may come from trunk, or from PRs combined.\n"
         "Run the batch again without a suspect to confirm.",
