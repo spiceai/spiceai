@@ -48,6 +48,10 @@ jobs:
     name: Seed the Delta Lake fixture
     runs-on: spiceai-dev-runners
     timeout-minutes: 60
+    # Dependabot-triggered runs get no Actions secrets, so the MinIO setup
+    # would fail on empty credentials. Skip those; a push by a maintainer to
+    # the same branch runs the job with secrets.
+    if: ${{ github.actor != 'dependabot[bot]' }}
     # The only writer of the fixture: two concurrent first seeds would interleave
     # their Delta logs under one prefix.
     concurrency:
