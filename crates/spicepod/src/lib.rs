@@ -653,7 +653,7 @@ mod version_tests {
     use crate::component::{
         access::AccessMode,
         caching::{CacheEngine, CacheKeyType, CachingPolicy, Encoding, HashingAlgorithm},
-        runtime::{FlightBatchSize, FlightIpcCompression, RuntimeReadyState},
+        runtime::{FlightBatchSize, FlightIpcCompression, RuntimeReadyState, StateSource},
     };
 
     // ========================================================================
@@ -1289,13 +1289,16 @@ mod version_tests {
         let state = runtime.state.as_ref().expect("state section should exist");
         assert_eq!(state.location, "s3://my-bucket/spice-state");
         assert!(state.params.is_some());
-        let scheduler = runtime
-            .resolved_scheduler()
-            .expect("runtime.state should fill scheduler state");
-        assert_eq!(
-            scheduler.state_location.as_deref(),
-            Some("s3://my-bucket/spice-state")
+        assert!(
+            runtime.resolved_scheduler().is_some(),
+            "runtime.state alone configures a scheduler"
         );
+        let scheduler_state = runtime
+            .scheduler_state()
+            .expect("runtime.state should give the scheduler a state location");
+        assert_eq!(scheduler_state.location, "s3://my-bucket/spice-state");
+        assert_eq!(scheduler_state.params, state.params);
+        assert_eq!(scheduler_state.source, StateSource::RuntimeState);
     }
 
     #[test]
@@ -1307,13 +1310,11 @@ mod version_tests {
               state_location: s3://cluster/scheduler-state
         ";
         let runtime: Runtime = yaml::from_str(yaml).expect("Should parse Runtime");
-        let scheduler = runtime
-            .resolved_scheduler()
+        let scheduler_state = runtime
+            .scheduler_state()
             .expect("scheduler section should exist");
-        assert_eq!(
-            scheduler.state_location.as_deref(),
-            Some("s3://cluster/scheduler-state")
-        );
+        assert_eq!(scheduler_state.location, "s3://cluster/scheduler-state");
+        assert_eq!(scheduler_state.source, StateSource::FeatureSetting);
     }
 
     #[test]
@@ -1331,17 +1332,24 @@ mod version_tests {
         let scheduler = runtime
             .resolved_scheduler()
             .expect("scheduler section should exist");
-        assert_eq!(
-            scheduler.state_location.as_deref(),
-            Some("s3://shared/spice-state"),
-            "omitted scheduler.state_location must fall back to runtime.state.location"
-        );
         assert_eq!(scheduler.partition_assignment_interval, "15s");
         assert_eq!(scheduler.max_partitions_per_executor, 42);
-        assert!(
-            scheduler.params.is_some(),
+        let scheduler_state = runtime
+            .scheduler_state()
+            .expect("runtime.state should give the scheduler a state location");
+        assert_eq!(
+            scheduler_state.location, "s3://shared/spice-state",
+            "omitted scheduler.state_location must fall back to runtime.state.location"
+        );
+        assert_eq!(
+            scheduler_state.params,
+            runtime
+                .state
+                .as_ref()
+                .and_then(|state| state.params.clone()),
             "omitted scheduler.params must fall back to runtime.state.params"
         );
+        assert_eq!(scheduler_state.source, StateSource::RuntimeState);
     }
 
     /// `read_write_create` access mode deserializes.

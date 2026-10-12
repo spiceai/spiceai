@@ -16,45 +16,12 @@ limitations under the License.
 
 pub mod provider;
 
-use async_trait::async_trait;
-use datafusion::{common::TableReference, datasource::TableProvider};
-use std::sync::Arc;
-
-use crate::{Read, ReadWrite};
-
-use datafusion::arrow::datatypes::SchemaRef;
-use datafusion_table_providers::postgres::PostgresTableFactory;
-
-#[async_trait]
-impl Read for PostgresTableFactory {
-    async fn table_provider(
-        &self,
-        table_reference: TableReference,
-    ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
-        // Named through the concrete type: `self.table_provider(..)` would also
-        // resolve to the inherent method today, but silently becomes unbounded
-        // recursion into this impl if that method is ever renamed or removed.
-        PostgresTableFactory::table_provider(self, table_reference).await
-    }
-
-    /// Skips the per-table schema query, which is the point of resolving a
-    /// namespace in bulk. The underlying constructor shares its dialect and
-    /// federation wrapping with the querying one, so the provider is the same.
-    async fn table_provider_with_schema(
-        &self,
-        table_reference: TableReference,
-        schema: SchemaRef,
-    ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
-        PostgresTableFactory::table_provider_with_schema(self, table_reference, schema)
-    }
-}
-
-#[async_trait]
-impl ReadWrite for PostgresTableFactory {
-    async fn table_provider(
-        &self,
-        table_reference: TableReference,
-    ) -> Result<Arc<dyn TableProvider + 'static>, Box<dyn std::error::Error + Send + Sync>> {
-        self.read_write_table_provider(table_reference).await
-    }
-}
+// There is deliberately no `impl Read` (or `ReadWrite`) for the fork's
+// `PostgresTableFactory`. Its read path federates with no Spice function
+// deny-list and has no seam to install one, so a provider built from it as
+// `Arc<dyn Read>` unparses every Spice-only UDF into the SQL sent to
+// `PostgreSQL`, which rejects it (#13664). A `PostgreSQL` read provider is built
+// through `create_spice_federated_table_provider` with
+// `deny_spice_functions_for_postgres_table_providers()`: see the dataset
+// connector's `federated_postgres_table_provider` and the catalog connector's
+// `build_table_factory`.

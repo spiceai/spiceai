@@ -276,7 +276,8 @@ async fn replicas_with_different_limits_are_held_to_the_lowest() {
 
 /// `runtime.source_rate_control.state_location` turns cluster rate control on
 /// by itself and takes precedence over `runtime.state`. The state object for
-/// an origin sits at `<spicepod>/<origin>-<hash>` directly under it.
+/// an origin sits at `<spicepod>/<origin>-<hash>` directly under it, not in a
+/// `rate-control/` folder.
 #[tokio::test]
 async fn source_rate_control_state_location_overrides_runtime_state() {
     for with_runtime_state in [false, true] {
@@ -320,16 +321,14 @@ async fn source_rate_control_state_location_overrides_runtime_state() {
 
         // The persistence task may be mid-write, so skip the store's
         // `<object>#<n>` staging files.
-        let rate_control_objects = |state_dir: &Path| {
+        let rate_control_objects = |state_dir: &Path, folder: &str| {
             state_objects(state_dir)
                 .into_iter()
-                .filter(|object| {
-                    object.starts_with(&format!("{APP_NAME}/")) && !object.contains('#')
-                })
+                .filter(|object| object.starts_with(folder) && !object.contains('#'))
                 .collect::<Vec<_>>()
         };
         let expected_prefix = format!("{APP_NAME}/rate-control-cluster.example.com_443-");
-        let objects = rate_control_objects(&rate_control_dir);
+        let objects = rate_control_objects(&rate_control_dir, &format!("{APP_NAME}/"));
         assert!(
             matches!(
                 objects.as_slice(),
@@ -339,7 +338,7 @@ async fn source_rate_control_state_location_overrides_runtime_state() {
             "expected one {expected_prefix}*.json object under the rate-control location (runtime.state set: {with_runtime_state}), found {objects:?}"
         );
         assert_eq!(
-            rate_control_objects(&runtime_state_dir),
+            rate_control_objects(&runtime_state_dir, "rate-control/"),
             Vec::<String>::new(),
             "runtime.state must hold no rate-control state when the override is set"
         );
@@ -877,4 +876,46 @@ mod shared_origin_acquire_timeout {
             other => panic!("expected an invalid-configuration error, got {other:?}"),
         }
     }
+}
+
+/// Rate control keeps its state in the `rate-control/` folder of a
+/// `runtime.state` location.
+#[tokio::test]
+async fn runtime_state_rate_control_writes_under_its_folder() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let state_dir = temp_dir.path().join("state");
+    let app = app_with_file_rate_control(&state_url(&state_dir), "1s");
+    let runtime = Arc::new(Runtime::builder().with_app(app.clone()).build().await);
+    let dataset = dataset_for_runtime(&app, &runtime);
+    let shared = runtime
+        .http_rate_control_registry()
+        .shared_rate_controller_for_component(
+            &Url::parse(ORIGIN_URL).expect("origin URL parse"),
+            &rps_config(10),
+            dataset.app.name.as_str(),
+            &ConnectorComponent::from(&dataset),
+            "https",
+        )
+        .await
+        .expect("controller builds");
+    let controller = shared.controller.expect("a rate-limited origin is enabled");
+    controller.acquire().await.expect("permit");
+
+    let spicepod_dir = state_dir.join("rate-control").join(APP_NAME);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !std::fs::read_dir(&spicepod_dir).is_ok_and(|mut entries| {
+        entries
+            .any(|entry| entry.is_ok_and(|entry| entry.path().extension() == Some("json".as_ref())))
+    }) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "rate control wrote no state under {}",
+            spicepod_dir.display()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        !state_dir.join(APP_NAME).exists(),
+        "rate control must not write at the location root"
+    );
 }

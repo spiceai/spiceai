@@ -573,6 +573,10 @@
             "type": "string"
           }
         },
+        "adaptive_tuning": {
+          "description": "Turns adaptive tuning on or off for the whole runtime. `disabled` (default) derives\nCayenne's knobs statically; `enabled` also runs its closed-loop controller.",
+          "$ref": "#/$defs/AdaptiveTuning"
+        },
         "task_history": {
           "$ref": "#/$defs/TaskHistory"
         },
@@ -688,7 +692,7 @@
           ]
         },
         "state": {
-          "description": "Shared object-store location for runtime state (`file://`, `s3://`, `abfs://`, `abfss://`). Used for SQL results-cache warmup, cluster source rate control, and distributed query state. A `runtime.scheduler.state_location` overrides it for the scheduler, and a `runtime.source_rate_control.state_location` for cluster source rate control.",
+          "description": "Shared object-store location for runtime state (`file://`, `s3://`, `abfs://`, `abfss://`). Used for SQL results-cache warmup, cluster source rate control, and distributed query state. Each feature writes under its own folder: `results-cache/`, `rate-control/` and `cluster/`. A `runtime.scheduler.state_location` overrides it for the scheduler, and a `runtime.source_rate_control.state_location` for cluster source rate control.",
           "anyOf": [
             {
               "$ref": "#/$defs/RuntimeState"
@@ -1187,6 +1191,21 @@
           "description": "Counters use cumulative, histograms use delta.",
           "type": "string",
           "const": "low_memory"
+        }
+      ]
+    },
+    "AdaptiveTuning": {
+      "description": "Turns adaptive tuning on or off for the whole runtime.\n\n`disabled` (the default) derives Cayenne's knobs statically from the host and, where\navailable, the inferred schema. `enabled` additionally runs Cayenne's closed-loop\ncontroller, which moves them within the statically derived bounds. The\n`runtime.params.target_*` setpoints steer the controller and never turn it on.\n\nOnly the exact values `enabled` and `disabled` are accepted, matching the published\nschema. Anything else, including a different case or surrounding whitespace, fails the\nSpicepod load.",
+      "oneOf": [
+        {
+          "description": "Derive the knobs statically. No closed loop.",
+          "type": "string",
+          "const": "disabled"
+        },
+        {
+          "description": "Run the closed-loop controller (preview).",
+          "type": "string",
+          "const": "enabled"
         }
       ]
     },
@@ -9446,7 +9465,7 @@
           ]
         },
         "cayenne_deletion_mode": {
-          "description": "How primary-key deletions are recorded and applied. 'auto' (default) resolves to 'key' for refresh_mode: changes tables with a primary key (key-based deletes compact concurrently with writers and ride the in-memory CDC tier, where position-delete compaction must serialize with continuous writes), and to 'position' (merge-on-read) everywhere else: per-file row-position bitmaps are pushed into the Vortex scan, skipping deleted pages at the storage layer with no per-row CPU. For a primary-key table positions are captured via a row_idx() read-back after each write, with key-based fallback for any row whose position is not yet known; a table without a primary key uses the existing position-based strategy. 'key' applies deletes above the Vortex scan via a per-row RowConverter probe; 'position' explicitly opts a CDC table back into merge-on-read.",
+          "description": "How primary-key deletions are recorded and applied. 'auto' (default) resolves to 'key' for every table with a primary key: key-based deletes are recorded by primary-key bytes and sequence number, compact concurrently with writers, and are pruned by the seq-prefix bake pass. It resolves to 'position' (merge-on-read) for a table without a primary key, which has no key to record: per-file row-position bitmaps are pushed into the Vortex scan, skipping deleted pages at the storage layer with no per-row CPU. 'key' applies deletes above the Vortex scan via a per-row RowConverter probe. 'position' explicitly opts a primary-key table into merge-on-read position deletes, where positions are captured via a row_idx() read-back after each write and any row whose position is not yet known falls back to a key-based delete.",
           "type": "string",
           "default": "auto",
           "enum": [
@@ -9544,31 +9563,6 @@
         },
         "cayenne_cdc_mem_tier_shards": {
           "description": "Number of PK-hash shards the in-RAM CDC tier is partitioned into, in cdc_durability: memory mode only (non-partitioned, key-based merge-on-read tables). Each shard is an independent serial validate->append domain keyed by the RowConverter OwnedRow bytes, so disjoint keys validate and append in parallel within one apply (intra-apply fan-out) while a key's whole version history — upserts AND delete tombstones — stays confined to its one owning shard (last-writer-wins preserved). Checkpoints are always all-shards-atomic on a single source-position axis. Default 1 (the byte-identical serial path). Raise (e.g. 4) on update/insert-heavy CDC tables to lift the per-apply serialization ceiling.",
-          "type": "string"
-        },
-        "cayenne_tuning": {
-          "description": "Auto-tuning mode. 'auto': derive the correct configuration values from the detected environment (cgroup-aware cores + memory, storage class) and the inferred schema (cardinality, row width, primary key) — no closed loop. 'adaptive': additionally run a per-table closed-feedback controller that measures the live CDC ingest rate, delete fraction, and arrival burstiness AND the runtime's whole-system response (apply latency vs offered load, read amplification that slows queries, cgroup-aware memory pressure) and adapts the inline-memtable flush caps, the in-memory CDC tier byte cap, compaction cadence/trigger, and write concurrency over time, within the environment-derived [floor, ceiling]. DEFAULT: 'auto'. Nothing else turns the closed loop on — 'adaptive' is entered only by setting it here, and a configured cayenne_goal_* SLO is ignored (with a warning) until you do. Schema inference is always attempted and sharpens the 'adaptive' warm-start (inferred cardinality/size) but is not required for it — without inferred metadata the controller relearns the row width from observed ingest and converges from the hardware-derived warm-start. In BOTH modes an explicit per-parameter value (e.g. cayenne_segment_cache_mb: 512) overrides the derived value; under 'adaptive' an explicitly-set actuator is pinned (the loop will not move it).",
-          "type": "string",
-          "default": "auto",
-          "enum": [
-            "auto",
-            "adaptive"
-          ]
-        },
-        "cayenne_goal_replication_lag": {
-          "description": "Goal-driven adaptive tuning: target end-to-end CDC replication lag as a duration (e.g. '5s'). Best set GLOBALLY at runtime.params (cayenne_goal_replication_lag) and overridden here per-dataset. Requires cayenne_tuning: adaptive — under the 'auto' default the goal is ignored. With the loop enabled, it converges toward this SLO in small, bounded steps.",
-          "type": "string"
-        },
-        "cayenne_goal_freshness": {
-          "description": "Goal-driven adaptive tuning: target data freshness — age of the newest queryable data — as a duration (e.g. '30s'). Settable globally at runtime.params and overridden here per-dataset. Requires cayenne_tuning: adaptive.",
-          "type": "string"
-        },
-        "cayenne_goal_query_latency": {
-          "description": "Goal-driven adaptive tuning: target p99 query latency on this table as a duration (e.g. '10s' or '250ms'). Settable globally at runtime.params and overridden here per-dataset. Requires cayenne_tuning: adaptive.",
-          "type": "string"
-        },
-        "cayenne_goal_convergence_window": {
-          "description": "Advanced: the control-loop pacing window — the time budget over which the loop steps toward the configured cayenne_goal_* SLOs, as a duration (e.g. '1m'). Default 60s. This paces HOW fast the loop chases the goals, not a target outcome; it is a per-dataset knob, not part of the global SLO surface.",
           "type": "string"
         },
         "cdc_prefetch_buffer": {
