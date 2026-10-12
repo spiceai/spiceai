@@ -273,7 +273,7 @@ datafusion-common-runtime = "55.2.0"
 datafusion-datasource = "55.2.0"
 datafusion-execution = "55.2.0"
 datafusion-expr = "55.2.0"
-datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "e93dfc30003621350686191b8db470fcb0993af3", features = ["sql"] } # branch: viktor/vep-sort-pushdown (spiceai/datafusion-federation#93)
+datafusion-federation = { git = "https://github.com/spiceai/datafusion-federation.git", rev = "0ef7d349b1f6608151d7d575f71b89d52ece350c", features = ["sql"] } # branch: spiceai-55
 datafusion-functions = "55.2.0"
 datafusion-functions-aggregate = "55.2.0"
 datafusion-functions-aggregate-common = "55.2.0"
@@ -288,7 +288,7 @@ datafusion-proto-common = "55.2.0"
 datafusion-pruning = "55.2.0"
 datafusion-spark = "55.2.0"
 datafusion-substrait = "55.2.0"
-datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "44f076672bb9a0c253d7594b03a3cee1c3567e19" } # branch: viktor/sqltable-sort-pushdown (spiceai/datafusion-table-providers#91)
+datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "ad4e0865fe7e440316867ca626079354f5eaeb2a" } # branch: viktor/sqltable-sort-pushdown (spiceai/datafusion-table-providers#91)
 delta_kernel = { version = "0.27.1", features = ["arrow-59", "internal-api"] }
 delta_kernel_default_engine = { version = "0.27.1", default-features = false, features = [
     "arrow-59",
