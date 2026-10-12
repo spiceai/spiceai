@@ -114,8 +114,8 @@ pub(crate) enum CompactionOutcome {
     /// A permanent state rather than a transient one, so a steady count here is
     /// the expected shape, not a problem.
     DeclinedNotConfigured,
-    /// The CDC apply is at or over capacity, so the bake yields the shared write
-    /// path to the foreground writer.
+    /// The CDC apply is at or over capacity, so the bake, or an `auto` table's
+    /// whole-table reclaim, yields the shared write path to the foreground writer.
     DeclinedApplyBackpressure,
     /// Fewer than two inputs qualified.
     DeclinedNoCandidates,
@@ -132,6 +132,12 @@ pub(crate) enum CompactionOutcome {
     /// A live snapshot is not clean past the prefix cutoff, so the bake's prune
     /// would be withheld and the merge write-amplification wasted.
     DeclinedNoCleanPrefix,
+    /// A `deletion_mode: auto` table's whole-table reclaim is held back by the
+    /// pace that keeps such reclaims to a tenth of the time, though the deletion
+    /// index is past its trigger. Also recorded when a table's first whole-table
+    /// reclaim takes more than that share, which moves the table to key deletes
+    /// instead of committing it.
+    DeclinedPaced,
 }
 
 impl CompactionOutcome {
@@ -161,6 +167,7 @@ impl CompactionOutcome {
         Self::DeclinedNoQualifyingTier,
         Self::DeclinedSizingFailed,
         Self::DeclinedNoCleanPrefix,
+        Self::DeclinedPaced,
     ];
 
     pub(crate) const fn as_str(self) -> &'static str {
@@ -182,6 +189,7 @@ impl CompactionOutcome {
             Self::DeclinedNoQualifyingTier => "declined_no_qualifying_tier",
             Self::DeclinedSizingFailed => "declined_sizing_failed",
             Self::DeclinedNoCleanPrefix => "declined_no_clean_prefix",
+            Self::DeclinedPaced => "declined_paced",
         }
     }
 }

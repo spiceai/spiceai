@@ -62,7 +62,7 @@ use super::on_conflict::{
     RowCountExactnessTaintingDeletionSink, RowKeyDeletionDelta, ShardedApplyBatches,
     ShardedApplyResult, pk_deletion_snapshot_for_strategy,
 };
-use super::pk_deletion_mode::PkDeletionMode;
+use super::pk_deletion_mode::{AutoDeletionMode, PkDeletionMode};
 use super::pk_index::{
     BoundedShardedPkIndexBuilder, COLD_PK_BLOOM_PER_FILE_MAX_BYTES, CachedPkIndex, CachedPkKeyset,
     CheckedOutShardedPkIndex, ColdPkExistence, PK_INDEX_PERSIST_MAX_BYTES, PendingPkExistence,
@@ -1760,6 +1760,40 @@ impl ScanViewCache {
     #[cfg(test)]
     fn has_latest_complete(&self) -> bool {
         self.latest_complete.load().is_some()
+    }
+}
+
+/// What [`CayenneTableProvider::deletion_index_reclaim_decision`] found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReclaimDecision {
+    /// A whole-table reclaim should run now.
+    Due(SnapshotMaintenanceTrigger),
+    /// The deletion index is past its trigger, but the pace holds an `auto`
+    /// table's whole-table reclaim back.
+    Paced,
+    /// The deletion index is past its trigger, but the CDC apply is at or over
+    /// capacity.
+    Backpressure,
+    /// Nothing for the whole-table reclaim to do yet, or a table it does not serve.
+    NotDue,
+}
+
+impl ReclaimDecision {
+    /// The trigger to run the reclaim with, when it is due.
+    fn trigger(self) -> Option<SnapshotMaintenanceTrigger> {
+        match self {
+            Self::Due(trigger) => Some(trigger),
+            Self::Paced | Self::Backpressure | Self::NotDue => None,
+        }
+    }
+
+    /// The outcome a pass records when this decision leaves it nothing to do.
+    fn declined_outcome(self) -> CompactionOutcome {
+        match self {
+            Self::Paced => CompactionOutcome::DeclinedPaced,
+            Self::Backpressure => CompactionOutcome::DeclinedApplyBackpressure,
+            Self::Due(_) | Self::NotDue => CompactionOutcome::DeclinedBelowTrigger,
+        }
     }
 }
 
@@ -13565,26 +13599,9 @@ impl CayenneTableProvider {
     /// tombstone that the key-mode passes now running keep until a rewrite
     /// applies it.
     fn switch_auto_to_key_deletes(&self) -> bool {
-        let Some(auto) = self.pk_deletion_mode.auto() else {
+        let Some(auto) = self.switch_auto_to_key_deletes_unlogged() else {
             return false;
         };
-        if !auto.switch_to_key() {
-            return false;
-        }
-        // Forget the positions the read-back captured, so no later upsert records
-        // a position delete: from here on every delete is a key delete.
-        let keyset_bytes = {
-            let mut guard = self.pk_keyset_cache.lock();
-            match guard.as_mut() {
-                Some(CachedPkIndex::Exact(keyset)) => {
-                    keyset.forget_positions();
-                    keyset.approx_bytes
-                }
-                Some(other) => other.approx_bytes(),
-                None => 0,
-            }
-        };
-        self.publish_single_keyset_bytes(keyset_bytes);
         // The user sees this change only for a table that was kept fully
         // compacted: a table that passes the bound during its first load was never
         // rewritten whole, so its reads do not change.
@@ -13606,6 +13623,48 @@ impl CayenneTableProvider {
             );
         }
         true
+    }
+
+    /// [`Self::switch_auto_to_key_deletes`] for a table whose whole-table rewrite
+    /// took more than its tenth of the time at its write rate, before any such
+    /// rewrite committed. Its reads do not change, but it never gets the compacted
+    /// layout its size qualified it for, so it says why once at `info`.
+    fn switch_auto_to_key_deletes_for_write_rate(&self, took: Duration, interval: Duration) {
+        if self.switch_auto_to_key_deletes_unlogged().is_some() {
+            tracing::info!(
+                target: "cayenne::compaction",
+                "{}",
+                auto_outpaced_by_writes_message(
+                    self.table_metadata.table_name.as_str(),
+                    took,
+                    interval,
+                )
+            );
+        }
+    }
+
+    /// Move an `auto` table to key deletes and forget the positions it captured.
+    /// Returns the table's `auto` state when this call switched it.
+    fn switch_auto_to_key_deletes_unlogged(&self) -> Option<&Arc<AutoDeletionMode>> {
+        let auto = self.pk_deletion_mode.auto()?;
+        if !auto.switch_to_key() {
+            return None;
+        }
+        // Forget the positions the read-back captured, so no later upsert records
+        // a position delete: from here on every delete is a key delete.
+        let keyset_bytes = {
+            let mut guard = self.pk_keyset_cache.lock();
+            match guard.as_mut() {
+                Some(CachedPkIndex::Exact(keyset)) => {
+                    keyset.forget_positions();
+                    keyset.approx_bytes
+                }
+                Some(other) => other.approx_bytes(),
+                None => 0,
+            }
+        };
+        self.publish_single_keyset_bytes(keyset_bytes);
+        Some(auto)
     }
 
     /// Force a synchronous position-capture pass now, if this table is in
@@ -18428,6 +18487,10 @@ impl CayenneTableProvider {
         if !has_file_deletions && !has_inlined_deletions {
             return Ok(OnConflictUpdate::none());
         }
+        // `deletion_mode: auto` measures its write rate from the first delete.
+        if let Some(auto) = self.pk_deletion_mode.auto() {
+            auto.note_delete(Instant::now());
+        }
 
         // Reserve the delete sequence ONCE, up front. It is shared by the inline
         // tombstone (phase 1) and the file `DeleteFile` (phase 3) — both express
@@ -20041,7 +20104,7 @@ impl CayenneTableProvider {
     ///
     /// Cheap on the common path: an explicit key-delete or primary-key-less table
     /// returns before any index is read.
-    fn deletion_index_reclaim_trigger(&self) -> Option<SnapshotMaintenanceTrigger> {
+    fn deletion_index_reclaim_decision(&self) -> ReclaimDecision {
         // Excludes the tables that do not need this: a primary-key-less table
         // records no key tombstones at all, and an explicit key-delete table has
         // the bake, which is cheaper (it rewrites the settled protected prefix, not
@@ -20050,13 +20113,13 @@ impl CayenneTableProvider {
         let key_reclaim = !self.pk_deletion_strategy.is_position_based()
             && auto.is_some_and(|auto| !auto.uses_positions());
         if !self.should_capture_positions() && !key_reclaim {
-            return None;
+            return ReclaimDecision::NotDue;
         }
         let deletion_index_len = self.pk_deletion_snapshot().delete_len();
         // An empty index has nothing to reclaim — whatever the trigger, even a
         // configured 0 — and this path is a whole-snapshot rewrite.
         if deletion_index_len == 0 {
-            return None;
+            return ReclaimDecision::NotDue;
         }
         // The CONFIGURED trigger, not the adaptive one: the controller lowers that
         // to bake more often, a trade priced against the incremental bake's write
@@ -20065,7 +20128,7 @@ impl CayenneTableProvider {
         let trigger_len = self.context.configured_deletion_index_trigger();
         let over_memory_ceiling = self.deletion_index_over_memory_ceiling();
         if deletion_index_len < trigger_len && !over_memory_ceiling {
-            return None;
+            return ReclaimDecision::NotDue;
         }
         if !over_memory_ceiling
             && let Some(auto) = auto
@@ -20077,7 +20140,7 @@ impl CayenneTableProvider {
                 deletion_index_len,
                 "Deferring the whole-table reclaim: the previous one ended too recently",
             );
-            return None;
+            return ReclaimDecision::Paced;
         }
         // Apply-back-pressure gate, mirroring the seq-prefix bake's. The rewrite
         // competes with the CDC apply for the same write path, and it competes
@@ -20103,13 +20166,19 @@ impl CayenneTableProvider {
                 deletion_index_len,
                 "Deferring whole-table deletion-index rewrite: CDC apply at/over capacity (back-pressure)",
             );
-            return None;
+            return ReclaimDecision::Backpressure;
         }
-        Some(SnapshotMaintenanceTrigger::DeletionIndexSize {
+        ReclaimDecision::Due(SnapshotMaintenanceTrigger::DeletionIndexSize {
             deletion_index_len,
             trigger_len,
             over_memory_ceiling,
         })
+    }
+
+    /// [`Self::deletion_index_reclaim_decision`], as the trigger to run with.
+    #[cfg(test)]
+    fn deletion_index_reclaim_trigger(&self) -> Option<SnapshotMaintenanceTrigger> {
+        self.deletion_index_reclaim_decision().trigger()
     }
 
     /// Compact current snapshot files into a new snapshot dir, with atomic,
@@ -20158,12 +20227,13 @@ impl CayenneTableProvider {
         // other, and is the only one a `deletion_mode: position` primary-key table
         // can ever raise — see `deletion_index_reclaim_trigger`.
         let small_files = self.new_current_files_above_compaction_threshold();
-        let deletion_index_trigger = self.deletion_index_reclaim_trigger();
+        let reclaim = self.deletion_index_reclaim_decision();
+        let deletion_index_trigger = reclaim.trigger();
         if !small_files && deletion_index_trigger.is_none() {
             maintenance_metrics::track_compaction(
                 table_name,
                 CompactionKind::SubsetCurrent,
-                CompactionOutcome::DeclinedBelowTrigger,
+                reclaim.declined_outcome(),
             );
             return Ok(false);
         }
@@ -20246,7 +20316,9 @@ impl CayenneTableProvider {
         // can reach, and the whole-table reclaim fires on the key-delete rule. Read
         // it again under that rule.
         if deletion_index_trigger.is_some() && !self.should_capture_positions() {
-            deletion_index_trigger = self.deletion_index_reclaim_trigger();
+            let reclaim = self.deletion_index_reclaim_decision();
+            deletion_index_trigger = reclaim.trigger();
+            let mut declined = reclaim.declined_outcome();
             // On key deletes the whole-table reclaim is for rows the bake cannot
             // reach, which are rows in the current snapshot: with none there, every
             // row is in a protected snapshot and the bake reclaims the index.
@@ -20257,12 +20329,13 @@ impl CayenneTableProvider {
                     .is_ok_and(|files| !files.is_empty())
             {
                 deletion_index_trigger = None;
+                declined = CompactionOutcome::DeclinedBelowTrigger;
             }
             if deletion_index_trigger.is_none() && !small_files {
                 maintenance_metrics::track_compaction(
                     table_name,
                     CompactionKind::SubsetCurrent,
-                    CompactionOutcome::DeclinedBelowTrigger,
+                    declined,
                 );
                 return Ok(false);
             }
@@ -23961,6 +24034,11 @@ impl CayenneTableProvider {
         // table from the manifest, which can trail a just-published write, so size
         // what this rewrite actually captured — the current snapshot and every
         // protected snapshot it folds — before encoding any of it.
+        //
+        // A reclaim that finds every row in protected snapshots may also be
+        // discarded for the table's write rate, after it encodes (below): set when
+        // the current snapshot held no file.
+        let mut rows_all_protected = false;
         if reclaim
             && let Some(auto) = self.pk_deletion_mode.auto()
             && auto.uses_positions()
@@ -23982,6 +24060,9 @@ impl CayenneTableProvider {
                         break;
                     }
                 };
+                if snapshot_id == &snapshot_id_before {
+                    rows_all_protected = files.is_empty();
+                }
                 captured_bytes = files.iter().fold(captured_bytes, |total, (_, size)| {
                     total.saturating_add(*size)
                 });
@@ -24208,6 +24289,32 @@ impl CayenneTableProvider {
         // the `match &fence` below). Holding the fence across the catalog write
         // briefly blocks scans/appends, but the expensive work (scan + encode)
         // already completed off-fence.
+        // An `auto` table on position deletes whose rows are all still in protected
+        // snapshots can stay where the incremental bake reaches them. If rewriting
+        // it whole took more than its tenth of the time at the table's write rate,
+        // the pace would hold every such rewrite back, so discard this one and move
+        // the table to key deletes instead of committing it to the compacted layout
+        // that only the paced rewrite would then reclaim.
+        if rows_all_protected
+            && let Some(auto) = self.pk_deletion_mode.auto()
+            && auto.uses_positions()
+        {
+            let took = compaction_start.elapsed();
+            if let Some(interval) = auto.rewrite_outpaces_writes(compaction_start, took) {
+                self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
+                    .await;
+                // The caller holds `compaction_lock`, as every caller of this
+                // rewrite does.
+                self.switch_auto_to_key_deletes_for_write_rate(took, interval);
+                maintenance_metrics::track_compaction(
+                    table_name,
+                    CompactionKind::Full,
+                    CompactionOutcome::DeclinedPaced,
+                );
+                return Ok(false);
+            }
+        }
+
         // Checkpoint the PK existence index for the new snapshot (best-effort)
         // BEFORE the commit makes it current. The commit drops the in-memory keyset
         // (its row locations name the files this rewrite replaces), and the next
@@ -40627,6 +40734,17 @@ fn auto_switched_to_key_deletes_message(dataset: &str, max_position_bytes: u64) 
     };
     format!(
         "Dataset '{dataset}' grew past {bound} on disk, the largest size Cayenne keeps fully compacted, so its reads now filter recent updates and deletes until background compaction folds them in. See: https://spiceai.org/docs/components/data-accelerators/cayenne#deletion-strategies"
+    )
+}
+
+/// The line a table logs, once, when `deletion_mode: auto` keeps it on key deletes
+/// because rewriting it whole took `took` against `interval` of writes, more than
+/// the tenth of the time it allows such rewrites.
+fn auto_outpaced_by_writes_message(dataset: &str, took: Duration, interval: Duration) -> String {
+    format!(
+        "Dataset '{dataset}' is written too fast to keep fully compacted: rewriting it whole took {} ms for every {} ms of writes, more than a tenth of the time, so it keeps incremental cleanup and its reads filter recent updates and deletes until background compaction folds them in. See: https://spiceai.org/docs/components/data-accelerators/cayenne#deletion-strategies",
+        took.as_millis(),
+        interval.as_millis()
     )
 }
 

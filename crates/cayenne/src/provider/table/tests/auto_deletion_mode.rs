@@ -467,6 +467,12 @@ async fn an_auto_table_paces_its_whole_table_reclaims_on_either_kind_of_delete()
             pending >= 2,
             "premise: the index is past its trigger ({pending})"
         );
+        let decision = provider.deletion_index_reclaim_decision();
+        assert_eq!(
+            (decision, decision.declined_outcome()),
+            (ReclaimDecision::Paced, CompactionOutcome::DeclinedPaced),
+            "a held-back reclaim is counted as paced, not as below its trigger (key deletes: {on_key_deletes})"
+        );
         assert!(
             !provider
                 .compact_current_snapshot_small_files()
@@ -948,6 +954,157 @@ fn the_key_deletes_switch_line_names_the_dataset_the_bound_and_the_docs() {
          until background compaction folds them in. See: \
          https://spiceai.org/docs/components/data-accelerators/cayenne#deletion-strategies"
     );
+}
+
+#[test]
+fn the_write_rate_line_names_the_dataset_the_times_and_the_docs() {
+    assert_eq!(
+        auto_outpaced_by_writes_message(
+            "orders",
+            Duration::from_millis(236),
+            Duration::from_millis(1_560)
+        ),
+        "Dataset 'orders' is written too fast to keep fully compacted: rewriting it \
+         whole took 236 ms for every 1560 ms of writes, more than a tenth of the time, \
+         so it keeps incremental cleanup and its reads filter recent updates and \
+         deletes until background compaction folds them in. See: \
+         https://spiceai.org/docs/components/data-accelerators/cayenne#deletion-strategies"
+    );
+}
+
+/// An auto table on position deletes whose rows are all still in protected
+/// snapshots, and whose first whole-table rewrite takes more than a tenth of the
+/// time at its write rate, keeps key deletes: the rewrite is discarded rather
+/// than committed, so the rows stay where the incremental bake reaches them, as
+/// on an explicit `key` table.
+#[tokio::test]
+async fn an_auto_table_whose_first_rewrite_outpaces_its_writes_keeps_key_deletes() {
+    let name = "auto_outpaced_first_rewrite";
+    let (provider, _catalog, _tmp) = table(name, DeletionMode::Auto, 256).await;
+    let auto = Arc::clone(provider.pk_deletion_mode.auto().expect("an auto table"));
+    // Any rewrite counts, against an interval that has not begun: every rewrite
+    // outpaces the writes.
+    auto.measure_write_rate_from(Some(Instant::now() + Duration::from_secs(3_600)));
+    let keys: Vec<i64> = (0..16).collect();
+    write(&provider, &keys, 100).await;
+    assert!(
+        provider.should_capture_positions(),
+        "premise: a small auto table starts on position deletes"
+    );
+    // Upserts only, so every row is in a protected snapshot; the second write's
+    // deletes put the index past its trigger and its maintenance tries the
+    // first whole-table reclaim.
+    write(&provider, &keys, 200).await;
+    provider
+        .compact_current_snapshot_small_files()
+        .await
+        .expect("reclaim pass");
+
+    assert!(
+        !provider.should_capture_positions(),
+        "the table moved to key deletes"
+    );
+    assert_eq!(
+        provider.last_small_file_compact_path(),
+        LastSmallFileCompactPath::None,
+        "no whole-table rewrite committed"
+    );
+    assert!(
+        provider
+            .list_snapshot_files_with_sizes(&provider.get_current_snapshot_id())
+            .await
+            .expect("list the current snapshot")
+            .is_empty(),
+        "the rows stayed in protected snapshots, where the bake reaches them"
+    );
+    let ctx = SessionContext::new();
+    let rows = collect_id_value_pairs(&ctx, &provider, name).await;
+    let expected: Vec<(i64, i64)> = keys.iter().map(|id| (*id, 200)).collect();
+    assert_eq!(rows, expected, "every key shows its latest row, once");
+
+    // From here the table is served as an explicit `key` table is: later passes
+    // leave its rows to the bake rather than rewriting it whole.
+    for value in 300..303 {
+        write(&provider, &keys, value).await;
+    }
+    assert!(
+        !provider
+            .compact_current_snapshot_small_files()
+            .await
+            .expect("reclaim pass"),
+        "a table whose rows the bake can reach is not rewritten whole"
+    );
+    assert_eq!(
+        provider.last_small_file_compact_path(),
+        LastSmallFileCompactPath::None,
+        "still no whole-table rewrite"
+    );
+    let rows = collect_id_value_pairs(&ctx, &provider, name).await;
+    let expected: Vec<(i64, i64)> = keys.iter().map(|id| (*id, 302)).collect();
+    assert_eq!(rows, expected, "every key shows its latest row, once");
+}
+
+/// A first whole-table rewrite within its tenth of the time commits, and so does
+/// any rewrite of a table whose rows already sit in its current snapshot: moving
+/// that table to key deletes would leave it needing the same paced rewrite.
+#[tokio::test]
+async fn a_rewrite_within_its_share_or_of_compacted_rows_keeps_position_deletes() {
+    // Within its share: the interval began ten seconds ago, against a rewrite of
+    // milliseconds.
+    let name = "auto_rewrite_within_share";
+    let (provider, _catalog, _tmp) = table(name, DeletionMode::Auto, 256).await;
+    let auto = Arc::clone(provider.pk_deletion_mode.auto().expect("an auto table"));
+    auto.measure_write_rate_from(Some(
+        Instant::now()
+            .checked_sub(Duration::from_secs(10))
+            .expect("ten seconds ago is representable"),
+    ));
+    let keys: Vec<i64> = (0..16).collect();
+    write(&provider, &keys, 100).await;
+    write(&provider, &keys, 200).await;
+    provider
+        .compact_current_snapshot_small_files()
+        .await
+        .expect("reclaim pass");
+    assert!(
+        provider.should_capture_positions(),
+        "a rewrite within its share keeps position deletes"
+    );
+    assert_eq!(
+        provider.last_small_file_compact_path(),
+        LastSmallFileCompactPath::Full,
+        "the whole-table rewrite committed"
+    );
+
+    // Rows already in the current snapshot: the rule does not apply.
+    let name = "auto_rewrite_of_compacted_rows";
+    let (provider, _catalog, _tmp) = table(name, DeletionMode::Auto, 256).await;
+    let auto = Arc::clone(provider.pk_deletion_mode.auto().expect("an auto table"));
+    write(&provider, &keys, 100).await;
+    provider
+        .rewrite_current_snapshot_for_compaction_tracked(None)
+        .await
+        .expect("fold the seed into the current snapshot");
+    auto.forget_reclaim_pace();
+    auto.measure_write_rate_from(Some(Instant::now() + Duration::from_secs(3_600)));
+    write(&provider, &keys, 200).await;
+    provider
+        .compact_current_snapshot_small_files()
+        .await
+        .expect("reclaim pass");
+    assert!(
+        provider.should_capture_positions(),
+        "a table whose rows are in its current snapshot keeps position deletes"
+    );
+    assert_eq!(
+        provider.last_small_file_compact_path(),
+        LastSmallFileCompactPath::Full,
+        "its whole-table rewrite committed"
+    );
+    let ctx = SessionContext::new();
+    let rows = collect_id_value_pairs(&ctx, &provider, name).await;
+    let expected: Vec<(i64, i64)> = keys.iter().map(|id| (*id, 200)).collect();
+    assert_eq!(rows, expected, "every key shows its latest row, once");
 }
 
 /// An auto table is sized by its live snapshot directories, not the metastore's

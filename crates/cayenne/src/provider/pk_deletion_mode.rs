@@ -40,6 +40,15 @@ limitations under the License.
 //! rows are all in protected snapshots leaves them to the bake. Every whole-table
 //! reclaim of an `auto` table, on either kind of delete, is paced to a small share
 //! of the time ([`RECLAIM_SHARE_DENOMINATOR`]).
+//!
+//! The pace makes the size bound a rate bound too. A table small enough for
+//! position deletes, written fast enough that its first whole-table rewrite takes
+//! more than its share of the time, would be held back by the pace on every
+//! rewrite after it, so that rewrite is discarded and the table keeps key deletes
+//! ([`AutoDeletionMode::rewrite_outpaces_writes`]). Its rows are then all still
+//! in protected snapshots, where the bake serves it as it serves an explicit
+//! `key` table. A table whose rows already sit in its current snapshot keeps the
+//! paced rewrite, which is all that reaches them.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -62,15 +71,25 @@ use crate::metadata::{DeletionMode, ResolvedDeletionMode};
 /// it bounds a small table under a high write rate on a small host. At 32,000
 /// upserts a second on four CPUs, a 250K-row table rewrote itself every 1.8 s for
 /// 236 ms, 13% of the time, and its write P99 was 16% above key deletes'. Paced to
-/// a tenth, it was 8% below, and its read P99s ranged from 16% faster to 8% slower
-/// than key deletes', against 15–22% faster unpaced. The pace costs reads while it
-/// holds a reclaim back, because the index grows past the trigger: a 1M-row table
-/// under 8,000 upserts a second read at a 10 ms P99 rewriting at every trigger,
-/// with a rewrite running 4.3% of the time, and at 16–19 ms paced to a fiftieth. A
-/// tenth leaves that table unpaced, as it does every position-delete table
-/// measured at 8,000 upserts a second on 16 cores, which rewrote for 44–145 ms
-/// every ~6.25 s.
+/// a tenth, its write P99 was even with key deletes', but its read P99s ranged
+/// from 9% faster to 11% slower, against 15–22% faster unpaced. Such a table now
+/// keeps key deletes from the start ([`AutoDeletionMode::rewrite_outpaces_writes`]),
+/// and the pace is left to tables whose rows its rewrite has already compacted.
+/// The pace costs reads while it holds a reclaim back, because the index grows
+/// past the trigger: a 1M-row table under 8,000 upserts a second read at a 10 ms
+/// P99 rewriting at every trigger, with a rewrite running 4.3% of the time, and at
+/// 16–19 ms paced to a fiftieth. A tenth leaves that table unpaced, as it does
+/// every position-delete table measured at 8,000 upserts a second on 16 cores,
+/// which rewrote for 44–145 ms every ~6.25 s.
 pub(crate) const RECLAIM_SHARE_DENOMINATOR: u32 = 10;
+
+/// The shortest whole-table rewrite that can move an `auto` table to key deletes
+/// for its write rate ([`AutoDeletionMode::rewrite_outpaces_writes`]). A shorter
+/// rewrite holds writes up for less than that whatever the rate, and over a few
+/// milliseconds the share it is measured as would be noise. The rewrite that
+/// crowded out writes — 250K rows at 32,000 upserts a second on four CPUs — took
+/// 236 ms. The 200K-row table on 16 cores took 70 ms, against a 6.25 s interval.
+pub(crate) const MIN_PACED_REWRITE: Duration = Duration::from_millis(100);
 
 /// How a primary-key table records the delete of a row right now.
 #[derive(Clone, Debug)]
@@ -149,6 +168,12 @@ pub(crate) struct AutoDeletionMode {
     /// Whether a whole-table reclaim has committed while the table was on
     /// position deletes (see [`Self::was_kept_compacted`]).
     kept_compacted: AtomicBool,
+    /// When the table recorded its first delete since it was opened (see
+    /// [`Self::rewrite_outpaces_writes`]).
+    first_delete_at: Mutex<Option<Instant>>,
+    /// [`MIN_PACED_REWRITE`], lowered by tests whose tables rewrite in
+    /// milliseconds.
+    min_paced_rewrite: Mutex<Duration>,
 }
 
 #[derive(Debug, Default)]
@@ -175,6 +200,8 @@ impl AutoDeletionMode {
             max_position_bytes,
             reclaims: Mutex::new(ReclaimPace::default()),
             kept_compacted: AtomicBool::new(false),
+            first_delete_at: Mutex::new(None),
+            min_paced_rewrite: Mutex::new(MIN_PACED_REWRITE),
         }
     }
 
@@ -261,6 +288,47 @@ impl AutoDeletionMode {
     #[cfg(test)]
     pub(crate) fn forget_reclaim_pace(&self) {
         *self.reclaims.lock() = ReclaimPace::default();
+    }
+
+    /// Note that the table recorded a delete. The first one starts the interval
+    /// its first whole-table reclaim is measured against.
+    pub(crate) fn note_delete(&self, now: Instant) {
+        self.first_delete_at.lock().get_or_insert(now);
+    }
+
+    /// Whether a whole-table rewrite that started at `started` and took `took`
+    /// takes more than one [`RECLAIM_SHARE_DENOMINATOR`]th of the time at the
+    /// table's write rate: more than `RECLAIM_SHARE_DENOMINATOR - 1` times less
+    /// than the interval since the previous whole-table reclaim ended or, before
+    /// the first, since the table's first delete. Returns that interval when it
+    /// does. The pace would hold every such rewrite back, so a table whose rows
+    /// are all still where the bake reaches them is better served by key deletes.
+    /// A rewrite shorter than [`MIN_PACED_REWRITE`] never counts, and neither does
+    /// one with nothing to measure against.
+    pub(crate) fn rewrite_outpaces_writes(
+        &self,
+        started: Instant,
+        took: Duration,
+    ) -> Option<Duration> {
+        if took < *self.min_paced_rewrite.lock() {
+            return None;
+        }
+        let since = self
+            .reclaims
+            .lock()
+            .last_end
+            .or_else(|| *self.first_delete_at.lock())?;
+        let interval = started.saturating_duration_since(since);
+        (took.saturating_mul(RECLAIM_SHARE_DENOMINATOR - 1) > interval).then_some(interval)
+    }
+
+    /// Let a rewrite of any duration move the table to key deletes for its write
+    /// rate, and start the interval it is measured against at `first_delete_at`:
+    /// lets a test reach the rule with a table that rewrites in milliseconds.
+    #[cfg(test)]
+    pub(crate) fn measure_write_rate_from(&self, first_delete_at: Option<Instant>) {
+        *self.min_paced_rewrite.lock() = Duration::ZERO;
+        *self.first_delete_at.lock() = first_delete_at;
     }
 
     /// Ask the next compaction trigger to move the table to key deletes. Returns
@@ -383,6 +451,66 @@ mod tests {
         // due at 13 s, with rewriting 16.9% of the time.
         assert!(!auto.reclaim_due(second_end + Duration::from_millis(18_899)));
         assert!(auto.reclaim_due(second_end + Duration::from_millis(18_900)));
+    }
+
+    #[test]
+    fn a_rewrite_outpaces_writes_when_it_takes_over_a_tenth_of_the_interval() {
+        let auto = opened(Some(1));
+        let first_delete = Instant::now();
+        auto.note_delete(first_delete);
+        // A later delete does not move the start of the interval.
+        auto.note_delete(first_delete + Duration::from_secs(1));
+        let started = first_delete + Duration::from_millis(1_800);
+        // 9 × 200 ms = 1.8 s is not more than the 1.8 s interval: within its share.
+        assert_eq!(
+            auto.rewrite_outpaces_writes(started, Duration::from_millis(200)),
+            None
+        );
+        // 9 × 201 ms is: past its share, measured against 1.8 s.
+        assert_eq!(
+            auto.rewrite_outpaces_writes(started, Duration::from_millis(201)),
+            Some(Duration::from_millis(1_800))
+        );
+    }
+
+    #[test]
+    fn a_rewrite_is_measured_from_the_previous_reclaim_once_there_is_one() {
+        let auto = opened(Some(1));
+        let first_delete = Instant::now();
+        auto.note_delete(first_delete);
+        let previous_end = first_delete + Duration::from_secs(60);
+        auto.record_reclaim(Duration::from_millis(100), previous_end);
+        let started = previous_end + Duration::from_secs(1);
+        // Against the minute since the first delete it would be within its share;
+        // against the second since the previous reclaim it is not.
+        assert_eq!(
+            auto.rewrite_outpaces_writes(started, Duration::from_millis(150)),
+            Some(Duration::from_secs(1))
+        );
+    }
+
+    #[test]
+    fn a_short_rewrite_or_one_with_nothing_to_measure_against_never_outpaces_writes() {
+        let auto = opened(Some(1));
+        let started = Instant::now();
+        // No delete yet: nothing to measure against.
+        assert_eq!(
+            auto.rewrite_outpaces_writes(started, Duration::from_secs(10)),
+            None
+        );
+        auto.note_delete(started);
+        // Below the floor, however short the interval.
+        assert_eq!(
+            auto.rewrite_outpaces_writes(
+                started,
+                MIN_PACED_REWRITE.saturating_sub(Duration::from_millis(1))
+            ),
+            None
+        );
+        assert_eq!(
+            auto.rewrite_outpaces_writes(started, MIN_PACED_REWRITE),
+            Some(Duration::ZERO)
+        );
     }
 
     #[test]
