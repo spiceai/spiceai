@@ -820,6 +820,12 @@ pub struct FileDeletionHold {
     _guard: tokio::sync::OwnedRwLockReadGuard<()>,
 }
 
+/// Keeps the table's persisted secondary index runs as they were written until
+/// dropped. See [`CayenneTableProvider::persist_lookup_index_for_snapshot`].
+pub struct LookupIndexSnapshotHold {
+    _runs: Option<super::lookup_index::PersistedRunsHold>,
+}
+
 /// What one superseded-snapshot sweep must preserve.
 ///
 /// A struct rather than a long argument list. `live_referenced` is an `Option`
@@ -20799,6 +20805,30 @@ impl CayenneTableProvider {
         }
     }
 
+    /// Write the secondary index's runs to disk and keep them as they are until
+    /// the returned hold drops, for an acceleration snapshot: the runs of a
+    /// write that just returned otherwise persist in the background, and a
+    /// snapshot taken before they do restores with those files unindexed. Take
+    /// it under the dataset's write lock, after [`Self::hold_file_deletions`],
+    /// and hold it until the archive is written. Best-effort: when the runs
+    /// cannot be written, the snapshot carries the runs persisted so far, and a
+    /// table restored from it indexes the rest before it serves queries.
+    pub async fn persist_lookup_index_for_snapshot(&self) -> LookupIndexSnapshotHold {
+        let runs = match self.lookup_index.as_ref() {
+            Some(state) => state.persist_for_snapshot().await,
+            None => None,
+        };
+        let runs = match runs {
+            Some(Ok(hold)) => Some(hold),
+            Some(Err(error)) => {
+                tracing::debug!(table = %self.table_metadata.table_name, %error, "Secondary index runs were not all persisted before a snapshot; a table restored from it indexes the rest before serving");
+                None
+            }
+            None => None,
+        };
+        LookupIndexSnapshotHold { _runs: runs }
+    }
+
     /// Claim file deletion for a snapshot-directory sweep, held until its
     /// deletion finishes. `None` while file deletions are held: the sweep skips its
     /// pass and the next commit retries it.
@@ -38059,32 +38089,73 @@ impl CayenneTableProvider {
     /// snapshots', and starts the background build `claim` holds over the ones
     /// no run covers, or frees the claim when the files cannot be listed.
     async fn start_lookup_index_build(self: &Arc<Self>, claim: super::lookup_index::BuildClaim) {
+        let Some((store, uncovered)) = self.lookup_index_uncovered_files().await else {
+            claim.unpublished();
+            return;
+        };
+        super::lookup_index::spawn_build(claim, store, uncovered, self.lookup_index_list_live());
+    }
+
+    /// Indexes every file a lookup reads that no secondary index run covers yet,
+    /// and returns once that build has finished. Called before an opened table
+    /// is served — one restored from a snapshot taken behind its index, or one
+    /// whose persisted runs could not all be loaded — so its first lookups are
+    /// answered from the index rather than by reading those files in full. A
+    /// safety net: when the loaded runs cover every file, as they do after a
+    /// clean shutdown or a snapshot that carried its runs, it starts no build.
+    /// Returns at once when every file is covered, when the table declares
+    /// no file-mode index, or when a build is already running. Files the build
+    /// cannot index (the memory pool refuses it, or a read fails) stay read in
+    /// full and are indexed in the background as usual.
+    pub async fn catch_up_lookup_index(&self) {
         let Some(index_state) = &self.lookup_index else {
             return;
         };
+        let Some((store, uncovered)) = self.lookup_index_uncovered_files().await else {
+            return;
+        };
+        if uncovered.is_empty() {
+            return;
+        }
+        let Some(claim) = index_state.claim_build() else {
+            return;
+        };
+        let build = super::lookup_index::spawn_build(
+            claim,
+            store,
+            uncovered,
+            self.lookup_index_list_live(),
+        );
+        if let Err(error) = build.await {
+            tracing::debug!(table = %self.table_metadata.table_name, %error, "Secondary index catch-up build did not complete");
+        }
+    }
+
+    /// The files a lookup reads, the current snapshot's and the protected
+    /// snapshots', that no published run covers, with the store they are read
+    /// from. `None` when the files cannot be listed.
+    async fn lookup_index_uncovered_files(
+        &self,
+    ) -> Option<(Arc<dyn ObjectStore>, Vec<super::lookup_index::IndexedFile>)> {
+        let index_state = self.lookup_index.as_ref()?;
         let read_schema = self.read_schema();
         let ctx = self.create_session_context();
         let session = ctx.state();
         let snapshot_id = self.get_current_snapshot_id();
-        let Some((store, files)) = self
+        let (store, files) = self
             .lookup_index_snapshot_files(&session, &snapshot_id, &read_schema)
-            .await
-        else {
-            claim.unpublished();
-            return;
-        };
+            .await?;
         // A lookup reads the protected snapshots' files too (an upsert's rows
         // stay there until compaction folds them in), so they are indexed with
         // the current snapshot's.
         let protected_map = self.protected_snapshots.load_full();
-        let Ok((_, protected_files)) = self.lookup_index_protected_files(&protected_map).await
-        else {
-            claim.unpublished();
-            return;
-        };
+        let (_, protected_files) = self
+            .lookup_index_protected_files(&protected_map)
+            .await
+            .ok()?;
         let view = index_state.published();
         let mut seen: HashSet<String> = HashSet::new();
-        let uncovered: Vec<super::lookup_index::IndexedFile> = files
+        let uncovered = files
             .into_iter()
             .chain(
                 protected_files
@@ -38093,7 +38164,7 @@ impl CayenneTableProvider {
             )
             .filter(|file| !view.covers(&file.path) && seen.insert(file.path.clone()))
             .collect();
-        super::lookup_index::spawn_build(claim, store, uncovered, self.lookup_index_list_live());
+        Some((store, uncovered))
     }
 
     /// Lists the files a reader sees now under the listing fence, the current
