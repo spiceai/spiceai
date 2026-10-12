@@ -4212,6 +4212,11 @@ pub(crate) enum EncodeFanOut {
     /// Size the fan-out from the configured write concurrency and the byte
     /// estimate. The overwhelming majority of writes.
     Sized,
+    /// One encoder for one of many writes the caller runs side by side, as the
+    /// per-file fold does. The parallelism lives in the caller, so the write
+    /// is not recorded as the table's write shape: a fan-out of one here says
+    /// nothing about how the table's own writes are sharded.
+    PerCaller,
     /// One encoder, whatever the configuration says. Required where the output
     /// must be a single sequence of files: a position-delete table's merge
     /// (its tombstones are file-path scoped and the rewrite's position bake-in
@@ -10907,6 +10912,9 @@ impl CayenneTableProvider {
     ) -> usize {
         // The caller requires a single sequence of output files. Checked before
         // the configured concurrency, which must not be able to override it.
+        if matches!(fan_out, EncodeFanOut::PerCaller) {
+            return 1;
+        }
         if matches!(fan_out, EncodeFanOut::Serial) {
             // A fan-out of 1 has two causes that call for opposite responses: a
             // structural one (the write's output order is load-bearing, so no

@@ -69,16 +69,17 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::execution::SendableRecordBatchStream;
-use futures::StreamExt;
+use futures::{StreamExt, TryStreamExt};
 use tokio::sync::{OwnedMutexGuard, OwnedSemaphorePermit};
 
 use super::Result;
 use super::column_stats::ColumnStatsAccumulator;
+use super::delta_encoding::{ShardRouting, WritePolicy};
 use super::mutation_writer::InlineBatchBuffer;
 use super::overwrite_postpass::CopyOrder;
 use super::table::{
-    CayenneTableProvider, InlinedOverwritePublish, OverwriteRangePlan, OverwriteRouting,
-    RangePartitioning, serialize_batches_to_ipc,
+    CayenneTableProvider, EncodeFanOut, InlinedOverwritePublish, OverwriteRangePlan,
+    OverwriteRouting, RangePartitioning, serialize_batches_to_ipc,
 };
 use crate::CayenneCatalog;
 use crate::catalog::CatalogResult;
@@ -960,8 +961,9 @@ impl CayenneTableProvider {
     }
 
     /// Rewrite the files of an unpublished snapshot that hold the superseded
-    /// copies at `superseded`, without them, and return the statistics of the
-    /// snapshot that results: the files left as written, plus the rewritten ones.
+    /// copies at `superseded`, each without them, and return the statistics of
+    /// the snapshot that results: the files left as written, plus the rewritten
+    /// ones.
     ///
     /// `written` describes every row written to the snapshot; a rewrite that
     /// leaves anything but those rows less the superseded copies is an error.
@@ -981,20 +983,52 @@ impl CayenneTableProvider {
                     .map(str::to_string)
             })
             .collect();
-        let survivors = self
-            .scan_snapshot_files_excluding(snapshot_id, superseded)
+        // Each file folds on its own, through one writer, keeping its rows in
+        // the order it holds them; as many files fold at once as the encode
+        // budget has permits, and each write holds one. Merging every file's
+        // survivors into one stream would feed the rewrite from a single task,
+        // however many encoders it had.
+        let policy = WritePolicy {
+            class: write.write_policy.class,
+            fan_out: EncodeFanOut::PerCaller,
+            routing: ShardRouting::Key,
+        };
+        let in_flight = super::write_budget::encode_budget_snapshot()
+            .and_then(|budget| usize::try_from(budget.total).ok())
+            .unwrap_or(write.target_partitions)
+            .max(1);
+        type FileFold<'f> = std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<(u64, Arc<ColumnStatsAccumulator>)>> + Send + 'f>,
+        >;
+        let folds: Vec<FileFold<'_>> = superseded
+            .iter()
+            .map(|(location, positions)| {
+                let file = HashMap::from([(location.clone(), positions.clone())]);
+                let fold: FileFold<'_> = Box::pin(async move {
+                    let survivors = self
+                        .scan_snapshot_files_excluding(snapshot_id, &file)
+                        .await?;
+                    let (rows, _files, stats) = self
+                        .write_to_snapshot_range_partitioned(
+                            survivors,
+                            write.target_size_bytes,
+                            snapshot_id,
+                            1,
+                            None,
+                            policy,
+                            None,
+                        )
+                        .await?;
+                    Ok((rows, stats))
+                });
+                fold
+            })
+            .collect();
+        let rewritten: Vec<(u64, Arc<ColumnStatsAccumulator>)> = futures::stream::iter(folds)
+            .buffer_unordered(in_flight)
+            .try_collect()
             .await?;
-        let (rewritten_rows, _files, rewritten) = self
-            .write_to_snapshot_range_partitioned(
-                survivors,
-                write.target_size_bytes,
-                snapshot_id,
-                write.target_partitions,
-                None,
-                write.write_policy,
-                Some(RangePartitioning::hashed_run_sorted()),
-            )
-            .await?;
+        let rewritten_rows: u64 = rewritten.iter().map(|(rows, _)| rows).sum();
         self.remove_snapshot_files(
             snapshot_id,
             superseded
@@ -1017,7 +1051,9 @@ impl CayenneTableProvider {
                 folded.merge_from(&stats);
             }
         }
-        folded.merge_from(&rewritten);
+        for (_, stats) in &rewritten {
+            folded.merge_from(stats);
+        }
         // Distinct counts are estimates whichever rows they cover, and the copies
         // the fold dropped share their keys with copies it kept.
         folded.merge_ndv_from(written);
