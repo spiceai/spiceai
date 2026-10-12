@@ -56,6 +56,10 @@ fn error(status: StatusCode, message: impl Into<String>) -> Response {
     (status, message.into()).into_response()
 }
 
+#[expect(
+    clippy::result_large_err,
+    reason = "the error is the HTTP response returned to the client as-is"
+)]
 fn content_encoding(headers: &HeaderMap) -> Result<Encoding, Response> {
     let content_type = headers
         .get(header::CONTENT_TYPE)
@@ -80,6 +84,10 @@ fn content_encoding(headers: &HeaderMap) -> Result<Encoding, Response> {
 }
 
 /// The body with any `Content-Encoding` removed.
+#[expect(
+    clippy::result_large_err,
+    reason = "the error is the HTTP response returned to the client as-is"
+)]
 pub(crate) fn decompress(headers: &HeaderMap, body: Bytes) -> Result<Bytes, Response> {
     let encoding = headers
         .get(header::CONTENT_ENCODING)

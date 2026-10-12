@@ -320,6 +320,7 @@ impl StoreBuilders {
         self.scale.append_option(values.scale);
         self.zero_count.append_option(values.zero_count);
         self.zero_threshold.append_option(values.zero_threshold);
+        self.flags.append_value(flags);
         self.positive_offset
             .append_option(values.positive.map(|(offset, _)| offset));
         append_u64_list(
