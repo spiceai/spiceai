@@ -169,7 +169,12 @@ async fn position_delete_counts(
     (pos_files, pos_rows, key_files, key_rows)
 }
 
-/// Bytes of every file under `dir`, recursively.
+/// Bytes of every file under `dir`, recursively. Reported for the fixture's data
+/// directory as `dir_bytes`: the table's snapshots and any not yet swept. That is
+/// not the size `deletion_mode: auto` sizes a table by, the files of its live
+/// snapshots (`CayenneTableProvider::warm_listed_bytes`), which this harness cannot
+/// report: an A/B compiles it against trunk's crate too, where that method is
+/// absent.
 fn dir_bytes(dir: &std::path::Path) -> u64 {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
@@ -265,7 +270,7 @@ async fn deletion_mode_steady_state_harness() -> Result<(), Box<dyn std::error::
     }
     table.drain_in_flight_maintenance().await?;
     eprintln!(
-        "HARNESS mode={mode_label} metric=seed_ms value={:.1} data_bytes={}",
+        "HARNESS mode={mode_label} metric=seed_ms value={:.1} dir_bytes={}",
         seed_start.elapsed().as_secs_f64() * 1e3,
         dir_bytes(&fixture.data_path)
     );
@@ -397,7 +402,7 @@ async fn deletion_mode_steady_state_harness() -> Result<(), Box<dyn std::error::
         table.last_small_file_compact_path(),
     );
     eprintln!(
-        "HARNESS mode={mode_label} metric=final_data_bytes value={}",
+        "HARNESS mode={mode_label} metric=final_dir_bytes value={}",
         dir_bytes(&fixture.data_path)
     );
     let (pos_files, pos_rows, key_files, key_rows) =
@@ -489,7 +494,7 @@ async fn deletion_mode_concurrent_harness() -> Result<(), Box<dyn std::error::Er
     }
     table.drain_in_flight_maintenance().await?;
     eprintln!(
-        "HARNESS mode={mode_label} metric=seed data_bytes={} seed_op={seed_op}",
+        "HARNESS mode={mode_label} metric=seed dir_bytes={} seed_op={seed_op}",
         dir_bytes(&fixture.data_path)
     );
 
@@ -611,7 +616,7 @@ async fn deletion_mode_concurrent_harness() -> Result<(), Box<dyn std::error::Er
     );
     table.drain_in_flight_maintenance().await?;
     eprintln!(
-        "HARNESS mode={mode_label} metric=c_final data_bytes={} last_small_file_compact_path={:?}",
+        "HARNESS mode={mode_label} metric=c_final dir_bytes={} last_small_file_compact_path={:?}",
         dir_bytes(&fixture.data_path),
         table.last_small_file_compact_path()
     );
