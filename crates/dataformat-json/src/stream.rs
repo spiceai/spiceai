@@ -2398,16 +2398,8 @@ mod tests {
             }
         }
 
-        /// The other half of the fix: a buffer that merely stops part-way
-        /// through an element is still "wait for more bytes".
-        ///
-        /// The whole fix rests on `Category::Eof` covering every incomplete
-        /// buffer, so this splits each body at every byte offset — including
-        /// offsets inside an escape sequence and inside a multi-byte UTF-8
-        /// character, where a misclassification would turn a valid streamed
-        /// read into a spurious hard error. Splitting on bytes rather than
-        /// `char`s is deliberate: a chunk boundary from an object store lands
-        /// wherever it lands.
+        /// An unfinished element waits across every byte split, including
+        /// splits inside escape sequences and multi-byte UTF-8 characters.
         #[test]
         fn a_truncated_element_still_waits_for_more_bytes() {
             for (body, expected) in [
@@ -2478,11 +2470,8 @@ mod tests {
             }
         }
 
-        /// `Category::Eof` does not cover every incomplete buffer: serde
-        /// reports a buffer that stops inside a numeric literal as a syntax
-        /// error, because what it has read is not a number. Treating every
-        /// syntax error as fatal would therefore fail a valid array whose
-        /// chunk boundary happened to land mid-number.
+        /// Incomplete literals wait for more bytes; an invalid literal in a
+        /// closed element fails on the push that closes it.
         #[test]
         fn a_syntax_error_at_a_truncation_boundary_waits_for_more_bytes() {
             for head in [
@@ -5166,7 +5155,10 @@ mod tests {
             let mut form_feed = br#"[{"a":1}"#.to_vec();
             form_feed.push(0x0c);
             form_feed.push(b']');
-            assert!(lines_from(&form_feed, 3).is_err());
+            let err = lines_from(&form_feed, 3)
+                .expect_err("form feed cannot separate an element from its delimiter");
+            assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(err.to_string(), "expected ',' or ']' but found '\u{c}'");
         }
 
         /// The delimiter scan reads the source itself, so a signal there is
