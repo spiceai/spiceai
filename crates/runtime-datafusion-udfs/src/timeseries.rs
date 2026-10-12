@@ -23,7 +23,7 @@ limitations under the License.
 //! - `rate(value, time)` is `increase` divided by the seconds between the first and last
 //!   sample, with `time` in Unix nanoseconds or a timestamp.
 //!
-//! Unlike PromQL, `increase` and `rate` do not extrapolate to the edges of a time window:
+//! Unlike `PromQL`, `increase` and `rate` do not extrapolate to the edges of a time window:
 //! they use only the samples in the group.
 
 use std::mem::size_of_val;
