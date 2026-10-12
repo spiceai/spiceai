@@ -16,7 +16,7 @@ limitations under the License.
 
 //! A first load into an indexed table that repeats keys is covered by its
 //! secondary index the moment it returns: the first lookup after it reads only
-//! indexed files, though the fold rewrites every file the load wrote.
+//! indexed files, though the fold rewrote every file the load wrote.
 
 mod common;
 
@@ -25,18 +25,22 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use cayenne::metadata::DeletionMode;
 use common::lookup_index::{
-    TableSpec, counters, file_mode_config, insert, int64_column, open_table, query,
+    TableSpec, counters, file_mode_config, int64_column, open_table, query,
 };
 use datafusion::execution::runtime_env::RuntimeEnv;
+use datafusion_expr::dml::InsertOp;
 use std::sync::Arc;
 
-/// Two files of 1.2M rows each: more rows per file than a write may leave
-/// for its index to finish in the background, so a fold that did would publish
-/// files it had not indexed yet.
-const ROWS: i64 = 2_400_000;
+/// Rows per input batch. The load hands whole batches to its two shards in
+/// turn, so each of its two files holds 12 of the 24 batches, 1.2M rows: more
+/// rows than a write may leave for its index to finish in the background, so a
+/// fold that did would publish files it had not indexed yet.
+const BATCH_ROWS: i64 = 100_000;
+const BATCHES: i64 = 24;
 
-/// Every 1000th row repeats the key of the row half its position, an earlier
-/// row, so the repeats spread across every file of the load.
+/// In every batch after the first, each row at position 999 mod 1000 repeats
+/// the key of the row at 500 mod 1000 of the batch before it, so both files
+/// hold superseded copies and the fold rewrites both.
 const REPEAT_EVERY: i64 = 1000;
 
 test_with_backends!(bulk_load_with_repeats_is_indexed_when_it_returns_impl);
@@ -66,39 +70,44 @@ async fn bulk_load_with_repeats_is_indexed_when_it_returns_impl(
     )
     .await;
 
-    let ids: Vec<i64> = (0..ROWS)
-        .map(|row| {
-            if row % REPEAT_EVERY == REPEAT_EVERY - 1 {
-                row / 2
-            } else {
-                row
-            }
+    let batches = (0..BATCHES)
+        .map(|batch| {
+            let rows = batch * BATCH_ROWS..(batch + 1) * BATCH_ROWS;
+            let ids: Vec<i64> = rows
+                .clone()
+                .map(|row| {
+                    if batch > 0 && row % REPEAT_EVERY == REPEAT_EVERY - 1 {
+                        row - BATCH_ROWS - (REPEAT_EVERY - 1 - 500)
+                    } else {
+                        row
+                    }
+                })
+                .collect();
+            RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(ids)),
+                    Arc::new(Int64Array::from(rows.clone().collect::<Vec<_>>())),
+                    Arc::new(StringArray::from(
+                        rows.map(|row| format!("{row:016x}")).collect::<Vec<_>>(),
+                    )),
+                ],
+            )
         })
-        .collect();
-    let batch = RecordBatch::try_new(
-        Arc::clone(&schema),
-        vec![
-            Arc::new(Int64Array::from(ids)),
-            Arc::new(Int64Array::from((0..ROWS).collect::<Vec<_>>())),
-            Arc::new(StringArray::from(
-                (0..ROWS)
-                    .map(|row| format!("{row:016x}"))
-                    .collect::<Vec<_>>(),
-            )),
-        ],
-    )?;
-    insert(&provider, "loaded", batch).await;
+        .collect::<Result<Vec<_>, _>>()?;
+    common::write_batches(&provider, batches, InsertOp::Append).await?;
 
-    // Row 1999 repeats the key of row 999, so the later copy wins.
+    // Key 500 is written by row 500 of the first batch and repeated by row
+    // 100,999 of the second, a copy in the other file, so the later one wins.
     let before = counters(&provider);
     let rows = query(
         &provider,
         "loaded",
-        "SELECT payload FROM loaded WHERE id = 999",
+        "SELECT payload FROM loaded WHERE id = 500",
     )
     .await;
     let after = counters(&provider);
-    assert_eq!(int64_column(&rows), vec![1999]);
+    assert_eq!(int64_column(&rows), vec![BATCH_ROWS + 999]);
     assert_eq!(
         (
             after.none - before.none,

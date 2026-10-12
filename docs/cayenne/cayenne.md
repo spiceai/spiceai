@@ -1533,7 +1533,7 @@ Both axes classify every component kind that creates a Cayenne table: datasets, 
 | `cayenne_bake_deletion_index_trigger` | deletion-index size that triggers the bake | `50_000` |
 | `cayenne_compaction_max_levels` / `_max_files_per_pick` | passes per trigger / candidate paths retained | `3` / `32` |
 | `cayenne_cdc_mem_tier_min_flush_bytes` / `_checkpoint_interval_ms` / `_shards` | periodic-checkpoint byte gate / tick / PK-hash shards | memory-derived (1/8 of the cap, 32–128 MiB) / `1_000` / `1` |
-| `cayenne_sort_columns` / `cayenne_shard_key_columns` | insert sort order / encode-shard hash key | (unset) / (unset: PK hash, else round-robin; a load into an empty table with no requested layout routes whole batches round-robin) |
+| `cayenne_sort_columns` / `cayenne_shard_key_columns` | insert sort order / encode-shard hash key | (unset) / (unset: PK hash, else round-robin) |
 | `cayenne_goal_convergence_window` | per-dataset controller pacing window | `60s` |
 
 When `cayenne_tuning: adaptive`, a per-table closed-feedback controller makes at most one bounded actuator move per tick, **always clamped to the static `[floor, ceiling]` the `auto` tier derived** — so a dynamic decision can only pick a value `auto` could also have picked; the worst case is the worst static config, never worse.
