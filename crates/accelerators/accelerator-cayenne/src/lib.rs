@@ -1932,6 +1932,23 @@ impl CayenneAccelerator {
                 );
             }
 
+            // `auto` keeps a small primary-key table on position deletes, compacted
+            // whole alongside its writes, only on a runtime with the cores for it
+            // (`CpuBudget::cayenne_keeps_small_tables_compacted`); on fewer it
+            // resolves to `key` here, before the table opens, so the table never
+            // records a position delete. The auto-tuned config line below shows the
+            // result beside `cores`.
+            if config.deletion_mode == cayenne::metadata::DeletionMode::Auto
+                && workload.has_primary_key
+                && !cpu_budget::cpu_budget().cayenne_keeps_small_tables_compacted()
+            {
+                config.deletion_mode = cayenne::metadata::DeletionMode::Key;
+                tracing::debug!(
+                    "Dataset '{table_name}': auto-resolved cayenne_deletion_mode to 'key' (this runtime has {} CPU cores, fewer than the 8 that keep a small table compacted whole alongside its writes). Set `cayenne_deletion_mode: position` to opt into position deletes.",
+                    hw.cores
+                );
+            }
+
             // CDC durability mode (file | memory). Memory mode appends CDC
             // batches to an in-RAM tier and defers the source slot ack to a
             // checkpoint; it is only meaningful for the small-write/CDC
@@ -3260,7 +3277,7 @@ const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
             .one_of(&["auto", "none"])
             .default("auto"),
         ParameterSpec::component("deletion_mode")
-            .description("How primary-key deletions are recorded and applied. 'auto' (default) chooses per table. A table with a primary key on local disk, at most 1/32 of its target file size (cayenne_target_file_size_mb) and never more than 8 MiB, is compacted whole alongside writers, at most a tenth of the time, so reads come from one compact copy plus the changes since its last rewrite. A table past that size uses key deletes, and so does one written so fast that compacting it whole would take more than that tenth, or any on fewer than 8 CPU cores, unless its rows already sit in one compact copy, as after a full refresh; it is sized again when it next loads. A table with refresh_mode: changes, a datalake tier, mode: memory, partitioning, or object storage uses key deletes; a table without a primary key always uses position deletes. 'key' records each delete by primary key and folds deletes into the data incrementally, alongside writers. 'position' pins a primary-key table to position deletes, recorded by file position where it is known; it folds deletes in by rewriting the whole table, pausing writes while that runs.")
+            .description("How primary-key deletions are recorded and applied. 'auto' (default) chooses per table: on a runtime with 8 or more CPU cores, a small table on local disk (at most 8 MiB, and 1/32 of cayenne_target_file_size_mb) uses position deletes and is compacted whole alongside writers; other tables with a primary key use key deletes. 'key' records each delete by primary key and folds deletes in incrementally, alongside writers. 'position' records deletes by file position and folds them in by rewriting the whole table, pausing writes while that runs. A table without a primary key always uses position deletes.")
             .one_of(&["auto", "key", "position"])
             .default("auto"),
         ParameterSpec::component("upload_concurrency")
@@ -8058,8 +8075,10 @@ mod tests {
         .expect("config should be valid");
         assert_eq!(config.deletion_mode, cayenne::metadata::DeletionMode::Auto);
 
-        // A non-CDC profile with a PK stays Auto at config time; Cayenne itself
-        // chooses position or key deletes for the table as it grows.
+        // A non-CDC profile with a PK stays Auto at config time on a runtime with
+        // the cores to keep a small table compacted whole, and Cayenne chooses
+        // position or key deletes for the table as it grows; on a smaller one it
+        // resolves to Key (pinned by the next test).
         let ds = build("full_pk", RefreshMode::Full, vec![]);
         let config = CayenneAccelerator::get_vortex_config_with_footer_cache(
             "full_pk",
@@ -8069,7 +8088,67 @@ mod tests {
         )
         .await
         .expect("config should be valid");
-        assert_eq!(config.deletion_mode, cayenne::metadata::DeletionMode::Auto);
+        let expected = if cpu_budget::cpu_budget().cayenne_keeps_small_tables_compacted() {
+            cayenne::metadata::DeletionMode::Auto
+        } else {
+            cayenne::metadata::DeletionMode::Key
+        };
+        assert_eq!(config.deletion_mode, expected);
+    }
+
+    /// On a runtime with too few cores to keep a small table compacted whole
+    /// alongside its writes, `deletion_mode: auto` resolves to `key` before a
+    /// primary-key table opens. Explicit modes and tables without a primary key
+    /// keep theirs. Runs under an installed budget of two or three cores.
+    #[tokio::test]
+    async fn test_deletion_mode_auto_resolves_to_key_on_a_small_host() {
+        let cpu_budget::testing::Isolation::Child { cores } = cpu_budget::testing::isolated_budget(
+            "tests::test_deletion_mode_auto_resolves_to_key_on_a_small_host",
+        )
+        .expect("an isolated run with an installed CPU budget") else {
+            return;
+        };
+        assert!(
+            !cpu_budget::cpu_budget().cayenne_keeps_small_tables_compacted(),
+            "premise: a {cores}-core budget is a small host"
+        );
+        let resolve = |name: &'static str, params: Vec<(String, String)>, has_primary_key: bool| async move {
+            let mut ds = TestAccelerationSource::new(name);
+            ds.set_acceleration(Acceleration {
+                engine: Engine::Cayenne,
+                mode: Mode::File,
+                refresh_mode: Some(RefreshMode::Full),
+                params: params.into_iter().collect(),
+                ..Default::default()
+            });
+            let workload = autotune::WorkloadProfile {
+                has_primary_key,
+                is_upsert: has_primary_key,
+                pk_arity: usize::from(has_primary_key),
+                ..Default::default()
+            };
+            CayenneAccelerator::get_vortex_config_with_footer_cache(name, &ds, None, &workload)
+                .await
+                .expect("config should be valid")
+                .deletion_mode
+        };
+        assert_eq!(
+            resolve("small_host_pk", vec![], true).await,
+            cayenne::metadata::DeletionMode::Key
+        );
+        assert_eq!(
+            resolve(
+                "small_host_pk_position",
+                vec![("cayenne_deletion_mode".to_string(), "position".to_string())],
+                true
+            )
+            .await,
+            cayenne::metadata::DeletionMode::Position
+        );
+        assert_eq!(
+            resolve("small_host_no_pk", vec![], false).await,
+            cayenne::metadata::DeletionMode::Auto
+        );
     }
 
     fn datalake_test_options(

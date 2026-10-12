@@ -136,7 +136,7 @@ pub use provider::constants::{
     LOOKUP_INDEX_DIR_NAME, STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME,
 };
 pub use provider::{
-    AutoWriteRateRule, CayenneCdcWrite, CayenneContext, CayenneStagedAppend, CayenneStagedUpsert,
+    CayenneCdcWrite, CayenneContext, CayenneStagedAppend, CayenneStagedUpsert,
     CayenneTableProvider, CayenneTableProviderBuilder, CayenneTransaction, EncodeBudgetSnapshot,
     FileDeletionHold, LastSmallFileCompactPath, PARTITIONED_WAL_DIR, PartitionedWal,
     PartitionedWalEntry, PreparedOverwrite, PreparedStagedAppend, PreparedTxnCommit,

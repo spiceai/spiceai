@@ -40,24 +40,6 @@ limitations under the License.
 //! rows are all in protected snapshots leaves them to the bake. Every whole-table
 //! reclaim of an `auto` table, on either kind of delete, is paced to a small share
 //! of the time ([`RECLAIM_SHARE_DENOMINATOR`]).
-//!
-//! The pace makes the size bound a rate bound too. A table small enough for
-//! position deletes, written fast enough that its first whole-table rewrite takes
-//! more than its share of the time, would be held back by the pace on every
-//! rewrite after it, so that rewrite is discarded and the table keeps key deletes
-//! ([`AutoDeletionMode::rewrite_keeps_key_deletes`]). Its rows are then all still
-//! in protected snapshots, where the bake serves it as it serves an explicit
-//! `key` table. A table whose rows already sit in its current snapshot keeps the
-//! paced rewrite, which is all that reaches them.
-//!
-//! On a host with too few cores the same first rewrite keeps key deletes however
-//! long it took (`CpuBudget::cayenne_keeps_small_tables_compacted`). In a Linux
-//! virtual machine held to four CPUs, a 200K-row table under 2,000 upserts every
-//! 250 ms rewrote itself in about 190 ms, a few percent of the time, so the pace
-//! never held it back, yet on position deletes its P99 write was 4% above key
-//! deletes' and its reads were mixed. Four performance cores of a bare-metal Arm
-//! host showed no such loss, and on eight its writes were even and its reads
-//! faster, but a small host is often a virtual machine.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -79,13 +61,13 @@ use crate::metadata::{DeletionMode, ResolvedDeletionMode};
 ///
 /// On key deletes the pace bounds what a table of any size can spend on
 /// whole-table rewrites when the bake cannot reach its rows. On position deletes
-/// it bounds a small table under a high write rate on a small host. At 32,000
-/// upserts a second on four CPUs, a 250K-row table rewrote itself every 1.8 s for
-/// 236 ms, 13% of the time, and its write P99 was 16% above key deletes'. Paced to
-/// a tenth, its write P99 was even with key deletes', but its read P99s ranged
-/// from 9% faster to 11% slower, against 15–22% faster unpaced. Such a table now
-/// keeps key deletes from the start ([`AutoDeletionMode::rewrite_keeps_key_deletes`]),
-/// and the pace is left to tables whose rows its rewrite has already compacted.
+/// it bounds a small table under a high write rate: at 32,000 upserts a second in
+/// a Linux virtual machine held to four CPUs, a 250K-row table rewrote itself
+/// every 1.8 s for 236 ms, 13% of the time, and its write P99 was 16% above key
+/// deletes'; paced to a tenth, its writes were even with key deletes'. On a
+/// runtime with fewer than 8 CPU cores the accelerator resolves `auto` to key
+/// deletes before the table opens (`CpuBudget::cayenne_keeps_small_tables_compacted`).
+///
 /// The pace costs reads while it holds a reclaim back, because the index grows
 /// past the trigger: a 1M-row table under 8,000 upserts a second read at a 10 ms
 /// P99 rewriting at every trigger, with a rewrite running 4.3% of the time, and at
@@ -93,58 +75,6 @@ use crate::metadata::{DeletionMode, ResolvedDeletionMode};
 /// every position-delete table measured at 8,000 upserts a second on 16 cores,
 /// which rewrote for 44–145 ms every ~6.25 s.
 pub(crate) const RECLAIM_SHARE_DENOMINATOR: u32 = 10;
-
-/// The shortest whole-table rewrite that can move an `auto` table to key deletes
-/// for its write rate ([`AutoDeletionMode::rewrite_keeps_key_deletes`]). A shorter
-/// rewrite holds writes up for less than that whatever the rate, and over a few
-/// milliseconds the share it is measured as would be noise. The rewrite that
-/// crowded out writes — 250K rows at 32,000 upserts a second on four CPUs — took
-/// 236 ms. The 200K-row table on 16 cores took 70 ms, against a 6.25 s interval.
-pub(crate) const MIN_PACED_REWRITE: Duration = Duration::from_millis(100);
-
-/// How `deletion_mode: auto`'s write-rate rule treats one table
-/// ([`AutoDeletionMode::rewrite_keeps_key_deletes`]), pinned by a test whose
-/// subject is one regime (`CayenneTableProvider::pin_auto_write_rate_rule`). The
-/// rule times the table's first whole-table rewrite, and in a debug build that
-/// time depends on the machine and its load. `#[doc(hidden)]`: not a stable API.
-#[doc(hidden)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum AutoWriteRateRule {
-    /// The rule as `spiced` runs it: the rewrite's duration against the table's
-    /// write rate.
-    Measured,
-    /// No rewrite outpaces the writes: the table keeps position deletes until it
-    /// outgrows its bound.
-    Never,
-    /// Every first whole-table rewrite of rows all in protected snapshots
-    /// outpaces the writes: it is discarded, and the table keeps key deletes.
-    Always,
-}
-
-/// The state behind [`AutoWriteRateRule`].
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum WriteRateRule {
-    /// A rewrite shorter than `floor` never counts ([`MIN_PACED_REWRITE`] outside
-    /// this crate's unit tests).
-    Measured {
-        floor: Duration,
-    },
-    Never,
-    Always,
-}
-
-/// Why a first whole-table rewrite of an `auto` table keeps it on key deletes
-/// ([`AutoDeletionMode::rewrite_keeps_key_deletes`]).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum KeyDeletesReason {
-    /// The rewrite took more than a [`RECLAIM_SHARE_DENOMINATOR`]th of
-    /// `interval`: the time since the table's previous whole-table reclaim ended
-    /// or, before the first, since its first delete.
-    WriteRate { interval: Duration },
-    /// The host has `cores` CPU cores, too few to keep a table compacted whole
-    /// alongside its writes (`CpuBudget::cayenne_keeps_small_tables_compacted`).
-    Host { cores: usize },
-}
 
 /// How a primary-key table records the delete of a row right now.
 #[derive(Clone, Debug)]
@@ -223,18 +153,6 @@ pub(crate) struct AutoDeletionMode {
     /// Whether a whole-table reclaim has committed while the table was on
     /// position deletes (see [`Self::was_kept_compacted`]).
     kept_compacted: AtomicBool,
-    /// When a compaction pass first found a delete in the table's index since it
-    /// was opened (see [`Self::rewrite_keeps_key_deletes`]).
-    first_delete_at: Mutex<Option<Instant>>,
-    /// See [`Self::rewrite_keeps_key_deletes`]. In this crate's unit tests the rule
-    /// applies only where a test asks for it: their tables rewrite in times that
-    /// depend on the machine and its load.
-    write_rate_rule: Mutex<WriteRateRule>,
-    /// The CPU cores of a host too small to keep a table compacted whole
-    /// alongside its writes (`CpuBudget::cayenne_keeps_small_tables_compacted`),
-    /// or `None` on a host that can. Every host can in this crate's unit tests,
-    /// unless a test says otherwise.
-    small_host_cores: Mutex<Option<usize>>,
 }
 
 #[derive(Debug, Default)]
@@ -250,13 +168,6 @@ struct ReclaimPace {
 /// [`AutoDeletionMode::max_position_bytes_for`]).
 pub(crate) const MAX_POSITION_BYTES: u64 = 8 * 1024 * 1024;
 
-/// The CPU cores of this host when they are too few to keep a table compacted
-/// whole alongside its writes, as `deletion_mode: auto` does on a larger one.
-fn small_host_cores() -> Option<usize> {
-    let budget = cpu_budget::cpu_budget();
-    (!budget.cayenne_keeps_small_tables_compacted()).then_some(budget.cores())
-}
-
 impl AutoDeletionMode {
     /// A table at most `max_position_bytes` on-disk bytes keeps position deletes.
     /// It starts on them; [`Self::size_at_open`] moves it to key deletes when the
@@ -268,15 +179,6 @@ impl AutoDeletionMode {
             max_position_bytes,
             reclaims: Mutex::new(ReclaimPace::default()),
             kept_compacted: AtomicBool::new(false),
-            first_delete_at: Mutex::new(None),
-            write_rate_rule: Mutex::new(if cfg!(test) {
-                WriteRateRule::Never
-            } else {
-                WriteRateRule::Measured {
-                    floor: MIN_PACED_REWRITE,
-                }
-            }),
-            small_host_cores: Mutex::new(if cfg!(test) { None } else { small_host_cores() }),
         }
     }
 
@@ -366,92 +268,6 @@ impl AutoDeletionMode {
         *self.reclaims.lock() = ReclaimPace::default();
     }
 
-    /// Note that the table's deletion index holds a delete at `now`. The first such
-    /// note starts the interval its first whole-table reclaim is measured against.
-    pub(crate) fn note_delete(&self, now: Instant) {
-        self.first_delete_at.lock().get_or_insert(now);
-    }
-
-    /// When [`Self::note_delete`] was first called, if it has been.
-    #[cfg(test)]
-    pub(crate) fn first_delete_noted(&self) -> Option<Instant> {
-        *self.first_delete_at.lock()
-    }
-
-    /// Whether a whole-table rewrite of a table whose rows are all still in
-    /// protected snapshots, which started at `started` and took `took`, should be
-    /// discarded and the table kept on key deletes, and why. The bake reaches such
-    /// rows, so key deletes serve the table whenever rewriting it whole would cost
-    /// its writes:
-    ///
-    /// - The rewrite takes more than one [`RECLAIM_SHARE_DENOMINATOR`]th of the
-    ///   time at the table's write rate: more than `RECLAIM_SHARE_DENOMINATOR - 1`
-    ///   times less than the interval since the previous whole-table reclaim
-    ///   ended or, before the first, since the table's first delete. The pace
-    ///   would hold every such rewrite back.
-    /// - The host has too few cores to keep the table compacted whole alongside its
-    ///   writes (`small_host_cores`), whatever the rewrite took.
-    ///
-    /// Otherwise a rewrite shorter than [`MIN_PACED_REWRITE`] never counts, and the
-    /// write rate needs a delete to measure against. A test may pin the answer
-    /// ([`Self::pin_write_rate_rule`]).
-    pub(crate) fn rewrite_keeps_key_deletes(
-        &self,
-        started: Instant,
-        took: Duration,
-    ) -> Option<KeyDeletesReason> {
-        let interval = self
-            .reclaims
-            .lock()
-            .last_end
-            .or_else(|| *self.first_delete_at.lock())
-            .map(|since| started.saturating_duration_since(since));
-        match *self.write_rate_rule.lock() {
-            WriteRateRule::Never => None,
-            WriteRateRule::Always => Some(KeyDeletesReason::WriteRate {
-                interval: interval.unwrap_or_default(),
-            }),
-            WriteRateRule::Measured { floor } => {
-                if let Some(cores) = *self.small_host_cores.lock() {
-                    return Some(KeyDeletesReason::Host { cores });
-                }
-                let interval = interval?;
-                (took >= floor && took.saturating_mul(RECLAIM_SHARE_DENOMINATOR - 1) > interval)
-                    .then_some(KeyDeletesReason::WriteRate { interval })
-            }
-        }
-    }
-
-    /// Treat the host as one of `cores` CPU cores, too few to keep a table
-    /// compacted whole alongside its writes, or (`None`) as one with enough.
-    #[cfg(test)]
-    pub(crate) fn on_small_host(&self, cores: Option<usize>) {
-        *self.small_host_cores.lock() = cores;
-    }
-
-    /// Pin how [`Self::rewrite_keeps_key_deletes`] answers, for a test whose subject
-    /// is one regime.
-    pub(crate) fn pin_write_rate_rule(&self, rule: AutoWriteRateRule) {
-        *self.write_rate_rule.lock() = match rule {
-            AutoWriteRateRule::Measured => WriteRateRule::Measured {
-                floor: MIN_PACED_REWRITE,
-            },
-            AutoWriteRateRule::Never => WriteRateRule::Never,
-            AutoWriteRateRule::Always => WriteRateRule::Always,
-        };
-    }
-
-    /// Measure rewrites of any duration against the table's write rate, starting
-    /// the interval at `first_delete_at`: lets a test reach the share comparison
-    /// with a table that rewrites in milliseconds.
-    #[cfg(test)]
-    pub(crate) fn measure_write_rate_from(&self, first_delete_at: Option<Instant>) {
-        *self.write_rate_rule.lock() = WriteRateRule::Measured {
-            floor: Duration::ZERO,
-        };
-        *self.first_delete_at.lock() = first_delete_at;
-    }
-
     /// Ask the next compaction trigger to move the table to key deletes. Returns
     /// `true` when this call raised the request (the table was still on position
     /// deletes and no request was pending).
@@ -478,12 +294,10 @@ mod tests {
     const TARGET: usize = 256 * 1024 * 1024;
     const BOUND: u64 = 8 * 1024 * 1024;
 
-    /// An `auto` table opened at `table_bytes` (`None`: could not be sized),
-    /// with the write-rate rule as `spiced` runs it.
+    /// An `auto` table opened at `table_bytes` (`None`: could not be sized).
     fn opened(table_bytes: Option<u64>) -> AutoDeletionMode {
         let auto = AutoDeletionMode::new(BOUND);
         auto.size_at_open(table_bytes);
-        auto.pin_write_rate_rule(AutoWriteRateRule::Measured);
         auto
     }
 
@@ -574,96 +388,6 @@ mod tests {
         // due at 13 s, with rewriting 16.9% of the time.
         assert!(!auto.reclaim_due(second_end + Duration::from_millis(18_899)));
         assert!(auto.reclaim_due(second_end + Duration::from_millis(18_900)));
-    }
-
-    #[test]
-    fn a_rewrite_keeps_key_deletes_when_it_takes_over_a_tenth_of_the_interval() {
-        let auto = opened(Some(1));
-        let first_delete = Instant::now();
-        auto.note_delete(first_delete);
-        // A later delete does not move the start of the interval.
-        auto.note_delete(first_delete + Duration::from_secs(1));
-        let started = first_delete + Duration::from_millis(1_800);
-        // 9 × 200 ms = 1.8 s is not more than the 1.8 s interval: within its share.
-        assert_eq!(
-            auto.rewrite_keeps_key_deletes(started, Duration::from_millis(200)),
-            None
-        );
-        // 9 × 201 ms is: past its share, measured against 1.8 s.
-        assert_eq!(
-            auto.rewrite_keeps_key_deletes(started, Duration::from_millis(201)),
-            Some(KeyDeletesReason::WriteRate {
-                interval: Duration::from_millis(1_800)
-            })
-        );
-    }
-
-    #[test]
-    fn a_rewrite_is_measured_from_the_previous_reclaim_once_there_is_one() {
-        let auto = opened(Some(1));
-        let first_delete = Instant::now();
-        auto.note_delete(first_delete);
-        let previous_end = first_delete + Duration::from_secs(60);
-        auto.record_reclaim(Duration::from_millis(100), previous_end);
-        let started = previous_end + Duration::from_secs(1);
-        // Against the minute since the first delete it would be within its share;
-        // against the second since the previous reclaim it is not.
-        assert_eq!(
-            auto.rewrite_keeps_key_deletes(started, Duration::from_millis(150)),
-            Some(KeyDeletesReason::WriteRate {
-                interval: Duration::from_secs(1)
-            })
-        );
-    }
-
-    #[test]
-    fn a_short_rewrite_or_one_with_nothing_to_measure_against_never_outpaces_writes() {
-        let auto = opened(Some(1));
-        let started = Instant::now();
-        // No delete yet: nothing to measure against.
-        assert_eq!(
-            auto.rewrite_keeps_key_deletes(started, Duration::from_secs(10)),
-            None
-        );
-        auto.note_delete(started);
-        // Below the floor, however short the interval.
-        assert_eq!(
-            auto.rewrite_keeps_key_deletes(
-                started,
-                MIN_PACED_REWRITE.saturating_sub(Duration::from_millis(1))
-            ),
-            None
-        );
-        assert_eq!(
-            auto.rewrite_keeps_key_deletes(started, MIN_PACED_REWRITE),
-            Some(KeyDeletesReason::WriteRate {
-                interval: Duration::ZERO
-            })
-        );
-    }
-
-    #[test]
-    fn a_first_rewrite_on_a_small_host_keeps_key_deletes_however_long_it_took() {
-        let auto = opened(Some(1));
-        let started = Instant::now();
-        auto.note_delete(
-            started
-                .checked_sub(Duration::from_secs(60))
-                .expect("a minute ago is representable"),
-        );
-        // Well within its share of a minute, on a host with enough cores.
-        assert_eq!(
-            auto.rewrite_keeps_key_deletes(started, Duration::from_millis(150)),
-            None
-        );
-        auto.on_small_host(Some(4));
-        for took in [Duration::from_millis(1), Duration::from_millis(150)] {
-            assert_eq!(
-                auto.rewrite_keeps_key_deletes(started, took),
-                Some(KeyDeletesReason::Host { cores: 4 }),
-                "a rewrite that took {took:?}"
-            );
-        }
     }
 
     #[test]

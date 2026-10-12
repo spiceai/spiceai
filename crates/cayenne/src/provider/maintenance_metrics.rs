@@ -134,9 +134,7 @@ pub(crate) enum CompactionOutcome {
     DeclinedNoCleanPrefix,
     /// A `deletion_mode: auto` table's whole-table reclaim is held back by the
     /// pace that keeps such reclaims to a tenth of the time, though the deletion
-    /// index is past its trigger. Also recorded when a table's first whole-table
-    /// reclaim takes more than that share, which moves the table to key deletes
-    /// instead of committing it.
+    /// index is past its trigger.
     DeclinedPaced,
     /// A `deletion_mode: auto` table on position deletes captured more than its
     /// position-delete bound for a whole-table reclaim, so it moved to key

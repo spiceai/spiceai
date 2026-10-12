@@ -1209,9 +1209,8 @@ impl CpuBudget {
     /// on position deletes, compacted whole alongside its writes. In a Linux
     /// virtual machine held to four CPUs, a 200K-row table under 2,000 upserts
     /// every 250 ms wrote at a P99 4% above key deletes' on position deletes, with
-    /// mixed reads. On eight performance cores of an Arm host its writes were even
-    /// and its reads 6–25% faster. Four of that host's cores showed no loss, but a
-    /// small host is often a virtual machine.
+    /// mixed reads. On eight performance cores of a bare-metal Arm host its writes
+    /// were even and its P99 reads 8–27% faster.
     #[must_use]
     pub const fn cayenne_keeps_small_tables_compacted(&self) -> bool {
         self.cores >= 8
@@ -1407,6 +1406,19 @@ mod tests {
 
     fn budget(cores: usize) -> CpuBudget {
         CpuBudget::resolve(&CpuConfig::default(), &host(cores)).expect("detection cannot fail")
+    }
+
+    /// Cayenne's `deletion_mode: auto` keeps small tables compacted on eight
+    /// cores and more, and on key deletes below.
+    #[test]
+    fn cayenne_keeps_small_tables_compacted_from_eight_cores() {
+        for (cores, keeps) in [(1, false), (4, false), (7, false), (8, true), (64, true)] {
+            assert_eq!(
+                budget(cores).cayenne_keeps_small_tables_compacted(),
+                keeps,
+                "{cores} cores"
+            );
+        }
     }
 
     fn quota(affinity_cores: usize, quota_millicores: u64) -> HostReadings {
