@@ -1753,7 +1753,7 @@ mod tests {
         );
     }
 
-    /// Freshness counts from read start even when insertion is recent.
+    /// Freshness counts from query start even when insertion is recent.
     #[tokio::test]
     async fn freshness_counts_from_read_start() {
         let now = Instant::now();

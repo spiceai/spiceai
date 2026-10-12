@@ -127,11 +127,14 @@ pub struct CachedQueryResult {
     /// Instant the result was stored. Together with `read_started_at`, this
     /// identifies a stored generation for [`Self::is_same_generation`].
     cached_at: Instant,
-    /// When the query that produced this result began reading.
+    /// When the query that produced this result started: taken before the
+    /// results-cache lookup and before any wait for a query worker, so it is no
+    /// later than the moment the query read its tables.
     ///
-    /// Freshness and expiry are measured from this instant. The table-change
-    /// clock also compares against it, so a client write, reload or unload
-    /// between the read and storage disqualifies the cached result.
+    /// Freshness and expiry are measured from this instant, so queueing time
+    /// counts toward `item_ttl`. The table-change clock also compares against
+    /// it, so a client write, reload or unload after the query started
+    /// disqualifies the cached result.
     pub read_started_at: Instant,
     /// Encoder used to decode the data
     encoder: Option<Arc<dyn Encoder>>,
@@ -395,7 +398,7 @@ impl CachedQueryResult {
         }
     }
 
-    /// Whether the query began reading more than `ttl` before `now`.
+    /// Whether the query started more than `ttl` before `now`.
     #[must_use]
     pub fn is_stale(&self, ttl: Duration, now: Instant) -> bool {
         now.saturating_duration_since(self.read_started_at) > ttl

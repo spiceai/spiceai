@@ -2543,12 +2543,13 @@ mod tests {
         )
     }
 
-    /// Reproduction for warmup vs checkpoint-backed startup refresh: the
-    /// reusable `initial_load_completed` flag is already true, so a poller
-    /// that waits on it stores while this process's first refresh is still
-    /// in flight; that refresh then invalidates the warmed entry.
+    /// Warmup vs checkpoint-backed startup refresh: the reusable
+    /// `initial_load_completed` flag is already true, so a poller that waits on
+    /// it stores while this process's first refresh is still in flight. The
+    /// refresh does not invalidate SQL results, so the warmed entry survives it
+    /// and ages out on `item_ttl` like any other entry.
     #[tokio::test]
-    async fn checkpoint_ready_flag_lets_warmup_store_before_startup_invalidation() {
+    async fn checkpoint_ready_flag_lets_warmup_store_before_startup_refresh() {
         const WARMUP_KEY: u64 = 7;
         let (refresher, refresh_completion, open, cache, _caching, refresh_handle) =
             started_gated_checkpoint_always_refresher().await;
@@ -2575,18 +2576,17 @@ mod tests {
             .expect("the gated startup refresh completes after the source opens");
 
         assert!(
-            !warmup_entry_present(&cache, WARMUP_KEY).await,
-            "the startup refresh must invalidate entries stored while it was in flight"
+            warmup_entry_present(&cache, WARMUP_KEY).await,
+            "a refresh leaves cached SQL results to age out on item_ttl"
         );
 
         drop(refresh_handle);
     }
 
-    /// The wait warmup must use: a store after the per-process completion
-    /// cannot be evicted by that same refresh, because invalidation already
-    /// ran.
+    /// The wait warmup uses: a store after the per-process completion reads
+    /// the refreshed data and stays cached.
     #[tokio::test]
-    async fn warmup_store_after_refresh_completion_survives_startup_invalidation() {
+    async fn warmup_store_after_refresh_completion_survives_startup_refresh() {
         const WARMUP_KEY: u64 = 11;
         let (refresher, refresh_completion, open, cache, _caching, refresh_handle) =
             started_gated_checkpoint_always_refresher().await;
@@ -2612,7 +2612,7 @@ mod tests {
         store_warmup_entry(&cache, "orders", WARMUP_KEY).await;
         assert!(
             warmup_entry_present(&cache, WARMUP_KEY).await,
-            "a store after the completion is recorded must survive that refresh's invalidation"
+            "a store after the completion is recorded stays cached"
         );
 
         drop(refresh_handle);

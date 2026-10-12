@@ -255,9 +255,10 @@ const MAX_ENCODING_COMPRESSION_RATIO: usize = 16;
 /// `read_started_at` is when the query began, and is recorded on the entry so
 /// every later cache hit can check it — see
 /// [`QueryResultsCacheProvider::tables_changed_since`], which documents why
-/// the comparison is deliberately conservative. It must be the start of the
-/// read, not the moment the result is stored: a change landing in between has
-/// to disqualify the entry. The same read start anchors its TTL and stale window.
+/// the comparison is deliberately conservative. It must be no later than the
+/// start of the read, not the moment the result is stored: a change landing in
+/// between has to disqualify the entry. The same instant anchors the entry's TTL
+/// and stale window.
 #[must_use]
 #[expect(clippy::implicit_hasher)]
 pub fn to_cached_record_batch_stream(
