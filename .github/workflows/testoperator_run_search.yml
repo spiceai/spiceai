@@ -44,7 +44,7 @@ on:
         default: 1800
         type: number
       sql_pipeline:
-        description: 'Parameterized SQL search pipeline file. Leave empty to search through /v1/search.'
+        description: 'Parameterized SQL search pipeline: a file path or the SQL text. Leave empty to search through /v1/search.'
         required: false
         default: ''
         type: string
@@ -67,16 +67,21 @@ jobs:
           fi
           echo "Spicepod file found at ${{ github.event.inputs.spicepod_path }}"
 
-      - name: Validate SQL pipeline file exists
+      - name: Validate SQL pipeline
         if: github.event.inputs.sql_pipeline != ''
         env:
           SQL_PIPELINE: ${{ github.event.inputs.sql_pipeline }}
         run: |
-          if [ ! -f "$SQL_PIPELINE" ]; then
+          # Same rule as `testoperator run search --sql-pipeline`: a value that ends with `.sql` or
+          # has no whitespace is a file path, and other values are SQL text.
+          if [ -f "$SQL_PIPELINE" ]; then
+            echo "SQL pipeline file found at $SQL_PIPELINE"
+          elif [[ "$SQL_PIPELINE" == *.sql || "$SQL_PIPELINE" != *[[:space:]]* ]]; then
             echo "Error: SQL pipeline file not found at $SQL_PIPELINE"
             exit 1
+          else
+            echo "SQL pipeline is inline SQL"
           fi
-          echo "SQL pipeline file found at $SQL_PIPELINE"
 
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
@@ -139,7 +144,8 @@ jobs:
           if [ -n "$BENCHMARK_DATASET" ] && [ "$BENCHMARK_DATASET" != "custom" ]; then
             dataset_flag="--benchmark-dataset $BENCHMARK_DATASET"
           fi
-          # An empty SQL pipeline sends each query to /v1/search; a set one sends it to /v1/sql.
+          # An empty SQL pipeline sends each query to /v1/search; a set one (file or SQL) sends it to
+          # /v1/sql.
           sql_pipeline_args=()
           if [ -n "$SQL_PIPELINE" ]; then
             sql_pipeline_args=(--sql-pipeline "$SQL_PIPELINE")
