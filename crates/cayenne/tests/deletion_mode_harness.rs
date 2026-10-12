@@ -200,6 +200,47 @@ fn mode_from_env() -> DeletionMode {
     }
 }
 
+/// Sets up Cayenne's process-wide compaction the way `spiced` does before any
+/// table opens, so maintenance competes for the CPU here as it does there: the
+/// global encode budget, and a dedicated compaction runtime whose worker threads
+/// run at nice 10, as `ManagedTokioRuntime::with_low_priority` builds it. Every
+/// compaction pass, the whole-table rewrite included, runs on that runtime. Left
+/// on the test's runtime instead, a rewrite competes with writes and queries at
+/// their own priority, which on a host with few cores costs writers more than it
+/// does under `spiced` on Linux, where the lower priority is per thread. On
+/// macOS `setpriority` lowers the whole process, writers included.
+///
+/// `HARNESS_COMPACTION_RUNTIME=shared` keeps compaction on the test's runtime.
+fn install_compaction_runtime_from_env() {
+    match env_string("HARNESS_COMPACTION_RUNTIME", "dedicated").as_str() {
+        "shared" => return,
+        "dedicated" => {}
+        other => {
+            panic!("HARNESS_COMPACTION_RUNTIME must be `dedicated` or `shared`, not {other:?}")
+        }
+    }
+    let budget = cpu_budget::cpu_budget();
+    cayenne::set_global_encode_concurrency(budget.cayenne_encode_permits());
+    let mut builder = tokio::runtime::Builder::new_multi_thread();
+    builder
+        .worker_threads(budget.dedicated_runtime_worker_threads())
+        .thread_name("compaction-worker")
+        .enable_all();
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    builder.on_thread_start(|| {
+        // SAFETY: `setpriority` takes no pointers; `PRIO_PROCESS` with id 0 names
+        // the calling thread on Linux and the calling process on macOS.
+        unsafe {
+            libc::setpriority(libc::PRIO_PROCESS, 0, 10);
+        }
+    });
+    let runtime = builder.build().expect("compaction runtime builds");
+    cayenne::set_compaction_runtime_handle(runtime.handle().clone());
+    // Lives for the rest of the process, as it does in `spiced`. Dropped here,
+    // inside the test's runtime, it would panic.
+    std::mem::forget(runtime);
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "timing harness; run explicitly with HARNESS_* variables"]
 async fn deletion_mode_steady_state_harness() -> Result<(), Box<dyn std::error::Error>> {
@@ -436,10 +477,14 @@ async fn deletion_mode_steady_state_harness() -> Result<(), Box<dyn std::error::
 /// with few cores those queries take CPU from the writer. `HARNESS_READ_INTERVAL_MS`
 /// starts each round of the four queries at a fixed rate instead, so two builds
 /// whose reads differ in speed are compared at the same read load.
+///
+/// Compaction runs as under `spiced`; see [`install_compaction_runtime_from_env`].
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "timing harness; run explicitly with HARNESS_* variables"]
 async fn deletion_mode_concurrent_harness() -> Result<(), Box<dyn std::error::Error>> {
     let mode = mode_from_env();
+    install_compaction_runtime_from_env();
+    let compaction_runtime = env_string("HARNESS_COMPACTION_RUNTIME", "dedicated");
     let mode_label = env_string("HARNESS_MODE", "key");
     let rows = env_usize("HARNESS_ROWS", 1_000_000);
     let round_keys = env_usize("HARNESS_ROUND_KEYS", 2_000);
@@ -485,7 +530,7 @@ async fn deletion_mode_concurrent_harness() -> Result<(), Box<dyn std::error::Er
     table.spawn_background_compaction(Arc::new(tokio::sync::Semaphore::new(2)));
     ctx.register_table("t", Arc::clone(&table) as Arc<dyn TableProvider>)?;
     eprintln!(
-        "HARNESS mode={mode_label} config concurrent rows={rows} round_keys={round_keys} write_interval_ms={write_interval_ms} duration_s={duration_s} seed={seed} pattern={pattern} trigger={trigger} read_interval_ms={read_interval_ms}"
+        "HARNESS mode={mode_label} config concurrent rows={rows} round_keys={round_keys} write_interval_ms={write_interval_ms} duration_s={duration_s} seed={seed} pattern={pattern} trigger={trigger} read_interval_ms={read_interval_ms} compaction_runtime={compaction_runtime}"
     );
 
     let mut next = 0usize;
