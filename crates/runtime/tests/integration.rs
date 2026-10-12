@@ -144,7 +144,6 @@ mod cdc_cayenne;
 #[cfg(feature = "debezium")]
 mod cdc_ingest;
 mod cluster_tls_reload;
-mod initial_load_supersede;
 #[cfg(feature = "kafka")]
 mod kafka;
 mod metadata;
