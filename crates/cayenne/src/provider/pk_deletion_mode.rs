@@ -50,9 +50,11 @@ use parking_lot::Mutex;
 use crate::metadata::{DeletionMode, ResolvedDeletionMode};
 
 /// An `auto` table on key deletes takes at most this fraction (one tenth) of the
-/// time rewriting itself whole: such a reclaim waits, the deletion index growing
-/// past its trigger meanwhile, until 9 times the recent whole-table reclaims'
-/// duration has passed since the previous one ended. Over the deletion index's
+/// time rewriting itself whole: after each whole-table reclaim the next one waits,
+/// the deletion index growing past its trigger meanwhile, until 9 times that
+/// reclaim's duration has passed since it ended. Each reclaim is followed by a
+/// wait nine times as long, so however their durations change, rewriting takes at
+/// most a tenth of any run of reclaims and their waits. Over the deletion index's
 /// memory ceiling it does not wait.
 ///
 /// The pace bounds what a table of any size can spend on whole-table rewrites
@@ -147,8 +149,7 @@ pub(crate) struct AutoDeletionMode {
 struct ReclaimPace {
     /// When the previous whole-table reclaim ended; `None` before the first.
     last_end: Option<Instant>,
-    /// How long a whole-table reclaim takes: the mean of the last one and the
-    /// estimate before it, so one slow pass does not stall the next for long.
+    /// How long the previous whole-table reclaim took.
     busy: Duration,
 }
 
@@ -232,7 +233,7 @@ impl AutoDeletionMode {
     /// Whether a whole-table reclaim may start at `now` with the table's reclaims
     /// still taking at most one [`RECLAIM_SHARE_DENOMINATOR`]th of the time: the
     /// first always may, and each later one once the time since the previous one
-    /// ended is at least `RECLAIM_SHARE_DENOMINATOR - 1` times a reclaim's
+    /// ended is at least `RECLAIM_SHARE_DENOMINATOR - 1` times that reclaim's
     /// duration.
     pub(crate) fn reclaim_due(&self, now: Instant) -> bool {
         let pace = self.reclaims.lock();
@@ -245,11 +246,7 @@ impl AutoDeletionMode {
     /// Record a whole-table reclaim that took `busy` and ended at `ended`.
     pub(crate) fn record_reclaim(&self, busy: Duration, ended: Instant) {
         let mut pace = self.reclaims.lock();
-        pace.busy = if pace.last_end.is_some() {
-            pace.busy.saturating_add(busy) / 2
-        } else {
-            busy
-        };
+        pace.busy = busy;
         pace.last_end = Some(ended);
     }
 
@@ -363,15 +360,23 @@ mod tests {
     }
 
     #[test]
-    fn one_slow_reclaim_moves_the_pace_by_half() {
+    fn a_slower_reclaim_waits_nine_times_its_own_duration() {
         let auto = opened(Some(1));
-        let first = Instant::now();
-        auto.record_reclaim(Duration::from_millis(100), first);
-        let second = first + Duration::from_secs(10);
-        // A 2.1 s pass after a 100 ms one: the estimate is their mean, 1.1 s.
-        auto.record_reclaim(Duration::from_millis(2_100), second);
-        assert!(!auto.reclaim_due(second + Duration::from_millis(9_899)));
-        assert!(auto.reclaim_due(second + Duration::from_millis(9_900)));
+        // A 100 ms reclaim from 0 ms, then a 2.1 s one from the moment the next is
+        // due (1,000 ms): it ends at 3,100 ms.
+        let start = Instant::now();
+        auto.record_reclaim(
+            Duration::from_millis(100),
+            start + Duration::from_millis(100),
+        );
+        assert!(auto.reclaim_due(start + Duration::from_millis(1_000)));
+        let second_end = start + Duration::from_millis(3_100);
+        auto.record_reclaim(Duration::from_millis(2_100), second_end);
+        // The third waits 9 × 2.1 s = 18.9 s, to 22 s: 2.2 s of rewriting in 22 s,
+        // a tenth. Paced from the two reclaims' mean (1.1 s), it would have been
+        // due at 13 s, with rewriting 16.9% of the time.
+        assert!(!auto.reclaim_due(second_end + Duration::from_millis(18_899)));
+        assert!(auto.reclaim_due(second_end + Duration::from_millis(18_900)));
     }
 
     #[test]
