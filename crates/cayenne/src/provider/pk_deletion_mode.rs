@@ -258,9 +258,11 @@ impl AutoDeletionMode {
         self.kept_compacted.store(true, Ordering::Release);
     }
 
-    /// Whether the table was kept fully compacted at some point: a whole-table
-    /// reclaim committed while it was on position deletes. A table that outgrew
-    /// the bound during its first load never was.
+    /// Whether the table was kept fully compacted since this provider opened it: a
+    /// whole-table reclaim committed while it was on position deletes. A table that
+    /// outgrew the bound during its first load never was, and neither, until such a
+    /// reclaim, was one an earlier load compacted: the metastore records no kind of
+    /// commit to tell that from an overwrite.
     pub(crate) fn was_kept_compacted(&self) -> bool {
         self.kept_compacted.load(Ordering::Acquire)
     }

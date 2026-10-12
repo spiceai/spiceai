@@ -12758,7 +12758,18 @@ impl CayenneTableProvider {
             return;
         }
 
-        let mut to_store = match index {
+        // A table `deletion_mode: auto` moved to key deletes while this keyset was
+        // checked out: forget the positions it captured, as the switch did for a
+        // cached keyset. A keyset that never captured a position has no captured
+        // files, so this costs a key table nothing.
+        if let CachedPkIndex::Exact(keyset) = &mut index
+            && !keyset.captured_files.is_empty()
+            && !self.should_capture_positions()
+        {
+            keyset.forget_positions();
+        }
+
+        let to_store = match index {
             CachedPkIndex::Exact(keyset) if keyset.approx_bytes > max_bytes => {
                 if self.upsert_bloom_eligible() {
                     // Convert the over-budget exact keyset to a bounded bloom so
@@ -12796,18 +12807,6 @@ impl CayenneTableProvider {
             }
             other => other,
         };
-
-        // A keyset checked out while the table was still capturing positions can
-        // return after `auto` moved to key deletes (the cache cell was `None` at
-        // the switch, so `switch_auto_to_key_deletes_unlogged` scrubbed nothing).
-        // Forget any still-`FilePositioned` locations and their `captured_files`
-        // before restoring, matching that method's contract: from here on every
-        // delete is a key delete.
-        if !self.should_capture_positions()
-            && let CachedPkIndex::Exact(keyset) = &mut to_store
-        {
-            keyset.forget_positions();
-        }
 
         let bytes = to_store.approx_bytes();
         self.track_pk_index_preserved("table_keyset", to_store.bloom_density().is_some());
@@ -13626,8 +13625,8 @@ impl CayenneTableProvider {
             return false;
         };
         // The user sees this change only for a table that was kept fully
-        // compacted: a table that passes the bound during its first load was never
-        // rewritten whole, so its reads do not change.
+        // compacted since it loaded: a table that passes the bound during its first
+        // load was never rewritten whole, so its reads do not change.
         if auto.was_kept_compacted() {
             tracing::info!(
                 target: "cayenne::compaction",
@@ -13968,8 +13967,13 @@ impl CayenneTableProvider {
                 // (no byte-budget change — `RowLocation` is a fixed-size enum).
                 // Entries should already exist (recorded as `FileUnlocated` by
                 // `record_file_pk_keys`); a missing one is skipped defensively.
+                // Read the mode again under the lock: a table `deletion_mode: auto`
+                // moved to key deletes since this pass began has forgotten its
+                // positions, and the switch takes this lock after it moves.
                 let mut guard = self.pk_keyset_cache.lock();
-                if let Some(CachedPkIndex::Exact(keyset)) = guard.as_mut() {
+                if let Some(CachedPkIndex::Exact(keyset)) = guard.as_mut()
+                    && self.should_capture_positions()
+                {
                     for (key, position) in entries {
                         if let Some(location) = keyset.location_mut(&key) {
                             *location = RowLocation::FilePositioned {

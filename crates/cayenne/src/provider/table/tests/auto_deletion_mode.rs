@@ -63,6 +63,15 @@ async fn write(provider: &CayenneTableProvider, ids: &[i64], value: i64) {
 /// Rebuild the keyset cold and capture positions, as the seeded position-mode
 /// tests do, so the next upsert of these keys records position deletes.
 async fn capture_positions(provider: &CayenneTableProvider) {
+    load_keyset(provider).await;
+    provider
+        .run_position_capture()
+        .await
+        .expect("position capture succeeds");
+}
+
+/// Rebuild the table's exact keyset from its files, every key unlocated.
+async fn load_keyset(provider: &CayenneTableProvider) {
     let pk_indices = provider
         .primary_key_indices()
         .expect("resolve pk indices")
@@ -76,10 +85,42 @@ async fn capture_positions(provider: &CayenneTableProvider) {
         .await
         .expect("cold keyset rebuild");
     provider.store_cached_pk_index(index, checkout);
-    provider
-        .run_position_capture()
-        .await
-        .expect("position capture succeeds");
+}
+
+/// How many of `ids` `keyset` locates by file position.
+fn located_keys(provider: &CayenneTableProvider, keyset: &CachedPkKeyset, ids: &[i64]) -> usize {
+    let pk_indices = provider
+        .primary_key_indices()
+        .expect("resolve pk indices")
+        .expect("table has a primary key");
+    let converter = provider
+        .build_pk_converter(&pk_indices)
+        .expect("build pk converter");
+    ids.iter()
+        .filter(|id| {
+            let batch = id_value_batch(Arc::clone(&provider.table_metadata.schema), &[**id], &[0]);
+            let rows = converter
+                .convert_columns(&[Arc::clone(batch.column(0))])
+                .expect("convert key");
+            matches!(
+                keyset.location_by_digest(pk_digest(&rows.row(0).owned())),
+                Some(RowLocation::FilePositioned { .. })
+            )
+        })
+        .count()
+}
+
+/// The cached keyset's captured files and how many of `ids` it locates by file
+/// position.
+fn cached_captured_positions(provider: &CayenneTableProvider, ids: &[i64]) -> (usize, usize) {
+    let guard = provider.pk_keyset_cache.lock();
+    let Some(CachedPkIndex::Exact(keyset)) = guard.as_ref() else {
+        panic!("the table caches an exact keyset");
+    };
+    (
+        keyset.captured_files.len(),
+        located_keys(provider, keyset, ids),
+    )
 }
 
 /// Write `ids` with values that do not compress, so the table's size on disk
@@ -689,8 +730,8 @@ async fn an_auto_table_on_key_deletes_defers_its_whole_table_reclaim_with_the_ba
 
 /// A writer that checked the keyset out while the table was on position deletes
 /// and returns it after the switch to key deletes records no position delete with
-/// it: the upsert path reads the table's mode, not the positions the keyset still
-/// carries.
+/// it: the upsert path reads the table's mode. The keyset it returns forgets its
+/// captured positions, as the switch did for the cached one.
 #[tokio::test]
 async fn a_keyset_checked_out_before_the_switch_records_no_position_delete_after_it() {
     let name = "auto_checkout_across_switch";
@@ -706,26 +747,7 @@ async fn a_keyset_checked_out_before_the_switch_records_no_position_delete_after
     // A writer holds the keyset, located, across the switch.
     let (index, checkout) = provider.take_cached_pk_index();
     let located = match index.as_ref() {
-        Some(CachedPkIndex::Exact(keyset)) => keys
-            .iter()
-            .filter(|id| {
-                let schema = Arc::clone(&provider.table_metadata.schema);
-                let batch = id_value_batch(schema, &[**id], &[0]);
-                let pk_indices = provider
-                    .primary_key_indices()
-                    .expect("pk indices")
-                    .expect("primary key");
-                let rows = provider
-                    .build_pk_converter(&pk_indices)
-                    .expect("converter")
-                    .convert_columns(&[Arc::clone(batch.column(0))])
-                    .expect("convert key");
-                matches!(
-                    keyset.location_by_digest(pk_digest(&rows.row(0).owned())),
-                    Some(RowLocation::FilePositioned { .. })
-                )
-            })
-            .count(),
+        Some(CachedPkIndex::Exact(keyset)) => located_keys(&provider, keyset, &keys),
         _ => 0,
     };
     assert_eq!(
@@ -740,25 +762,10 @@ async fn a_keyset_checked_out_before_the_switch_records_no_position_delete_after
     // Cache cell was `None` while the keyset was checked out, so the switch
     // scrubbed nothing; restoring must forget positions itself.
     provider.store_cached_pk_index(index.expect("an exact keyset"), checkout);
-    let (restored, restore_checkout) = provider.take_cached_pk_index();
-    let (still_positioned, captured_files) = match restored.as_ref() {
-        Some(CachedPkIndex::Exact(keyset)) => (
-            keyset
-                .locations()
-                .filter(|loc| matches!(loc, RowLocation::FilePositioned { .. }))
-                .count(),
-            keyset.captured_files.len(),
-        ),
-        other => panic!("expected an exact keyset after restore, got {other:?}"),
-    };
-    provider.store_cached_pk_index(restored.expect("exact keyset"), restore_checkout);
     assert_eq!(
-        still_positioned, 0,
-        "store_cached_pk_index must scrub FilePositioned locations after the switch"
-    );
-    assert_eq!(
-        captured_files, 0,
-        "store_cached_pk_index must drop captured_files after the switch"
+        cached_captured_positions(&provider, &keys),
+        (0, 0),
+        "the returned keyset keeps no captured file or position: (captured files, located keys)"
     );
 
     write(&provider, &keys, 200).await;
@@ -771,6 +778,45 @@ async fn a_keyset_checked_out_before_the_switch_records_no_position_delete_after
     let rows = collect_id_value_pairs(&ctx, &provider, name).await;
     let expected: Vec<(i64, i64)> = keys.iter().map(|id| (*id, 200)).collect();
     assert_eq!(rows, expected, "every key shows its latest row, once");
+}
+
+/// A position-capture pass that began while an auto table was on position deletes
+/// and publishes after the switch to key deletes captures nothing: the switch
+/// forgot the table's positions, and the pass reads the mode again before it
+/// records any.
+#[tokio::test]
+async fn a_capture_pass_that_publishes_after_the_switch_captures_nothing() {
+    let name = "auto_capture_across_switch";
+    let (provider, _catalog, _tmp) = table(name, DeletionMode::Auto, 256).await;
+    let keys: Vec<i64> = (0..16).collect();
+    write(&provider, &keys, 100).await;
+    provider
+        .rewrite_current_snapshot_for_compaction_tracked(None)
+        .await
+        .expect("fold the seed into the current snapshot");
+    load_keyset(&provider).await;
+    assert_eq!(
+        cached_captured_positions(&provider, &keys),
+        (0, 0),
+        "premise: nothing captured yet"
+    );
+    assert!(
+        provider.switch_auto_to_key_deletes(),
+        "the table switches to key deletes"
+    );
+
+    // The pass passed its mode check before the switch; it lists and scans the
+    // current snapshot's files now.
+    provider
+        .capture_new_file_positions()
+        .await
+        .expect("capture pass");
+
+    assert_eq!(
+        cached_captured_positions(&provider, &keys),
+        (0, 0),
+        "a pass that publishes after the switch captures no file or position: (captured files, located keys)"
+    );
 }
 
 /// A key repeated within one write is folded out of an auto table's files, as key
