@@ -342,8 +342,11 @@ pub(crate) fn map_pg_oid_to_arrow(type_oid: u32, type_modifier: i32) -> Option<D
         26 => DataType::UInt32,
         700 => DataType::Float32,
         701 => DataType::Float64,
-        // text, name, bpchar, varchar, uuid, json, xml, cidr, inet, macaddr
-        25 | 19 | 1042 | 1043 | 2950 | 114 | 142 | 650 | 869 | 829 => DataType::Utf8,
+        // text, name, bpchar, varchar, uuid, json, jsonb, xml, cidr, inet,
+        // macaddr. The provider maps `json` and `jsonb` alike, and the WAL
+        // decoder reads a `jsonb` value's text past its version byte, so the
+        // two agree on `Utf8` here as well.
+        25 | 19 | 1042 | 1043 | 2950 | 114 | 3802 | 142 | 650 | 869 | 829 => DataType::Utf8,
         17 => DataType::Binary,
         1082 => DataType::Date32,
         1083 => DataType::Time64(TimeUnit::Nanosecond),
@@ -727,6 +730,8 @@ mod tests {
         assert_eq!(map_pg_oid_to_arrow(700, -1), Some(DataType::Float32));
         assert_eq!(map_pg_oid_to_arrow(701, -1), Some(DataType::Float64));
         assert_eq!(map_pg_oid_to_arrow(25, -1), Some(DataType::Utf8));
+        assert_eq!(map_pg_oid_to_arrow(114, -1), Some(DataType::Utf8));
+        assert_eq!(map_pg_oid_to_arrow(3802, -1), Some(DataType::Utf8));
         assert_eq!(map_pg_oid_to_arrow(17, -1), Some(DataType::Binary));
         assert_eq!(map_pg_oid_to_arrow(1082, -1), Some(DataType::Date32));
         assert_eq!(

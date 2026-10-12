@@ -3536,12 +3536,18 @@ mod tests {
         let numeric_zero = enc_numeric(&[], 0, false, 2);
         assert_eq!(numeric_zero.len(), 8);
         let text = b"1234".to_vec();
+        // `jsonb_send` prefixes the JSON text with a version byte, so the JSON
+        // number 123 is exactly four bytes — an `int4` decode of it would store
+        // 0x01313233 = 20001331.
+        let jsonb_number = vec![0x01, b'1', b'2', b'3'];
+        assert_eq!(jsonb_number.len(), 4);
         for (dt, oid, raw) in [
             (DataType::Int64, 1700, numeric_zero.clone()),
             (DataType::Float64, 1700, numeric_zero),
             (DataType::Int32, 25, text.clone()),
             (DataType::Float32, 1043, text),
             (DataType::Int64, 1114, 0i64.to_be_bytes().to_vec()),
+            (DataType::Int32, 3802, jsonb_number),
         ] {
             let message = bin_convert(&dt, oid, &raw).expect_err("no misread");
             assert!(
