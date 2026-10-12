@@ -222,6 +222,10 @@ impl Read for ScyllaDbTableFactory {
             .context(UnableToFetchTableSchemaSnafu)?;
 
         // Create the base SqlTable, configured for what CQL can serve
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "ScyllaDB does not federate, and `ScyllaDbTable::supports_filters_pushdown` pushes only key-column predicates, which name no function"
+        )]
         let base_table = apply_cql_pushdown_limits(
             SqlTable::new("scylladb", &pool, table_reference.clone(), None)
                 .await
@@ -283,6 +287,10 @@ mod tests {
         ]))
     }
 
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test fixture over a mock pool, wrapped in `ScyllaDbTable`, whose own filter pushdown is what these tests exercise"
+    )]
     fn base_table() -> ScyllaDbSqlTable {
         let pool: Arc<ScyllaDbConnectionPool> = Arc::new(MockPool);
         SqlTable::new_with_schema(

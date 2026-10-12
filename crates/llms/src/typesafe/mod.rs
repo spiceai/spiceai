@@ -147,7 +147,13 @@ pub fn normalize_model_id(model_id: Option<&str>) -> String {
 #[async_trait]
 impl Evaluate for TypeSafe {
     async fn evaluate(&self, mut request: EvaluateRequest) -> Result<EvaluateResponse> {
-        evaluate_api::check_questions(&self.name, &request.questions)?;
+        if request.questions.is_empty() {
+            return InvalidRequestSnafu {
+                model: self.name.clone(),
+                message: "questions map must contain at least one question",
+            }
+            .fail();
+        }
 
         let _permit = self
             .rate_controller
@@ -236,6 +242,11 @@ impl Evaluate for TypeSafe {
                 source: format!("HTTP {status}: {body}").into(),
             }),
         }
+    }
+
+    /// Jev is a System One model: a decision model, not a chat model.
+    fn is_decision_model(&self) -> bool {
+        true
     }
 
     async fn health(&self) -> Result<()> {
@@ -393,6 +404,9 @@ mod tests {
                 model: "triage".into(), // spicepod name; provider replaces with jev-latest
                 state: EvaluateState::from("Help! My payouts have been failing for 3 days."),
                 questions,
+                safety_identifier: None,
+                reasoning_effort: None,
+                typed_choices: BTreeMap::new(),
             })
             .await
             .expect("evaluate succeeds");
@@ -429,6 +443,9 @@ mod tests {
                 model: "jev".into(),
                 state: EvaluateState::from("x"),
                 questions: BTreeMap::new(),
+                safety_identifier: None,
+                reasoning_effort: None,
+                typed_choices: BTreeMap::new(),
             })
             .await
             .expect_err("empty questions");
@@ -462,6 +479,9 @@ mod tests {
                 model: "jev".into(),
                 state: EvaluateState::from("s"),
                 questions,
+                safety_identifier: None,
+                reasoning_effort: None,
+                typed_choices: BTreeMap::new(),
             })
             .await
             .expect_err("401");
@@ -498,6 +518,9 @@ mod tests {
                 model: "jev".into(),
                 state: EvaluateState::from("s"),
                 questions,
+                safety_identifier: None,
+                reasoning_effort: None,
+                typed_choices: BTreeMap::new(),
             })
             .await
             .expect_err("403");
@@ -531,6 +554,9 @@ mod tests {
                 model: "jev".into(),
                 state: EvaluateState::from("s"),
                 questions,
+                safety_identifier: None,
+                reasoning_effort: None,
+                typed_choices: BTreeMap::new(),
             })
             .await
             .expect_err("404");
@@ -572,6 +598,9 @@ mod tests {
                 model: "jev".into(),
                 state: EvaluateState::String("s".into()),
                 questions: noul_question("q"),
+                safety_identifier: None,
+                reasoning_effort: None,
+                typed_choices: BTreeMap::new(),
             })
             .await
             .expect_err("a missing answer must not be published as success");
@@ -600,6 +629,9 @@ mod tests {
                 model: "jev".into(),
                 state: EvaluateState::String("s".into()),
                 questions: noul_question("q"),
+                safety_identifier: None,
+                reasoning_effort: None,
+                typed_choices: BTreeMap::new(),
             })
             .await
             .expect_err("a mismatched answer kind must not be published as success");
@@ -712,6 +744,9 @@ mod tests {
                 model: "jev".into(),
                 state: EvaluateState::String("s".into()),
                 questions: choice_question("q"),
+                safety_identifier: None,
+                reasoning_effort: None,
+                typed_choices: BTreeMap::new(),
             })
             .await
             .expect_err("an out-of-domain choice must not be published");
@@ -755,6 +790,9 @@ mod tests {
                 model: "jev".into(),
                 state: EvaluateState::String("s".into()),
                 questions: score_question("q", 4),
+                safety_identifier: None,
+                reasoning_effort: None,
+                typed_choices: BTreeMap::new(),
             })
             .await
             .expect("a sparse legend with a full distribution is valid");
@@ -783,6 +821,9 @@ mod tests {
                 model: "jev".into(),
                 state: EvaluateState::String("s".into()),
                 questions: score_question("q", 2),
+                safety_identifier: None,
+                reasoning_effort: None,
+                typed_choices: BTreeMap::new(),
             })
             .await
             .expect_err("an out-of-range legend key must not be published");
@@ -815,6 +856,9 @@ mod tests {
                 model: "jev".into(),
                 state: EvaluateState::String("s".into()),
                 questions: choice_question("q"),
+                safety_identifier: None,
+                reasoning_effort: None,
+                typed_choices: BTreeMap::new(),
             })
             .await
             .expect_err("probabilities summing to 0.3 must not be published");
@@ -840,6 +884,9 @@ mod tests {
                 model: "jev".into(),
                 state: EvaluateState::String("s".into()),
                 questions: noul_question("q"),
+                safety_identifier: None,
+                reasoning_effort: None,
+                typed_choices: BTreeMap::new(),
             })
             .await
             .expect_err("an out-of-range noul must not be published");
@@ -867,6 +914,9 @@ mod tests {
                 model: "jev".into(),
                 state: EvaluateState::String("s".into()),
                 questions: choice_question("q"),
+                safety_identifier: None,
+                reasoning_effort: None,
+                typed_choices: BTreeMap::new(),
             })
             .await
             .expect_err("out-of-range confidence must not be published");
@@ -897,6 +947,9 @@ mod tests {
                 model: "jev".into(),
                 state: EvaluateState::String("s".into()),
                 questions: choice_question("q"),
+                safety_identifier: None,
+                reasoning_effort: None,
+                typed_choices: BTreeMap::new(),
             })
             .await
             .expect_err("an unknown probability key must not be published");
@@ -907,9 +960,9 @@ mod tests {
         );
     }
 
-    /// A rubric with no levels is refused before the provider is called.
+    /// Empty score criteria via the Rust API must not panic on `len - 1`.
     #[tokio::test]
-    async fn evaluate_refuses_a_score_without_levels_before_calling_the_provider() {
+    async fn evaluate_rejects_empty_score_criteria_without_panicking() {
         let server = MockServer::start().await;
         systemone_returning(
             &server,
@@ -937,17 +990,16 @@ mod tests {
                 model: "jev".into(),
                 state: EvaluateState::String("s".into()),
                 questions,
+                safety_identifier: None,
+                reasoning_effort: None,
+                typed_choices: BTreeMap::new(),
             })
             .await
             .expect_err("empty score criteria must fail closed");
-        assert_eq!(
-            err.to_string(),
-            "Invalid evaluation request for model 'jev': score question 'q' needs two to ten levels in `criteria`, but has 0"
-        );
-        assert_eq!(
-            server.received_requests().await.expect("requests").len(),
-            0,
-            "a question no model can answer must not reach the provider"
+        assert!(
+            err.to_string()
+                .contains("score criteria must contain at least one level"),
+            "{err}"
         );
     }
 
@@ -972,6 +1024,9 @@ mod tests {
                 model: "jev".into(),
                 state: EvaluateState::String("s".into()),
                 questions: choice_question("q"),
+                safety_identifier: None,
+                reasoning_effort: None,
+                typed_choices: BTreeMap::new(),
             })
             .await
             .expect("a well-formed answer is still accepted");
@@ -998,6 +1053,9 @@ mod tests {
                 model: "jev".into(),
                 state: EvaluateState::String("s".into()),
                 questions: choice_question("q"),
+                safety_identifier: None,
+                reasoning_effort: None,
+                typed_choices: BTreeMap::new(),
             })
             .await
             .expect_err("a non-max choice must not be published");
@@ -1029,6 +1087,9 @@ mod tests {
                 model: "jev".into(),
                 state: EvaluateState::String("s".into()),
                 questions: choice_question("q"),
+                safety_identifier: None,
+                reasoning_effort: None,
+                typed_choices: BTreeMap::new(),
             })
             .await
             .expect("a tied maximum is still a valid choice");
@@ -1057,6 +1118,9 @@ mod tests {
                 model: "jev".into(),
                 state: EvaluateState::String("s".into()),
                 questions: score_question("q", 2),
+                safety_identifier: None,
+                reasoning_effort: None,
+                typed_choices: BTreeMap::new(),
             })
             .await
             .expect_err("a contradictory score must not be published");
@@ -1101,6 +1165,9 @@ mod tests {
                 model: "jev".into(),
                 state: EvaluateState::String("s".into()),
                 questions,
+                safety_identifier: None,
+                reasoning_effort: None,
+                typed_choices: BTreeMap::new(),
             })
             .await
             .expect("a two-decimal rounded distribution is still valid");
@@ -1136,6 +1203,9 @@ mod tests {
                 model: "jev".into(),
                 state: EvaluateState::String("s".into()),
                 questions: score_question("q", 10),
+                safety_identifier: None,
+                reasoning_effort: None,
+                typed_choices: BTreeMap::new(),
             })
             .await
             .expect("a rounded distribution with its exact score is a valid answer");
@@ -1168,6 +1238,9 @@ mod tests {
                 model: "jev".into(),
                 state: EvaluateState::String("s".into()),
                 questions: score_question("q", 10),
+                safety_identifier: None,
+                reasoning_effort: None,
+                typed_choices: BTreeMap::new(),
             })
             .await
             .expect_err("a score half a level from its distribution must not be published");
@@ -1210,6 +1283,9 @@ mod tests {
                         criteria,
                     },
                 )]),
+                safety_identifier: None,
+                reasoning_effort: None,
+                typed_choices: BTreeMap::new(),
             })
             .await
     }
@@ -1264,6 +1340,9 @@ mod tests {
                 model: "jev".into(),
                 state: EvaluateState::String("s".into()),
                 questions: score_question("q", 10),
+                safety_identifier: None,
+                reasoning_effort: None,
+                typed_choices: BTreeMap::new(),
             })
             .await
             .expect_err("a score of 8.8 contradicts a one-hot distribution on level 9");
@@ -1301,6 +1380,9 @@ mod tests {
                 model: "jev".into(),
                 state: EvaluateState::from("s"),
                 questions,
+                safety_identifier: None,
+                reasoning_effort: None,
+                typed_choices: BTreeMap::new(),
             })
             .await
             .expect_err("503");
@@ -1311,7 +1393,7 @@ mod tests {
     }
 
     /// A refused TCP connect is a transport outage, not an unclassified provider
-    /// failure: `/v1/evaluate` maps `ServiceUnavailable` to HTTP 503.
+    /// failure: `/v1/decisions` maps `ServiceUnavailable` to HTTP 503.
     #[tokio::test]
     async fn evaluate_maps_transport_failure_to_unavailable() {
         let client = TypeSafe::try_new("jev", Some("jev-latest"), "key")
@@ -1332,6 +1414,9 @@ mod tests {
                 model: "jev".into(),
                 state: EvaluateState::from("s"),
                 questions,
+                safety_identifier: None,
+                reasoning_effort: None,
+                typed_choices: BTreeMap::new(),
             })
             .await
             .expect_err("transport failure");

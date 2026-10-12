@@ -312,7 +312,7 @@ yaml = "foundation"
 #   app, cache, cayenne, data-accelerator-api, data_components, datafusion-ddl,
 #   datafusion-optimizer-rules, evaluate-chat, llms, package, runtime-acceleration,
 #   runtime-auth, runtime-cluster, runtime-datafusion, runtime-datafusion-udfs,
-#   runtime-drasi, runtime-parameters, runtime-request-context, runtime-search,
+#   runtime-decide, runtime-drasi, runtime-parameters, runtime-request-context, runtime-search,
 #   runtime-secrets, runtime-table-partition, runtime-tools, search,
 #   test-framework, workers
 #

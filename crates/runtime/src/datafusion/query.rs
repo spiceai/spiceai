@@ -1022,7 +1022,14 @@ impl Query {
                 // Check for cached results using the standard cache lookup.
                 // Resume drives the persisted graph, so skip the short-circuit
                 // entirely (returning a cached result would orphan the job).
-                if mode != DistributedSubmitMode::Resume
+                // Plans containing non-Immutable functions (e.g. `random()`,
+                // `now()`, Stable remote UDFs) are never served from or stored
+                // in the results cache, matching the text-query path.
+                let plan_cacheable =
+                    Query::should_cache_results(&self.df, &logical_plan, CacheStatus::CacheMiss)
+                        == CacheStatus::CacheMiss;
+                if plan_cacheable
+                    && mode != DistributedSubmitMode::Resume
                     && results_cache_mode == ResultsCacheMode::Default
                     && let Some(cache_provider) = self.df.results_cache_provider()
                     && let Ok(Some(cached_result)) =
@@ -1065,7 +1072,8 @@ impl Query {
                 }
 
                 // Don't cache results for a recovered job or a query that bypasses caching.
-                let cache_key = (mode != DistributedSubmitMode::Resume
+                let cache_key = (plan_cacheable
+                    && mode != DistributedSubmitMode::Resume
                     && results_cache_mode == ResultsCacheMode::Default)
                     .then_some(plan_cache_key);
                 (*logical_plan, tracker, cache_key)
@@ -1477,7 +1485,11 @@ impl Query {
                         let cache_namespace = request_context.cache_namespace();
                         let (ns_tag, ns_id) = cache_namespace.hash_inputs();
                         let cache_status = match results_cache_mode {
-                            ResultsCacheMode::Default => CacheStatus::CacheMiss,
+                            ResultsCacheMode::Default => Query::should_cache_results(
+                                &ctx.df,
+                                &logical_plan,
+                                CacheStatus::CacheMiss,
+                            ),
                             ResultsCacheMode::Bypass => CacheStatus::CacheDisabled,
                         };
                         let cache_manager = RequestCacheManager::new(
@@ -3690,6 +3702,70 @@ mod tests {
         }
 
         assert_eq!(query.cache_status, CacheStatus::CacheMiss);
+    }
+
+    /// `Query::run` on a submitted plan stores its result but never looks it
+    /// up, so a second submission is a `CacheMiss` either way. What the plan
+    /// path controls is whether it stores, so count the stored entries.
+    #[tokio::test]
+    async fn from_logical_plan_does_not_cache_volatile_plans() {
+        async fn run_plan(df: &Arc<DataFusion>, sql: &str) -> CacheStatus {
+            let plan = df
+                .ctx
+                .state()
+                .create_logical_plan(sql)
+                .await
+                .expect("logical plan");
+            let mut query = Query::from_logical_plan(df, plan)
+                .run()
+                .await
+                .expect("Query::run");
+            while let Some(Ok(_)) = query.data.next().await {}
+            query.cache_status
+        }
+
+        let config = SQLResultsCacheConfig::default();
+        let cache_provider = Arc::new(
+            QueryResultsCacheProvider::try_new(&config, Box::new([])).expect("cache provider new"),
+        );
+        let df = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .with_caching(Arc::new(
+                Caching::new().with_results_cache(Arc::clone(&cache_provider)),
+            ))
+            .build(),
+        );
+
+        let mut statuses = Vec::new();
+        for _ in 0..2 {
+            statuses.push(run_plan(&df, "SELECT random() AS r").await);
+        }
+        cache_provider.run_pending_tasks().await;
+        assert_eq!(
+            cache_provider.item_count().await,
+            0,
+            "a volatile plan's result must not be stored"
+        );
+        assert_eq!(
+            statuses,
+            [CacheStatus::CacheDisabled, CacheStatus::CacheDisabled]
+        );
+
+        // Immutable plans submitted directly are still cached.
+        assert_eq!(
+            run_plan(&df, "SELECT 1 + 1 AS two").await,
+            CacheStatus::CacheMiss
+        );
+        cache_provider.run_pending_tasks().await;
+        assert_eq!(
+            cache_provider.item_count().await,
+            1,
+            "an immutable plan's result must be stored"
+        );
     }
 
     #[tokio::test]

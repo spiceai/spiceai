@@ -19,7 +19,7 @@ limitations under the License.
 //! An evaluation model takes unstructured `state` plus a map of typed
 //! `questions` and returns structured `answers` (noul / choice / score) with
 //! probabilities. Implemented by provider crates and by `evaluate-chat`, which
-//! answers through any chat model; called by the runtime's `POST /v1/evaluate`
+//! answers through any chat model; called by the runtime's `POST /v1/decisions` and SQL decision functions
 //! endpoint — which never names a provider. [`check_answers`] holds every
 //! implementation's answers to the same invariants.
 //!
@@ -37,10 +37,9 @@ use serde_json::{Map, Value};
 use snafu::Snafu;
 
 mod check;
+pub mod openai;
 
-pub use check::{
-    SCORE_LEVELS, check_answers, check_questions, is_probability, probability_sum_tolerance,
-};
+pub use check::{check_answers, is_probability, probability_sum_tolerance};
 
 /// Name → evaluation model map. Holds System One providers (e.g. `TypeSafe` Jev).
 pub type EvaluateModelStore = std::collections::HashMap<String, Arc<dyn Evaluate>>;
@@ -302,15 +301,19 @@ pub enum Question {
     Choice {
         #[serde(default, skip_serializing_if = "nullable_entry_is_absent")]
         instructions: NullableEntry,
-        /// Option id → description (`EntryType`, or JSON null).
+        /// Option id → description (`EntryType`, or JSON null). An option listed twice
+        /// is refused rather than merged.
+        #[serde(deserialize_with = "deserialize_choice_criteria")]
         criteria: BTreeMap<String, EntryType>,
     },
     /// Ordered rubric score. Answer is a probability-weighted value across levels.
     Score {
         #[serde(default, skip_serializing_if = "nullable_entry_is_absent")]
         instructions: NullableEntry,
-        /// Two to ten non-null rubric levels ([`SCORE_LEVELS`]). The count is checked by
-        /// [`check_questions`], with the other rules a question must meet.
+        /// Two to ten non-null rubric levels: `TypeSafe` documents score criteria as
+        /// "at least two levels and takes up to 10"
+        /// (<https://docs.typesafe.ai/primitives/score>).
+        #[serde(deserialize_with = "deserialize_score_criteria")]
         #[schemars(length(min = 2, max = 10))]
         #[cfg_attr(feature = "openapi", schema(min_items = 2, max_items = 10))]
         criteria: Vec<NonNullEntry>,
@@ -336,6 +339,58 @@ pub struct NoulCriteria {
         rename = "false"
     )]
     pub false_meaning: NullableEntry,
+}
+
+/// Choice criteria, refusing an option listed twice: a JSON object keeps only the last
+/// value of a repeated key, which would silently merge two options into one.
+fn deserialize_choice_criteria<'de, D>(
+    deserializer: D,
+) -> std::result::Result<BTreeMap<String, EntryType>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct CriteriaVisitor;
+
+    impl<'de> serde::de::Visitor<'de> for CriteriaVisitor {
+        type Value = BTreeMap<String, EntryType>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.write_str("an object of option to description")
+        }
+
+        fn visit_map<A: serde::de::MapAccess<'de>>(
+            self,
+            mut entries: A,
+        ) -> std::result::Result<Self::Value, A::Error> {
+            let mut criteria = BTreeMap::new();
+            while let Some((option, description)) = entries.next_entry::<String, EntryType>()? {
+                if criteria.contains_key(&option) {
+                    return Err(serde::de::Error::custom(format!(
+                        "choice option '{option}' is listed more than once"
+                    )));
+                }
+                criteria.insert(option, description);
+            }
+            Ok(criteria)
+        }
+    }
+
+    deserializer.deserialize_map(CriteriaVisitor)
+}
+
+fn deserialize_score_criteria<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Vec<NonNullEntry>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let criteria = Vec::<NonNullEntry>::deserialize(deserializer)?;
+    if !(2..=10).contains(&criteria.len()) {
+        return Err(serde::de::Error::custom(
+            "score criteria must contain between two and ten non-null levels",
+        ));
+    }
+    Ok(criteria)
 }
 
 /// A successful evaluation answers something; an empty `answers` map is a malformed
@@ -400,7 +455,21 @@ fn nonempty_answer_map() -> utoipa::openapi::schema::Object {
     nonempty_map_of("Answer")
 }
 
-/// Request body for `POST /v1/evaluate` and provider System One calls.
+/// How much a chat model reasons before it answers.
+/// Wire values match `reasoning_effort`. `max` is not a value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
+#[serde(rename_all = "lowercase")]
+pub enum ReasoningEffort {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    Xhigh,
+}
+
+/// A System One evaluation request, as providers receive it.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct EvaluateRequest {
@@ -408,15 +477,31 @@ pub struct EvaluateRequest {
     pub model: String,
     /// State for the model to evaluate: string, object, or array.
     pub state: EvaluateState,
-    /// Questions keyed by caller-selected identifiers. At least one is required, which
-    /// [`check_questions`] enforces.
+    /// Questions keyed by caller-selected identifiers. At least one is required.
     #[schemars(extend("minProperties" = 1))]
     #[cfg_attr(feature = "openapi", schema(schema_with = nonempty_question_map))]
     pub questions: BTreeMap<String, Question>,
+    /// Opaque end-user identifier from an `OpenAI`-shaped request, forwarded only to
+    /// `OpenAI` decision models. It is never serialized, so other providers never see it.
+    #[serde(skip)]
+    pub safety_identifier: Option<String>,
+    /// Effort for a chat evaluator. Skipped in serde so a provider never receives it.
+    /// The `OpenAI` Decisions API has no effort field.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub reasoning_effort: Option<ReasoningEffort>,
+    /// How an `OpenAI`-shaped caller typed each choice question with a boolean option, by
+    /// question id. Only `OpenAI` decision models read it: their choice values are typed,
+    /// so `true` and `"true"` are different values. A choice without a boolean option
+    /// needs none, because its keys are its values. Skipped in serde so a provider never
+    /// receives it.
+    #[serde(skip)]
+    #[schemars(skip)]
+    pub typed_choices: BTreeMap<String, openai::ChoiceTypes>,
 }
 
 /// Token usage reported by the provider.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[cfg_attr(feature = "openapi", derive(utoipa::ToSchema))]
 pub struct Usage {
     /// Defaulted: the provider may report one count without the other, and a partial
@@ -425,6 +510,18 @@ pub struct Usage {
     pub input_tokens: u64,
     #[serde(default)]
     pub output_tokens: u64,
+    /// Input tokens served from the provider's prompt cache, when it reports them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cached_tokens: Option<u64>,
+    /// Input tokens written to the provider's prompt cache, when it reports them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_write_tokens: Option<u64>,
+    /// Output tokens spent on reasoning, when the provider reports them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u64>,
+    /// The provider's own total, when it reports one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub total_tokens: Option<u64>,
 }
 
 /// A typed answer returned for one question.
@@ -446,6 +543,9 @@ pub enum Answer {
         probabilities: BTreeMap<String, f64>,
         confidence: f64,
     },
+    /// The model declined to answer this question. Only a model that can refuse
+    /// reports it (an `OpenAI` decision model); the other answers in the response stand.
+    Refusal {},
 }
 
 /// Response body for evaluation: typed answers plus provider metadata.
@@ -469,8 +569,7 @@ pub trait Evaluate: Send + Sync + Debug {
     ///
     /// The runtime sets `request.model` to the Spicepod model *name*; providers
     /// should substitute their upstream model id before calling the remote API, and
-    /// report the Spicepod name back in [`EvaluateResponse::model`]. Every
-    /// implementation holds `request.questions` to [`check_questions`].
+    /// report the Spicepod name back in [`EvaluateResponse::model`].
     async fn evaluate(&self, request: EvaluateRequest) -> Result<EvaluateResponse>;
 
     /// Checks the model can answer, e.g. by listing the provider's models.
@@ -478,6 +577,14 @@ pub trait Evaluate: Send + Sync + Debug {
     /// No default: a wrapper that inherited one would silently skip the check of the
     /// model it wraps, so every implementation says what its health is.
     async fn health(&self) -> Result<()>;
+
+    /// Whether this is a dedicated decision model — one trained to answer typed
+    /// questions, such as `TypeSafe` Jev or an `OpenAI` decision model — rather than a chat
+    /// model answering through a prompt.
+    ///
+    /// SQL decision functions prefer the only decision model when no model is named.
+    /// No default: a wrapper must report the kind of the model it wraps.
+    fn is_decision_model(&self) -> bool;
 }
 
 #[cfg(test)]
@@ -674,6 +781,47 @@ mod tests {
     }
 
     #[test]
+    fn score_criteria_rejects_empty_and_null() {
+        let empty = serde_json::from_value::<Question>(json!({
+            "type": "score",
+            "criteria": []
+        }));
+        assert!(empty.is_err(), "empty score criteria must fail");
+
+        let with_null = serde_json::from_value::<Question>(json!({
+            "type": "score",
+            "criteria": [null]
+        }));
+        assert!(with_null.is_err(), "null score criteria items must fail");
+
+        let ok: Question = serde_json::from_value(json!({
+            "type": "score",
+            "criteria": ["low", {"label": "mid"}]
+        }))
+        .expect("non-empty non-null");
+        assert!(matches!(ok, Question::Score { criteria, .. } if criteria.len() == 2));
+    }
+
+    #[test]
+    fn choice_criteria_refuse_an_option_listed_twice() {
+        // Raw text: a `json!` object would already have merged the repeat.
+        let err = serde_json::from_str::<Question>(
+            r#"{"type": "choice", "criteria": {"billing": null, "billing": "Payments"}}"#,
+        )
+        .expect_err("a repeated option must fail");
+        assert_eq!(
+            err.to_string(),
+            "choice option 'billing' is listed more than once"
+        );
+
+        let ok: Question = serde_json::from_str(
+            r#"{"type": "choice", "criteria": {"billing": null, "technical": "Bugs"}}"#,
+        )
+        .expect("distinct options");
+        assert!(matches!(ok, Question::Choice { criteria, .. } if criteria.len() == 2));
+    }
+
+    #[test]
     fn noul_criteria_preserves_explicit_null() {
         let q: Question = serde_json::from_value(json!({
             "type": "noul",
@@ -736,60 +884,35 @@ mod tests {
         );
     }
 
-    fn questions(entries: Value) -> BTreeMap<String, Question> {
-        serde_json::from_value(entries).expect("questions deserialize")
-    }
-
-    fn unanswerable(entries: Value) -> String {
-        match check_questions("jev", &questions(entries)) {
-            Err(Error::InvalidRequest { model, message }) => {
-                assert_eq!(model, "jev");
-                message
-            }
-            other => panic!("expected an invalid request, got {other:?}"),
-        }
-    }
-
     /// `TypeSafe` documents score criteria as two to ten levels.
     #[test]
-    fn check_questions_holds_score_rubrics_to_two_to_ten_levels() {
-        let levels = |n: usize| (0..n).map(|i| format!("level {i}")).collect::<Vec<_>>();
-        for n in [0, 1, 11] {
-            assert_eq!(
-                unanswerable(json!({"q": {"type": "score", "criteria": levels(n)}})),
-                format!("score question 'q' needs two to ten levels in `criteria`, but has {n}")
-            );
-        }
-        for n in [2, 10] {
-            check_questions(
-                "jev",
-                &questions(json!({"q": {"type": "score", "criteria": levels(n)}})),
-            )
-            .unwrap_or_else(|e| panic!("{n} levels are valid: {e}"));
-        }
-    }
+    fn score_criteria_requires_two_levels() {
+        const LEVELS_ERROR: &str =
+            "score criteria must contain between two and ten non-null levels";
 
-    #[test]
-    fn check_questions_needs_a_question_and_a_choice_between_two_options() {
-        assert_eq!(
-            unanswerable(json!({})),
-            "`questions` must contain at least one question"
-        );
-        assert_eq!(
-            unanswerable(json!({
-                "a": {"type": "noul"},
-                "b": {"type": "choice", "criteria": {"only": "the one option"}}
-            })),
-            "choice question 'b' needs at least two options in `criteria`"
-        );
-        check_questions(
-            "jev",
-            &questions(json!({
-                "a": {"type": "noul"},
-                "b": {"type": "choice", "criteria": {"yes": null, "no": null}}
-            })),
+        let one = serde_json::from_value::<Question>(
+            json!({"type": "score", "instructions": "how bad?", "criteria": ["only"]}),
         )
-        .expect("a noul and a two-option choice are answerable");
+        .expect_err("one level must be rejected");
+        assert_eq!(one.to_string(), LEVELS_ERROR);
+
+        serde_json::from_value::<Question>(
+            json!({"type": "score", "instructions": "how bad?", "criteria": ["calm", "angry"]}),
+        )
+        .expect("two levels are valid");
+
+        let ten: Vec<String> = (0..10).map(|i| format!("level {i}")).collect();
+        serde_json::from_value::<Question>(
+            json!({"type": "score", "instructions": "how bad?", "criteria": ten}),
+        )
+        .expect("ten levels are valid");
+
+        let eleven: Vec<String> = (0..11).map(|i| format!("level {i}")).collect();
+        let over = serde_json::from_value::<Question>(
+            json!({"type": "score", "instructions": "how bad?", "criteria": eleven}),
+        )
+        .expect_err("eleven levels must be rejected");
+        assert_eq!(over.to_string(), LEVELS_ERROR);
     }
 
     /// A provider reply with no answers is malformed, not a successful evaluation.

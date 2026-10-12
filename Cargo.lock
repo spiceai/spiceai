@@ -4201,7 +4201,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 [[package]]
 name = "clickhouse-rs"
 version = "1.1.0-alpha.1"
-source = "git+https://github.com/spiceai/clickhouse-rs.git?tag=0.2.2#7e98394f44cfa33919ebc5a92c06d5bddba708bf"
+source = "git+https://github.com/spiceai/clickhouse-rs.git?rev=d93e350575d4be2f56f37d513bfbfc672d128528#d93e350575d4be2f56f37d513bfbfc672d128528"
 dependencies = [
  "byteorder",
  "cfg-if",
@@ -4231,7 +4231,7 @@ dependencies = [
 [[package]]
 name = "clickhouse-rs-cityhash-sys"
 version = "0.1.2"
-source = "git+https://github.com/spiceai/clickhouse-rs.git?tag=0.2.2#7e98394f44cfa33919ebc5a92c06d5bddba708bf"
+source = "git+https://github.com/spiceai/clickhouse-rs.git?rev=d93e350575d4be2f56f37d513bfbfc672d128528#d93e350575d4be2f56f37d513bfbfc672d128528"
 dependencies = [
  "cc",
 ]
@@ -4473,6 +4473,7 @@ dependencies = [
  "datafusion",
  "datafusion-table-providers",
  "futures",
+ "insta",
  "linkme",
  "ns_lookup",
  "paste",
@@ -8397,6 +8398,7 @@ name = "evaluate-api"
 version = "2.4.0-unstable"
 dependencies = [
  "async-trait",
+ "criterion 0.7.0",
  "schemars 1.2.1",
  "serde",
  "serde_json",
@@ -8414,6 +8416,7 @@ dependencies = [
  "chat-api",
  "evaluate-api",
  "insta",
+ "runtime-rate-control",
  "serde",
  "serde_json",
  "tokio",
@@ -17642,6 +17645,7 @@ dependencies = [
  "runtime-datafusion",
  "runtime-datafusion-index",
  "runtime-datafusion-udfs",
+ "runtime-decide",
  "runtime-drasi",
  "runtime-execution-plans",
  "runtime-metrics",
@@ -18120,6 +18124,28 @@ dependencies = [
  "util",
  "wasmtime",
  "wat",
+]
+
+[[package]]
+name = "runtime-decide"
+version = "2.4.0-unstable"
+dependencies = [
+ "arrow",
+ "arrow-json",
+ "async-trait",
+ "criterion 0.7.0",
+ "datafusion",
+ "evaluate-api",
+ "futures",
+ "insta",
+ "linkme",
+ "runtime-request-context",
+ "runtime-status",
+ "runtime-udfs-api",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -20240,11 +20266,15 @@ dependencies = [
  "clap",
  "datafusion",
  "datafusion-substrait",
+ "futures",
  "prost 0.14.3",
  "serde",
  "serde_json",
  "snafu",
+ "tempfile",
+ "test-framework",
  "tokio",
+ "tonic",
  "tpchgen",
  "yaml",
 ]
@@ -22707,9 +22737,9 @@ dependencies = [
 
 [[package]]
 name = "turso"
-version = "0.8.1"
+version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7de8cbeace6385bf3fcb346d4aace8d9ba0de5cffe5e5a0ed210beebd671c208"
+checksum = "a2ebd8a76c2b005a9f42de15e0fe232cd9c17d7c8acb571ddfa294e6c9fa1e44"
 dependencies = [
  "thiserror 2.0.18",
  "tracing",
@@ -22728,9 +22758,9 @@ dependencies = [
 
 [[package]]
 name = "turso_core"
-version = "0.8.1"
+version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "58e5f09aaead5dfc87c5a22a2b3e95fb85e2d666e27e5f4a2474c42198af20ec"
+checksum = "4fa832d4ab648bf139f1b18b29bef6d653b18fbd4a77b0e4846c57aaf28c215c"
 dependencies = [
  "aegis",
  "aes 0.8.4",
@@ -22801,9 +22831,9 @@ dependencies = [
 
 [[package]]
 name = "turso_ext"
-version = "0.8.1"
+version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3902472c63d19191d5982d28542595d1babef787a8482175422ecf7f28100261"
+checksum = "07d9b915ee3c37d552597b07c05c127702a926ca0eac8843f248d693f4368155"
 dependencies = [
  "chrono",
  "getrandom 0.4.2",
@@ -22812,9 +22842,9 @@ dependencies = [
 
 [[package]]
 name = "turso_macros"
-version = "0.8.1"
+version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "63bd5f0f7186707a8b4cf54bbaddff9056c218823befab15508ef6e7502c2340"
+checksum = "476aa46d793a8aaae6d7a12f591d85eff039129264b1d441586528c88c3feacd"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -22823,9 +22853,9 @@ dependencies = [
 
 [[package]]
 name = "turso_parser"
-version = "0.8.1"
+version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "25b6d3428f16fff69a13bf7f966628d9fc8e0d097fec6cd84ce1af3d5a9be6b1"
+checksum = "7e03bf6489a80da2e9bf08f22d0b8af4eb391dfa5e6f71e787031cd61a921a3c"
 dependencies = [
  "bitflags 2.13.0",
  "memchr",
@@ -22838,9 +22868,9 @@ dependencies = [
 
 [[package]]
 name = "turso_sdk_kit"
-version = "0.8.1"
+version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c2f96fb1bf669ebd868caf17d865cfa7dc94ad5b2e840402bb28525be09767fc"
+checksum = "e7893b565a3405c8f44c97b6008bed55314535514c2536db1aaf2bb9b687705a"
 dependencies = [
  "bindgen 0.69.5",
  "env_logger",
@@ -22855,9 +22885,9 @@ dependencies = [
 
 [[package]]
 name = "turso_sdk_kit_macros"
-version = "0.8.1"
+version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "592f57f212b0ce58c876ab760ef84b219719ee2ade738b53f180db87c0232432"
+checksum = "af97d8302c41404272bb6e3612abe61f604acd23a2062fde52249641007c59ff"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -22866,9 +22896,9 @@ dependencies = [
 
 [[package]]
 name = "turso_sync_engine"
-version = "0.8.1"
+version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8ef57fe72ac7905ad0cfe1cb3f1f24ee1d671176c57a5151709ba9bbf4e1f050"
+checksum = "f188ee2458899c017b95d1d100b87b2a22628a48b9a8e91e753006af6e8fd391"
 dependencies = [
  "base64 0.22.1",
  "bytes",
@@ -22889,9 +22919,9 @@ dependencies = [
 
 [[package]]
 name = "turso_sync_sdk_kit"
-version = "0.8.1"
+version = "0.8.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b83c90ebfc04dc00d1c98cf030510b0d132ec819c355b9ed64d6b767f13db686"
+checksum = "28e1232dce3a4e517db5ba5e9767b0703676a7f59270ed4f5d0118000120b9b0"
 dependencies = [
  "bindgen 0.69.5",
  "env_logger",

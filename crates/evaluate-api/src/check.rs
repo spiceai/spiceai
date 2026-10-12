@@ -14,11 +14,9 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! The rules every evaluation question must meet, and the invariants every answer must
-//! hold, whichever model is asked.
+//! The invariants every evaluation answer must hold, whichever model produced it.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::ops::RangeInclusive;
 
 use crate::{Answer, EvaluateResponse, Question};
 
@@ -37,51 +35,6 @@ const FLOAT_SLACK: f64 = 0.001;
 /// with an error instead. No score rubric reaches the cap, since ten levels allow at
 /// most `0.051`, so it bounds only wide choice domains.
 const MAX_PROBABILITY_SUM_TOLERANCE: f64 = 0.1;
-
-/// How many levels a score rubric may have: `TypeSafe` documents score criteria as
-/// "at least two levels and takes up to 10" (<https://docs.typesafe.ai/primitives/score>).
-pub const SCORE_LEVELS: RangeInclusive<usize> = 2..=10;
-
-/// Checks that `questions` can be answered: there is at least one, every choice has at
-/// least two options to choose between, and every score rubric has [`SCORE_LEVELS`]
-/// levels.
-///
-/// Every model is held to the same rules, so a question no model can answer is refused
-/// the same way whichever model was asked.
-///
-/// # Errors
-///
-/// Returns [`crate::Error::InvalidRequest`] naming the first question that cannot be
-/// answered.
-pub fn check_questions(model: &str, questions: &BTreeMap<String, Question>) -> crate::Result<()> {
-    first_unanswerable(questions).map_err(|message| crate::Error::InvalidRequest {
-        model: model.to_string(),
-        message,
-    })
-}
-
-fn first_unanswerable(questions: &BTreeMap<String, Question>) -> Result<(), String> {
-    if questions.is_empty() {
-        return Err("`questions` must contain at least one question".to_string());
-    }
-    for (id, question) in questions {
-        match question {
-            Question::Choice { criteria, .. } if criteria.len() < 2 => {
-                return Err(format!(
-                    "choice question '{id}' needs at least two options in `criteria`"
-                ));
-            }
-            Question::Score { criteria, .. } if !SCORE_LEVELS.contains(&criteria.len()) => {
-                return Err(format!(
-                    "score question '{id}' needs two to ten levels in `criteria`, but has {}",
-                    criteria.len()
-                ));
-            }
-            Question::Noul { .. } | Question::Choice { .. } | Question::Score { .. } => {}
-        }
-    }
-    Ok(())
-}
 
 /// Checks that `response` answers every question in `asked` and nothing else, each
 /// with an answer of the matching kind and values inside the domain the question
@@ -123,6 +76,10 @@ fn first_mismatch(
         let Some(question) = asked.get(id) else {
             return Err(format!("answer for question '{id}', which was not asked"));
         };
+        // A refusal answers any kind of question: the model declined, and says so.
+        if matches!(answer, Answer::Refusal {}) {
+            continue;
+        }
         let (expected, got) = (question_kind(question), answer_kind(answer));
         if expected != got {
             return Err(format!(
@@ -368,6 +325,7 @@ fn answer_kind(answer: &Answer) -> &'static str {
         Answer::Noul { .. } => "noul",
         Answer::Choice { .. } => "choice",
         Answer::Score { .. } => "score",
+        Answer::Refusal {} => "refusal",
     }
 }
 

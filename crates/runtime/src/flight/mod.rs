@@ -86,6 +86,7 @@ mod handshake;
 pub(crate) mod metrics;
 pub mod middleware;
 mod mtls;
+pub mod server_timing;
 mod session;
 pub(crate) mod session_auth;
 mod traced_ticket;

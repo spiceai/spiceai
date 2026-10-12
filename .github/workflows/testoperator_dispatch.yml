@@ -473,6 +473,17 @@ jobs:
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           WORKFLOW_COMMIT: ${{ matrix.branch }}
 
+      # CH-benCHmark SF1 under acceleration layouts, validated against the unaccelerated
+      # source (the configs are weekly; their HTAP runs come from testoperator_dispatch_htap.yml).
+      - name: Dispatch Testoperator - Scheduled CH-BenCHmark Bench - SF1 layouts
+        if: ${{ matrix.branch == 'trunk' }}
+        run: |
+          testoperator dispatch ./tools/testoperator/dispatch/chbench/sf1-layouts --workflow bench ${SCHEDULE:+--schedule "$SCHEDULE"}
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
+          WORKFLOW_COMMIT: ${{ matrix.branch }}
+
       # Record the spiced commit this release run benchmarked, for the check above.
       - name: Record the benchmarked release commit
         if: ${{ matrix.schedule == '' && steps.benchmarked.outputs.skip != 'true' }}

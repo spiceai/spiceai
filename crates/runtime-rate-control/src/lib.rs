@@ -28,7 +28,8 @@ limitations under the License.
 //! When cluster mode is enabled, the configured `requests_per_second_limit` /
 //! `requests_per_minute_limit` is interpreted as the **cluster-wide** limit,
 //! not per replica. This is a deliberate semantics change from the standalone
-//! mode and is documented in the user-facing docs.
+//! mode and is documented in the user-facing docs. Replicas that configure
+//! different limits for one quota are held together to the lowest of them.
 
 use std::{
     num::NonZeroU32,
