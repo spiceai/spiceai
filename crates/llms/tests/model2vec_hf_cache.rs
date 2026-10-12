@@ -17,12 +17,12 @@ limitations under the License.
 //! Guards that a static-embedding model is resolved out of the shared Hugging
 //! Face cache when `HF_HUB_CACHE` names one.
 //!
-//! Its own test binary because it sets a process-wide environment variable, and
-//! `std::env::set_var` is only sound while no other thread is touching the
-//! environment. One test per binary is what makes that true here.
+//! It needs a process of its own because it sets a process-wide environment
+//! variable, and `std::env::set_var` is only sound while no other thread is
+//! touching the environment (see `crate::require_process_per_test`).
 //!
-//! Registered in the `nextest` gate by name (see `NEXTEST_FILTER` in the
-//! Makefile), like the other credential-free `llms` integration binaries.
+//! Selected in the `nextest` gate (see `NEXTEST_FILTER` in the Makefile), like
+//! the other credential-free `llms` integration tests.
 
 use std::io::Write;
 use std::path::Path;
@@ -106,6 +106,9 @@ fn write_static_model(dir: &Path) {
 /// where the id resolves to nothing (measured: `status code 401`).
 #[test]
 fn a_cached_model_is_read_from_the_directory_hf_hub_cache_names() {
+    crate::require_process_per_test(
+        "this test sets the process-wide `HF_HUB_CACHE` environment variable",
+    );
     let cache = tempfile::tempdir().expect("creates a cache directory");
 
     // hf-hub's on-disk layout: `refs/<revision>` holds the commit hash, and the
@@ -120,8 +123,9 @@ fn a_cached_model_is_read_from_the_directory_hf_hub_cache_names() {
     std::fs::write(repo_dir.join("refs").join("main"), commit).expect("writes the ref");
     write_static_model(&snapshot);
 
-    // SAFETY: this binary holds exactly one test, so no other thread is reading
-    // or writing the environment while this runs.
+    // SAFETY: `require_process_per_test` above has established that this test
+    // runs in a process of its own, so no other thread is reading or writing the
+    // environment while this runs.
     unsafe {
         std::env::set_var("HF_HUB_CACHE", cache.path());
     }
