@@ -120,8 +120,20 @@ pub(crate) enum WriteClass {
     Maintenance,
 }
 
+/// Whether a write's encode takes permits from the process-global encode budget
+/// (see `write_budget`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum EncodeBudgetUse {
+    /// Takes its shards' permits, capped by its class.
+    Shared,
+    /// Takes none: the whole-table reclaim of an `auto` table on position deletes
+    /// (see `CayenneTableProvider::rewrite_current_snapshot_holding_bounded`).
+    Exempt,
+}
+
 /// How a snapshot write should be treated: the encoding policy it falls under,
-/// and whether it may fan its encode across shards at all.
+/// whether it may fan its encode across shards at all, and whether its encode
+/// takes permits from the global encode budget.
 ///
 /// Bundled because both answer "what kind of write is this?", travel together
 /// through every write path, and are decided by the same caller at the same
@@ -130,6 +142,7 @@ pub(crate) enum WriteClass {
 pub(crate) struct WritePolicy {
     pub(crate) class: WriteClass,
     pub(crate) fan_out: crate::provider::table::EncodeFanOut,
+    pub(crate) encode_budget: EncodeBudgetUse,
 }
 
 impl WritePolicy {
@@ -137,6 +150,7 @@ impl WritePolicy {
     pub(crate) const DELTA: Self = Self {
         class: WriteClass::Delta,
         fan_out: crate::provider::table::EncodeFanOut::Sized,
+        encode_budget: EncodeBudgetUse::Shared,
     };
 
     /// A maintenance rewrite that may shard: compaction outputs and overwrites
@@ -144,6 +158,7 @@ impl WritePolicy {
     pub(crate) const MAINTENANCE: Self = Self {
         class: WriteClass::Maintenance,
         fan_out: crate::provider::table::EncodeFanOut::Sized,
+        encode_budget: EncodeBudgetUse::Shared,
     };
 
     /// A maintenance rewrite that must emit ONE sequence of files, whatever the
@@ -151,7 +166,16 @@ impl WritePolicy {
     pub(crate) const MAINTENANCE_SERIAL: Self = Self {
         class: WriteClass::Maintenance,
         fan_out: crate::provider::table::EncodeFanOut::Serial,
+        encode_budget: EncodeBudgetUse::Shared,
     };
+
+    /// This policy, with an encode that takes no permit from the global budget.
+    pub(crate) const fn without_encode_budget(self) -> Self {
+        Self {
+            encode_budget: EncodeBudgetUse::Exempt,
+            ..self
+        }
+    }
 }
 
 /// Level used for every [`WriteClass::Maintenance`] write: the full default

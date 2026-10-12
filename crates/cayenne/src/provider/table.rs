@@ -10471,6 +10471,7 @@ impl CayenneTableProvider {
         let super::delta_encoding::WritePolicy {
             class: write_class,
             fan_out,
+            encode_budget,
         } = policy;
 
         // Materialize the snapshot directory before the write, unconditionally.
@@ -10528,12 +10529,17 @@ impl CayenneTableProvider {
         // deadlocks the demux against the permit holders (see `write_budget`
         // module docs; spiceai/spiceai#11818).
         let encode_permit_wait_start = Instant::now();
-        let _encode_permits = super::write_budget::acquire_encode_permits(
-            shard_count,
-            write_class,
-            self.context.is_coupled_writer(),
-        )
-        .await;
+        let _encode_permits = match encode_budget {
+            super::delta_encoding::EncodeBudgetUse::Shared => {
+                super::write_budget::acquire_encode_permits(
+                    shard_count,
+                    write_class,
+                    self.context.is_coupled_writer(),
+                )
+                .await
+            }
+            super::delta_encoding::EncodeBudgetUse::Exempt => None,
+        };
         record_cayenne_write_phase(
             self.table_name(),
             "encode_permit_wait",
@@ -24153,6 +24159,24 @@ impl CayenneTableProvider {
             Self::ensure_snapshot_dir_exists(&snapshot_dir).await?;
         }
 
+        // The whole-table reclaim of an `auto` table on position deletes takes no
+        // permit from the global encode budget. It reads at most
+        // `MAX_POSITION_BYTES`, takes at most a tenth of the time, and in `spiced`
+        // runs on the low-priority compaction runtime, so it needs no share of
+        // the budget. Holding one, it made every write that asked for the
+        // budget's whole width wait out its encode: on four CPUs, a two-permit
+        // budget, a writer upserting 2,000 keys every 250 ms reached a 96 ms P99
+        // write, against 37–40 ms on key deletes.
+        let write_policy = if reclaim
+            && self
+                .pk_deletion_mode
+                .auto()
+                .is_some_and(|auto| auto.uses_positions())
+        {
+            rewrite_write_policy(rewrite_is_sorted).without_encode_budget()
+        } else {
+            rewrite_write_policy(rewrite_is_sorted)
+        };
         let target_size_bytes = self.context.target_file_size_bytes();
         let write_result = self
             .write_to_snapshot(
@@ -24163,7 +24187,7 @@ impl CayenneTableProvider {
                 // Compaction consolidates into a single output file, so it needs
                 // no size estimate.
                 None,
-                rewrite_write_policy(rewrite_is_sorted),
+                write_policy,
             )
             .await;
 

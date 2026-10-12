@@ -161,6 +161,13 @@ pub(crate) struct EncodePermits {
 static GLOBAL_ENCODE_BUDGET: LazyLock<RwLock<Option<EncodeBudget>>> =
     LazyLock::new(|| RwLock::new(None));
 
+/// Remove the process-global encode budget, so a test that installed one leaves
+/// the process as it found it.
+#[cfg(test)]
+pub(crate) fn clear_global_encode_budget() {
+    *GLOBAL_ENCODE_BUDGET.write() = None;
+}
+
 /// Install the process-global encode-concurrency budget. Called once at startup
 /// with the host core budget (optionally minus a reserve for query threads).
 /// `permits` is clamped to at least 1. Later calls replace the previous budget.
