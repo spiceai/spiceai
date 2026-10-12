@@ -247,7 +247,8 @@ jobs:
             fi
           fi
           test_binary=./integration_test/llms_integration_test
-          # Every test in this binary lives under `integration.rs`'s only module, `llms`.
+          # The live-provider tests live under `integration.rs`'s `llms` module; the
+          # binary's other modules are credential-free and run in `make nextest`.
           filter='llms::'
 
           # A filter that matches nothing makes libtest print `ok. 0 passed` and exit 0, so the
