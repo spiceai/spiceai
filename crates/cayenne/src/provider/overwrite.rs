@@ -997,9 +997,6 @@ impl CayenneTableProvider {
             .and_then(|budget| usize::try_from(budget.total).ok())
             .unwrap_or(write.target_partitions)
             .max(1);
-        type FileFold<'f> = std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<(u64, Arc<ColumnStatsAccumulator>)>> + Send + 'f>,
-        >;
         let folds: Vec<FileFold<'_>> = superseded
             .iter()
             .map(|(location, positions)| {
@@ -1077,6 +1074,12 @@ impl CayenneTableProvider {
         Ok(Arc::new(folded))
     }
 }
+
+/// One file's fold in `fold_superseded_copies`: the rows it wrote and their
+/// statistics.
+type FileFold<'f> = std::pin::Pin<
+    Box<dyn std::future::Future<Output = Result<(u64, Arc<ColumnStatsAccumulator>)>> + Send + 'f>,
+>;
 
 /// How a write that rewrites files of an unpublished snapshot shapes them.
 #[derive(Clone, Copy)]

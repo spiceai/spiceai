@@ -11660,8 +11660,7 @@ impl CayenneTableProvider {
         match routing {
             super::delta_encoding::ShardRouting::Key => false,
             super::delta_encoding::ShardRouting::WholeBatch => {
-                self.context.shard_key_columns().is_empty()
-                    && !self.context.has_requested_layout()
+                self.context.shard_key_columns().is_empty() && !self.context.has_requested_layout()
             }
         }
     }
@@ -51052,6 +51051,76 @@ mod tests {
         assert_eq!(
             provider.snapshot_shard_count(8, small_tsb, Some(17 * mib), EncodeFanOut::Sized),
             2
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::no_layout(0, true)]
+    #[case::shard_key(1, false)]
+    #[case::cluster_by(2, false)]
+    #[case::user_sort(3, false)]
+    #[case::inferred_sort(4, true)]
+    #[tokio::test]
+    async fn test_bulk_load_shard_routing_respects_requested_layout(
+        #[case] layout: usize,
+        #[case] whole_batch: bool,
+    ) {
+        use crate::metadata::SortColumnsOrigin;
+        use crate::provider::delta_encoding::ShardRouting;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let ctx = SessionContext::new();
+        let configs = [
+            VortexConfig::default(),
+            VortexConfig {
+                shard_key_columns: vec!["id".into()],
+                ..Default::default()
+            },
+            VortexConfig {
+                cluster_by: vec!["id".into()],
+                ..Default::default()
+            },
+            VortexConfig {
+                sort_columns: vec!["id".into()],
+                sort_columns_origin: SortColumnsOrigin::User,
+                ..Default::default()
+            },
+            VortexConfig {
+                sort_columns: vec!["id".into()],
+                sort_columns_origin: SortColumnsOrigin::Inferred,
+                ..Default::default()
+            },
+        ];
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
+            "bulk_routing",
+            Arc::clone(&schema),
+            configs[layout].clone(),
+            vec!["id".into()],
+            ctx.runtime_env(),
+        )
+        .await;
+        let shard = provider
+            .write_shard_config(
+                4,
+                provider.context.target_file_size_bytes(),
+                None,
+                EncodeFanOut::Sized,
+                ShardRouting::WholeBatch,
+                None,
+            )
+            .expect("bulk load enables sharding");
+        let expected_key = if whole_batch {
+            vec![]
+        } else {
+            vec!["id".to_string()]
+        };
+        assert_eq!(
+            (
+                provider.routes_whole_batches(ShardRouting::WholeBatch),
+                provider.routes_whole_batches(ShardRouting::Key),
+                shard.shard_key_columns,
+            ),
+            (whole_batch, false, expected_key),
         );
     }
 
