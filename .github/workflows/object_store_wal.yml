@@ -208,12 +208,6 @@ jobs:
           port=$(docker port "$WAL_CONTAINER" 9000/tcp | head -n 1 | sed 's/.*://')
           echo "AWS_ENDPOINT=http://127.0.0.1:${port:?no published port for the $STORE container}" >> "$GITHUB_ENV"
 
-      # The toolchain MinIO's go.mod names for the release the next step builds.
-      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        if: runner.os == 'macOS' && matrix.store == 'minio'
-        with:
-          go-version: '1.24.8'
-          cache: false
       - name: Start ${{ matrix.store }} on the host
         if: runner.os == 'macOS' && (matrix.store == 'minio' || matrix.store == 'rustfs')
         run: |
@@ -228,17 +222,22 @@ jobs:
             # properties through IOKit, and on a Mac that lacks one it
             # dereferences null, so the server dies with SIGSEGV before it starts.
             minio)
+              # The toolchain MinIO's go.mod names for that release.
+              curl -fsSL --retry 3 -o "$dir/go.tar.gz" https://go.dev/dl/go1.24.8.darwin-arm64.tar.gz
+              echo "0db27ff8c3e35fd93ccf9d31dd88a0f9c6454e8d9b30c28bd88a70b930cc4240  $dir/go.tar.gz" | shasum -a 256 -c -
+              tar -xzf "$dir/go.tar.gz" -C "$dir"
               commit=9e49d5e7a648f00e26f2246f4dc28e6b07f8c84a
               GOBIN="$dir" GOMODCACHE="$dir/go-mod" GOCACHE="$dir/go-build" GOFLAGS=-modcacherw \
-                GOTOOLCHAIN=local CGO_ENABLED=0 go install -tags kqueue -trimpath -ldflags "-s -w \
+                GOTOOLCHAIN=local CGO_ENABLED=0 "$dir/go/bin/go" install -tags kqueue -trimpath -ldflags "-s -w \
                 -X github.com/minio/minio/cmd.Version=2025-10-15T17:29:55Z \
                 -X github.com/minio/minio/cmd.ReleaseTag=RELEASE.2025-10-15T17-29-55Z \
                 -X github.com/minio/minio/cmd.CommitID=$commit \
                 -X github.com/minio/minio/cmd.ShortCommitID=${commit:0:12} \
                 -X github.com/minio/minio/cmd.CopyrightYear=2025" \
                 "github.com/minio/minio@$commit"
-              # The module and build caches take about 2 GB on a shared Mac.
-              rm -rf "$dir/go-mod" "$dir/go-build"
+              # The toolchain and the module and build caches take over 2 GB on a
+              # shared Mac.
+              rm -rf "$dir/go" "$dir/go.tar.gz" "$dir/go-mod" "$dir/go-build"
               ;;
             rustfs)
               digest=18aac7101c3484b98f93de64a0609aaa8e02aba072ba7927172c4b2eae7d4843
