@@ -495,7 +495,12 @@ impl RuntimeServer {
             tools
                 .values()
                 .filter_map(|tooling| match tooling {
-                    Tooling::Catalog { tools: catalog, .. } => Some(Arc::clone(catalog)),
+                    Tooling::Catalog {
+                        tools: catalog,
+                        default_catalog_names,
+                    } if !is_default_catalog(catalog.name(), default_catalog_names) => {
+                        Some(Arc::clone(catalog))
+                    }
                     _ => None,
                 })
                 .collect::<Vec<_>>()
@@ -899,10 +904,19 @@ fn mcp_schemas_from_map_with_warm(
     warm: &[Arc<dyn SpiceModelTool>],
 ) -> HashMap<String, Tool> {
     let mut schemas = mcp_direct_schemas_from_map(tools);
+    // Default-catalog tools are already listed as top-level tools; listing
+    // the catalog too would advertise each one twice (`X` and `catalog__X`).
     let mut async_only = HashSet::new();
     for tooling in tools.values() {
-        if let Tooling::Catalog { tools: catalog, .. } = tooling {
+        if let Tooling::Catalog {
+            tools: catalog,
+            default_catalog_names,
+        } = tooling
+        {
             let catalog_name = catalog.name();
+            if is_default_catalog(catalog_name, default_catalog_names) {
+                continue;
+            }
             let listed = catalog.try_all();
             if listed.is_empty() {
                 async_only.insert(catalog_name.to_string());
@@ -939,6 +953,12 @@ fn mcp_schemas_from_map_with_warm(
         schemas.insert(name, fetched);
     }
     schemas
+}
+
+fn is_default_catalog(catalog_name: &str, default_catalog_names: &[String]) -> bool {
+    default_catalog_names
+        .iter()
+        .any(|name| name == catalog_name)
 }
 
 fn mcp_tool_from_spice(name: impl Into<Cow<'static, str>>, tool: &dyn SpiceModelTool) -> Tool {
