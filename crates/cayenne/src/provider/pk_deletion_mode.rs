@@ -51,11 +51,13 @@ limitations under the License.
 //! paced rewrite, which is all that reaches them.
 //!
 //! On a host with too few cores the same first rewrite keeps key deletes however
-//! long it took (`CpuBudget::cayenne_keeps_small_tables_compacted`). On four cores
-//! a 200K-row table under 2,000 upserts every 250 ms rewrote itself in about
-//! 190 ms, a few percent of the time, so the pace never held it back, yet on
-//! position deletes its P99 write was 4% above key deletes' while its reads
-//! gained nothing over them.
+//! long it took (`CpuBudget::cayenne_keeps_small_tables_compacted`). In a Linux
+//! virtual machine held to four CPUs, a 200K-row table under 2,000 upserts every
+//! 250 ms rewrote itself in about 190 ms, a few percent of the time, so the pace
+//! never held it back, yet on position deletes its P99 write was 4% above key
+//! deletes' and its reads were mixed. Four performance cores of a bare-metal Arm
+//! host showed no such loss, and on eight its writes were even and its reads
+//! faster, but a small host is often a virtual machine.
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

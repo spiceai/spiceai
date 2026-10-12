@@ -1206,9 +1206,12 @@ impl CpuBudget {
     }
 
     /// Whether Cayenne's `deletion_mode: auto` may keep a small primary-key table
-    /// on position deletes, compacted whole alongside its writes. On four cores a
-    /// 200K-row table under 2,000 upserts every 250 ms wrote at a P99 4% above
-    /// key deletes' on position deletes, while its reads gained nothing over them.
+    /// on position deletes, compacted whole alongside its writes. In a Linux
+    /// virtual machine held to four CPUs, a 200K-row table under 2,000 upserts
+    /// every 250 ms wrote at a P99 4% above key deletes' on position deletes, with
+    /// mixed reads. On eight performance cores of an Arm host its writes were even
+    /// and its reads 6–25% faster. Four of that host's cores showed no loss, but a
+    /// small host is often a virtual machine.
     #[must_use]
     pub const fn cayenne_keeps_small_tables_compacted(&self) -> bool {
         self.cores >= 8
