@@ -254,6 +254,10 @@ def choose_signoff(worktree: Path) -> Path:
 def verify(signoff: Path, worktree: Path, log_path: Path, skip_targeted: bool) -> tuple[bool, str]:
     """Run `scripts/signoff verify` in the worktree. Return (passed, check summary)."""
     args = [str(signoff), "verify"] + (["--skip-targeted"] if skip_targeted else [])
+    if sys.platform == "darwin":
+        # The checks take hours; keep the Mac from idle-sleeping and pausing them.
+        # Closing the lid still sleeps it.
+        args = ["caffeinate", "-i", *args]
     summary = ""
     log_path.parent.mkdir(parents=True, exist_ok=True)
     with log_path.open("w") as log, subprocess.Popen(
