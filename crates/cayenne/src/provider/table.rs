@@ -13429,7 +13429,10 @@ impl CayenneTableProvider {
     /// deletes: a PK table (`Int64Pk`/`RowConverterBased`) whose deletion mode
     /// — configured, or chosen by `auto` — is position. PK-less tables use the
     /// `PositionBased` strategy directly and never reach this read-back.
-    pub(crate) fn should_capture_positions(&self) -> bool {
+    ///
+    /// Public so integration tests (e.g. AutoCrossing non-vacuity) can observe
+    /// the live mode without relying only on model convergence.
+    pub fn should_capture_positions(&self) -> bool {
         !self.pk_deletion_strategy.is_position_based() && self.pk_deletion_mode.uses_positions()
     }
 
@@ -13498,7 +13501,10 @@ impl CayenneTableProvider {
     /// from their directories. The metastore's storage figures are not used: they
     /// still count a protected snapshot that a merge replaced until its
     /// registration is swept, and read about twice the table during a load.
-    pub(crate) async fn warm_listed_bytes(&self) -> Result<u64> {
+    ///
+    /// Public so integration tests can assert a table crossed `auto`'s
+    /// position-delete bound without inventing sizes.
+    pub async fn warm_listed_bytes(&self) -> Result<u64> {
         let files = self
             .list_compaction_candidate_files_with_sizes(&self.get_current_snapshot_id())
             .await?;

@@ -143,9 +143,12 @@ enum Mode {
     /// (the reclaim trigger is two tombstones).
     Auto,
     /// `deletion_mode: auto` with a 1 MiB target file size, a 32 KiB bound that
-    /// every run crosses under live writers: position deletes and whole-table
-    /// reclaims first, then key deletes and the reclaims of rows the bake cannot
-    /// reach.
+    /// every run is meant to cross under live writers: position deletes and
+    /// whole-table reclaims first, then key deletes and the reclaims of rows the
+    /// bake cannot reach. Non-vacuity of that crossing is pinned by
+    /// `prop_auto_crossing_observes_position_then_key_switch_impl`: the random
+    /// walks alone would still pass if adaptive sizing regressed and stayed on
+    /// position deletes.
     AutoCrossing,
 }
 
@@ -834,6 +837,12 @@ async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
         w.cold,
     )
     .await?;
+    if matches!(w.mode, Mode::AutoCrossing) {
+        assert!(
+            table.should_capture_positions(),
+            "AutoCrossing non-vacuity: a fresh auto table must start on position deletes              (seed={seed})"
+        );
+    }
     let mut rng = Rng::new(seed);
     let mut model = Model::new();
     let mut history: Vec<Op> = Vec::with_capacity(w.ops);
@@ -932,6 +941,12 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
         w.cold,
     )
     .await?;
+    if matches!(w.mode, Mode::AutoCrossing) {
+        assert!(
+            table0.should_capture_positions(),
+            "AutoCrossing non-vacuity: a fresh auto table must start on position deletes              (seed={seed})"
+        );
+    }
     let mut rng = Rng::new(seed);
 
     for start in (0..w.population).step_by(20) {
@@ -1380,6 +1395,76 @@ async fn prop_harness_stack_headroom_impl(_f: TestFixture) -> TestResult<()> {
     Ok(())
 }
 test_with_backends!(prop_harness_stack_headroom_impl);
+
+// --- AutoCrossing non-vacuity (mode transition, not only model convergence) ---
+//
+// SplitMix64 of the key — values that do not compress, so listed bytes track
+// row count (same recipe as the unit tests in `auto_deletion_mode.rs`).
+fn incompressible_value(id: i64) -> i64 {
+    let mut z = u64::from_ne_bytes(id.to_ne_bytes()).wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    i64::from_ne_bytes((z ^ (z >> 31)).to_ne_bytes())
+}
+
+/// Observe position mode before growth and key mode afterward on an
+/// `AutoCrossing` table. The random AutoCrossing walks would still pass if
+/// adaptive sizing regressed and never left position deletes; this pins the
+/// transition through `should_capture_positions` and listed bytes.
+async fn prop_auto_crossing_observes_position_then_key_switch_impl(
+    f: TestFixture,
+) -> TestResult<()> {
+    let name = "auto_crossing_mode_switch";
+    let (table, _ctx) =
+        create_table(&f, name, Mode::AutoCrossing, Durability::File, None, false).await?;
+
+    assert!(
+        table.should_capture_positions(),
+        "AutoCrossing non-vacuity: empty auto table must start on position deletes"
+    );
+
+    // Seed a few keys, then upsert them so the deletion index is past the
+    // reclaim trigger (2) before the size-driven switch.
+    let seed: Vec<(i64, i64)> = (0..16).map(|id| (id, 100)).collect();
+    upsert(&table, &seed, Durability::File).await?;
+    let upserted: Vec<(i64, i64)> = (0..8).map(|id| (id, 200)).collect();
+    upsert(&table, &upserted, Durability::File).await?;
+    table.flush_pending_maintenance().await?;
+
+    // Grow past the 32 KiB bound (1 MiB target / 32).
+    const BOUND: u64 = 32 * 1024;
+    let grow: Vec<(i64, i64)> = (1_000..61_000)
+        .map(|id| (id, incompressible_value(id)))
+        .collect();
+    for chunk in grow.chunks(8_000) {
+        upsert(&table, chunk, Durability::File).await?;
+    }
+    table.flush_pending_maintenance().await?;
+
+    let bytes = table.warm_listed_bytes().await?;
+    assert!(
+        bytes > BOUND,
+        "AutoCrossing non-vacuity premise: grown table ({bytes} B) must exceed the {BOUND} B bound"
+    );
+
+    // Growth + flush may already have requested/run the switch; if not, the
+    // reclaim pass under compaction_lock does it (same path as production).
+    if table.should_capture_positions() {
+        assert!(
+            table
+                .compact_current_snapshot_small_files()
+                .await
+                .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?,
+            "AutoCrossing non-vacuity: reclaim pass must run after growth past the bound"
+        );
+    }
+    assert!(
+        !table.should_capture_positions(),
+        "AutoCrossing non-vacuity: after growth past the bound the table must be on key deletes"
+    );
+    Ok(())
+}
+test_with_backends!(prop_auto_crossing_observes_position_then_key_switch_impl);
 
 // --- Sequential convergence (GREEN) ---
 async fn prop_sequential_key_impl(f: TestFixture) -> TestResult<()> {
