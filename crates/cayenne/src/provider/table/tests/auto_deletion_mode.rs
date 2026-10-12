@@ -793,6 +793,10 @@ async fn an_auto_tables_position_reclaim_takes_no_encode_permit() {
             crate::provider::write_budget::clear_global_encode_budget();
         }
     }
+    // Dropped after `_installed`, which removes the budget first.
+    let _serialized = crate::provider::write_budget::GLOBAL_ENCODE_BUDGET_TEST_LOCK
+        .lock()
+        .await;
     crate::provider::write_budget::set_global_encode_concurrency(1);
     let _installed = InstalledBudget;
 

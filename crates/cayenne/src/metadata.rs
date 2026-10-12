@@ -507,8 +507,10 @@ pub enum DeletionMode {
     /// size on disk, and never more than 8 MiB — and switches to [`Self::Key`]
     /// deletes once it outgrows that. The switch holds until the table is next
     /// opened, which sizes it again. A table written so fast that its first
-    /// whole-table rewrite takes more than a tenth of the time keeps key deletes
-    /// too. A table on object storage, in `mode: memory`, partitioned, or with a
+    /// whole-table rewrite takes more than a tenth of the time, while its rows
+    /// are all still in protected snapshots, keeps key deletes too; one whose
+    /// rows already sit in its current snapshot keeps that paced rewrite, the
+    /// only pass that reaches them. A table on object storage, in `mode: memory`, partitioned, or with a
     /// cold tier uses key deletes throughout.
     /// While it uses position deletes, `Auto` rewrites alongside writers rather
     /// than holding them off, and folds a key repeated within one write out of
