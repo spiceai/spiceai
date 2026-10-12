@@ -411,16 +411,20 @@ def crashes(executable, stores, artifacts):
         print(f"SIGKILL checkpoint boundary={point}: recovered all 3 pages", flush=True)
 
 
-def export_store(executable, stores):
+def export_store(executable, stores, *, passed):
     # The service does not outlive the run, so its objects are kept with the
-    # histories. This runs while a history failure may be propagating, so no
-    # error from the copy may replace the run's own result.
+    # histories. While a history failure is propagating, an error from the copy
+    # must not replace it, so it is only reported. After a passing run, a failed
+    # copy fails the run, because the artifacts would lack the store.
     target = stores.local / "object-store"
     try:
         exported = driver_command(executable, "--export", stores.url, target, timeout=TIMEOUT * 5)["exported"]
-        print(f"copied {exported} objects from {stores.url} into {target}", flush=True)
     except Exception as error:  # noqa: BLE001
+        if passed:
+            raise
         print(f"could not copy {stores.url} into the artifacts: {error!r}", flush=True)
+        return
+    print(f"copied {exported} objects from {stores.url} into {target}", flush=True)
 
 
 def object_store_url(value):
@@ -456,6 +460,7 @@ def main():
     else:
         print("Redis differential testing NOT RUN (pass --redis-url)", flush=True)
     check_conditional_writes(driver, stores.location("probe"))
+    passed = False
     try:
         for seed in args.seeds:
             oracle = RedisOracle(args.redis_url, args.artifacts, f"redis-{seed}") if args.redis_url else nullcontext()
@@ -466,9 +471,10 @@ def main():
                 redis_conflicts(driver, stores, args.artifacts, redis)
         concurrency(driver, stores, args.artifacts)
         crashes(driver, stores, args.artifacts)
+        passed = True
     finally:
         if stores.url:
-            export_store(driver, stores)
+            export_store(driver, stores, passed=passed)
     print("PASS: WAL process-level qualification", flush=True)
 
 
