@@ -338,8 +338,15 @@ async fn default_mode_small_table_reclaims_by_rewriting_itself(
         "the index never shrank while the rounds ran, so nothing reclaimed it: {observed:?}"
     );
     let bound = RECLAIM_TRIGGER + usize::try_from(ROWS_PER_ROUND).expect("row count fits in usize");
+    // `drive_rounds` already proved a paced rewrite can shrink the index; the
+    // pace then waits nine times that rewrite's duration before the next. On CI
+    // a whole-table rewrite of this fixture can take several seconds, so the
+    // wait outruns a short poll and leaves the index above the bound (signoff
+    // 38257591389: observations ending at 7500 with bound 3500). Clear the pace
+    // so the poll's reclaim is due at once.
+    table.forget_auto_reclaim_pace();
     common::lookup_index::poll_until(
-        Duration::from_secs(30),
+        Duration::from_secs(60),
         Duration::from_millis(20),
         async || {
             table

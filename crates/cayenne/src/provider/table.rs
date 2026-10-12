@@ -12758,7 +12758,7 @@ impl CayenneTableProvider {
             return;
         }
 
-        let to_store = match index {
+        let mut to_store = match index {
             CachedPkIndex::Exact(keyset) if keyset.approx_bytes > max_bytes => {
                 if self.upsert_bloom_eligible() {
                     // Convert the over-budget exact keyset to a bounded bloom so
@@ -12796,6 +12796,18 @@ impl CayenneTableProvider {
             }
             other => other,
         };
+
+        // A keyset checked out while the table was still capturing positions can
+        // return after `auto` moved to key deletes (the cache cell was `None` at
+        // the switch, so `switch_auto_to_key_deletes_unlogged` scrubbed nothing).
+        // Forget any still-`FilePositioned` locations and their `captured_files`
+        // before restoring, matching that method's contract: from here on every
+        // delete is a key delete.
+        if !self.should_capture_positions()
+            && let CachedPkIndex::Exact(keyset) = &mut to_store
+        {
+            keyset.forget_positions();
+        }
 
         let bytes = to_store.approx_bytes();
         self.track_pk_index_preserved("table_keyset", to_store.bloom_density().is_some());
@@ -13704,6 +13716,17 @@ impl CayenneTableProvider {
     #[must_use]
     pub fn deletion_index_len(&self) -> usize {
         self.pk_deletion_snapshot().delete_len()
+    }
+
+    /// Clear `deletion_mode: auto`'s whole-table reclaim pace so the next reclaim
+    /// is due at once. Integration tests that already observed a paced shrink use
+    /// this before waiting for the index to return under its bound, rather than
+    /// waiting nine times a CI-slow rewrite.
+    #[doc(hidden)]
+    pub fn forget_auto_reclaim_pace(&self) {
+        if let Some(auto) = self.pk_deletion_mode.auto() {
+            auto.forget_reclaim_pace();
+        }
     }
 
     /// Bytes this table currently reserves against the query memory pool for its

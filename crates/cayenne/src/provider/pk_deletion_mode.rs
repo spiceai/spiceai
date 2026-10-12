@@ -322,8 +322,7 @@ impl AutoDeletionMode {
     }
 
     /// Forget the pace, so the next reclaim is due at once: lets a test run
-    /// reclaims back to back.
-    #[cfg(test)]
+    /// reclaims back to back (via [`crate::CayenneTableProvider::forget_auto_reclaim_pace`]).
     pub(crate) fn forget_reclaim_pace(&self) {
         *self.reclaims.lock() = ReclaimPace::default();
     }

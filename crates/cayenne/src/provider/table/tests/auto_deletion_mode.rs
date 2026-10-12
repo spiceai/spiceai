@@ -737,7 +737,29 @@ async fn a_keyset_checked_out_before_the_switch_records_no_position_delete_after
         provider.switch_auto_to_key_deletes(),
         "the table switches to key deletes"
     );
+    // Cache cell was `None` while the keyset was checked out, so the switch
+    // scrubbed nothing; restoring must forget positions itself.
     provider.store_cached_pk_index(index.expect("an exact keyset"), checkout);
+    let (restored, restore_checkout) = provider.take_cached_pk_index();
+    let (still_positioned, captured_files) = match restored.as_ref() {
+        Some(CachedPkIndex::Exact(keyset)) => (
+            keyset
+                .locations()
+                .filter(|loc| matches!(loc, RowLocation::FilePositioned { .. }))
+                .count(),
+            keyset.captured_files.len(),
+        ),
+        other => panic!("expected an exact keyset after restore, got {other:?}"),
+    };
+    provider.store_cached_pk_index(restored.expect("exact keyset"), restore_checkout);
+    assert_eq!(
+        still_positioned, 0,
+        "store_cached_pk_index must scrub FilePositioned locations after the switch"
+    );
+    assert_eq!(
+        captured_files, 0,
+        "store_cached_pk_index must drop captured_files after the switch"
+    );
 
     write(&provider, &keys, 200).await;
     assert_eq!(
