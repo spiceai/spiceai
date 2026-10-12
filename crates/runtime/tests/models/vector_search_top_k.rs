@@ -322,6 +322,23 @@ async fn vector_search_returns_top_k_on_a_chunked_column() -> Result<(), anyhow:
         .await?;
         assert_top_k(&got, &want, "chunked with a filter");
 
+        // A filter on a column the search adds, such as the matched chunk `_value`, applies to
+        // the `k` rows the search returns, so it can only drop rows from them.
+        let top = expected_top_k(2, |body| cosine(&q, &stub_embedding(body)));
+        let got = ids_and_scores(
+            &rt,
+            &format!(
+                "SELECT id, _score FROM vector_search(docs, '{QUERY}', 2) \
+                 WHERE _value NOT LIKE 'HTTP/2%'"
+            ),
+        )
+        .await?;
+        let top_ids: Vec<i64> = top.iter().map(|(id, _)| *id).collect();
+        assert!(
+            got.iter().all(|(id, _)| top_ids.contains(id)),
+            "chunked with a `_value` filter: expected a subset of the top k {top:?}, got {got:?}"
+        );
+
         // An enclosing operator that needs no order still sees only `k` rows, chunked or not
         // (the unchunked shape is #14818).
         for table in ["docs", "plain"] {

@@ -67,7 +67,7 @@ use std::{
 };
 
 use runtime_datafusion_udfs::cosine_distance::COSINE_DISTANCE_UDF_NAME;
-use search::{SEARCH_MATCH_COLUMN_NAME, SEARCH_SCORE_COLUMN_NAME, generation::util::append_fields};
+use search::{SEARCH_SCORE_COLUMN_NAME, generation::util::append_fields};
 use snafu::ResultExt;
 
 use crate::datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
@@ -640,6 +640,12 @@ impl TableFunctionImpl for VectorSearchTableFunc {
             };
             return Ok(Arc::new(TopKByScoreProvider {
                 candidates: alias_value_to_match(table)?,
+                base_columns: table_provider
+                    .schema()
+                    .fields()
+                    .iter()
+                    .map(|f| f.name().clone())
+                    .collect(),
                 limit: args.limit,
             }));
         }
@@ -1000,11 +1006,13 @@ fn alias_value_to_match(
 /// [`ChunkedNonIndexVectorGeneration`], whose plan ends in a join that adds the base table's
 /// columns back. An `ORDER BY` under a join does not order the join's output, so the candidates
 /// carry neither the score order nor `k`; this provider applies both above them. A filter that
-/// reads neither `_score` nor `_match` is applied before the limit, as [`VectorSearchUDTFProvider`]
-/// applies it, so `k` counts the rows the filter keeps.
+/// reads only the base table's columns is applied before the limit, as [`VectorSearchUDTFProvider`]
+/// applies it, so `k` counts the rows the filter keeps. A filter on a column the search adds
+/// (`_score`, `_match`, `_value`, ...) is left above the limit.
 #[derive(Debug)]
 struct TopKByScoreProvider {
     candidates: Arc<dyn TableProvider>,
+    base_columns: HashSet<String>,
     limit: Option<usize>,
 }
 
@@ -1025,13 +1033,14 @@ impl TableProvider for TopKByScoreProvider {
         Ok(filters
             .iter()
             .map(|f| {
-                let reads_search_output = f.column_refs().iter().any(|c| {
-                    c.name() == SEARCH_SCORE_COLUMN_NAME || c.name() == SEARCH_MATCH_COLUMN_NAME
-                });
-                if reads_search_output {
-                    TableProviderFilterPushDown::Unsupported
-                } else {
+                let reads_only_base_columns = f
+                    .column_refs()
+                    .iter()
+                    .all(|c| self.base_columns.contains(c.name()));
+                if reads_only_base_columns {
                     TableProviderFilterPushDown::Exact
+                } else {
+                    TableProviderFilterPushDown::Unsupported
                 }
             })
             .collect())
