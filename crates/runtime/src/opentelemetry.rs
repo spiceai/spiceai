@@ -63,7 +63,7 @@ use tonic::codec::CompressionEncoding;
 
 use crate::Runtime;
 use crate::opentelemetry_store::{
-    OTLP_METRICS_PARAM, export_to_store_batch, is_otlp_metrics_store_param,
+    MAX_STORE_BATCH_ROWS, OTLP_METRICS_PARAM, StoreExport, is_otlp_metrics_store_param,
 };
 use runtime_query_engine::query_engine::{QueryEngine, UpdateType};
 use util::tracers::OnceTracer;
@@ -187,7 +187,8 @@ impl MetricsService for Service {
         // Write the whole export to every metrics store table first (#15060). When that
         // succeeds every data point is stored, so a metric without its own dataset is not
         // rejected, and its per-metric dataset, if any, still receives it below.
-        let stored_in_metrics_store = self.write_to_metrics_store(&request).await;
+        let store_outcome = self.write_to_metrics_store(&request).await;
+        let stored_in_metrics_store = store_outcome == StoreOutcome::Stored;
         let resource_metrics = request.resource_metrics;
         tracing::debug!(
             "OpenTelemetry export: received {} resource metric group(s)",
@@ -245,6 +246,13 @@ impl MetricsService for Service {
         // nothing, so it succeeds; only an export that had data points and lost all of them is
         // a failed export.
         if total_data_points > 0 && rejected_data_points >= total_data_points {
+            if store_outcome == StoreOutcome::Failed {
+                // The store failed to write, which is not the client's fault: tell exporters
+                // to retry instead of dropping the export as invalid.
+                return Err(Status::unavailable(
+                    "Failed to write to the OpenTelemetry metrics store; retry the export",
+                ));
+            }
             return Err(Status::invalid_argument("All data points were rejected"));
         }
 
@@ -260,6 +268,17 @@ impl MetricsService for Service {
             partial_success,
         }))
     }
+}
+
+/// Outcome of writing an export to the metrics store tables.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StoreOutcome {
+    /// No writable metrics store table, or nothing to write.
+    NotConfigured,
+    /// Every table stored every data point.
+    Stored,
+    /// A table failed to store a batch.
+    Failed,
 }
 
 /// Outcome of one attempt to build and write a metric's batch.
@@ -324,46 +343,55 @@ impl Service {
             .collect()
     }
 
-    /// Writes every data point of the export to each metrics store table. Returns `true` when
-    /// at least one table stored the export.
-    async fn write_to_metrics_store(&self, request: &ExportMetricsServiceRequest) -> bool {
+    /// Writes every data point of the export to each metrics store table, in batches of
+    /// bounded size.
+    async fn write_to_metrics_store(&self, request: &ExportMetricsServiceRequest) -> StoreOutcome {
         let tables = self.metrics_store_tables().await;
         if tables.is_empty() {
-            return false;
+            return StoreOutcome::NotConfigured;
         }
-        let batch = match export_to_store_batch(request) {
-            Ok(Some(batch)) => batch,
-            Ok(None) => return false,
-            Err(e) => {
-                tracing::error!("Failed to build the OpenTelemetry metrics store batch: {e}");
-                return false;
-            }
-        };
-        let mut stored = false;
-        for table in tables {
-            match self
-                .datafusion
-                .write_data(
-                    &table,
-                    batch.schema(),
-                    vec![batch.clone()],
-                    UpdateType::Append,
-                )
-                .await
-            {
-                Ok(()) => {
-                    tracing::debug!(
-                        "OpenTelemetry export: wrote {} data point(s) to metrics store {table}",
-                        batch.num_rows()
-                    );
-                    stored = true;
+        let export = StoreExport::new(request);
+        if export.rows() == 0 {
+            return StoreOutcome::NotConfigured;
+        }
+        let mut failed = false;
+        for batch in export.batches(MAX_STORE_BATCH_ROWS) {
+            let batch = match batch {
+                Ok(batch) => batch,
+                Err(e) => {
+                    tracing::error!("Failed to build an OpenTelemetry metrics store batch: {e}");
+                    return StoreOutcome::Failed;
                 }
-                Err(e) => tracing::warn!(
-                    "Failed to write OpenTelemetry metrics to metrics store {table}: {e}"
-                ),
+            };
+            for table in &tables {
+                if let Err(e) = self
+                    .datafusion
+                    .write_data(
+                        table,
+                        batch.schema(),
+                        vec![batch.clone()],
+                        UpdateType::Append,
+                    )
+                    .await
+                {
+                    tracing::warn!(
+                        "Failed to write OpenTelemetry metrics to metrics store {table}: {e}"
+                    );
+                    failed = true;
+                }
+            }
+            if failed {
+                // A retried export rewrites the batches already stored; the
+                // `(time_unix_nano, series_hash)` primary key deduplicates them.
+                return StoreOutcome::Failed;
             }
         }
-        stored
+        tracing::debug!(
+            "OpenTelemetry export: wrote {} data point(s) to {} metrics store table(s)",
+            export.rows(),
+            tables.len()
+        );
+        StoreOutcome::Stored
     }
 
     /// Ingests one metric of an export, returning how many of its data points were rejected.
@@ -3382,7 +3410,11 @@ mod tests {
             .export(Request::new(request))
             .await
             .expect_err("nothing was stored anywhere");
-        assert_eq!(status.code(), tonic::Code::InvalidArgument);
+        assert_eq!(
+            status.code(),
+            tonic::Code::Unavailable,
+            "a store write failure is retryable, not an invalid export"
+        );
     }
 
     /// An export whose data points were all rejected is a failed export, including when every

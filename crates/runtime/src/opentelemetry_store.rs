@@ -30,7 +30,7 @@ use std::sync::{Arc, LazyLock};
 
 use arrow::array::{
     ArrayRef, BooleanBuilder, Float64Builder, Int32Builder, Int64Builder, ListBuilder,
-    StringBuilder, UInt64Builder,
+    StringBuilder, UInt32Builder, UInt64Builder,
 };
 use arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use arrow::error::ArrowError;
@@ -40,6 +40,9 @@ use opentelemetry_proto::tonic::collector::metrics::v1::ExportMetricsServiceRequ
 use opentelemetry_proto::tonic::common::v1::{AnyValue, KeyValue, any_value};
 use opentelemetry_proto::tonic::metrics::v1::metric::Data;
 use opentelemetry_proto::tonic::metrics::v1::number_data_point::Value;
+use opentelemetry_proto::tonic::metrics::v1::{
+    ExponentialHistogramDataPoint, HistogramDataPoint, NumberDataPoint, SummaryDataPoint,
+};
 use serde_json::Value as JsonValue;
 
 /// Dataset param that routes OTLP metrics into a dataset. The only accepted value is `all`.
@@ -73,6 +76,8 @@ pub static METRICS_STORE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
         Field::new("resource_attributes", DataType::Utf8, true),
         Field::new("scope_name", DataType::Utf8, true),
         Field::new("scope_version", DataType::Utf8, true),
+        Field::new("scope_attributes", DataType::Utf8, true),
+        Field::new("flags", DataType::UInt32, true),
         Field::new("value_double", DataType::Float64, true),
         Field::new("value_int", DataType::Int64, true),
         Field::new("count", DataType::UInt64, true),
@@ -83,6 +88,7 @@ pub static METRICS_STORE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
         Field::new("bucket_counts", list_of(DataType::UInt64), true),
         Field::new("scale", DataType::Int32, true),
         Field::new("zero_count", DataType::UInt64, true),
+        Field::new("zero_threshold", DataType::Float64, true),
         Field::new("positive_offset", DataType::Int32, true),
         Field::new("positive_bucket_counts", list_of(DataType::UInt64), true),
         Field::new("negative_offset", DataType::Int32, true),
@@ -115,6 +121,8 @@ fn any_value_to_json(value: Option<&AnyValue>) -> JsonValue {
                 .collect(),
         ),
         any_value::Value::KvlistValue(kv) => attributes_to_json(&kv.values),
+        // String-table references are a profiling-signal encoding; metrics never carry them.
+        any_value::Value::StringValueStrindex(_) => JsonValue::Null,
     }
 }
 
@@ -136,8 +144,8 @@ fn attributes_to_json_string(attributes: &[KeyValue]) -> String {
     attributes_to_json(attributes).to_string()
 }
 
-/// Identity of a series: metric name, resource attributes, scope name and version, and point
-/// attributes. Each part is length-prefixed so no two different series encode the same bytes.
+/// Identity of a series: metric name, resource attributes, scope name, version and
+/// attributes, and point attributes. Each part is length-prefixed so no two different series encode the same bytes.
 /// The algorithm (`XxHash3_64`, seed 0) is part of the stored data and must not change.
 #[must_use]
 pub fn series_hash(
@@ -145,6 +153,7 @@ pub fn series_hash(
     resource_attributes_json: &str,
     scope_name: &str,
     scope_version: &str,
+    scope_attributes_json: &str,
     attributes_json: &str,
 ) -> u64 {
     let parts = [
@@ -152,6 +161,7 @@ pub fn series_hash(
         resource_attributes_json,
         scope_name,
         scope_version,
+        scope_attributes_json,
         attributes_json,
     ];
     let mut bytes = Vec::with_capacity(parts.iter().map(|p| p.len() + 8).sum());
@@ -186,6 +196,8 @@ struct StoreBuilders {
     resource_attributes: StringBuilder,
     scope_name: StringBuilder,
     scope_version: StringBuilder,
+    scope_attributes: StringBuilder,
+    flags: UInt32Builder,
     value_double: Float64Builder,
     value_int: Int64Builder,
     count: UInt64Builder,
@@ -196,6 +208,7 @@ struct StoreBuilders {
     bucket_counts: ListBuilder<UInt64Builder>,
     scale: Int32Builder,
     zero_count: UInt64Builder,
+    zero_threshold: Float64Builder,
     positive_offset: Int32Builder,
     positive_bucket_counts: ListBuilder<UInt64Builder>,
     negative_offset: Int32Builder,
@@ -215,6 +228,7 @@ struct MetricContext<'a> {
     resource_attributes: &'a str,
     scope_name: &'a str,
     scope_version: &'a str,
+    scope_attributes: &'a str,
 }
 
 fn non_empty(s: &str) -> Option<&str> {
@@ -234,6 +248,7 @@ struct PointValues<'a> {
     bucket_counts: Option<&'a [u64]>,
     scale: Option<i32>,
     zero_count: Option<u64>,
+    zero_threshold: Option<f64>,
     positive: Option<(i32, &'a [u64])>,
     negative: Option<(i32, &'a [u64])>,
     quantiles: Option<(Vec<f64>, Vec<f64>)>,
@@ -266,6 +281,7 @@ impl StoreBuilders {
         time_unix_nano: u64,
         start_time_unix_nano: u64,
         attributes: &[KeyValue],
+        flags: u32,
         values: PointValues<'_>,
     ) {
         let attributes_json = attributes_to_json_string(attributes);
@@ -284,6 +300,7 @@ impl StoreBuilders {
             ctx.resource_attributes,
             ctx.scope_name,
             ctx.scope_version,
+            ctx.scope_attributes,
             &attributes_json,
         ));
         self.attributes.append_value(&attributes_json);
@@ -302,6 +319,7 @@ impl StoreBuilders {
         append_u64_list(&mut self.bucket_counts, values.bucket_counts);
         self.scale.append_option(values.scale);
         self.zero_count.append_option(values.zero_count);
+        self.zero_threshold.append_option(values.zero_threshold);
         self.positive_offset
             .append_option(values.positive.map(|(offset, _)| offset));
         append_u64_list(
@@ -337,6 +355,8 @@ impl StoreBuilders {
             Arc::new(self.resource_attributes.finish()),
             Arc::new(self.scope_name.finish()),
             Arc::new(self.scope_version.finish()),
+            Arc::new(self.scope_attributes.finish()),
+            Arc::new(self.flags.finish()),
             Arc::new(self.value_double.finish()),
             Arc::new(self.value_int.finish()),
             Arc::new(self.count.finish()),
@@ -347,6 +367,7 @@ impl StoreBuilders {
             Arc::new(self.bucket_counts.finish()),
             Arc::new(self.scale.finish()),
             Arc::new(self.zero_count.finish()),
+            Arc::new(self.zero_threshold.finish()),
             Arc::new(self.positive_offset.finish()),
             Arc::new(self.positive_bucket_counts.finish()),
             Arc::new(self.negative_offset.finish()),
@@ -358,156 +379,256 @@ impl StoreBuilders {
     }
 }
 
-/// Builds one metrics store batch holding every data point of every metric in `request`, of
-/// every OTLP metric type. Returns `None` when the export carries no data points.
-///
-/// # Errors
-///
-/// Returns an error if the arrays cannot form a batch, which indicates a bug in this module.
-pub fn export_to_store_batch(
-    request: &ExportMetricsServiceRequest,
-) -> Result<Option<RecordBatch>, ArrowError> {
-    let mut builders = StoreBuilders::default();
-    let mut rows = 0usize;
-    for resource_metric in &request.resource_metrics {
-        let resource_attributes = attributes_to_json_string(
-            resource_metric
-                .resource
-                .as_ref()
-                .map_or(&[][..], |r| r.attributes.as_slice()),
-        );
-        for scope_metric in &resource_metric.scope_metrics {
-            let (scope_name, scope_version) = scope_metric
-                .scope
-                .as_ref()
-                .map_or(("", ""), |s| (s.name.as_str(), s.version.as_str()));
-            for metric in &scope_metric.metrics {
-                let Some(data) = metric.data.as_ref() else {
-                    continue;
-                };
-                let mut ctx = MetricContext {
-                    name: &metric.name,
-                    metric_type: "",
-                    description: &metric.description,
-                    unit: &metric.unit,
-                    temporality: None,
-                    is_monotonic: None,
-                    resource_attributes: &resource_attributes,
-                    scope_name,
-                    scope_version,
-                };
-                match data {
-                    Data::Gauge(gauge) => {
-                        ctx.metric_type = "gauge";
-                        for p in &gauge.data_points {
-                            builders.append(
-                                &ctx,
-                                p.time_unix_nano,
-                                p.start_time_unix_nano,
-                                &p.attributes,
-                                number_values(p.value.as_ref()),
-                            );
-                            rows += 1;
-                        }
-                    }
-                    Data::Sum(sum) => {
-                        ctx.metric_type = "sum";
-                        ctx.temporality = temporality_name(sum.aggregation_temporality);
-                        ctx.is_monotonic = Some(sum.is_monotonic);
-                        for p in &sum.data_points {
-                            builders.append(
-                                &ctx,
-                                p.time_unix_nano,
-                                p.start_time_unix_nano,
-                                &p.attributes,
-                                number_values(p.value.as_ref()),
-                            );
-                            rows += 1;
-                        }
-                    }
-                    Data::Histogram(histogram) => {
-                        ctx.metric_type = "histogram";
-                        ctx.temporality = temporality_name(histogram.aggregation_temporality);
-                        for p in &histogram.data_points {
-                            builders.append(
-                                &ctx,
-                                p.time_unix_nano,
-                                p.start_time_unix_nano,
-                                &p.attributes,
-                                PointValues {
-                                    count: Some(p.count),
-                                    sum: p.sum,
-                                    min: p.min,
-                                    max: p.max,
-                                    explicit_bounds: Some(&p.explicit_bounds),
-                                    bucket_counts: Some(&p.bucket_counts),
-                                    ..PointValues::default()
-                                },
-                            );
-                            rows += 1;
-                        }
-                    }
-                    Data::ExponentialHistogram(histogram) => {
-                        ctx.metric_type = "exponential_histogram";
-                        ctx.temporality = temporality_name(histogram.aggregation_temporality);
-                        for p in &histogram.data_points {
-                            builders.append(
-                                &ctx,
-                                p.time_unix_nano,
-                                p.start_time_unix_nano,
-                                &p.attributes,
-                                PointValues {
-                                    count: Some(p.count),
-                                    sum: p.sum,
-                                    min: p.min,
-                                    max: p.max,
-                                    scale: Some(p.scale),
-                                    zero_count: Some(p.zero_count),
-                                    positive: p
-                                        .positive
-                                        .as_ref()
-                                        .map(|b| (b.offset, b.bucket_counts.as_slice())),
-                                    negative: p
-                                        .negative
-                                        .as_ref()
-                                        .map(|b| (b.offset, b.bucket_counts.as_slice())),
-                                    ..PointValues::default()
-                                },
-                            );
-                            rows += 1;
-                        }
-                    }
-                    Data::Summary(summary) => {
-                        ctx.metric_type = "summary";
-                        for p in &summary.data_points {
-                            let (quantiles, values) = p
-                                .quantile_values
+/// Rows per metrics store batch. Bounds the memory one batch takes, since resource and scope
+/// attributes are repeated on every row.
+pub const MAX_STORE_BATCH_ROWS: usize = 8192;
+
+/// One data point of an export, by reference.
+#[derive(Clone, Copy)]
+enum PointRef<'a> {
+    Number(&'a NumberDataPoint),
+    Histogram(&'a HistogramDataPoint),
+    Exponential(&'a ExponentialHistogramDataPoint),
+    Summary(&'a SummaryDataPoint),
+}
+
+/// Columns shared by every point of one metric of one scope, by index into the export's
+/// serialized resource and scope attributes.
+struct OwnedContext<'a> {
+    name: &'a str,
+    metric_type: &'static str,
+    description: &'a str,
+    unit: &'a str,
+    temporality: Option<&'static str>,
+    is_monotonic: Option<bool>,
+    resource: usize,
+    scope_name: &'a str,
+    scope_version: &'a str,
+    scope_attributes: usize,
+}
+
+/// Every data point of an export, in order, ready to build metrics store batches of bounded
+/// size. Attributes shared across points are serialized once.
+pub struct StoreExport<'a> {
+    resources: Vec<String>,
+    scopes: Vec<String>,
+    contexts: Vec<OwnedContext<'a>>,
+    points: Vec<(usize, PointRef<'a>)>,
+}
+
+impl<'a> StoreExport<'a> {
+    /// Indexes every data point of every metric in `request`, of every OTLP metric type.
+    #[must_use]
+    pub fn new(request: &'a ExportMetricsServiceRequest) -> Self {
+        let mut export = Self {
+            resources: Vec::new(),
+            scopes: Vec::new(),
+            contexts: Vec::new(),
+            points: Vec::new(),
+        };
+        for resource_metric in &request.resource_metrics {
+            let resource = export.resources.len();
+            export.resources.push(attributes_to_json_string(
+                resource_metric
+                    .resource
+                    .as_ref()
+                    .map_or(&[][..], |r| r.attributes.as_slice()),
+            ));
+            for scope_metric in &resource_metric.scope_metrics {
+                let scope = scope_metric.scope.as_ref();
+                let scope_attributes = export.scopes.len();
+                export.scopes.push(attributes_to_json_string(
+                    scope.map_or(&[][..], |s| s.attributes.as_slice()),
+                ));
+                let (scope_name, scope_version) =
+                    scope.map_or(("", ""), |s| (s.name.as_str(), s.version.as_str()));
+                for metric in &scope_metric.metrics {
+                    let Some(data) = metric.data.as_ref() else {
+                        continue;
+                    };
+                    let (metric_type, temporality, is_monotonic) = match data {
+                        Data::Gauge(_) => ("gauge", None, None),
+                        Data::Sum(sum) => (
+                            "sum",
+                            temporality_name(sum.aggregation_temporality),
+                            Some(sum.is_monotonic),
+                        ),
+                        Data::Histogram(h) => (
+                            "histogram",
+                            temporality_name(h.aggregation_temporality),
+                            None,
+                        ),
+                        Data::ExponentialHistogram(h) => (
+                            "exponential_histogram",
+                            temporality_name(h.aggregation_temporality),
+                            None,
+                        ),
+                        Data::Summary(_) => ("summary", None, None),
+                    };
+                    let context = export.contexts.len();
+                    export.contexts.push(OwnedContext {
+                        name: &metric.name,
+                        metric_type,
+                        description: &metric.description,
+                        unit: &metric.unit,
+                        temporality,
+                        is_monotonic,
+                        resource,
+                        scope_name,
+                        scope_version,
+                        scope_attributes,
+                    });
+                    match data {
+                        Data::Gauge(g) => export
+                            .points
+                            .extend(g.data_points.iter().map(|p| (context, PointRef::Number(p)))),
+                        Data::Sum(sum) => export.points.extend(
+                            sum.data_points
                                 .iter()
-                                .map(|q| (q.quantile, q.value))
-                                .unzip();
-                            builders.append(
-                                &ctx,
-                                p.time_unix_nano,
-                                p.start_time_unix_nano,
-                                &p.attributes,
-                                PointValues {
-                                    count: Some(p.count),
-                                    sum: Some(p.sum),
-                                    quantiles: Some((quantiles, values)),
-                                    ..PointValues::default()
-                                },
-                            );
-                            rows += 1;
-                        }
+                                .map(|p| (context, PointRef::Number(p))),
+                        ),
+                        Data::Histogram(h) => export.points.extend(
+                            h.data_points
+                                .iter()
+                                .map(|p| (context, PointRef::Histogram(p))),
+                        ),
+                        Data::ExponentialHistogram(h) => export.points.extend(
+                            h.data_points
+                                .iter()
+                                .map(|p| (context, PointRef::Exponential(p))),
+                        ),
+                        Data::Summary(summary) => export.points.extend(
+                            summary
+                                .data_points
+                                .iter()
+                                .map(|p| (context, PointRef::Summary(p))),
+                        ),
                     }
                 }
             }
         }
+        export
     }
-    if rows == 0 {
+
+    /// Number of data points (rows) in the export.
+    #[must_use]
+    pub fn rows(&self) -> usize {
+        self.points.len()
+    }
+
+    /// Metrics store batches of at most `max_rows` rows each, built one at a time.
+    pub fn batches(
+        &self,
+        max_rows: usize,
+    ) -> impl Iterator<Item = Result<RecordBatch, ArrowError>> + '_ {
+        self.points
+            .chunks(max_rows.max(1))
+            .map(|chunk| self.build(chunk))
+    }
+
+    fn build(&self, points: &[(usize, PointRef<'a>)]) -> Result<RecordBatch, ArrowError> {
+        let mut builders = StoreBuilders::default();
+        for (context, point) in points {
+            let c = &self.contexts[*context];
+            let ctx = MetricContext {
+                name: c.name,
+                metric_type: c.metric_type,
+                description: c.description,
+                unit: c.unit,
+                temporality: c.temporality,
+                is_monotonic: c.is_monotonic,
+                resource_attributes: &self.resources[c.resource],
+                scope_name: c.scope_name,
+                scope_version: c.scope_version,
+                scope_attributes: &self.scopes[c.scope_attributes],
+            };
+            match point {
+                PointRef::Number(p) => builders.append(
+                    &ctx,
+                    p.time_unix_nano,
+                    p.start_time_unix_nano,
+                    &p.attributes,
+                    p.flags,
+                    number_values(p.value.as_ref()),
+                ),
+                PointRef::Histogram(p) => builders.append(
+                    &ctx,
+                    p.time_unix_nano,
+                    p.start_time_unix_nano,
+                    &p.attributes,
+                    p.flags,
+                    PointValues {
+                        count: Some(p.count),
+                        sum: p.sum,
+                        min: p.min,
+                        max: p.max,
+                        explicit_bounds: Some(&p.explicit_bounds),
+                        bucket_counts: Some(&p.bucket_counts),
+                        ..PointValues::default()
+                    },
+                ),
+                PointRef::Exponential(p) => builders.append(
+                    &ctx,
+                    p.time_unix_nano,
+                    p.start_time_unix_nano,
+                    &p.attributes,
+                    p.flags,
+                    PointValues {
+                        count: Some(p.count),
+                        sum: p.sum,
+                        min: p.min,
+                        max: p.max,
+                        scale: Some(p.scale),
+                        zero_count: Some(p.zero_count),
+                        zero_threshold: Some(p.zero_threshold),
+                        positive: p
+                            .positive
+                            .as_ref()
+                            .map(|b| (b.offset, b.bucket_counts.as_slice())),
+                        negative: p
+                            .negative
+                            .as_ref()
+                            .map(|b| (b.offset, b.bucket_counts.as_slice())),
+                        ..PointValues::default()
+                    },
+                ),
+                PointRef::Summary(p) => {
+                    let (quantiles, values) = p
+                        .quantile_values
+                        .iter()
+                        .map(|q| (q.quantile, q.value))
+                        .unzip();
+                    builders.append(
+                        &ctx,
+                        p.time_unix_nano,
+                        p.start_time_unix_nano,
+                        &p.attributes,
+                        p.flags,
+                        PointValues {
+                            count: Some(p.count),
+                            sum: Some(p.sum),
+                            quantiles: Some((quantiles, values)),
+                            ..PointValues::default()
+                        },
+                    );
+                }
+            }
+        }
+        builders.finish()
+    }
+}
+
+/// Builds one metrics store batch holding every data point of `request`. Returns `None` when
+/// the export carries no data points. Test helper; ingest uses [`StoreExport::batches`].
+#[cfg(test)]
+fn export_to_store_batch(
+    request: &ExportMetricsServiceRequest,
+) -> Result<Option<RecordBatch>, ArrowError> {
+    let export = StoreExport::new(request);
+    if export.rows() == 0 {
         return Ok(None);
     }
-    builders.finish().map(Some)
+    export.batches(usize::MAX).next().transpose()
 }
 
 fn number_values(value: Option<&Value>) -> PointValues<'static> {
@@ -541,6 +662,7 @@ mod tests {
         KeyValue {
             key: key.to_string(),
             value: Some(AnyValue { value: Some(value) }),
+            key_strindex: 0,
         }
     }
 
@@ -655,7 +777,7 @@ mod tests {
                         exemplars: vec![],
                         min: None,
                         max: None,
-                        zero_threshold: 0.0,
+                        zero_threshold: 0.25,
                     }],
                     aggregation_temporality: 2,
                 }),
@@ -883,6 +1005,40 @@ mod tests {
             json,
             r#"{"b":true,"bytes":"AQI=","d":1.5,"i":7,"nan":"NaN"}"#
         );
+    }
+
+    #[test]
+    fn exports_are_split_into_bounded_batches() {
+        let points: Vec<NumberDataPoint> = (0..5)
+            .map(|i| number_point(i, Value::AsInt(1), vec![]))
+            .collect();
+        let req = request(vec![metric(
+            "m",
+            "",
+            Data::Gauge(Gauge {
+                data_points: points,
+            }),
+        )]);
+        let export = StoreExport::new(&req);
+        let sizes: Vec<usize> = export
+            .batches(2)
+            .map(|b| b.expect("batch").num_rows())
+            .collect();
+        assert_eq!(sizes, vec![2, 2, 1]);
+    }
+
+    #[test]
+    fn exponential_histogram_zero_threshold_and_flags_are_kept() {
+        let batch = export_to_store_batch(&all_types_request())
+            .expect("batch")
+            .expect("rows");
+        let zero_threshold = batch
+            .column_by_name("zero_threshold")
+            .expect("col")
+            .as_primitive::<Float64Type>();
+        assert!((zero_threshold.value(3) - 0.25).abs() < f64::EPSILON);
+        assert!(zero_threshold.is_null(0));
+        assert!(batch.column_by_name("flags").expect("col").is_valid(0));
     }
 
     #[test]
