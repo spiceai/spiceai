@@ -116,6 +116,7 @@ pub(crate) struct McpToolCatalog {
 
     /// Spicepod defined name & description, not from underlying MCP.
     name: String,
+    description: Option<String>,
     heartbeat_task: tokio::task::JoinHandle<()>,
     /// Schemas from the last successful `tools/list` / `tools/get`, used by
     /// [`SpiceToolCatalog::try_get`] so Streamable HTTP can validate `Mcp-Param-*`
@@ -332,7 +333,7 @@ impl Drop for McpToolCatalog {
 }
 
 impl McpToolCatalog {
-    pub async fn try_new(cfg: MCPConfig, name: &str) -> Result<Self> {
+    pub async fn try_new(cfg: MCPConfig, name: &str, description: Option<String>) -> Result<Self> {
         let client = Self::create_client(&cfg).await?;
         let client = Arc::new(RwLock::new(client));
 
@@ -428,6 +429,7 @@ impl McpToolCatalog {
         let catalog = Self {
             client,
             name: name.to_string(),
+            description,
             heartbeat_task,
             tool_cache,
             schemas,
@@ -487,6 +489,18 @@ impl McpToolCatalog {
             .ok()
             .map(|cache| cache.tools.values().cloned().collect())
             .unwrap_or_default()
+    }
+
+    /// Prefixes the Spicepod description to the upstream tool description.
+    fn with_spicepod_description(&self, mut tool: rmcp::model::Tool) -> rmcp::model::Tool {
+        let Some(prefix) = self.description.as_deref().filter(|d| !d.is_empty()) else {
+            return tool;
+        };
+        tool.description = Some(match tool.description.take() {
+            Some(upstream) => format!("{prefix}\n\n{upstream}").into(),
+            None => prefix.to_string().into(),
+        });
+        tool
     }
 
     async fn create_client(cfg: &MCPConfig) -> Result<McpClient> {
@@ -636,6 +650,7 @@ impl McpToolCatalog {
         Self {
             client: Arc::new(RwLock::new(client)),
             name: name.to_string(),
+            description: None,
             heartbeat_task: tokio::spawn(async {}),
             tool_cache: Arc::new(StdRwLock::new(cache)),
             schemas: Arc::new(StdRwLock::new(None)),
@@ -1020,7 +1035,7 @@ impl SpiceToolCatalog for McpToolCatalog {
             .map(|t| {
                 Arc::new(McpToolWrapper::new(
                     Arc::clone(&self.client),
-                    t,
+                    self.with_spicepod_description(t),
                     self.name.clone(),
                 )) as Arc<dyn SpiceModelTool>
             })
@@ -1031,18 +1046,21 @@ impl SpiceToolCatalog for McpToolCatalog {
         let tools = self.list_tools().await.unwrap_or_default();
         tools
             .into_iter()
-            .map(|t| ChatCompletionTool {
-                function: FunctionObject {
-                    strict: None,
-                    name: t.name.to_string(),
-                    description: t.description.as_deref().map(ToString::to_string),
-                    parameters: Some(serde_json::Value::Object(
-                        t.input_schema
-                            .iter()
-                            .map(|(k, v)| (k.clone(), v.clone()))
-                            .collect(),
-                    )),
-                },
+            .map(|t| {
+                let t = self.with_spicepod_description(t);
+                ChatCompletionTool {
+                    function: FunctionObject {
+                        strict: None,
+                        name: t.name.to_string(),
+                        description: t.description.as_deref().map(ToString::to_string),
+                        parameters: Some(serde_json::Value::Object(
+                            t.input_schema
+                                .iter()
+                                .map(|(k, v)| (k.clone(), v.clone()))
+                                .collect(),
+                        )),
+                    },
+                }
             })
             .collect()
     }
@@ -1055,7 +1073,7 @@ impl SpiceToolCatalog for McpToolCatalog {
 
         Some(Arc::new(McpToolWrapper::new(
             Arc::clone(&self.client),
-            tool,
+            self.with_spicepod_description(tool),
             self.name.clone(),
         )))
     }
@@ -1072,7 +1090,7 @@ impl SpiceToolCatalog for McpToolCatalog {
         };
         Some(Arc::new(McpToolWrapper::new(
             Arc::clone(&self.client),
-            spec,
+            self.with_spicepod_description(spec),
             self.name.clone(),
         )))
     }
@@ -1087,7 +1105,7 @@ impl SpiceToolCatalog for McpToolCatalog {
             .map(|spec| {
                 Arc::new(McpToolWrapper::new(
                     Arc::clone(&self.client),
-                    spec.clone(),
+                    self.with_spicepod_description(spec.clone()),
                     self.name.clone(),
                 )) as Arc<dyn SpiceModelTool>
             })
