@@ -43,6 +43,11 @@ on:
         required: false
         default: 1800
         type: number
+      sql_pipeline:
+        description: 'Parameterized SQL search pipeline file. Leave empty to search through /v1/search.'
+        required: false
+        default: ''
+        type: string
 
 jobs:
   run-bench:
@@ -61,6 +66,17 @@ jobs:
             exit 1
           fi
           echo "Spicepod file found at ${{ github.event.inputs.spicepod_path }}"
+
+      - name: Validate SQL pipeline file exists
+        if: github.event.inputs.sql_pipeline != ''
+        env:
+          SQL_PIPELINE: ${{ github.event.inputs.sql_pipeline }}
+        run: |
+          if [ ! -f "$SQL_PIPELINE" ]; then
+            echo "Error: SQL pipeline file not found at $SQL_PIPELINE"
+            exit 1
+          fi
+          echo "SQL pipeline file found at $SQL_PIPELINE"
 
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
@@ -106,6 +122,7 @@ jobs:
       - name: Run the benchmark test - ${{ steps.extract_spicepod_filename.outputs.SPICEPOD_FILENAME }}
         env:
           BENCHMARK_DATASET: ${{ github.event.inputs.benchmark_dataset }}
+          SQL_PIPELINE: ${{ github.event.inputs.sql_pipeline }}
           S3_ENDPOINT: ${{ secrets.TEST_MINIO_ENDPOINT }}
           S3_KEY: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
           S3_SECRET: ${{ secrets.TEST_MINIO_SECRET_KEY }}
@@ -122,9 +139,15 @@ jobs:
           if [ -n "$BENCHMARK_DATASET" ] && [ "$BENCHMARK_DATASET" != "custom" ]; then
             dataset_flag="--benchmark-dataset $BENCHMARK_DATASET"
           fi
+          # An empty SQL pipeline sends each query to /v1/search; a set one sends it to /v1/sql.
+          sql_pipeline_args=()
+          if [ -n "$SQL_PIPELINE" ]; then
+            sql_pipeline_args=(--sql-pipeline "$SQL_PIPELINE")
+          fi
           testoperator run search \
             --ready-wait ${{ github.event.inputs.ready_wait }} \
             --concurrency 10 \
             $dataset_flag \
+            "${sql_pipeline_args[@]}" \
             --metrics \
             -p "${{ github.event.inputs.spicepod_path }}"

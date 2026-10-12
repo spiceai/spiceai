@@ -14,6 +14,8 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
+use std::path::PathBuf;
+
 use super::CommonArgs;
 use clap::{Parser, ValueEnum};
 use serde::{Deserialize, Serialize};
@@ -28,6 +30,13 @@ pub struct SearchTestArgs {
     /// `corpus`, `test_queries`, and `relevance_data` tables defined in `--spicepod-path` as-is.
     #[arg(long)]
     pub(crate) benchmark_dataset: Option<SearchDatasetArg>,
+
+    /// File with a parameterized SQL search pipeline. When set, each test query is sent to
+    /// `POST /v1/sql` with this SQL, not to `POST /v1/search`. The SQL can use the named parameters
+    /// `:query` (the query text) and `:limit` (the result limit). It must return an `_id` column
+    /// (the corpus id) and can return a numeric `_score` column. Rows must be in rank order.
+    #[arg(long)]
+    pub(crate) sql_pipeline: Option<PathBuf>,
 }
 
 /// Search benchmark dataset selector. Used both as the `--benchmark-dataset` CLI value and as the

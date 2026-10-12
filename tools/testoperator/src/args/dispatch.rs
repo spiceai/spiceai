@@ -423,6 +423,9 @@ pub struct SearchArgs {
     pub benchmark_dataset: Option<SearchDatasetArg>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ready_wait: Option<u64>,
+    /// Parameterized SQL search pipeline file. Omitted to search through `POST /v1/search`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sql_pipeline: Option<PathBuf>,
 }
 
 /// Schema test workflow arguments, defined in the test files
@@ -1223,6 +1226,36 @@ tests:
         let serialized =
             serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
         assert_eq!(serialized["benchmark_dataset"], "quora_retrieval");
+        // An unset SQL pipeline sends no workflow input, so the run uses `/v1/search`.
+        assert!(serialized.get("sql_pipeline").is_none());
+    }
+
+    #[test]
+    fn test_search_section_sql_pipeline_round_trip() {
+        let yaml = "
+tests:
+  search:
+    spicepod_path: test/spicepods/search/mteb/fiqa/full_text_search-duckdb[file].yaml
+    runner_type: spiceai-dev-runners
+    benchmark_dataset: fiqa_retrieval
+    sql_pipeline: test/spicepods/search/pipelines/text_search.sql
+";
+
+        let test_file: DispatchTestFile = yaml::from_str(yaml).expect("Failed to deserialize");
+        assert_eq!(
+            test_file.tests.search[0]
+                .sql_pipeline
+                .as_deref()
+                .map(|path| path.to_string_lossy().into_owned()),
+            Some("test/spicepods/search/pipelines/text_search.sql".to_string())
+        );
+
+        let serialized =
+            serde_json::to_value(&test_file.tests.search[0]).expect("Failed to serialize");
+        assert_eq!(
+            serialized["sql_pipeline"],
+            "test/spicepods/search/pipelines/text_search.sql"
+        );
     }
 
     #[test]
