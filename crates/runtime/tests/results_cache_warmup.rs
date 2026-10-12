@@ -129,30 +129,15 @@ async fn warmup_record_persist_restart_refresh_ready_cache_hit() {
                 let miss = run_query(&rt, "SELECT id FROM lookup WHERE id = 1").await;
                 assert_eq!(miss, CacheStatus::CacheMiss, "first query records a plan");
 
-                // Wait for async persist into runtime.state.
-                let warmup_key = state_dir.join("results_cache_warmup.json");
+                // Wait for async persist into the results-cache folder of runtime.state.
+                let warmup_key = state_dir.join("results-cache/results_cache_warmup.json");
                 tokio::time::timeout(Duration::from_secs(30), async {
-                    loop {
-                        if warmup_key.is_file() {
-                            break;
-                        }
-                        // ObjectState may nest under a prefix; search the state dir.
-                        if std::fs::read_dir(&state_dir)
-                            .is_ok_and(|entries| {
-                                entries.filter_map(Result::ok).any(|e| {
-                                    e.file_name()
-                                        .to_string_lossy()
-                                        .contains("results_cache_warmup")
-                                })
-                            })
-                        {
-                            break;
-                        }
+                    while !warmup_key.is_file() {
                         tokio::time::sleep(Duration::from_millis(50)).await;
                     }
                 })
                 .await
-                .expect("warmup catalog should persist under runtime.state");
+                .expect("warmup catalog should persist under runtime.state/results-cache");
 
                 rt.shutdown().await;
                 // Drop runtime before restarting.

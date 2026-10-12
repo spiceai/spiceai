@@ -39,6 +39,7 @@ pub use routes::get_api_doc;
 mod mtls;
 mod response_outcome;
 mod routes;
+mod server_timing;
 
 pub mod v1;
 

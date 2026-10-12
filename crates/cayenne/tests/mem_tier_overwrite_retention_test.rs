@@ -26,7 +26,7 @@ limitations under the License.
 
 #![allow(clippy::expect_used)]
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};

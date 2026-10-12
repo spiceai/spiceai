@@ -162,6 +162,13 @@ pub async fn register_udfs(runtime: &crate::Runtime) {
         );
     }
 
+    // `ai_if`, `ai_probability`, `ai_classify`, `ai_score` and `ai_decide`, answered by
+    // the decision and chat models in the evaluation store, with the planner rules that
+    // place their model calls. Registered once per runtime, so the rules are appended
+    // once.
+    runtime_decide::DecisionFunctions::new(runtime.evaluate_models(), runtime.status())
+        .register(ctx);
+
     in_tracing_context_async(register_user_functions(runtime, ctx)).await;
 }
 
@@ -415,6 +422,12 @@ fn info_from_decl(decl: &Function) -> UserFunctionInfo {
 /// keeps evaluating a dropped or redefined function's own body no matter
 /// what the session context now holds for that name. Dataset and view
 /// registration already discard them for the same reason.
+///
+/// Discards the cached query results too. A result is keyed by its query, not
+/// by the definitions of the functions it called, and a `cache_key_type: sql`
+/// hit is served before the query is planned, so a result computed with the
+/// old definition (or while a now-`volatile` function was `immutable`) would
+/// otherwise keep being served until it expires.
 pub async fn apply_function_diff(
     runtime: &crate::Runtime,
     current_app: &Arc<app::App>,
@@ -422,6 +435,9 @@ pub async fn apply_function_diff(
 ) {
     if apply_function_diff_inner(runtime, current_app, new_app).await {
         runtime.df.clear_cached_plans().await;
+        if let Some(results) = runtime.df.results_cache_provider() {
+            results.invalidate_all().await;
+        }
     }
 }
 
@@ -721,6 +737,11 @@ mod deny_list_registration_tests {
             FLATTEN_JSON_UDTF_NAME,
             JSON_TREE_UDTF_NAME,
             RERANK_UDTF_NAME,
+            runtime_decide::AI_IF_NAME,
+            runtime_decide::AI_PROBABILITY_NAME,
+            runtime_decide::AI_CLASSIFY_NAME,
+            runtime_decide::AI_SCORE_NAME,
+            runtime_decide::AI_DECIDE_NAME,
         ]
         .iter()
         .map(ToString::to_string)
@@ -1164,8 +1185,10 @@ mod tests {
                 !support.supports(&make_named_expr(json_name.as_str()), None),
                 "{json_name} must stay denied for {backend}"
             );
+            // `upper` is a SQLite extra (ASCII-only case folding). `abs` is
+            // still a function both backends evaluate the same way.
             assert!(
-                support.supports(&make_named_expr("upper"), None),
+                support.supports(&make_named_expr("abs"), None),
                 "an ordinary function must still federate to {backend}"
             );
         }
@@ -1570,6 +1593,128 @@ body: \"{body}\"
             1,
             "an unchanged function set must not discard cached plans"
         );
+    }
+
+    /// [`app_with_body`]'s function, declared with `volatility`, in an app whose
+    /// SQL results cache is keyed by the query text (`cache_key_type: sql`):
+    /// such a hit is answered before the query is planned.
+    fn app_with_sql_keyed_results_cache(body: &str, volatility: &str) -> Arc<app::App> {
+        let function: Function = yaml::from_str(&format!(
+            "
+name: myscale
+from: sql
+kind: scalar
+volatility: {volatility}
+signature:
+  args: [{{ name: x, type: int64 }}]
+  returns: int64
+body: \"{body}\"
+"
+        ))
+        .expect("the function declaration should parse");
+
+        Arc::new(
+            app::AppBuilder::new("results_cache_function_diff")
+                .with_function(function)
+                .with_runtime(spicepod::component::runtime::Runtime {
+                    functions: spicepod::component::runtime::Functions::enabled(),
+                    caching: spicepod::component::caching::Caching {
+                        sql_results: Some(spicepod::component::caching::SQLResultsCacheConfig {
+                            item_ttl: Some("10m".to_string()),
+                            cache_key_type: spicepod::component::caching::CacheKeyType::Sql,
+                            ..Default::default()
+                        }),
+                        ..Default::default()
+                    },
+                    ..Default::default()
+                })
+                .build(),
+        )
+    }
+
+    /// Runs `sql` through the query path, results cache included, as a request
+    /// keyed by its SQL text (`cache_key_type: sql`), whose hit is answered before
+    /// the query is planned. Returns the cache status with the single `Int64`
+    /// value it answered.
+    async fn run_through_results_cache(
+        df: &Arc<crate::datafusion::DataFusion>,
+        sql: &str,
+    ) -> (cache::result::CacheStatus, i64) {
+        use runtime_request_context::{CacheControl, CacheKeyType, Protocol, RequestContext};
+
+        let request_context = Arc::new(
+            RequestContext::builder(Protocol::Internal)
+                .with_cache_control(CacheControl::Cache(CacheKeyType::Raw))
+                .build(),
+        );
+        let query = df.query_builder(sql).build();
+        request_context
+            .scope(async move {
+                let result = query.run().await.expect("the query should run");
+                let status = result.cache_status;
+                let batches = result
+                    .collect_batches()
+                    .await
+                    .expect("the query should return rows");
+                let value = batches[0]
+                    .column(0)
+                    .as_primitive::<datafusion::arrow::datatypes::Int64Type>()
+                    .value(0);
+                (status, value)
+            })
+            .await
+    }
+
+    /// A cached result is keyed by its query, not by the definitions of the
+    /// functions it called, and a `cache_key_type: sql` hit is answered before
+    /// planning, where the volatility check runs. So a reload that redefines a
+    /// function must discard the cached results, or the old definition's answer
+    /// is replayed until the entry expires, even after the function became
+    /// `volatile`.
+    #[tokio::test]
+    async fn function_diff_discards_cached_results_so_a_redefined_function_is_not_replayed() {
+        use cache::result::CacheStatus;
+        static SQL: &str = "SELECT myscale(21) AS v";
+
+        let doubling = app_with_sql_keyed_results_cache("x * 2", "immutable");
+        let runtime = crate::Runtime::builder()
+            .with_app_opt(Some(Arc::clone(&doubling)))
+            .build()
+            .await;
+        let df = Arc::clone(&runtime.df);
+        assert_eq!(
+            run_through_results_cache(&df, SQL).await,
+            (CacheStatus::CacheMiss, 42)
+        );
+        assert_eq!(
+            run_through_results_cache(&df, SQL).await,
+            (CacheStatus::CacheHit, 42),
+            "precondition: the result must be cached, or the test cannot observe a replay"
+        );
+
+        // Redefined, still `immutable`: the next run computes the new body.
+        let tripling = app_with_sql_keyed_results_cache("x * 3", "immutable");
+        apply_function_diff(&runtime, &doubling, &tripling).await;
+        assert_eq!(
+            run_through_results_cache(&df, SQL).await,
+            (CacheStatus::CacheMiss, 63),
+            "a HIT with 42 replays the result the replaced body computed"
+        );
+        assert_eq!(
+            run_through_results_cache(&df, SQL).await,
+            (CacheStatus::CacheHit, 63)
+        );
+
+        // Now `volatile`: no result may be served from the cache for it.
+        let volatile = app_with_sql_keyed_results_cache("x * 4", "volatile");
+        apply_function_diff(&runtime, &tripling, &volatile).await;
+        for run in 1..=2 {
+            assert_eq!(
+                run_through_results_cache(&df, SQL).await,
+                (CacheStatus::CacheDisabled, 84),
+                "run {run}: a volatile function's results must not be served from the cache"
+            );
+        }
     }
 
     /// Execute a planned query expected to yield a single `Int64` value.

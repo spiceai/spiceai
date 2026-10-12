@@ -1212,6 +1212,7 @@ pub(crate) async fn initialize_cluster_scheduler_future(
         let self_ref = Arc::clone(rt);
         let cluster_state = rt.cluster_state();
         let heartbeats = rt.scheduler_heartbeats();
+        let scheduler_state = app.runtime.scheduler_state();
         let scheduler_registry_fut = self_for_task
             .start_runtime_task(
                 CLUSTER_SCHEDULER_REGISTRY,
@@ -1227,7 +1228,7 @@ pub(crate) async fn initialize_cluster_scheduler_future(
                     };
                     start_scheduler_registry(
                         self_ref,
-                        &config,
+                        scheduler_state.as_ref(),
                         registry_shutdown.clone(),
                         peers,
                         cluster_state,
@@ -2143,7 +2144,7 @@ async fn create_scheduler_server(
     // a fibonacci backoff and keep retrying until it loads (warning periodically)
     // rather than giving up — when a state location is configured we must honor it,
     // not silently degrade to in-memory.
-    let scheduler_cfg = {
+    let scheduler_state = {
         let mut backoff = util::fibonacci_backoff::FibonacciBackoffBuilder::new()
             .max_retries(None)
             .build();
@@ -2156,7 +2157,7 @@ async fn create_scheduler_server(
         tokio::pin!(shutdown);
         loop {
             if let Some(app) = rt.read_app().await {
-                break app.runtime.resolved_scheduler();
+                break app.runtime.scheduler_state();
             }
             if last_warn.elapsed() >= std::time::Duration::from_secs(30) {
                 tracing::warn!(
@@ -2180,39 +2181,31 @@ async fn create_scheduler_server(
             }
         }
     };
-    let job_state: Arc<dyn JobState> = if let Some(scheduler_cfg) = scheduler_cfg {
-        if let Some(state_location) = scheduler_cfg.state_location.as_deref() {
-            tracing::info!(
-                state_location = %state_location,
-                "Scheduler using shared object-store job state"
-            );
-            let (store, base_prefix) =
-                scheduler_registry::build_object_store(rt.as_ref(), state_location, &scheduler_cfg)
-                    .await
-                    .map_err(|e| crate::Error::FailedToStartClusterScheduler {
-                        source: Box::new(e),
-                    })?;
-            let codec: BallistaCodec<LogicalPlanNode, PhysicalPlanNode> = BallistaCodec::new(
-                SpiceLogicalCodec::new_codec(),
-                SpicePhysicalCodec::new(Arc::clone(rt))
-                    .boxed()
-                    .context(FailedToStartClusterSchedulerSnafu)?,
-            );
-            Arc::new(shared_job_state::SharedJobState::new(
-                metrics_node_id,
-                store,
-                base_prefix,
-                codec,
-                session_builder,
-                config_producer,
-            ))
-        } else {
-            Arc::new(InMemoryJobState::new(
-                metrics_node_id,
-                session_builder,
-                config_producer,
-            ))
-        }
+    let job_state: Arc<dyn JobState> = if let Some(scheduler_state) = scheduler_state {
+        tracing::info!(
+            state_location = %scheduler_state.location,
+            "Scheduler using shared object-store job state"
+        );
+        let (store, base_prefix) =
+            scheduler_registry::build_object_store(rt.as_ref(), &scheduler_state)
+                .await
+                .map_err(|e| crate::Error::FailedToStartClusterScheduler {
+                    source: Box::new(e),
+                })?;
+        let codec: BallistaCodec<LogicalPlanNode, PhysicalPlanNode> = BallistaCodec::new(
+            SpiceLogicalCodec::new_codec(),
+            SpicePhysicalCodec::new(Arc::clone(rt))
+                .boxed()
+                .context(FailedToStartClusterSchedulerSnafu)?,
+        );
+        Arc::new(shared_job_state::SharedJobState::new(
+            metrics_node_id,
+            store,
+            base_prefix,
+            codec,
+            session_builder,
+            config_producer,
+        ))
     } else {
         Arc::new(InMemoryJobState::new(
             metrics_node_id,
@@ -2356,22 +2349,21 @@ impl runtime_secrets::ClusterSecretExpander for ClusterSecretExpanderImpl {
         &self,
         executor_id: &str,
         key: &str,
-    ) -> Result<secrecy::SecretString, String> {
+    ) -> Result<Option<secrecy::SecretString>, String> {
         let request = runtime_proto::ExpandSecretRequest {
             executor_id: executor_id.to_string(),
             key: key.to_string(),
         };
 
-        let response = self
-            .client
-            .clone()
-            .expand_secret(request)
-            .await
-            .map_err(|status| format!("Failed to expand secret from scheduler: {status}"))?;
-
-        // Wrap at the earliest point we own the plaintext so downstream code
-        // cannot accidentally stash it in a non-zeroizing buffer.
-        Ok(secrecy::SecretString::from(response.into_inner().value))
+        match self.client.clone().expand_secret(request).await {
+            // Wrap at the earliest point we own the plaintext so downstream code
+            // cannot accidentally stash it in a non-zeroizing buffer.
+            Ok(response) => Ok(Some(secrecy::SecretString::from(
+                response.into_inner().value,
+            ))),
+            Err(status) if status.code() == tonic::Code::NotFound => Ok(None),
+            Err(status) => Err(format!("Failed to expand secret from scheduler: {status}")),
+        }
     }
 }
 

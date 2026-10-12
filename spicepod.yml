@@ -50,3 +50,22 @@ datasets:
     time_column: updated_at
     time_format: timestamp
     acceleration: *github_acceleration
+
+  # Reviews carry PullRequestReview.state, which can change after submit.
+  # on_registration: the history scan is slow and must not hold /v1/ready.
+  # Full refresh: append keeps a row whose submitted_at is already past the watermark.
+  - from: github:github.com/spiceai/spiceai/reviews
+    name: reviews
+    description: github.com/spiceai/spiceai pull request reviews
+    params: *github_params
+    ready_state: on_registration
+    time_column: submitted_at
+    time_format: timestamp
+    acceleration:
+      enabled: true
+      engine: cayenne
+      mode: file
+      refresh_mode: full
+      refresh_check_interval: 1h
+      refresh_jitter_enabled: true
+      refresh_jitter_max: 5m

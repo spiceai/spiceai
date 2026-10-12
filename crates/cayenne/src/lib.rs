@@ -102,6 +102,13 @@ pub mod lookup_index {
     pub use crate::provider::lookup_index::{LookupIndexCounters, LookupIndexVerification};
 }
 
+/// Per-file scan statistics accounting, so a check can prove concurrent cold
+/// scans shared their footer reads and metastore writes. Not a stable API.
+#[doc(hidden)]
+pub mod scan_file_statistics {
+    pub use crate::provider::ScanFileStatisticsCounters;
+}
+
 pub mod row_converter;
 pub(crate) mod schema;
 pub mod stats;
@@ -123,7 +130,7 @@ pub use metadata::{
 };
 pub use metastore::sqlite::{SqliteAutoVacuum, SqliteMetastoreConfig, set_sqlite_metastore_config};
 #[cfg(feature = "partition-table-provider")]
-pub use partition_creator::CayennePartitionCreator;
+pub use partition_creator::{CayennePartitionCreator, partition_column_labels};
 pub use provider::RebuildableWrite;
 pub use provider::constants::{
     LOOKUP_INDEX_DIR_NAME, STAGING_DIR_NAME, STAGING_WAL_FILENAME, STAGING_WAL_TMP_FILENAME,
@@ -131,19 +138,19 @@ pub use provider::constants::{
 pub use provider::{
     CayenneCdcWrite, CayenneContext, CayenneStagedAppend, CayenneStagedUpsert,
     CayenneTableProvider, CayenneTableProviderBuilder, CayenneTransaction, EncodeBudgetSnapshot,
-    FileDeletionHold, LastSmallFileCompactPath, PARTITIONED_WAL_DIR, PartitionedWal,
-    PartitionedWalEntry, PreparedOverwrite, PreparedStagedAppend, PreparedTxnCommit,
-    QueryObservations, ScanViewReuse, SlotAdvancer, TimeRetentionFilterBuilder, TransactionCommit,
-    TransactionWriteToken, TxnTable, begin_compaction_shutdown, cap_global_encode_concurrency,
-    clear_global_mem_tier_pool_account, compaction_budget, compaction_budget_permits,
-    deregister_query_observations, drain_compaction_tasks, encode_budget_snapshot,
-    global_mem_tier_pool_account_bytes, global_mem_tier_total, global_mem_tier_used,
-    global_pk_keyset_total, global_pk_keyset_used, global_qph, in_flight_compaction_tasks,
-    record_global_query, record_query_latency, register_query_observations,
-    release_global_mem_tier_bytes, reset_compaction_shutdown, set_compaction_runtime_env,
-    set_compaction_runtime_handle, set_cpu_burstable, set_global_encode_concurrency,
-    set_global_mem_tier_bytes, set_global_mem_tier_pool_account, set_global_memory_budget,
-    set_global_pk_keyset_bytes, set_query_admission_governor, try_reserve_global_mem_tier_bytes,
-    update_global_mem_tier_total,
+    FileDeletionHold, LastSmallFileCompactPath, LookupIndexSnapshotHold, PARTITIONED_WAL_DIR,
+    PartitionedWal, PartitionedWalEntry, PreparedOverwrite, PreparedStagedAppend,
+    PreparedTxnCommit, QueryObservations, ScanViewReuse, SlotAdvancer, TimeRetentionFilterBuilder,
+    TransactionCommit, TransactionWriteToken, TxnTable, begin_compaction_shutdown,
+    cap_global_encode_concurrency, clear_global_mem_tier_pool_account, compaction_budget,
+    compaction_budget_permits, deregister_query_observations, drain_compaction_tasks,
+    encode_budget_snapshot, global_mem_tier_pool_account_bytes, global_mem_tier_total,
+    global_mem_tier_used, global_pk_keyset_total, global_pk_keyset_used, global_qph,
+    in_flight_compaction_tasks, record_global_query, record_query_latency,
+    register_query_observations, release_global_mem_tier_bytes, reset_compaction_shutdown,
+    set_compaction_runtime_env, set_compaction_runtime_handle, set_cpu_burstable,
+    set_global_encode_concurrency, set_global_mem_tier_bytes, set_global_mem_tier_pool_account,
+    set_global_memory_budget, set_global_pk_keyset_bytes, set_query_admission_governor,
+    try_reserve_global_mem_tier_bytes, update_global_mem_tier_total,
 };
 pub use schema::{CAYENNE_TYPE_REWRITE_RULES, transform_schema_for_vortex};

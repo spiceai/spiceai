@@ -48,7 +48,9 @@ use runtime_acceleration::dataset_checkpoint::DatasetCheckpointer;
 use runtime_component::dataset::acceleration::{RefreshMode, RefreshOnStartup, ZeroResultsAction};
 use runtime_component::dataset::{ReadyState, TimeFormat};
 use runtime_datafusion::error::{SpiceExternalError, format_datafusion_error};
-use runtime_datafusion::execution_plan::fallback_on_zero_results::FallbackAsyncTableProvider;
+use runtime_datafusion::execution_plan::fallback_on_zero_results::{
+    FallbackAsyncTableProvider, FallbackKeepFilters,
+};
 use runtime_datafusion::execution_plan::{
     TableScanParams, fallback_on_zero_results::FallbackOnZeroResultsScanExec,
     schema_cast::SchemaCastScanExec, wrap_with_filter,
@@ -71,6 +73,8 @@ pub mod caching_eviction;
 #[cfg(test)]
 mod caching_scan_tests;
 pub mod checkpoint_primary_key;
+pub mod fallback_retention;
+pub use fallback_retention::{Error as FallbackRetentionKeepError, FallbackRetentionKeep};
 pub mod federation;
 pub mod refresh;
 pub mod refresh_completion;
@@ -270,6 +274,10 @@ pub enum AcceleratedTableBuilderError {
     #[snafu(transparent)]
     AcceleratedTableError { source: Error },
 
+    /// Raised after the builder started producers or accepted writes.
+    #[snafu(display("{source}"))]
+    FailedAfterStart { source: Error },
+
     #[snafu(display(
         "Failed to accelerate dataset {dataset_name}: durable write-back delivers each committed row to the source keyed on the primary key, and only a single-column key can be delivered on, but this dataset's accelerator resolved a {pk_columns}-column key. Declare a single-column 'acceleration.primary_key', or use a different 'acceleration.write_mode'. See: https://spiceai.org/docs/reference/spicepod/datasets#acceleration"
     ))]
@@ -289,6 +297,15 @@ pub enum AcceleratedTableBuilderError {
 }
 
 pub type AcceleratedTableBuilderResult<T> = std::result::Result<T, AcceleratedTableBuilderError>;
+
+impl AcceleratedTableBuilderError {
+    /// Whether [`Builder::build`] may have started producers or accepted writes
+    /// before failing. A rejected setting fails before anything starts.
+    #[must_use]
+    pub fn may_have_started_ingestion(&self) -> bool {
+        matches!(self, Self::FailedAfterStart { .. })
+    }
+}
 
 // An accelerated table consists of a federated table and a local accelerator.
 //
@@ -337,6 +354,9 @@ pub struct AcceleratedTable {
     /// mode, where the storage schema is augmented with a hidden
     /// [`caching::CACHE_NAMESPACE_COLUMN`] for per-principal isolation.
     user_facing_schema: Option<SchemaRef>,
+    /// Inverse of configured retention predicates, applied to
+    /// `on_zero_results: use_source` fallback scans.
+    fallback_retention_keep: Option<fallback_retention::FallbackRetentionKeep>,
 }
 
 impl std::fmt::Debug for AcceleratedTable {
@@ -482,6 +502,7 @@ pub struct Builder {
     /// Per-dataset `cdc_*` overrides drawn from `dataset.acceleration.params`.
     /// Layered over the process-global CDC config.
     cdc_param_overrides: Option<Arc<HashMap<String, String>>>,
+    fallback_retention_keep: Option<fallback_retention::FallbackRetentionKeep>,
 }
 
 impl Builder {
@@ -540,6 +561,7 @@ impl Builder {
             accelerator_write_mutex: Arc::new(Mutex::new(())), // can be overridden
             user_facing_schema: None,
             cdc_param_overrides: None,
+            fallback_retention_keep: None,
         }
     }
 
@@ -582,6 +604,14 @@ impl Builder {
 
     pub fn retention(&mut self, retention: Option<Retention>) -> &mut Self {
         self.retention = retention;
+        self
+    }
+
+    pub fn fallback_retention_keep(
+        &mut self,
+        keep: Option<fallback_retention::FallbackRetentionKeep>,
+    ) -> &mut Self {
+        self.fallback_retention_keep = keep;
         self
     }
 
@@ -1025,6 +1055,7 @@ impl Builder {
             WriteMode::WriteThrough
         };
         let refresh_mode = self.refresh.mode;
+        let write_retention_sql_delete_expr = self.refresh.write_retention_sql_delete_expr.clone();
         let change_sink = if matches!(
             refresh_mode,
             RefreshMode::Changes | RefreshMode::Append | RefreshMode::Caching
@@ -1197,7 +1228,9 @@ impl Builder {
                 synchronize_with
                     .prepare_cache_child(child)
                     .await
-                    .map_err(|source| Error::FailedToWriteData { source })?,
+                    .map_err(|source| AcceleratedTableBuilderError::FailedAfterStart {
+                        source: Error::FailedToWriteData { source },
+                    })?,
             )
         } else {
             None
@@ -1229,7 +1262,12 @@ impl Builder {
                 (None, None)
             } else {
                 (
-                    refresher.start(acceleration_refresh_mode).await?,
+                    refresher
+                        .start(acceleration_refresh_mode)
+                        .await
+                        .map_err(|source| AcceleratedTableBuilderError::FailedAfterStart {
+                            source,
+                        })?,
                     refresh_trigger,
                 )
             };
@@ -1275,6 +1313,23 @@ impl Builder {
         // swept by the same ticker, write lock and index-aware delete every
         // other dataset uses. Attached before the retention task is spawned
         // below.
+        let fallback_retention_keep =
+            if matches!(self.zero_results_action, ZeroResultsAction::UseSource)
+                && refresh_mode != RefreshMode::Caching
+            {
+                match self.fallback_retention_keep.clone() {
+                    Some(keep) => Some(keep),
+                    None => fallback_retention::FallbackRetentionKeep::from_configured(
+                        self.retention.as_ref(),
+                        write_retention_sql_delete_expr,
+                    )
+                    .ok()
+                    .flatten(),
+                }
+            } else {
+                None
+            };
+
         let retention = if refresh_mode == RefreshMode::Caching {
             Some(caching_eviction::retention(
                 caching_eviction::CacheLimits {
@@ -1411,11 +1466,14 @@ impl Builder {
             batch_write_tx,
             cluster_role: self.cluster_role,
             user_facing_schema: self.user_facing_schema,
+            fallback_retention_keep,
         };
         if let Some(prepared_child) = prepared_child {
-            let rows = prepared_child
-                .publish()
-                .map_err(|source| Error::FailedToWriteData { source })?;
+            let rows = prepared_child.publish().map_err(|source| {
+                AcceleratedTableBuilderError::FailedAfterStart {
+                    source: Error::FailedToWriteData { source },
+                }
+            })?;
             if let Some(synchronize_with) = &table.synchronized_with {
                 if rows > 0 {
                     tracing::info!(
@@ -1473,6 +1531,7 @@ impl AcceleratedTable {
                     .then(|| self.synchronized_with.clone())
                     .flatten();
                 let claims = Arc::clone(&self.in_flight_revalidations);
+                let accelerator = Arc::clone(&self.accelerator);
                 let (sender, receiver) = tokio::sync::watch::channel(None);
                 self.io_runtime.spawn(async move {
                     let mut producer_failure = None;
@@ -1506,6 +1565,12 @@ impl AcceleratedTable {
                         Some(publication) => publication.wait().await,
                         None => Ok(()),
                     };
+                    // The accelerator's own background maintenance — compaction,
+                    // sweeps, checkpoints — is not a change producer, so nothing
+                    // above stops it, and the generation that replaces this one
+                    // opens the same storage. Stop it once ingest has drained, so
+                    // the two instances never maintain one table at once (#11581).
+                    write::dual_write::quiesce_cayenne_maintenance(&accelerator).await;
                     // Initialization owns the registry write guard. The admission
                     // fence prevents a later initializer from attaching a child.
                     drop(children.write().await);
@@ -2118,11 +2183,25 @@ impl AcceleratedTable {
                         accelerator_limit,
                     )
                     .await?;
+                // Schema only, and only invoked if the accelerator stream is
+                // empty. Planning here would coerce/simplify the keep predicate
+                // on every scan, including hits. Awaiting `table_provider()`
+                // would also block those hits on a deferred source.
+                let federated_schema = self.federated.schema();
+                let keep_spec = self.fallback_retention_keep.clone();
+                let fallback_keep_filters: FallbackKeepFilters =
+                    Arc::new(move || match &keep_spec {
+                        Some(keep) => keep
+                            .keep_filters(&federated_schema)
+                            .map_err(|e| DataFusionError::Plan(e.to_string())),
+                        None => Ok(Vec::new()),
+                    });
                 Arc::new(FallbackOnZeroResultsScanExec::new(
                     self.dataset_name.clone(),
                     input,
                     fallback_fn,
                     TableScanParams::new(state, projection, filters, limit),
+                    fallback_keep_filters,
                 ))
             }
         };
@@ -2685,7 +2764,7 @@ pub trait RetentionPredicate: Send + Sync + std::fmt::Debug {
     ) -> datafusion::error::Result<Option<Expr>>;
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum DataRetentionFilter {
     Time {
         period: Duration,

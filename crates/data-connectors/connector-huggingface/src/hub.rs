@@ -434,8 +434,8 @@ impl Hub {
         url.query_pairs_mut()
             .append_pair("expand[]", "sha")
             .append_pair("expand[]", "lastModified");
-        let body = self
-            .request_bytes(repo, Some(revision), Method::GET, url, None)
+        let (_, body) = self
+            .request_body(repo, Some(revision), Method::GET, url, None)
             .await?;
         let info: RevisionInfo =
             serde_json::from_slice(&body).map_err(|e| Error::UnexpectedResponse {
@@ -498,14 +498,10 @@ impl Hub {
         while let Some(page_url) = next.take() {
             let first_page = entries.is_empty();
             let (headers, body) = match self
-                .request(repo, Some(commit), Method::GET, page_url, None)
+                .request_body(repo, Some(commit), Method::GET, page_url, None)
                 .await
             {
-                Ok(response) => {
-                    let headers = response.headers().clone();
-                    let body = read_body(repo, &self.config.endpoint, response).await?;
-                    (headers, body)
-                }
+                Ok(page) => page,
                 // The tree of a path that does not exist (or names a file) is empty. A later
                 // page that is missing is an error: ending the listing there would drop files.
                 Err(error) if first_page && error.is_entry_not_found() => break,
@@ -561,8 +557,8 @@ impl Hub {
             .append_pair("paths", path)
             .append_pair("expand", "false")
             .finish();
-        let body = self
-            .request_bytes(repo, Some(commit), Method::POST, url, Some(form))
+        let (_, body) = self
+            .request_body(repo, Some(commit), Method::POST, url, Some(form))
             .await?;
         let entries: Vec<TreeEntry> =
             serde_json::from_slice(&body).map_err(|e| Error::UnexpectedResponse {
@@ -752,18 +748,51 @@ impl Hub {
         url.origin() == self.config.endpoint.origin()
     }
 
-    async fn request_bytes(
+    /// Sends an API request and reads its whole body, returning the body and the response
+    /// headers.
+    ///
+    /// A body that breaks off part way, by a reset connection or a read timeout, is requested
+    /// again like a request that failed to connect, from the same budget of attempts: an API
+    /// response is small, and reading it again is safe. Decompression is off, so reading a
+    /// body fails only when the connection does.
+    async fn request_body(
         &self,
         repo: &RepoId,
         revision: Option<&str>,
         method: Method,
         url: Url,
         form: Option<String>,
-    ) -> Result<Bytes> {
-        let response = self
-            .send_with_retry(repo, revision, method, url, None, form)
-            .await?;
-        read_body(repo, &self.config.endpoint, response).await
+    ) -> Result<(HeaderMap, Bytes)> {
+        let request = HubRequest {
+            repo,
+            revision,
+            method,
+            url,
+            range: None,
+            form,
+        };
+        let mut attempts = Attempts::new();
+        loop {
+            let mut response = self.send_with_retry(&request, &mut attempts).await?;
+            let headers = std::mem::take(response.headers_mut());
+            let source = match response.bytes().await {
+                Ok(body) => return Ok((headers, body)),
+                Err(source) => source.without_url(),
+            };
+            if !attempts.can_retry() {
+                return Err(Error::Request {
+                    repo: repo.clone(),
+                    endpoint: self.config.endpoint.to_string(),
+                    attempts: attempts.made,
+                    source,
+                });
+            }
+            tracing::debug!(
+                "Retrying a request for Hugging Face dataset '{repo}' after its response broke off: {source} (attempt {} of {MAX_ATTEMPTS})",
+                attempts.made
+            );
+            attempts.wait(None).await;
+        }
     }
 
     async fn request(
@@ -774,30 +803,42 @@ impl Hub {
         url: Url,
         range: Option<String>,
     ) -> Result<reqwest::Response> {
-        self.send_with_retry(repo, revision, method, url, range, None)
-            .await
+        let request = HubRequest {
+            repo,
+            revision,
+            method,
+            url,
+            range,
+            form: None,
+        };
+        self.send_with_retry(&request, &mut Attempts::new()).await
     }
 
     /// Sends a request, retrying connection failures, server errors and rate limiting with
     /// backoff, and maps a final error status to an [`Error`]. A redirect is returned as is.
+    ///
+    /// Each send counts against `attempts`, which the caller keeps when it goes on to read the
+    /// body and sends the request again if that body breaks off.
     async fn send_with_retry(
         &self,
-        repo: &RepoId,
-        revision: Option<&str>,
-        method: Method,
-        url: Url,
-        range: Option<String>,
-        form: Option<String>,
+        request: &HubRequest<'_>,
+        attempts: &mut Attempts,
     ) -> Result<reqwest::Response> {
-        let mut backoff = INITIAL_BACKOFF;
-        let mut attempt = 0;
+        let HubRequest {
+            repo,
+            revision,
+            method,
+            url,
+            range,
+            form,
+        } = request;
         loop {
-            attempt += 1;
+            let attempt = attempts.start();
             let mut request = self.http.request(method.clone(), url.clone());
-            if let Some(range) = &range {
+            if let Some(range) = range {
                 request = request.header(RANGE, range);
             }
-            if let Some(form) = &form {
+            if let Some(form) = form {
                 request = request
                     .header(
                         reqwest::header::CONTENT_TYPE,
@@ -807,12 +848,12 @@ impl Hub {
             }
             // The token goes only to the Hub's own origin, never to a CDN.
             if let Some(authorization) = &self.authorization
-                && self.is_endpoint_origin(&url)
+                && self.is_endpoint_origin(url)
             {
                 request = request.header(AUTHORIZATION, authorization.clone());
             }
             let request = request.build().map_err(|source| Error::Request {
-                repo: repo.clone(),
+                repo: (*repo).clone(),
                 endpoint: self.config.endpoint.to_string(),
                 attempts: attempt,
                 source: source.without_url(),
@@ -823,21 +864,22 @@ impl Hub {
                 .io_runtime
                 .spawn(async move { client.execute(request).await })
                 .await
-                .context(TaskStoppedSnafu { repo: repo.clone() })?;
+                .context(TaskStoppedSnafu {
+                    repo: (*repo).clone(),
+                })?;
 
             let response = match outcome {
                 Ok(response) => response,
                 Err(source) => {
-                    if attempt < MAX_ATTEMPTS && is_transient(&source) {
+                    if attempts.can_retry() && is_transient(&source) {
                         tracing::debug!(
                             "Retrying a request for Hugging Face dataset '{repo}' after {source} (attempt {attempt} of {MAX_ATTEMPTS})"
                         );
-                        tokio::time::sleep(backoff).await;
-                        backoff = (backoff * 2).min(MAX_BACKOFF);
+                        attempts.wait(None).await;
                         continue;
                     }
                     return Err(Error::Request {
-                        repo: repo.clone(),
+                        repo: (*repo).clone(),
                         endpoint: self.config.endpoint.to_string(),
                         attempts: attempt,
                         source: source.without_url(),
@@ -850,33 +892,31 @@ impl Hub {
                 return Ok(response);
             }
             if status == StatusCode::TOO_MANY_REQUESTS {
-                let wait = rate_limit_reset(response.headers());
-                if attempt < MAX_ATTEMPTS && wait.is_none_or(|wait| wait <= MAX_RATE_LIMIT_WAIT) {
-                    let wait = wait.unwrap_or(backoff).max(backoff);
+                let reset = rate_limit_reset(response.headers());
+                if attempts.can_retry() && reset.is_none_or(|reset| reset <= MAX_RATE_LIMIT_WAIT) {
                     tracing::debug!(
-                        "The Hugging Face Hub rate-limited a request for dataset '{repo}'; retrying in {wait:?} (attempt {attempt} of {MAX_ATTEMPTS})"
+                        "The Hugging Face Hub rate-limited a request for dataset '{repo}'; retrying in {:?} (attempt {attempt} of {MAX_ATTEMPTS})",
+                        attempts.next_wait(reset)
                     );
-                    tokio::time::sleep(wait).await;
-                    backoff = (backoff * 2).min(MAX_BACKOFF);
+                    attempts.wait(reset).await;
                     continue;
                 }
                 return RateLimitedSnafu {
-                    repo: repo.clone(),
-                    reset_hint: wait.map_or_else(String::new, |wait| {
-                        format!(" (the limit resets in {}s)", wait.as_secs())
+                    repo: (*repo).clone(),
+                    reset_hint: reset.map_or_else(String::new, |reset| {
+                        format!(" (the limit resets in {}s)", reset.as_secs())
                     }),
                 }
                 .fail();
             }
-            if attempt < MAX_ATTEMPTS && is_transient_status(status) {
+            if attempts.can_retry() && is_transient_status(status) {
                 tracing::debug!(
                     "Retrying a request for Hugging Face dataset '{repo}' after HTTP {status} (attempt {attempt} of {MAX_ATTEMPTS})"
                 );
-                tokio::time::sleep(backoff).await;
-                backoff = (backoff * 2).min(MAX_BACKOFF);
+                attempts.wait(None).await;
                 continue;
             }
-            return Err(self.status_error(repo, revision, &url, &response, attempt));
+            return Err(self.status_error(repo, *revision, url, &response, attempt));
         }
     }
 
@@ -1092,6 +1132,58 @@ fn checked_range(
     Ok((returned, size))
 }
 
+/// What every attempt of one request sends.
+struct HubRequest<'a> {
+    repo: &'a RepoId,
+    /// The revision the request reads, named by the error when it does not exist.
+    revision: Option<&'a str>,
+    method: Method,
+    url: Url,
+    /// The `Range` header of a file read.
+    range: Option<String>,
+    /// The form body of a `paths-info` lookup.
+    form: Option<String>,
+}
+
+/// The attempts one request has made, and the backoff before its next.
+///
+/// A connection failure, a retriable status and a body that breaks off all count against the
+/// same [`MAX_ATTEMPTS`].
+struct Attempts {
+    made: u32,
+    backoff: Duration,
+}
+
+impl Attempts {
+    fn new() -> Self {
+        Self {
+            made: 0,
+            backoff: INITIAL_BACKOFF,
+        }
+    }
+
+    /// Counts a new attempt, returning its number from 1.
+    fn start(&mut self) -> u32 {
+        self.made += 1;
+        self.made
+    }
+
+    fn can_retry(&self) -> bool {
+        self.made < MAX_ATTEMPTS
+    }
+
+    /// The wait before the next attempt: the backoff, or `at_least` when that is longer.
+    fn next_wait(&self, at_least: Option<Duration>) -> Duration {
+        at_least.map_or(self.backoff, |wait| wait.max(self.backoff))
+    }
+
+    /// Waits before the next attempt, and doubles the backoff for the one after.
+    async fn wait(&mut self, at_least: Option<Duration>) {
+        tokio::time::sleep(self.next_wait(at_least)).await;
+        self.backoff = (self.backoff * 2).min(MAX_BACKOFF);
+    }
+}
+
 /// A download of `next..end` of a file that resumes after a failed connection.
 struct Download {
     hub: Arc<Hub>,
@@ -1156,15 +1248,6 @@ impl Download {
         })
         .boxed()
     }
-}
-
-async fn read_body(repo: &RepoId, endpoint: &Url, response: reqwest::Response) -> Result<Bytes> {
-    response.bytes().await.map_err(|source| Error::Request {
-        repo: repo.clone(),
-        endpoint: endpoint.to_string(),
-        attempts: 1,
-        source: source.without_url(),
-    })
 }
 
 /// The `rel="next"` page of a paginated listing, `None` on the last page.

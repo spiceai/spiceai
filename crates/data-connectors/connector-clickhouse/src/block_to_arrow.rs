@@ -14,35 +14,41 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-use std::{str::FromStr, sync::Arc};
+use std::{
+    net::{Ipv4Addr, Ipv6Addr},
+    str::FromStr,
+    sync::Arc,
+};
 
 use arrow::{
     array::{
-        ArrayBuilder, ArrayRef, BooleanBuilder, Date32Builder, Decimal128Builder, Float32Builder,
-        Float64Builder, Int8Builder, Int16Builder, Int32Builder, Int64Builder, RecordBatch,
-        RecordBatchOptions, StringBuilder, TimestampSecondBuilder, UInt8Builder, UInt16Builder,
-        UInt32Builder, UInt64Builder,
+        ArrayBuilder, ArrayRef, BooleanBuilder, Date32Builder, Decimal128Builder,
+        Decimal256Builder, Float32Builder, Float64Builder, Int8Builder, Int16Builder, Int32Builder,
+        Int64Builder, ListBuilder, MapBuilder, PrimitiveBuilder, RecordBatch, RecordBatchOptions,
+        StringBuilder, StructBuilder, TimestampSecondBuilder, UInt8Builder, UInt16Builder,
+        UInt32Builder, UInt64Builder, make_builder,
     },
-    datatypes::{DataType, Date32Type, Field, Schema, TimeUnit},
+    datatypes::{
+        ArrowTimestampType, DataType, Date32Type, Field, Fields, Schema, TimeUnit,
+        TimestampMicrosecondType, TimestampMillisecondType, TimestampNanosecondType,
+        TimestampSecondType, i256,
+    },
 };
 use bigdecimal::{BigDecimal, ToPrimitive};
 use chrono::NaiveDate;
 use chrono_tz::Tz;
 use clickhouse_rs::{
     Block,
-    types::{ColumnType, Decimal, SqlType},
+    types::{
+        ColumnType, DateTimeType, Decimal, Enum8, Enum16, FromSql, FromSqlResult, SqlType, ValueRef,
+    },
 };
 use snafu::{ResultExt, Snafu};
-
-use datafusion_table_providers::sql::arrow_sql_gen::arrow::map_data_type_to_array_builder;
 
 #[derive(Debug, Snafu)]
 pub(crate) enum Error {
     #[snafu(display("Failed to process ClickHouse query result: {source}"))]
     FailedToBuildRecordBatch { source: arrow::error::ArrowError },
-
-    #[snafu(display("Failed to process ClickHouse query result: no column at index {index}"))]
-    NoBuilderForIndex { index: usize },
 
     #[snafu(display(
         "Failed to process ClickHouse query result: unsupported type '{clickhouse_type}'"
@@ -55,11 +61,19 @@ pub(crate) enum Error {
         source: clickhouse_rs::errors::Error,
     },
 
-    #[snafu(display("No column definition found at index {index} in the ClickHouse result"))]
-    NoArrowFieldForIndex { index: usize },
+    #[snafu(display("A {clickhouse_type} column returned a value of another type: {value}"))]
+    UnexpectedValue {
+        clickhouse_type: SqlType,
+        value: String,
+    },
 
-    #[snafu(display("No column name found at index {index} in the ClickHouse result"))]
-    NoColumnNameForIndex { index: usize },
+    #[snafu(display(
+        "The {clickhouse_type} value {value} is outside the range an Arrow timestamp of its precision can hold (nanosecond timestamps end at 2262-04-11)"
+    ))]
+    TimestampOutOfRange {
+        clickhouse_type: SqlType,
+        value: String,
+    },
 
     #[snafu(display("Cannot represent BigDecimal as i128: {big_decimal}"))]
     FailedToConvertBigDecimalToI128 { big_decimal: BigDecimal },
@@ -76,49 +90,13 @@ pub(crate) enum Error {
 
 pub(crate) type Result<T, E = Error> = std::result::Result<T, E>;
 
-macro_rules! handle_primitive_type {
-    ($builder:expr, $type:expr, $builder_ty:ty, $value_ty:ty, $row:expr, $index:expr) => {{
-        let Some(builder) = $builder else {
-            return NoBuilderForIndexSnafu { index: $index }.fail();
-        };
-        let Some(builder) = builder.as_any_mut().downcast_mut::<$builder_ty>() else {
-            return FailedToDowncastBuilderSnafu {
-                clickhouse_type: $type,
-            }
-            .fail();
-        };
-        let v = $row
-            .get::<$value_ty, usize>($index)
-            .context(FailedToGetRowValueSnafu {
-                clickhouse_type: $type,
-            })?;
+/// A cell as the driver decoded it, before it is converted to an Arrow value.
+struct Cell<'a>(ValueRef<'a>);
 
-        builder.append_value(v)
-    }};
-}
-
-macro_rules! handle_primitive_nullable_type {
-    ($builder:expr, $type:expr, $builder_ty:ty, $value_ty:ty, $row:expr, $index:expr) => {{
-        let Some(builder) = $builder else {
-            return NoBuilderForIndexSnafu { index: $index }.fail();
-        };
-        let Some(builder) = builder.as_any_mut().downcast_mut::<$builder_ty>() else {
-            return FailedToDowncastBuilderSnafu {
-                clickhouse_type: $type,
-            }
-            .fail();
-        };
-        let v = $row
-            .get::<Option<$value_ty>, usize>($index)
-            .context(FailedToGetRowValueSnafu {
-                clickhouse_type: $type,
-            })?;
-
-        match v {
-            Some(v) => builder.append_value(v),
-            None => builder.append_null(),
-        }
-    }};
+impl<'a> FromSql<'a> for Cell<'a> {
+    fn from_sql(value: ValueRef<'a>) -> FromSqlResult<Self> {
+        Ok(Cell(value))
+    }
 }
 
 /// Converts `Clickhouse` `Block` to an Arrow `RecordBatch`. Assumes that all rows have the same schema and
@@ -128,382 +106,46 @@ macro_rules! handle_primitive_nullable_type {
 ///
 /// Returns an error if there is a failure in converting the rows to a `RecordBatch`.
 pub(crate) fn block_to_arrow<T: ColumnType>(block: &Block<T>) -> Result<RecordBatch> {
-    let mut arrow_fields: Vec<Option<Field>> = Vec::new();
-    let mut arrow_columns_builders: Vec<Option<Box<dyn ArrayBuilder>>> = Vec::new();
-    let mut clickhouse_types: Vec<SqlType> = Vec::new();
-    let mut column_names: Vec<String> = Vec::new();
+    let mut arrow_fields = Vec::new();
+    let mut builders = Vec::new();
+    let mut clickhouse_types = Vec::new();
 
     if !block.is_empty() {
-        let columns = block.columns();
-        for column in columns {
-            let column_name = column.name();
+        for column in block.columns() {
             let column_type = column.sql_type();
-            let data_type = map_column_to_data_type(&column_type);
-            arrow_fields.push(Some(Field::new(column_name, data_type.clone(), true)));
-            arrow_columns_builders.push(Some(map_data_type_to_array_builder(&data_type)));
+            let data_type = map_column_to_data_type(&column_type)?;
+            builders.push(make_builder(&data_type, block.row_count()));
+            arrow_fields.push(Field::new(column.name(), data_type, true));
             clickhouse_types.push(column_type);
-            column_names.push(column_name.to_string());
         }
     }
 
     for row in block.rows() {
-        for (i, clickhouse_type) in clickhouse_types.iter().enumerate() {
-            let Some(builder) = arrow_columns_builders.get_mut(i) else {
-                return NoBuilderForIndexSnafu { index: i }.fail();
-            };
-
-            let Some(arrow_field) = arrow_fields.get_mut(i) else {
-                return NoArrowFieldForIndexSnafu { index: i }.fail();
-            };
-
-            match clickhouse_type {
-                SqlType::Uuid | SqlType::Nullable(SqlType::Uuid) => {
-                    let Some(builder) = builder else {
-                        return NoBuilderForIndexSnafu { index: i }.fail();
-                    };
-                    let Some(builder) = builder.as_any_mut().downcast_mut::<StringBuilder>() else {
-                        return FailedToDowncastBuilderSnafu {
-                            clickhouse_type: SqlType::Uuid,
-                        }
-                        .fail();
-                    };
-                    let v = match *clickhouse_type {
-                        SqlType::Uuid => Some(row.get::<uuid::Uuid, usize>(i).context(
-                            FailedToGetRowValueSnafu {
-                                clickhouse_type: SqlType::Uuid,
-                            },
-                        )?),
-                        SqlType::Nullable(SqlType::Uuid) => row
-                            .get::<Option<uuid::Uuid>, usize>(i)
-                            .context(FailedToGetRowValueSnafu {
-                                clickhouse_type: SqlType::Uuid,
-                            })?,
-                        _ => unreachable!(),
-                    };
-
-                    match v {
-                        Some(v) => builder.append_value(v.to_string()),
-                        None => builder.append_null(),
-                    }
-                }
-                SqlType::Bool => {
-                    handle_primitive_type!(builder, SqlType::Bool, BooleanBuilder, bool, row, i);
-                }
-                SqlType::Nullable(SqlType::Bool) => {
-                    handle_primitive_nullable_type!(
-                        builder,
-                        SqlType::Bool,
-                        BooleanBuilder,
-                        bool,
-                        row,
-                        i
-                    );
-                }
-                SqlType::Int8 => {
-                    handle_primitive_type!(builder, SqlType::Int8, Int8Builder, i8, row, i);
-                }
-                SqlType::Nullable(SqlType::Int8) => {
-                    handle_primitive_nullable_type!(
-                        builder,
-                        SqlType::Int8,
-                        Int8Builder,
-                        i8,
-                        row,
-                        i
-                    );
-                }
-                SqlType::Int16 => {
-                    handle_primitive_type!(builder, SqlType::Int16, Int16Builder, i16, row, i);
-                }
-                SqlType::Nullable(SqlType::Int16) => {
-                    handle_primitive_nullable_type!(
-                        builder,
-                        SqlType::Int16,
-                        Int16Builder,
-                        i16,
-                        row,
-                        i
-                    );
-                }
-                SqlType::Int32 => {
-                    handle_primitive_type!(builder, SqlType::Int32, Int32Builder, i32, row, i);
-                }
-                SqlType::Nullable(SqlType::Int32) => {
-                    handle_primitive_nullable_type!(
-                        builder,
-                        SqlType::Int32,
-                        Int32Builder,
-                        i32,
-                        row,
-                        i
-                    );
-                }
-                SqlType::Int64 => {
-                    handle_primitive_type!(builder, SqlType::Int64, Int64Builder, i64, row, i);
-                }
-                SqlType::Nullable(SqlType::Int64) => {
-                    handle_primitive_nullable_type!(
-                        builder,
-                        SqlType::Int64,
-                        Int64Builder,
-                        i64,
-                        row,
-                        i
-                    );
-                }
-                SqlType::UInt8 => {
-                    handle_primitive_type!(builder, SqlType::UInt8, UInt8Builder, u8, row, i);
-                }
-                SqlType::Nullable(SqlType::UInt8) => {
-                    handle_primitive_nullable_type!(
-                        builder,
-                        SqlType::UInt8,
-                        UInt8Builder,
-                        u8,
-                        row,
-                        i
-                    );
-                }
-                SqlType::UInt16 => {
-                    handle_primitive_type!(builder, SqlType::UInt16, UInt16Builder, u16, row, i);
-                }
-                SqlType::Nullable(SqlType::UInt16) => {
-                    handle_primitive_nullable_type!(
-                        builder,
-                        SqlType::UInt16,
-                        UInt16Builder,
-                        u16,
-                        row,
-                        i
-                    );
-                }
-                SqlType::UInt32 => {
-                    handle_primitive_type!(builder, SqlType::UInt32, UInt32Builder, u32, row, i);
-                }
-                SqlType::Nullable(SqlType::UInt32) => {
-                    handle_primitive_nullable_type!(
-                        builder,
-                        SqlType::UInt32,
-                        UInt32Builder,
-                        u32,
-                        row,
-                        i
-                    );
-                }
-                SqlType::UInt64 => {
-                    handle_primitive_type!(builder, SqlType::UInt64, UInt64Builder, u64, row, i);
-                }
-                SqlType::Nullable(SqlType::UInt64) => {
-                    handle_primitive_nullable_type!(
-                        builder,
-                        SqlType::UInt64,
-                        UInt64Builder,
-                        u64,
-                        row,
-                        i
-                    );
-                }
-                SqlType::Float32 => {
-                    handle_primitive_type!(builder, SqlType::Float32, Float32Builder, f32, row, i);
-                }
-                SqlType::Nullable(SqlType::Float32) => {
-                    handle_primitive_nullable_type!(
-                        builder,
-                        SqlType::Float32,
-                        Float32Builder,
-                        f32,
-                        row,
-                        i
-                    );
-                }
-                SqlType::Float64 => {
-                    handle_primitive_type!(builder, SqlType::Float64, Float64Builder, f64, row, i);
-                }
-                SqlType::Nullable(SqlType::Float64) => {
-                    handle_primitive_nullable_type!(
-                        builder,
-                        SqlType::Float64,
-                        Float64Builder,
-                        f64,
-                        row,
-                        i
-                    );
-                }
-                SqlType::String => {
-                    handle_primitive_type!(builder, SqlType::String, StringBuilder, String, row, i);
-                }
-                SqlType::Nullable(SqlType::String) => {
-                    handle_primitive_nullable_type!(
-                        builder,
-                        SqlType::String,
-                        StringBuilder,
-                        String,
-                        row,
-                        i
-                    );
-                }
-                SqlType::FixedString(size) => {
-                    handle_primitive_type!(
-                        builder,
-                        SqlType::FixedString(*size),
-                        StringBuilder,
-                        String,
-                        row,
-                        i
-                    );
-                }
-                SqlType::Nullable(SqlType::FixedString(size)) => {
-                    handle_primitive_nullable_type!(
-                        builder,
-                        SqlType::FixedString(*size),
-                        StringBuilder,
-                        String,
-                        row,
-                        i
-                    );
-                }
-                SqlType::Date | SqlType::Nullable(SqlType::Date) => {
-                    let Some(builder) = builder else {
-                        return NoBuilderForIndexSnafu { index: i }.fail();
-                    };
-                    let Some(builder) = builder.as_any_mut().downcast_mut::<Date32Builder>() else {
-                        return FailedToDowncastBuilderSnafu {
-                            clickhouse_type: SqlType::Date,
-                        }
-                        .fail();
-                    };
-                    let v = match *clickhouse_type {
-                        SqlType::Date => Some(row.get::<NaiveDate, usize>(i).context(
-                            FailedToGetRowValueSnafu {
-                                clickhouse_type: SqlType::Date,
-                            },
-                        )?),
-                        SqlType::Nullable(SqlType::Date) => row
-                            .get::<Option<NaiveDate>, usize>(i)
-                            .context(FailedToGetRowValueSnafu {
-                                clickhouse_type: SqlType::Date,
-                            })?,
-                        _ => unreachable!(),
-                    };
-                    match v {
-                        Some(v) => builder.append_value(Date32Type::from_naive_date(v)),
-                        None => builder.append_null(),
-                    }
-                }
-                SqlType::DateTime(date_type) | SqlType::Nullable(SqlType::DateTime(date_type)) => {
-                    let Some(builder) = builder else {
-                        return NoBuilderForIndexSnafu { index: i }.fail();
-                    };
-                    let Some(builder) = builder
-                        .as_any_mut()
-                        .downcast_mut::<TimestampSecondBuilder>()
-                    else {
-                        return FailedToDowncastBuilderSnafu {
-                            clickhouse_type: SqlType::DateTime(*date_type),
-                        }
-                        .fail();
-                    };
-                    let v = match *clickhouse_type {
-                        SqlType::DateTime(_) => {
-                            Some(row.get::<chrono::DateTime<Tz>, usize>(i).context(
-                                FailedToGetRowValueSnafu {
-                                    clickhouse_type: SqlType::DateTime(*date_type),
-                                },
-                            )?)
-                        }
-                        SqlType::Nullable(SqlType::DateTime(_)) => row
-                            .get::<Option<chrono::DateTime<Tz>>, usize>(i)
-                            .context(FailedToGetRowValueSnafu {
-                                clickhouse_type: SqlType::DateTime(*date_type),
-                            })?,
-                        _ => unreachable!(),
-                    };
-                    match v {
-                        Some(v) => builder.append_value(v.timestamp()),
-                        None => builder.append_null(),
-                    }
-                }
-
-                SqlType::Decimal(size, align)
-                | SqlType::Nullable(SqlType::Decimal(size, align)) => {
-                    let size = *size;
-                    let align = *align;
-                    let scale = align.try_into().unwrap_or_default();
-                    let dec_builder = builder.get_or_insert_with(|| {
-                        Box::new(
-                            Decimal128Builder::new()
-                                .with_precision_and_scale(size, scale)
-                                .unwrap_or_default(),
-                        )
-                    });
-                    let Some(dec_builder) =
-                        dec_builder.as_any_mut().downcast_mut::<Decimal128Builder>()
-                    else {
-                        return FailedToDowncastBuilderSnafu {
-                            clickhouse_type: SqlType::Decimal(size, align),
-                        }
-                        .fail();
-                    };
-
-                    if arrow_field.is_none() {
-                        let Some(field_name) = column_names.get(i) else {
-                            return NoColumnNameForIndexSnafu { index: i }.fail();
-                        };
-                        let new_arrow_field =
-                            Field::new(field_name, DataType::Decimal128(size, scale), true);
-
-                        *arrow_field = Some(new_arrow_field);
-                    }
-
-                    let v = match *clickhouse_type {
-                        SqlType::Decimal(_, _) => Some(row.get::<Decimal, usize>(i).context(
-                            FailedToGetRowValueSnafu {
-                                clickhouse_type: SqlType::Decimal(size, align),
-                            },
-                        )?),
-                        SqlType::Nullable(SqlType::Decimal(_, _)) => row
-                            .get::<Option<Decimal>, usize>(i)
-                            .context(FailedToGetRowValueSnafu {
-                                clickhouse_type: SqlType::Decimal(size, align),
-                            })?,
-                        _ => unreachable!(),
-                    };
-                    match v {
-                        Some(v) => {
-                            let v = BigDecimal::from_str(v.to_string().as_str()).context(
-                                FailedToParseBigDecimalFromClickhouseSnafu {
-                                    value: v.to_string(),
-                                },
-                            )?;
-                            let Some(v) = to_decimal_128(&v, scale) else {
-                                return FailedToConvertBigDecimalToI128Snafu { big_decimal: v }
-                                    .fail();
-                            };
-                            dec_builder.append_value(v);
-                        }
-                        None => dec_builder.append_null(),
-                    }
-                }
-                _ => UnsupportedColumnTypeSnafu {
-                    column_type: clickhouse_type.clone(),
-                }
-                .fail()?,
-            }
+        for (i, (clickhouse_type, builder)) in
+            clickhouse_types.iter().zip(builders.iter_mut()).enumerate()
+        {
+            let cell = row
+                .get::<Cell, usize>(i)
+                .context(FailedToGetRowValueSnafu {
+                    clickhouse_type: clickhouse_type.clone(),
+                })?;
+            append_value(builder.as_mut(), clickhouse_type, Some(cell.0))?;
         }
     }
 
-    let columns = arrow_columns_builders
-        .into_iter()
-        .filter_map(|builder| builder.map(|mut b| b.finish()))
+    let columns = builders
+        .iter_mut()
+        .map(ArrayBuilder::finish)
         .collect::<Vec<ArrayRef>>();
-    let arrow_fields = arrow_fields.into_iter().flatten().collect::<Vec<Field>>();
     let options = &RecordBatchOptions::new().with_row_count(Some(block.row_count()));
     RecordBatch::try_new_with_options(Arc::new(Schema::new(arrow_fields)), columns, options)
-        .map_err(|err| Error::FailedToBuildRecordBatch { source: err })
+        .context(FailedToBuildRecordBatchSnafu)
 }
 
-fn map_column_to_data_type(column_type: &SqlType) -> DataType {
-    match column_type {
+/// The Arrow type a `ClickHouse` column is read as. `conn::map_clickhouse_type_to_arrow`
+/// maps the same types from their names and must agree with this.
+fn map_column_to_data_type(column_type: &SqlType) -> Result<DataType> {
+    Ok(match column_type {
         SqlType::Bool => DataType::Boolean,
         SqlType::Int8 => DataType::Int8,
         SqlType::Int16 => DataType::Int16,
@@ -513,17 +155,339 @@ fn map_column_to_data_type(column_type: &SqlType) -> DataType {
         SqlType::UInt16 => DataType::UInt16,
         SqlType::UInt32 => DataType::UInt32,
         SqlType::UInt64 => DataType::UInt64,
+        SqlType::Int128 | SqlType::UInt128 => INT128_DATA_TYPE,
         SqlType::Float32 => DataType::Float32,
         SqlType::Float64 => DataType::Float64,
-        SqlType::String | SqlType::FixedString(_) | SqlType::Uuid => DataType::Utf8,
+        SqlType::String
+        | SqlType::FixedString(_)
+        | SqlType::Uuid
+        | SqlType::Ipv4
+        | SqlType::Ipv6
+        | SqlType::Enum8(_)
+        | SqlType::Enum16(_) => DataType::Utf8,
         SqlType::Date => DataType::Date32,
+        SqlType::DateTime(DateTimeType::DateTime64(precision, _)) => {
+            DataType::Timestamp(datetime64_unit(*precision), None)
+        }
         SqlType::DateTime(_) => DataType::Timestamp(TimeUnit::Second, None),
         SqlType::Decimal(size, align) => {
             DataType::Decimal128(*size, (*align).try_into().unwrap_or_default())
         }
-        SqlType::Nullable(inner) => map_column_to_data_type(inner),
-        _ => unimplemented!("Unsupported column type {:?}", column_type),
+        SqlType::Nullable(inner) | SqlType::LowCardinality(inner) => {
+            map_column_to_data_type(inner)?
+        }
+        SqlType::Array(inner) => list_data_type(map_column_to_data_type(inner)?),
+        SqlType::Map(key, value) => map_data_type(
+            map_column_to_data_type(key)?,
+            map_column_to_data_type(value)?,
+        ),
+        SqlType::Tuple(elements) => DataType::Struct(
+            elements
+                .iter()
+                .enumerate()
+                .map(|(index, (name, element))| {
+                    Ok(tuple_field(
+                        index,
+                        name.as_deref(),
+                        map_column_to_data_type(element)?,
+                    ))
+                })
+                .collect::<Result<Fields>>()?,
+        ),
+        SqlType::SimpleAggregateFunction(..) => {
+            return UnsupportedColumnTypeSnafu {
+                column_type: column_type.clone(),
+            }
+            .fail();
+        }
+    })
+}
+
+/// `Int128` and `UInt128` both need 39 decimal digits.
+pub(crate) const INT128_DATA_TYPE: DataType = DataType::Decimal256(39, 0);
+
+/// The coarsest Arrow unit that holds a `DateTime64(precision)` value exactly.
+pub(crate) fn datetime64_unit(precision: u32) -> TimeUnit {
+    match precision {
+        0 => TimeUnit::Second,
+        1..=3 => TimeUnit::Millisecond,
+        4..=6 => TimeUnit::Microsecond,
+        _ => TimeUnit::Nanosecond,
     }
+}
+
+pub(crate) fn list_data_type(item: DataType) -> DataType {
+    DataType::List(Arc::new(Field::new_list_field(item, true)))
+}
+
+/// The field names are the ones [`MapBuilder`] writes.
+pub(crate) fn map_data_type(key: DataType, value: DataType) -> DataType {
+    let entries = Fields::from(vec![
+        Field::new("keys", key, false),
+        Field::new("values", value, true),
+    ]);
+    DataType::Map(
+        Arc::new(Field::new("entries", DataType::Struct(entries), false)),
+        false,
+    )
+}
+
+/// An unnamed tuple element is named by its 1-based position, as `ClickHouse` addresses it.
+pub(crate) fn tuple_field(index: usize, name: Option<&str>, data_type: DataType) -> Field {
+    let name = name.map_or_else(|| (index + 1).to_string(), str::to_string);
+    Field::new(name, data_type, true)
+}
+
+fn downcast<'b, B: ArrayBuilder>(
+    builder: &'b mut dyn ArrayBuilder,
+    clickhouse_type: &SqlType,
+) -> Result<&'b mut B> {
+    builder
+        .as_any_mut()
+        .downcast_mut::<B>()
+        .ok_or_else(|| Error::FailedToDowncastBuilder {
+            clickhouse_type: clickhouse_type.clone(),
+        })
+}
+
+fn from_sql<'a, V: FromSql<'a>>(value: ValueRef<'a>, clickhouse_type: &SqlType) -> Result<V> {
+    V::from_sql(value).context(FailedToGetRowValueSnafu {
+        clickhouse_type: clickhouse_type.clone(),
+    })
+}
+
+fn unexpected_value<V>(value: &ValueRef<'_>, clickhouse_type: &SqlType) -> Result<V> {
+    UnexpectedValueSnafu {
+        clickhouse_type: clickhouse_type.clone(),
+        value: value.to_string(),
+    }
+    .fail()
+}
+
+/// Appends `value`, or a null when it is `None`, to a builder of type `$builder_ty`.
+macro_rules! append {
+    ($builder:expr, $builder_ty:ty, $clickhouse_type:expr, $value:expr, |$v:ident| $convert:expr) => {{
+        let builder = downcast::<$builder_ty>($builder, $clickhouse_type)?;
+        match $value {
+            Some($v) => builder.append_value($convert),
+            None => builder.append_null(),
+        }
+    }};
+}
+
+fn append_value(
+    builder: &mut dyn ArrayBuilder,
+    clickhouse_type: &SqlType,
+    value: Option<ValueRef<'_>>,
+) -> Result<()> {
+    let t = clickhouse_type;
+    match t {
+        SqlType::Nullable(inner) => {
+            let value = match value {
+                Some(value) => from_sql::<Option<Cell>>(value, t)?.map(|cell| cell.0),
+                None => None,
+            };
+            return append_value(builder, inner, value);
+        }
+        // The driver resolves a `LowCardinality` cell to its dictionary value.
+        SqlType::LowCardinality(inner) => return append_value(builder, inner, value),
+        SqlType::Bool => append!(builder, BooleanBuilder, t, value, |v| from_sql(v, t)?),
+        SqlType::Int8 => append!(builder, Int8Builder, t, value, |v| from_sql(v, t)?),
+        SqlType::Int16 => append!(builder, Int16Builder, t, value, |v| from_sql(v, t)?),
+        SqlType::Int32 => append!(builder, Int32Builder, t, value, |v| from_sql(v, t)?),
+        SqlType::Int64 => append!(builder, Int64Builder, t, value, |v| from_sql(v, t)?),
+        SqlType::UInt8 => append!(builder, UInt8Builder, t, value, |v| from_sql(v, t)?),
+        SqlType::UInt16 => append!(builder, UInt16Builder, t, value, |v| from_sql(v, t)?),
+        SqlType::UInt32 => append!(builder, UInt32Builder, t, value, |v| from_sql(v, t)?),
+        SqlType::UInt64 => append!(builder, UInt64Builder, t, value, |v| from_sql(v, t)?),
+        SqlType::Int128 => append!(builder, Decimal256Builder, t, value, |v| {
+            i256::from_i128(from_sql(v, t)?)
+        }),
+        SqlType::UInt128 => append!(builder, Decimal256Builder, t, value, |v| {
+            i256::from_parts(from_sql(v, t)?, 0)
+        }),
+        SqlType::Float32 => append!(builder, Float32Builder, t, value, |v| from_sql(v, t)?),
+        SqlType::Float64 => append!(builder, Float64Builder, t, value, |v| from_sql(v, t)?),
+        SqlType::String | SqlType::FixedString(_) => {
+            append!(builder, StringBuilder, t, value, |v| from_sql::<&str>(
+                v, t
+            )?);
+        }
+        SqlType::Uuid => append!(builder, StringBuilder, t, value, |v| {
+            from_sql::<uuid::Uuid>(v, t)?.to_string()
+        }),
+        SqlType::Ipv4 => append!(builder, StringBuilder, t, value, |v| {
+            from_sql::<Ipv4Addr>(v, t)?.to_string()
+        }),
+        SqlType::Ipv6 => append!(builder, StringBuilder, t, value, |v| {
+            from_sql::<Ipv6Addr>(v, t)?.to_string()
+        }),
+        SqlType::Enum8(names) => append!(builder, StringBuilder, t, value, |v| {
+            enum_name(names, from_sql::<Enum8>(v, t)?.internal(), t)?
+        }),
+        SqlType::Enum16(names) => append!(builder, StringBuilder, t, value, |v| {
+            enum_name(names, from_sql::<Enum16>(v, t)?.internal(), t)?
+        }),
+        SqlType::Date => append!(builder, Date32Builder, t, value, |v| {
+            Date32Type::from_naive_date(from_sql::<NaiveDate>(v, t)?)
+        }),
+        SqlType::DateTime(DateTimeType::DateTime64(precision, _)) => {
+            let ticks = value.map(|v| match v {
+                ValueRef::DateTime64(ticks, _) => Ok(ticks),
+                other => unexpected_value(&other, t),
+            });
+            let ticks = ticks.transpose()?;
+            match datetime64_unit(*precision) {
+                TimeUnit::Second => {
+                    append_timestamp::<TimestampSecondType>(builder, t, *precision, ticks)?;
+                }
+                TimeUnit::Millisecond => {
+                    append_timestamp::<TimestampMillisecondType>(builder, t, *precision, ticks)?;
+                }
+                TimeUnit::Microsecond => {
+                    append_timestamp::<TimestampMicrosecondType>(builder, t, *precision, ticks)?;
+                }
+                TimeUnit::Nanosecond => {
+                    append_timestamp::<TimestampNanosecondType>(builder, t, *precision, ticks)?;
+                }
+            }
+        }
+        SqlType::DateTime(_) => append!(builder, TimestampSecondBuilder, t, value, |v| {
+            from_sql::<chrono::DateTime<Tz>>(v, t)?.timestamp()
+        }),
+        SqlType::Decimal(_, align) => {
+            let scale = (*align).try_into().unwrap_or_default();
+            append!(builder, Decimal128Builder, t, value, |v| {
+                let v = from_sql::<Decimal>(v, t)?;
+                let v = BigDecimal::from_str(v.to_string().as_str()).context(
+                    FailedToParseBigDecimalFromClickhouseSnafu {
+                        value: v.to_string(),
+                    },
+                )?;
+                let Some(v) = to_decimal_128(&v, scale) else {
+                    return FailedToConvertBigDecimalToI128Snafu { big_decimal: v }.fail();
+                };
+                v
+            });
+        }
+        SqlType::Array(inner) => {
+            let builder = downcast::<ListBuilder<Box<dyn ArrayBuilder>>>(builder, t)?;
+            match value {
+                Some(ValueRef::Array(_, items)) => {
+                    for item in items.iter() {
+                        append_value(builder.values().as_mut(), inner, Some(item.clone()))?;
+                    }
+                    builder.append(true);
+                }
+                Some(other) => return unexpected_value(&other, t),
+                None => builder.append(false),
+            }
+        }
+        SqlType::Map(key_type, value_type) => {
+            let builder =
+                downcast::<MapBuilder<Box<dyn ArrayBuilder>, Box<dyn ArrayBuilder>>>(builder, t)?;
+            let is_valid = match value {
+                Some(ValueRef::Map(_, _, entries)) => {
+                    for (key, entry_value) in entries.iter() {
+                        append_value(builder.keys().as_mut(), key_type, Some(key.clone()))?;
+                        append_value(
+                            builder.values().as_mut(),
+                            value_type,
+                            Some(entry_value.clone()),
+                        )?;
+                    }
+                    true
+                }
+                Some(other) => return unexpected_value(&other, t),
+                None => false,
+            };
+            builder
+                .append(is_valid)
+                .context(FailedToBuildRecordBatchSnafu)?;
+        }
+        SqlType::Tuple(elements) => {
+            let builder = downcast::<StructBuilder>(builder, t)?;
+            let items = match value {
+                Some(ValueRef::Tuple(items)) if items.len() == elements.len() => {
+                    Some(items.iter().cloned().map(Some).collect::<Vec<_>>())
+                }
+                Some(other) => return unexpected_value(&other, t),
+                None => None,
+            };
+            let is_valid = items.is_some();
+            let items = items.unwrap_or_else(|| vec![None; elements.len()]);
+            for ((field_builder, (_, element_type)), item) in builder
+                .field_builders_mut()
+                .iter_mut()
+                .zip(elements)
+                .zip(items)
+            {
+                append_value(field_builder.as_mut(), element_type, item)?;
+            }
+            builder.append(is_valid);
+        }
+        SqlType::SimpleAggregateFunction(..) => {
+            return UnsupportedColumnTypeSnafu {
+                column_type: t.clone(),
+            }
+            .fail();
+        }
+    }
+    Ok(())
+}
+
+/// Appends a `DateTime64(precision)` value, counted in `10^-precision` seconds, in the unit of `T`.
+fn append_timestamp<T: ArrowTimestampType>(
+    builder: &mut dyn ArrayBuilder,
+    clickhouse_type: &SqlType,
+    precision: u32,
+    ticks: Option<i64>,
+) -> Result<()> {
+    let builder = downcast::<PrimitiveBuilder<T>>(builder, clickhouse_type)?;
+    let Some(ticks) = ticks else {
+        builder.append_null();
+        return Ok(());
+    };
+    let unit_digits: u32 = match T::UNIT {
+        TimeUnit::Second => 0,
+        TimeUnit::Millisecond => 3,
+        TimeUnit::Microsecond => 6,
+        TimeUnit::Nanosecond => 9,
+    };
+    let scaled = unit_digits
+        .checked_sub(precision)
+        .and_then(|digits| 10_i64.checked_pow(digits))
+        .and_then(|factor| ticks.checked_mul(factor))
+        .ok_or_else(|| Error::TimestampOutOfRange {
+            clickhouse_type: clickhouse_type.clone(),
+            value: datetime64_text(ticks, precision),
+        })?;
+    builder.append_value(scaled);
+    Ok(())
+}
+
+/// A `DateTime64(precision)` value as UTC date and time text, for error messages.
+fn datetime64_text(ticks: i64, precision: u32) -> String {
+    let parts = 10_i64.checked_pow(precision).and_then(|scale| {
+        let nanos = ticks.rem_euclid(scale) * 10_i64.checked_pow(9_u32.checked_sub(precision)?)?;
+        chrono::DateTime::from_timestamp(ticks.div_euclid(scale), u32::try_from(nanos).ok()?)
+    });
+    parts.map_or_else(|| ticks.to_string(), |time| time.naive_utc().to_string())
+}
+
+fn enum_name<V: Copy + PartialEq + std::fmt::Display>(
+    names: &[(String, V)],
+    value: V,
+    clickhouse_type: &SqlType,
+) -> Result<String> {
+    names
+        .iter()
+        .find(|(_, code)| *code == value)
+        .map(|(name, _)| name.clone())
+        .ok_or_else(|| Error::UnexpectedValue {
+            clickhouse_type: clickhouse_type.clone(),
+            value: value.to_string(),
+        })
 }
 
 fn to_decimal_128(decimal: &BigDecimal, scale: i8) -> Option<i128> {
@@ -677,5 +641,174 @@ mod tests {
                 "Data type mismatch"
             );
         }
+    }
+
+    fn converted(block: &clickhouse_rs::Block) -> String {
+        let rec = super::block_to_arrow(block).expect("the block converts to Arrow");
+        arrow::util::pretty::pretty_format_batches(&[rec])
+            .expect("the batch formats")
+            .to_string()
+    }
+
+    #[test]
+    fn scalar_types_convert_to_their_arrow_values() {
+        use std::net::{Ipv4Addr, Ipv6Addr};
+
+        let block = clickhouse_rs::Block::new()
+            .add_column("ipv4", vec![Ipv4Addr::LOCALHOST, Ipv4Addr::BROADCAST])
+            .add_column(
+                "nullable_ipv4",
+                vec![None, Some(Ipv4Addr::new(192, 168, 1, 20))],
+            )
+            .add_column(
+                "ipv6",
+                vec![
+                    "2001:db8::1".parse::<Ipv6Addr>().expect("valid IPv6"),
+                    Ipv4Addr::new(1, 2, 3, 4).to_ipv6_mapped(),
+                ],
+            )
+            .add_column("uint128", vec![0_u128, u128::MAX])
+            .add_column("int128", vec![i128::MIN, -1_i128]);
+
+        let rec = super::block_to_arrow(&block).expect("the block converts to Arrow");
+        assert_eq!(
+            rec.schema().field(3).data_type(),
+            &arrow::datatypes::DataType::Decimal256(39, 0)
+        );
+        insta::assert_snapshot!("scalar_types", converted(&block));
+    }
+
+    #[test]
+    fn an_enum_converts_to_its_names() {
+        use clickhouse_rs::{row, types::Enum8, types::Value};
+
+        let names = vec![("a".to_string(), 1_i8), ("b".to_string(), 2_i8)];
+        let mut block = clickhouse_rs::Block::new();
+        for code in [1, 2, 1] {
+            block
+                .push(row! { e: Value::Enum8(names.clone(), Enum8::of(code)) })
+                .expect("the row matches the block");
+        }
+
+        insta::assert_snapshot!("enum_names", converted(&block));
+    }
+
+    #[test]
+    fn a_datetime64_converts_in_the_unit_its_precision_needs() {
+        use arrow::datatypes::{DataType, TimeUnit};
+        use chrono_tz::Tz;
+        use clickhouse_rs::{row, types::Value};
+
+        let mut block = clickhouse_rs::Block::new();
+        // Ticks of 10^-precision seconds since the epoch.
+        for (millis, micros, nanos) in [
+            (1_713_962_096_789_i64, 1_713_962_096_789_012_i64, 1_i64),
+            (
+                4_102_444_800_001,
+                4_102_444_800_000_001,
+                4_102_444_800_000_000_001,
+            ),
+        ] {
+            block
+                .push(row! {
+                    ms: Value::DateTime64(millis, (3, Tz::UTC)),
+                    us: Value::DateTime64(micros, (6, Tz::UTC)),
+                    ns: Value::DateTime64(nanos, (9, Tz::UTC)),
+                    s: Value::DateTime64(millis / 1000, (0, Tz::UTC)),
+                })
+                .expect("the row matches the block");
+        }
+
+        let rec = super::block_to_arrow(&block).expect("the block converts to Arrow");
+        let units: Vec<_> = rec
+            .schema()
+            .fields()
+            .iter()
+            .map(|field| field.data_type().clone())
+            .collect();
+        assert_eq!(
+            units,
+            [
+                TimeUnit::Millisecond,
+                TimeUnit::Microsecond,
+                TimeUnit::Nanosecond,
+                TimeUnit::Second
+            ]
+            .map(|unit| DataType::Timestamp(unit, None))
+        );
+        insta::assert_snapshot!("datetime64_units", converted(&block));
+    }
+
+    /// `DateTime64(7)` and `DateTime64(8)` reach 2299, past the last nanosecond an `i64`
+    /// holds, and no coarser unit keeps their digits: such a value is an error, never a
+    /// truncated or wrapped timestamp.
+    #[test]
+    fn a_datetime64_past_the_nanosecond_range_is_an_error() {
+        use arrow::array::TimestampNanosecondBuilder;
+        use arrow::datatypes::TimestampNanosecondType;
+        use chrono_tz::Tz;
+        use clickhouse_rs::types::{DateTimeType, SqlType};
+
+        let clickhouse_type = SqlType::DateTime(DateTimeType::DateTime64(8, Tz::UTC));
+        let mut builder = TimestampNanosecondBuilder::new();
+        // 10^-8 s ticks: `i64::MAX / 10` is 2262-04-11 23:47:16.854775800, the last value that fits.
+        let last = i64::MAX / 10;
+        super::append_timestamp::<TimestampNanosecondType>(
+            &mut builder,
+            &clickhouse_type,
+            8,
+            Some(last),
+        )
+        .expect("the last representable DateTime64(8) value converts");
+
+        for (ticks, text) in [
+            (last + 1, "2262-04-11 23:47:16.854775810"),
+            // The latest value a ClickHouse DateTime64(8) holds.
+            (1_041_379_199_999_999_999, "2299-12-31 23:59:59.999999990"),
+        ] {
+            let error = super::append_timestamp::<TimestampNanosecondType>(
+                &mut builder,
+                &clickhouse_type,
+                8,
+                Some(ticks),
+            )
+            .expect_err("a value past 2262-04-11 has no nanosecond timestamp");
+            assert_eq!(
+                error.to_string(),
+                format!(
+                    "The DateTime64(8, 'UTC') value {text} is outside the range an Arrow timestamp of its precision can hold (nanosecond timestamps end at 2262-04-11)"
+                )
+            );
+        }
+
+        let timestamps = builder.finish();
+        assert_eq!(timestamps.len(), 1, "only the value that fits was appended");
+        assert_eq!(timestamps.value(0), last * 10);
+    }
+
+    #[test]
+    fn arrays_maps_and_tuples_convert_to_nested_arrow_values() {
+        use std::{collections::HashMap, sync::Arc};
+
+        use clickhouse_rs::{row, types::Value};
+
+        let mut block = clickhouse_rs::Block::new();
+        for (items, key, tuple) in [
+            (vec![1_i32, 2, 3], "a", (1_i32, "one")),
+            (vec![], "k", (-2, "")),
+        ] {
+            block
+                .push(row! {
+                    array: Value::from(items),
+                    map: Value::from(HashMap::from([(key.to_string(), 7_i32)])),
+                    tuple: Value::Tuple(Arc::new(vec![
+                        Value::Int32(tuple.0),
+                        Value::from(tuple.1),
+                    ])),
+                })
+                .expect("the row matches the block");
+        }
+
+        insta::assert_snapshot!("nested_values", converted(&block));
     }
 }

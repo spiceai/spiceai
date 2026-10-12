@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -33,6 +33,7 @@ pub mod pg_catalog;
 pub mod query_cancel_registry;
 pub mod refresh_scan;
 pub mod refresh_sql;
+pub mod retention_keep;
 pub mod retention_sql;
 pub mod schema_provider;
 pub mod session_config;

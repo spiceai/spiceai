@@ -49,7 +49,7 @@ limitations under the License.
 #![allow(clippy::expect_used)]
 #![allow(clippy::clone_on_ref_ptr)]
 
-mod common;
+use crate::common;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -135,7 +135,7 @@ impl Rng {
 enum Mode {
     /// Explicit `deletion_mode: key` — the deletion index is authoritative.
     Key,
-    /// Default (`auto` resolves to position even for PK tables).
+    /// Explicit `deletion_mode: position` (merge-on-read position deletes).
     Position,
 }
 
@@ -254,7 +254,10 @@ fn config(
             deletion_mode: DeletionMode::Key,
             ..base
         },
-        Mode::Position => base,
+        Mode::Position => VortexConfig {
+            deletion_mode: DeletionMode::Position,
+            ..base
+        },
     }
 }
 

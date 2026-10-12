@@ -1411,22 +1411,21 @@ impl RefreshTask {
             return Ok(update);
         };
         let accelerator_schema = self.accelerator.schema();
+        let dedup = refresh.versions_by_time.unwrap_or_default();
         // A synchronized child writes the same rows but cannot read their versions, so
         // a dataset with one resolves them here, before the rows reach either table.
-        let dedup = refresh.versions_by_time.unwrap_or_default();
         // The accelerator orders a key's copies by version only against the copies one
-        // write holds: a write that replaces the table, or an append it loads into an
-        // empty table (which it confirms itself, refusing the append otherwise). An
-        // append with no high-water mark reads the whole source, so into an empty
+        // write holds: a write that replaces the table, or an append it takes as a first
+        // load into an empty table. Only the accelerator can say whether it would take
+        // one, and it confirms that again as it writes, refusing the append otherwise.
+        // An append with no high-water mark reads the whole source, so into an empty
         // acceleration it is such a load.
         if dedup.versions_resolved_after_write
             && window_start.is_none()
             && self.sink.read().await.synchronized_tables().is_empty()
             && match update.update_type {
                 UpdateType::Overwrite => true,
-                UpdateType::Append => {
-                    dedup.appends_resolved_after_write && self.acceleration_is_empty().await?
-                }
+                UpdateType::Append => self.accelerator_takes_versioned_append().await,
                 UpdateType::Changes => false,
             }
         {
@@ -1441,6 +1440,11 @@ impl RefreshTask {
                 refresh.time_format,
             )
             .map_err(|e| not_applied(&e))?;
+            tracing::debug!(
+                "Refreshing {} {}: the accelerator keeps each key's newest version as it writes the rows",
+                self.component_type(),
+                self.dataset_name
+            );
             return Ok(update.with_row_versions(Some(row_versions)));
         }
         let mut selector = latest_by_time::LatestByTime::try_new(
@@ -1513,29 +1517,18 @@ impl RefreshTask {
         Ok(latest_by_time::select_latest(selector, update))
     }
 
-    /// Whether the acceleration holds no rows, read rather than inferred from a missing
-    /// high-water mark, which rows with a NULL time would also give.
-    async fn acceleration_is_empty(&self) -> Result<bool, RetryError<super::Error>> {
-        let federated_provider = self.federated.table_provider().await;
-        let ctx = Self::create_refresh_df_context(
-            federated_provider,
-            &self.dataset_name,
-            &self.accelerator,
-            self.disable_federation,
-            self.io_runtime.clone(),
-        )
-        .await;
-        let rows = accelerator_df(&Arc::clone(&self.accelerator), &ctx)
-            .and_then(|df| df.limit(0, Some(1)))
-            .map_err(find_datafusion_root)
-            .context(super::UnableToScanTableProviderSnafu)
-            .map_err(RetryError::permanent)?
-            .count()
-            .await
-            .map_err(find_datafusion_root)
-            .context(super::UnableToScanTableProviderSnafu)
-            .map_err(RetryError::permanent)?;
-        Ok(rows == 0)
+    /// Whether the accelerator would take an append that carries row versions now,
+    /// asked of the Cayenne table itself, whose write path is the only judge
+    /// (`CayenneTableProvider::takes_versioned_append`). It reads emptiness from
+    /// storage rather than a missing high-water mark, which rows with a NULL time
+    /// would also give.
+    async fn accelerator_takes_versioned_append(&self) -> bool {
+        match super::write::dual_write::extract_cayenne_write_target(&self.accelerator) {
+            Some(super::write::CayenneWriteTarget::Staged(cayenne)) => {
+                cayenne.takes_versioned_append().await
+            }
+            Some(super::write::CayenneWriteTarget::Partitioned(_)) | None => false,
+        }
     }
 
     async fn refresh_stale_cached_rows(

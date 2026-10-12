@@ -25,6 +25,7 @@ use runtime_parameters::{ParameterSpec, Parameters};
 use runtime_secrets::{Secrets, get_params_with_secrets};
 use secrecy::ExposeSecret;
 use snafu::prelude::*;
+use spicepod::component::runtime::{StateLocation, StateSource};
 use spicepod::param::Params;
 use tokio::runtime::Handle;
 use tokio::sync::RwLock;
@@ -126,17 +127,58 @@ pub(crate) enum Error {
 
 pub(crate) type Result<T, E = Error> = std::result::Result<T, E>;
 
+/// A runtime feature that keeps shared state in a state location.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StateFeature {
+    Scheduler,
+    RateControl,
+    ResultsCacheWarmup,
+}
+
+impl StateFeature {
+    /// The folder the feature writes under in a `runtime.state` location.
+    fn folder(self) -> &'static str {
+        match self {
+            Self::Scheduler => "cluster",
+            Self::RateControl => "rate-control",
+            Self::ResultsCacheWarmup => "results-cache",
+        }
+    }
+
+    fn usage(self) -> &'static str {
+        match self {
+            Self::Scheduler => "scheduler state",
+            Self::RateControl => "rate-control state",
+            Self::ResultsCacheWarmup => "SQL results cache warmup state",
+        }
+    }
+}
+
+/// Builds the object store for `feature` at `state` and returns it with the
+/// key prefix the feature writes under.
+///
+/// A `runtime.state` location puts each feature in its own folder below the
+/// location's path. A feature's own location setting puts the feature at the
+/// location root; for `abfs://` and `abfss://` that root is the container root,
+/// whatever path the URL has.
 pub(crate) async fn build_object_store(
     secrets: Arc<RwLock<Secrets>>,
     io_runtime: Handle,
-    state_location: &str,
-    params: Option<&Params>,
-    usage: &'static str,
+    state: &StateLocation,
+    feature: StateFeature,
 ) -> Result<(Arc<dyn ObjectStore>, String)> {
+    let usage = feature.usage();
+    let state_location = state.location.as_str();
+    let params = state.params.as_ref();
     let url = Url::parse(state_location).context(InvalidStateLocationSnafu {
         usage,
         location: state_location,
     })?;
+    let feature_prefix = |location_prefix: &str| match state.source {
+        StateSource::RuntimeState if location_prefix.is_empty() => feature.folder().to_string(),
+        StateSource::RuntimeState => format!("{location_prefix}/{}", feature.folder()),
+        StateSource::FeatureSetting => location_prefix.to_string(),
+    };
 
     if url.scheme() == "file" {
         let local_path = url
@@ -164,13 +206,15 @@ pub(crate) async fn build_object_store(
             })?,
         );
 
-        return Ok((store, String::new()));
+        return Ok((store, feature_prefix("")));
     }
 
-    let base_prefix = if matches!(url.scheme(), "abfs" | "abfss") {
+    let base_prefix = if matches!(url.scheme(), "abfs" | "abfss")
+        && state.source == StateSource::FeatureSetting
+    {
         String::new()
     } else {
-        url.path().trim_matches('/').to_string()
+        feature_prefix(url.path().trim_matches('/'))
     };
 
     let store: Arc<dyn ObjectStore> = if url.scheme() == "s3" {
@@ -317,13 +361,128 @@ mod tests {
             &self,
             executor_id: &str,
             key: &str,
-        ) -> std::result::Result<SecretString, String> {
-            Ok(SecretString::from(format!("{executor_id}:{key}")))
+        ) -> std::result::Result<Option<SecretString>, String> {
+            Ok(Some(SecretString::from(format!("{executor_id}:{key}"))))
         }
     }
 
     fn secrets() -> Arc<RwLock<Secrets>> {
         Arc::new(RwLock::new(Secrets::new()))
+    }
+
+    fn feature_setting(location: &str, params: Option<&Params>) -> StateLocation {
+        StateLocation {
+            location: location.to_string(),
+            params: params.cloned(),
+            source: StateSource::FeatureSetting,
+        }
+    }
+
+    fn runtime_state(location: &str, params: &[(&str, &str)]) -> StateLocation {
+        StateLocation {
+            location: location.to_string(),
+            params: Some(Params::from_string_map(
+                params
+                    .iter()
+                    .map(|(key, value)| ((*key).to_string(), (*value).to_string()))
+                    .collect(),
+            )),
+            source: StateSource::RuntimeState,
+        }
+    }
+
+    /// A `runtime.state` `file://` location gives each feature its own folder.
+    #[tokio::test]
+    async fn runtime_state_file_location_writes_each_feature_to_its_folder() {
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let state_location = format!("file://{}", temp_dir.path().display());
+
+        for (feature, folder) in [
+            (StateFeature::Scheduler, "cluster"),
+            (StateFeature::RateControl, "rate-control"),
+            (StateFeature::ResultsCacheWarmup, "results-cache"),
+        ] {
+            let (store, prefix) = build_object_store(
+                secrets(),
+                Handle::current(),
+                &runtime_state(&state_location, &[]),
+                feature,
+            )
+            .await
+            .expect("file state store should build");
+            let writer: ObjectState<TestState> =
+                ObjectState::new(store).with_prefix(format!("{prefix}/"));
+            writer
+                .insert("origin", &TestState { value: 1 })
+                .await
+                .expect("write state");
+
+            let written = temp_dir.path().join(folder).join("origin.json");
+            assert!(
+                written.is_file(),
+                "{feature:?} must write {}",
+                written.display()
+            );
+        }
+        let mut root: Vec<_> = std::fs::read_dir(temp_dir.path())
+            .expect("list state root")
+            .map(|entry| entry.expect("state root entry").file_name())
+            .filter(|name| name != ".spice-object-store-occ.lock")
+            .collect();
+        root.sort();
+        assert_eq!(root, ["cluster", "rate-control", "results-cache"]);
+    }
+
+    const S3_KEY_PARAMS: &[(&str, &str)] = &[
+        ("s3_endpoint", "http://localhost:9000"),
+        ("s3_key", "AKID"),
+        ("s3_secret", "SECRET"),
+        ("s3_region", "us-east-1"),
+    ];
+
+    /// A `runtime.state` location keeps its URL path, for `abfs://` and
+    /// `abfss://` too, and adds the feature's folder below it.
+    #[tokio::test]
+    async fn runtime_state_location_prefix_is_path_and_feature_folder() {
+        for (state, feature, expected_prefix) in [
+            (
+                runtime_state("s3://bucket/spice/", S3_KEY_PARAMS),
+                StateFeature::Scheduler,
+                "spice/cluster",
+            ),
+            (
+                runtime_state("s3://bucket", S3_KEY_PARAMS),
+                StateFeature::RateControl,
+                "rate-control",
+            ),
+            (
+                runtime_state("abfs://container/spice/state/", &[("use_emulator", "true")]),
+                StateFeature::ResultsCacheWarmup,
+                "spice/state/results-cache",
+            ),
+            (
+                runtime_state(
+                    "abfss://container@account.dfs.core.windows.net/spice/",
+                    &[("account", "account"), ("access_key", "ZHVtbXlrZXk=")],
+                ),
+                StateFeature::Scheduler,
+                "spice/cluster",
+            ),
+            (
+                runtime_state("gs://bucket/spice/", &[("gcs_skip_signature", "true")]),
+                StateFeature::RateControl,
+                "spice/rate-control",
+            ),
+        ] {
+            let (_, prefix) = build_object_store(secrets(), Handle::current(), &state, feature)
+                .await
+                .expect("runtime.state store should build");
+            assert_eq!(
+                prefix, expected_prefix,
+                "{} for {feature:?}",
+                state.location
+            );
+        }
     }
 
     #[tokio::test]
@@ -335,9 +494,8 @@ mod tests {
         let (store, prefix) = build_object_store(
             secrets(),
             Handle::current(),
-            &state_location,
-            None,
-            "test state",
+            &feature_setting(&state_location, None),
+            StateFeature::RateControl,
         )
         .await
         .expect("file state store should build");
@@ -395,9 +553,8 @@ mod tests {
         let (_, prefix) = build_object_store(
             secrets(),
             Handle::current(),
-            &state_location,
-            None,
-            "test state",
+            &feature_setting(&state_location, None),
+            StateFeature::RateControl,
         )
         .await
         .expect("file state store should build");
@@ -411,9 +568,8 @@ mod tests {
         let err = build_object_store(
             secrets(),
             Handle::current(),
-            "not a url",
-            None,
-            "test state",
+            &feature_setting("not a url", None),
+            StateFeature::RateControl,
         )
         .await
         .expect_err("invalid URL should fail");
@@ -500,9 +656,8 @@ mod tests {
         let result = build_object_store(
             secrets(),
             Handle::current(),
-            "s3://spice-state/runtime/rate-control/",
-            Some(&params),
-            "test state",
+            &feature_setting("s3://spice-state/runtime/rate-control/", Some(&params)),
+            StateFeature::RateControl,
         )
         .await;
 
@@ -520,9 +675,8 @@ mod tests {
         let result = build_object_store(
             secrets(),
             Handle::current(),
-            "abfs://testcontainer/runtime/rate-control/",
-            Some(&params),
-            "test state",
+            &feature_setting("abfs://testcontainer/runtime/rate-control/", Some(&params)),
+            StateFeature::RateControl,
         )
         .await;
 
@@ -543,9 +697,8 @@ mod tests {
         let (store, prefix) = build_object_store(
             secrets(),
             Handle::current(),
-            "gs://state-bucket/runtime/rate-control/",
-            Some(&params),
-            "test state",
+            &feature_setting("gs://state-bucket/runtime/rate-control/", Some(&params)),
+            StateFeature::RateControl,
         )
         .await
         .expect("gcs state store should build");
@@ -560,18 +713,20 @@ mod tests {
         let invalid = build_object_store(
             secrets(),
             Handle::current(),
-            "gs://state-bucket/",
-            Some(&Params::from_string_map(HashMap::from([(
-                "gcs_skip_signature".to_string(),
-                "not-a-bool".to_string(),
-            )]))),
-            "test state",
+            &feature_setting(
+                "gs://state-bucket/",
+                Some(&Params::from_string_map(HashMap::from([(
+                    "gcs_skip_signature".to_string(),
+                    "not-a-bool".to_string(),
+                )]))),
+            ),
+            StateFeature::RateControl,
         )
         .await
         .expect_err("an invalid GCS parameter is reported, not ignored");
         assert_eq!(
             invalid.to_string(),
-            "Failed to validate GCS parameters for test state: Invalid configuration for test state. 'gcs_skip_signature' parameter must be one of: true, false. Found not-a-bool."
+            "Failed to validate GCS parameters for rate-control state: Invalid configuration for rate-control state. 'gcs_skip_signature' parameter must be one of: true, false. Found not-a-bool."
         );
     }
 
@@ -591,15 +746,14 @@ mod tests {
         let err = build_object_store(
             secrets(),
             Handle::current(),
-            "gs://state-bucket/runtime/rate-control/",
-            Some(&params),
-            "test state",
+            &feature_setting("gs://state-bucket/runtime/rate-control/", Some(&params)),
+            StateFeature::RateControl,
         )
         .await
         .expect_err("two GCS authentication methods are reported, not resolved silently");
         assert_eq!(
             err.to_string(),
-            "Failed to validate GCS parameters for test state: Multiple authentication methods were provided. Specify only one of the following: gcs_service_account_path, gcs_service_account_key, gcs_application_default_credentials, or gcs_skip_signature. For details, visit: https://spiceai.org/docs/components/data-connectors/gcs#auth"
+            "Failed to validate GCS parameters for rate-control state: Multiple authentication methods were provided. Specify only one of the following: gcs_service_account_path, gcs_service_account_key, gcs_application_default_credentials, or gcs_skip_signature. For details, visit: https://spiceai.org/docs/components/data-connectors/gcs#auth"
         );
     }
 
@@ -613,9 +767,11 @@ mod tests {
         let result = build_object_store(
             secrets(),
             Handle::current(),
-            "abfss://container@account.dfs.core.windows.net/runtime/rate-control/",
-            Some(&params),
-            "test state",
+            &feature_setting(
+                "abfss://container@account.dfs.core.windows.net/runtime/rate-control/",
+                Some(&params),
+            ),
+            StateFeature::RateControl,
         )
         .await;
 

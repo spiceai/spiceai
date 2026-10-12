@@ -37,7 +37,7 @@ use futures::{Stream, StreamExt};
 use graph_rs_sdk::GraphFailure;
 use snafu::ResultExt;
 
-use crate::sharepoint::drive_items::drive_items_to_record_batch;
+use crate::sharepoint::drive_items::{drive_items_to_record_batch, parse_drive_item_page};
 
 use super::{
     client::SharepointClient,
@@ -163,10 +163,15 @@ impl SharepointListExec {
                         continue;
                     }
                 };
-                match response.body() {
+                let status = response.status();
+                let drive_items = match response.into_body() {
+                    Ok(body) => parse_drive_item_page(status, body),
+                    Err(e) => Err(Error::MicrosoftGraphFailure { source: Box::new(GraphFailure::ErrorMessage(e)) }),
+                };
+                match drive_items {
                     Ok(drive_items) => {
                         let content = if include_file_content {
-                            match client.get_file_content(&drive_items.value, formatter.clone()).await.boxed() {
+                            match client.get_file_content(&drive_items, formatter.clone()).await.boxed() {
                                 Ok(c) => Some(c),
                                 Err(e) => {
                                     yield Err(DataFusionError::External(e));
@@ -176,7 +181,7 @@ impl SharepointListExec {
                         } else {
                             None
                         };
-                        match drive_items_to_record_batch(&drive_items.value, content) {
+                        match drive_items_to_record_batch(&drive_items, content) {
                             Ok(record_batch) => {
                                 // Ensure that the record batch is projected to the required columns (since `select` on OData from Microsoft Graph isn't used).
                                 if let Some(projection) = &projection {
@@ -190,7 +195,7 @@ impl SharepointListExec {
                     },
                     Err(e) => {
                         tracing::debug!("Error fetching drive items. {:#?}", e);
-                        yield Err(DataFusionError::External(Error::MicrosoftGraphFailure { source: Box::new(GraphFailure::ErrorMessage(e.clone())) }.into()));
+                        yield Err(DataFusionError::External(e.into()));
                     },
                 }
             }
