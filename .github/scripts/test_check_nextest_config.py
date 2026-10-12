@@ -41,7 +41,7 @@ filter = '(binary_id(=cayenne::integration) & test(/^mutation_model_test::/))'
 slow-timeout = { period = "120s", terminate-after = 8 }
 
 [[profile.default.overrides]]
-filter = '(binary_id(=cayenne::integration) & test(/^result_correctness_vs_duckdb_test::/)) | (binary_id(=cayenne::integration) & test(/^result_correctness_vs_sqlite_test::/))'
+filter = '(binary_id(=cayenne::integration) & test(/^result_correctness_vs_duckdb_test::/)) | (binary_id(=cayenne::integration) & test(/^result_correctness_vs_sqlite_test::/)) | (binary_id(=runtime::integration) & test(/^result_correctness::/))'
 retries = 0
 slow-timeout = { period = "120s", terminate-after = 12 }
 """
@@ -381,6 +381,29 @@ class CheckConfigTest(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             problems = check_nextest_config.check_config(write(tmp, config))
         self.assertTrue(any("no longer has retries = 0" in p for p in problems))
+
+    def test_rejects_dropping_a_module_from_the_parity_override(self):
+        """Each zero-retry module is guarded on its own, not only through its block-mates.
+
+        Deleting one clause from the shared filter leaves the others intact, so
+        the module silently falls back to the default retries and a parity
+        mismatch is retried until a run happens to pass.
+        """
+        config = FIXED_CONFIG.replace(
+            " | (binary_id(=runtime::integration) & test(/^result_correctness::/))", ""
+        )
+        self.assertNotEqual(config, FIXED_CONFIG)
+        with tempfile.TemporaryDirectory() as tmp:
+            problems = check_nextest_config.check_config(write(tmp, config))
+        self.assertEqual(
+            [p for p in problems if "no longer has retries = 0" in p],
+            [
+                "nextest.toml: runtime::integration::result_correctness no longer has "
+                "retries = 0. These tests assert the accelerated table converges to a "
+                "reference model; a retry that passes hides a real race instead of "
+                "working around flakiness."
+            ],
+        )
 
     def test_rejects_removing_the_ceiling_from_a_zero_retry_binary(self):
         """A bare period cannot kill a test — including a genuinely hung one.
