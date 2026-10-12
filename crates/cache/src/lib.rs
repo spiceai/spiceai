@@ -1271,6 +1271,17 @@ impl QueryResultsCacheProvider {
             .await;
     }
 
+    /// Drops every cached result.
+    ///
+    /// For a change no table change records: a result's key is the query, not
+    /// the definitions of the functions it called, so when a Spicepod reload
+    /// redefines or removes a user function, any entry may hold rows the old
+    /// definition computed. A `cache_key_type: sql` hit is answered before
+    /// planning, so discarding cached plans does not reach it; this does.
+    pub async fn invalidate_all(&self) {
+        self.cache.invalidate_all().await;
+    }
+
     /// Invalidates the cached results that read `table_name`, because the table's
     /// *contents* changed — an accelerated refresh, a DML write.
     ///
@@ -1582,43 +1593,160 @@ impl QueryResultsCacheProvider {
         }
     }
 
+    /// Whether results of `plan` may be stored in / served from the SQL
+    /// results cache.
+    ///
+    /// Caching policy for non-deterministic plans: only plans whose functions
+    /// are all `Volatility::Immutable` are cacheable. A plan is never cached if
+    /// any scalar, aggregate, or window function (including in subqueries) is
+    /// `Volatile` (`random()`, `uuid()`, ...) or `Stable`. `Stable` covers the
+    /// time functions (`now()`, `current_date`, `current_time`, ...; see
+    /// [`NON_CACHEABLE_TIME_FUNCTIONS`]) and remote HTTP UDFs, which are capped
+    /// at `Stable`. They are constant within one statement, but a cached result
+    /// would replay stale output across statements. A plan that scans a
+    /// `Temporary` table, anywhere including in a subquery, is never cached
+    /// either: that is how a table function whose rows can change between
+    /// executions is planned (remote and search table functions, and SQL and
+    /// WASM table functions not declared `immutable`). Such queries report no
+    /// results-cache status.
     #[must_use]
     pub fn cache_is_enabled_for_plan(&self, plan: &LogicalPlan) -> bool {
-        let mut plan_stack = vec![plan];
+        use datafusion::common::tree_node::TreeNodeRecursion;
 
-        while let Some(current_plan) = plan_stack.pop() {
-            match current_plan {
-                LogicalPlan::TableScan(source, ..) => {
-                    let schema_name = source.table_name.schema();
-                    let Some(schema) = schema_name else {
-                        continue;
-                    };
-                    for ignore_schema in &self.ignore_schemas {
-                        if *schema == **ignore_schema {
-                            return false;
-                        }
-                    }
-                }
-                LogicalPlan::Explain { .. }
-                | LogicalPlan::Analyze { .. }
-                | LogicalPlan::DescribeTable { .. }
-                | LogicalPlan::Ddl(..)
-                | LogicalPlan::Dml(..)
-                | LogicalPlan::Copy { .. }
-                | LogicalPlan::Statement(..) => return false,
-                LogicalPlan::Extension(ext)
-                    if WRITE_CAPABLE_EXTENSION_NAMES.contains(&ext.node.name()) =>
+        // `apply_with_subqueries`, not an `inputs()` walk: a subquery in an
+        // expression (`IN (SELECT ...)`, `EXISTS (...)`, a scalar subquery)
+        // is held in the node's expressions, so `inputs()` never reaches the
+        // scans inside it (see `utils::get_logical_plan_input_tables`).
+        let mut cacheable = true;
+        // The closure is infallible, so the returned Result cannot be an error.
+        let _ = plan.apply_with_subqueries(|node| {
+            if self.plan_node_is_cacheable(node) {
+                Ok(TreeNodeRecursion::Continue)
+            } else {
+                cacheable = false;
+                Ok(TreeNodeRecursion::Stop)
+            }
+        });
+
+        cacheable && !plan_is_non_deterministic(plan)
+    }
+
+    /// Checks one plan node, not its inputs or subqueries.
+    fn plan_node_is_cacheable(&self, node: &LogicalPlan) -> bool {
+        match node {
+            LogicalPlan::TableScan(source, ..) => {
+                // Table-function providers whose rows can change between
+                // executions (remote and search UDTFs, and SQL and WASM table
+                // functions not declared `immutable`) are planned as
+                // `Temporary` scans; never cache them. A recursive CTE's work
+                // table is `Temporary` too, but it holds only the rows the
+                // query itself derives, so it does not decide.
+                if source.source.table_type() == datafusion::datasource::TableType::Temporary
+                    && !is_cte_work_table(source)
                 {
                     return false;
                 }
-                _ => {}
+                let Some(schema) = source.table_name.schema() else {
+                    return true;
+                };
+                !self
+                    .ignore_schemas
+                    .iter()
+                    .any(|ignore_schema| *schema == **ignore_schema)
             }
-
-            plan_stack.extend(current_plan.inputs());
+            LogicalPlan::Explain { .. }
+            | LogicalPlan::Analyze { .. }
+            | LogicalPlan::DescribeTable { .. }
+            | LogicalPlan::Ddl(..)
+            | LogicalPlan::Dml(..)
+            | LogicalPlan::Copy { .. }
+            | LogicalPlan::Statement(..) => false,
+            LogicalPlan::Extension(ext) => {
+                !WRITE_CAPABLE_EXTENSION_NAMES.contains(&ext.node.name())
+            }
+            _ => true,
         }
-
-        true
     }
+}
+
+/// Whether `scan` reads the work table of a recursive CTE, which `DataFusion`
+/// plans as a `Temporary` scan of the rows the recursion has derived so far.
+fn is_cte_work_table(scan: &datafusion::logical_expr::TableScan) -> bool {
+    datafusion::datasource::source_as_provider(&scan.source).is_ok_and(|provider| {
+        provider
+            .downcast_ref::<datafusion::datasource::cte_worktable::CteWorkTable>()
+            .is_some()
+    })
+}
+
+/// Time functions that `DataFusion` marks `Volatility::Stable` (the value is
+/// fixed for one statement but changes between statements). Caching their
+/// results would serve a stale clock, so they are treated as uncacheable.
+pub const NON_CACHEABLE_TIME_FUNCTIONS: &[&str] = &[
+    "now",
+    "current_timestamp",
+    "current_date",
+    "current_time",
+    "localtime",
+    "localtimestamp",
+    "today",
+];
+
+/// Returns `true` when `plan` (including any subquery) contains a function
+/// whose result can differ between two executions of the same plan: any
+/// function that is not `Volatility::Immutable` (`random()`, `uuid()`,
+/// `now()`, remote UDFs, ...) or one of [`NON_CACHEABLE_TIME_FUNCTIONS`]. Results of such plans must not be served
+/// from the SQL results cache.
+#[must_use]
+pub fn plan_is_non_deterministic(plan: &LogicalPlan) -> bool {
+    use datafusion::common::tree_node::TreeNodeRecursion;
+
+    let mut found = false;
+    let _ = plan.apply_with_subqueries(|node| {
+        node.apply_expressions(|expr| {
+            if expr_is_non_deterministic(expr) {
+                found = true;
+                Ok(TreeNodeRecursion::Stop)
+            } else {
+                Ok(TreeNodeRecursion::Continue)
+            }
+        })
+    });
+    found
+}
+
+fn is_time_function_name(name: &str) -> bool {
+    NON_CACHEABLE_TIME_FUNCTIONS
+        .iter()
+        .any(|f| f.eq_ignore_ascii_case(name))
+}
+
+/// Checks a single expression tree (not descending into subquery plans,
+/// which [`plan_is_non_deterministic`] visits itself).
+fn expr_is_non_deterministic(expr: &datafusion::logical_expr::Expr) -> bool {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    use datafusion::logical_expr::{Expr, Volatility};
+
+    let mut found = false;
+    let _ = expr.apply(|e| {
+        let hit = match e {
+            Expr::ScalarFunction(f) => {
+                f.func.signature().volatility != Volatility::Immutable
+                    || is_time_function_name(f.func.name())
+                    || f.func.aliases().iter().any(|a| is_time_function_name(a))
+            }
+            Expr::AggregateFunction(f) => f.func.signature().volatility != Volatility::Immutable,
+            Expr::WindowFunction(w) => w.fun.signature().volatility != Volatility::Immutable,
+            _ => false,
+        };
+        if hit {
+            found = true;
+            Ok(TreeNodeRecursion::Stop)
+        } else {
+            Ok(TreeNodeRecursion::Continue)
+        }
+    });
+    found
 }
 
 impl Display for QueryResultsCacheProvider {
@@ -2459,6 +2587,177 @@ mod tests {
         assert_eq!(validity, EntryValidity::Valid);
     }
 
+    /// A table provider that reports a fixed `TableType`.
+    #[derive(Debug)]
+    struct TypedTable(
+        datafusion::datasource::empty::EmptyTable,
+        datafusion::datasource::TableType,
+    );
+
+    #[async_trait::async_trait]
+    impl datafusion::catalog::TableProvider for TypedTable {
+        fn schema(&self) -> arrow::datatypes::SchemaRef {
+            self.0.schema()
+        }
+        fn table_type(&self) -> datafusion::datasource::TableType {
+            self.1
+        }
+        async fn scan(
+            &self,
+            state: &dyn datafusion::catalog::Session,
+            projection: Option<&Vec<usize>>,
+            filters: &[datafusion::logical_expr::Expr],
+            limit: Option<usize>,
+        ) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+            self.0.scan(state, projection, filters, limit).await
+        }
+    }
+
+    /// A table function whose provider reports the given `TableType`, as a
+    /// table function whose rows can change between executions reports
+    /// `Temporary`.
+    #[derive(Debug)]
+    struct TypedTableFunction(datafusion::datasource::TableType);
+
+    impl datafusion::catalog::TableFunctionImpl for TypedTableFunction {
+        fn call(
+            &self,
+            _args: &[datafusion::logical_expr::Expr],
+        ) -> datafusion::error::Result<Arc<dyn datafusion::catalog::TableProvider>> {
+            use datafusion::arrow::datatypes::{DataType, Field, Schema};
+
+            let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
+            Ok(Arc::new(TypedTable(
+                datafusion::datasource::empty::EmptyTable::new(schema),
+                self.0,
+            )))
+        }
+    }
+
+    /// A `Temporary` scan is never cached, wherever the plan holds it:
+    /// directly, in a `FROM` subquery, or in an `IN`, `EXISTS`, or scalar
+    /// subquery, which a node keeps in its expressions rather than its inputs.
+    /// The same queries over a `Base` provider stay cacheable, so the scan's
+    /// table type is what decides.
+    #[tokio::test]
+    async fn test_cache_is_disabled_for_temporary_table_function_scan() {
+        use datafusion::datasource::TableType;
+
+        let cache_provider =
+            QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
+                .expect("valid cache provider");
+
+        for sql in [
+            "SELECT a FROM udtf()",
+            "SELECT a FROM (SELECT a FROM udtf()) t",
+            "SELECT * FROM customer WHERE id IN (SELECT a FROM udtf())",
+            "SELECT * FROM customer WHERE EXISTS (SELECT 1 FROM udtf() WHERE a = customer.id)",
+            "SELECT id, (SELECT max(a) FROM udtf()) AS m FROM customer",
+        ] {
+            for (table_type, cacheable) in [(TableType::Temporary, false), (TableType::Base, true)]
+            {
+                let ctx = utils::tests::create_session_context();
+                ctx.register_udtf("udtf", Arc::new(TypedTableFunction(table_type)));
+                let plan = ctx.state().create_logical_plan(sql).await.expect("plan");
+                assert_eq!(
+                    cache_provider.cache_is_enabled_for_plan(&plan),
+                    cacheable,
+                    "{table_type:?}: {sql}"
+                );
+            }
+        }
+    }
+
+    /// A recursive CTE's work table is a `Temporary` scan of the rows the query
+    /// derives itself, so it leaves a recursive query cacheable; a volatile
+    /// function or a `Temporary` table function inside the recursion still
+    /// keeps it out.
+    #[tokio::test]
+    async fn test_recursive_cte_work_table_does_not_disable_the_cache() {
+        use datafusion::common::tree_node::TreeNode;
+        use datafusion::datasource::TableType;
+
+        let cache_provider =
+            QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
+                .expect("valid cache provider");
+
+        for (sql, cacheable) in [
+            (
+                "WITH RECURSIVE nums(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM nums WHERE n < 3) SELECT n FROM nums",
+                true,
+            ),
+            (
+                "WITH RECURSIVE nums(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM nums WHERE n < 3 AND random() < 2) SELECT n FROM nums",
+                false,
+            ),
+            (
+                "WITH RECURSIVE nums(n) AS (SELECT a FROM udtf() UNION ALL SELECT n + 1 FROM nums WHERE n < 3) SELECT n FROM nums",
+                false,
+            ),
+        ] {
+            let ctx = utils::tests::create_session_context();
+            ctx.register_udtf("udtf", Arc::new(TypedTableFunction(TableType::Temporary)));
+            let plan = ctx.state().create_logical_plan(sql).await.expect("plan");
+            assert!(
+                plan.exists(|node| Ok(matches!(node, LogicalPlan::RecursiveQuery(_))))
+                    .expect("infallible"),
+                "{sql} must plan as a recursive query, or this test checks nothing"
+            );
+            assert_eq!(
+                cache_provider.cache_is_enabled_for_plan(&plan),
+                cacheable,
+                "{sql}"
+            );
+        }
+    }
+
+    /// A table in an ignored schema keeps a plan out of the cache when only a
+    /// subquery reads it, as it does when the outer query reads it.
+    #[test]
+    fn test_cache_is_disabled_for_ignored_schema_in_subquery() {
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::common::TableReference;
+        use datafusion::datasource::{empty::EmptyTable, provider_as_source};
+        use datafusion::logical_expr::LogicalPlanBuilder;
+        use datafusion::prelude::{col, in_subquery};
+
+        let scan = |table: TableReference| {
+            let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
+            LogicalPlanBuilder::scan(
+                table,
+                provider_as_source(Arc::new(EmptyTable::new(schema))),
+                None,
+            )
+            .expect("scan")
+        };
+        let subquery = Arc::new(
+            scan(TableReference::partial("runtime", "task_history"))
+                .build()
+                .expect("subquery plan"),
+        );
+        let plan = scan(TableReference::bare("t"))
+            .filter(in_subquery(col("a"), subquery))
+            .expect("filter")
+            .build()
+            .expect("plan");
+
+        for (ignore_schemas, cacheable) in [(&["runtime"][..], false), (&[][..], true)] {
+            let cache_provider = QueryResultsCacheProvider::try_new(
+                &SQLResultsCacheConfig::default(),
+                ignore_schemas
+                    .iter()
+                    .map(|s| Box::<str>::from(*s))
+                    .collect(),
+            )
+            .expect("valid cache provider");
+            assert_eq!(
+                cache_provider.cache_is_enabled_for_plan(&plan),
+                cacheable,
+                "ignore_schemas={ignore_schemas:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_cache_is_enabled_for_system_query_describe() {
         let sql = "describe customer";
@@ -2500,6 +2799,92 @@ mod tests {
             .cache_is_enabled_for_plan(&logical_plan)
             .then_some(())
             .expect("cache should be enabled for simple SELECT");
+    }
+
+    #[tokio::test]
+    async fn test_cache_is_disabled_for_non_deterministic_functions() {
+        let cache_provider =
+            QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
+                .expect("valid cache provider");
+
+        for sql in [
+            "SELECT uuid() u",
+            "SELECT random() r",
+            "SELECT uuid() u, random() r, now() t",
+            "SELECT now()",
+            "SELECT current_timestamp",
+            "SELECT current_date",
+            "SELECT current_time()",
+            "SELECT id, random() FROM customer",
+            "SELECT * FROM customer WHERE random() > 0.5",
+            "SELECT * FROM customer WHERE now() > to_timestamp(0)",
+            "SELECT * FROM customer WHERE id IN (SELECT id FROM customer WHERE random() > 0.5)",
+            "SELECT count(*) FROM customer GROUP BY id ORDER BY random()",
+        ] {
+            let logical_plan = parse_sql_to_logical_plan(sql).await;
+            assert!(
+                !cache_provider.cache_is_enabled_for_plan(&logical_plan),
+                "results cache must be disabled for non-deterministic query: {sql}"
+            );
+        }
+    }
+
+    /// `Stable` user functions (e.g. remote HTTP UDFs, which are capped at
+    /// `Stable`) can change between statements, so only `Immutable`
+    /// functions are cacheable.
+    #[tokio::test]
+    async fn test_cache_is_disabled_for_stable_udf() {
+        use datafusion::arrow::datatypes::DataType;
+        use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
+
+        let cache_provider =
+            QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
+                .expect("valid cache provider");
+
+        for (volatility, cacheable) in [(Volatility::Stable, false), (Volatility::Immutable, true)]
+        {
+            let ctx = utils::tests::create_session_context();
+            ctx.register_udf(create_udf(
+                "probe",
+                vec![],
+                DataType::Int64,
+                volatility,
+                std::sync::Arc::new(|_: &[ColumnarValue]| {
+                    Ok(ColumnarValue::Scalar(
+                        datafusion::scalar::ScalarValue::Int64(Some(1)),
+                    ))
+                }),
+            ));
+            let plan = ctx
+                .state()
+                .create_logical_plan("SELECT probe()")
+                .await
+                .expect("plan");
+            assert_eq!(
+                cache_provider.cache_is_enabled_for_plan(&plan),
+                cacheable,
+                "{volatility:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cache_is_enabled_for_deterministic_functions() {
+        let cache_provider =
+            QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
+                .expect("valid cache provider");
+
+        for sql in [
+            "SELECT abs(-1), upper('a')",
+            "SELECT id, lower(first_name) FROM customer WHERE id > 1",
+            "SELECT * FROM customer WHERE id IN (SELECT id FROM customer WHERE state = 'NY')",
+        ] {
+            let logical_plan = parse_sql_to_logical_plan(sql).await;
+            assert!(
+                cache_provider.cache_is_enabled_for_plan(&logical_plan),
+                "results cache must stay enabled for deterministic query: {sql}"
+            );
+        }
     }
 
     #[tokio::test]
