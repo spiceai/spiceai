@@ -22,6 +22,9 @@ pub use partitioned_table_scan_rewrite::*;
 pub mod correlated_filter_push_down;
 pub use correlated_filter_push_down::{CorrelatedFilterPushDown, federation_analyzer_rule};
 
+pub mod limit_below_projection;
+pub use limit_below_projection::PushLimitBelowProjection;
+
 use std::sync::Arc;
 
 use datafusion::optimizer::AnalyzerRule;
