@@ -989,17 +989,23 @@ impl CayenneTableProvider {
         // survivors into one stream would feed the rewrite from a single task,
         // however many encoders it had. Each write holds one encode permit, and
         // as many files fold at once as maintenance may hold, so the permits
-        // reserved for deltas stay free whatever the write's class.
+        // reserved for deltas stay free whatever the write's class. A coupled
+        // writer (a partition child) takes no permits and keeps to one encode
+        // stream, so it folds one file at a time: its siblings fold alongside.
         let policy = WritePolicy {
             class: write.write_policy.class,
             fan_out: EncodeFanOut::PerCaller,
             routing: ShardRouting::Key,
         };
-        let in_flight = super::write_budget::encode_budget_snapshot()
-            .and_then(|budget| usize::try_from(budget.total).ok())
-            .map(super::write_budget::maintenance_gate_cap)
-            .unwrap_or(write.target_partitions)
-            .max(1);
+        let in_flight = if self.context().is_coupled_writer() {
+            1
+        } else {
+            super::write_budget::encode_budget_snapshot()
+                .and_then(|budget| usize::try_from(budget.total).ok())
+                .map(super::write_budget::maintenance_gate_cap)
+                .unwrap_or(write.target_partitions)
+                .max(1)
+        };
         let folds: Vec<FileFold<'_>> = superseded
             .iter()
             .map(|(location, positions)| {
