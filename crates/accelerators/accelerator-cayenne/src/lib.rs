@@ -423,13 +423,10 @@ pub struct CayenneAccelerator {
     /// on this one budget, including those created by `CREATE TABLE …
     /// PARTITIONED BY`, which belong to no accelerator.
     compaction_semaphore: Arc<tokio::sync::Semaphore>,
-    /// The snapshot-directory pins a `refresh_mode: snapshot` reload hands from
-    /// the provider it replaces to the one the reload factory creates, keyed by
-    /// dataset. An entry lives only for the duration of that one create:
-    /// `reload_from_snapshot` inserts it before calling the factory and removes
-    /// it after, whatever the outcome, and `create_cayenne_table_provider` takes
-    /// it. Reloads of one dataset are serialized by the runtime's accelerator
-    /// write mutex, so the map holds at most one entry per dataset mid-reload.
+    /// Pins a snapshot reload hands from the replaced provider to the one the
+    /// factory creates, keyed by dataset. An entry lives only for that one
+    /// create: inserted before the factory runs, removed after, whatever the
+    /// outcome.
     inherited_snapshot_dir_pins: parking_lot::Mutex<HashMap<String, cayenne::SnapshotDirPins>>,
 }
 
@@ -2890,9 +2887,8 @@ impl CayenneAccelerator {
         if let Some(cold) = cold_object_store {
             builder = builder.with_cold_object_store(cold);
         }
-        // A reload's replacement instance sweeps against the pins of the instance
-        // it replaces, so queries still reading the replaced snapshot keep their
-        // directories (see `CayenneTableProvider::retire_unreferenced_snapshot_dirs`).
+        // A reload's replacement sweeps against the replaced instance's pins, so
+        // queries still reading the replaced snapshot keep their directories.
         if let Some(pins) = self
             .inherited_snapshot_dir_pins
             .lock()
@@ -4330,11 +4326,9 @@ impl DataAccelerator for CayenneAccelerator {
         // previous instance's maintenance must stop before the new one starts:
         // nothing in memory serializes two instances' compaction (#11581).
         change_sink::quiesce_table_maintenance(&previous_provider).await;
-        // Queries planned on the previous instance may still be reading its
-        // snapshot directories after the swap, and they pin those directories in
-        // the previous instance's maps. The replacement is opened over the same
-        // maps so its sweep defers them; without that it would see every
-        // superseded directory as unused (spiceai/spiceai#14981).
+        // Queries planned on the previous instance may still read its snapshot
+        // directories after the swap; they pin them in that instance's maps, so
+        // the replacement is opened over the same maps (spiceai/spiceai#14981).
         let pins = find_concrete::<cayenne::CayenneTableProvider>(
             previous_provider.as_ref(),
             LayerWalk::Write,
@@ -4342,9 +4336,8 @@ impl DataAccelerator for CayenneAccelerator {
         .map(cayenne::CayenneTableProvider::snapshot_dir_pins);
         drop(previous_provider);
         let Some(pins) = pins else {
-            // No single Cayenne instance to inherit from (a partitioned dataset):
-            // the replacement starts with no pins and `snapshot_installed`
-            // reclaims nothing for it either.
+            // No single Cayenne instance to inherit from (partitioned): no pins,
+            // and `maintain_after_snapshot_restore` reclaims nothing either.
             return provider_factory().await;
         };
         let dataset = source.name().to_string();
@@ -4352,17 +4345,15 @@ impl DataAccelerator for CayenneAccelerator {
             .lock()
             .insert(dataset.clone(), pins);
         let created = provider_factory().await;
-        // Cleared on every outcome: a failed create must not leave pins for a
-        // later, unrelated create of this dataset to inherit.
+        // Cleared on every outcome, so a failed create leaves nothing behind.
         self.inherited_snapshot_dir_pins.lock().remove(&dataset);
         created
     }
 
-    /// Reclaim the snapshot directories the installed snapshot no longer
-    /// references. Called after the swap, so the replaced instance is no longer
-    /// served; the pins handed over in `reload_from_snapshot` keep the
-    /// directories its remaining queries still read.
-    async fn snapshot_installed(
+    /// Reclaim the snapshot directories the restored snapshot no longer
+    /// references. The pins handed over in `reload_from_snapshot` keep the ones
+    /// the replaced instance's queries still read.
+    async fn maintain_after_snapshot_restore(
         &self,
         source: &dyn AccelerationSource,
         provider: &Arc<dyn TableProvider>,

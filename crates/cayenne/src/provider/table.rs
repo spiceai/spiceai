@@ -3030,17 +3030,11 @@ struct CayenneTableProviderOpenOptions {
     snapshot_dir_pins: Option<SnapshotDirPins>,
 }
 
-/// What keeps a snapshot directory on disk while something still reads it, and
-/// the ledger of directories awaiting deletion: the in-flight scan ref-counts,
-/// the last listing time of each directory, and the retired-directory ledger.
-///
-/// A provider instance owns one of these, and every scan it plans pins its
-/// snapshot ids there. A `refresh_mode: snapshot` reload opens a *replacement*
-/// instance over the same table while queries planned on the replaced one may
-/// still be reading its directories, so the replacement is opened over the
-/// replaced instance's pins ([`CayenneTableProviderBuilder::with_snapshot_dir_pins`])
-/// and its sweeps defer every directory those queries hold, exactly as they
-/// defer the instance's own.
+/// What a sweep consults before deleting a snapshot directory: in-flight scan
+/// ref-counts, each directory's last listing time, and the retired-directory
+/// ledger. A reload opens its replacement provider over the replaced provider's
+/// pins ([`CayenneTableProviderBuilder::with_snapshot_dir_pins`]), so queries
+/// still reading the replaced snapshot keep their directories.
 #[derive(Clone, Default)]
 pub struct SnapshotDirPins {
     scan_refs: Arc<ParkingMutex<HashMap<String, usize>>>,
@@ -3080,13 +3074,8 @@ impl CayenneTableProviderBuilder {
         }
     }
 
-    /// Open the table over the snapshot-directory pins of the instance this one
-    /// replaces, so a sweep run by this instance defers the directories that
-    /// queries planned on the replaced instance still read. A `refresh_mode:
-    /// snapshot` reload passes its replaced provider's
-    /// [`CayenneTableProvider::snapshot_dir_pins`]; an instance opened with none
-    /// starts with no pins, which is right only when no earlier instance of the
-    /// table can still be serving queries.
+    /// Open the table over the pins of the instance this one replaces, so this
+    /// instance's sweeps defer the directories that instance's queries still read.
     #[must_use]
     pub fn with_snapshot_dir_pins(mut self, pins: SnapshotDirPins) -> Self {
         self.snapshot_dir_pins = Some(pins);
@@ -7143,9 +7132,7 @@ impl CayenneTableProvider {
         }
     }
 
-    /// The pins and retired-directory ledger this instance sweeps against, for
-    /// the instance that replaces it to be opened over
-    /// ([`CayenneTableProviderBuilder::with_snapshot_dir_pins`]).
+    /// The pins the instance replacing this one must be opened over.
     #[must_use]
     pub fn snapshot_dir_pins(&self) -> SnapshotDirPins {
         SnapshotDirPins {
@@ -7155,38 +7142,27 @@ impl CayenneTableProvider {
         }
     }
 
-    /// Retire every snapshot directory under this table's root that the catalog
-    /// no longer references, and sweep them once their grace elapses.
+    /// Retire every snapshot directory under the table root that the catalog no
+    /// longer references, and sweep them once their grace elapses.
     ///
-    /// A `refresh_mode: snapshot` reader fills its table by extracting each
-    /// snapshot archive into the data directory and importing the archived
-    /// metastore slice, which replaces the table's catalog rows. The directories
-    /// the previous slice referenced stay on disk with nothing pointing at them,
-    /// and since the reader never commits, neither sweep a commit schedules ever
-    /// runs over them: disk grows by a table copy per reload
-    /// (spiceai/spiceai#14981). The runtime calls this on the replacement
-    /// instance once it is serving — after the swap, never before, because the
-    /// replaced instance keeps serving its directories when the swap is refused.
+    /// A `refresh_mode: snapshot` reader imports a new metastore slice on each
+    /// reload, which leaves the previous snapshot's directory unreferenced, and it
+    /// never commits, so no commit-scheduled sweep reclaims it
+    /// (spiceai/spiceai#14981). Called once the replacement provider is serving,
+    /// never before the swap.
     ///
-    /// The live set is read through this instance from the catalog it opened on:
-    /// the current snapshot, every protected snapshot, and the directory of
-    /// every referenced deletion file. Only directories named by a uuid are
-    /// candidates: reserved `_`-prefixed directories and anything this engine
-    /// did not write are left alone. The retired directories go through the same
-    /// ledger sweep a writer's merge-away uses — grace, in-flight scan pins, the
-    /// manifest ref-count — rather than the uuid7-age sweep, which keeps every
-    /// directory at or newer than the current snapshot and so could never
-    /// reclaim a merged-away checkpoint of a CDC writer, whose current snapshot
-    /// never rotates. The grace is anchored on this process's clock at
-    /// retirement, not on the directory's creation time on the writer.
+    /// Live: the current snapshot, the protected snapshots, and the directory of
+    /// every referenced deletion file. Only uuid-named directories are candidates.
+    /// Uses the retired-directory ledger, not the uuid7-age sweep: the age sweep
+    /// keeps every directory newer than current, which on a CDC writer is every
+    /// merged-away checkpoint.
     ///
-    /// Returns the ids retired by this call, sorted. A partitioned table and an
-    /// object-store table retire nothing.
+    /// Returns the retired ids, sorted. Partitioned and object-store tables retire
+    /// nothing.
     ///
     /// # Errors
     ///
-    /// Returns an error if the table root cannot be listed or the catalog's
-    /// deletion files cannot be read; nothing is retired then.
+    /// The table root cannot be listed, or the deletion files cannot be read.
     pub async fn retire_unreferenced_snapshot_dirs(&self) -> CatalogResult<Vec<String>> {
         if self.table_metadata.partition_column.is_some()
             || self.table_metadata.path.starts_with("s3://")
@@ -7242,11 +7218,8 @@ impl CayenneTableProvider {
         Ok(unreferenced)
     }
 
-    /// The directories under the table root that no live snapshot references,
-    /// sorted: every uuid-named entry of `on_disk` outside `live`. Reserved
-    /// `_`-prefixed directories and names that are not a uuid are never
-    /// candidates — this engine names a snapshot directory by a uuid, so anything
-    /// else was not written by it.
+    /// The uuid-named entries of `on_disk` outside `live`, sorted. Reserved
+    /// `_`-prefixed and non-uuid names are never candidates.
     fn unreferenced_snapshot_dir_ids(on_disk: Vec<String>, live: &HashSet<String>) -> Vec<String> {
         let mut unreferenced: Vec<String> = on_disk
             .into_iter()
@@ -7258,8 +7231,7 @@ impl CayenneTableProvider {
         unreferenced
     }
 
-    /// The snapshot directory under `table_dir` that `path` lies in, if any:
-    /// the first path component below the table root.
+    /// The snapshot directory under `table_dir` that `path` lies in, if any.
     fn snapshot_dir_holding(table_dir: &std::path::Path, path: &str) -> Option<String> {
         std::path::Path::new(path)
             .strip_prefix(table_dir)
@@ -7269,10 +7241,9 @@ impl CayenneTableProvider {
             .map(|component| component.as_os_str().to_string_lossy().into_owned())
     }
 
-    /// Re-run the retired-directory sweep after each grace until the ledger
-    /// drains or the follow-up budget is spent. A writer's next commit re-sweeps
-    /// for it; a snapshot reader never commits, so without this a directory a
-    /// query held past the first sweep would wait for the next reload.
+    /// Re-sweep after each grace, up to the follow-up budget. A reader never
+    /// commits, so nothing else re-sweeps a directory a query held past the first
+    /// pass.
     fn follow_up_retired_snapshot_dirs(&self) {
         if !self.maintenance_still_admitted() {
             return;
@@ -9691,8 +9662,8 @@ impl CayenneTableProvider {
         }));
 
         let force_staging_probe_on_startup = table_metadata.path.starts_with("s3://");
-        // A replacement instance inherits the pins of the instance it replaces;
-        // any other instance starts with none (see `SnapshotDirPins`).
+        // A replacement inherits the replaced instance's pins; any other
+        // instance starts with none.
         let snapshot_dir_pins = snapshot_dir_pins.unwrap_or_default();
 
         // Register the S3 object store in the shared RuntimeEnv once during
@@ -74783,13 +74754,11 @@ mod tests {
         );
     }
 
-    /// A `refresh_mode: snapshot` reader reclaims the snapshot directories a
-    /// reload leaves unreferenced, without touching one a query still reads
-    /// (spiceai/spiceai#14981). The reader is modelled the way the runtime builds
-    /// it: the writer's metastore slice is exported, its data directory copied
-    /// over the reader's skipping files already there, the slice imported into
-    /// the reader's own metastore, and a provider opened on it; a reload repeats
-    /// that and opens a replacement provider over the replaced one's pins.
+    /// A snapshot reader reclaims the directories a reload leaves unreferenced
+    /// without touching one a query still reads (spiceai/spiceai#14981). The
+    /// reader is built as the runtime builds it: export the writer's slice, copy
+    /// the referenced directories, import the slice, open a provider; a reload
+    /// repeats that over the replaced provider's pins.
     mod snapshot_reader_reclaim {
         use super::*;
         use std::collections::BTreeSet;
@@ -74819,10 +74788,8 @@ mod tests {
                 }
             }
 
-            /// Deliver the writer's current snapshot: export its slice, copy the
-            /// snapshot directories the slice references — the archive excludes
-            /// the rest — skipping files already present as the archive
-            /// extraction does, and import the slice into the reader's metastore.
+            /// Deliver the writer's current snapshot as an archive would: the
+            /// slice, and the directories it references, skipping existing files.
             async fn replicate(&self, writer: &CayenneTableProvider) {
                 let writer_dir = Path::new(&writer.table_metadata.path);
                 let slice = writer
@@ -74846,8 +74813,8 @@ mod tests {
                     .expect("import the slice into the reader");
             }
 
-            /// Open the reader's provider: the initial instance, or a reload's
-            /// replacement over the pins of the instance it replaces.
+            /// The initial provider, or a reload's replacement over the replaced
+            /// provider's pins.
             async fn open(
                 &self,
                 table_name: &str,
@@ -74895,8 +74862,8 @@ mod tests {
                 .collect()
         }
 
-        /// Pretend the grace has elapsed for every retired dir and every listing,
-        /// so a sweep judges the pins alone.
+        /// Elapse the grace for every retired dir and listing, so a sweep judges
+        /// the pins alone.
         fn elapse_grace(provider: &CayenneTableProvider) {
             let past = Instant::now()
                 .checked_sub(CayenneTableProvider::SNAPSHOT_CLEANUP_GRACE * 2)
@@ -74921,8 +74888,7 @@ mod tests {
             }
         }
 
-        /// Plan a scan — which pins the snapshot dirs it will read — without
-        /// executing it, as a query does before it opens any file.
+        /// Plan a scan without executing it: the plan pins the dirs it will read.
         async fn plan_scan(
             ctx: &SessionContext,
             provider: &CayenneTableProvider,
@@ -74963,8 +74929,7 @@ mod tests {
             pairs
         }
 
-        /// A writer whose every refresh is a whole-table overwrite, as a
-        /// `refresh_mode: full` dataset's is: each publishes a new current
+        /// A `refresh_mode: full` writer: each overwrite publishes a new current
         /// snapshot. Files, not inlined rows, so the snapshot has a directory.
         async fn full_refresh_writer(
             table_name: &str,
@@ -75003,9 +74968,8 @@ mod tests {
             collect(plan, ctx.task_ctx()).await.expect("overwrite");
         }
 
-        /// The full-refresh shape: every reload supersedes the previous current
-        /// snapshot, which the reader then reclaims — and the writer's own
-        /// directories are not touched.
+        /// Full refresh: each reload supersedes the previous current snapshot,
+        /// which the reader reclaims; the writer's directories are untouched.
         #[tokio::test]
         async fn a_reload_reclaims_the_superseded_current_snapshot() {
             let table_name = "reader_reclaims_superseded_current";
@@ -75060,11 +75024,9 @@ mod tests {
             );
         }
 
-        /// A query planned on the replaced instance before the swap still reads
-        /// the superseded snapshot after it. The replacement's sweep sees that
-        /// query's pin only because it was opened over the replaced instance's
-        /// pins; it defers the directory until the query completes, then
-        /// deletes it.
+        /// A query planned before the swap still reads the superseded snapshot
+        /// after it. The replacement sees its pin only through the handed-over
+        /// pins: it defers the directory until the query completes, then deletes.
         #[tokio::test]
         async fn a_reload_keeps_a_directory_a_query_on_the_replaced_instance_still_reads() {
             let table_name = "reader_keeps_dir_under_query";
@@ -75077,7 +75039,7 @@ mod tests {
             let reader = Reader::new().await;
             reader.replicate(&writer).await;
             let initial = reader.open(table_name, &ctx, None).await;
-            // The query is planned against the first snapshot and has opened no file yet.
+            // Planned against the first snapshot; no file opened yet.
             let in_flight = plan_scan(&ctx, &initial).await;
 
             overwrite(&ctx, &writer, &[(1, 11), (3, 30)]).await;
@@ -75093,8 +75055,7 @@ mod tests {
             );
             elapse_grace(&replacement);
             replacement.sweep_retired_snapshot_dirs();
-            // Deferred: the directory is still pinned, so the query reads every
-            // file it planned for.
+            // Still pinned: deferred, and the query reads every file it planned for.
             assert!(
                 replacement
                     .retired_snapshot_dirs
@@ -75107,9 +75068,8 @@ mod tests {
                 vec![(1, 10), (2, 20)],
                 "the query sees the snapshot it was planned against, in full"
             );
-            // The query is done and, as after a swap, nothing holds the replaced
-            // instance any more — its cached scan view held the pin too. The pin
-            // is gone, and the next sweep deletes.
+            // As after a swap, nothing holds the replaced instance; its cached scan
+            // view released the last pin.
             drop(initial);
             assert!(
                 !replacement.in_flight_scan_snapshot_ids().contains(&first),
@@ -75125,12 +75085,10 @@ mod tests {
             );
         }
 
-        /// The CDC shape: the writer's current snapshot never rotates and each
-        /// checkpoint is a protected snapshot newer than it. Once the writer
-        /// merges those away, the reader's next slice no longer references them.
-        /// The uuid7-age sweep keeps every directory newer than current, so it can
-        /// never reclaim them; the ledger path does, and keeps the merged
-        /// snapshot the slice still references.
+        /// CDC: the current snapshot never rotates and each checkpoint is a
+        /// protected snapshot newer than it. Once merged away they leave the
+        /// slice; the age sweep keeps them (newer than current), the ledger path
+        /// reclaims them and keeps the merged snapshot.
         #[tokio::test]
         async fn a_reload_reclaims_merged_away_protected_snapshots_the_age_sweep_keeps() {
             let table_name = "reader_reclaims_merged_protected";
@@ -75175,8 +75133,7 @@ mod tests {
             expected_on_disk.insert(current.clone());
             assert_eq!(snapshot_dirs(&replacement), expected_on_disk);
 
-            // The age sweep is what a commit would run; the merged-away
-            // checkpoints are newer than current, so it keeps all of them.
+            // The age sweep keeps them: newer than current.
             replacement
                 .cleanup_old_snapshots_now_for_test(&current)
                 .await
@@ -75210,10 +75167,8 @@ mod tests {
             );
         }
 
-        /// A reader restarted over a data directory an earlier process left
-        /// full of superseded snapshots reclaims them when its provider opens;
-        /// reserved directories and directories this engine did not name are
-        /// left alone.
+        /// A restart over directories an earlier process leaked reclaims them;
+        /// reserved and foreign directories are left alone.
         #[tokio::test]
         async fn opening_over_a_leaked_directory_reclaims_it() {
             let table_name = "reader_heals_leaked_dirs";

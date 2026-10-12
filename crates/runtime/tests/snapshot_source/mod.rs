@@ -1221,8 +1221,7 @@ async fn custom_paths_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
 const RECLAIM: &str = "spice_test_rustfs_snapshot_source_reclaim";
 
 /// A reader keeps only the snapshot directory it serves: each reload reclaims the
-/// directory of the snapshot it supersedes once no query reads it, and a reader
-/// restarted over directories an earlier process left behind reclaims those too
+/// one it supersedes, and a restart reclaims directories an earlier process left
 /// (spiceai/spiceai#14981).
 #[tokio::test]
 async fn a_reader_reclaims_the_snapshot_directories_a_reload_supersedes() -> Result<()> {
@@ -1239,8 +1238,8 @@ async fn a_reader_reclaims_the_snapshot_directories_a_reload_supersedes() -> Res
         .await
 }
 
-/// A reader dataset that keeps its copy under `data_dir` and its metastore under
-/// `metadata_dir`, so the test can watch the copy's snapshot directories.
+/// A reader dataset with its copy under `data_dir` and its metastore under
+/// `metadata_dir`.
 fn reader_dataset_at(
     rustfs: Rustfs,
     name: &str,
@@ -1264,8 +1263,7 @@ fn reader_dataset_at(
     dataset
 }
 
-/// The snapshot directories under a Cayenne data directory — `<table_id>/<snapshot_id>/`,
-/// both uuids — however deeply the data directory nests the table root.
+/// The `<table_id>/<snapshot_id>/` directories (both uuids) under a data directory.
 fn snapshot_dirs_under(data_dir: &Path) -> BTreeSet<PathBuf> {
     fn is_uuid(path: &Path) -> bool {
         path.file_name()
@@ -1292,8 +1290,8 @@ fn snapshot_dirs_under(data_dir: &Path) -> BTreeSet<PathBuf> {
     found
 }
 
-/// Wait for the copy under `data_dir` to hold exactly `expected` snapshot directories:
-/// reclamation runs after a grace, once no query reads the superseded snapshot.
+/// Wait for `data_dir` to hold exactly `expected` snapshot directories; reclamation
+/// runs after a grace.
 async fn wait_for_snapshot_dirs(data_dir: &Path, expected: usize) -> Result<BTreeSet<PathBuf>> {
     let deadline = Instant::now() + Duration::from_mins(1);
     let mut seen = BTreeSet::new();
@@ -1324,8 +1322,7 @@ async fn reclaim_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
     let dir = TempDir::new()?;
     let modules_csv = dir.path().join("modules.csv");
     std::fs::write(&modules_csv, csv_with_rows(3))?;
-    // Files, not inlined rows: a snapshot of a table this small would otherwise be
-    // inlined in the metastore and have no directory to reclaim.
+    // Files, not inlined rows: an inlined snapshot has no directory to reclaim.
     let mut writer_modules = writer_dataset(modules, &modules_csv, "cayenne", dir.path());
     if let Some(acceleration) = writer_modules.acceleration.as_mut() {
         let mut params = acceleration
@@ -1369,8 +1366,7 @@ async fn reclaim_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
     wait_for_rows(&reader, modules, 3).await?;
     let mut served = wait_for_snapshot_dirs(&data_dir, 1).await?;
 
-    // Every reload supersedes the snapshot directory the previous one restored;
-    // the reader keeps only the one it serves.
+    // Each reload supersedes the previous directory; only the served one remains.
     for round in 1..=5 {
         let rows_now = 3 + round;
         std::fs::write(&modules_csv, csv_with_rows(rows_now))?;
@@ -1400,7 +1396,7 @@ async fn reclaim_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
     }
     assert_eq!(rows(&reader, modules).await?, rows(&writer, modules).await?);
 
-    // A reader restarted over directories an earlier process leaked reclaims them.
+    // A restart reclaims directories an earlier process leaked.
     reader.shutdown().await;
     let table_dir = served
         .iter()

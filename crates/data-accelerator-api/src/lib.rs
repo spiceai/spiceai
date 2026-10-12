@@ -937,13 +937,12 @@ pub trait DataAccelerator: Send + Sync {
         }))
     }
 
-    /// A `refresh_mode: snapshot` dataset is serving `provider`: the runtime
-    /// calls this after the initial provider is installed at registration and
-    /// after each reload's replacement is swapped in — never before a swap, since
-    /// the replaced provider keeps serving if the swap is refused. An engine that
-    /// keeps per-snapshot state on disk reclaims here what the installed snapshot
-    /// no longer references. The default does nothing.
-    async fn snapshot_installed(
+    /// Perform the engine's maintenance after a snapshot was restored and
+    /// `provider` serves it: after the initial provider is installed, and after
+    /// each reload's replacement is swapped in — never before a swap, since the
+    /// replaced provider keeps serving if the swap is refused. The default does
+    /// nothing.
+    async fn maintain_after_snapshot_restore(
         &self,
         _source: &dyn AccelerationSource,
         _provider: &Arc<dyn TableProvider>,
