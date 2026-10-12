@@ -1121,6 +1121,74 @@ fn the_write_rate_line_names_the_dataset_the_times_and_the_docs() {
     );
 }
 
+#[test]
+fn the_small_host_line_names_the_dataset_the_cores_and_the_docs() {
+    assert_eq!(
+        auto_small_host_message("orders", 4),
+        "Dataset 'orders' keeps incremental cleanup: on the 4 CPU cores this runtime \
+         uses, keeping it fully compacted would slow its writes, so its reads filter \
+         recent updates and deletes until background compaction folds them in. See: \
+         https://spiceai.org/docs/components/data-accelerators/cayenne#deletion-strategies"
+    );
+}
+
+/// On a host with too few cores to keep a table compacted whole alongside its
+/// writes, an auto table keeps key deletes at its first whole-table rewrite,
+/// however slowly it is written and however quickly it rewrites; on a larger host
+/// the same rewrite commits. The write rule runs as `spiced` runs it, against an
+/// interval of ten seconds, well within the rewrite's share.
+#[tokio::test]
+async fn a_first_rewrite_keeps_key_deletes_on_a_small_host_only() {
+    let keys: Vec<i64> = (0..16).collect();
+    for (name, small_host_cores, expect_positions, expect_path) in [
+        (
+            "auto_first_rewrite_small_host",
+            Some(4),
+            false,
+            LastSmallFileCompactPath::None,
+        ),
+        (
+            "auto_first_rewrite_large_host",
+            None,
+            true,
+            LastSmallFileCompactPath::Full,
+        ),
+    ] {
+        let (provider, _catalog, _tmp) = table(name, DeletionMode::Auto, 256).await;
+        let auto = Arc::clone(provider.pk_deletion_mode.auto().expect("an auto table"));
+        provider.pin_auto_write_rate_rule(AutoWriteRateRule::Measured);
+        auto.note_delete(
+            Instant::now()
+                .checked_sub(Duration::from_secs(10))
+                .expect("ten seconds ago is representable"),
+        );
+        auto.on_small_host(small_host_cores);
+        write(&provider, &keys, 100).await;
+        write(&provider, &keys, 200).await;
+        provider
+            .compact_current_snapshot_small_files()
+            .await
+            .expect("reclaim pass");
+        assert_eq!(
+            provider.should_capture_positions(),
+            expect_positions,
+            "{name}: position deletes after the first whole-table rewrite"
+        );
+        assert_eq!(
+            provider.last_small_file_compact_path(),
+            expect_path,
+            "{name}: whether the first whole-table rewrite committed"
+        );
+        let ctx = SessionContext::new();
+        let rows = collect_id_value_pairs(&ctx, &provider, name).await;
+        let expected: Vec<(i64, i64)> = keys.iter().map(|id| (*id, 200)).collect();
+        assert_eq!(
+            rows, expected,
+            "{name}: every key shows its latest row, once"
+        );
+    }
+}
+
 /// The write rate an auto table's first whole-table rewrite is measured against
 /// starts at its first delete, which the compaction pass that follows the write
 /// that recorded it notes, whichever write path recorded it.

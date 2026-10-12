@@ -62,7 +62,9 @@ use super::on_conflict::{
     RowCountExactnessTaintingDeletionSink, RowKeyDeletionDelta, ShardedApplyBatches,
     ShardedApplyResult, pk_deletion_snapshot_for_strategy,
 };
-use super::pk_deletion_mode::{AutoDeletionMode, AutoWriteRateRule, PkDeletionMode};
+use super::pk_deletion_mode::{
+    AutoDeletionMode, AutoWriteRateRule, KeyDeletesReason, PkDeletionMode,
+};
 use super::pk_index::{
     BoundedShardedPkIndexBuilder, COLD_PK_BLOOM_PER_FILE_MAX_BYTES, CachedPkIndex, CachedPkKeyset,
     CheckedOutShardedPkIndex, ColdPkExistence, PK_INDEX_PERSIST_MAX_BYTES, PendingPkExistence,
@@ -13653,21 +13655,24 @@ impl CayenneTableProvider {
         true
     }
 
-    /// [`Self::switch_auto_to_key_deletes`] for a table whose whole-table rewrite
-    /// took more than its tenth of the time at its write rate, before any such
+    /// [`Self::switch_auto_to_key_deletes`] for a table whose first whole-table
+    /// rewrite would cost its writes too much, for `reason`, before any such
     /// rewrite committed. Its reads do not change, but it never gets the compacted
     /// layout its size qualified it for, so it says why once at `info`.
-    fn switch_auto_to_key_deletes_for_write_rate(&self, took: Duration, interval: Duration) {
+    fn switch_auto_to_key_deletes_for_rewrite_cost(
+        &self,
+        took: Duration,
+        reason: KeyDeletesReason,
+    ) {
         if self.switch_auto_to_key_deletes_unlogged().is_some() {
-            tracing::info!(
-                target: "cayenne::compaction",
-                "{}",
-                auto_outpaced_by_writes_message(
-                    self.table_metadata.table_name.as_str(),
-                    took,
-                    interval,
-                )
-            );
+            let dataset = self.table_metadata.table_name.as_str();
+            let message = match reason {
+                KeyDeletesReason::WriteRate { interval } => {
+                    auto_outpaced_by_writes_message(dataset, took, interval)
+                }
+                KeyDeletesReason::Host { cores } => auto_small_host_message(dataset, cores),
+            };
+            tracing::info!(target: "cayenne::compaction", "{message}");
         }
     }
 
@@ -24355,22 +24360,23 @@ impl CayenneTableProvider {
         // briefly blocks scans/appends, but the expensive work (scan + encode)
         // already completed off-fence.
         // An `auto` table on position deletes whose rows are all still in protected
-        // snapshots can stay where the incremental bake reaches them. If rewriting
-        // it whole took more than its tenth of the time at the table's write rate,
-        // the pace would hold every such rewrite back, so discard this one and move
-        // the table to key deletes instead of committing it to the compacted layout
-        // that only the paced rewrite would then reclaim.
+        // snapshots can stay where the incremental bake reaches them. If keeping it
+        // compacted whole costs its writes too much — the rewrite took more than its
+        // tenth of the time at the table's write rate, which the pace would hold
+        // every such rewrite back to, or the host has too few cores — discard this
+        // one and move the table to key deletes instead of committing it to the
+        // compacted layout that only the paced rewrite would then reclaim.
         if rows_all_protected
             && let Some(auto) = self.pk_deletion_mode.auto()
             && auto.uses_positions()
         {
             let took = compaction_start.elapsed();
-            if let Some(interval) = auto.rewrite_outpaces_writes(compaction_start, took) {
+            if let Some(reason) = auto.rewrite_keeps_key_deletes(compaction_start, took) {
                 self.cleanup_failed_compaction_snapshot(&new_snapshot_id, is_s3)
                     .await;
                 // The caller holds `compaction_lock`, as every caller of this
                 // rewrite does.
-                self.switch_auto_to_key_deletes_for_write_rate(took, interval);
+                self.switch_auto_to_key_deletes_for_rewrite_cost(took, reason);
                 maintenance_metrics::track_compaction(
                     table_name,
                     CompactionKind::Full,
@@ -40805,6 +40811,14 @@ fn auto_switched_to_key_deletes_message(dataset: &str, max_position_bytes: u64) 
 /// The line a table logs, once, when `deletion_mode: auto` keeps it on key deletes
 /// because rewriting it whole took `took` against `interval` of writes, more than
 /// the tenth of the time it allows such rewrites.
+/// The `info` line a `deletion_mode: auto` table logs when the host's `cores` CPU
+/// cores are too few to keep it compacted whole alongside its writes.
+fn auto_small_host_message(dataset: &str, cores: usize) -> String {
+    format!(
+        "Dataset '{dataset}' keeps incremental cleanup: on the {cores} CPU cores this runtime uses, keeping it fully compacted would slow its writes, so its reads filter recent updates and deletes until background compaction folds them in. See: https://spiceai.org/docs/components/data-accelerators/cayenne#deletion-strategies"
+    )
+}
+
 fn auto_outpaced_by_writes_message(dataset: &str, took: Duration, interval: Duration) -> String {
     format!(
         "Dataset '{dataset}' is written too fast to keep fully compacted: rewriting it whole took {} ms for every {} ms of writes, more than a tenth of the time, so it keeps incremental cleanup and its reads filter recent updates and deletes until background compaction folds them in. See: https://spiceai.org/docs/components/data-accelerators/cayenne#deletion-strategies",

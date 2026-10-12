@@ -1205,6 +1205,15 @@ impl CpuBudget {
         self.cores
     }
 
+    /// Whether Cayenne's `deletion_mode: auto` may keep a small primary-key table
+    /// on position deletes, compacted whole alongside its writes. On four cores a
+    /// 200K-row table under 2,000 upserts every 250 ms wrote at a P99 4% above
+    /// key deletes' on position deletes, while its reads gained nothing over them.
+    #[must_use]
+    pub const fn cayenne_keeps_small_tables_compacted(&self) -> bool {
+        self.cores >= 8
+    }
+
     /// Connections in the Cayenne `SQLite` metastore pool. Capped at 32 because
     /// each connection carries its own mmap and page cache; floored at 2 so a
     /// single-core host still has a slot for read-while-write.
