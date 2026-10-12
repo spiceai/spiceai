@@ -511,6 +511,7 @@ mod tests {
     }
 
     #[test]
+    #[expect(clippy::float_cmp)]
     fn latency_uses_the_source_commit_time_when_the_batch_has_one() {
         assert_eq!(delivery_latency_ms(Some(1_000), 5_000, 1_500), 500.0);
         assert_eq!(

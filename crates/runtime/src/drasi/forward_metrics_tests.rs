@@ -407,9 +407,10 @@ async fn queue_for(
 async fn wait_for(mut ready: impl FnMut() -> bool, what: &str) {
     let start = Instant::now();
     while !ready() {
-        if start.elapsed() > Duration::from_secs(15) {
-            panic!("timed out waiting until {what}");
-        }
+        assert!(
+            start.elapsed() <= Duration::from_secs(15),
+            "timed out waiting until {what}"
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
