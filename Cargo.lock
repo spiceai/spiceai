@@ -6536,6 +6536,8 @@ dependencies = [
  "object_store 0.13.2",
  "serde_json",
  "snafu",
+ "tempfile",
+ "tokio",
  "tracing",
 ]
 

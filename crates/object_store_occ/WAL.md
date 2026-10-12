@@ -124,7 +124,10 @@ stable snapshots, deterministic model histories, paged checkpoints, exact retrie
 lost responses, cancellation, delayed writes, corruption and resource bounds.
 Its subprocess test exits around the publication boundary and recovers from real
 local files. This exercises process termination, not machine power loss.
-The existing S3 suites require explicit credentials and bucket configuration.
+`s3_integration` runs the conditional-write primitives against the S3-compatible
+store named by `AWS_S3_BUCKET` and `AWS_S3_PREFIX`, with the endpoint and
+credentials in the usual `AWS_*` variables; without `AWS_S3_BUCKET` every test
+returns immediately.
 
 
 The process-level harness starts independent writer, reader and checkpoint
@@ -178,8 +181,65 @@ records version, requests and results in JSONL, and deletes only that hash on
 exit. It never flushes the service or restarts an existing server. Passing
 `--redis-url` requires Redis to be available; a missing oracle fails the run.
 
-`.github/workflows/object_store_wal.yml` runs these suites and the mandatory
-SlateDB oracle on Linux and macOS for changes to this crate and in the merge queue.
-Linux also requires Redis 7.4.11 in a health-checked service container; GitHub
-service containers are unavailable on macOS. Both oracles are test dependencies.
-This qualifies the library path; it is not a Cayenne/runtime integration test.
+By default each history keeps its WAL in a local directory under the artifacts.
+`--store s3://bucket/prefix` runs every history through the S3 client instead,
+against any S3-compatible service configured through the `AWS_*` variables. Each
+run takes a fresh namespace under the prefix, because a namespace is never
+reused. Before the first history the harness probes the store and fails unless
+it refuses both a duplicate create and an update at a stale ETag: a store that
+ignores the condition passes single-writer histories and loses writes only under
+concurrency. When the run ends, its objects are copied into the artifacts. The
+oracles stay local.
+
+```sh
+docker run --rm -d --name spice-wal-rustfs -p 127.0.0.1:9000:9000 \
+  -e RUSTFS_ACCESS_KEY=spice-wal -e RUSTFS_SECRET_KEY=spice-wal-secret \
+  rustfs/rustfs:1.0.1 /data
+export AWS_ENDPOINT=http://127.0.0.1:9000 AWS_ALLOW_HTTP=true AWS_REGION=us-east-1 \
+  AWS_ACCESS_KEY_ID=spice-wal AWS_SECRET_ACCESS_KEY=spice-wal-secret
+# Once the server answers, create the bucket.
+curl -fsS -X PUT --aws-sigv4 aws:amz:us-east-1:s3 --user spice-wal:spice-wal-secret \
+  -H 'x-amz-content-sha256: e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855' \
+  "$AWS_ENDPOINT/wal"
+AWS_S3_BUCKET=wal AWS_S3_PREFIX=dev/s3_integration \
+  cargo test --profile dev -p object_store_occ --test s3_integration
+/tmp/wal-oracle/bin/python test/object_store_occ/e2e.py \
+  --driver target/debug/examples/wal_test_driver \
+  --artifacts /tmp/wal-e2e-rustfs --slatedb --store s3://wal/dev
+target/debug/examples/wal_test_driver --purge s3://wal/dev
+docker stop spice-wal-rustfs
+```
+
+Nothing collects a finished run's objects, so `wal_test_driver --purge` deletes
+every object under an `s3://` prefix; it refuses a bare bucket.
+
+`.github/workflows/object_store_wal.yml` runs on the self-hosted pools:
+`spiceai-dev-runners` for Linux, and for macOS whichever Mac is free first in
+`spiceai-macos` or `spiceai-macos-large`. It runs for
+changes to this crate, its harness, the workflow, the workspace manifest and
+lockfile, or the toolchain, in pull requests and in the merge queue. A pull
+request from a fork or from Dependabot runs no leg, since its code would run on
+those persistent runners before review; the merge queue runs them. Every leg
+runs in parallel, each with the mandatory SlateDB oracle:
+
+| Store | Linux | macOS |
+| --- | --- | --- |
+| Local directory | ✓ | ✓ |
+| MinIO | `cgr.dev/chainguard/minio` container | RELEASE.2025-10-15T17-29-55Z, built without cgo |
+| RustFS 1.0.1 | `rustfs/rustfs` container | release binary |
+| spiceio | not available | built from spiceai/spiceio@35977eac |
+
+The local-directory legs also run the in-process suites above, and the
+object-store legs run `s3_integration`. Linux legs add Redis 7.4.11 in a
+health-checked service container; GitHub service containers are unavailable on
+macOS. spiceio fronts the CI NAS's SMB share through macOS CommonCrypto, so it
+has no Linux leg. It refuses conditional writes outside `SPICEIO_STRICT_PREFIXES`,
+so the leg sets one over its namespace, turns off write-back and the disk spill,
+and purges its objects at the end. spiceio keeps a permanent lock record for each
+key ever written under a strict prefix, so each run leaves about a thousand
+records in the share's `.spiceio-locks/`, which nothing may remove. The spiceio
+leg therefore runs only for changes to this crate, its harness or the workflow,
+and when the workflow is dispatched by hand. Dependency-only changes run the
+other legs. The spiceio leg needs the `UNAS_SMB_PASS` secret and does not run
+without it. Both oracles are test dependencies. This qualifies the
+library path; it is not a Cayenne/runtime integration test.
