@@ -375,7 +375,10 @@ impl Service {
                     .await
                 {
                     tracing::warn!(
-                        "Failed to write OpenTelemetry metrics to metrics store {table}: {e}"
+                        "Failed to write OpenTelemetry metrics to metrics store dataset '{table}': {e}. \
+                        This export falls back to per-metric datasets, so metrics without a writable \
+                        per-metric dataset are rejected and the exporter is asked to retry. \
+                        Check that '{table}' is loaded and writable (`access: read_write`)."
                     );
                     failed = true;
                 }
