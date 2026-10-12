@@ -245,14 +245,16 @@ impl MetricsService for Service {
         // An export carrying no data points at all (e.g. only metrics with no data) rejected
         // nothing, so it succeeds; only an export that had data points and lost all of them is
         // a failed export.
+        if store_outcome == StoreOutcome::Failed {
+            // The store failed to write, which is not the client's fault. Fail the export
+            // even if per-metric datasets took some points, so exporters retry and the store
+            // is not left missing data. A retry may write those per-metric points again;
+            // a duplicate is preferable to a silent gap in the all-metrics store.
+            return Err(Status::unavailable(
+                "Failed to write to the OpenTelemetry metrics store; retry the export",
+            ));
+        }
         if total_data_points > 0 && rejected_data_points >= total_data_points {
-            if store_outcome == StoreOutcome::Failed {
-                // The store failed to write, which is not the client's fault: tell exporters
-                // to retry instead of dropping the export as invalid.
-                return Err(Status::unavailable(
-                    "Failed to write to the OpenTelemetry metrics store; retry the export",
-                ));
-            }
             return Err(Status::invalid_argument("All data points were rejected"));
         }
 
