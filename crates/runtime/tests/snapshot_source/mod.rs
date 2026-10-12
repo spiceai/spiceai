@@ -1298,8 +1298,12 @@ async fn wait_for_snapshot_dirs(data_dir: &Path, expected: usize) -> Result<BTre
 }
 
 fn csv_with_rows(rows: usize) -> String {
-    let rows: String = (1..=rows).map(|id| format!("{id},row{id}\n")).collect();
-    format!("id,name\n{rows}")
+    use std::fmt::Write as _;
+    let mut csv = String::from("id,name\n");
+    for id in 1..=rows {
+        writeln!(csv, "{id},row{id}").expect("writing to a String cannot fail");
+    }
+    csv
 }
 
 async fn reclaim_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
