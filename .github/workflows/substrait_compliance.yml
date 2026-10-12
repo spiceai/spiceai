@@ -167,7 +167,10 @@ jobs:
     # over the same tables, and each layout to the default layout: a case that
     # passes there and not here fails the job.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: spiceai-macos
+    # Linux, unlike Mode A: `setup-spiced` downloads the trunk build from the
+    # in-cluster MinIO, which only these runners can resolve, and the trunk
+    # builds stored there are linux-x86_64 only.
+    runs-on: spiceai-dev-runners
     timeout-minutes: 180
     strategy:
       fail-fast: false
@@ -210,8 +213,6 @@ jobs:
           - engine: none
             mode: file
             layouts: ''
-    env:
-      HAS_SPICEIO_SECRET: ${{ secrets.UNAS_SMB_PASS != '' }}
     steps:
       - name: Checkout spiceai
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -233,27 +234,12 @@ jobs:
       - name: Install Protoc
         uses: ./.github/actions/install-protoc
 
-      - name: Set up spiceio
-        if: runner.os == 'macOS' && env.HAS_SPICEIO_SECRET == 'true'
-        id: setup-spiceio
-        uses: spiceai/spiceio/.github/actions/setup@dd13a600d4af72fb179563000674f76812208534 # v0.11.0 assets; no gh; strips Authorization on cross-host redirect
-        with:
-          smb-url: smb://runner@192.168.3.148/ai_platform_dev
-          smb-pass: ${{ secrets.UNAS_SMB_PASS }}
-          token: ${{ github.token }}
-          bucket: sccache
-          region: us-west-1
-          immutable-objects: "true"
-          otel-endpoint: spicehq/spiceio
-          otel-api-key: ${{ secrets.SCP_SPICEHQ_SPICEIO_API_KEY }}
-          otel-region: us-west-2
-          instance-id: ci-${{ github.run_id }}-${{ github.job }}
-          machine: ${{ runner.name }}
-
       - name: Set up sccache
         uses: ./.github/actions/setup-sccache
         with:
-          spiceio_endpoint: ${{ steps.setup-spiceio.outputs.endpoint }}
+          minio_endpoint: ${{ secrets.TEST_MINIO_ENDPOINT }}
+          minio_access_key: ${{ secrets.TEST_MINIO_ACCESS_KEY }}
+          minio_secret_key: ${{ secrets.TEST_MINIO_SECRET_KEY }}
 
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
@@ -297,7 +283,3 @@ jobs:
           name: substrait-compliance-mode-b-tpch-${{ matrix.engine }}-${{ matrix.mode }}
           path: tools/substrait-compliance/results/mode-b
           if-no-files-found: warn
-
-      - name: Kill spiceio
-        if: always() && runner.os == 'macOS' && steps.setup-spiceio.outputs.pid != ''
-        run: kill ${{ steps.setup-spiceio.outputs.pid }} || true
