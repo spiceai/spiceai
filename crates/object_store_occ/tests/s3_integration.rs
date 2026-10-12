@@ -33,7 +33,6 @@ limitations under the License.
 #![allow(clippy::expect_used)]
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use object_store::ObjectStore;
 use object_store::ObjectStoreExt;
@@ -69,15 +68,15 @@ fn create_store() -> Option<Arc<dyn ObjectStore>> {
 
 fn get_test_prefix() -> String {
     let base_prefix = std::env::var("AWS_S3_PREFIX").unwrap_or_default();
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| d.as_millis());
+    // The tests run in parallel, and several can start within one millisecond.
+    // A v7 UUID keeps the prefixes in time order and makes each one unique.
+    let id = uuid::Uuid::now_v7();
 
     if base_prefix.is_empty() {
-        format!("object_store_occ_test/{timestamp}/")
+        format!("object_store_occ_test/{id}/")
     } else {
         let base = base_prefix.trim_end_matches('/');
-        format!("{base}/object_store_occ_test/{timestamp}/")
+        format!("{base}/object_store_occ_test/{id}/")
     }
 }
 

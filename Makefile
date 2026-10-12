@@ -160,15 +160,13 @@ endif
 # out: spiced's enrollment client does not trust the test's HTTPS mock, on Linux
 # or macOS, because nothing gives it the test's certificate authority.
 #
-# `llms`'s `anthropic_stream_errors` and `list_models_errors` are selected by
-# name for the same reason: each stands a local one-shot HTTP server up on an
+# `llms`'s `anthropic_stream_errors` and `list_models_errors` modules are
+# selected for the same reason: each stands a local one-shot HTTP server up on an
 # ephemeral port and drives a provider adapter against it, so they exercise the
-# real client's error mapping with no credentials and no external service.
-# `model2vec_hf_cache` is selected for a different reason: it is its own binary
-# because it sets a process-wide environment variable, which is only sound with
-# one test in the process.
-# `llms`'s remaining `kind(=test)` binary, `integration`, calls the live
-# provider APIs and needs a `.env`, so it stays in the nightly gate.
+# real client's error mapping with no credentials and no external service, as
+# does `model2vec_hf_cache` against a local Hugging Face cache. They are modules
+# of `llms`'s `integration` binary; its `llms` module calls the live provider
+# APIs and needs a `.env`, so it stays in the nightly gate.
 #
 # `vortex-datafusion`'s integration tests are offline: they install the
 # process-wide segment cache and measure the footer cache's heap through a
@@ -237,7 +235,7 @@ print-rust-gate-features:
 # `runtime`'s `integration` binary on purpose: selecting any test there makes
 # nextest execute that binary to list it, and its debug build on macOS is too
 # large to load (dyld aborts before `main`, failing the whole run).
-NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + kind(=bin) + (package(=runtime) & binary(=rate_control)) + (package(=runtime) & binary(=cayenne_runtime_tuning)) + (package(=cayenne) & kind(=test)) + (package(=runtime-acceleration) & binary(=optional_snapshot_files)) + (binary_id(=data_components::integration) & test(=every_test_file_is_compiled)) + (package(=vortex-datafusion) & kind(=test)) + (package(=runtime-cloud-connect) & kind(=test)) + (package(=spice) & binary(=cli_integration)) + (package(=spice) & binary(=connect_service_cli)) + (package(=llms) & binary(=anthropic_stream_errors)) + (package(=llms) & binary(=list_models_errors)) + (package(=llms) & binary(=model2vec_hf_cache)) + binary(=metrics) + (package(=testoperator) & (test(=commands::tests::benchmark_dispatches_validate_results_against_an_oracle) | test(=commands::tests::nextest_filter_selects_the_oracle_dispatch_guard_by_its_rustc_name))) + (package(=runtime-udfs-api) & binary(=json_semantics)) + (package(=connector-adbc) & binary(=adbc_cancellation)) + (binary_id(=spiced::integration) - test(/^cloud_connect_bootstrap::/))
+NEXTEST_FILTER := kind(=lib) + kind(=proc-macro) + kind(=bin) + (package(=runtime) & binary(=rate_control)) + (package(=runtime) & binary(=cayenne_runtime_tuning)) + (package(=cayenne) & kind(=test)) + (package(=runtime-acceleration) & binary(=optional_snapshot_files)) + (binary_id(=data_components::integration) & test(=every_test_file_is_compiled)) + (package(=vortex-datafusion) & kind(=test)) + (package(=runtime-cloud-connect) & kind(=test)) + (package(=spice) & binary(=cli_integration)) + (package(=spice) & binary(=connect_service_cli)) + binary(=metrics) + (package(=testoperator) & (test(=commands::tests::benchmark_dispatches_validate_results_against_an_oracle) | test(=commands::tests::nextest_filter_selects_the_oracle_dispatch_guard_by_its_rustc_name))) + (package(=runtime-udfs-api) & binary(=json_semantics)) + (package(=connector-adbc) & binary(=adbc_cancellation)) + (binary_id(=llms::integration) & (test(/^(anthropic_stream_errors|list_models_errors|model2vec_hf_cache)::/) | test(=every_test_file_is_compiled))) + (binary_id(=spiced::integration) - test(/^cloud_connect_bootstrap::/))
 # Extra narrowing for callers that can't run everything (CI lacks credentials
 # for some tests). It has to *intersect* the expression above rather than sit
 # beside it: nextest unions repeated `-E` flags, so a second `-E 'not (…)'` would
