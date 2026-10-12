@@ -1002,8 +1002,10 @@ impl CayenneTableProvider {
         } else {
             super::write_budget::encode_budget_snapshot()
                 .and_then(|budget| usize::try_from(budget.total).ok())
-                .map(super::write_budget::maintenance_gate_cap)
-                .unwrap_or(write.target_partitions)
+                .map_or(
+                    write.target_partitions,
+                    super::write_budget::maintenance_gate_cap,
+                )
                 .max(1)
         };
         let folds: Vec<FileFold<'_>> = superseded
