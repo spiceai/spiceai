@@ -102,10 +102,18 @@ fn identity(parts: &[(String, u8, Vec<u8>)]) -> String {
     hasher.update(&u64::try_from(parts.len()).unwrap_or(u64::MAX).to_le_bytes());
     for (key, kind, payload) in parts {
         let key_bytes = key.as_bytes();
-        hasher.update(&u64::try_from(key_bytes.len()).unwrap_or(u64::MAX).to_le_bytes());
+        hasher.update(
+            &u64::try_from(key_bytes.len())
+                .unwrap_or(u64::MAX)
+                .to_le_bytes(),
+        );
         hasher.update(key_bytes);
         hasher.update(&[*kind]);
-        hasher.update(&u64::try_from(payload.len()).unwrap_or(u64::MAX).to_le_bytes());
+        hasher.update(
+            &u64::try_from(payload.len())
+                .unwrap_or(u64::MAX)
+                .to_le_bytes(),
+        );
         hasher.update(payload);
     }
     hasher.finalize().to_hex().to_string()
