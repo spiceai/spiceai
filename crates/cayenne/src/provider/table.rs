@@ -55623,31 +55623,35 @@ mod tests {
         // Invalidate the listing cache without anything else changing, so scans
         // keep being served the same view. Its listing belongs to the previous
         // epoch and must not answer them; each scan builds its own instead.
-        let invalidations: [(&str, fn(&CayenneTableProvider)); 2] = [
-            ("listing-cache epoch", |provider| {
-                provider.drop_cached_snapshot_listing()
-            }),
-            ("directory generation", |provider| {
-                provider
-                    .current_dir_generation
-                    .fetch_add(1, Ordering::AcqRel);
-            }),
-        ];
-        for (what, invalidate) in invalidations {
-            invalidate(&provider);
-            for scan in 1..=2 {
-                let builds = snapshot_listing_builds(&provider);
-                assert_eq!(lookup_value(&provider, &ctx, 7).await, vec![72]);
-                assert!(
-                    Arc::ptr_eq(&latest_scan_view(&provider), &second),
-                    "the scan is served the view whose {what} moved"
-                );
-                assert_eq!(
-                    snapshot_listing_builds(&provider) - builds,
-                    1,
-                    "scan {scan} after the {what} moved must not use the view's listing"
-                );
-            }
+        provider.drop_cached_snapshot_listing();
+        assert_scans_bypass_view_listing(&provider, &ctx, &second, "listing-cache epoch").await;
+        provider
+            .current_dir_generation
+            .fetch_add(1, Ordering::AcqRel);
+        assert_scans_bypass_view_listing(&provider, &ctx, &second, "directory generation").await;
+    }
+
+    /// Two scans each served `view`, whose `what` has moved since it was built,
+    /// read the right rows and each build their own listing rather than using
+    /// the view's.
+    async fn assert_scans_bypass_view_listing(
+        provider: &Arc<CayenneTableProvider>,
+        ctx: &SessionContext,
+        view: &Arc<ScanView>,
+        what: &str,
+    ) {
+        for scan in 1..=2 {
+            let builds = snapshot_listing_builds(provider);
+            assert_eq!(lookup_value(provider, ctx, 7).await, vec![72]);
+            assert!(
+                Arc::ptr_eq(&latest_scan_view(provider), view),
+                "the scan is served the view whose {what} moved"
+            );
+            assert_eq!(
+                snapshot_listing_builds(provider) - builds,
+                1,
+                "scan {scan} after the {what} moved must not use the view's listing"
+            );
         }
     }
 
