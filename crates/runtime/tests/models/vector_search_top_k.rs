@@ -20,7 +20,7 @@ limitations under the License.
 //! Embeddings come from a local OpenAI-compatible stub whose vectors are a fixed function of the
 //! text, so the expected ranking is computed here, independently of the runtime.
 
-use std::{collections::HashMap, net::SocketAddr, sync::Arc};
+use std::{collections::HashMap, fmt::Write as _, net::SocketAddr, sync::Arc};
 
 use anyhow::Context as _;
 use app::AppBuilder;
@@ -130,7 +130,7 @@ fn write_datasets(dir: &std::path::Path) -> Result<(), anyhow::Error> {
     for (part, rows) in DOCS.iter().enumerate() {
         let mut csv = String::from("id,body\n");
         for (id, body) in *rows {
-            csv.push_str(&format!("{id},{body}\n"));
+            writeln!(csv, "{id},{body}")?;
         }
         std::fs::write(chunked.join(format!("part{part}.csv")), csv)?;
 
