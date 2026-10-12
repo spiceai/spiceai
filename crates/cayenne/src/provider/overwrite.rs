@@ -69,7 +69,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::execution::SendableRecordBatchStream;
-use futures::{StreamExt, TryStreamExt};
+use futures::StreamExt;
 use tokio::sync::{OwnedMutexGuard, OwnedSemaphorePermit};
 
 use super::Result;
@@ -1038,10 +1038,15 @@ impl CayenneTableProvider {
                 fold
             })
             .collect();
-        let rewritten: Vec<(u64, Arc<ColumnStatsAccumulator>)> = futures::stream::iter(folds)
-            .buffer_unordered(in_flight)
-            .try_collect()
-            .await?;
+        // Every fold runs to its end before the first error is returned: a
+        // fold dropped mid-write could leave its writer finishing files in the
+        // snapshot while the caller's error path removes it.
+        let outcomes: Vec<Result<(u64, Arc<ColumnStatsAccumulator>)>> =
+            futures::stream::iter(folds)
+                .buffer_unordered(in_flight)
+                .collect()
+                .await;
+        let rewritten = outcomes.into_iter().collect::<Result<Vec<_>>>()?;
         let rewritten_rows: u64 = rewritten.iter().map(|(rows, _)| rows).sum();
         self.remove_snapshot_files(
             snapshot_id,
