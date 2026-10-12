@@ -532,7 +532,7 @@ fn handle_iceberg_error(e: iceberg::Error) -> Error {
 /// named in.
 #[cfg(test)]
 mod tests {
-    use datafusion::arrow::array::AsArray as _;
+    use datafusion::arrow::array::{AsArray as _, RecordBatch};
     use datafusion::arrow::datatypes::Int64Type;
     use datafusion::physical_plan::collect;
     use datafusion::prelude::{SessionConfig, SessionContext};
@@ -739,11 +739,11 @@ mod tests {
             .expect("scan plans");
         let batches = collect(plan, ctx.task_ctx()).await.expect("scan executes");
         assert_eq!(
-            batches.iter().map(|batch| batch.num_rows()).sum::<usize>(),
+            batches.iter().map(RecordBatch::num_rows).sum::<usize>(),
             20_000
         );
         assert_eq!(
-            batches.iter().map(|batch| batch.num_rows()).max(),
+            batches.iter().map(RecordBatch::num_rows).max(),
             Some(batch_size)
         );
         let mut ids: Vec<i64> = batches
