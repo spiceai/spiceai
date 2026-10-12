@@ -431,6 +431,11 @@ async fn deletion_mode_steady_state_harness() -> Result<(), Box<dyn std::error::
 /// small-write profile: protected-snapshot trigger 4, 60 s age, 10 s interval).
 /// Write latency is measured from each write's SCHEDULED start, so a write that
 /// waits behind a maintenance pass holding the write lock is charged for the wait.
+///
+/// A closed-loop reader issues more queries the faster they run, and on a host
+/// with few cores those queries take CPU from the writer. `HARNESS_READ_INTERVAL_MS`
+/// starts each round of the four queries at a fixed rate instead, so two builds
+/// whose reads differ in speed are compared at the same read load.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "timing harness; run explicitly with HARNESS_* variables"]
 async fn deletion_mode_concurrent_harness() -> Result<(), Box<dyn std::error::Error>> {
@@ -447,6 +452,9 @@ async fn deletion_mode_concurrent_harness() -> Result<(), Box<dyn std::error::Er
     // `append` seeds through upserts, into protected snapshots; `overwrite` seeds
     // through one replace, into the current snapshot, as a full refresh does.
     let seed_op = env_string("HARNESS_SEED_OP", "append");
+    // 0: the reader runs closed-loop. Otherwise a round of reads starts every
+    // this many milliseconds.
+    let read_interval_ms = env_usize("HARNESS_READ_INTERVAL_MS", 0) as u64;
 
     let fixture = common::TestFixture::new(common::BackendType::Sqlite).await?;
     let schema = schema();
@@ -477,7 +485,7 @@ async fn deletion_mode_concurrent_harness() -> Result<(), Box<dyn std::error::Er
     table.spawn_background_compaction(Arc::new(tokio::sync::Semaphore::new(2)));
     ctx.register_table("t", Arc::clone(&table) as Arc<dyn TableProvider>)?;
     eprintln!(
-        "HARNESS mode={mode_label} config concurrent rows={rows} round_keys={round_keys} write_interval_ms={write_interval_ms} duration_s={duration_s} seed={seed} pattern={pattern} trigger={trigger}"
+        "HARNESS mode={mode_label} config concurrent rows={rows} round_keys={round_keys} write_interval_ms={write_interval_ms} duration_s={duration_s} seed={seed} pattern={pattern} trigger={trigger} read_interval_ms={read_interval_ms}"
     );
 
     let mut next = 0usize;
@@ -553,7 +561,15 @@ async fn deletion_mode_concurrent_harness() -> Result<(), Box<dyn std::error::Er
             let mut point = Vec::new();
             let mut count = Vec::new();
             let mut explained = !explain;
+            let mut next_round = Instant::now();
             while Instant::now() < deadline {
+                if read_interval_ms > 0 {
+                    let now = Instant::now();
+                    if now < next_round {
+                        tokio::time::sleep(next_round - now).await;
+                    }
+                    next_round += Duration::from_millis(read_interval_ms);
+                }
                 if !explained && Instant::now() >= midpoint {
                     explained = true;
                     let plan = run_query(

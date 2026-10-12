@@ -1595,6 +1595,7 @@ sum by (kind, outcome) (rate(cayenne_compaction_outcome_total{outcome=~"declined
 | `declined_no_qualifying_tier` | no size tier has accumulated enough runs |
 | `declined_sizing_failed` | an input could not be sized, and an unknown size cannot count as free against a memory ceiling |
 | `declined_no_clean_prefix` | a live snapshot is not clean past the prefix cutoff, so the bake's prune would be withheld and its write amplification wasted |
+| `declined_over_position_bound` | a `deletion_mode: auto` table on position deletes captured more than its position-delete bound for a whole-table reclaim, so it moved to key deletes instead of rewriting itself whole |
 | `declined_paced` | a `deletion_mode: auto` table's whole-table reclaim is held back by the pace that keeps such reclaims to a tenth of the time, though the deletion index is past its trigger; or its first whole-table reclaim took more than that share, so it was discarded and the table keeps key deletes |
 | `declined_not_configured` | the pass is not configured for this table (no cold-tier location) — a permanent state, so a steady count here is the expected shape |
 

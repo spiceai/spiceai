@@ -24095,7 +24095,7 @@ impl CayenneTableProvider {
                 maintenance_metrics::track_compaction(
                     table_name,
                     CompactionKind::Full,
-                    CompactionOutcome::DeclinedOverPassBudget,
+                    CompactionOutcome::DeclinedOverPositionBound,
                 );
                 return Ok(false);
             }

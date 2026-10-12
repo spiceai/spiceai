@@ -138,6 +138,10 @@ pub(crate) enum CompactionOutcome {
     /// reclaim takes more than that share, which moves the table to key deletes
     /// instead of committing it.
     DeclinedPaced,
+    /// A `deletion_mode: auto` table on position deletes captured more than its
+    /// position-delete bound for a whole-table reclaim, so it moved to key
+    /// deletes instead of rewriting itself whole.
+    DeclinedOverPositionBound,
 }
 
 impl CompactionOutcome {
@@ -168,6 +172,7 @@ impl CompactionOutcome {
         Self::DeclinedSizingFailed,
         Self::DeclinedNoCleanPrefix,
         Self::DeclinedPaced,
+        Self::DeclinedOverPositionBound,
     ];
 
     pub(crate) const fn as_str(self) -> &'static str {
@@ -190,6 +195,7 @@ impl CompactionOutcome {
             Self::DeclinedSizingFailed => "declined_sizing_failed",
             Self::DeclinedNoCleanPrefix => "declined_no_clean_prefix",
             Self::DeclinedPaced => "declined_paced",
+            Self::DeclinedOverPositionBound => "declined_over_position_bound",
         }
     }
 }
