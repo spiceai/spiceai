@@ -287,9 +287,11 @@ impl StoreBuilders {
             &attributes_json,
         ));
         self.attributes.append_value(&attributes_json);
-        self.resource_attributes.append_value(ctx.resource_attributes);
+        self.resource_attributes
+            .append_value(ctx.resource_attributes);
         self.scope_name.append_option(non_empty(ctx.scope_name));
-        self.scope_version.append_option(non_empty(ctx.scope_version));
+        self.scope_version
+            .append_option(non_empty(ctx.scope_version));
         self.value_double.append_option(values.value_double);
         self.value_int.append_option(values.value_int);
         self.count.append_option(values.count);
@@ -529,10 +531,9 @@ mod tests {
     use arrow::datatypes::{Float64Type, Int64Type, UInt64Type};
     use opentelemetry_proto::tonic::common::v1::InstrumentationScope;
     use opentelemetry_proto::tonic::metrics::v1::{
-        ExponentialHistogram, ExponentialHistogramDataPoint, Gauge, Histogram,
-        HistogramDataPoint, Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum, Summary,
-        SummaryDataPoint, exponential_histogram_data_point::Buckets,
-        summary_data_point::ValueAtQuantile,
+        ExponentialHistogram, ExponentialHistogramDataPoint, Gauge, Histogram, HistogramDataPoint,
+        Metric, NumberDataPoint, ResourceMetrics, ScopeMetrics, Sum, Summary, SummaryDataPoint,
+        exponential_histogram_data_point::Buckets, summary_data_point::ValueAtQuantile,
     };
     use opentelemetry_proto::tonic::resource::v1::Resource;
 
@@ -730,7 +731,10 @@ mod tests {
             .as_boolean();
         assert!(monotonic.is_null(0));
         assert!(monotonic.value(1));
-        let unit = batch.column_by_name("unit").expect("col").as_string::<i32>();
+        let unit = batch
+            .column_by_name("unit")
+            .expect("col")
+            .as_string::<i32>();
         assert_eq!(unit.value(2), "s");
         let value_int = batch
             .column_by_name("value_int")
@@ -852,7 +856,10 @@ mod tests {
     fn series_hash_distinguishes_every_identity_part() {
         let base = series_hash("m", "{}", "s", "1", r#"{"a":"1"}"#);
         assert_ne!(base, series_hash("n", "{}", "s", "1", r#"{"a":"1"}"#));
-        assert_ne!(base, series_hash("m", r#"{"x":1}"#, "s", "1", r#"{"a":"1"}"#));
+        assert_ne!(
+            base,
+            series_hash("m", r#"{"x":1}"#, "s", "1", r#"{"a":"1"}"#)
+        );
         assert_ne!(base, series_hash("m", "{}", "t", "1", r#"{"a":"1"}"#));
         assert_ne!(base, series_hash("m", "{}", "s", "2", r#"{"a":"1"}"#));
         assert_ne!(base, series_hash("m", "{}", "s", "1", r#"{"a":"2"}"#));

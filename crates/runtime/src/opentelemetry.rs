@@ -224,8 +224,13 @@ impl MetricsService for Service {
                             .datafusion
                             .is_writable(&TableReference::bare(metric.name.clone()))
                         {
-                            self.ingest_metric(&metric.name, &data, resource_attrs, data_points_count)
-                                .await;
+                            self.ingest_metric(
+                                &metric.name,
+                                &data,
+                                resource_attrs,
+                                data_points_count,
+                            )
+                            .await;
                         }
                         continue;
                     }
@@ -3281,8 +3286,7 @@ mod tests {
     }
 
     fn store_service(engine: &Arc<FakeQueryEngine>, tables: &[&str]) -> Service {
-        let mut service =
-            build_metrics_service(Arc::clone(engine) as Arc<dyn QueryEngine>, None);
+        let mut service = build_metrics_service(Arc::clone(engine) as Arc<dyn QueryEngine>, None);
         service.store_tables_override =
             Some(tables.iter().map(|t| TableReference::from(*t)).collect());
         service

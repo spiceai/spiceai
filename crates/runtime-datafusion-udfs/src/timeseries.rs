@@ -81,7 +81,9 @@ fn f64_lists(array: &ArrayRef) -> Result<Vec<Option<Vec<f64>>>> {
 }
 
 fn f64_values(array: &ArrayRef) -> Result<Float64Array> {
-    Ok(cast(array, &DataType::Float64)?.as_primitive::<Float64Type>().clone())
+    Ok(cast(array, &DataType::Float64)?
+        .as_primitive::<Float64Type>()
+        .clone())
 }
 
 /// Times as Unix nanoseconds. Timestamps of any unit are converted to nanoseconds; integers
@@ -89,7 +91,10 @@ fn f64_values(array: &ArrayRef) -> Result<Float64Array> {
 fn nanos_values(array: &ArrayRef) -> Result<Int64Array> {
     let nanos = match array.data_type() {
         DataType::Timestamp(_, tz) => cast(
-            &cast(array, &DataType::Timestamp(TimeUnit::Nanosecond, tz.clone()))?,
+            &cast(
+                array,
+                &DataType::Timestamp(TimeUnit::Nanosecond, tz.clone()),
+            )?,
             &DataType::Int64,
         )?,
         _ => cast(array, &DataType::Int64)?,
@@ -208,8 +213,18 @@ impl AggregateUDFImpl for HistogramQuantile {
     fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
         Ok(vec![
             Field::new(format_state_name(args.name, "q"), DataType::Float64, true).into(),
-            Field::new(format_state_name(args.name, "bounds"), f64_list_type(), true).into(),
-            Field::new(format_state_name(args.name, "counts"), f64_list_type(), true).into(),
+            Field::new(
+                format_state_name(args.name, "bounds"),
+                f64_list_type(),
+                true,
+            )
+            .into(),
+            Field::new(
+                format_state_name(args.name, "counts"),
+                f64_list_type(),
+                true,
+            )
+            .into(),
         ])
     }
 }
@@ -222,7 +237,12 @@ struct HistogramQuantileAccumulator {
 }
 
 impl HistogramQuantileAccumulator {
-    fn add(&mut self, q: Option<f64>, bounds: Option<Vec<f64>>, counts: Option<Vec<f64>>) -> Result<()> {
+    fn add(
+        &mut self,
+        q: Option<f64>,
+        bounds: Option<Vec<f64>>,
+        counts: Option<Vec<f64>>,
+    ) -> Result<()> {
         if self.q.is_none() {
             self.q = q;
         }
@@ -262,9 +282,10 @@ impl HistogramQuantileAccumulator {
 fn list_scalar(values: Option<&[f64]>) -> ScalarValue {
     match values {
         Some(values) => {
-            let array: ArrayRef = Arc::new(ListArray::from_iter_primitive::<Float64Type, _, _>(
-                [Some(values.iter().map(|v| Some(*v)).collect::<Vec<_>>())],
-            ));
+            let array: ArrayRef =
+                Arc::new(ListArray::from_iter_primitive::<Float64Type, _, _>([Some(
+                    values.iter().map(|v| Some(*v)).collect::<Vec<_>>(),
+                )]));
             ScalarValue::List(Arc::new(array.as_list::<i32>().clone()))
         }
         None => ScalarValue::try_from(&f64_list_type()).unwrap_or(ScalarValue::Null),
@@ -402,7 +423,12 @@ impl AggregateUDFImpl for CounterGrowth {
 
     fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
         Ok(vec![
-            Field::new(format_state_name(args.name, "values"), f64_list_type(), true).into(),
+            Field::new(
+                format_state_name(args.name, "values"),
+                f64_list_type(),
+                true,
+            )
+            .into(),
             Field::new(format_state_name(args.name, "times"), i64_list_type(), true).into(),
         ])
     }
@@ -520,7 +546,11 @@ mod tests {
             let col = cast(batch.column(batch.num_columns() - 1), &DataType::Float64).expect("f64");
             out.extend(col.as_primitive::<Float64Type>().iter());
         }
-        assert!(!out.is_empty(), "{}", pretty_format_batches(&batches).expect("fmt"));
+        assert!(
+            !out.is_empty(),
+            "{}",
+            pretty_format_batches(&batches).expect("fmt")
+        );
         out
     }
 
@@ -542,14 +572,20 @@ mod tests {
         assert!(close(bucket_quantile(0.95, &bounds, &counts), 3.6));
         assert!(close(bucket_quantile(1.0, &bounds, &counts), 4.0));
         // Ranks in the +Inf bucket return the highest finite bound.
-        assert!(close(bucket_quantile(0.99, &bounds, &[0.0, 0.0, 1.0, 9.0]), 4.0));
+        assert!(close(
+            bucket_quantile(0.99, &bounds, &[0.0, 0.0, 1.0, 9.0]),
+            4.0
+        ));
         assert!(bucket_quantile(-0.1, &bounds, &counts).is_infinite());
         assert!(bucket_quantile(1.1, &bounds, &counts).is_sign_positive());
         assert!(bucket_quantile(f64::NAN, &bounds, &counts).is_nan());
         assert!(bucket_quantile(0.5, &bounds, &[0.0; 4]).is_nan());
         assert!(bucket_quantile(0.5, &[], &[1.0]).is_nan());
         // A non-positive lowest bound is returned as is.
-        assert!(close(bucket_quantile(0.1, &[-1.0, 1.0], &[5.0, 5.0, 0.0]), -1.0));
+        assert!(close(
+            bucket_quantile(0.1, &[-1.0, 1.0], &[5.0, 5.0, 0.0]),
+            -1.0
+        ));
     }
 
     #[test]
@@ -643,8 +679,11 @@ mod tests {
     #[tokio::test]
     async fn single_sample_groups_are_null() {
         let ctx = ctx();
-        let got = query_f64(&ctx, "SELECT rate(v, ts) FROM (VALUES (1, 1.0)) AS t(ts, v)").await;
+        let got = query_f64(
+            &ctx,
+            "SELECT rate(v, ts) FROM (VALUES (1, 1.0)) AS t(ts, v)",
+        )
+        .await;
         assert_eq!(got, vec![None]);
     }
-
 }
