@@ -446,6 +446,8 @@ impl OtelToArrowConverter {
         let Some(attributes) = self.attributes_builder.finish() else {
             return Err(ConversionError("Could not convert attributes".into()));
         };
+        let series_id = crate::series_ids(&attributes)
+            .map_err(|e| ConversionError(format!("Could not derive series_id: {e}")))?;
         let Some(data_number) = self.data_number_builder.finish() else {
             return Err(ConversionError("Could not convert data number".into()));
         };
@@ -467,6 +469,7 @@ impl OtelToArrowConverter {
             Arc::new(self.is_monotonic_builder.finish()),
             Arc::new(self.flags_builder.finish()),
             Arc::new(attributes),
+            Arc::new(series_id),
             Arc::new(data_number),
             Arc::new(data_histogram),
         ];

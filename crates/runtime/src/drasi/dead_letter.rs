@@ -43,12 +43,14 @@ limitations under the License.
 //! non-zero count means Drasi's view of that component has a gap.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::Schema;
 use arrow::ipc::reader::FileReader;
 use arrow::ipc::writer::FileWriter;
+use runtime_metrics::drasi::{DrasiForwardMetrics, OUTCOME_DISCARDED};
 use serde::{Deserialize, Serialize};
 use snafu::prelude::*;
 
@@ -70,6 +72,9 @@ struct BatchMetadata {
     op_codes: Vec<String>,
     primary_key_columns: Vec<Vec<String>>,
     source_commit_ts_ms: Option<i64>,
+    /// Absent on a batch written before delivery latency was recorded.
+    #[serde(default)]
+    queued_at_ms: i64,
 }
 
 #[derive(Debug, Snafu)]
@@ -116,8 +121,14 @@ pub(crate) struct DeadLetterStore {
     /// Next filename sequence. Recovered from the directory on open so ordering
     /// survives a restart.
     next_sequence: AtomicU64,
-    /// Batches discarded because the store was full.
+    /// Batches discarded because the store was full, or because a retained
+    /// batch could never be delivered.
     discarded: AtomicU64,
+    /// `http` or `redis`. The discarded-batch counter is labelled with it.
+    transport: &'static str,
+    metrics: DrasiForwardMetrics,
+    /// Batches currently on disk. The dead-letter gauge reads this atomic.
+    occupancy: Arc<AtomicU64>,
 }
 
 impl DeadLetterStore {
@@ -127,7 +138,29 @@ impl DeadLetterStore {
     /// # Errors
     ///
     /// Returns an error if the directory cannot be created or listed.
+    #[cfg(test)]
     pub(crate) async fn open(dir: PathBuf, component: String, max_batches: usize) -> Result<Self> {
+        Self::open_with(
+            dir,
+            component,
+            max_batches,
+            "http",
+            DrasiForwardMetrics::global(),
+        )
+        .await
+    }
+
+    /// [`Self::open`] on an explicit transport and meter.
+    ///
+    /// `transport` is `http` or `redis`. The gauge starts at the number of
+    /// batches already on disk, including zero.
+    pub(crate) async fn open_with(
+        dir: PathBuf,
+        component: String,
+        max_batches: usize,
+        transport: &'static str,
+        metrics: DrasiForwardMetrics,
+    ) -> Result<Self> {
         tokio::fs::create_dir_all(&dir)
             .await
             .context(PrepareDirectorySnafu { path: dir.clone() })?;
@@ -145,12 +178,18 @@ impl DeadLetterStore {
             );
         }
 
+        let occupancy = metrics.dead_letter_slot(&component);
+        occupancy.store(saturating_u64(pending.len()), Ordering::Relaxed);
+
         Ok(Self {
             dir,
             component,
             max_batches,
             next_sequence: AtomicU64::new(next),
             discarded: AtomicU64::new(0),
+            transport,
+            metrics,
+            occupancy,
         })
     }
 
@@ -196,6 +235,7 @@ impl DeadLetterStore {
             op_codes: batch.op_codes.clone(),
             primary_key_columns: batch.primary_key_columns.clone(),
             source_commit_ts_ms: batch.source_commit_ts_ms,
+            queued_at_ms: batch.queued_at_ms,
         })
         .map_err(|e| Error::EncodeBatch {
             source: arrow::error::ArrowError::JsonError(e.to_string()),
@@ -220,6 +260,7 @@ impl DeadLetterStore {
             .await
             .context(WriteBatchSnafu { path: path.clone() })?;
 
+        self.occupancy.fetch_add(1, Ordering::Relaxed);
         Ok(())
     }
 
@@ -254,8 +295,9 @@ impl DeadLetterStore {
                         "Discarding an unreadable Drasi dead-letter batch for {}: {e}",
                         self.component
                     );
-                    self.discarded.fetch_add(1, Ordering::Relaxed);
+                    self.note_discarded();
                     let _ = tokio::fs::remove_file(&path).await;
+                    self.release_one();
                     continue;
                 }
             };
@@ -271,9 +313,11 @@ impl DeadLetterStore {
                 crate::drasi::queue::Outcome::Discard => {
                     // It can never be delivered, so leaving it here would block
                     // every later batch permanently. Drop it and keep going —
-                    // the count is what says the component has a gap.
+                    // the count is what says the component has a gap. The
+                    // caller records the `discarded` metric for this attempt.
                     self.discarded.fetch_add(1, Ordering::Relaxed);
                     let _ = tokio::fs::remove_file(&path).await;
+                    self.release_one();
                     continue;
                 }
             }
@@ -291,6 +335,7 @@ impl DeadLetterStore {
                 break;
             }
 
+            self.release_one();
             delivered += 1;
         }
 
@@ -314,7 +359,8 @@ impl DeadLetterStore {
         let excess = pending.len() - self.max_batches + 1;
         for (_, path) in pending.into_iter().take(excess) {
             if tokio::fs::remove_file(&path).await.is_ok() {
-                let total = self.discarded.fetch_add(1, Ordering::Relaxed) + 1;
+                let total = self.note_discarded();
+                self.release_one();
                 if total == 1 || total.is_multiple_of(1000) {
                     tracing::warn!(
                         "The Drasi dead-letter store for {} is full at {} batches; discarded the oldest ({total} discarded so far). Drasi's view of this component has a gap.",
@@ -327,6 +373,33 @@ impl DeadLetterStore {
 
         Ok(())
     }
+
+    /// Counts a batch this store gave up on, and reports it as `discarded`.
+    fn note_discarded(&self) -> u64 {
+        self.metrics
+            .record_batch(&self.component, self.transport, OUTCOME_DISCARDED);
+        self.discarded.fetch_add(1, Ordering::Relaxed) + 1
+    }
+
+    fn release_one(&self) {
+        let mut current = self.occupancy.load(Ordering::Relaxed);
+        loop {
+            let next = current.saturating_sub(1);
+            match self.occupancy.compare_exchange_weak(
+                current,
+                next,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => break,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+fn saturating_u64(len: usize) -> u64 {
+    u64::try_from(len).unwrap_or(u64::MAX)
 }
 
 /// Pending batch files, oldest first.
@@ -421,6 +494,7 @@ fn decode(bytes: &[u8], path: &Path) -> Result<QueuedBatch> {
         primary_key_columns: metadata.primary_key_columns,
         data,
         source_commit_ts_ms: metadata.source_commit_ts_ms,
+        queued_at_ms: metadata.queued_at_ms,
     })
 }
 
@@ -486,7 +560,9 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let store = store(&dir, DEFAULT_MAX_BATCHES).await;
 
-        store.append(&queued("row-1")).await.expect("appends");
+        let queued = queued("row-1");
+        let queued_at = queued.queued_at_ms;
+        store.append(&queued).await.expect("appends");
 
         let seen = std::sync::Mutex::new(Vec::new());
         store
@@ -501,6 +577,10 @@ mod tests {
         assert_eq!(seen[0].op_codes, vec!["c".to_string()]);
         assert_eq!(seen[0].primary_key_columns, vec![vec!["id".to_string()]]);
         assert_eq!(seen[0].source_commit_ts_ms, Some(42));
+        assert_eq!(
+            seen[0].queued_at_ms, queued_at,
+            "redelivery keeps the original queue time, so latency is not restamped"
+        );
         assert_eq!(ids(&seen[0].data), vec!["row-1".to_string()]);
     }
 
