@@ -985,10 +985,11 @@ impl CayenneTableProvider {
             .collect();
         // Each file folds on its own, through one writer: its rows stay in one
         // file, though not necessarily in the order it held them, since the
-        // scan may split a large file into ranges. As many files fold at once
-        // as the encode budget has permits, and each write holds one. Merging every file's
+        // scan may split a large file into ranges. Merging every file's
         // survivors into one stream would feed the rewrite from a single task,
-        // however many encoders it had.
+        // however many encoders it had. Each write holds one encode permit, and
+        // as many files fold at once as maintenance may hold, so the permits
+        // reserved for deltas stay free whatever the write's class.
         let policy = WritePolicy {
             class: write.write_policy.class,
             fan_out: EncodeFanOut::PerCaller,
@@ -996,6 +997,7 @@ impl CayenneTableProvider {
         };
         let in_flight = super::write_budget::encode_budget_snapshot()
             .and_then(|budget| usize::try_from(budget.total).ok())
+            .map(super::write_budget::maintenance_gate_cap)
             .unwrap_or(write.target_partitions)
             .max(1);
         let folds: Vec<FileFold<'_>> = superseded

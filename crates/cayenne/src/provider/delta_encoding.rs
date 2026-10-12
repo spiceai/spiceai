@@ -153,11 +153,14 @@ impl WritePolicy {
         routing: ShardRouting::Key,
     };
 
-    /// A load into an empty table: encoded like a delta, routed in whole
-    /// batches.
+    /// A load into an empty table, routed in whole batches. It writes the
+    /// table's durable files, as a full refresh's replace does, so it is
+    /// maintenance: it encodes at the full level, leaves the encode permits
+    /// reserved for deltas free, and finishes its secondary index runs before
+    /// it is visible.
     pub(crate) const BULK_LOAD: Self = Self {
         routing: ShardRouting::WholeBatch,
-        ..Self::DELTA
+        ..Self::MAINTENANCE
     };
 
     /// A maintenance rewrite that may shard: compaction outputs and overwrites
