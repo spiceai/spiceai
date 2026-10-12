@@ -10434,9 +10434,10 @@ impl CayenneTableProvider {
 
         // Build the write-path Vortex format for this snapshot. Unsorted writes
         // are sharded across `target_partitions` concurrent encoders (PK-hashed
-        // for keyed tables, round-robin otherwise or when `routing` asks for
-        // whole batches) so the encode saturates all cores; sorted rewrites and single-writer configs fall back to one
-        // serial writer. Scans are unaffected — they never read the write-shard
+        // for keyed tables, round-robin otherwise, and whole batches in turn
+        // when `routing` asks for them and the table requested no layout) so
+        // the encode saturates all cores; sorted rewrites and single-writer
+        // configs fall back to one serial writer. Scans are unaffected — they never read the write-shard
         // config (only `create_writer_physical_plan` does). The shard count is
         // size-aware: a write smaller than one target file stays a single shard
         // regardless of `target_partitions` (see `snapshot_shard_count`).
@@ -10910,11 +10911,13 @@ impl CayenneTableProvider {
         estimated_bytes: Option<u64>,
         fan_out: EncodeFanOut,
     ) -> usize {
-        // The caller requires a single sequence of output files. Checked before
-        // the configured concurrency, which must not be able to override it.
+        // The caller runs many such writes side by side, so each takes one
+        // encoder and records no write shape.
         if matches!(fan_out, EncodeFanOut::PerCaller) {
             return 1;
         }
+        // The caller requires a single sequence of output files. Checked before
+        // the configured concurrency, which must not be able to override it.
         if matches!(fan_out, EncodeFanOut::Serial) {
             // A fan-out of 1 has two causes that call for opposite responses: a
             // structural one (the write's output order is load-bearing, so no

@@ -983,9 +983,10 @@ impl CayenneTableProvider {
                     .map(str::to_string)
             })
             .collect();
-        // Each file folds on its own, through one writer, keeping its rows in
-        // the order it holds them; as many files fold at once as the encode
-        // budget has permits, and each write holds one. Merging every file's
+        // Each file folds on its own, through one writer: its rows stay in one
+        // file, though not necessarily in the order it held them, since the
+        // scan may split a large file into ranges. As many files fold at once
+        // as the encode budget has permits, and each write holds one. Merging every file's
         // survivors into one stream would feed the rewrite from a single task,
         // however many encoders it had.
         let policy = WritePolicy {
