@@ -898,19 +898,42 @@ impl QueryResultsCacheProvider {
         self.get_raw_key(&raw_key).await
     }
 
+    /// Looks `raw_key` up, accepting any entry the cache may still serve: one no
+    /// older than `item_ttl + stale_while_revalidate_ttl`.
+    ///
     /// # Errors
     ///
     /// Will return `Err` if method fails to access the cache
     pub async fn get_raw_key(&self, raw_key: &RawCacheKey) -> Result<Option<CachedQueryResult>> {
+        self.get_raw_key_within(raw_key, self.max_servable_age)
+            .await
+    }
+
+    /// Looks `raw_key` up, accepting only an entry no older than `max_age`, capped
+    /// at `item_ttl + stale_while_revalidate_ttl`.
+    ///
+    /// A request that accepts less than the cache serves (a `max-stale` shorter
+    /// than `stale_while_revalidate_ttl`) passes its own bound here, so an entry it
+    /// would turn away is rejected, and counted as a miss, by the lookup itself.
+    ///
+    /// # Errors
+    ///
+    /// Will return `Err` if method fails to access the cache
+    pub async fn get_raw_key_within(
+        &self,
+        raw_key: &RawCacheKey,
+        max_age: std::time::Duration,
+    ) -> Result<Option<CachedQueryResult>> {
+        let max_age = max_age.min(self.max_servable_age);
         // Validate on lookup so a result published after an invalidation cannot be reused.
         // Both backends call the predicate at most once, preserving rejection accounting.
         let is_valid = |entry: &CachedQueryResult| {
             if self.tables_changed_since(&entry.input_tables, entry.read_started_at) {
-                CachedQueryResult::record_stale_rejection(StaleRejectionReason::Invalidated);
+                CachedQueryResult::record_stale_rejection(StaleRejectionReason::WriteDuringRead);
                 return false;
             }
             let now = std::time::Instant::now();
-            now.saturating_duration_since(entry.read_started_at) <= self.max_servable_age
+            now.saturating_duration_since(entry.read_started_at) <= max_age
         };
         Ok(self
             .cache
@@ -1219,6 +1242,13 @@ impl QueryResultsCacheProvider {
     #[must_use]
     pub fn ttl(&self) -> std::time::Duration {
         self.ttl
+    }
+
+    /// The oldest an entry may be and still be served, measured from when its
+    /// query started: `item_ttl` plus `stale_while_revalidate_ttl`.
+    #[must_use]
+    pub fn max_servable_age(&self) -> std::time::Duration {
+        self.max_servable_age
     }
 
     /// Runs pending cache maintenance tasks (e.g., eviction of expired entries).

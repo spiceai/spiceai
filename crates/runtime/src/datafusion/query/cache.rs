@@ -199,7 +199,7 @@ enum StalePolicy {
     /// Past `item_ttl` is served stale and revalidated; past `item_ttl` plus
     /// this window is a miss.
     Window(std::time::Duration),
-    /// The request's `max-stale` has no value: serve however old the entry is.
+    /// The request's `max-stale` has no value: only the provider age cap applies.
     AnyAge,
 }
 
@@ -217,22 +217,36 @@ fn stale_policy(
     }
 }
 
+/// The oldest an entry may be and still be served to a request with `policy`:
+/// the request's own bound, never more than the cache's `max_servable_age`
+/// (`item_ttl + stale_while_revalidate_ttl`). A request's `max-stale` can only
+/// narrow what the cache serves.
+fn max_age_for(
+    policy: StalePolicy,
+    ttl: std::time::Duration,
+    max_servable_age: std::time::Duration,
+) -> std::time::Duration {
+    let requested = match policy {
+        StalePolicy::FreshOnly => ttl,
+        StalePolicy::Window(stale_duration) => ttl.saturating_add(stale_duration),
+        StalePolicy::AnyAge => max_servable_age,
+    };
+    requested.min(max_servable_age)
+}
+
 /// Whether TTL / stale-while-revalidate age still allows the entry to be
 /// served. Does not mutate; [`apply_age_eligibility`] records revalidation
-/// when a windowed entry is past `item_ttl` but still inside the window.
+/// when an entry is past `item_ttl` but still within its bound.
 fn age_is_eligible(
     entry: &ServableEntry,
     ttl: std::time::Duration,
+    max_servable_age: std::time::Duration,
     policy: StalePolicy,
     now: std::time::Instant,
 ) -> bool {
-    match policy {
-        StalePolicy::AnyAge => true,
-        StalePolicy::FreshOnly => !entry.cached_result.is_stale(ttl, now),
-        StalePolicy::Window(stale_duration) => !entry
-            .cached_result
-            .is_stale(ttl.saturating_add(stale_duration), now),
-    }
+    !entry
+        .cached_result
+        .is_stale(max_age_for(policy, ttl, max_servable_age), now)
 }
 
 /// Re-evaluate TTL / stale-while-revalidate age. Returns `false` when the
@@ -241,14 +255,15 @@ fn age_is_eligible(
 fn apply_age_eligibility(
     entry: &mut ServableEntry,
     ttl: std::time::Duration,
+    max_servable_age: std::time::Duration,
     policy: StalePolicy,
     now: std::time::Instant,
 ) -> bool {
-    if !age_is_eligible(entry, ttl, policy, now) {
+    if !age_is_eligible(entry, ttl, max_servable_age, policy, now) {
         tracing::debug!("Cache entry is past its eligible age, treating as cache miss");
         return false;
     }
-    if matches!(policy, StalePolicy::Window(_)) && entry.cached_result.is_stale(ttl, now) {
+    if !matches!(policy, StalePolicy::FreshOnly) && entry.cached_result.is_stale(ttl, now) {
         tracing::debug!(
             "Cache entry is stale (beyond TTL), triggering background revalidation for stale-while-revalidate"
         );
@@ -272,7 +287,13 @@ fn entry_still_servable(
     };
     let now = std::time::Instant::now();
     let policy = stale_policy(cache_control, provider.stale_while_revalidate_ttl());
-    if !age_is_eligible(entry, provider.ttl(), policy, now) {
+    if !age_is_eligible(
+        entry,
+        provider.ttl(),
+        provider.max_servable_age(),
+        policy,
+        now,
+    ) {
         return false;
     }
     !entry_tables_changed(entry, provider)
@@ -281,15 +302,23 @@ fn entry_still_servable(
 /// Looks `raw_key` up and decides whether the entry found may be served to a
 /// request with `cache_control`.
 ///
-/// An entry beyond the stale-while-revalidate window is not servable. One past
-/// its TTL is served stale and
-/// marked for revalidation.
+/// An entry older than the request accepts (see [`max_age_for`]) is not
+/// servable, and the lookup counts it as a miss. One past its TTL is served
+/// stale and marked for revalidation.
 async fn find_servable_entry(
     cache_provider: &QueryResultsCacheProvider,
     cache_control: CacheControl,
     raw_key: &RawCacheKey,
 ) -> super::Result<Option<ServableEntry>> {
-    let cached_result = match cache_provider.get_raw_key(raw_key).await {
+    let policy = stale_policy(cache_control, cache_provider.stale_while_revalidate_ttl());
+    // The request's own bound goes into the counted lookup, so an entry this
+    // request turns away is a miss there rather than a hit followed by a query.
+    let max_age = max_age_for(
+        policy,
+        cache_provider.ttl(),
+        cache_provider.max_servable_age(),
+    );
+    let cached_result = match cache_provider.get_raw_key_within(raw_key, max_age).await {
         Ok(Some(hit)) => hit,
         Ok(None) => return Ok(None),
         Err(e) => return Err(super::Error::FailedToAccessCache { source: e }),
@@ -299,10 +328,10 @@ async fn find_servable_entry(
         cache_status: CacheStatus::CacheHit,
         revalidate: false,
     };
-    let policy = stale_policy(cache_control, cache_provider.stale_while_revalidate_ttl());
     Ok(apply_age_eligibility(
         &mut entry,
         cache_provider.ttl(),
+        cache_provider.max_servable_age(),
         policy,
         std::time::Instant::now(),
     )
@@ -1005,7 +1034,13 @@ impl Query {
                 request_context.cache_control(),
                 provider.stale_while_revalidate_ttl(),
             );
-            if !apply_age_eligibility(&mut entry, provider.ttl(), policy, now) {
+            if !apply_age_eligibility(
+                &mut entry,
+                provider.ttl(),
+                provider.max_servable_age(),
+                policy,
+                now,
+            ) {
                 return None;
             }
             if entry_tables_changed(&entry, &provider) {
@@ -1645,6 +1680,49 @@ mod tests {
     }
 
     #[test]
+    fn request_max_stale_cannot_exceed_provider_age_cap() {
+        let provider = QueryResultsCacheProvider::try_new(
+            &SQLResultsCacheConfig {
+                item_ttl: Some("1s".to_string()),
+                stale_while_revalidate_ttl: Some("1s".to_string()),
+                ..Default::default()
+            },
+            Box::new([]),
+        )
+        .expect("create a provider with a two-second age cap");
+        let now = std::time::Instant::now();
+        for directive in [
+            CacheControl::MaxStale(CacheKeyType::Default, Some(Duration::from_secs(5))),
+            CacheControl::MaxStale(CacheKeyType::Default, None),
+        ] {
+            let policy = stale_policy(directive, Some(Duration::from_secs(1)));
+            let mut expired =
+                dummy_servable_entry_cached_at(cached_ago(now, Duration::from_millis(2_100)));
+            assert!(
+                !apply_age_eligibility(
+                    &mut expired,
+                    provider.ttl(),
+                    provider.max_servable_age(),
+                    policy,
+                    now
+                ),
+                "{directive:?} must not serve beyond the provider's two-second age cap"
+            );
+            let mut stale =
+                dummy_servable_entry_cached_at(cached_ago(now, Duration::from_millis(1_500)));
+            assert!(apply_age_eligibility(
+                &mut stale,
+                provider.ttl(),
+                provider.max_servable_age(),
+                policy,
+                now
+            ));
+            assert_eq!(stale.cache_status, CacheStatus::CacheStaleWhileRevalidate);
+            assert!(stale.revalidate);
+        }
+    }
+
+    #[test]
     fn a_probed_entry_past_item_ttl_is_not_served() {
         let now = std::time::Instant::now();
         let mut entry =
@@ -1653,6 +1731,7 @@ mod tests {
             !apply_age_eligibility(
                 &mut entry,
                 Duration::from_secs(1),
+                Duration::from_secs(2),
                 StalePolicy::FreshOnly,
                 now,
             ),
@@ -1667,6 +1746,7 @@ mod tests {
         assert!(apply_age_eligibility(
             &mut entry,
             Duration::from_secs(1),
+            Duration::from_secs(2),
             StalePolicy::FreshOnly,
             now,
         ));
@@ -1682,6 +1762,7 @@ mod tests {
         assert!(apply_age_eligibility(
             &mut entry,
             Duration::from_secs(1),
+            Duration::from_secs(2),
             StalePolicy::Window(Duration::from_secs(1)),
             now,
         ));
@@ -1697,6 +1778,7 @@ mod tests {
         assert!(!apply_age_eligibility(
             &mut entry,
             Duration::from_secs(1),
+            Duration::from_secs(2),
             StalePolicy::Window(Duration::from_secs(1)),
             now,
         ));
@@ -1710,6 +1792,7 @@ mod tests {
         assert!(apply_age_eligibility(
             &mut entry,
             Duration::from_secs(1),
+            Duration::from_secs(2),
             StalePolicy::AnyAge,
             now,
         ));
