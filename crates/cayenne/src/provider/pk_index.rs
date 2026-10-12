@@ -166,8 +166,12 @@ pub(crate) fn approx_pk_keyset_entry_bytes(key: &OwnedRow) -> usize {
     // those bounds the cache at a fraction of its believed size - a
     // counting-allocator measurement puts the real per-entry cost at 1.6-3.5x
     // a key-plus-location-only figure.
-    key.as_ref().len()
-        + std::mem::size_of::<u128>()
+    key.as_ref().len() + min_pk_keyset_entry_bytes()
+}
+
+/// Lower bound on the rebuild's per-key charge, excluding encoded key bytes.
+pub(crate) const fn min_pk_keyset_entry_bytes() -> usize {
+    std::mem::size_of::<u128>()
         + std::mem::size_of::<PkKeysetEntry>()
         + PK_KEYSET_CACHE_HASHMAP_ENTRY_OVERHEAD_BYTES
 }
@@ -836,6 +840,53 @@ impl PkBloom {
             }
         }
         self.inserted_keys = self.inserted_keys.saturating_add(1);
+    }
+
+    /// Where a key lands in a split-block filter with `block_mask`, computed
+    /// without the filter so a concurrent builder can hash outside its lock.
+    /// `None` for the legacy scattered layout, whose keys go through
+    /// [`Self::insert`].
+    pub(crate) fn split_block_mask(&self) -> Option<u64> {
+        match &self.repr {
+            PkBloomRepr::SplitBlock { block_mask, .. } => Some(*block_mask),
+            PkBloomRepr::Scattered { .. } => None,
+        }
+    }
+
+    /// [`Self::split_block_locate`] for a filter of `block_mask`.
+    #[inline]
+    pub(crate) fn locate_split_block(block_mask: u64, key: &[u8]) -> (usize, [u32; 8]) {
+        Self::split_block_locate(block_mask, key)
+    }
+
+    /// Set the bits [`Self::locate_split_block`] computed for one key each.
+    ///
+    /// Returns `false`, setting nothing, when the locations were computed for a
+    /// filter of another layout or size: their keys are then absent, so the
+    /// caller must discard this filter rather than use it.
+    #[must_use]
+    pub(crate) fn insert_located(
+        &mut self,
+        block_mask: u64,
+        located: &[(usize, [u32; 8])],
+    ) -> bool {
+        let PkBloomRepr::SplitBlock {
+            blocks,
+            block_mask: own_mask,
+        } = &mut self.repr
+        else {
+            return false;
+        };
+        if *own_mask != block_mask {
+            return false;
+        }
+        for (index, masks) in located {
+            for (lane, mask) in blocks[*index].iter_mut().zip(masks) {
+                *lane |= *mask;
+            }
+        }
+        self.inserted_keys = self.inserted_keys.saturating_add(located.len());
+        true
     }
 
     pub(crate) fn maybe_contains(&self, key: &[u8]) -> bool {

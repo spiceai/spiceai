@@ -87,6 +87,7 @@ pub(crate) mod delta_encoding;
 pub(crate) mod fadvise_tier;
 pub(crate) mod file_digest;
 pub(crate) mod file_pruning;
+mod first_load_pk;
 pub(crate) mod fsync_tier;
 pub(crate) mod inlined_cache;
 pub(crate) mod key_conflicts;

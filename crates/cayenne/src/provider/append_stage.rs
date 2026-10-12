@@ -31,7 +31,7 @@ use super::key_conflicts::KeyResolver;
 use super::on_conflict::{OnConflictDeletions, PostValidationState};
 use super::overwrite::{FileStatsObserver, WriteShape};
 use super::overwrite_postpass::{self, ArrivalStream, CopyOrder, DedupShare};
-use super::pk_index::PkDigestSet;
+use super::pk_index::{PkBloom, PkDigestSet};
 use super::table::{CayenneTableProvider, record_cayenne_write_phase};
 
 /// A write that resolves the keys it repeats across record batches after it is
@@ -128,6 +128,7 @@ pub(super) struct StagedAppend {
     pub stats: Arc<ColumnStatsAccumulator>,
     pub row_count: u64,
     pub superseded: usize,
+    pub first_load_pk_bloom: Option<PkBloom>,
 }
 
 type ResolvedFiles = (u64, Arc<ColumnStatsAccumulator>, HashMap<String, Vec<u32>>);
@@ -205,9 +206,26 @@ impl CayenneTableProvider {
                 (prepared.stream, post_validation)
             }
         };
+        let first_load_pk =
+            if matches!(scope, ValidationScope::Empty) && self.upsert_bloom_eligible() {
+                self.primary_key_indices()?
+                    .filter(|indices| !indices.is_empty())
+                    .map(|indices| {
+                        super::first_load_pk::FirstLoadPkObserver::new(self, indices).map(Arc::new)
+                    })
+                    .transpose()?
+            } else {
+                None
+            };
+        let pk_observer = first_load_pk.as_ref().map(|observer| {
+            Arc::clone(observer) as Arc<dyn vortex_datafusion::VortexWriteObserver>
+        });
         let new_snapshot_id = uuid::Uuid::now_v7().to_string();
         let file_stats = (!self.should_capture_positions())
-            .then(|| FileStatsObserver::new(self.table_name(), &schema, None).map(Arc::new))
+            .then(|| {
+                FileStatsObserver::new(self.table_name(), &schema, pk_observer.clone())
+                    .map(Arc::new)
+            })
             .transpose()?;
         let start = Instant::now();
         let written: Result<ResolvedFiles> = async {
@@ -222,7 +240,8 @@ impl CayenneTableProvider {
                     None,
                     file_stats
                         .as_ref()
-                        .map(|observer| Arc::clone(observer) as _),
+                        .map(|observer| Arc::clone(observer) as _)
+                        .or_else(|| pk_observer.clone()),
                     resolution.write_schema(),
                 )
                 .await?;
@@ -247,7 +266,15 @@ impl CayenneTableProvider {
         }
         .await;
         record_cayenne_write_phase(self.table_name(), "vortex_write", start);
-        let (row_count, stats, hidden) = match written {
+        let written = written.map(|(rows, stats, hidden)| {
+            let live_rows =
+                rows.saturating_sub(hidden.values().map(|rows| rows.len() as u64).sum());
+            let bloom = first_load_pk
+                .as_ref()
+                .and_then(|observer| observer.finish(live_rows));
+            (rows, stats, hidden, bloom)
+        });
+        let (row_count, stats, hidden, first_load_pk_bloom) = match written {
             Ok(written) => written,
             Err(error) => {
                 drop(post_validation.lock().take());
@@ -279,6 +306,7 @@ impl CayenneTableProvider {
             stats,
             row_count,
             superseded,
+            first_load_pk_bloom,
         })
     }
 }
