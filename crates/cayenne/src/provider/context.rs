@@ -952,7 +952,7 @@ impl CayenneContext {
     }
 
     /// Whether closed-loop dynamic tuning is active for this table
-    /// (`cayenne_tuning: adaptive`; a `cayenne_goal_*` setpoint alone does not
+    /// (`runtime.adaptive_tuning: enabled`; a `runtime.params.target_*` setpoint alone does not
     /// enable it). Gates the per-tick query-admission reserve report so it is a
     /// strict no-op for non-adaptive tables.
     #[must_use]
