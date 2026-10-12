@@ -692,7 +692,7 @@
           ]
         },
         "state": {
-          "description": "Shared object-store location for runtime state (`file://`, `s3://`, `abfs://`, `abfss://`). Used for SQL results-cache warmup, cluster source rate control, and distributed query state. A `runtime.scheduler.state_location` overrides it for the scheduler.",
+          "description": "Shared object-store location for runtime state (`file://`, `s3://`, `abfs://`, `abfss://`). Used for SQL results-cache warmup, cluster source rate control, and distributed query state. Each feature writes under its own folder: `results-cache/`, `rate-control/` and `cluster/`. A `runtime.scheduler.state_location` overrides it for the scheduler.",
           "anyOf": [
             {
               "$ref": "#/$defs/RuntimeState"

@@ -783,3 +783,45 @@ mod shared_origin_acquire_timeout {
         }
     }
 }
+
+/// Rate control keeps its state in the `rate-control/` folder of a
+/// `runtime.state` location.
+#[tokio::test]
+async fn runtime_state_rate_control_writes_under_its_folder() {
+    let temp_dir = tempfile::tempdir().expect("create temp dir");
+    let state_dir = temp_dir.path().join("state");
+    let app = app_with_file_rate_control(&state_url(&state_dir), "1s");
+    let runtime = Arc::new(Runtime::builder().with_app(app.clone()).build().await);
+    let dataset = dataset_for_runtime(&app, &runtime);
+    let shared = runtime
+        .http_rate_control_registry()
+        .shared_rate_controller_for_component(
+            &Url::parse(ORIGIN_URL).expect("origin URL parse"),
+            &rps_config(10),
+            dataset.app.name.as_str(),
+            &ConnectorComponent::from(&dataset),
+            "https",
+        )
+        .await
+        .expect("controller builds");
+    let controller = shared.controller.expect("a rate-limited origin is enabled");
+    controller.acquire().await.expect("permit");
+
+    let spicepod_dir = state_dir.join("rate-control").join(APP_NAME);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+    while !std::fs::read_dir(&spicepod_dir).is_ok_and(|mut entries| {
+        entries
+            .any(|entry| entry.is_ok_and(|entry| entry.path().extension() == Some("json".as_ref())))
+    }) {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "rate control wrote no state under {}",
+            spicepod_dir.display()
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert!(
+        !state_dir.join(APP_NAME).exists(),
+        "rate control must not write at the location root"
+    );
+}
