@@ -231,6 +231,11 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
+      # The Linux runner image carries no C toolchain, which the build scripts
+      # of the harness's dependencies need.
+      - name: Set up cc
+        uses: ./.github/actions/setup-cc
+
       - name: Install Protoc
         uses: ./.github/actions/install-protoc
 
