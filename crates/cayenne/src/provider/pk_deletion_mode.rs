@@ -91,6 +91,37 @@ pub(crate) const RECLAIM_SHARE_DENOMINATOR: u32 = 10;
 /// 236 ms. The 200K-row table on 16 cores took 70 ms, against a 6.25 s interval.
 pub(crate) const MIN_PACED_REWRITE: Duration = Duration::from_millis(100);
 
+/// How `deletion_mode: auto`'s write-rate rule treats one table
+/// ([`AutoDeletionMode::rewrite_outpaces_writes`]), pinned by a test whose
+/// subject is one regime (`CayenneTableProvider::pin_auto_write_rate_rule`). The
+/// rule times the table's first whole-table rewrite, and in a debug build that
+/// time depends on the machine and its load. `#[doc(hidden)]`: not a stable API.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AutoWriteRateRule {
+    /// The rule as `spiced` runs it: the rewrite's duration against the table's
+    /// write rate.
+    Measured,
+    /// No rewrite outpaces the writes: the table keeps position deletes until it
+    /// outgrows its bound.
+    Never,
+    /// Every first whole-table rewrite of rows all in protected snapshots
+    /// outpaces the writes: it is discarded, and the table keeps key deletes.
+    Always,
+}
+
+/// The state behind [`AutoWriteRateRule`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WriteRateRule {
+    /// A rewrite shorter than `floor` never counts ([`MIN_PACED_REWRITE`] outside
+    /// this crate's unit tests).
+    Measured {
+        floor: Duration,
+    },
+    Never,
+    Always,
+}
+
 /// How a primary-key table records the delete of a row right now.
 #[derive(Clone, Debug)]
 pub(crate) enum PkDeletionMode {
@@ -171,9 +202,10 @@ pub(crate) struct AutoDeletionMode {
     /// When a compaction pass first found a delete in the table's index since it
     /// was opened (see [`Self::rewrite_outpaces_writes`]).
     first_delete_at: Mutex<Option<Instant>>,
-    /// [`MIN_PACED_REWRITE`], lowered by tests whose tables rewrite in
-    /// milliseconds.
-    min_paced_rewrite: Mutex<Duration>,
+    /// See [`Self::rewrite_outpaces_writes`]. In this crate's unit tests the rule
+    /// applies only where a test asks for it: their tables rewrite in times that
+    /// depend on the machine and its load.
+    write_rate_rule: Mutex<WriteRateRule>,
 }
 
 #[derive(Debug, Default)]
@@ -201,7 +233,13 @@ impl AutoDeletionMode {
             reclaims: Mutex::new(ReclaimPace::default()),
             kept_compacted: AtomicBool::new(false),
             first_delete_at: Mutex::new(None),
-            min_paced_rewrite: Mutex::new(MIN_PACED_REWRITE),
+            write_rate_rule: Mutex::new(if cfg!(test) {
+                WriteRateRule::Never
+            } else {
+                WriteRateRule::Measured {
+                    floor: MIN_PACED_REWRITE,
+                }
+            }),
         }
     }
 
@@ -310,30 +348,50 @@ impl AutoDeletionMode {
     /// does. The pace would hold every such rewrite back, so a table whose rows
     /// are all still where the bake reaches them is better served by key deletes.
     /// A rewrite shorter than [`MIN_PACED_REWRITE`] never counts, and neither does
-    /// one with nothing to measure against.
+    /// one with nothing to measure against. A test may pin the answer
+    /// ([`Self::pin_write_rate_rule`]).
     pub(crate) fn rewrite_outpaces_writes(
         &self,
         started: Instant,
         took: Duration,
     ) -> Option<Duration> {
-        if took < *self.min_paced_rewrite.lock() {
-            return None;
-        }
-        let since = self
+        let interval = self
             .reclaims
             .lock()
             .last_end
-            .or_else(|| *self.first_delete_at.lock())?;
-        let interval = started.saturating_duration_since(since);
-        (took.saturating_mul(RECLAIM_SHARE_DENOMINATOR - 1) > interval).then_some(interval)
+            .or_else(|| *self.first_delete_at.lock())
+            .map(|since| started.saturating_duration_since(since));
+        match *self.write_rate_rule.lock() {
+            WriteRateRule::Never => None,
+            WriteRateRule::Always => Some(interval.unwrap_or_default()),
+            WriteRateRule::Measured { floor } => {
+                let interval = interval?;
+                (took >= floor && took.saturating_mul(RECLAIM_SHARE_DENOMINATOR - 1) > interval)
+                    .then_some(interval)
+            }
+        }
     }
 
-    /// Let a rewrite of any duration move the table to key deletes for its write
-    /// rate, and start the interval it is measured against at `first_delete_at`:
-    /// lets a test reach the rule with a table that rewrites in milliseconds.
+    /// Pin how [`Self::rewrite_outpaces_writes`] answers, for a test whose subject
+    /// is one regime.
+    pub(crate) fn pin_write_rate_rule(&self, rule: AutoWriteRateRule) {
+        *self.write_rate_rule.lock() = match rule {
+            AutoWriteRateRule::Measured => WriteRateRule::Measured {
+                floor: MIN_PACED_REWRITE,
+            },
+            AutoWriteRateRule::Never => WriteRateRule::Never,
+            AutoWriteRateRule::Always => WriteRateRule::Always,
+        };
+    }
+
+    /// Measure rewrites of any duration against the table's write rate, starting
+    /// the interval at `first_delete_at`: lets a test reach the share comparison
+    /// with a table that rewrites in milliseconds.
     #[cfg(test)]
     pub(crate) fn measure_write_rate_from(&self, first_delete_at: Option<Instant>) {
-        *self.min_paced_rewrite.lock() = Duration::ZERO;
+        *self.write_rate_rule.lock() = WriteRateRule::Measured {
+            floor: Duration::ZERO,
+        };
         *self.first_delete_at.lock() = first_delete_at;
     }
 
@@ -363,10 +421,12 @@ mod tests {
     const TARGET: usize = 256 * 1024 * 1024;
     const BOUND: u64 = 8 * 1024 * 1024;
 
-    /// An `auto` table opened at `table_bytes` (`None`: could not be sized).
+    /// An `auto` table opened at `table_bytes` (`None`: could not be sized),
+    /// with the write-rate rule as `spiced` runs it.
     fn opened(table_bytes: Option<u64>) -> AutoDeletionMode {
         let auto = AutoDeletionMode::new(BOUND);
         auto.size_at_open(table_bytes);
+        auto.pin_write_rate_rule(AutoWriteRateRule::Measured);
         auto
     }
 

@@ -1021,10 +1021,8 @@ async fn an_auto_tables_first_delete_starts_its_write_rate_interval() {
 async fn an_auto_table_whose_first_rewrite_outpaces_its_writes_keeps_key_deletes() {
     let name = "auto_outpaced_first_rewrite";
     let (provider, _catalog, _tmp) = table(name, DeletionMode::Auto, 256).await;
-    let auto = Arc::clone(provider.pk_deletion_mode.auto().expect("an auto table"));
-    // Any rewrite counts, against an interval that has not begun: every rewrite
-    // outpaces the writes.
-    auto.measure_write_rate_from(Some(Instant::now() + Duration::from_secs(3_600)));
+    // Every first whole-table rewrite outpaces the writes.
+    provider.pin_auto_write_rate_rule(AutoWriteRateRule::Always);
     let keys: Vec<i64> = (0..16).collect();
     write(&provider, &keys, 100).await;
     assert!(
@@ -1126,7 +1124,7 @@ async fn a_rewrite_within_its_share_or_of_compacted_rows_keeps_position_deletes(
         .await
         .expect("fold the seed into the current snapshot");
     auto.forget_reclaim_pace();
-    auto.measure_write_rate_from(Some(Instant::now() + Duration::from_secs(3_600)));
+    provider.pin_auto_write_rate_rule(AutoWriteRateRule::Always);
     write(&provider, &keys, 200).await;
     provider
         .compact_current_snapshot_small_files()

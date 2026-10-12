@@ -58,7 +58,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use arrow::array::{Int64Array, RecordBatch};
 use arrow::datatypes::{DataType, Field, Schema};
 use cayenne::metadata::{CdcDurability, CreateTableOptions, DeletionMode, VortexConfig};
-use cayenne::{CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog, SlotAdvancer};
+use cayenne::{
+    AutoWriteRateRule, CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog,
+    SlotAdvancer,
+};
 use common::{BackendType, TestFixture};
 use datafusion::datasource::TableProvider;
 use datafusion::datasource::memory::MemorySourceConfig;
@@ -140,8 +143,16 @@ enum Mode {
     /// The default `deletion_mode: auto`, with the default target file size: these
     /// tables stay inside its position-delete bound, so the whole run is on
     /// position deletes, reclaimed by whole-table rewrites that race the writers
-    /// (the reclaim trigger is two tombstones).
+    /// (the reclaim trigger is two tombstones). The write-rate rule is pinned off,
+    /// so a slow build does not move the table to key deletes; `run_workload`
+    /// checks it never left position deletes.
     Auto,
+    /// `Auto` with its write-rate rule pinned to fire: the first whole-table
+    /// reclaim of rows all in protected snapshots is discarded under live writers,
+    /// and the table continues on key deletes. A `Restart` sizes the table again,
+    /// back on position deletes. `run_workload` checks that some seed reached the
+    /// discard.
+    AutoOutpaced,
     /// `deletion_mode: auto` with a 1 MiB target file size, a 32 KiB bound that
     /// every run is meant to cross under live writers: position deletes and
     /// whole-table reclaims first, then key deletes and the reclaims of rows the
@@ -271,7 +282,7 @@ fn config(
             deletion_mode: DeletionMode::Position,
             ..base
         },
-        Mode::Auto => VortexConfig {
+        Mode::Auto | Mode::AutoOutpaced => VortexConfig {
             deletion_mode: DeletionMode::Auto,
             target_vortex_file_size_mb: VortexConfig::default().target_vortex_file_size_mb,
             bake_deletion_index_trigger: 2,
@@ -322,6 +333,7 @@ async fn create_table(
     let ctx = SessionContext::new();
     let table =
         Arc::new(CayenneTableProvider::create_table(catalog, opts, ctx.runtime_env()).await?);
+    pin_write_rate_rule(&table, mode);
     if durability == Durability::Memory {
         // Arm mem-mode deferral (the runtime does this on the first replayable
         // committer); without it mem-mode CDC writes take the durable path.
@@ -339,6 +351,7 @@ async fn create_table(
 async fn reopen_table(
     fixture: &TestFixture,
     name: &str,
+    mode: Mode,
 ) -> TestResult<(Arc<CayenneTableProvider>, SessionContext)> {
     let catalog: Arc<dyn MetadataCatalog> =
         Arc::clone(&fixture.catalog) as Arc<dyn MetadataCatalog>;
@@ -348,8 +361,20 @@ async fn reopen_table(
             .open(name)
             .await?,
     );
+    pin_write_rate_rule(&provider, mode);
     ctx.register_table(name, Arc::clone(&provider) as Arc<dyn TableProvider>)?;
     Ok((provider, ctx))
+}
+
+/// Pins `deletion_mode: auto`'s write-rate rule for the mode under test, so the
+/// deletes an `auto` table records do not depend on how long this build takes to
+/// rewrite it. No effect on the other modes.
+fn pin_write_rate_rule(table: &CayenneTableProvider, mode: Mode) {
+    table.pin_auto_write_rate_rule(if matches!(mode, Mode::AutoOutpaced) {
+        AutoWriteRateRule::Always
+    } else {
+        AutoWriteRateRule::Never
+    });
 }
 
 fn rows_to_batch(rows: &[(i64, i64)]) -> RecordBatch {
@@ -826,7 +851,9 @@ fn apply_model(model: &mut Model, op: &Op) {
 // Harness
 // ============================================================================
 
-async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestResult<()> {
+/// Returns whether the table was seen on key deletes after it opened on position
+/// deletes (see [`Mode::AutoOutpaced`]).
+async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestResult<bool> {
     let name = format!("seq_{:?}_{:?}_{seed}", w.mode, w.durability);
     let (mut table, mut ctx) = create_table(
         fixture,
@@ -843,6 +870,8 @@ async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
             "AutoCrossing non-vacuity: a fresh auto table must start on position deletes (seed={seed})"
         );
     }
+    let opened_on_positions = table.should_capture_positions();
+    let mut left_positions = false;
     let mut rng = Rng::new(seed);
     let mut model = Model::new();
     let mut history: Vec<Op> = Vec::with_capacity(w.ops);
@@ -876,7 +905,8 @@ async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
                     table.checkpoint_mem_tier().await?;
                 }
                 table.drain_in_flight_maintenance().await?;
-                let (t, c) = reopen_table(fixture, &name).await?;
+                left_positions |= opened_on_positions && !table.should_capture_positions();
+                let (t, c) = reopen_table(fixture, &name, w.mode).await?;
                 table = t;
                 ctx = c;
                 // Re-arm mem-mode deferral on the fresh provider instance.
@@ -919,7 +949,8 @@ async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
     // before reopening from the catalog (see the loop's Op::Restart).
     settle(&table, w.durability).await?;
     table.drain_in_flight_maintenance().await?;
-    let (t, c) = reopen_table(fixture, &name).await?;
+    left_positions |= opened_on_positions && !table.should_capture_positions();
+    let (t, c) = reopen_table(fixture, &name, w.mode).await?;
     let final_state = read_rows(&c, &name).await?;
     let msg = format!(
         "seq final compact+restart diverged mode={:?} durability={:?} seed={seed}\nhistory={history:?}",
@@ -927,10 +958,12 @@ async fn run_sequential(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
     );
     assert_converged(&final_state, &model, &msg);
     verify_aggregate_queries(&c, t.as_ref(), &name, &model, w.population, &msg).await?;
-    Ok(())
+    Ok(left_positions)
 }
 
-async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestResult<()> {
+/// Returns whether the table was seen on key deletes after it opened on position
+/// deletes (see [`Mode::AutoOutpaced`]).
+async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestResult<bool> {
     let name = format!("conc_{:?}_{:?}_{seed}", w.mode, w.durability);
     let (table0, ctx0) = create_table(
         fixture,
@@ -947,6 +980,8 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
             "AutoCrossing non-vacuity: a fresh auto table must start on position deletes (seed={seed})"
         );
     }
+    let opened_on_positions = table0.should_capture_positions();
+    let mut left_positions = false;
     let mut rng = Rng::new(seed);
 
     for start in (0..w.population).step_by(20) {
@@ -1042,7 +1077,8 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
                     guard.checkpoint_mem_tier().await?;
                 }
                 guard.drain_in_flight_maintenance().await?;
-                let (nt, nc) = reopen_table(fixture, &name).await?;
+                left_positions |= opened_on_positions && !guard.should_capture_positions();
+                let (nt, nc) = reopen_table(fixture, &name, w.mode).await?;
                 if w.durability == Durability::Memory {
                     nt.install_slot_advancer(Arc::new(NoopSlotAdvancer));
                 }
@@ -1076,6 +1112,7 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
     // Quiesce before the final assertion so no detached compaction from this (or
     // an earlier, since-replaced) instance commits mid-read.
     table.drain_in_flight_maintenance().await?;
+    left_positions |= opened_on_positions && !table.should_capture_positions();
 
     let live = read_rows(&ctx, &name).await?;
     let msg = format!(
@@ -1084,15 +1121,28 @@ async fn run_concurrent(fixture: &TestFixture, w: &Workload, seed: u64) -> TestR
     );
     assert_converged(&live, &model, &msg);
     verify_aggregate_queries(&ctx, table.as_ref(), &name, &model, w.population, &msg).await?;
-    Ok(())
+    Ok(left_positions)
 }
 
 async fn run_workload(fixture: TestFixture, w: Workload) -> TestResult<()> {
+    let mut seeds_that_left_positions = 0usize;
     for seed in 0..w.seeds {
-        match w.concurrency {
+        let left_positions = match w.concurrency {
             Concurrency::Sequential => run_sequential(&fixture, &w, seed).await?,
             Concurrency::ConcurrentWithCompaction => run_concurrent(&fixture, &w, seed).await?,
-        }
+        };
+        seeds_that_left_positions += usize::from(left_positions);
+    }
+    match w.mode {
+        Mode::Auto => assert_eq!(
+            seeds_that_left_positions, 0,
+            "Auto non-vacuity: with the write-rate rule pinned off, a table inside its bound must stay on position deletes"
+        ),
+        Mode::AutoOutpaced => assert!(
+            seeds_that_left_positions > 0,
+            "AutoOutpaced non-vacuity: no seed's whole-table reclaim was discarded for the write rate, so no walk reached the rule"
+        ),
+        Mode::Key | Mode::Position | Mode::AutoCrossing => {}
     }
     Ok(())
 }
@@ -1480,10 +1530,14 @@ async fn prop_sequential_auto_impl(f: TestFixture) -> TestResult<()> {
 async fn prop_sequential_auto_crossing_impl(f: TestFixture) -> TestResult<()> {
     run_workload(f, sequential(Mode::AutoCrossing)).await
 }
+async fn prop_sequential_auto_outpaced_impl(f: TestFixture) -> TestResult<()> {
+    run_workload(f, sequential(Mode::AutoOutpaced)).await
+}
 test_with_backends!(prop_sequential_key_impl);
 test_with_backends!(prop_sequential_position_impl);
 test_with_backends!(prop_sequential_auto_impl);
 test_with_backends!(prop_sequential_auto_crossing_impl);
+test_with_backends!(prop_sequential_auto_outpaced_impl);
 
 // --- Memory-CDC convergence + count-exactness (mem-tier checkpoint + bake) ---
 //
@@ -1741,6 +1795,14 @@ async fn prop_concurrent_upsert_only_auto_sqlite() -> TestResult<()> {
 async fn prop_concurrent_mixed_auto_sqlite() -> TestResult<()> {
     common::run_with_backend(BackendType::Sqlite, |f| {
         run_workload(f, concurrent_mixed(Mode::Auto))
+    })
+    .await
+    .map_err(|e| -> Box<dyn std::error::Error> { e })
+}
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn prop_concurrent_mixed_auto_outpaced_sqlite() -> TestResult<()> {
+    common::run_with_backend(BackendType::Sqlite, |f| {
+        run_workload(f, concurrent_mixed(Mode::AutoOutpaced))
     })
     .await
     .map_err(|e| -> Box<dyn std::error::Error> { e })

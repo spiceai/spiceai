@@ -39,7 +39,7 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 
 use cayenne::metadata::{CreateTableOptions, DeletionMode, VortexConfig};
-use cayenne::{CayenneTableProvider, LastSmallFileCompactPath, MetadataCatalog};
+use cayenne::{AutoWriteRateRule, CayenneTableProvider, LastSmallFileCompactPath, MetadataCatalog};
 use datafusion::prelude::SessionContext;
 use datafusion_table_providers::util::{
     column_reference::ColumnReference, on_conflict::OnConflict,
@@ -48,6 +48,7 @@ use datafusion_table_providers::util::{
 test_with_backends!(position_mode_deletion_index_reaches_bounded_steady_state);
 test_with_backends!(key_mode_deletion_index_still_reclaims);
 test_with_backends!(default_mode_small_table_reclaims_by_rewriting_itself);
+test_with_backends!(default_mode_table_written_faster_than_it_rewrites_keeps_key_deletes);
 test_with_backends!(default_mode_table_past_its_bound_reclaims_through_the_bake);
 test_with_backends!(small_write_profile_deletion_index_reclaims_through_the_bake);
 
@@ -320,21 +321,23 @@ async fn key_mode_deletion_index_still_reclaims(
 ///
 /// `auto` paces those rewrites to a tenth of the time, so rounds written back to
 /// back can run ahead of them: the index grows past the trigger until the pace
-/// lets the next rewrite run, and then comes back under it.
+/// lets the next rewrite run, and then comes back under it. The write-rate rule
+/// is pinned off: a debug build rewrites this tight loop's table slowly enough
+/// for its first rewrite to outpace the writes, which the next test covers.
 async fn default_mode_small_table_reclaims_by_rewriting_itself(
     fixture: common::TestFixture,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let schema = pk_schema();
     let table = build_table(&fixture, "auto_reclaim", &schema, DeletionMode::Auto).await?;
+    table.pin_auto_write_rate_rule(AutoWriteRateRule::Never);
 
     let observed = drive_rounds(&table, &schema).await?;
 
     assert!(
         observed.windows(2).any(|pair| pair[1] < pair[0]),
-        "the index never shrank while the rounds ran, so no rewrite reclaimed it: {observed:?}"
+        "the index never shrank while the rounds ran, so nothing reclaimed it: {observed:?}"
     );
-    let rows_per_round = usize::try_from(ROWS_PER_ROUND).expect("row count fits in usize");
-    let bound = RECLAIM_TRIGGER + rows_per_round;
+    let bound = RECLAIM_TRIGGER + usize::try_from(ROWS_PER_ROUND).expect("row count fits in usize");
     common::lookup_index::poll_until(
         Duration::from_secs(30),
         Duration::from_millis(20),
@@ -357,8 +360,12 @@ async fn default_mode_small_table_reclaims_by_rewriting_itself(
         },
     )
     .await;
-    // Reclaimed by the whole-table rewrite: a small `auto` table is on position
-    // deletes, and the seq-prefix bake declines those.
+    assert!(
+        table.should_capture_positions(),
+        "the small default-mode table left position deletes: {observed:?}"
+    );
+    // Reclaimed by the whole-table rewrite: the seq-prefix bake declines a
+    // position table.
     assert_eq!(
         table.last_small_file_compact_path(),
         LastSmallFileCompactPath::Full,
@@ -366,6 +373,51 @@ async fn default_mode_small_table_reclaims_by_rewriting_itself(
     );
 
     assert_latest_row_per_key(&table, "auto_reclaim").await;
+
+    Ok(())
+}
+
+/// The same small default-mode table, written so fast that its first whole-table
+/// rewrite takes more than a tenth of the time since its first delete: `auto`
+/// discards that rewrite and keeps the table on key deletes, with its rows in
+/// protected snapshots, where the seq-prefix bake bounds the index as on an
+/// explicit `key` table. The rule is pinned to fire, as it does on a machine
+/// that rewrites the table slowly enough.
+async fn default_mode_table_written_faster_than_it_rewrites_keeps_key_deletes(
+    fixture: common::TestFixture,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let schema = pk_schema();
+    let table = build_table(&fixture, "auto_outpaced", &schema, DeletionMode::Auto).await?;
+    table.pin_auto_write_rate_rule(AutoWriteRateRule::Always);
+    assert!(
+        table.should_capture_positions(),
+        "premise: a small default-mode table starts on position deletes"
+    );
+
+    let observed = drive_rounds(&table, &schema).await?;
+
+    assert!(
+        !table.should_capture_positions(),
+        "the table stayed on position deletes: {observed:?}"
+    );
+    assert_eq!(
+        table.last_small_file_compact_path(),
+        LastSmallFileCompactPath::None,
+        "the discarded rewrite committed, or a later pass rewrote the table whole: {observed:?}"
+    );
+    let rows_per_round = usize::try_from(ROWS_PER_ROUND).expect("row count fits in usize");
+    let unbounded = usize::try_from(ROUNDS).expect("round count fits in usize") * rows_per_round;
+    let peak = observed.iter().copied().max().unwrap_or(0);
+    assert!(
+        peak < unbounded,
+        "the bake never reclaimed the table's deletion index: peak {peak}, observations {observed:?}"
+    );
+    assert!(
+        observed.windows(2).any(|pair| pair[1] < pair[0]),
+        "the index never shrank while the rounds ran, so nothing reclaimed it: {observed:?}"
+    );
+
+    assert_latest_row_per_key(&table, "auto_outpaced").await;
 
     Ok(())
 }

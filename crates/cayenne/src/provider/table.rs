@@ -62,7 +62,7 @@ use super::on_conflict::{
     RowCountExactnessTaintingDeletionSink, RowKeyDeletionDelta, ShardedApplyBatches,
     ShardedApplyResult, pk_deletion_snapshot_for_strategy,
 };
-use super::pk_deletion_mode::{AutoDeletionMode, PkDeletionMode};
+use super::pk_deletion_mode::{AutoDeletionMode, AutoWriteRateRule, PkDeletionMode};
 use super::pk_index::{
     BoundedShardedPkIndexBuilder, COLD_PK_BLOOM_PER_FILE_MAX_BYTES, CachedPkIndex, CachedPkKeyset,
     CheckedOutShardedPkIndex, ColdPkExistence, PK_INDEX_PERSIST_MAX_BYTES, PendingPkExistence,
@@ -13486,6 +13486,17 @@ impl CayenneTableProvider {
     #[must_use]
     pub fn should_capture_positions(&self) -> bool {
         !self.pk_deletion_strategy.is_position_based() && self.pk_deletion_mode.uses_positions()
+    }
+
+    /// Pin how `deletion_mode: auto`'s write-rate rule treats this table, so a test
+    /// whose subject is one regime does not depend on how long this machine takes
+    /// to rewrite the table. No effect unless the table is `auto`; a reopened
+    /// table starts from the rule as `spiced` runs it.
+    #[doc(hidden)]
+    pub fn pin_auto_write_rate_rule(&self, rule: AutoWriteRateRule) {
+        if let Some(auto) = self.pk_deletion_mode.auto() {
+            auto.pin_write_rate_rule(rule);
+        }
     }
 
     /// Whether this table's position-delete rewrites — the whole-table reclaim and

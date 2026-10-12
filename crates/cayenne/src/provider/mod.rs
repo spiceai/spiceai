@@ -150,6 +150,7 @@ pub use mem_tier_budget::{
 pub use on_conflict::PreparedOnConflictDeletionPublish;
 pub use overwrite::PreparedOverwrite;
 pub use partitioned_wal::{PARTITIONED_WAL_DIR, PartitionedWal, PartitionedWalEntry};
+pub use pk_deletion_mode::AutoWriteRateRule;
 pub use pk_keyset_budget::{
     force_reserve_keyset_bytes, global_pk_keyset_total, global_pk_keyset_used,
     release_keyset_bytes, set_global_pk_keyset_bytes, try_reserve_keyset_bytes,
