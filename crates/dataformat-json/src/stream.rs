@@ -1116,6 +1116,7 @@ pub struct ArrayToNdjsonPush {
     buffer: Vec<u8>,       // Accumulates pushed bytes
     pending: VecDeque<u8>, // Ready NDJSON output
     state: ParsingState,   // Current parsing state
+    failure: Option<io::Error>,
     /// First unread byte in `buffer`. Consumed bytes stay put until the
     /// end of a push, so each element does not copy the tail.
     buf_start: usize,
@@ -1152,6 +1153,7 @@ impl ArrayToNdjsonPush {
             buffer: Vec::new(),
             pending: VecDeque::new(),
             state: ParsingState::ExpectingArrayStart,
+            failure: None,
             buf_start: 0,
             element_at: 0,
             element_depth: 0,
@@ -1165,10 +1167,18 @@ impl ArrayToNdjsonPush {
     ///
     /// # Errors
     ///
-    /// Returns an error if the pushed data contains invalid JSON syntax.
+    /// Returns an error if the pushed data contains invalid JSON syntax or an
+    /// earlier push has failed.
     pub fn push_bytes(&mut self, data: &[u8]) -> io::Result<()> {
+        if let Some(error) = &self.failure {
+            return Err(io::Error::new(error.kind(), error.to_string()));
+        }
         self.buffer.extend_from_slice(data);
         let result = self.process_unread();
+        if let Err(error) = &result {
+            self.failure = Some(io::Error::new(error.kind(), error.to_string()));
+            self.drop_unread();
+        }
         self.compact_once();
         result
     }
@@ -1177,7 +1187,7 @@ impl ArrayToNdjsonPush {
     ///
     pub fn try_read(&mut self) -> ReadResult {
         if self.pending.is_empty() {
-            if matches!(self.state, ParsingState::Complete) {
+            if self.is_complete() {
                 return ReadResult::Eof;
             }
 
@@ -1198,23 +1208,22 @@ impl ArrayToNdjsonPush {
     /// Check if the adapter has finished processing (reached end of array)
     #[must_use]
     pub fn is_complete(&self) -> bool {
-        matches!(self.state, ParsingState::Complete)
+        self.failure.is_none() && matches!(self.state, ParsingState::Complete)
     }
 
     /// Signal that no more bytes will arrive.
     ///
-    /// Every state other than [`ParsingState::Complete`] means the array was
-    /// still open when the input ran out, so the elements already emitted are
-    /// a prefix of the file rather than the whole of it. Without this call the
-    /// adapter has no end-of-input transition at all: a body cut short mid-way
-    /// simply stops producing rows, and the short result is indistinguishable
-    /// from a complete one.
+    /// An earlier push failure is reported again. An array that is still open
+    /// when the input ends is rejected rather than treated as a complete prefix.
     ///
     /// # Errors
     ///
     /// Returns [`io::ErrorKind::UnexpectedEof`] if the array was never opened
-    /// or never closed.
+    /// or never closed, or preserves the error from an earlier failed push.
     pub fn finish(&self) -> io::Result<()> {
+        if let Some(error) = &self.failure {
+            return Err(io::Error::new(error.kind(), error.to_string()));
+        }
         let detail = match self.state {
             ParsingState::Complete => return self.ensure_only_trailing_whitespace(),
             ParsingState::ExpectingArrayStart => {
@@ -5347,21 +5356,74 @@ mod tests {
         body.push(b']');
         let mut adapter = ArrayToNdjsonPush::new();
         let started = std::time::Instant::now();
-        let mut reported = false;
+        let mut first_error: Option<io::Error> = None;
         for piece in body.chunks(4096) {
-            if let Err(err) = adapter.push_bytes(piece) {
+            let result = adapter.push_bytes(piece);
+            if let Some(expected) = &first_error {
+                let err = result.expect_err("later chunks must preserve the failure");
+                assert_eq!(err.kind(), expected.kind());
+                assert_eq!(err.to_string(), expected.to_string());
+                assert_eq!(
+                    adapter.buffered_len(),
+                    0,
+                    "failed input must not accumulate"
+                );
+            } else if let Err(err) = result {
                 assert_eq!(err.kind(), io::ErrorKind::InvalidData);
-                reported = true;
-                break;
+                first_error = Some(err);
             }
         }
         let elapsed = started.elapsed();
-        assert!(reported, "the rejected element was not reported");
+        let first_error = first_error.expect("the rejected element must be reported");
+        let err = adapter
+            .finish()
+            .expect_err("finish must preserve the failure");
+        assert_eq!(err.kind(), first_error.kind());
+        assert_eq!(err.to_string(), first_error.to_string());
         assert!(
             elapsed < std::time::Duration::from_secs(2),
             "rejected element took {elapsed:?}"
         );
         eprintln!("rejected element 1 MiB elapsed={elapsed:?}");
+    }
+
+    #[test]
+    fn push_reader_preserves_the_first_error_after_later_pushes() {
+        for (body, expected_rows) in [
+            (&b"x"[..], ReadResult::NotReady),
+            (
+                &br#"[{"id":1},{"broken":}]"#[..],
+                ReadResult::Ready(b"{\"id\":1}\n".to_vec()),
+            ),
+            (
+                &br#"[{"id":1}x]"#[..],
+                ReadResult::Ready(b"{\"id\":1}\n".to_vec()),
+            ),
+            (
+                &br#"[{"id":1}]x"#[..],
+                ReadResult::Ready(b"{\"id\":1}\n".to_vec()),
+            ),
+        ] {
+            let mut adapter = ArrayToNdjsonPush::new();
+            let first = adapter.push_bytes(body).expect_err("invalid JSON input");
+            assert_eq!(first.kind(), io::ErrorKind::InvalidData);
+            assert_eq!(adapter.try_read(), expected_rows);
+            for later in [&b""[..], &b"[]"[..], &br#",{"id":2}]"#[..]] {
+                let err = adapter
+                    .push_bytes(later)
+                    .expect_err("a failed adapter cannot resume parsing");
+                assert_eq!(err.kind(), first.kind());
+                assert_eq!(err.to_string(), first.to_string());
+                assert_eq!(adapter.buffered_len(), 0);
+                assert_eq!(adapter.try_read(), ReadResult::NotReady);
+                assert!(!adapter.is_complete());
+            }
+            let err = adapter
+                .finish()
+                .expect_err("finish must preserve the failure");
+            assert_eq!(err.kind(), first.kind());
+            assert_eq!(err.to_string(), first.to_string());
+        }
     }
 
     /// One push of many small elements must not copy the tail once per element.
