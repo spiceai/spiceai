@@ -1979,6 +1979,10 @@ mod tests {
         async fn health(&self) -> llms::evaluate::Result<()> {
             Ok(())
         }
+
+        fn is_decision_model(&self) -> bool {
+            true
+        }
     }
 
     /// Reranks `test_docs` with the evaluation model `jev`, passing `strategy_arg`

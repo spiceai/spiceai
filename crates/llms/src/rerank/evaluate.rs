@@ -96,6 +96,10 @@ impl EvaluateRerank {
             model: self.name.clone(),
             state: EvaluateState::Object(state),
             questions,
+            safety_identifier: None,
+            reasoning_effort: None,
+            // Rerank asks only `noul` questions, so no choice needs typed options.
+            typed_choices: BTreeMap::new(),
         };
         self.evaluator
             .evaluate(request)
@@ -247,6 +251,10 @@ mod tests {
 
         async fn health(&self) -> evaluate_api::Result<()> {
             Ok(())
+        }
+
+        fn is_decision_model(&self) -> bool {
+            true
         }
     }
 
