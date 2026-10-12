@@ -251,9 +251,11 @@ fn assert_top_k(got: &[(i64, f64)], want: &[(i64, f64)], case: &str) {
     );
 }
 
-#[tokio::test(flavor = "multi_thread")]
-async fn vector_search_returns_top_k_by_score_without_a_vector_index() -> Result<(), anyhow::Error>
-{
+/// Start a runtime over the [`DOCS`] datasets, embedded by the local stub, and run `check`
+/// against it inside a request context.
+async fn with_runtime(
+    check: impl AsyncFnOnce(Arc<Runtime>) -> Result<(), anyhow::Error>,
+) -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(None);
     test_request_context()
         .scope(async {
@@ -264,31 +266,18 @@ async fn vector_search_returns_top_k_by_score_without_a_vector_index() -> Result
             let mut embedding = Embeddings::new(format!("openai:{MODEL}"), MODEL);
             embedding.params = HashMap::from([
                 ("endpoint".to_string(), format!("http://{stub}/v1").into()),
-                ("openai_api_key".to_string(), "sk-not-a-real-key".to_string().into()),
+                (
+                    "openai_api_key".to_string(),
+                    "sk-not-a-real-key".to_string().into(),
+                ),
             ]);
+            let chunked = format!("file:{}/", dir.path().join("chunked").display());
+            let multi = format!("file:{}/", dir.path().join("multi").display());
             let app = AppBuilder::new("vector_search_top_k")
                 .with_embedding(embedding)
-                .with_dataset(dataset(
-                    format!("file:{}/", dir.path().join("chunked").display()),
-                    "docs",
-                    "csv",
-                    "body",
-                    true,
-                ))
-                .with_dataset(dataset(
-                    format!("file:{}/", dir.path().join("chunked").display()),
-                    "plain",
-                    "csv",
-                    "body",
-                    false,
-                ))
-                .with_dataset(dataset(
-                    format!("file:{}/", dir.path().join("multi").display()),
-                    "tagged",
-                    "parquet",
-                    "tags",
-                    false,
-                ))
+                .with_dataset(dataset(chunked.clone(), "docs", "csv", "body", true))
+                .with_dataset(dataset(chunked, "plain", "csv", "body", false))
+                .with_dataset(dataset(multi, "tagged", "parquet", "tags", false))
                 .build();
 
             register_test_connectors().await;
@@ -302,79 +291,111 @@ async fn vector_search_returns_top_k_by_score_without_a_vector_index() -> Result
             }
             runtime_ready_check(&rt).await;
 
-            let q = stub_embedding(QUERY);
-            let words = |body: &str| body.split(' ').map(stub_embedding).collect::<Vec<_>>();
-
-            // Chunked scalar column: each body is a single chunk, so its score is the body's.
-            let want = expected_top_k(2, |body| cosine(&q, &stub_embedding(body)));
-            let got = ids_and_scores(
-                &rt,
-                &format!("SELECT id, _score FROM vector_search(docs, '{QUERY}', 2)"),
-            )
-            .await?;
-            assert_top_k(&got, &want, "chunked");
-
-            // `k` counts the rows a filter on a base column keeps, as on the unchunked path.
-            let want_filtered = expected_top_k(1, |body| {
-                if body.starts_with("HTTP/2") { f64::MIN } else { cosine(&q, &stub_embedding(body)) }
-            });
-            let got = ids_and_scores(
-                &rt,
-                &format!(
-                    "SELECT id, _score FROM vector_search(docs, '{QUERY}', 1) WHERE body NOT LIKE 'HTTP/2%'"
-                ),
-            )
-            .await?;
-            assert_top_k(&got, &want_filtered, "chunked with a filter");
-
-            // An enclosing operator that needs no order still sees only `k` rows, chunked or
-            // not (the unchunked shape is #14818).
-            for table in ["docs", "plain"] {
-                let counted = query(
-                    &rt,
-                    &format!("SELECT COUNT(*) AS c FROM vector_search({table}, '{QUERY}', 2)"),
-                )
-                .await?;
-                let c = counted[0]
-                    .column(0)
-                    .as_any()
-                    .downcast_ref::<Int64Array>()
-                    .context("count column")?
-                    .value(0);
-                assert_eq!(c, 2, "{table}: COUNT(*) over k = 2");
-            }
-
-            // Multi-vector column, default `max` aggregation over the per-word scores.
-            let want = expected_top_k(3, |body| {
-                words(body).iter().map(|w| cosine(&q, w)).fold(f64::MIN, f64::max)
-            });
-            let got = ids_and_scores(
-                &rt,
-                &format!("SELECT id, _score FROM vector_search(tagged, '{QUERY}', 3)"),
-            )
-            .await?;
-            assert_top_k(&got, &want, "multi-vector");
-
-            // Multi-query late interaction: sum over queries of the best per-word score.
-            let queries = ["HTTP/2", "proxy"];
-            let want = expected_top_k(2, |body| {
-                let ws = words(body);
-                queries
-                    .iter()
-                    .map(|qs| {
-                        let qv = stub_embedding(qs);
-                        ws.iter().map(|w| cosine(&qv, w)).fold(f64::MIN, f64::max)
-                    })
-                    .sum()
-            });
-            let got = ids_and_scores(
-                &rt,
-                "SELECT id, _score FROM vector_search(tagged, ['HTTP/2', 'proxy'], tags, 2)",
-            )
-            .await?;
-            assert_top_k(&got, &want, "late interaction");
-
-            Ok(())
+            check(rt).await
         })
         .await
+}
+
+fn words(body: &str) -> Vec<Vec<f32>> {
+    body.split(' ').map(stub_embedding).collect()
+}
+
+/// A chunked scalar column. Each body is a single chunk, so its score is the body's.
+#[tokio::test(flavor = "multi_thread")]
+async fn vector_search_returns_top_k_on_a_chunked_column() -> Result<(), anyhow::Error> {
+    with_runtime(async |rt| {
+        let q = stub_embedding(QUERY);
+        let want = expected_top_k(2, |body| cosine(&q, &stub_embedding(body)));
+        let got = ids_and_scores(
+            &rt,
+            &format!("SELECT id, _score FROM vector_search(docs, '{QUERY}', 2)"),
+        )
+        .await?;
+        assert_top_k(&got, &want, "chunked");
+
+        // `k` counts the rows a filter on a base column keeps, as on the unchunked path.
+        let want = expected_top_k(1, |body| {
+            if body.starts_with("HTTP/2") {
+                f64::MIN
+            } else {
+                cosine(&q, &stub_embedding(body))
+            }
+        });
+        let got = ids_and_scores(
+            &rt,
+            &format!(
+                "SELECT id, _score FROM vector_search(docs, '{QUERY}', 1) \
+                 WHERE body NOT LIKE 'HTTP/2%'"
+            ),
+        )
+        .await?;
+        assert_top_k(&got, &want, "chunked with a filter");
+
+        // An enclosing operator that needs no order still sees only `k` rows, chunked or not
+        // (the unchunked shape is #14818).
+        for table in ["docs", "plain"] {
+            let counted = query(
+                &rt,
+                &format!("SELECT COUNT(*) AS c FROM vector_search({table}, '{QUERY}', 2)"),
+            )
+            .await?;
+            let c = counted[0]
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .context("count column")?
+                .value(0);
+            assert_eq!(c, 2, "{table}: COUNT(*) over k = 2");
+        }
+        Ok(())
+    })
+    .await
+}
+
+/// A multi-vector column, scored by the default `max` aggregation over its elements.
+#[tokio::test(flavor = "multi_thread")]
+async fn vector_search_returns_top_k_on_a_multi_vector_column() -> Result<(), anyhow::Error> {
+    with_runtime(async |rt| {
+        let q = stub_embedding(QUERY);
+        let want = expected_top_k(3, |body| {
+            words(body)
+                .iter()
+                .map(|w| cosine(&q, w))
+                .fold(f64::MIN, f64::max)
+        });
+        let got = ids_and_scores(
+            &rt,
+            &format!("SELECT id, _score FROM vector_search(tagged, '{QUERY}', 3)"),
+        )
+        .await?;
+        assert_top_k(&got, &want, "multi-vector");
+        Ok(())
+    })
+    .await
+}
+
+/// Multi-query late interaction: the sum over queries of each query's best element score.
+#[tokio::test(flavor = "multi_thread")]
+async fn vector_search_returns_top_k_for_late_interaction() -> Result<(), anyhow::Error> {
+    with_runtime(async |rt| {
+        let queries = ["HTTP/2", "proxy"];
+        let want = expected_top_k(4, |body| {
+            let ws = words(body);
+            queries
+                .iter()
+                .map(|qs| {
+                    let qv = stub_embedding(qs);
+                    ws.iter().map(|w| cosine(&qv, w)).fold(f64::MIN, f64::max)
+                })
+                .sum()
+        });
+        let got = ids_and_scores(
+            &rt,
+            "SELECT id, _score FROM vector_search(tagged, ['HTTP/2', 'proxy'], tags, 4)",
+        )
+        .await?;
+        assert_top_k(&got, &want, "late interaction");
+        Ok(())
+    })
+    .await
 }
