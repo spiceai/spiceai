@@ -1116,6 +1116,14 @@ pub struct ArrayToNdjsonPush {
     buffer: Vec<u8>,       // Accumulates pushed bytes
     pending: VecDeque<u8>, // Ready NDJSON output
     state: ParsingState,   // Current parsing state
+    /// Bytes of `buffer` already classified for the unfinished element.
+    element_at: usize,
+    element_depth: u32,
+    element_in_string: bool,
+    element_escape: bool,
+    element_started: bool,
+    element_scalar: bool,
+    element_complete: bool,
 }
 
 #[derive(Debug)]
@@ -1135,6 +1143,13 @@ impl ArrayToNdjsonPush {
             buffer: Vec::new(),
             pending: VecDeque::new(),
             state: ParsingState::ExpectingArrayStart,
+            element_at: 0,
+            element_depth: 0,
+            element_in_string: false,
+            element_escape: false,
+            element_started: false,
+            element_scalar: false,
+            element_complete: false,
         }
     }
 
@@ -1268,8 +1283,15 @@ impl ArrayToNdjsonPush {
                     }
                 }
                 ParsingState::ExpectingElement => {
-                    self.discard_leading_whitespace();
-                    if self.buffer.is_empty() {
+                    if !self.element_started {
+                        self.discard_leading_whitespace();
+                        if self.buffer.is_empty() {
+                            return Ok(());
+                        }
+                    }
+                    // An unfinished element is classified once. serde runs when
+                    // the closing byte arrives, not on every earlier chunk.
+                    if !self.advance_element_scan() {
                         return Ok(());
                     }
                     let cursor = io::Cursor::new(&self.buffer);
@@ -1297,6 +1319,7 @@ impl ArrayToNdjsonPush {
                             filter_element_bytes(element_bytes, &mut self.pending);
 
                             self.buffer.drain(..consumed);
+                            self.reset_element_scan();
 
                             self.state = ParsingState::ExpectingCommaOrClosingBracket;
                         }
@@ -1434,6 +1457,87 @@ impl ArrayToNdjsonPush {
         if start > 0 {
             self.buffer.drain(..start);
         }
+    }
+
+    fn reset_element_scan(&mut self) {
+        self.element_at = 0;
+        self.element_depth = 0;
+        self.element_in_string = false;
+        self.element_escape = false;
+        self.element_started = false;
+        self.element_scalar = false;
+        self.element_complete = false;
+    }
+
+    /// Classify newly arrived bytes of the current element.
+    ///
+    /// Returns whether the element has its closing byte. Bytes already
+    /// classified are not read again. A scalar stays open until a byte that
+    /// cannot extend it arrives, and that byte is left for the delimiter scan.
+    fn advance_element_scan(&mut self) -> bool {
+        if self.element_complete {
+            return true;
+        }
+        while self.element_at < self.buffer.len() {
+            let byte = self.buffer[self.element_at];
+            if !self.element_started {
+                self.element_started = true;
+                self.element_at += 1;
+                match byte {
+                    b'{' | b'[' => self.element_depth = 1,
+                    b'"' => self.element_in_string = true,
+                    b'-' | b'0'..=b'9' | b't' | b'f' | b'n' => self.element_scalar = true,
+                    // `]`, `,`, or other junk is not a value. serde reports it
+                    // on this push; waiting would hide a trailing comma.
+                    _ => {
+                        self.element_complete = true;
+                        return true;
+                    }
+                }
+                continue;
+            }
+            if self.element_in_string {
+                self.element_at += 1;
+                if self.element_escape {
+                    self.element_escape = false;
+                    continue;
+                }
+                if byte == b'\\' {
+                    self.element_escape = true;
+                    continue;
+                }
+                if byte == b'"' {
+                    self.element_in_string = false;
+                    if self.element_depth == 0 {
+                        self.element_complete = true;
+                        return true;
+                    }
+                }
+                continue;
+            }
+            if self.element_scalar {
+                if byte.is_ascii_alphanumeric() || matches!(byte, b'+' | b'-' | b'.') {
+                    self.element_at += 1;
+                    continue;
+                }
+                self.element_complete = true;
+                return true;
+            }
+            self.element_at += 1;
+            match byte {
+                b'"' => self.element_in_string = true,
+                b'{' | b'[' => self.element_depth += 1,
+                b'}' | b']' => {
+                    self.element_depth -= 1;
+                    if self.element_depth == 0 {
+                        self.element_complete = true;
+                        return true;
+                    }
+                }
+                _ => {}
+            }
+        }
+        false
     }
 
     /// Whether the buffer ends part-way through a token, so that bytes still
@@ -5189,6 +5293,54 @@ mod tests {
             push_chunked(&small, 1).expect("one-byte chunks"),
             vec!["1", "2"]
         );
+    }
+
+    /// An element that arrives a chunk at a time is parsed when it closes,
+    /// not from its first byte on every earlier chunk. A completed element is
+    /// still available on the push that closed it.
+    #[test]
+    fn push_reader_parses_a_closed_element_once() {
+        let mut split = ArrayToNdjsonPush::new();
+        split.push_bytes(br#"[{"a":"#).unwrap();
+        split.push_bytes(br#"1},{"b":2}]"#).unwrap();
+        let mut out = String::new();
+        while let ReadResult::Ready(data) = split.try_read() {
+            out.push_str(&String::from_utf8_lossy(&data));
+        }
+        split.finish().unwrap();
+        let values: Vec<serde_json::Value> = out
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(values[0]["a"], 1);
+        assert_eq!(values[1]["b"], 2);
+
+        let mut body = br#"[{"a":1"#.to_vec();
+        body.extend(std::iter::repeat(b' ').take(1024 * 1024));
+        body.extend_from_slice(br#"},{"b":2}]"#);
+        let mut adapter = ArrayToNdjsonPush::new();
+        let started = std::time::Instant::now();
+        for piece in body.chunks(4096) {
+            adapter.push_bytes(piece).unwrap();
+        }
+        let elapsed = started.elapsed();
+        adapter.finish().unwrap();
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "closed element took {elapsed:?}"
+        );
+        let mut out = String::new();
+        while let ReadResult::Ready(data) = adapter.try_read() {
+            out.push_str(&String::from_utf8_lossy(&data));
+        }
+        let values: Vec<serde_json::Value> = out
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(values.len(), 2);
+        assert_eq!(values[0]["a"], 1);
+        assert_eq!(values[1]["b"], 2);
+        eprintln!("closed element 1 MiB elapsed={elapsed:?}");
     }
 
     mod file_jsonl_tests {
