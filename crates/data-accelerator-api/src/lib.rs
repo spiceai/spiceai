@@ -727,15 +727,17 @@ pub trait DataAccelerator: Send + Sync {
     /// Seeds this engine's adaptive-tuning knobs for a catalog, whose tables are
     /// configured before any of them exists.
     ///
-    /// `tuning` is the operator's raw `tuning` parameter, interpreted by the engine
-    /// because it owns the vocabulary; `data_path` and `metastore_path` are the
+    /// `adaptive_tuning` is the runtime's `runtime.adaptive_tuning` switch and
+    /// `runtime_params` its `runtime.params`, from which the engine reads the `target_*`
+    /// targets because it owns that vocabulary; `data_path` and `metastore_path` are the
     /// directories to probe. A catalog has no schema inference, so the seed comes from
     /// the host alone — which is precisely why it must come from the engine, and why an
     /// engine with no adaptive controller returns the default outcome and keeps its
     /// static values.
     async fn adaptive_tuning_seeds(
         &self,
-        _tuning: Option<&str>,
+        _adaptive_tuning: spicepod::component::runtime::AdaptiveTuning,
+        _runtime_params: &std::collections::HashMap<String, String>,
         _data_path: &str,
         _metastore_path: &str,
     ) -> AdaptiveTuningOutcome {
@@ -1318,12 +1320,37 @@ pub struct AdaptiveTuningSeeds {
 /// The outcome of asking an engine to seed adaptive tuning.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AdaptiveTuningOutcome {
-    /// The operator's `tuning` value was not one the engine recognizes. Reported rather
-    /// than corrected so the caller can warn once and carry on with the default.
-    pub tuning_value_invalid: bool,
     /// `None` when the operator did not ask for adaptive tuning, in which case the engine
     /// keeps its static defaults.
     pub seeds: Option<AdaptiveTuningSeeds>,
+    /// The `target_*` targets the operator configured, resolved whether or not adaptive
+    /// tuning is on, so the caller can report targets that will have no effect.
+    pub targets: TuningTargets,
+}
+
+/// The runtime-wide `target_*` targets the adaptive controller steers toward.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct TuningTargets {
+    pub replication_lag_secs: Option<f64>,
+    pub freshness_secs: Option<f64>,
+    pub query_latency_ms: Option<f64>,
+    /// Paces how fast the loop chases the targets; it is not a target itself.
+    pub convergence_window_secs: Option<f64>,
+    pub qph: Option<f64>,
+}
+
+impl TuningTargets {
+    /// Whether any `runtime.params.target_*` key is set. Every one of them, the
+    /// pacing-only convergence window included, is inert while adaptive tuning is
+    /// disabled, so this decides whether that is reported.
+    #[must_use]
+    pub fn any_set(&self) -> bool {
+        self.replication_lag_secs.is_some()
+            || self.freshness_secs.is_some()
+            || self.query_latency_ms.is_some()
+            || self.convergence_window_secs.is_some()
+            || self.qph.is_some()
+    }
 }
 
 /// How an engine's writes accumulate for one acceleration, classified from the Spicepod
@@ -1651,5 +1678,27 @@ mod tests {
                 "default_for({engine}) must produce the {engine} variant"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tuning_targets_tests {
+    use super::TuningTargets;
+
+    #[test]
+    fn convergence_window_alone_counts_as_set() {
+        let targets = TuningTargets {
+            convergence_window_secs: Some(120.0),
+            ..TuningTargets::default()
+        };
+        assert!(
+            targets.any_set(),
+            "a lone `target_convergence_window` is inert while adaptive tuning is disabled, so it must be reported"
+        );
+    }
+
+    #[test]
+    fn nothing_set_is_not_reported() {
+        assert!(!TuningTargets::default().any_set());
     }
 }
