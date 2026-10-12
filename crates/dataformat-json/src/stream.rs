@@ -504,10 +504,13 @@ fn filter_element_bytes(element_bytes: &[u8], output: &mut VecDeque<u8>) {
 /// Read until (and including) `expect`, skipping a leading UTF-8 BOM and
 /// any ASCII whitespace.
 fn skip_ws_until<R: Read>(r: &mut R, expect: u8) -> io::Result<()> {
+    skip_ws_until_with_bom_state(r, expect, &mut 0)
+}
+
+fn skip_ws_until_with_bom_state<R: Read>(r: &mut R, expect: u8, bom: &mut u8) -> io::Result<()> {
     let mut byte = [0u8; 1];
     // State machine for UTF-8 BOM detection: 0 = initial, 1 = seen 0xEF,
-    // 2 = seen 0xEF 0xBB, 3 = BOM consumed.
-    let mut bom: u8 = 0;
+    // 2 = seen 0xEF 0xBB, 3 = no further BOM allowed.
     loop {
         if r.read(&mut byte)? == 0 {
             return Err(io::Error::new(
@@ -516,18 +519,18 @@ fn skip_ws_until<R: Read>(r: &mut R, expect: u8) -> io::Result<()> {
             ));
         }
         // Try to match a leading UTF-8 BOM before anything else.
-        if bom < 3 {
-            match (bom, byte[0]) {
+        if *bom < 3 {
+            match (*bom, byte[0]) {
                 (0, 0xEF) => {
-                    bom = 1;
+                    *bom = 1;
                     continue;
                 }
                 (1, 0xBB) => {
-                    bom = 2;
+                    *bom = 2;
                     continue;
                 }
                 (2, 0xBF) => {
-                    bom = 3;
+                    *bom = 3;
                     continue;
                 }
                 // Incomplete BOM prefix — the bytes read so far aren't
@@ -543,7 +546,7 @@ fn skip_ws_until<R: Read>(r: &mut R, expect: u8) -> io::Result<()> {
                     ));
                 }
                 _ => {
-                    bom = 3;
+                    *bom = 3;
                 } // No BOM; fall through to normal check
             }
         }
@@ -1138,7 +1141,7 @@ enum ElementScanState {
 
 #[derive(Debug)]
 enum ParsingState {
-    ExpectingArrayStart,
+    ExpectingArrayStart { bom: u8 },
     ExpectingFirstElement,
     ExpectingElement,
     ExpectingCommaOrClosingBracket,
@@ -1152,7 +1155,7 @@ impl ArrayToNdjsonPush {
         Self {
             buffer: Vec::new(),
             pending: VecDeque::new(),
-            state: ParsingState::ExpectingArrayStart,
+            state: ParsingState::ExpectingArrayStart { bom: 0 },
             failure: None,
             buf_start: 0,
             element_at: 0,
@@ -1226,7 +1229,7 @@ impl ArrayToNdjsonPush {
         }
         let detail = match self.state {
             ParsingState::Complete => return self.ensure_only_trailing_whitespace(),
-            ParsingState::ExpectingArrayStart => {
+            ParsingState::ExpectingArrayStart { .. } => {
                 "the input ended before the opening '[' — the body is empty or contains only whitespace"
             }
             ParsingState::ExpectingFirstElement
@@ -1276,9 +1279,9 @@ impl ArrayToNdjsonPush {
         }
 
         // Skip whitespace and consume opening bracket if not done yet
-        if matches!(self.state, ParsingState::ExpectingArrayStart) {
-            let mut cursor = io::Cursor::new(self.unread());
-            match skip_ws_until(&mut cursor, b'[') {
+        if let ParsingState::ExpectingArrayStart { bom } = &mut self.state {
+            let mut cursor = io::Cursor::new(&self.buffer[self.buf_start..]);
+            match skip_ws_until_with_bom_state(&mut cursor, b'[', bom) {
                 Ok(()) => {
                     let consumed = cursor.position() as usize;
                     if consumed <= self.unread().len() {
@@ -1291,9 +1294,9 @@ impl ArrayToNdjsonPush {
                 // array at all — an NDJSON or object body read as one is a
                 // configuration mistake, not a short read.
                 Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => {
-                    // A partial BOM has to stay. Anything else checked on this
-                    // path is a BOM already recognized, whitespace, or both.
-                    self.discard_checked_prologue();
+                    // BOM progress stays in the parser state, so no checked
+                    // prologue bytes need to be retained or scanned again.
+                    self.drop_unread();
                     return Ok(());
                 }
                 Err(e) => return Err(e),
@@ -1439,28 +1442,6 @@ impl ArrayToNdjsonPush {
         match first_non_whitespace(self.unread()) {
             Some(byte) => Err(trailing_content_error(byte)),
             None => Ok(()),
-        }
-    }
-
-    /// Drop a prologue that has been checked and does not contain `[`.
-    ///
-    /// A one- or two-byte BOM prefix is kept: the next chunk may complete it.
-    /// A finished BOM and the whitespace after it will not become part of the
-    /// array, so keeping them would make every later chunk scan them again.
-    fn discard_checked_prologue(&mut self) {
-        let drop_all = {
-            let unread = self.unread();
-            if unread == [0xEF] || unread == [0xEF, 0xBB] {
-                false
-            } else {
-                let after_bom = usize::from(unread.starts_with(&[0xEF, 0xBB, 0xBF])) * 3;
-                unread[after_bom..]
-                    .iter()
-                    .all(|byte| is_json_whitespace(*byte))
-            }
-        };
-        if drop_all {
-            self.drop_unread();
         }
     }
 
@@ -2711,6 +2692,56 @@ mod tests {
             }
             assert_eq!(read_all_push(&mut adapter), vec![r#"{"a":1}"#.to_string()]);
             assert!(adapter.is_complete());
+        }
+
+        #[test]
+        fn prologue_validity_does_not_depend_on_push_boundaries() {
+            for prologue in [
+                &b""[..],
+                &b" \t\r\n"[..],
+                &UTF8_BOM[..],
+                &b"\xEF\xBB\xBF \t\r\n"[..],
+                &b"\xEF\xBB\xBF\xEF\xBB\xBF"[..],
+                &b" \xEF\xBB\xBF"[..],
+                &b"\xEF\xBB\xBF \xEF\xBB\xBF"[..],
+                &b"\xEF"[..],
+                &b"\xEF\xBB"[..],
+            ] {
+                let mut body = prologue.to_vec();
+                body.extend_from_slice(br#"[{"a":1}]"#);
+                // The supported BOM is a single prefix at byte zero. Let serde
+                // judge the remaining document independently of the adapter.
+                let expected = serde_json::from_slice::<Vec<serde_json::Value>>(
+                    body.strip_prefix(&UTF8_BOM).unwrap_or(&body),
+                );
+                for first in 0..=body.len() {
+                    for second in first..=body.len() {
+                        let mut adapter = ArrayToNdjsonPush::new();
+                        let result = adapter
+                            .push_bytes(&body[..first])
+                            .and_then(|()| adapter.push_bytes(&body[first..second]))
+                            .and_then(|()| adapter.push_bytes(&body[second..]))
+                            .and_then(|()| adapter.finish());
+                        if let Ok(expected) = &expected {
+                            result.unwrap_or_else(|error| {
+                                panic!(
+                                    "valid prologue {prologue:?}, splits {first}/{second}: {error}"
+                                )
+                            });
+                            let actual: Vec<serde_json::Value> = read_all_push(&mut adapter)
+                                .iter()
+                                .map(|row| serde_json::from_str(row).expect("valid output row"))
+                                .collect();
+                            assert_eq!(&actual, expected);
+                            assert_eq!(adapter.try_read(), ReadResult::Eof);
+                        } else {
+                            let error = result.expect_err("misplaced or malformed BOM");
+                            assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+                            assert_eq!(adapter.try_read(), ReadResult::NotReady);
+                        }
+                    }
+                }
+            }
         }
 
         /// A `json_format: array` dataset pointed at an NDJSON or object body
