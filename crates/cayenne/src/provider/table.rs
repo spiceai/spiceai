@@ -28902,7 +28902,9 @@ impl CayenneTableProvider {
 
     /// Seq-prefix clear of the in-memory deletion index: drop every PK tombstone
     /// whose `delete_seq <= cutoff` (= `T`) while retaining tombstones with
-    /// `delete_seq > cutoff` and all upsert re-insertion records.
+    /// `delete_seq > cutoff` and upsert re-insertion records with
+    /// `insert_seq > cutoff`. A re-insertion at or below the cutoff decides no
+    /// probe, because every surviving delete of its key is newer.
     ///
     /// COLD-TIER CONTRACT: callers whose rewrite did not touch the cold tier
     /// must cap `cutoff` at [`Self::cold_tombstone_prune_cap`] — tombstones
@@ -58526,9 +58528,9 @@ mod tests {
     /// dual-encoded — the key twin masks the same prior version by sequence, so an
     /// ordinary visibility check stays green even with every position vector
     /// dropped (verified by mutating the loader). So this test also PRUNES the key
-    /// tombstones (`prune_deletes_at_or_below` keeps `insert_seq` and leaves
-    /// position deletions untouched by contract) and re-queries, which leaves the
-    /// reloaded position vectors as the only thing that can mask a prior version.
+    /// tombstones (`prune_deletes_at_or_below` leaves position deletions untouched
+    /// by contract) and re-queries, which leaves the reloaded position vectors as
+    /// the only thing that can mask a prior version.
     #[tokio::test]
     async fn position_deletion_vectors_still_apply_after_reopening_in_key_mode() {
         let ctx = SessionContext::new();

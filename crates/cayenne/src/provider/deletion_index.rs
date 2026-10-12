@@ -1191,7 +1191,8 @@ impl DeletionIndex {
     }
 
     /// Build a new index with every **deletion** at or below `cutoff` removed,
-    /// retaining deletions with `delete_seq > cutoff` and all insert records.
+    /// retaining deletions with `delete_seq > cutoff` and insert records with
+    /// `insert_seq > cutoff`.
     ///
     /// Used by a seq-prefix compaction after the rewrite has physically applied
     /// every deletion with `delete_seq <= cutoff` (= `T`): those tombstones are
