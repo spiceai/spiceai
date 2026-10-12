@@ -189,6 +189,10 @@ impl DataConnectorFactory for SnowflakeFactory {
 /// query that references one of these UDFs against a Snowflake-federated
 /// dataset fails at the remote engine instead of falling back to local
 /// `DataFusion` evaluation.
+#[expect(
+    clippy::disallowed_methods,
+    reason = "installs `deny_spice_specific_functions()` with `with_function_support`"
+)]
 fn build_snowflake_table_factory(pool: Arc<DynSnowflakeConnectionPool>) -> SnowflakeTableFactory {
     SnowflakeTableFactory::new(pool)
         .with_function_support(deny_spice_specific_functions().as_ref().clone())
