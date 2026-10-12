@@ -497,7 +497,7 @@ async fn an_auto_table_paces_its_whole_table_reclaims_on_either_kind_of_delete()
         }
 
         // As if the last whole-table reclaim had taken a minute: a paced one is
-        // due in 49.
+        // due nine minutes after it.
         auto.record_reclaim(
             std::time::Duration::from_secs(60),
             std::time::Instant::now(),

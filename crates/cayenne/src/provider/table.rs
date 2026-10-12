@@ -23608,7 +23608,9 @@ impl CayenneTableProvider {
             .rewrite_current_snapshot_holding_bounded(held_position_guards, reclaim)
             .await;
         // Paces an `auto` table's whole-table reclaims (`AutoDeletionMode::reclaim_due`).
-        // Every pass counts, committed or not: the time was spent either way.
+        // Every pass counts, committed or not: the time was spent either way, and a
+        // pass that gave up waiting for staged writes to drain held new writes off
+        // under `write_lock` for as long as it waited.
         if reclaim && let Some(auto) = self.pk_deletion_mode.auto() {
             auto.record_reclaim(pass_start.elapsed(), Instant::now());
             if matches!(result, Ok(true)) && auto.uses_positions() {
@@ -23985,7 +23987,7 @@ impl CayenneTableProvider {
                 tracing::debug!(
                     target: "cayenne::compaction",
                     table = self.table_metadata.table_name.as_str(),
-                    "Aborting full rewrite: in-flight staged writes did not drain; will retry on the next trigger",
+                    "Aborting full rewrite: in-flight staged writes did not drain; will retry on a later trigger",
                 );
                 maintenance_metrics::track_compaction(
                     table_name,
