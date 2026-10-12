@@ -302,6 +302,27 @@ pub enum Question {
     },
 }
 
+impl Question {
+    /// The answer to a question that needs no model: a choice with a single option,
+    /// which is that option with all the probability. Every model answers it this way
+    /// rather than asking. `None` for any other question.
+    #[must_use]
+    pub fn foregone_answer(&self) -> Option<Answer> {
+        let Self::Choice { criteria, .. } = self else {
+            return None;
+        };
+        if criteria.len() != 1 {
+            return None;
+        }
+        let option = criteria.keys().next()?;
+        Some(Answer::Choice {
+            choice: option.clone(),
+            probabilities: BTreeMap::from([(option.clone(), 1.0)]),
+            confidence: 1.0,
+        })
+    }
+}
+
 /// Optional yes/no rubric for a noul question.
 ///
 /// `true` / `false` use [`NullableEntry`] so explicit JSON `null` is preserved when
