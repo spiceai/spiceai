@@ -1301,17 +1301,6 @@ impl ArrayToNdjsonPush {
                             // Calculate how many bytes were consumed
                             let consumed = stream.byte_offset();
 
-                            // A scalar has no closing delimiter, so serde ends
-                            // it at the end of the buffer and reports success:
-                            // `[123` yields `123` even though the next push
-                            // could make it `123456`. Emitting now would emit a
-                            // value the file never contained. Objects, arrays
-                            // and strings all end on a delimiter, so only a
-                            // scalar running to the buffer's end is ambiguous.
-                            if consumed == self.buffer.len() && self.may_be_truncated() {
-                                return Ok(());
-                            }
-
                             // Successfully parsed an element
                             let element_bytes = element.get().as_bytes();
 
@@ -1324,25 +1313,10 @@ impl ArrayToNdjsonPush {
                             self.state = ParsingState::ExpectingCommaOrClosingBracket;
                         }
                         Some(Err(e)) => {
-                            // Waiting on every error drops the malformed element
-                            // and every one after it: each later push re-parses
-                            // the same bytes from the same offset and fails the
-                            // same way, so nothing is ever emitted again.
-                            //
-                            // `Category::Eof` is most of the "the buffer stops
-                            // part-way through an element" case — a truncated
-                            // object, string or literal — but not all of it. A
-                            // buffer ending inside a numeric literal (`-`, `1.`,
-                            // `1e`) is reported as `Category::Syntax`, because
-                            // what serde has read is not a number and it cannot
-                            // know more is coming. So a syntax error only counts
-                            // as malformed once the buffer ends on a byte that
-                            // no continuation could extend into a value.
-                            if e.classify() == Category::Eof || self.may_be_truncated() {
-                                return Ok(());
-                            }
-
-                            // This is a real syntax error
+                            // The scan already found the element's closing byte,
+                            // so another chunk cannot turn this verdict into a
+                            // different one. Waiting and parsing again would
+                            // repeat the same failure on every later push.
                             return Err(io::Error::new(io::ErrorKind::InvalidData, e));
                         }
                         None => {
@@ -1538,22 +1512,6 @@ impl ArrayToNdjsonPush {
             }
         }
         false
-    }
-
-    /// Whether the buffer ends part-way through a token, so that bytes still
-    /// to arrive could change how it parses.
-    ///
-    /// Only scalars need this. A truncated object, array or string leaves
-    /// serde inside a structure it knows is unterminated, which it reports as
-    /// `Category::Eof`; a truncated number or literal looks to serde like a
-    /// complete but invalid value, and is reported as `Category::Syntax`. The
-    /// bytes those tokens are built from are exactly the ones tested here, so
-    /// a buffer ending on any other byte — `]`, `}`, `,` — has stopped at a
-    /// boundary no continuation can move.
-    fn may_be_truncated(&self) -> bool {
-        self.buffer
-            .last()
-            .is_some_and(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'+' | b'.'))
     }
 
     /// Get the next non-whitespace byte
@@ -5301,30 +5259,30 @@ mod tests {
     #[test]
     fn push_reader_parses_a_closed_element_once() {
         let mut split = ArrayToNdjsonPush::new();
-        split.push_bytes(br#"[{"a":"#).unwrap();
-        split.push_bytes(br#"1},{"b":2}]"#).unwrap();
+        split.push_bytes(br#"[{"a":"#).expect("first push");
+        split.push_bytes(br#"1},{"b":2}]"#).expect("closing push");
         let mut out = String::new();
         while let ReadResult::Ready(data) = split.try_read() {
             out.push_str(&String::from_utf8_lossy(&data));
         }
-        split.finish().unwrap();
+        split.finish().expect("split finish");
         let values: Vec<serde_json::Value> = out
             .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
+            .map(|line| serde_json::from_str(line).expect("row"))
             .collect();
         assert_eq!(values[0]["a"], 1);
         assert_eq!(values[1]["b"], 2);
 
         let mut body = br#"[{"a":1"#.to_vec();
-        body.extend(std::iter::repeat(b' ').take(1024 * 1024));
+        body.extend(std::iter::repeat_n(b' ', 1024 * 1024));
         body.extend_from_slice(br#"},{"b":2}]"#);
         let mut adapter = ArrayToNdjsonPush::new();
         let started = std::time::Instant::now();
         for piece in body.chunks(4096) {
-            adapter.push_bytes(piece).unwrap();
+            adapter.push_bytes(piece).expect("push");
         }
         let elapsed = started.elapsed();
-        adapter.finish().unwrap();
+        adapter.finish().expect("finish");
         assert!(
             elapsed < std::time::Duration::from_secs(2),
             "closed element took {elapsed:?}"
@@ -5335,12 +5293,40 @@ mod tests {
         }
         let values: Vec<serde_json::Value> = out
             .lines()
-            .map(|line| serde_json::from_str(line).unwrap())
+            .map(|line| serde_json::from_str(line).expect("row"))
             .collect();
         assert_eq!(values.len(), 2);
         assert_eq!(values[0]["a"], 1);
         assert_eq!(values[1]["b"], 2);
         eprintln!("closed element 1 MiB elapsed={elapsed:?}");
+    }
+
+    /// A closed element that serde rejects is reported on that push.
+    /// Later chunks must not parse the same element again.
+    #[test]
+    fn push_reader_reports_a_rejected_element_without_reparsing_it() {
+        let mut body = br#"[{"k":""#.to_vec();
+        body.extend(std::iter::repeat_n(b'a', 1024 * 1024));
+        body.extend_from_slice(br#""x}"#);
+        body.extend(std::iter::repeat_n(b'a', 1024 * 1024));
+        body.push(b']');
+        let mut adapter = ArrayToNdjsonPush::new();
+        let started = std::time::Instant::now();
+        let mut reported = false;
+        for piece in body.chunks(4096) {
+            if let Err(err) = adapter.push_bytes(piece) {
+                assert_eq!(err.kind(), io::ErrorKind::InvalidData);
+                reported = true;
+                break;
+            }
+        }
+        let elapsed = started.elapsed();
+        assert!(reported, "the rejected element was not reported");
+        assert!(
+            elapsed < std::time::Duration::from_secs(2),
+            "rejected element took {elapsed:?}"
+        );
+        eprintln!("rejected element 1 MiB elapsed={elapsed:?}");
     }
 
     mod file_jsonl_tests {
