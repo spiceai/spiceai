@@ -1298,11 +1298,8 @@ async fn wait_for_snapshot_dirs(data_dir: &Path, expected: usize) -> Result<BTre
 }
 
 fn csv_with_rows(rows: usize) -> String {
-    let mut csv = String::from("id,name\n");
-    for id in 1..=rows {
-        csv.push_str(&format!("{id},row{id}\n"));
-    }
-    csv
+    let rows: String = (1..=rows).map(|id| format!("{id},row{id}\n")).collect();
+    format!("id,name\n{rows}")
 }
 
 async fn reclaim_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
