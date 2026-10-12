@@ -59,12 +59,14 @@ use parking_lot::Mutex;
 use crate::metadata::{DeletionMode, ResolvedDeletionMode};
 
 /// An `auto` table takes at most this fraction (one tenth) of the time rewriting
-/// itself whole, on position or key deletes. After each whole-table reclaim the
-/// next one waits, the deletion index growing past its trigger meanwhile, until 9
-/// times that reclaim's duration has passed since it ended. Each reclaim is
-/// followed by a wait nine times as long, so however their durations change,
-/// rewriting takes at most a tenth of any run of reclaims and their waits. Over
-/// the deletion index's memory ceiling it does not wait.
+/// itself whole, on position or key deletes, counted over each reclaim and the
+/// wait after it. After each whole-table reclaim the next one waits, the deletion
+/// index growing past its trigger meanwhile, until 9 times that reclaim's
+/// duration has passed since it ended, so each reclaim and its wait are at most a
+/// tenth rewriting however the durations change from one reclaim to the next. A
+/// reclaim's duration is known only when it ends, so a window that ends just after
+/// a long reclaim, before its wait, can show more than a tenth. Over the deletion
+/// index's memory ceiling it does not wait.
 ///
 /// On key deletes the pace bounds what a table of any size can spend on
 /// whole-table rewrites when the bake cannot reach its rows. On position deletes
