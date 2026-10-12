@@ -324,28 +324,34 @@ pub fn build_change_batch(
                     // The source column's Postgres type OID drives binary-format
                     // decoding; the text path ignores it.
                     let column = &relation.columns[*source_idx];
-                    let appended = data_builders[col_idx].append(value, change.op, column.type_oid);
-                    match appended {
-                        Ok(()) => {}
-                        // A delete applies by primary key, so a non-key value of its
-                        // old row that the column's type cannot hold (the source type
-                        // changed) is carried as NULL rather than refusing the delete.
-                        Err(super::Error::PgOutputDecode { .. })
-                            if change.op == ChangeOp::Delete && !column.is_key =>
-                        {
-                            data_builders[col_idx].append_null();
-                        }
-                        Err(super::Error::PgOutputDecode { message }) => {
-                            return PgOutputDecodeSnafu {
-                                message: format!(
-                                    "column '{}': {message}",
-                                    dataset_schema.field(col_idx).name()
-                                ),
-                            }
-                            .fail();
-                        }
-                        Err(other) => return Err(other),
+                    // A delete applies by primary key. Under `REPLICA IDENTITY FULL`
+                    // its old row carries every column, and one whose source type
+                    // changed may hold a value the column's type cannot; it is
+                    // carried as NULL, as `REPLICA IDENTITY DEFAULT` sends it,
+                    // rather than refusing a delete that does not depend on it.
+                    // Only a fixed-width column takes this path, and it is skipped
+                    // before any decode, so no partial value reaches the builder.
+                    if change.op == ChangeOp::Delete
+                        && !column.is_key
+                        && matches!(value, Some(Value::Binary(_)))
+                        && !data_builders[col_idx].decodes_wire_type(column.type_oid)
+                    {
+                        data_builders[col_idx].append_null();
+                        continue;
                     }
+                    data_builders[col_idx]
+                        .append(value, change.op, column.type_oid)
+                        .map_err(|e| match e {
+                            super::Error::PgOutputDecode { message } => {
+                                super::Error::PgOutputDecode {
+                                    message: format!(
+                                        "column '{}': {message}",
+                                        dataset_schema.field(col_idx).name()
+                                    ),
+                                }
+                            }
+                            other => other,
+                        })?;
                 }
                 None => data_builders[col_idx].append_null(),
             }
@@ -2652,6 +2658,90 @@ mod tests {
         assert_op_column(&batch, &["d"]);
         assert_eq!(id_value(&batch, 0), 9);
         assert!(!name_is_null(&batch, 0));
+    }
+
+    /// Regression test for #14718: under `REPLICA IDENTITY FULL`, a delete's
+    /// non-key value whose source type changed (here `float8` into the
+    /// registered `Int32`) is carried as NULL, not refused, and decodes nothing
+    /// into the builder, so the insert after it in the batch keeps its own value.
+    #[test]
+    fn delete_old_value_of_another_type_is_null_and_leaves_later_rows_intact() {
+        let schema: SchemaRef = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("k", DataType::Int32, true),
+        ]));
+        let relation = Relation {
+            relation_id: 3,
+            namespace: "public".into(),
+            name: "t".into(),
+            replica_identity: b'f',
+            columns: vec![
+                PgColumn {
+                    is_key: true,
+                    name: "id".into(),
+                    type_oid: 20,
+                    type_modifier: -1,
+                },
+                PgColumn {
+                    is_key: false,
+                    name: "k".into(),
+                    type_oid: 701,
+                    type_modifier: -1,
+                },
+            ],
+        };
+        let binary = |raw: Vec<u8>| Some(PgValue::Binary(Bytes::from(raw)));
+        let changes = [
+            DecodedChange {
+                op: ChangeOp::Delete,
+                row: TupleData {
+                    columns: vec![
+                        binary(1i64.to_be_bytes().to_vec()),
+                        binary(10.5f64.to_be_bytes().to_vec()),
+                    ],
+                },
+            },
+            DecodedChange {
+                op: ChangeOp::Create,
+                row: TupleData {
+                    columns: vec![
+                        binary(4i64.to_be_bytes().to_vec()),
+                        binary(2.0f64.to_be_bytes().to_vec()),
+                    ],
+                },
+            },
+        ];
+        let batch = build_change_batch(&schema, &relation, &changes).expect("build");
+        assert_op_column(&batch, &["d", "c"]);
+        let data = batch
+            .record
+            .column_by_name("data")
+            .expect("data")
+            .as_struct();
+        let k = data
+            .column_by_name("k")
+            .expect("k")
+            .as_primitive::<arrow::datatypes::Int32Type>();
+        assert!(k.is_null(0), "the delete's unfitting old value is NULL");
+        assert_eq!(k.value(1), 2, "the insert after it keeps its value");
+
+        // An insert with a value the column cannot hold is still refused.
+        let lossy = [DecodedChange {
+            op: ChangeOp::Create,
+            row: TupleData {
+                columns: vec![
+                    binary(5i64.to_be_bytes().to_vec()),
+                    binary(10.5f64.to_be_bytes().to_vec()),
+                ],
+            },
+        }];
+        let message = build_change_batch(&schema, &relation, &lossy)
+            .expect_err("lossy insert")
+            .to_string();
+        assert!(
+            message.contains("column 'k': postgres_replication: the float8 value 10.5"),
+            "{message}"
+        );
     }
 
     #[test]
