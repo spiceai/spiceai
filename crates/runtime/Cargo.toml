@@ -490,8 +490,7 @@ required-features = ["rate-control"]
 name = "metrics"
 path = "tests/metrics.rs"
 
-# Runs in `make nextest`, which must not load `integration`, and installs the
-# process-global tracing subscriber its log assertions read.
+# Runs in `make nextest`, which must not load `integration` (see `rate_control`).
 [[test]]
 name = "cayenne_runtime_tuning"
 path = "tests/cayenne_runtime_tuning.rs"
