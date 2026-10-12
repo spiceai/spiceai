@@ -350,6 +350,11 @@ jobs:
         if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'default')
         run: ./spiced --version
 
+      # Release gate: every release-notes highlight must work on the binary we ship.
+      - name: Smoke test release-notes highlights
+        if: matrix.target.target_os == 'linux' && matrix.target.target_arch == 'x86_64' && contains(matrix.target.tags, 'default')
+        run: test/release/smoke_highlights.sh ./spiced
+
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         if: matrix.target.target_os != 'windows' && contains(matrix.target.tags, 'default')
         with:
