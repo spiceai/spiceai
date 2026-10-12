@@ -189,11 +189,14 @@ fn dir_bytes(dir: &std::path::Path) -> u64 {
         .sum()
 }
 
+/// The deletion mode `HARNESS_MODE` names (`key` when unset). Any other value
+/// fails the run, so a typo cannot label one mode's numbers with another's name.
 fn mode_from_env() -> DeletionMode {
     match env_string("HARNESS_MODE", "key").as_str() {
+        "key" => DeletionMode::Key,
         "position" => DeletionMode::Position,
         "auto" => DeletionMode::Auto,
-        _ => DeletionMode::Key,
+        other => panic!("HARNESS_MODE must be `auto`, `key` or `position`, not {other:?}"),
     }
 }
 
