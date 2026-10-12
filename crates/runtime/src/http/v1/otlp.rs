@@ -26,8 +26,10 @@ use std::sync::Arc;
 
 use axum::{
     Extension,
-    body::Bytes,
+    body::{Body, Bytes},
+    extract::{MatchedPath, Request},
     http::{HeaderMap, HeaderValue, StatusCode, header},
+    middleware::Next,
     response::{IntoResponse, Response},
 };
 use opentelemetry_proto::tonic::collector::metrics::v1::{
@@ -38,6 +40,9 @@ use prost::Message;
 
 use super::require_write_access;
 use crate::opentelemetry::Service as MetricsIngestService;
+
+/// The OTLP/HTTP metrics route.
+pub(crate) const PATH: &str = "/v1/metrics";
 
 const PROTOBUF_CONTENT_TYPE: &str = "application/x-protobuf";
 const JSON_CONTENT_TYPE: &str = "application/json";
@@ -107,7 +112,71 @@ fn status_error(
     response
         .headers_mut()
         .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    response.extensions_mut().insert(OtlpEncoded);
     response
+}
+
+/// Marks a response whose body is already an OTLP message in the request's encoding, so
+/// [`encode_layer_errors`] leaves it alone.
+#[derive(Debug, Clone, Copy)]
+struct OtlpEncoded;
+
+/// Largest error body read back from a layer in front of the route to reuse as the message.
+const MAX_LAYER_ERROR_BODY_BYTES: usize = 64 * 1024;
+
+/// Middleware for `/v1/metrics` that re-encodes errors from the layers in front of the handler
+/// (API key auth, the mTLS gate, the body limit, extractor rejections) as a `google.rpc.Status`
+/// in the request's encoding, since OTLP/HTTP requires that body on every 4xx/5xx response,
+/// including 401 and 403. Other routes, successes, responses the handler already encoded, and
+/// requests with an unsupported Content-Type pass through unchanged.
+pub(crate) async fn encode_layer_errors(req: Request<Body>, next: Next) -> Response {
+    let is_otlp = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map_or_else(|| req.uri().path() == PATH, |path| path.as_str() == PATH);
+    if !is_otlp {
+        return next.run(req).await;
+    }
+    let encoding_kind = content_encoding(req.headers()).ok();
+    let response = next.run(req).await;
+    let status = response.status();
+    let Some(encoding_kind) = encoding_kind else {
+        return response;
+    };
+    if !(status.is_client_error() || status.is_server_error())
+        || response.extensions().get::<OtlpEncoded>().is_some()
+    {
+        return response;
+    }
+    let (parts, body) = response.into_parts();
+    let message = layer_error_message(body).await.unwrap_or_else(|| {
+        status
+            .canonical_reason()
+            .unwrap_or("Request failed")
+            .to_string()
+    });
+    let mut encoded = status_error(encoding_kind, status, grpc_code_for(status), message);
+    // Keep headers such as `WWW-Authenticate`; the body and its type are replaced.
+    for (name, value) in &parts.headers {
+        if *name != header::CONTENT_TYPE && *name != header::CONTENT_LENGTH {
+            encoded.headers_mut().append(name, value.clone());
+        }
+    }
+    encoded
+}
+
+/// The message of a layer's error body: a JSON `message` field, or the text itself.
+async fn layer_error_message(body: Body) -> Option<String> {
+    let bytes = axum::body::to_bytes(body, MAX_LAYER_ERROR_BODY_BYTES)
+        .await
+        .ok()?;
+    if let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes)
+        && let Some(message) = value.get("message").and_then(serde_json::Value::as_str)
+    {
+        return Some(message.to_string());
+    }
+    let text = String::from_utf8_lossy(&bytes).trim().to_string();
+    (!text.is_empty()).then_some(text)
 }
 
 #[expect(
@@ -218,6 +287,7 @@ fn encode_response(encoding_kind: Encoding, response: &ExportMetricsServiceRespo
     response
         .headers_mut()
         .insert(header::CONTENT_TYPE, HeaderValue::from_static(content_type));
+    response.extensions_mut().insert(OtlpEncoded);
     response
 }
 
@@ -252,6 +322,7 @@ fn status_code_for(code: tonic::Code) -> StatusCode {
     responses(
         (status = 200, description = "Export accepted, possibly with partial success"),
         (status = 400, description = "Invalid body, or every data point was rejected"),
+        (status = 401, description = "Missing or invalid API key"),
         (status = 403, description = "Write access required"),
         (status = 413, description = "Body too large"),
         (status = 415, description = "Unsupported Content-Type or Content-Encoding"),
@@ -263,7 +334,16 @@ pub(crate) async fn post(
     body: Bytes,
 ) -> Response {
     if let Some(resp) = require_write_access().await {
-        return resp;
+        // Answer in the request's encoding when it has one, like every other OTLP error.
+        let Ok(encoding_kind) = content_encoding(&headers) else {
+            return resp;
+        };
+        return status_error(
+            encoding_kind,
+            StatusCode::FORBIDDEN,
+            tonic::Code::PermissionDenied,
+            "API key does not allow write access",
+        );
     }
     handle(&service, &headers, body).await
 }
@@ -456,5 +536,89 @@ mod tests {
             response.headers()[header::CONTENT_TYPE],
             HeaderValue::from_static(JSON_CONTENT_TYPE)
         );
+    }
+
+    /// A router whose layer in front of `/v1/metrics` rejects like the API key auth layer does:
+    /// plain text, with a `WWW-Authenticate` header.
+    fn rejecting_router() -> axum::Router {
+        async fn reject_unauthenticated(_req: Request<Body>, _next: Next) -> Response {
+            let mut response =
+                (StatusCode::UNAUTHORIZED, "Missing or invalid API key").into_response();
+            response
+                .headers_mut()
+                .insert(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"));
+            response
+        }
+        axum::Router::new()
+            .route(PATH, axum::routing::post(|| async { StatusCode::OK }))
+            .route(
+                "/v1/other",
+                axum::routing::post(|| async { StatusCode::OK }),
+            )
+            .route_layer(axum::middleware::from_fn(reject_unauthenticated))
+            .route_layer(axum::middleware::from_fn(encode_layer_errors))
+    }
+
+    async fn send(router: axum::Router, path: &str, content_type: &str) -> Response {
+        use tower::ServiceExt;
+        let request = axum::http::Request::post(path)
+            .header(header::CONTENT_TYPE, content_type)
+            .body(Body::empty())
+            .expect("request");
+        router.oneshot(request).await.expect("response")
+    }
+
+    #[tokio::test]
+    async fn layer_errors_are_rpc_status_in_the_request_encoding() {
+        let response = send(rejecting_router(), PATH, PROTOBUF_CONTENT_TYPE).await;
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            response.headers()[header::CONTENT_TYPE],
+            HeaderValue::from_static(PROTOBUF_CONTENT_TYPE)
+        );
+        assert_eq!(
+            response.headers()[header::WWW_AUTHENTICATE],
+            HeaderValue::from_static("Bearer")
+        );
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let status = RpcStatus::decode(body.as_ref()).expect("google.rpc.Status");
+        assert_eq!(status.code, i32::from(tonic::Code::Unauthenticated));
+        assert_eq!(status.message, "Missing or invalid API key");
+
+        let response = send(rejecting_router(), PATH, JSON_CONTENT_TYPE).await;
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(json["code"], i32::from(tonic::Code::Unauthenticated));
+        assert_eq!(json["message"], "Missing or invalid API key");
+    }
+
+    #[tokio::test]
+    async fn layer_errors_pass_through_off_route_or_without_an_encoding() {
+        let other = send(rejecting_router(), "/v1/other", PROTOBUF_CONTENT_TYPE).await;
+        assert_eq!(
+            other.headers().get(header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static("text/plain; charset=utf-8"))
+        );
+        let unsupported = send(rejecting_router(), PATH, "text/csv").await;
+        assert_eq!(unsupported.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            unsupported.headers().get(header::CONTENT_TYPE),
+            Some(&HeaderValue::from_static("text/plain; charset=utf-8"))
+        );
+    }
+
+    #[test]
+    fn handler_encoded_errors_are_not_re_encoded() {
+        let response = status_error(
+            Encoding::Json,
+            StatusCode::BAD_REQUEST,
+            tonic::Code::InvalidArgument,
+            "bad",
+        );
+        assert!(response.extensions().get::<OtlpEncoded>().is_some());
     }
 }

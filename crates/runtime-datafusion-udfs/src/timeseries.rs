@@ -759,20 +759,20 @@ impl Accumulator for CounterGrowthAccumulator {
             CounterSamples::Signed(s) => {
                 let increase = integer_counter_increase(s);
                 if !self.per_second {
-                    return match increase.map(i64::try_from).transpose() {
-                        Ok(exact) => Ok(ScalarValue::Int64(exact)),
-                        Err(_) => exec_err!("{name}: the counter increase overflows Int64"),
+                    let Ok(exact) = increase.map(i64::try_from).transpose() else {
+                        return exec_err!("{name}: the counter increase overflows Int64");
                     };
+                    return Ok(ScalarValue::Int64(exact));
                 }
                 increase.map(i128_to_f64)
             }
             CounterSamples::Unsigned(s) => {
                 let increase = integer_counter_increase(s);
                 if !self.per_second {
-                    return match increase.map(u64::try_from).transpose() {
-                        Ok(exact) => Ok(ScalarValue::UInt64(exact)),
-                        Err(_) => exec_err!("{name}: the counter increase overflows UInt64"),
+                    let Ok(exact) = increase.map(u64::try_from).transpose() else {
+                        return exec_err!("{name}: the counter increase overflows UInt64");
                     };
+                    return Ok(ScalarValue::UInt64(exact));
                 }
                 increase.map(i128_to_f64)
             }
@@ -781,15 +781,12 @@ impl Accumulator for CounterGrowthAccumulator {
             return Ok(ScalarValue::Float64(None));
         };
         // Sorted by the increase above.
-        let span_nanos = last.saturating_sub(first);
+        // In `i128`: two `i64` times can be up to 2^64 - 1 ns apart, past `i64::MAX`.
+        let span_nanos = i128::from(last) - i128::from(first);
         if span_nanos <= 0 {
             return Ok(ScalarValue::Float64(None));
         }
-        #[expect(
-            clippy::cast_precision_loss,
-            reason = "a time span in seconds does not need nanosecond precision"
-        )]
-        let seconds = span_nanos as f64 / 1e9;
+        let seconds = i128_to_f64(span_nanos) / 1e9;
         Ok(ScalarValue::Float64(Some(increase / seconds)))
     }
 
@@ -798,10 +795,11 @@ impl Accumulator for CounterGrowthAccumulator {
     }
 }
 
-/// An exact integer increase as `f64`, rounded only once at the end for `rate`.
+/// An exact integer (an increase or a time span) as `f64`, rounded only once at the end for
+/// `rate`.
 #[expect(
     clippy::cast_precision_loss,
-    reason = "a per-second rate is a float; the increase itself was summed exactly"
+    reason = "a per-second rate is a float; its inputs were computed exactly"
 )]
 fn i128_to_f64(value: i128) -> f64 {
     value as f64
@@ -979,6 +977,31 @@ mod tests {
             panic!("rate is a Float64");
         };
         assert!((rate - expected).abs() / expected < 1e-12, "{rate}");
+    }
+
+    #[tokio::test]
+    async fn rate_spans_wider_than_i64_max_nanos() {
+        let ctx = ctx();
+        // i64::MIN to i64::MAX is 2^64 - 1 ns, which a saturating i64 span would halve.
+        let got = query_f64(
+            &ctx,
+            &format!(
+                "SELECT rate(v, ts) FROM (VALUES ({min}, 0.0), ({max}, 1000.0)) AS t(ts, v)",
+                min = i64::MIN,
+                max = i64::MAX
+            ),
+        )
+        .await;
+        #[expect(
+            clippy::cast_precision_loss,
+            reason = "expected value for a float rate"
+        )]
+        let expected = 1000.0 / (u64::MAX as f64 / 1e9);
+        let rate = got[0].expect("rate");
+        assert!(
+            (rate - expected).abs() / expected < 1e-12,
+            "{rate} vs {expected}"
+        );
     }
 
     #[test]

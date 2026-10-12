@@ -422,7 +422,7 @@ pub(crate) fn routes(
         .route("/v1/datasets", get(v1::datasets::get))
         .route("/v1/datasets/{name}/cdc", post(v1::cdc::post))
         // OTLP/HTTP metrics receiver; same handler as the gRPC receiver on the Flight port.
-        .route("/v1/metrics", post(v1::otlp::post))
+        .route(v1::otlp::PATH, post(v1::otlp::post))
         .route(
             "/v1/datasets/{name}/acceleration/refresh",
             post(v1::datasets::refresh),
@@ -629,6 +629,11 @@ pub(crate) fn routes(
     // non-probe request whose connection presented no verified peer cert.
     authenticated_router = authenticated_router
         .route_layer(middleware::from_fn(super::mtls::require_channel_identity));
+
+    // OTLP/HTTP needs every `/v1/metrics` error as a `google.rpc.Status` in the request's
+    // encoding, including the auth, mTLS, and body-limit rejections above, so this wraps them.
+    authenticated_router =
+        authenticated_router.route_layer(middleware::from_fn(v1::otlp::encode_layer_errors));
 
     // The executor registry only exists when the runtime is in scheduler role; it is `None`
     // otherwise. `/v1/ready`'s executor gating reads it through this layer.
