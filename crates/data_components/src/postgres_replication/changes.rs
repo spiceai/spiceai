@@ -1237,8 +1237,16 @@ impl FieldBuilder {
             Self::Float64(_) => type_oid == PG_FLOAT8_OID,
             Self::Date32(_) => type_oid == PG_DATE_OID,
             Self::Time64Nanos(_) => type_oid == PG_TIME_OID,
-            Self::TimestampMicros(..) | Self::TimestampNanos(..) => {
-                type_oid == PG_TIMESTAMP_OID || type_oid == PG_TIMESTAMPTZ_OID
+            // The provider maps `timestamptz` to a timezone-bearing column and
+            // `timestamp` to a naive one; their payloads share a width but not
+            // a meaning, so each column decodes only its own kind.
+            Self::TimestampMicros(_, tz) | Self::TimestampNanos(_, tz) => {
+                type_oid
+                    == if tz.is_some() {
+                        PG_TIMESTAMPTZ_OID
+                    } else {
+                        PG_TIMESTAMP_OID
+                    }
             }
             Self::Decimal128(..) => type_oid == PG_NUMERIC_OID,
             _ => true,
@@ -3498,6 +3506,38 @@ mod tests {
                 )),
                 "{dt} from oid {oid}: {message}"
             );
+        }
+    }
+
+    /// `timestamp` and `timestamptz` share a wire payload but not its meaning:
+    /// a naive local time against a UTC instant. A column registered as one
+    /// does not take the other's values as its own.
+    #[test]
+    fn timestamp_and_timestamptz_values_are_not_interchangeable() {
+        let raw = 0i64.to_be_bytes().to_vec();
+        let utc: Option<Arc<str>> = Some(Arc::from("UTC"));
+        for (dt, oid) in [
+            (DataType::Timestamp(TimeUnit::Microsecond, None), 1184),
+            (DataType::Timestamp(TimeUnit::Nanosecond, None), 1184),
+            (
+                DataType::Timestamp(TimeUnit::Microsecond, utc.clone()),
+                1114,
+            ),
+            (DataType::Timestamp(TimeUnit::Nanosecond, utc.clone()), 1114),
+        ] {
+            let message = bin_convert(&dt, oid, &raw).expect_err("other timestamp kind");
+            assert!(
+                message.contains(&format!(
+                    "the source column's type (type oid {oid}) is not the dataset column's type `{dt}`"
+                )),
+                "{dt} from oid {oid}: {message}"
+            );
+        }
+        for (dt, oid) in [
+            (DataType::Timestamp(TimeUnit::Microsecond, None), 1114),
+            (DataType::Timestamp(TimeUnit::Nanosecond, utc), 1184),
+        ] {
+            bin_convert(&dt, oid, &raw).expect("own timestamp kind");
         }
     }
 
