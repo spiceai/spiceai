@@ -700,3 +700,194 @@ async fn deletion_mode_concurrent_harness() -> Result<(), Box<dyn std::error::Er
     );
     Ok(())
 }
+
+/// Many primary-key upsert tables at once, each under its own open-loop writer,
+/// as a Spicepod with many small tables runs them. `HARNESS_TABLES` tables of
+/// `HARNESS_ROWS` rows each; every writer upserts a slice of `HARNESS_ROUND_KEYS`
+/// keys every `HARNESS_WRITE_INTERVAL_MS`, the writers staggered across the
+/// interval. One reader starts a round of the four queries every
+/// `HARNESS_READ_INTERVAL_MS` (default 60), on the next table in turn. Write and
+/// read latencies are pooled across tables, and the final answer sums every
+/// table's. Compaction runs as under `spiced`; see
+/// [`install_compaction_runtime_from_env`].
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+#[ignore = "timing harness; run explicitly with HARNESS_* variables"]
+async fn deletion_mode_many_tables_harness() -> Result<(), Box<dyn std::error::Error>> {
+    let mode = mode_from_env();
+    install_compaction_runtime_from_env();
+    let compaction_runtime = env_string("HARNESS_COMPACTION_RUNTIME", "dedicated");
+    let mode_label = env_string("HARNESS_MODE", "key");
+    let tables = env_usize("HARNESS_TABLES", 20).max(1);
+    let rows = env_usize("HARNESS_ROWS", 200_000);
+    let round_keys = env_usize("HARNESS_ROUND_KEYS", 2_000);
+    let write_interval_ms = env_usize("HARNESS_WRITE_INTERVAL_MS", 250) as u64;
+    let duration_s = env_usize("HARNESS_DURATION_S", 120) as u64;
+    let seed = env_usize("HARNESS_SEED", 42) as u64;
+    let trigger = env_usize("HARNESS_TRIGGER", 50_000);
+    let seed_batch = env_usize("HARNESS_SEED_BATCH", 100_000);
+    let read_interval_ms = env_usize("HARNESS_READ_INTERVAL_MS", 60) as u64;
+
+    let fixture = common::TestFixture::new(common::BackendType::Sqlite).await?;
+    let schema = schema();
+    let ctx = SessionContext::new();
+    let mut providers = Vec::with_capacity(tables);
+    let compactions = Arc::new(tokio::sync::Semaphore::new(2));
+    for index in 0..tables {
+        let name = format!("t{index}");
+        let options = CreateTableOptions {
+            table_name: name.clone(),
+            schema: Arc::clone(&schema),
+            primary_key: vec!["id".to_string()],
+            on_conflict: Some(OnConflict::Upsert(ColumnReference::new(vec![
+                "id".to_string(),
+            ]))),
+            base_path: fixture.data_path.to_string_lossy().to_string(),
+            partition_column: None,
+            vortex_config: VortexConfig {
+                deletion_mode: mode,
+                bake_deletion_index_trigger: trigger,
+                compaction_trigger_files: 4,
+                compaction_trigger_protected_snapshots: 4,
+                compaction_trigger_snapshot_age_ms: 60_000,
+                compaction_background_interval_ms: 10_000,
+                ..VortexConfig::default()
+            },
+        };
+        let catalog: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
+        let table = Arc::new(
+            CayenneTableProvider::create_table(catalog, options, ctx.runtime_env()).await?,
+        );
+        table.spawn_background_compaction(Arc::clone(&compactions));
+        ctx.register_table(name.as_str(), Arc::clone(&table) as Arc<dyn TableProvider>)?;
+        let mut next = 0usize;
+        while next < rows {
+            let end = (next + seed_batch).min(rows);
+            let ids: Vec<i64> = (next as i64..end as i64).collect();
+            common::insert_batch(&table, rows_batch(&schema, &ids, 0)).await?;
+            next = end;
+        }
+        providers.push(table);
+    }
+    for table in &providers {
+        table.drain_in_flight_maintenance().await?;
+    }
+    eprintln!(
+        "HARNESS mode={mode_label} config many_tables tables={tables} rows={rows} round_keys={round_keys} write_interval_ms={write_interval_ms} duration_s={duration_s} seed={seed} trigger={trigger} read_interval_ms={read_interval_ms} compaction_runtime={compaction_runtime}"
+    );
+
+    let start = Instant::now();
+    let deadline = start + Duration::from_secs(duration_s);
+    let interval = Duration::from_millis(write_interval_ms);
+    let writers: Vec<_> = providers
+        .iter()
+        .enumerate()
+        .map(|(index, table)| {
+            let table = Arc::clone(table);
+            let schema = Arc::clone(&schema);
+            tokio::spawn(async move {
+                let mut latencies = Vec::new();
+                let mut scheduled = start + interval.mul_f64(index as f64 / tables as f64);
+                let mut round = 0usize;
+                while scheduled < deadline {
+                    let now = Instant::now();
+                    if now < scheduled {
+                        tokio::time::sleep(scheduled - now).await;
+                    }
+                    let first = (round * round_keys) % rows.max(1);
+                    let ids: Vec<i64> = (first..first + round_keys)
+                        .map(|id| (id % rows) as i64)
+                        .collect();
+                    common::insert_batch(&table, rows_batch(&schema, &ids, (round + 1) as i64))
+                        .await
+                        .expect("upsert");
+                    latencies.push(scheduled.elapsed().as_secs_f64() * 1e3);
+                    round += 1;
+                    scheduled += interval;
+                }
+                latencies
+            })
+        })
+        .collect();
+
+    let reader = {
+        let ctx = ctx.clone();
+        tokio::spawn(async move {
+            let mut rng = SplitMix(seed ^ 0xA5A5);
+            let (mut agg, mut filter, mut point, mut count) =
+                (Vec::new(), Vec::new(), Vec::new(), Vec::new());
+            let mut next_round = Instant::now();
+            let mut round = 0usize;
+            while Instant::now() < deadline {
+                let now = Instant::now();
+                if now < next_round {
+                    tokio::time::sleep(next_round - now).await;
+                }
+                next_round += Duration::from_millis(read_interval_ms.max(1));
+                let name = format!("t{}", round % tables);
+                round += 1;
+                let begin = Instant::now();
+                run_query(
+                    &ctx,
+                    &format!("SELECT SUM(amount), SUM(qty), COUNT(payload) FROM {name}"),
+                )
+                .await;
+                agg.push(begin.elapsed().as_secs_f64() * 1e3);
+                let begin = Instant::now();
+                run_query(
+                    &ctx,
+                    &format!("SELECT COUNT(payload) FROM {name} WHERE qty < 50"),
+                )
+                .await;
+                filter.push(begin.elapsed().as_secs_f64() * 1e3);
+                let key = rng.below(rows as u64);
+                let begin = Instant::now();
+                run_query(&ctx, &format!("SELECT * FROM {name} WHERE id = {key}")).await;
+                point.push(begin.elapsed().as_secs_f64() * 1e3);
+                let begin = Instant::now();
+                run_query(&ctx, &format!("SELECT COUNT(*) FROM {name}")).await;
+                count.push(begin.elapsed().as_secs_f64() * 1e3);
+            }
+            (agg, filter, point, count)
+        })
+    };
+
+    let mut write_ms = Vec::new();
+    for writer in writers {
+        write_ms.extend(writer.await?);
+    }
+    let (mut agg, mut filter, mut point, mut count) = reader.await?;
+    summarize("c_write", &mode_label, &mut write_ms);
+    summarize("c_scan_agg", &mode_label, &mut agg);
+    summarize("c_scan_filter", &mode_label, &mut filter);
+    summarize("c_point_lookup", &mode_label, &mut point);
+    summarize("c_count_star", &mode_label, &mut count);
+    let mut rewritten_whole = 0usize;
+    for table in &providers {
+        table.drain_in_flight_maintenance().await?;
+        if matches!(
+            table.last_small_file_compact_path(),
+            cayenne::LastSmallFileCompactPath::Full
+        ) {
+            rewritten_whole += 1;
+        }
+    }
+    eprintln!(
+        "HARNESS mode={mode_label} metric=c_final dir_bytes={} tables_rewritten_whole={rewritten_whole}/{tables} last_small_file_compact_path={}",
+        dir_bytes(&fixture.data_path),
+        if rewritten_whole > 0 { "Full" } else { "None" }
+    );
+    let union = (0..tables)
+        .map(|index| format!("SELECT id, generation, qty FROM t{index}"))
+        .collect::<Vec<_>>()
+        .join(" UNION ALL ");
+    let answer = run_query(
+        &ctx,
+        &format!("SELECT COUNT(*) AS n, SUM(generation) AS gens, SUM(qty) AS qty FROM ({union})"),
+    )
+    .await;
+    eprintln!(
+        "HARNESS mode={mode_label} metric=c_answer value={}",
+        checksum(&answer)
+    );
+    Ok(())
+}
