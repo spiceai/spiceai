@@ -972,6 +972,46 @@ fn the_write_rate_line_names_the_dataset_the_times_and_the_docs() {
     );
 }
 
+/// The write rate an auto table's first whole-table rewrite is measured against
+/// starts at its first delete, which the compaction pass that follows the write
+/// that recorded it notes, whichever write path recorded it.
+#[tokio::test]
+async fn an_auto_tables_first_delete_starts_its_write_rate_interval() {
+    let (provider, _catalog, _tmp) = table("auto_first_delete", DeletionMode::Auto, 256).await;
+    let auto = Arc::clone(provider.pk_deletion_mode.auto().expect("an auto table"));
+    let keys: Vec<i64> = (0..16).collect();
+    write(&provider, &keys, 100).await;
+    provider
+        .compact_current_snapshot_small_files()
+        .await
+        .expect("compaction pass");
+    assert_eq!(
+        auto.first_delete_noted(),
+        None,
+        "a write that supersedes nothing records no delete"
+    );
+    let before = Instant::now();
+    write(&provider, &keys, 200).await;
+    provider
+        .compact_current_snapshot_small_files()
+        .await
+        .expect("compaction pass");
+    let noted = auto
+        .first_delete_noted()
+        .expect("the upsert's deletes were noted");
+    assert!(noted >= before, "noted at the upsert, not before it");
+    write(&provider, &keys, 300).await;
+    provider
+        .compact_current_snapshot_small_files()
+        .await
+        .expect("compaction pass");
+    assert_eq!(
+        auto.first_delete_noted(),
+        Some(noted),
+        "later deletes do not move the start"
+    );
+}
+
 /// An auto table on position deletes whose rows are all still in protected
 /// snapshots, and whose first whole-table rewrite takes more than a tenth of the
 /// time at its write rate, keeps key deletes: the rewrite is discarded rather

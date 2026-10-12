@@ -18487,10 +18487,6 @@ impl CayenneTableProvider {
         if !has_file_deletions && !has_inlined_deletions {
             return Ok(OnConflictUpdate::none());
         }
-        // `deletion_mode: auto` measures its write rate from the first delete.
-        if let Some(auto) = self.pk_deletion_mode.auto() {
-            auto.note_delete(Instant::now());
-        }
 
         // Reserve the delete sequence ONCE, up front. It is shared by the inline
         // tombstone (phase 1) and the file `DeleteFile` (phase 3) — both express
@@ -20120,6 +20116,13 @@ impl CayenneTableProvider {
         // configured 0 — and this path is a whole-snapshot rewrite.
         if deletion_index_len == 0 {
             return ReclaimDecision::NotDue;
+        }
+        // `deletion_mode: auto` measures its write rate from its first delete. The
+        // post-write maintenance that follows every write reaches this check, so
+        // the first non-empty index it sees dates that delete, whichever write path
+        // recorded it.
+        if let Some(auto) = auto {
+            auto.note_delete(Instant::now());
         }
         // The CONFIGURED trigger, not the adaptive one: the controller lowers that
         // to bake more often, a trade priced against the incremental bake's write

@@ -168,8 +168,8 @@ pub(crate) struct AutoDeletionMode {
     /// Whether a whole-table reclaim has committed while the table was on
     /// position deletes (see [`Self::was_kept_compacted`]).
     kept_compacted: AtomicBool,
-    /// When the table recorded its first delete since it was opened (see
-    /// [`Self::rewrite_outpaces_writes`]).
+    /// When a compaction pass first found a delete in the table's index since it
+    /// was opened (see [`Self::rewrite_outpaces_writes`]).
     first_delete_at: Mutex<Option<Instant>>,
     /// [`MIN_PACED_REWRITE`], lowered by tests whose tables rewrite in
     /// milliseconds.
@@ -290,10 +290,16 @@ impl AutoDeletionMode {
         *self.reclaims.lock() = ReclaimPace::default();
     }
 
-    /// Note that the table recorded a delete. The first one starts the interval
-    /// its first whole-table reclaim is measured against.
+    /// Note that the table's deletion index holds a delete at `now`. The first such
+    /// note starts the interval its first whole-table reclaim is measured against.
     pub(crate) fn note_delete(&self, now: Instant) {
         self.first_delete_at.lock().get_or_insert(now);
+    }
+
+    /// When [`Self::note_delete`] was first called, if it has been.
+    #[cfg(test)]
+    pub(crate) fn first_delete_noted(&self) -> Option<Instant> {
+        *self.first_delete_at.lock()
     }
 
     /// Whether a whole-table rewrite that started at `started` and took `took`
