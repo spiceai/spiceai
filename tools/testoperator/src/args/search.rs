@@ -60,7 +60,10 @@ impl SqlPipelineArg {
         if path.is_file() {
             return Ok(Self::File(path.to_path_buf()));
         }
-        if value.ends_with(".sql") || !value.contains(char::is_whitespace) {
+        let has_sql_extension = path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("sql"));
+        if has_sql_extension || !value.contains(char::is_whitespace) {
             return Err(format!("SQL pipeline file not found: {value}"));
         }
 
@@ -187,6 +190,7 @@ mod tests {
             "pipelines/missing.sql",
             "pipelines/missing",
             "my pipeline.sql",
+            "my pipeline.SQL",
         ] {
             assert_eq!(
                 SqlPipelineArg::parse(value),
