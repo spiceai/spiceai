@@ -99,7 +99,9 @@ pub static METRICS_STORE_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
 });
 
 /// JSON form of an OTLP attribute value. Integers, doubles, booleans and strings keep their
-/// JSON type; bytes are base64; arrays and key-value lists nest.
+/// JSON type; arrays and key-value lists nest. Bytes become `{"bytes": "<base64>"}` and NaN or
+/// an infinity becomes `{"double": "NaN"}`, so neither can collide with a string attribute
+/// carrying the same text (the JSON also feeds `series_hash`).
 fn any_value_to_json(value: Option<&AnyValue>) -> JsonValue {
     let Some(value) = value.and_then(|v| v.value.as_ref()) else {
         return JsonValue::Null;
@@ -108,11 +110,14 @@ fn any_value_to_json(value: Option<&AnyValue>) -> JsonValue {
         any_value::Value::StringValue(s) => JsonValue::String(s.clone()),
         any_value::Value::BoolValue(b) => JsonValue::Bool(*b),
         any_value::Value::IntValue(i) => JsonValue::from(*i),
-        // NaN and infinities have no JSON number form; keep them as text.
-        any_value::Value::DoubleValue(d) => serde_json::Number::from_f64(*d)
-            .map_or_else(|| JsonValue::String(d.to_string()), JsonValue::Number),
+        // NaN and infinities have no JSON number form; tag them so they stay distinct from
+        // strings such as "NaN".
+        any_value::Value::DoubleValue(d) => serde_json::Number::from_f64(*d).map_or_else(
+            || serde_json::json!({ "double": d.to_string() }),
+            JsonValue::Number,
+        ),
         any_value::Value::BytesValue(b) => {
-            JsonValue::String(base64::engine::general_purpose::STANDARD.encode(b))
+            serde_json::json!({ "bytes": base64::engine::general_purpose::STANDARD.encode(b) })
         }
         any_value::Value::ArrayValue(a) => JsonValue::Array(
             a.values
@@ -1006,7 +1011,7 @@ mod tests {
         ]);
         assert_eq!(
             json,
-            r#"{"b":true,"bytes":"AQI=","d":1.5,"i":7,"nan":"NaN"}"#
+            r#"{"b":true,"bytes":{"bytes":"AQI="},"d":1.5,"i":7,"nan":{"double":"NaN"}}"#
         );
     }
 
