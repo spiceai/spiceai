@@ -18,7 +18,9 @@ use std::sync::Arc;
 
 use arrow::array::{Array, Int64Array};
 use arrow::datatypes::{DataType, Field, Schema};
-use datafusion::datasource::listing::{ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl};
+use datafusion::datasource::listing::{
+    ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
+};
 use datafusion::execution::context::{SessionConfig, SessionContext};
 use datafusion::execution::object_store::ObjectStoreUrl;
 use object_store::{ObjectStoreExt, memory::InMemory, path::Path};
@@ -31,7 +33,11 @@ enum Payload {
     Stream,
 }
 
-async fn scan(body: &[u8], format: Format, payload: Payload) -> datafusion::error::Result<Vec<i64>> {
+async fn scan(
+    body: &[u8],
+    format: Format,
+    payload: Payload,
+) -> datafusion::error::Result<Vec<i64>> {
     let ctx = SessionContext::new_with_config(SessionConfig::new().with_batch_size(2));
     let directory = tempfile::tempdir().expect("create JSON fixture directory");
     let location = match payload {
@@ -42,7 +48,9 @@ async fn scan(body: &[u8], format: Format, payload: Payload) -> datafusion::erro
         }
         Payload::Stream => {
             let store = Arc::new(InMemory::new());
-            store.put(&Path::from("records.json"), body.to_vec().into()).await?;
+            store
+                .put(&Path::from("records.json"), body.to_vec().into())
+                .await?;
             let url = ObjectStoreUrl::parse("memory://json-audit")?;
             ctx.runtime_env().register_object_store(url.as_ref(), store);
             ListingTableUrl::parse("memory://json-audit/records.json")?
@@ -56,10 +64,18 @@ async fn scan(body: &[u8], format: Format, payload: Payload) -> datafusion::erro
         .with_listing_options(options)
         .with_schema(schema);
     ctx.register_table("records", Arc::new(ListingTable::try_new(config)?))?;
-    let batches = ctx.sql("SELECT id FROM records ORDER BY id").await?.collect().await?;
+    let batches = ctx
+        .sql("SELECT id FROM records ORDER BY id")
+        .await?
+        .collect()
+        .await?;
     let mut rows = Vec::new();
     for batch in batches {
-        let ids = batch.column(0).as_any().downcast_ref::<Int64Array>().expect("id is Int64");
+        let ids = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .expect("id is Int64");
         assert_eq!(ids.null_count(), 0, "fixture IDs are not null");
         rows.extend(ids.values().iter().copied());
     }
@@ -73,10 +89,15 @@ async fn array_scan_preserves_complete_input() {
         &br#"[{"id":1},{"id":2},{"id":3},{"id":4},{"id":5}]"#[..],
     ] {
         let oracle: Vec<serde_json::Value> = serde_json::from_slice(body).expect("valid array");
-        let expected: Vec<i64> = oracle.iter().map(|row| row["id"].as_i64().expect("integer ID")).collect();
+        let expected: Vec<i64> = oracle
+            .iter()
+            .map(|row| row["id"].as_i64().expect("integer ID"))
+            .collect();
         for format in [Format::Array, Format::Auto, Format::Json] {
             for payload in [Payload::File, Payload::Stream] {
-                let rows = scan(body, format, payload).await.expect("scan complete array");
+                let rows = scan(body, format, payload)
+                    .await
+                    .expect("scan complete array");
                 assert_eq!(rows, expected, "{format:?}/{payload:?}");
             }
         }
@@ -111,5 +132,9 @@ async fn array_scan_rejects_eof_after_separator() {
             }
         }
     }
-    assert_eq!(accepted, Vec::<String>::new(), "truncated arrays must fail, not return a successful prefix");
+    assert_eq!(
+        accepted,
+        Vec::<String>::new(),
+        "truncated arrays must fail, not return a successful prefix"
+    );
 }

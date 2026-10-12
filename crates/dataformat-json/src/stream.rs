@@ -186,8 +186,10 @@ impl<R: Read + Send> ArrayToNdjson<R> {
                 return Err(io::Error::new(io::ErrorKind::InvalidData, e));
             }
             None => {
-                self.eof = true;
-                return Ok(());
+                // A complete array consumes its `]` explicitly. End of input
+                // between elements is truncation, not the end of the array.
+                self.malformed = true;
+                return Err(truncated_array_error());
             }
         }
 
@@ -436,6 +438,14 @@ fn incomplete_bom_error(seen: usize) -> io::Error {
 /// The first byte of `bytes` that is not JSON whitespace, if there is one.
 fn first_non_whitespace(bytes: &[u8]) -> Option<u8> {
     bytes.iter().find(|b| !is_json_whitespace(**b)).copied()
+}
+
+/// The error both readers report when the array is still open at end of input.
+fn truncated_array_error() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::UnexpectedEof,
+        "Failed to read JSON array: the input ended before the closing ']' — the file is truncated. Rows read so far are only part of the file. Re-fetch the complete file, or set the dataset's 'format' to match its contents.",
+    )
 }
 
 /// The error both readers report for content that follows the array's `]`.
@@ -1180,9 +1190,7 @@ impl ArrayToNdjsonPush {
             }
             ParsingState::ExpectingFirstElement
             | ParsingState::ExpectingElement
-            | ParsingState::ExpectingCommaOrClosingBracket => {
-                "the input ended before the closing ']' — the file is truncated"
-            }
+            | ParsingState::ExpectingCommaOrClosingBracket => return Err(truncated_array_error()),
         };
 
         Err(io::Error::new(
@@ -4543,10 +4551,6 @@ mod tests {
 
         /// An array cut short mid-scalar has no closing `]`, and must be
         /// reported rather than read as a complete one.
-        ///
-        /// A body ending on the separator instead — `[1,` — is the separate
-        /// truncation gap tracked by #12755, which the reader shares with
-        /// object elements (`[{"a":1},`) and is not scalar-specific.
         #[test]
         fn a_truncated_array_is_still_reported() {
             for body in [&br"[1,2"[..], &br"[1"[..], &br"[1.5"[..]] {
@@ -4567,6 +4571,23 @@ mod tests {
                     "{} must be reported as cut short",
                     String::from_utf8_lossy(body)
                 );
+            }
+        }
+
+        /// End of input while the next element has not started is still an open
+        /// array. `[` and `[1,` must not read as an empty or one-row result.
+        #[test]
+        fn an_open_array_at_end_of_input_is_reported() {
+            for (body, reads_before_failure) in [
+                (&b"["[..], 0),
+                (&b"[ \n\t"[..], 0),
+                (&br"[1,"[..], 1),
+                (&br#"[{"a":1},"#[..], 1),
+            ] {
+                let err = ndjson_lines(body).expect_err("an open array must not read clean");
+                assert_eq!(err.kind(), io::ErrorKind::UnexpectedEof);
+                assert!(err.to_string().contains("before the closing ']'"));
+                assert_stays_failed(body, reads_before_failure);
             }
         }
 
