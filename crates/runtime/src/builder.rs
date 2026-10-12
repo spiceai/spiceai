@@ -662,18 +662,16 @@ impl RuntimeBuilder {
         {
             Some(ClusterRole::Scheduler) => {
                 // For a real object store, cluster_state.bootstrap() is called by start_scheduler_registry.
-                if let Some(scheduler_config) = shared_app
+                if let Some(scheduler_state) = shared_app
                     .read()
                     .await
                     .as_ref()
-                    .and_then(|app| app.runtime.resolved_scheduler())
-                    && let Some(state_location) = scheduler_config.state_location.as_deref()
+                    .and_then(|app| app.runtime.scheduler_state())
                 {
                     match crate::cluster::scheduler_registry::build_object_store_internal(
                         Arc::clone(&secrets),
                         io_runtime.clone(),
-                        state_location,
-                        &scheduler_config,
+                        &scheduler_state,
                     )
                     .await
                     {
@@ -986,9 +984,8 @@ async fn build_http_rate_control_registry(
     match runtime_object_store::state::build_object_store(
         secrets,
         io_runtime,
-        &state.location,
-        state.params.as_ref(),
-        "rate-control state",
+        &state.into(),
+        runtime_object_store::state::StateFeature::RateControl,
     )
     .await
     {

@@ -496,9 +496,8 @@ pub(crate) async fn build_results_cache_warmer(
     match runtime_object_store::state::build_object_store(
         secrets,
         io_runtime,
-        &state.location,
-        state.params.as_ref(),
-        "SQL results cache warmup state",
+        &state.into(),
+        runtime_object_store::state::StateFeature::ResultsCacheWarmup,
     )
     .await
     {
@@ -2208,7 +2207,7 @@ mod tests {
 
         let store: Arc<dyn object_store::ObjectStore> =
             Arc::new(object_store_occ::LocalConditionalPut::new(&dir).expect("local store"));
-        let state = ObjectState::<Vec<WarmupTemplate>>::new(store);
+        let state = ObjectState::<Vec<WarmupTemplate>>::new(store).with_prefix("results-cache/");
         let start = std::time::Instant::now();
         loop {
             if state
@@ -2222,7 +2221,7 @@ mod tests {
             }
             assert!(
                 start.elapsed() < Duration::from_secs(5),
-                "warmup catalog was not written to runtime.state location"
+                "warmup catalog was not written to the results-cache folder of the runtime.state location"
             );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }

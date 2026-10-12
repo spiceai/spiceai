@@ -28,7 +28,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
-use app::spicepod::component::runtime::Scheduler as SchedulerConfig;
+use app::spicepod::component::runtime::StateLocation;
 use futures::FutureExt;
 use futures::future::{Fuse, FusedFuture};
 use object_store::ObjectStore;
@@ -151,7 +151,7 @@ struct SchedulerRegistryRunner {
 
 pub async fn start_scheduler_registry(
     rt: Arc<Runtime>,
-    config: &SchedulerConfig,
+    state: Option<&StateLocation>,
     cancel: CancellationToken,
     peers: Arc<RwLock<SchedulerPeers>>,
     cluster: Arc<ClusterStateStore>,
@@ -188,11 +188,11 @@ pub async fn start_scheduler_registry(
 
     // Initialize job executor for async SQL queries. Reuses the raw
     // (store, base_prefix) pair behind ClusterStateStore.
-    let state_location = config.state_location.as_deref().ok_or_else(|| Error::ObjectStoreState {
+    let state = state.ok_or_else(|| Error::ObjectStoreState {
         source: "scheduler state_location is not configured (set runtime.scheduler.state_location or runtime.state.location)"
             .into(),
     })?;
-    let (store, base_prefix) = build_object_store(rt.as_ref(), state_location, config).await?;
+    let (store, base_prefix) = build_object_store(rt.as_ref(), state).await?;
     let job_store = crate::jobs::JobStore::new(
         Arc::clone(&store),
         base_prefix.clone(),
@@ -203,7 +203,10 @@ pub async fn start_scheduler_registry(
         rt.datafusion(),
     ));
     rt.set_job_executor(Arc::clone(&job_executor)).await;
-    tracing::info!("Initialized async SQL jobs API with state location: {state_location}");
+    tracing::info!(
+        "Initialized async SQL jobs API with state location: {}",
+        state.location
+    );
 
     let reaper = Reaper::new(Arc::clone(&cluster), Arc::clone(&heartbeats));
 
@@ -867,14 +870,12 @@ impl SchedulerRegistryRunner {
 
 pub(super) async fn build_object_store(
     rt: &Runtime,
-    state_location: &str,
-    config: &SchedulerConfig,
+    state: &StateLocation,
 ) -> Result<(Arc<dyn ObjectStore>, String)> {
     build_object_store_internal(
         Arc::clone(&rt.secrets()),
         rt.tokio_io_runtime().clone(),
-        state_location,
-        config,
+        state,
     )
     .await
 }
@@ -882,15 +883,13 @@ pub(super) async fn build_object_store(
 pub async fn build_object_store_internal(
     secrets: Arc<RwLock<Secrets>>,
     io_runtime: Handle,
-    state_location: &str,
-    config: &SchedulerConfig,
+    state: &StateLocation,
 ) -> Result<(Arc<dyn ObjectStore>, String)> {
     runtime_object_store::state::build_object_store(
         secrets,
         io_runtime,
-        state_location,
-        config.params.as_ref(),
-        "scheduler state",
+        state,
+        runtime_object_store::state::StateFeature::Scheduler,
     )
     .await
     .map_err(|source| Error::ObjectStoreState {
