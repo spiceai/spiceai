@@ -138,6 +138,8 @@ mod iceberg_api;
 mod json;
 
 #[cfg(not(windows))]
+mod cayenne_catalog_tuning;
+#[cfg(not(windows))]
 mod cdc_cayenne;
 #[cfg(feature = "debezium")]
 mod cdc_ingest;
