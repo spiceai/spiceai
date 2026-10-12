@@ -2873,6 +2873,7 @@ pub struct CayenneTableProviderBuilder {
     index_persistence: IndexPersistence,
     index_word_bits: Option<u32>,
     dataset_name: Option<Arc<str>>,
+    snapshot_dir_pins: Option<SnapshotDirPins>,
 }
 
 /// Whether a table's secondary index runs persist as run files, so a
@@ -3026,6 +3027,34 @@ struct CayenneTableProviderOpenOptions {
     index_persistence: IndexPersistence,
     index_word_bits: Option<u32>,
     dataset_name: Option<Arc<str>>,
+    snapshot_dir_pins: Option<SnapshotDirPins>,
+}
+
+/// What keeps a snapshot directory on disk while something still reads it, and
+/// the ledger of directories awaiting deletion: the in-flight scan ref-counts,
+/// the last listing time of each directory, and the retired-directory ledger.
+///
+/// A provider instance owns one of these, and every scan it plans pins its
+/// snapshot ids there. A `refresh_mode: snapshot` reload opens a *replacement*
+/// instance over the same table while queries planned on the replaced one may
+/// still be reading its directories, so the replacement is opened over the
+/// replaced instance's pins ([`CayenneTableProviderBuilder::with_snapshot_dir_pins`])
+/// and its sweeps defer every directory those queries hold, exactly as they
+/// defer the instance's own.
+#[derive(Clone, Default)]
+pub struct SnapshotDirPins {
+    scan_refs: Arc<ParkingMutex<HashMap<String, usize>>>,
+    last_listed: Arc<ParkingMutex<HashMap<String, Instant>>>,
+    retired: Arc<ParkingMutex<HashMap<String, Instant>>>,
+}
+
+impl std::fmt::Debug for SnapshotDirPins {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SnapshotDirPins")
+            .field("in_flight", &self.scan_refs.lock().len())
+            .field("retired", &self.retired.lock().len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl CayenneTableProviderBuilder {
@@ -3047,7 +3076,21 @@ impl CayenneTableProviderBuilder {
             index_persistence: IndexPersistence::default(),
             index_word_bits: None,
             dataset_name: None,
+            snapshot_dir_pins: None,
         }
+    }
+
+    /// Open the table over the snapshot-directory pins of the instance this one
+    /// replaces, so a sweep run by this instance defers the directories that
+    /// queries planned on the replaced instance still read. A `refresh_mode:
+    /// snapshot` reload passes its replaced provider's
+    /// [`CayenneTableProvider::snapshot_dir_pins`]; an instance opened with none
+    /// starts with no pins, which is right only when no earlier instance of the
+    /// table can still be serving queries.
+    #[must_use]
+    pub fn with_snapshot_dir_pins(mut self, pins: SnapshotDirPins) -> Self {
+        self.snapshot_dir_pins = Some(pins);
+        self
     }
 
     /// Name the dataset a user knows the table by in messages, when it differs from
@@ -3189,6 +3232,7 @@ impl CayenneTableProviderBuilder {
             index_persistence: self.index_persistence,
             index_word_bits: self.index_word_bits,
             dataset_name: self.dataset_name,
+            snapshot_dir_pins: self.snapshot_dir_pins,
         };
 
         CayenneTableProvider::new_internal(table_name, self.catalog, self.runtime_env, options)
@@ -3224,6 +3268,7 @@ impl CayenneTableProviderBuilder {
             index_persistence: self.index_persistence,
             index_word_bits: self.index_word_bits,
             dataset_name: self.dataset_name,
+            snapshot_dir_pins: self.snapshot_dir_pins,
         };
 
         CayenneTableProvider::new_internal(&table_name, self.catalog, self.runtime_env, options)
@@ -7098,6 +7143,152 @@ impl CayenneTableProvider {
         }
     }
 
+    /// The pins and retired-directory ledger this instance sweeps against, for
+    /// the instance that replaces it to be opened over
+    /// ([`CayenneTableProviderBuilder::with_snapshot_dir_pins`]).
+    #[must_use]
+    pub fn snapshot_dir_pins(&self) -> SnapshotDirPins {
+        SnapshotDirPins {
+            scan_refs: Arc::clone(&self.snapshot_scan_refs),
+            last_listed: Arc::clone(&self.snapshot_last_listed),
+            retired: Arc::clone(&self.retired_snapshot_dirs),
+        }
+    }
+
+    /// Retire every snapshot directory under this table's root that the catalog
+    /// no longer references, and sweep them once their grace elapses.
+    ///
+    /// A `refresh_mode: snapshot` reader fills its table by extracting each
+    /// snapshot archive into the data directory and importing the archived
+    /// metastore slice, which replaces the table's catalog rows. The directories
+    /// the previous slice referenced stay on disk with nothing pointing at them,
+    /// and since the reader never commits, neither sweep a commit schedules ever
+    /// runs over them: disk grows by a table copy per reload
+    /// (spiceai/spiceai#14981). The runtime calls this on the replacement
+    /// instance once it is serving — after the swap, never before, because the
+    /// replaced instance keeps serving its directories when the swap is refused.
+    ///
+    /// The live set is read through this instance from the catalog it opened on:
+    /// the current snapshot, every protected snapshot, and the directory of
+    /// every referenced deletion file. Only directories named by a uuid are
+    /// candidates: reserved `_`-prefixed directories and anything this engine
+    /// did not write are left alone. The retired directories go through the same
+    /// ledger sweep a writer's merge-away uses — grace, in-flight scan pins, the
+    /// manifest ref-count — rather than the uuid7-age sweep, which keeps every
+    /// directory at or newer than the current snapshot and so could never
+    /// reclaim a merged-away checkpoint of a CDC writer, whose current snapshot
+    /// never rotates. The grace is anchored on this process's clock at
+    /// retirement, not on the directory's creation time on the writer.
+    ///
+    /// Returns the ids retired by this call, sorted. A partitioned table and an
+    /// object-store table retire nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the table root cannot be listed or the catalog's
+    /// deletion files cannot be read; nothing is retired then.
+    pub async fn retire_unreferenced_snapshot_dirs(&self) -> CatalogResult<Vec<String>> {
+        if self.table_metadata.partition_column.is_some()
+            || self.table_metadata.path.starts_with("s3://")
+        {
+            return Ok(Vec::new());
+        }
+        let table_dir =
+            std::path::PathBuf::from(&self.table_metadata.path).join(&self.table_metadata.table_id);
+        let mut live = self.protected_snapshot_ids();
+        live.insert(self.get_current_snapshot_id());
+        for delete_file in self
+            .catalog
+            .get_table_delete_files(&self.table_metadata.table_id)
+            .await?
+        {
+            if let Some(id) = Self::snapshot_dir_holding(&table_dir, &delete_file.path) {
+                live.insert(id);
+            }
+        }
+        let mut on_disk = Vec::new();
+        let mut entries = match tokio::fs::read_dir(&table_dir).await {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(source) => return Err(CatalogError::IoError { source }),
+        };
+        while let Some(entry) = entries
+            .next_entry()
+            .await
+            .map_err(|source| CatalogError::IoError { source })?
+        {
+            if entry
+                .file_type()
+                .await
+                .map_err(|source| CatalogError::IoError { source })?
+                .is_dir()
+            {
+                on_disk.push(entry.file_name().to_string_lossy().into_owned());
+            }
+        }
+        let unreferenced = Self::unreferenced_snapshot_dir_ids(on_disk, &live);
+        if unreferenced.is_empty() {
+            return Ok(unreferenced);
+        }
+        tracing::debug!(
+            target: "cayenne::compaction",
+            table = self.table_metadata.table_name.as_str(),
+            retired = unreferenced.len(),
+            "Retired the snapshot directories the table's snapshot no longer references; each is deleted once no query reads it"
+        );
+        self.retire_snapshot_dirs(unreferenced.iter().map(String::as_str));
+        self.sweep_retired_snapshot_dirs();
+        self.follow_up_retired_snapshot_dirs();
+        Ok(unreferenced)
+    }
+
+    /// The directories under the table root that no live snapshot references,
+    /// sorted: every uuid-named entry of `on_disk` outside `live`. Reserved
+    /// `_`-prefixed directories and names that are not a uuid are never
+    /// candidates — this engine names a snapshot directory by a uuid, so anything
+    /// else was not written by it.
+    fn unreferenced_snapshot_dir_ids(on_disk: Vec<String>, live: &HashSet<String>) -> Vec<String> {
+        let mut unreferenced: Vec<String> = on_disk
+            .into_iter()
+            .filter(|name| !Self::is_reserved_table_dir(std::ffi::OsStr::new(name)))
+            .filter(|name| uuid::Uuid::parse_str(name).is_ok())
+            .filter(|name| !live.contains(name))
+            .collect();
+        unreferenced.sort();
+        unreferenced
+    }
+
+    /// The snapshot directory under `table_dir` that `path` lies in, if any:
+    /// the first path component below the table root.
+    fn snapshot_dir_holding(table_dir: &std::path::Path, path: &str) -> Option<String> {
+        std::path::Path::new(path)
+            .strip_prefix(table_dir)
+            .ok()?
+            .components()
+            .next()
+            .map(|component| component.as_os_str().to_string_lossy().into_owned())
+    }
+
+    /// Re-run the retired-directory sweep after each grace until the ledger
+    /// drains or the follow-up budget is spent. A writer's next commit re-sweeps
+    /// for it; a snapshot reader never commits, so without this a directory a
+    /// query held past the first sweep would wait for the next reload.
+    fn follow_up_retired_snapshot_dirs(&self) {
+        if !self.maintenance_still_admitted() {
+            return;
+        }
+        let table = self.clone_for_write();
+        tokio::spawn(async move {
+            for _ in 0..Self::SNAPSHOT_CLEANUP_REARMS {
+                tokio::time::sleep(Self::SNAPSHOT_CLEANUP_GRACE).await;
+                if table.is_maintenance_closed() || table.retired_snapshot_dirs.lock().is_empty() {
+                    return;
+                }
+                table.sweep_retired_snapshot_dirs();
+            }
+        });
+    }
+
     /// Note that a scan resolved a file listing for `snapshot_id`; the sweep
     /// defers that dir's deletion a full grace past this point so the scan can
     /// open its files however long it runs.
@@ -9335,6 +9526,7 @@ impl CayenneTableProvider {
             index_persistence,
             index_word_bits,
             dataset_name,
+            snapshot_dir_pins,
         } = options;
 
         let mut table_metadata = catalog.get_table(table_name).await?;
@@ -9499,6 +9691,9 @@ impl CayenneTableProvider {
         }));
 
         let force_staging_probe_on_startup = table_metadata.path.starts_with("s3://");
+        // A replacement instance inherits the pins of the instance it replaces;
+        // any other instance starts with none (see `SnapshotDirPins`).
+        let snapshot_dir_pins = snapshot_dir_pins.unwrap_or_default();
 
         // Register the S3 object store in the shared RuntimeEnv once during
         // construction. Every code path that creates a SessionContext from
@@ -9745,9 +9940,9 @@ impl CayenneTableProvider {
             staging_may_have_files: Arc::new(AtomicBool::new(force_staging_probe_on_startup)),
             publication_outcome_unknown: Arc::new(AtomicBool::new(false)),
             inflight_staging_appends: Arc::new(ParkingMutex::new(HashMap::new())),
-            retired_snapshot_dirs: Arc::new(ParkingMutex::new(HashMap::new())),
-            snapshot_last_listed: Arc::new(ParkingMutex::new(HashMap::new())),
-            snapshot_scan_refs: Arc::new(ParkingMutex::new(HashMap::new())),
+            retired_snapshot_dirs: snapshot_dir_pins.retired,
+            snapshot_last_listed: snapshot_dir_pins.last_listed,
+            snapshot_scan_refs: snapshot_dir_pins.scan_refs,
             position_compaction_skip_streak: Arc::new(ParkingMutex::new(
                 ResourceStarvationTracker::new(POSITION_COMPACTION_SKIP_WARN_AFTER),
             )),
@@ -74586,6 +74781,537 @@ mod tests {
             "an earlier abandoned checkout must not force every later restore to \
              discard its keyset, which rebuilds the whole keyset on every write"
         );
+    }
+
+    /// A `refresh_mode: snapshot` reader reclaims the snapshot directories a
+    /// reload leaves unreferenced, without touching one a query still reads
+    /// (spiceai/spiceai#14981). The reader is modelled the way the runtime builds
+    /// it: the writer's metastore slice is exported, its data directory copied
+    /// over the reader's skipping files already there, the slice imported into
+    /// the reader's own metastore, and a provider opened on it; a reload repeats
+    /// that and opens a replacement provider over the replaced one's pins.
+    mod snapshot_reader_reclaim {
+        use super::*;
+        use std::collections::BTreeSet;
+        use std::path::{Path, PathBuf};
+
+        /// A reader's metastore and data directory.
+        struct Reader {
+            _tmp: TempDir,
+            catalog: Arc<dyn MetadataCatalog>,
+            data_dir: PathBuf,
+        }
+
+        impl Reader {
+            async fn new() -> Self {
+                let tmp = tempfile::tempdir().expect("reader temp dir");
+                let metadata_dir = tmp.path().join("metadata");
+                std::fs::create_dir_all(&metadata_dir).expect("reader metadata dir");
+                let catalog = Arc::new(
+                    CayenneCatalog::new(format!("sqlite://{}/cayenne.db", metadata_dir.display()))
+                        .expect("reader catalog"),
+                ) as Arc<dyn MetadataCatalog>;
+                catalog.init().await.expect("reader catalog initialized");
+                Self {
+                    data_dir: tmp.path().join("data"),
+                    _tmp: tmp,
+                    catalog,
+                }
+            }
+
+            /// Deliver the writer's current snapshot: export its slice, copy the
+            /// snapshot directories the slice references — the archive excludes
+            /// the rest — skipping files already present as the archive
+            /// extraction does, and import the slice into the reader's metastore.
+            async fn replicate(&self, writer: &CayenneTableProvider) {
+                let writer_dir = Path::new(&writer.table_metadata.path);
+                let slice = writer
+                    .catalog
+                    .export_dataset_slice(&writer.table_metadata.table_name, writer_dir)
+                    .await
+                    .expect("export the writer's slice");
+                let mut referenced = writer.protected_snapshot_ids();
+                referenced.insert(writer.get_current_snapshot_id());
+                let writer_table_dir = writer_dir.join(&writer.table_metadata.table_id);
+                let reader_table_dir = self.data_dir.join(&writer.table_metadata.table_id);
+                for id in &referenced {
+                    let from = writer_table_dir.join(id);
+                    if from.is_dir() {
+                        copy_tree_skip_existing(&from, &reader_table_dir.join(id));
+                    }
+                }
+                self.catalog
+                    .import_dataset_slice(&slice, &self.data_dir)
+                    .await
+                    .expect("import the slice into the reader");
+            }
+
+            /// Open the reader's provider: the initial instance, or a reload's
+            /// replacement over the pins of the instance it replaces.
+            async fn open(
+                &self,
+                table_name: &str,
+                ctx: &SessionContext,
+                replacing: Option<&CayenneTableProvider>,
+            ) -> CayenneTableProvider {
+                let mut builder =
+                    CayenneTableProviderBuilder::new(Arc::clone(&self.catalog), ctx.runtime_env());
+                if let Some(previous) = replacing {
+                    builder = builder.with_snapshot_dir_pins(previous.snapshot_dir_pins());
+                }
+                builder
+                    .open(table_name)
+                    .await
+                    .expect("open the reader's table")
+            }
+        }
+
+        fn copy_tree_skip_existing(from: &Path, to: &Path) {
+            std::fs::create_dir_all(to).expect("target dir");
+            for entry in std::fs::read_dir(from).expect("list source dir") {
+                let entry = entry.expect("source entry");
+                let target = to.join(entry.file_name());
+                if entry.file_type().expect("source entry type").is_dir() {
+                    copy_tree_skip_existing(&entry.path(), &target);
+                } else if !target.exists() {
+                    std::fs::copy(entry.path(), &target).expect("copy file");
+                }
+            }
+        }
+
+        /// The uuid-named snapshot directories under the table root, sorted.
+        fn snapshot_dirs(provider: &CayenneTableProvider) -> BTreeSet<String> {
+            let table_dir = provider.snapshot_dir_path_for("");
+            std::fs::read_dir(&table_dir)
+                .expect("list the table root")
+                .map(|entry| {
+                    entry
+                        .expect("entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .filter(|name| !name.starts_with('_'))
+                .collect()
+        }
+
+        /// Pretend the grace has elapsed for every retired dir and every listing,
+        /// so a sweep judges the pins alone.
+        fn elapse_grace(provider: &CayenneTableProvider) {
+            let past = Instant::now()
+                .checked_sub(CayenneTableProvider::SNAPSHOT_CLEANUP_GRACE * 2)
+                .expect("the clock has run longer than two graces");
+            for at in provider.retired_snapshot_dirs.lock().values_mut() {
+                *at = past;
+            }
+            for at in provider.snapshot_last_listed.lock().values_mut() {
+                *at = past;
+            }
+        }
+
+        async fn wait_until_absent(path: &Path) {
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while path.exists() {
+                assert!(
+                    Instant::now() < deadline,
+                    "{} should have been deleted",
+                    path.display()
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        /// Plan a scan — which pins the snapshot dirs it will read — without
+        /// executing it, as a query does before it opens any file.
+        async fn plan_scan(
+            ctx: &SessionContext,
+            provider: &CayenneTableProvider,
+        ) -> Arc<dyn ExecutionPlan> {
+            provider
+                .scan(&ctx.state(), None, &[], None)
+                .await
+                .expect("plan the scan")
+        }
+
+        async fn id_value_pairs_of(
+            ctx: &SessionContext,
+            plan: Arc<dyn ExecutionPlan>,
+        ) -> Vec<(i64, i64)> {
+            use arrow::array::Int64Array;
+            let batches = collect(plan, ctx.task_ctx())
+                .await
+                .expect("execute the scan");
+            let mut pairs = Vec::new();
+            for batch in &batches {
+                let ids = batch
+                    .column(batch.schema().index_of("id").expect("id"))
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("id is Int64")
+                    .clone();
+                let values = batch
+                    .column(batch.schema().index_of("value").expect("value"))
+                    .as_any()
+                    .downcast_ref::<Int64Array>()
+                    .expect("value is Int64")
+                    .clone();
+                for row in 0..batch.num_rows() {
+                    pairs.push((ids.value(row), values.value(row)));
+                }
+            }
+            pairs.sort_unstable();
+            pairs
+        }
+
+        /// A writer whose every refresh is a whole-table overwrite, as a
+        /// `refresh_mode: full` dataset's is: each publishes a new current
+        /// snapshot. Files, not inlined rows, so the snapshot has a directory.
+        async fn full_refresh_writer(
+            table_name: &str,
+            ctx: &SessionContext,
+        ) -> (CayenneTableProvider, Arc<dyn MetadataCatalog>, TempDir) {
+            create_cdc_upsert_table_with_vortex_config(
+                table_name,
+                ctx.runtime_env(),
+                VortexConfig {
+                    inline_max_rows: 0,
+                    compaction_background_interval_ms: 3_600_000,
+                    ..VortexConfig::default()
+                },
+            )
+            .await
+        }
+
+        async fn overwrite(
+            ctx: &SessionContext,
+            writer: &CayenneTableProvider,
+            rows: &[(i64, i64)],
+        ) {
+            let schema = writer.table_schema();
+            let ids: Vec<i64> = rows.iter().map(|(id, _)| *id).collect();
+            let values: Vec<i64> = rows.iter().map(|(_, value)| *value).collect();
+            let source = MemorySourceConfig::try_new_exec(
+                &[vec![id_value_batch(Arc::clone(&schema), &ids, &values)]],
+                schema,
+                None,
+            )
+            .expect("overwrite source");
+            let plan = writer
+                .insert_into(&ctx.state(), source, InsertOp::Overwrite)
+                .await
+                .expect("overwrite plan");
+            collect(plan, ctx.task_ctx()).await.expect("overwrite");
+        }
+
+        /// The full-refresh shape: every reload supersedes the previous current
+        /// snapshot, which the reader then reclaims — and the writer's own
+        /// directories are not touched.
+        #[tokio::test]
+        async fn a_reload_reclaims_the_superseded_current_snapshot() {
+            let table_name = "reader_reclaims_superseded_current";
+            let ctx = SessionContext::new();
+            let (writer, _writer_catalog, _writer_tmp) =
+                full_refresh_writer(table_name, &ctx).await;
+            overwrite(&ctx, &writer, &[(1, 10), (2, 20)]).await;
+            let first = writer.get_current_snapshot_id();
+
+            let reader = Reader::new().await;
+            reader.replicate(&writer).await;
+            let initial = reader.open(table_name, &ctx, None).await;
+            assert_eq!(snapshot_dirs(&initial), BTreeSet::from([first.clone()]));
+
+            overwrite(&ctx, &writer, &[(1, 11), (3, 30)]).await;
+            let second = writer.get_current_snapshot_id();
+            assert_ne!(
+                first, second,
+                "an overwrite publishes a new current snapshot"
+            );
+            reader.replicate(&writer).await;
+            let writer_dirs_before = snapshot_dirs(&writer);
+            let replacement = reader.open(table_name, &ctx, Some(&initial)).await;
+            assert_eq!(
+                snapshot_dirs(&replacement),
+                BTreeSet::from([first.clone(), second.clone()]),
+                "before the fix the superseded directory stays forever; this is the state a reload leaves"
+            );
+
+            assert_eq!(
+                replacement
+                    .retire_unreferenced_snapshot_dirs()
+                    .await
+                    .expect("retire"),
+                vec![first.clone()]
+            );
+            elapse_grace(&replacement);
+            replacement.sweep_retired_snapshot_dirs();
+            wait_until_absent(&replacement.snapshot_dir_path_for(&first)).await;
+            assert_eq!(
+                snapshot_dirs(&replacement),
+                BTreeSet::from([second.clone()])
+            );
+            assert_eq!(
+                id_value_pairs_of(&ctx, plan_scan(&ctx, &replacement).await).await,
+                vec![(1, 11), (3, 30)]
+            );
+            assert_eq!(
+                snapshot_dirs(&writer),
+                writer_dirs_before,
+                "the reader reclaims its own copy only; the writer's directories are its own sweep's business"
+            );
+        }
+
+        /// A query planned on the replaced instance before the swap still reads
+        /// the superseded snapshot after it. The replacement's sweep sees that
+        /// query's pin only because it was opened over the replaced instance's
+        /// pins; it defers the directory until the query completes, then
+        /// deletes it.
+        #[tokio::test]
+        async fn a_reload_keeps_a_directory_a_query_on_the_replaced_instance_still_reads() {
+            let table_name = "reader_keeps_dir_under_query";
+            let ctx = SessionContext::new();
+            let (writer, _writer_catalog, _writer_tmp) =
+                full_refresh_writer(table_name, &ctx).await;
+            overwrite(&ctx, &writer, &[(1, 10), (2, 20)]).await;
+            let first = writer.get_current_snapshot_id();
+
+            let reader = Reader::new().await;
+            reader.replicate(&writer).await;
+            let initial = reader.open(table_name, &ctx, None).await;
+            // The query is planned against the first snapshot and has opened no file yet.
+            let in_flight = plan_scan(&ctx, &initial).await;
+
+            overwrite(&ctx, &writer, &[(1, 11), (3, 30)]).await;
+            let second = writer.get_current_snapshot_id();
+            reader.replicate(&writer).await;
+            let replacement = reader.open(table_name, &ctx, Some(&initial)).await;
+            assert_eq!(
+                replacement
+                    .retire_unreferenced_snapshot_dirs()
+                    .await
+                    .expect("retire"),
+                vec![first.clone()]
+            );
+            elapse_grace(&replacement);
+            replacement.sweep_retired_snapshot_dirs();
+            // Deferred: the directory is still pinned, so the query reads every
+            // file it planned for.
+            assert!(
+                replacement
+                    .retired_snapshot_dirs
+                    .lock()
+                    .contains_key(&first),
+                "a pinned directory stays in the ledger"
+            );
+            assert_eq!(
+                id_value_pairs_of(&ctx, in_flight).await,
+                vec![(1, 10), (2, 20)],
+                "the query sees the snapshot it was planned against, in full"
+            );
+            // The query is done and, as after a swap, nothing holds the replaced
+            // instance any more — its cached scan view held the pin too. The pin
+            // is gone, and the next sweep deletes.
+            drop(initial);
+            assert!(
+                !replacement.in_flight_scan_snapshot_ids().contains(&first),
+                "the completed query released its pin"
+            );
+            elapse_grace(&replacement);
+            replacement.sweep_retired_snapshot_dirs();
+            wait_until_absent(&replacement.snapshot_dir_path_for(&first)).await;
+            assert_eq!(snapshot_dirs(&replacement), BTreeSet::from([second]));
+            assert_eq!(
+                id_value_pairs_of(&ctx, plan_scan(&ctx, &replacement).await).await,
+                vec![(1, 11), (3, 30)]
+            );
+        }
+
+        /// The CDC shape: the writer's current snapshot never rotates and each
+        /// checkpoint is a protected snapshot newer than it. Once the writer
+        /// merges those away, the reader's next slice no longer references them.
+        /// The uuid7-age sweep keeps every directory newer than current, so it can
+        /// never reclaim them; the ledger path does, and keeps the merged
+        /// snapshot the slice still references.
+        #[tokio::test]
+        async fn a_reload_reclaims_merged_away_protected_snapshots_the_age_sweep_keeps() {
+            let table_name = "reader_reclaims_merged_protected";
+            let ctx = SessionContext::new();
+            let (writer, _writer_catalog, _writer_tmp) =
+                three_unmerged_protected_snapshots(table_name, &ctx).await;
+            let current = writer.get_current_snapshot_id();
+            let checkpoints: BTreeSet<String> =
+                writer.protected_snapshot_ids().into_iter().collect();
+            assert_eq!(checkpoints.len(), 3);
+
+            let reader = Reader::new().await;
+            reader.replicate(&writer).await;
+            let initial = reader.open(table_name, &ctx, None).await;
+            assert_eq!(
+                initial
+                    .protected_snapshot_ids()
+                    .into_iter()
+                    .collect::<BTreeSet<_>>(),
+                checkpoints,
+                "the slice carries the protected snapshots"
+            );
+
+            assert!(
+                writer
+                    .compact_protected_snapshots_subset(usize::MAX)
+                    .await
+                    .expect("merge the protected snapshots"),
+                "precondition: the writer merges its three checkpoints"
+            );
+            let merged: BTreeSet<String> = writer.protected_snapshot_ids().into_iter().collect();
+            assert_eq!(merged.len(), 1);
+            assert_eq!(
+                writer.get_current_snapshot_id(),
+                current,
+                "current never rotates"
+            );
+            reader.replicate(&writer).await;
+            let replacement = reader.open(table_name, &ctx, Some(&initial)).await;
+            let mut expected_on_disk = checkpoints.clone();
+            expected_on_disk.extend(merged.iter().cloned());
+            expected_on_disk.insert(current.clone());
+            assert_eq!(snapshot_dirs(&replacement), expected_on_disk);
+
+            // The age sweep is what a commit would run; the merged-away
+            // checkpoints are newer than current, so it keeps all of them.
+            replacement
+                .cleanup_old_snapshots_now_for_test(&current)
+                .await
+                .expect("age sweep");
+            assert_eq!(
+                snapshot_dirs(&replacement),
+                expected_on_disk,
+                "the uuid7-age sweep cannot reclaim a directory newer than the current snapshot"
+            );
+
+            assert_eq!(
+                replacement
+                    .retire_unreferenced_snapshot_dirs()
+                    .await
+                    .expect("retire")
+                    .into_iter()
+                    .collect::<BTreeSet<_>>(),
+                checkpoints
+            );
+            elapse_grace(&replacement);
+            replacement.sweep_retired_snapshot_dirs();
+            for checkpoint in &checkpoints {
+                wait_until_absent(&replacement.snapshot_dir_path_for(checkpoint)).await;
+            }
+            let mut expected_after = merged;
+            expected_after.insert(current);
+            assert_eq!(snapshot_dirs(&replacement), expected_after);
+            assert_eq!(
+                id_value_pairs_of(&ctx, plan_scan(&ctx, &replacement).await).await,
+                vec![(0, 0), (1, 10), (2, 20)]
+            );
+        }
+
+        /// A reader restarted over a data directory an earlier process left
+        /// full of superseded snapshots reclaims them when its provider opens;
+        /// reserved directories and directories this engine did not name are
+        /// left alone.
+        #[tokio::test]
+        async fn opening_over_a_leaked_directory_reclaims_it() {
+            let table_name = "reader_heals_leaked_dirs";
+            let ctx = SessionContext::new();
+            let (writer, _writer_catalog, _writer_tmp) =
+                full_refresh_writer(table_name, &ctx).await;
+            overwrite(&ctx, &writer, &[(1, 10)]).await;
+            let current = writer.get_current_snapshot_id();
+            let reader = Reader::new().await;
+            reader.replicate(&writer).await;
+
+            let table_dir = reader.data_dir.join(&writer.table_metadata.table_id);
+            let leaked = uuid::Uuid::now_v7().to_string();
+            std::fs::create_dir_all(table_dir.join(&leaked)).expect("leaked dir");
+            std::fs::write(table_dir.join(&leaked).join("stale.vortex"), b"stale")
+                .expect("stale file");
+            std::fs::create_dir_all(table_dir.join("_lookup_index").join("run"))
+                .expect("reserved dir");
+            std::fs::create_dir_all(table_dir.join("not-a-snapshot")).expect("foreign dir");
+
+            let provider = reader.open(table_name, &ctx, None).await;
+            assert_eq!(
+                provider
+                    .retire_unreferenced_snapshot_dirs()
+                    .await
+                    .expect("retire"),
+                vec![leaked.clone()]
+            );
+            elapse_grace(&provider);
+            provider.sweep_retired_snapshot_dirs();
+            wait_until_absent(&table_dir.join(&leaked)).await;
+            let mut remaining: Vec<String> = std::fs::read_dir(&table_dir)
+                .expect("list")
+                .map(|entry| {
+                    entry
+                        .expect("entry")
+                        .file_name()
+                        .to_string_lossy()
+                        .into_owned()
+                })
+                .collect();
+            remaining.sort();
+            let mut expected = vec![
+                current,
+                "_lookup_index".to_string(),
+                "not-a-snapshot".to_string(),
+            ];
+            expected.sort();
+            assert_eq!(remaining, expected);
+            assert_eq!(
+                id_value_pairs_of(&ctx, plan_scan(&ctx, &provider).await).await,
+                vec![(1, 10)]
+            );
+        }
+
+        #[test]
+        fn unreferenced_snapshot_dir_ids_keeps_live_reserved_and_foreign_entries() {
+            let current = uuid::Uuid::now_v7().to_string();
+            let protected = uuid::Uuid::now_v7().to_string();
+            let stale_a = uuid::Uuid::now_v7().to_string();
+            let stale_b = uuid::Uuid::now_v7().to_string();
+            let live = HashSet::from([current.clone(), protected.clone()]);
+            let on_disk = vec![
+                stale_b.clone(),
+                "_staging".to_string(),
+                current,
+                "notes".to_string(),
+                stale_a.clone(),
+                protected,
+                "_lookup_index".to_string(),
+            ];
+            let mut expected = vec![stale_a, stale_b];
+            expected.sort();
+            assert_eq!(
+                CayenneTableProvider::unreferenced_snapshot_dir_ids(on_disk, &live),
+                expected
+            );
+        }
+
+        #[test]
+        fn snapshot_dir_holding_names_the_first_component_below_the_table_root() {
+            let table_dir = Path::new("/data/t/tid");
+            assert_eq!(
+                CayenneTableProvider::snapshot_dir_holding(
+                    table_dir,
+                    "/data/t/tid/snap/deletions/d.arrow"
+                ),
+                Some("snap".to_string())
+            );
+            assert_eq!(
+                CayenneTableProvider::snapshot_dir_holding(
+                    table_dir,
+                    "/data/t/snap/deletions/d.arrow"
+                ),
+                None,
+                "a deletion file beside the table root is in no snapshot directory under it"
+            );
+        }
     }
 
     mod layered_upsert_state;

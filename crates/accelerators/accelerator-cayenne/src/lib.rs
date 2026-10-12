@@ -71,7 +71,7 @@ use runtime_checkpoint_api::CheckpointError;
 use runtime_checkpoint_sqlite::SqliteSidecar;
 use runtime_parameters::ParameterSpec;
 use search::index::native_vector::NativeVectorIndex;
-use spice_table::{Index, IndexLayer};
+use spice_table::{Index, IndexLayer, LayerWalk, find_concrete};
 use spicepod::acceleration as spicepod_acceleration;
 
 /// Metadata key to identify the accelerator type in the schema metadata.
@@ -423,6 +423,14 @@ pub struct CayenneAccelerator {
     /// on this one budget, including those created by `CREATE TABLE …
     /// PARTITIONED BY`, which belong to no accelerator.
     compaction_semaphore: Arc<tokio::sync::Semaphore>,
+    /// The snapshot-directory pins a `refresh_mode: snapshot` reload hands from
+    /// the provider it replaces to the one the reload factory creates, keyed by
+    /// dataset. An entry lives only for the duration of that one create:
+    /// `reload_from_snapshot` inserts it before calling the factory and removes
+    /// it after, whatever the outcome, and `create_cayenne_table_provider` takes
+    /// it. Reloads of one dataset are serialized by the runtime's accelerator
+    /// write mutex, so the map holds at most one entry per dataset mid-reload.
+    inherited_snapshot_dir_pins: parking_lot::Mutex<HashMap<String, cayenne::SnapshotDirPins>>,
 }
 
 /// `(available, total)` permits of the fleet-wide compaction budget.
@@ -1341,6 +1349,7 @@ impl CayenneAccelerator {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             footer_cache_mb,
             compaction_semaphore: cayenne::compaction_budget(),
+            inherited_snapshot_dir_pins: parking_lot::Mutex::new(HashMap::new()),
         }
     }
 
@@ -2881,6 +2890,16 @@ impl CayenneAccelerator {
         if let Some(cold) = cold_object_store {
             builder = builder.with_cold_object_store(cold);
         }
+        // A reload's replacement instance sweeps against the pins of the instance
+        // it replaces, so queries still reading the replaced snapshot keep their
+        // directories (see `CayenneTableProvider::retire_unreferenced_snapshot_dirs`).
+        if let Some(pins) = self
+            .inherited_snapshot_dir_pins
+            .lock()
+            .remove(&source.name().to_string())
+        {
+            builder = builder.with_snapshot_dir_pins(pins);
+        }
         tracing::debug!("create_cayenne_table_provider: calling builder.create for {table_name}");
         let cayenne_table = builder
             .create(table_options)
@@ -4303,7 +4322,7 @@ impl DataAccelerator for CayenneAccelerator {
     /// factory then reopens the directory tree from disk.
     async fn reload_from_snapshot(
         &self,
-        _source: &dyn AccelerationSource,
+        source: &dyn AccelerationSource,
         previous_provider: Arc<dyn TableProvider>,
         provider_factory: data_accelerator_api::ReloadProviderFactory,
     ) -> Result<Arc<dyn TableProvider>, Box<dyn std::error::Error + Send + Sync>> {
@@ -4311,8 +4330,61 @@ impl DataAccelerator for CayenneAccelerator {
         // previous instance's maintenance must stop before the new one starts:
         // nothing in memory serializes two instances' compaction (#11581).
         change_sink::quiesce_table_maintenance(&previous_provider).await;
+        // Queries planned on the previous instance may still be reading its
+        // snapshot directories after the swap, and they pin those directories in
+        // the previous instance's maps. The replacement is opened over the same
+        // maps so its sweep defers them; without that it would see every
+        // superseded directory as unused (spiceai/spiceai#14981).
+        let pins = find_concrete::<cayenne::CayenneTableProvider>(
+            previous_provider.as_ref(),
+            LayerWalk::Write,
+        )
+        .map(cayenne::CayenneTableProvider::snapshot_dir_pins);
         drop(previous_provider);
-        provider_factory().await
+        let Some(pins) = pins else {
+            // No single Cayenne instance to inherit from (a partitioned dataset):
+            // the replacement starts with no pins and `snapshot_installed`
+            // reclaims nothing for it either.
+            return provider_factory().await;
+        };
+        let dataset = source.name().to_string();
+        self.inherited_snapshot_dir_pins
+            .lock()
+            .insert(dataset.clone(), pins);
+        let created = provider_factory().await;
+        // Cleared on every outcome: a failed create must not leave pins for a
+        // later, unrelated create of this dataset to inherit.
+        self.inherited_snapshot_dir_pins.lock().remove(&dataset);
+        created
+    }
+
+    /// Reclaim the snapshot directories the installed snapshot no longer
+    /// references. Called after the swap, so the replaced instance is no longer
+    /// served; the pins handed over in `reload_from_snapshot` keep the
+    /// directories its remaining queries still read.
+    async fn snapshot_installed(
+        &self,
+        source: &dyn AccelerationSource,
+        provider: &Arc<dyn TableProvider>,
+    ) {
+        let Some(table) =
+            find_concrete::<cayenne::CayenneTableProvider>(provider.as_ref(), LayerWalk::Write)
+        else {
+            return;
+        };
+        match table.retire_unreferenced_snapshot_dirs().await {
+            Ok(retired) if retired.is_empty() => {}
+            Ok(retired) => tracing::debug!(
+                dataset = %source.name(),
+                retired = retired.len(),
+                "Retired the local snapshot directories that dataset '{}' no longer references; they are deleted once no query reads them",
+                source.name()
+            ),
+            Err(error) => tracing::warn!(
+                "Failed to reclaim the superseded local snapshot directories of dataset '{}', so its local disk usage keeps the previous snapshot until the next snapshot reload retries. Cause: {error}",
+                source.name()
+            ),
+        }
     }
 
     async fn drop_table(

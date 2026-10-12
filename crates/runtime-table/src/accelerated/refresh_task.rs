@@ -1891,6 +1891,12 @@ impl RefreshTask {
             ));
         }
         state.set_current_loaded_id(info.snapshot_id, metadata_e_tag);
+        // Only now: the replaced provider is no longer served, so what its
+        // snapshot referenced and this one does not can be reclaimed.
+        state
+            .accelerator
+            .snapshot_installed(state.source.as_ref(), &state.swappable_provider.current())
+            .await;
         if let Some(updated_at) = info.last_updated_at {
             self.last_updated_at
                 .store(updated_at, std::sync::atomic::Ordering::Release);
