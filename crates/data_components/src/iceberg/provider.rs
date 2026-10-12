@@ -706,10 +706,12 @@ mod tests {
     }
 
     /// Guards the session batch size passed to the fork's `IcebergTableScan`.
+    /// The size is neither the Parquet reader's 1024 nor `DataFusion`'s 8192
+    /// default, so a scan that hard-codes either one fails.
     #[tokio::test]
     async fn a_scan_uses_the_session_batch_size() {
         let (catalog, ident) = catalog_with_empty_table().await;
-        let batch_size = 8192;
+        let batch_size = 5000;
         let ctx = SessionContext::new_with_config(
             SessionConfig::new()
                 .with_target_partitions(1)
