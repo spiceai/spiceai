@@ -317,7 +317,7 @@ scripts/signoff-batch --plan 15040 15041     # build and check out the batch, th
    change it. The log goes to `.git/signoff-batch/<batch>.log`.
 4. If the checks pass, the script asks for confirmation (skip it with `--yes`).
    Then it pushes each updated head and attests it. The description names the
-   other PRs and T. If a push is rejected because the branch moved during the
+   other PRs in the batch. If a push is rejected because the branch moved during the
    run, the script does not attest that PR.
 
 If the checks fail, the script pushes and attests nothing. It reads the log for

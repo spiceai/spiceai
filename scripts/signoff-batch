@@ -272,15 +272,14 @@ def verify(signoff: Path, worktree: Path, log_path: Path, skip_targeted: bool) -
     return proc.returncode == 0, summary or "lint+test passed"
 
 
-def compose_note(summary: str, trunk: str, pr: PullRequest, batch: Batch) -> str:
+def compose_note(summary: str, pr: PullRequest, batch: Batch) -> str:
     others = [f"#{h.pr.number}" for h in batch.heads if h.pr.number != pr.number]
-    on_trunk = f"on {TRUNK} {trunk[:10]}"
     if not others:
-        return f"{summary} {on_trunk} (signoff-batch)"
-    note = f"{summary} in batch with {' '.join(others)} {on_trunk}"
+        return f"{summary} (signoff-batch)"
+    note = f"{summary} in batch with {' '.join(others)}"
     if len(note) <= NOTE_MAX_CHARS:
         return note
-    return f"{summary} in batch with {len(others)} other PRs {on_trunk}"
+    return f"{summary} in batch with {len(others)} other PRs"
 
 
 def attest(repo: Path, signoff: Path, sha: str, note: str) -> subprocess.CompletedProcess[str]:
@@ -466,7 +465,7 @@ def main(argv: Sequence[str]) -> int:
                     # Usually the branch moved during the run: its new head was not checked.
                     failed.append(f"#{h.pr.number}: push rejected, not attested\n{push.stderr.strip()}")
                     continue
-            result = attest(repo, signoff, h.sha, compose_note(summary, trunk, h.pr, batch))
+            result = attest(repo, signoff, h.sha, compose_note(summary, h.pr, batch))
             if result.returncode != 0:
                 failed.append(f"#{h.pr.number}: attestation failed\n{(result.stdout + result.stderr).strip()}")
                 continue

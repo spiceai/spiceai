@@ -75,12 +75,12 @@ class PureFunctionTest(unittest.TestCase):
         prs = [batch.PullRequest(n, f"b{n}", "t", "trunk", "0" * 40) for n in range(15000, 15012)]
         heads = tuple(batch.UpdatedHead(pr, pr.head) for pr in prs)
         full = batch.Batch("a" * 40, heads, "b" * 40)
-        note = batch.compose_note("lint+test passed", "a" * 40, prs[0], full)
+        note = batch.compose_note("lint+test passed", prs[0], full)
         self.assertLessEqual(len(note), batch.NOTE_MAX_CHARS)
         self.assertIn("11 other PRs", note)
         pair = batch.Batch("a" * 40, heads[:2], "b" * 40)
-        self.assertEqual(batch.compose_note("lint+test passed", "a" * 40, prs[0], pair),
-                         "lint+test passed in batch with #15001 on trunk aaaaaaaaaa")
+        self.assertEqual(batch.compose_note("lint+test passed", prs[0], pair),
+                         "lint+test passed in batch with #15001")
 
 
 class EndToEndTest(unittest.TestCase):
@@ -168,7 +168,7 @@ class EndToEndTest(unittest.TestCase):
             tip = self.origin_tip(branch)
             self.git(self.origin, "merge-base", "--is-ancestor", trunk, tip)
             self.assertIn(tip, attested, f"#{number} head was not attested")
-            self.assertEqual(attested[tip], f"lint+test passed in batch with {other} on trunk {trunk[:10]}")
+            self.assertEqual(attested[tip], f"lint+test passed in batch with {other}")
         # The attestation worktrees are gone again.
         self.assertNotIn("signoff-batch-attest", self.git(self.dev, "worktree", "list"))
 
