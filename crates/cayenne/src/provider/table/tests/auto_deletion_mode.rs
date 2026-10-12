@@ -139,7 +139,7 @@ async fn a_small_auto_table_uses_position_deletes_and_a_large_one_key_deletes() 
     assert!(!key.position_rewrites_exclude_writers());
 
     // A table that is already past its bound when it opens starts on key deletes.
-    // The 1 MiB target file size makes the bound 64 KiB.
+    // The 1 MiB target file size makes the bound 32 KiB.
     let (seeded, catalog, tmp) = table("auto_reopened_large", DeletionMode::Auto, 1).await;
     let ids: Vec<i64> = (0..60_000).collect();
     write_incompressible(&seeded, &ids).await;
@@ -149,8 +149,8 @@ async fn a_small_auto_table_uses_position_deletes_and_a_large_one_key_deletes() 
         .expect("storage stats");
     let bytes = CayenneTableProvider::warm_table_bytes(&stats);
     assert!(
-        bytes > 64 * 1024,
-        "premise: the seeded table ({bytes} B) must be past the 64 KiB bound"
+        bytes > 32 * 1024,
+        "premise: the seeded table ({bytes} B) must be past the 32 KiB bound"
     );
     seeded
         .drain_in_flight_maintenance()
@@ -372,7 +372,7 @@ async fn the_switch_to_key_deletes_forgets_captured_positions() {
 #[tokio::test]
 async fn an_auto_table_past_its_bound_switches_to_key_deletes() {
     let name = "auto_outgrown";
-    // 1 MiB target file size: a 64 KiB bound.
+    // 1 MiB target file size: a 32 KiB bound.
     let (provider, catalog, _tmp) = table(name, DeletionMode::Auto, 1).await;
     let upserted: Vec<i64> = (0..8).collect();
     let seed: Vec<i64> = (0..16).collect();
@@ -392,8 +392,8 @@ async fn an_auto_table_past_its_bound_switches_to_key_deletes() {
         .expect("storage stats");
     let bytes = CayenneTableProvider::warm_table_bytes(&stats);
     assert!(
-        bytes > 64 * 1024,
-        "premise: the grown table ({bytes} B) must be past the 64 KiB bound"
+        bytes > 32 * 1024,
+        "premise: the grown table ({bytes} B) must be past the 32 KiB bound"
     );
     assert!(
         deletion_index_entries(&provider) >= 2,
@@ -887,4 +887,25 @@ async fn a_reclaim_leaves_no_reinsert_marker_at_or_below_its_cutoff() {
             ids.iter().map(|id| (*id, 2)).collect::<Vec<_>>()
         );
     }
+}
+
+/// The line an auto table logs when it outgrows position deletes names the
+/// dataset in quotes, gives the bound in MiB (in KiB below a whole MiB), and
+/// links the docs.
+#[test]
+fn the_key_deletes_switch_line_names_the_dataset_the_bound_and_the_docs() {
+    assert_eq!(
+        auto_switched_to_key_deletes_message("orders", 8 * 1024 * 1024),
+        "Dataset 'orders' grew past 8 MiB on disk, the largest size at which Cayenne \
+         applies its updates and deletes by rewriting it whole, so it now applies them \
+         incrementally. See: \
+         https://spiceai.org/docs/components/data-accelerators/cayenne#deletion-strategies"
+    );
+    assert_eq!(
+        auto_switched_to_key_deletes_message("sales.orders", 32 * 1024),
+        "Dataset 'sales.orders' grew past 32 KiB on disk, the largest size at which \
+         Cayenne applies its updates and deletes by rewriting it whole, so it now \
+         applies them incrementally. See: \
+         https://spiceai.org/docs/components/data-accelerators/cayenne#deletion-strategies"
+    );
 }

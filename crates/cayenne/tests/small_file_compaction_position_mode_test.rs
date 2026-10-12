@@ -176,7 +176,7 @@ async fn run_small_file_workload(name: &str, deletion_mode: DeletionMode) {
 async fn small_file_compaction_of_a_default_mode_primary_key_table_finishes() {
     // `auto` keeps a primary-key table that is not CDC-fed on position deletes
     // while it is small and moves it to key deletes as it grows past its bound
-    // (a quarter of this table's 1 MiB target file size): this workload crosses
+    // (1/32 of this table's 1 MiB target file size): this workload crosses
     // it, so it runs under both modes.
     run_small_file_workload("pk_small_files_auto", DeletionMode::Auto).await;
 }

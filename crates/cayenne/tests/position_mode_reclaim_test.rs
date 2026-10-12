@@ -313,7 +313,7 @@ async fn key_mode_deletion_index_still_reclaims(
 /// The same workload on the DEFAULT `deletion_mode` (`auto`), the configuration
 /// issue #13620 reports: its deletion index grew by one tombstone per superseded
 /// row for the life of the process. This table is far inside `auto`'s
-/// position-delete bound (a sixteenth of the 256 MiB target file size), so `auto`
+/// position-delete bound (1/32 of the 256 MiB target file size), so `auto`
 /// keeps it on position deletes and reclaims the index the way a position table
 /// does — by rewriting the whole table, which is cheap at this size and leaves
 /// one compact snapshot — and the index stays bounded.
@@ -350,7 +350,7 @@ async fn default_mode_small_table_reclaims_by_rewriting_itself(
     Ok(())
 }
 
-/// Rows of incompressible payload that put a table past the 64 KiB position-delete
+/// Rows of incompressible payload that put a table past the 32 KiB position-delete
 /// bound a 1 MiB target file size gives `auto`, on keys no upsert round touches.
 fn ballast_batch(schema: &Arc<Schema>) -> RecordBatch {
     const BALLAST_ROWS: i64 = 40_000;
@@ -404,8 +404,8 @@ async fn default_mode_table_past_its_bound_reclaims_through_the_bake(
         .await?;
     let bytes = stats.current_bytes + stats.protected_bytes;
     assert!(
-        bytes > 64 * 1024,
-        "premise: the ballast ({bytes} B) must put the table past the 64 KiB bound"
+        bytes > 32 * 1024,
+        "premise: the ballast ({bytes} B) must put the table past the 32 KiB bound"
     );
 
     let observed = drive_rounds(&table, &schema).await?;

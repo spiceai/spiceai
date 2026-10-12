@@ -13541,6 +13541,11 @@ impl CayenneTableProvider {
     /// tombstone that the key-mode passes now running keep until a rewrite
     /// applies it.
     fn switch_auto_to_key_deletes(&self) -> bool {
+        self.switch_auto_to_key_deletes_because(&KeyDeletesBecause::Outgrew)
+    }
+
+    /// [`Self::switch_auto_to_key_deletes`], for `because`.
+    fn switch_auto_to_key_deletes_because(&self, because: &KeyDeletesBecause) -> bool {
         let Some(auto) = self.pk_deletion_mode.auto() else {
             return false;
         };
@@ -13561,14 +13566,25 @@ impl CayenneTableProvider {
             }
         };
         self.publish_single_keyset_bytes(keyset_bytes);
-        tracing::info!(
-            target: "cayenne::compaction",
-            "{}",
-            auto_switched_to_key_deletes_message(
-                self.table_metadata.table_name.as_str(),
-                auto.max_position_bytes(),
-            )
-        );
+        match because {
+            KeyDeletesBecause::Outgrew => tracing::info!(
+                target: "cayenne::compaction",
+                "{}",
+                auto_switched_to_key_deletes_message(
+                    self.table_metadata.table_name.as_str(),
+                    auto.max_position_bytes(),
+                )
+            ),
+            // Not growth, and nothing the user acts on: a whole-table rewrite of a
+            // table that cannot be sized is not known to be cheap, so it takes key
+            // deletes, which is where an unsized table starts at open too.
+            KeyDeletesBecause::Unsized(error) => tracing::debug!(
+                target: "cayenne::compaction",
+                table = self.table_metadata.table_name.as_str(),
+                %error,
+                "deletion_mode auto: could not size the table, so it moved to key deletes"
+            ),
+        }
         true
     }
 
@@ -20174,18 +20190,24 @@ impl CayenneTableProvider {
         if let Some(auto) = self.pk_deletion_mode.auto()
             && auto.uses_positions()
         {
-            let over_bound = auto.switch_requested()
-                || match self
+            let because = if auto.switch_requested() {
+                Some(KeyDeletesBecause::Outgrew)
+            } else {
+                match self
                     .catalog
                     .table_storage_stats(&self.table_metadata.table_id)
                     .await
                 {
-                    Ok(stats) => !auto.fits(Self::warm_table_bytes(&stats)),
+                    Ok(stats) if !auto.fits(Self::warm_table_bytes(&stats)) => {
+                        Some(KeyDeletesBecause::Outgrew)
+                    }
+                    Ok(_) => None,
                     // Unsized, the rewrite is not known to be cheap: take the bake.
-                    Err(_) => true,
-                };
-            if over_bound {
-                self.switch_auto_to_key_deletes();
+                    Err(error) => Some(KeyDeletesBecause::Unsized(error.to_string())),
+                }
+            };
+            if let Some(because) = because {
+                self.switch_auto_to_key_deletes_because(&because);
             }
         }
         // A deletion-index trigger computed before this pass took `compaction_lock`
@@ -23903,23 +23925,31 @@ impl CayenneTableProvider {
                 RewriteScope::All => None,
             };
             let mut captured_bytes = 0_u64;
-            let mut sized = true;
+            let mut sizing_error = None;
             for snapshot_id in
                 std::iter::once(&snapshot_id_before).chain(folded.into_iter().flatten())
             {
-                let Ok(files) = self.list_snapshot_files_with_sizes(snapshot_id).await else {
-                    sized = false;
-                    break;
+                let files = match self.list_snapshot_files_with_sizes(snapshot_id).await {
+                    Ok(files) => files,
+                    Err(error) => {
+                        sizing_error = Some(error.to_string());
+                        break;
+                    }
                 };
                 captured_bytes = files.iter().fold(captured_bytes, |total, (_, size)| {
                     total.saturating_add(*size)
                 });
             }
-            if !sized || !auto.fits(captured_bytes) {
+            let because = match sizing_error {
+                Some(error) => Some(KeyDeletesBecause::Unsized(error)),
+                None if !auto.fits(captured_bytes) => Some(KeyDeletesBecause::Outgrew),
+                None => None,
+            };
+            if let Some(because) = because {
                 drop(stream);
                 // The caller holds `compaction_lock`, as every caller of this
                 // rewrite does.
-                self.switch_auto_to_key_deletes();
+                self.switch_auto_to_key_deletes_because(&because);
                 maintenance_metrics::track_compaction(
                     table_name,
                     CompactionKind::Full,
@@ -24120,6 +24150,23 @@ impl CayenneTableProvider {
         // the `match &fence` below). Holding the fence across the catalog write
         // briefly blocks scans/appends, but the expensive work (scan + encode)
         // already completed off-fence.
+        // Checkpoint the PK existence index for the new snapshot (best-effort)
+        // BEFORE the commit makes it current. The commit drops the in-memory keyset
+        // (its row locations name the files this rewrite replaces), and the next
+        // write that needs one loads this checkpoint and folds in only what landed
+        // since — the protected snapshots, inline rows and RAM tier the load reads
+        // under the listing fence. Persisted after the commit instead, a write
+        // between the two found no checkpoint for the current snapshot and rebuilt
+        // the keyset by scanning every key: 36–52 ms of write latency per rewrite
+        // on a 500K-row table. A checkpoint for a snapshot that never becomes
+        // current (the commit aborts) is ignored on load, which checks the tag.
+        // Nothing can retire the new snapshot's files while this scans them: they
+        // are not current yet, and this pass holds `compaction_lock`.
+        if self.upsert_bloom_eligible() {
+            self.persist_pk_bloom_checkpoint(&new_snapshot_id, total_rows)
+                .await;
+        }
+
         #[cfg(test)]
         self.run_test_pre_publish_hook().await;
         #[cfg(test)]
@@ -24328,34 +24375,6 @@ impl CayenneTableProvider {
             }
             self.debug_log_manifest_listing_mismatch(&new_snapshot_id, &files)
                 .await;
-        }
-
-        // Checkpoint the PK existence index for fast restart (best-effort). The
-        // new current snapshot now holds all live rows, and protected snapshots /
-        // inline entries were just cleared, so a bloom of this snapshot's keys is a
-        // complete checkpoint tagged with `new_snapshot_id`.
-        //
-        // The checkpoint build scans `new_snapshot_id`'s Vortex files, so pin it
-        // against the retired-dir sweep first. A key-delete table compacts
-        // concurrently with its writers, so a writer can supersede this snapshot
-        // and the sweep unlink its files while the scan reads them. A NotFound here
-        // is only swallowed (the checkpoint is lost, not the data), but the pin
-        // avoids the wasted scan and keeps this read consistent with the rebuild
-        // reads. Pin-then-verify rather than the read fence, because this runs under
-        // `compaction_lock` and an `.await` under the fence would extend that hold
-        // (as in `pin_current_snapshot_for_compaction`). If the verify fails the
-        // snapshot is already superseded, so the checkpoint would be tagged a stale
-        // id and rejected on load — skip persisting it.
-        if self.upsert_bloom_eligible() {
-            let pin = SnapshotScanRef::new(
-                Arc::clone(&self.snapshot_scan_refs),
-                vec![new_snapshot_id.clone()],
-            );
-            if self.get_current_snapshot_id() == new_snapshot_id {
-                self.persist_pk_bloom_checkpoint(&new_snapshot_id, total_rows)
-                    .await;
-            }
-            drop(pin);
         }
 
         // The fence guarantees no NEW plan-build sees the old listing table, and
@@ -40534,6 +40553,15 @@ fn format_bytes_per_sec(bytes_per_sec: f64) -> String {
     } else {
         format!("{bytes_per_sec:.0} B/s")
     }
+}
+
+/// Why `deletion_mode: auto` moved a table from position to key deletes.
+enum KeyDeletesBecause {
+    /// A size check found the table past its position-delete bound.
+    Outgrew,
+    /// The table could not be sized, so a whole-table rewrite was not known to be
+    /// cheap. Carries the error.
+    Unsized(String),
 }
 
 /// The line a table logs, once, when `deletion_mode: auto` moves it from position

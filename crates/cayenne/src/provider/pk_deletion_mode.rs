@@ -49,18 +49,20 @@ use parking_lot::Mutex;
 
 use crate::metadata::{DeletionMode, ResolvedDeletionMode};
 
-/// An `auto` table on key deletes takes at most this fraction (one fiftieth) of
-/// the time rewriting itself whole: such a reclaim waits, the deletion index
-/// growing past its trigger meanwhile, until 49 times the recent whole-table
-/// reclaims' duration has passed since the previous one ended. Over the deletion
-/// index's memory ceiling it does not wait.
+/// An `auto` table on key deletes takes at most this fraction (one tenth) of the
+/// time rewriting itself whole: such a reclaim waits, the deletion index growing
+/// past its trigger meanwhile, until 9 times the recent whole-table reclaims'
+/// duration has passed since the previous one ended. Over the deletion index's
+/// memory ceiling it does not wait.
 ///
 /// The pace bounds what a table of any size can spend on whole-table rewrites
 /// when the bake cannot reach its rows. It costs reads in the meantime, because
 /// the index grows past the trigger: a 1M-row table under 8,000 upserts a second
-/// read at a 19 ms P99 paced against 10 ms rewriting at every trigger. So a
-/// position-delete table, which `auto` keeps small, is not paced.
-pub(crate) const RECLAIM_SHARE_DENOMINATOR: u32 = 50;
+/// read at a 10 ms P99 rewriting at every trigger, with a rewrite running 4.3% of
+/// the time, and at 16–19 ms paced to a fiftieth. A tenth leaves such a table
+/// unpaced and still bounds a large one. A position-delete table, which `auto`
+/// keeps small, is not paced.
+pub(crate) const RECLAIM_SHARE_DENOMINATOR: u32 = 10;
 
 /// How a primary-key table records the delete of a row right now.
 #[derive(Clone, Debug)]
@@ -163,17 +165,18 @@ impl AutoDeletionMode {
     }
 
     /// The bound for a table whose target file size is `target_file_size_bytes`:
-    /// a sixteenth of it, 16 MiB at the default 256 MiB target.
+    /// 1/32 of it, 8 MiB at the default 256 MiB target.
     ///
     /// Under one writer upserting 8,000 keys a second, against key deletes the
-    /// table's bake could serve, position deletes read faster at 3 MB and 9 MB on
-    /// disk (P99 scans 5–10% and P99 point lookups 10–17% faster, 22–30% more
-    /// reads) and 25% slower at the P99 at 46 MB, where rewriting the table whole
-    /// at every trigger kept a rewrite running 4.3% of the time. A sixteenth of the
-    /// default target keeps position deletes in the range where they won; the
+    /// table's bake could serve, position deletes read faster with 1.8 MB, 4.8 MB
+    /// and 7.8 MB of table data (P99 scans 5–12% and P99 point lookups 9–16%
+    /// faster, 15–30% more reads, writes even), and slower at the P99 with 11.4 MB
+    /// and 16 MB (scans 20–25%). The bound is measured against what a whole-table
+    /// rewrite reads, which includes the upserts it is about to fold, so 1/32 of the
+    /// default target keeps position deletes inside the range where they won; the
     /// target it derives from follows the storage the table is on.
     pub(crate) fn max_position_bytes_for(target_file_size_bytes: usize) -> u64 {
-        u64::try_from(target_file_size_bytes / 16).unwrap_or(u64::MAX)
+        u64::try_from(target_file_size_bytes / 32).unwrap_or(u64::MAX)
     }
 
     /// Largest on-disk size, in bytes, at which the table keeps position deletes.
@@ -246,10 +249,10 @@ mod tests {
     use super::*;
 
     const TARGET: usize = 256 * 1024 * 1024;
-    const BOUND: u64 = 16 * 1024 * 1024;
+    const BOUND: u64 = 8 * 1024 * 1024;
 
     #[test]
-    fn the_bound_is_a_sixteenth_of_the_target_file_size() {
+    fn the_bound_is_a_thirty_second_of_the_target_file_size() {
         assert_eq!(AutoDeletionMode::max_position_bytes_for(TARGET), BOUND);
         assert_eq!(AutoDeletionMode::max_position_bytes_for(0), 0);
     }
@@ -291,13 +294,13 @@ mod tests {
     }
 
     #[test]
-    fn a_reclaim_waits_until_reclaims_take_at_most_a_fiftieth_of_the_time() {
+    fn a_reclaim_waits_until_reclaims_take_at_most_a_tenth_of_the_time() {
         let auto = AutoDeletionMode::new(Some(1), BOUND);
         let ended = Instant::now();
         auto.record_reclaim(Duration::from_millis(100), ended);
-        // 49 × 100 ms after it ended, and not a moment before.
-        assert!(!auto.reclaim_due(ended + Duration::from_millis(4_899)));
-        assert!(auto.reclaim_due(ended + Duration::from_millis(4_900)));
+        // 9 × 100 ms after it ended, and not a moment before.
+        assert!(!auto.reclaim_due(ended + Duration::from_millis(899)));
+        assert!(auto.reclaim_due(ended + Duration::from_millis(900)));
     }
 
     #[test]
@@ -308,8 +311,8 @@ mod tests {
         let second = first + Duration::from_secs(10);
         // A 2.1 s pass after a 100 ms one: the estimate is their mean, 1.1 s.
         auto.record_reclaim(Duration::from_millis(2_100), second);
-        assert!(!auto.reclaim_due(second + Duration::from_millis(53_899)));
-        assert!(auto.reclaim_due(second + Duration::from_millis(53_900)));
+        assert!(!auto.reclaim_due(second + Duration::from_millis(9_899)));
+        assert!(auto.reclaim_due(second + Duration::from_millis(9_900)));
     }
 
     #[test]

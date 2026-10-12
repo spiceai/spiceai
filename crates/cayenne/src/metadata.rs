@@ -503,7 +503,7 @@ impl PkConflictDetection {
 pub enum DeletionMode {
     /// Let Cayenne choose (the default). On a table with a primary key, `Auto`
     /// keeps [`Self::Position`] deletes while the table is small enough to
-    /// reclaim them by rewriting it whole — at most a quarter of the target file
+    /// reclaim them by rewriting it whole — at most 1/32 of the target file
     /// size on disk — and switches to [`Self::Key`] deletes once it outgrows
     /// that, for the life of the process. While it uses position deletes, `Auto`
     /// rewrites alongside writers rather than holding them off, and folds a key
