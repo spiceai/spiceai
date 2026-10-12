@@ -30,8 +30,8 @@ use std::mem::size_of_val;
 use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, AsArray, Float64Array, Int64Array, ListArray};
-use arrow::compute::cast;
-use arrow::datatypes::{DataType, Field, FieldRef, Float64Type, Int64Type, TimeUnit};
+use arrow::compute::{CastOptions, cast, cast_with_options};
+use arrow::datatypes::{DataType, Field, FieldRef, Float64Type, Int64Type, TimeUnit, UInt64Type};
 use datafusion::common::{Result, ScalarValue, exec_err, plan_err};
 use datafusion::logical_expr::function::{AccumulatorArgs, StateFieldsArgs};
 use datafusion::logical_expr::utils::format_state_name;
@@ -50,6 +50,43 @@ runtime_udfs_api::register_spice_function!(RATE_SPICE_FUNCTION, RATE_UDAF_NAME);
 
 fn f64_list_type() -> DataType {
     DataType::List(Arc::new(Field::new_list_field(DataType::Float64, true)))
+}
+
+fn u64_list_type() -> DataType {
+    DataType::List(Arc::new(Field::new_list_field(DataType::UInt64, true)))
+}
+
+fn is_integer_list(data_type: &DataType) -> bool {
+    match data_type {
+        DataType::List(f) | DataType::LargeList(f) | DataType::FixedSizeList(f, _) => {
+            f.data_type().is_integer() || f.data_type().is_null()
+        }
+        DataType::Null => true,
+        _ => false,
+    }
+}
+
+/// Each row of a list column as exact `u64` counts; a null list is `None`. A negative count
+/// is an error rather than a silent null.
+fn u64_lists(array: &ArrayRef) -> Result<Vec<Option<Vec<u64>>>> {
+    let options = CastOptions {
+        safe: false,
+        ..CastOptions::default()
+    };
+    let list = cast_with_options(array, &u64_list_type(), &options)?;
+    let list = list.as_list::<i32>();
+    Ok((0..list.len())
+        .map(|i| {
+            list.is_valid(i).then(|| {
+                let values = list.value(i);
+                values
+                    .as_primitive::<UInt64Type>()
+                    .iter()
+                    .map(|v| v.unwrap_or(0))
+                    .collect()
+            })
+        })
+        .collect())
 }
 
 fn is_numeric_list(data_type: &DataType) -> bool {
@@ -105,7 +142,7 @@ fn nanos_values(array: &ArrayRef) -> Result<Int64Array> {
 /// Prometheus `histogram_quantile` over cumulative bucket counts whose upper bounds are
 /// `bounds` followed by +Inf.
 #[must_use]
-pub fn bucket_quantile(q: f64, bounds: &[f64], counts: &[f64]) -> f64 {
+pub fn bucket_quantile(q: f64, bounds: &[f64], counts: &[u64]) -> f64 {
     if q.is_nan() {
         return f64::NAN;
     }
@@ -119,19 +156,33 @@ pub fn bucket_quantile(q: f64, bounds: &[f64], counts: &[f64]) -> f64 {
     if bounds.is_empty() || counts.len() != bounds.len() + 1 {
         return f64::NAN;
     }
-    let mut cumulative = Vec::with_capacity(counts.len());
-    let mut total = 0.0;
-    for count in counts {
-        total += count;
+    // Cumulative counts are kept exact in `u128` so the bucket choice cannot be skewed by
+    // float rounding of large `u64` counts.
+    let mut cumulative: Vec<u128> = Vec::with_capacity(counts.len());
+    let mut total: u128 = 0;
+    for &count in counts {
+        total += u128::from(count);
         cumulative.push(total);
     }
-    if total <= 0.0 {
+    if total == 0 {
         return f64::NAN;
     }
-    let rank = q * total;
+    let rank = q * count_as_f64(total);
+    // Counts are integers, so `c >= rank` is `c >= ceil(rank)`. At q = 1 the rank is exactly
+    // the total, which f64 may not represent.
+    #[expect(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "rank is in [0, total], and the result is clamped to total"
+    )]
+    let rank_int = if q >= 1.0 {
+        total
+    } else {
+        (rank.ceil() as u128).min(total)
+    };
     let bucket = cumulative
         .iter()
-        .position(|&c| c >= rank)
+        .position(|&c| c >= rank_int)
         .unwrap_or(cumulative.len() - 1);
     if bucket == bounds.len() {
         // The +Inf bucket: return the highest finite bound.
@@ -141,16 +192,30 @@ pub fn bucket_quantile(q: f64, bounds: &[f64], counts: &[f64]) -> f64 {
         return bounds[0];
     }
     let (start, below) = if bucket == 0 {
-        (0.0, 0.0)
+        (0.0, 0)
     } else {
         (bounds[bucket - 1], cumulative[bucket - 1])
     };
     let end = bounds[bucket];
     let in_bucket = cumulative[bucket] - below;
-    if in_bucket <= 0.0 {
+    if in_bucket == 0 {
         return end;
     }
-    start + (end - start) * ((rank - below) / in_bucket)
+    // At q = 1 the rank is the exact top of the bucket; f64 may not hold `total - below`.
+    let offset = if q >= 1.0 {
+        count_as_f64(in_bucket)
+    } else {
+        rank - count_as_f64(below)
+    };
+    start + (end - start) * (offset / count_as_f64(in_bucket)).clamp(0.0, 1.0)
+}
+
+#[expect(
+    clippy::cast_precision_loss,
+    reason = "interpolation is done in f64; only the bucket choice must be exact"
+)]
+fn count_as_f64(count: u128) -> f64 {
+    count as f64
 }
 
 /// `histogram_quantile(q, explicit_bounds, bucket_counts)`.
@@ -192,14 +257,18 @@ impl AggregateUDFImpl for HistogramQuantile {
         if !(q.is_numeric() || q.is_null()) {
             return plan_err!("{HISTOGRAM_QUANTILE_UDAF_NAME}: quantile must be numeric, got {q}");
         }
-        for (name, t) in [("explicit_bounds", bounds), ("bucket_counts", counts)] {
-            if !is_numeric_list(t) {
-                return plan_err!(
-                    "{HISTOGRAM_QUANTILE_UDAF_NAME}: {name} must be a list of numbers, got {t}"
-                );
-            }
+        if !is_numeric_list(bounds) {
+            return plan_err!(
+                "{HISTOGRAM_QUANTILE_UDAF_NAME}: explicit_bounds must be a list of numbers, got {bounds}"
+            );
         }
-        Ok(vec![DataType::Float64, f64_list_type(), f64_list_type()])
+        // Counts are summed exactly as integers; OTLP bucket counts are `uint64`.
+        if !is_integer_list(counts) {
+            return plan_err!(
+                "{HISTOGRAM_QUANTILE_UDAF_NAME}: bucket_counts must be a list of integers, got {counts}"
+            );
+        }
+        Ok(vec![DataType::Float64, f64_list_type(), u64_list_type()])
     }
 
     fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
@@ -221,7 +290,7 @@ impl AggregateUDFImpl for HistogramQuantile {
             .into(),
             Field::new(
                 format_state_name(args.name, "counts"),
-                f64_list_type(),
+                u64_list_type(),
                 true,
             )
             .into(),
@@ -233,7 +302,7 @@ impl AggregateUDFImpl for HistogramQuantile {
 struct HistogramQuantileAccumulator {
     q: Option<f64>,
     bounds: Option<Vec<f64>>,
-    counts: Vec<f64>,
+    counts: Vec<u64>,
 }
 
 impl HistogramQuantileAccumulator {
@@ -241,7 +310,7 @@ impl HistogramQuantileAccumulator {
         &mut self,
         q: Option<f64>,
         bounds: Option<Vec<f64>>,
-        counts: Option<Vec<f64>>,
+        counts: Option<Vec<u64>>,
     ) -> Result<()> {
         if self.q.is_none() {
             self.q = q;
@@ -261,7 +330,12 @@ impl HistogramQuantileAccumulator {
                     );
                 }
                 for (total, count) in self.counts.iter_mut().zip(counts) {
-                    *total += count;
+                    let Some(sum) = total.checked_add(count) else {
+                        return exec_err!(
+                            "{HISTOGRAM_QUANTILE_UDAF_NAME}: a summed bucket count overflows UInt64"
+                        );
+                    };
+                    *total = sum;
                 }
             }
         }
@@ -271,7 +345,7 @@ impl HistogramQuantileAccumulator {
     fn add_arrays(&mut self, q: &ArrayRef, bounds: &ArrayRef, counts: &ArrayRef) -> Result<()> {
         let q = f64_values(q)?;
         let bounds = f64_lists(bounds)?;
-        let counts = f64_lists(counts)?;
+        let counts = u64_lists(counts)?;
         for ((q, bounds), counts) in q.iter().zip(bounds).zip(counts) {
             self.add(q, bounds, counts)?;
         }
@@ -292,6 +366,19 @@ fn list_scalar(values: Option<&[f64]>) -> ScalarValue {
     }
 }
 
+fn u64_list_scalar(values: Option<&[u64]>) -> ScalarValue {
+    match values {
+        Some(values) => {
+            let array: ArrayRef =
+                Arc::new(ListArray::from_iter_primitive::<UInt64Type, _, _>([Some(
+                    values.iter().map(|v| Some(*v)).collect::<Vec<_>>(),
+                )]));
+            ScalarValue::List(Arc::new(array.as_list::<i32>().clone()))
+        }
+        None => ScalarValue::try_from(&u64_list_type()).unwrap_or(ScalarValue::Null),
+    }
+}
+
 impl Accumulator for HistogramQuantileAccumulator {
     fn update_batch(&mut self, values: &[ArrayRef]) -> Result<()> {
         let [q, bounds, counts] = values else {
@@ -309,7 +396,7 @@ impl Accumulator for HistogramQuantileAccumulator {
         Ok(vec![
             ScalarValue::Float64(self.q),
             list_scalar(self.bounds.as_deref()),
-            list_scalar(has_buckets.then_some(self.counts.as_slice())),
+            u64_list_scalar(has_buckets.then_some(self.counts.as_slice())),
         ])
     }
 
@@ -563,7 +650,7 @@ mod tests {
     fn bucket_quantile_matches_prometheus() {
         // Buckets le=1:10, le=2:20 (cumulative 30), le=4:10 (cum 40), +Inf:0 (cum 40).
         let bounds = [1.0, 2.0, 4.0];
-        let counts = [10.0, 20.0, 10.0, 0.0];
+        let counts = [10, 20, 10, 0];
         // rank 20 falls in (1,2]: 1 + 1 * (20-10)/20 = 1.5
         assert!(close(bucket_quantile(0.5, &bounds, &counts), 1.5));
         // rank 4 in the first bucket, interpolated from 0: 4 * 1/10 = 0.4
@@ -572,19 +659,18 @@ mod tests {
         assert!(close(bucket_quantile(0.95, &bounds, &counts), 3.6));
         assert!(close(bucket_quantile(1.0, &bounds, &counts), 4.0));
         // Ranks in the +Inf bucket return the highest finite bound.
-        assert!(close(
-            bucket_quantile(0.99, &bounds, &[0.0, 0.0, 1.0, 9.0]),
-            4.0
-        ));
+        assert!(close(bucket_quantile(0.99, &bounds, &[0, 0, 1, 9]), 4.0));
         assert!(bucket_quantile(-0.1, &bounds, &counts).is_infinite());
         assert!(bucket_quantile(1.1, &bounds, &counts).is_sign_positive());
         assert!(bucket_quantile(f64::NAN, &bounds, &counts).is_nan());
-        assert!(bucket_quantile(0.5, &bounds, &[0.0; 4]).is_nan());
-        assert!(bucket_quantile(0.5, &[], &[1.0]).is_nan());
+        assert!(bucket_quantile(0.5, &bounds, &[0; 4]).is_nan());
+        assert!(bucket_quantile(0.5, &[], &[1]).is_nan());
         // A non-positive lowest bound is returned as is.
+        assert!(close(bucket_quantile(0.1, &[-1.0, 1.0], &[5, 5, 0]), -1.0));
+        // Large counts are summed exactly: the +1 past 2^53 moves q = 1 into the second bucket.
         assert!(close(
-            bucket_quantile(0.1, &[-1.0, 1.0], &[5.0, 5.0, 0.0]),
-            -1.0
+            bucket_quantile(1.0, &[1.0, 2.0], &[9_007_199_254_740_992, 1, 0]),
+            2.0
         ));
     }
 
