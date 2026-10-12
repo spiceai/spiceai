@@ -19,12 +19,9 @@ limitations under the License.
 
 #![expect(clippy::expect_used, reason = "test setup and assertions")]
 
-#[expect(
-    dead_code,
-    reason = "shared helpers for every Cayenne test binary; this one uses only some"
-)]
-mod common;
+use crate::common;
 
+use crate::live_bytes;
 use arrow::array::Int64Array;
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
@@ -33,9 +30,7 @@ use cayenne::metadata::VortexConfig;
 use common::lookup_index::{
     TableSpec, counters, insert, int64_column, open_table, overwrite, query, runtime_with_pool,
 };
-use std::alloc::{GlobalAlloc, Layout, System};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use cayenne::MetadataCatalog;
@@ -43,53 +38,6 @@ use datafusion::execution::memory_pool::{
     GreedyMemoryPool, MemoryConsumer, MemoryLimit, MemoryPool, MemoryReservation,
 };
 use datafusion::execution::runtime_env::RuntimeEnvBuilder;
-
-/// Requested bytes allocated through Rust and not yet freed.
-///
-/// Each integration-test file is its own binary and nextest runs a process per
-/// test, so this counts only this test's own work.
-struct CountingAllocator;
-
-static LIVE_BYTES: AtomicUsize = AtomicUsize::new(0);
-static PEAK_BYTES: AtomicUsize = AtomicUsize::new(0);
-
-unsafe impl GlobalAlloc for CountingAllocator {
-    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        let ptr = unsafe { System.alloc(layout) };
-        if !ptr.is_null() {
-            let live = LIVE_BYTES.fetch_add(layout.size(), Ordering::Relaxed) + layout.size();
-            PEAK_BYTES.fetch_max(live, Ordering::Relaxed);
-        }
-        ptr
-    }
-
-    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
-        LIVE_BYTES.fetch_sub(layout.size(), Ordering::Relaxed);
-        unsafe { System.dealloc(ptr, layout) };
-    }
-
-    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
-        let new_ptr = unsafe { System.realloc(ptr, layout, new_size) };
-        if !new_ptr.is_null() {
-            let live = if new_size >= layout.size() {
-                let added = new_size - layout.size();
-                LIVE_BYTES.fetch_add(added, Ordering::Relaxed) + added
-            } else {
-                let removed = layout.size() - new_size;
-                LIVE_BYTES.fetch_sub(removed, Ordering::Relaxed) - removed
-            };
-            PEAK_BYTES.fetch_max(live, Ordering::Relaxed);
-        }
-        new_ptr
-    }
-}
-
-#[global_allocator]
-static ALLOC: CountingAllocator = CountingAllocator;
-
-fn live_bytes() -> usize {
-    LIVE_BYTES.load(Ordering::Relaxed)
-}
 
 /// Records actual allocation growth at the point the engine requests admission.
 #[derive(Debug)]
@@ -148,6 +96,9 @@ impl MemoryPool for ObservingPool {
 async fn opening_persisted_runs_respects_the_memory_budget() {
     const MIB: usize = 1024 * 1024;
     const ROWS: i64 = 150_000;
+    common::require_process_per_test(
+        "this test measures the process's live heap through a counting global allocator",
+    );
     let fixture = common::TestFixture::new(common::BackendType::Sqlite)
         .await
         .expect("fixture");
@@ -235,14 +186,14 @@ async fn opening_persisted_runs_respects_the_memory_budget() {
             .with_memory_pool(Arc::clone(&pool) as Arc<dyn MemoryPool>)
             .build_arc()
             .expect("observed runtime");
-        PEAK_BYTES.store(baseline, Ordering::Relaxed);
+        crate::reset_peak_bytes(baseline);
         let reopened = open_table(&fixture, env, spec()).await;
         assert_eq!(
             counters(&reopened).index_bytes,
             0,
             "loaded runs must be refused"
         );
-        let peak = PEAK_BYTES.load(Ordering::Relaxed).saturating_sub(baseline);
+        let peak = crate::peak_bytes().saturating_sub(baseline);
         println!(
             "persisted reopen Rust allocator: baseline={baseline} peak_growth={peak} pool_reserved={} limit={limit}",
             pool.reserved()

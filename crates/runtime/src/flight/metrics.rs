@@ -77,7 +77,12 @@ pub(crate) async fn track_flight_request_value(
     // Moved, not borrowed: `TimeMeasurement::new` takes `impl Into<Vec<KeyValue>>`,
     // so a slice would deep-clone every label — including the owned `user_agent`
     // string the request context contributes.
-    TimeMeasurement::new(&FLIGHT_REQUEST_DURATION_MS, dimensions)
+    let mut measurement = TimeMeasurement::new(&FLIGHT_REQUEST_DURATION_MS, dimensions);
+    // A query RPC reports this very sample in its `server-timing` trailer.
+    if let Some(timing) = request_context.extension::<super::server_timing::QueryRpcTiming>() {
+        measurement.report_to(timing.sample());
+    }
+    measurement
 }
 
 pub(crate) static DO_EXCHANGE_DATA_UPDATES_SENT: LazyLock<Counter<u64>> = LazyLock::new(|| {

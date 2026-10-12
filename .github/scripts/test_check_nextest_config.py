@@ -229,6 +229,42 @@ class ResolveTest(unittest.TestCase):
             {"period": "60s", "terminate-after": 2},
         )
 
+    def test_a_whole_binary_override_applies_to_its_modules_in_order(self):
+        """nextest takes the first override a test matches, and a module of a
+        binary matches a filter that selects the whole binary."""
+        module = "cayenne::integration::mutation_property_test"
+        config = {
+            "profile": {
+                "default": {
+                    "retries": 3,
+                    "overrides": [
+                        {"filter": "binary(=integration)", "retries": 5},
+                        {
+                            "filter": "(binary_id(=cayenne::integration) & test(/^mutation_property_test::/))",
+                            "retries": 0,
+                        },
+                    ],
+                }
+            }
+        }
+        self.assertEqual(check_nextest_config.resolve(config, module, "retries"), 5)
+        # With only the whole-binary override left, it alone has to count as an
+        # override that supplies the setting.
+        whole_binary_only = {
+            "profile": {
+                "default": {
+                    "retries": 3,
+                    "overrides": [{"filter": "binary(=integration)", "retries": 5}],
+                }
+            }
+        }
+        self.assertTrue(
+            check_nextest_config.has_override_setting(whole_binary_only, module, "retries")
+        )
+        # A whole-binary filter for a different binary does not match.
+        config["profile"]["default"]["overrides"][0]["filter"] = "binary(=retention_oom)"
+        self.assertEqual(check_nextest_config.resolve(config, module, "retries"), 0)
+
     def test_falls_back_to_the_profile_default(self):
         config = {"profile": {"default": {"retries": 5, "overrides": []}}}
         self.assertEqual(check_nextest_config.resolve(config, "z_test", "retries"), 5)
