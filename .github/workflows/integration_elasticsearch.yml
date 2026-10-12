@@ -116,4 +116,4 @@ jobs:
         env:
           ELASTICSEARCH_URL: http://localhost:9200
         run: |
-          RUSTC_WRAPPER="" cargo test -p data_components --features elasticsearch --test elasticsearch_test -- --nocapture
+          RUSTC_WRAPPER="" cargo test -p data_components --features elasticsearch --test integration -- elasticsearch_test:: --nocapture
