@@ -56,6 +56,11 @@ pub struct Runtime {
     #[serde(default)]
     pub params: HashMap<String, String>,
 
+    /// Turns adaptive tuning on or off for the whole runtime. `disabled` (default) derives
+    /// Cayenne's knobs statically; `enabled` also runs its closed-loop controller.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub adaptive_tuning: AdaptiveTuning,
+
     #[serde(default, skip_serializing_if = "is_default")]
     pub task_history: TaskHistory,
 
@@ -171,6 +176,86 @@ pub enum RuntimeReadyState {
     /// regardless of whether they are currently `Ready`, `Error`, or `Disabled`,
     /// as long as none is `ShuttingDown`.
     OnRegistration,
+}
+
+/// Turns adaptive tuning on or off for the whole runtime.
+///
+/// `disabled` (the default) derives Cayenne's knobs statically from the host and, where
+/// available, the inferred schema. `enabled` additionally runs Cayenne's closed-loop
+/// controller, which moves them within the statically derived bounds. The
+/// `runtime.params.target_*` setpoints steer the controller and never turn it on.
+///
+/// Only the exact values `enabled` and `disabled` are accepted, matching the published
+/// schema. Anything else, including a different case or surrounding whitespace, fails the
+/// Spicepod load.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Default)]
+#[cfg_attr(feature = "schemars", derive(JsonSchema))]
+#[serde(rename_all = "snake_case")]
+pub enum AdaptiveTuning {
+    /// Derive the knobs statically. No closed loop.
+    #[default]
+    Disabled,
+    /// Run the closed-loop controller (preview).
+    Enabled,
+}
+
+impl AdaptiveTuning {
+    /// Resolve a raw value. Only `enabled` and `disabled` are valid.
+    ///
+    /// # Errors
+    ///
+    /// Returns a user-facing error naming the invalid value as written.
+    pub fn parse(raw: &str) -> Result<Self, String> {
+        match raw {
+            "enabled" => Ok(Self::Enabled),
+            "disabled" => Ok(Self::Disabled),
+            _ => Err(invalid_tuning_message(raw)),
+        }
+    }
+
+    #[must_use]
+    pub fn is_enabled(self) -> bool {
+        self == Self::Enabled
+    }
+}
+
+// Not derived, so an invalid value reports the documented message rather than serde's
+// generic unknown-variant or type text. A scalar that is not a string (`true`, `1`) is
+// reported as written; `true`/`false` are deliberately not accepted as aliases.
+impl<'de> Deserialize<'de> for AdaptiveTuning {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct AdaptiveTuningVisitor;
+
+        impl serde::de::Visitor<'_> for AdaptiveTuningVisitor {
+            type Value = AdaptiveTuning;
+
+            fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                formatter.write_str("`enabled` or `disabled`")
+            }
+
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+                AdaptiveTuning::parse(value).map_err(E::custom)
+            }
+
+            fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Self::Value, E> {
+                self.visit_str(&value.to_string())
+            }
+
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Self::Value, E> {
+                self.visit_str(&value.to_string())
+            }
+
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Self::Value, E> {
+                self.visit_str(&value.to_string())
+            }
+
+            fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Self::Value, E> {
+                self.visit_str(&value.to_string())
+            }
+        }
+
+        deserializer.deserialize_any(AdaptiveTuningVisitor)
+    }
 }
 
 /// Controls registration and execution surfaces for Spicepod user-defined functions.
@@ -528,6 +613,124 @@ impl Default for TelemetryConfig {
             otel_exporter: None,
         }
     }
+}
+
+/// Docs page for the `runtime.params` keys, linked from tuning diagnostics.
+pub const RUNTIME_PARAMS_DOCS_URL: &str = "https://spiceai.org/docs/reference/spicepod/runtime";
+
+/// The runtime-wide targets the adaptive controller steers toward, under `runtime.params`.
+/// They steer the closed loop and never turn it on.
+pub const TUNING_TARGET_PARAMS: &[&str] = &[
+    "target_replication_lag",
+    "target_freshness",
+    "target_query_latency",
+    "target_convergence_window",
+    "target_qph",
+];
+
+/// Whether `runtime.params` sets any of [`TUNING_TARGET_PARAMS`].
+#[must_use]
+pub fn tuning_targets_set<S: std::hash::BuildHasher>(params: &HashMap<String, String, S>) -> bool {
+    TUNING_TARGET_PARAMS
+        .iter()
+        .any(|key| params.contains_key(*key))
+}
+
+/// Dataset acceleration parameters that moved to `runtime.params` and are no longer read.
+///
+/// Each is listed in its prefixed and unprefixed spelling, since a user may write either.
+pub const RETIRED_DATASET_TUNING_PARAMS: &[&str] = &[
+    "cayenne_tuning",
+    "tuning",
+    "cayenne_goal_replication_lag",
+    "goal_replication_lag",
+    "cayenne_goal_freshness",
+    "goal_freshness",
+    "cayenne_goal_query_latency",
+    "goal_query_latency",
+    "cayenne_goal_convergence_window",
+    "goal_convergence_window",
+    "cayenne_goal_qph",
+    "goal_qph",
+];
+
+/// Catalog parameters that moved to `runtime.params` and are no longer read.
+pub const RETIRED_CATALOG_TUNING_PARAMS: &[&str] = &[
+    "cayenne_tuning",
+    "tuning",
+    "cayenne_goal_replication_lag",
+    "goal_replication_lag",
+    "cayenne_goal_freshness",
+    "goal_freshness",
+    "cayenne_goal_query_latency",
+    "goal_query_latency",
+    "cayenne_goal_convergence_window",
+    "goal_convergence_window",
+    "cayenne_goal_qph",
+    "goal_qph",
+];
+
+/// `runtime.params` keys renamed without the `cayenne_` prefix, as `(old, new)`. The old
+/// names are no longer read.
+pub const RENAMED_RUNTIME_TUNING_PARAMS: &[(&str, &str)] = &[
+    ("cayenne_goal_replication_lag", "target_replication_lag"),
+    ("cayenne_goal_freshness", "target_freshness"),
+    ("cayenne_goal_query_latency", "target_query_latency"),
+    (
+        "cayenne_goal_convergence_window",
+        "target_convergence_window",
+    ),
+    ("cayenne_goal_qph", "target_qph"),
+];
+
+/// One warning for each of `retired` that `params` still sets on a dataset or catalog.
+///
+/// `kind` is `"dataset"` or `"catalog"` and `name` the component's name. The result is
+/// ordered as `retired` is, so the log is stable.
+#[must_use]
+pub fn retired_tuning_param_warnings<S: std::hash::BuildHasher>(
+    kind: &str,
+    name: &str,
+    params: &HashMap<String, String, S>,
+    retired: &[&str],
+) -> Vec<String> {
+    retired
+        .iter()
+        .filter(|key| params.contains_key(**key))
+        .map(|key| {
+            let bare = key.strip_prefix("cayenne_").unwrap_or(key);
+            let replacement = if bare == "tuning" {
+                "runtime.adaptive_tuning".to_string()
+            } else if let Some(target) = bare.strip_prefix("goal_") {
+                format!("runtime.params.target_{target}")
+            } else {
+                format!("runtime.params.{bare}")
+            };
+            let mut subject = kind.to_string();
+            if let Some(first) = subject.get_mut(..1) {
+                first.make_ascii_uppercase();
+            }
+            format!(
+                "{subject} '{name}' sets `{key}`, which is no longer a {kind} parameter, so it has no effect. Set `{replacement}` instead. See: {RUNTIME_PARAMS_DOCS_URL}"
+            )
+        })
+        .collect()
+}
+
+/// The warning for a `runtime.params` key that was renamed to `new_name`.
+#[must_use]
+pub fn renamed_runtime_param_warning(old_name: &str, new_name: &str) -> String {
+    format!(
+        "`runtime.params.{old_name}` has been renamed, so it has no effect. Set `runtime.params.{new_name}` instead. See: {RUNTIME_PARAMS_DOCS_URL}"
+    )
+}
+
+/// The error for an unrecognized `runtime.adaptive_tuning` value.
+#[must_use]
+pub fn invalid_tuning_message(value: &str) -> String {
+    format!(
+        "Invalid `runtime.adaptive_tuning` value '{value}': expected `enabled` or `disabled`. See: {RUNTIME_PARAMS_DOCS_URL}"
+    )
 }
 
 /// Validate `runtime.telemetry.metric_prefix` against OpenTelemetry instrument
@@ -1516,6 +1719,11 @@ pub struct RuntimeDeserializer {
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     #[serde(default)]
     pub params: HashMap<String, String>,
+
+    /// Turns adaptive tuning on or off for the whole runtime. `disabled` (default) derives
+    /// Cayenne's knobs statically; `enabled` also runs its closed-loop controller.
+    #[serde(default, skip_serializing_if = "is_default")]
+    pub adaptive_tuning: AdaptiveTuning,
     #[serde(default, skip_serializing_if = "is_default")]
     pub task_history: TaskHistory,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1634,6 +1842,7 @@ impl TryFrom<RuntimeDeserializer> for Runtime {
             tracing: deserializer.tracing,
             telemetry: deserializer.telemetry,
             params: deserializer.params,
+            adaptive_tuning: deserializer.adaptive_tuning,
             task_history: deserializer.task_history,
             drasi: deserializer.drasi,
             auth: deserializer.auth,
@@ -2611,6 +2820,183 @@ datasets:
         ";
         let runtime: Runtime = yaml::from_str(yaml).expect("Failed to parse Runtime");
         assert_eq!(runtime.telemetry.metric_prefix, None);
+    }
+
+    #[test]
+    fn test_adaptive_tuning_defaults_to_disabled() {
+        let runtime: Runtime = yaml::from_str("params: {}").expect("unset tuning must parse");
+        assert_eq!(runtime.adaptive_tuning, AdaptiveTuning::Disabled);
+        assert!(!runtime.adaptive_tuning.is_enabled());
+    }
+
+    #[test]
+    fn test_adaptive_tuning_accepts_enabled_and_disabled() {
+        for (value, expected) in [
+            ("disabled", AdaptiveTuning::Disabled),
+            ("enabled", AdaptiveTuning::Enabled),
+        ] {
+            let yaml = format!("adaptive_tuning: \"{value}\"\n");
+            let runtime: Runtime = yaml::from_str(&yaml).expect("valid tuning must parse");
+            assert_eq!(runtime.adaptive_tuning, expected, "value {value:?}");
+        }
+    }
+
+    #[test]
+    fn test_adaptive_tuning_is_matched_exactly() {
+        for value in ["ENABLED", "Disabled", " enabled", "disabled "] {
+            let error = yaml::from_str::<Runtime>(&format!("adaptive_tuning: \"{value}\"\n"))
+                .expect_err("only the exact schema values may load");
+            assert!(
+                error.to_string().contains(&invalid_tuning_message(value)),
+                "unexpected error for {value:?}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_adaptive_tuning_invalid_value_fails_load() {
+        let error = yaml::from_str::<Runtime>("adaptive_tuning: enablde\n")
+            .expect_err("an invalid tuning value must fail the load");
+        assert!(
+            error
+                .to_string()
+                .contains(&invalid_tuning_message("enablde")),
+            "unexpected error: {error}"
+        );
+        assert_eq!(
+            invalid_tuning_message("enablde"),
+            "Invalid `runtime.adaptive_tuning` value 'enablde': expected `enabled` or `disabled`. See: https://spiceai.org/docs/reference/spicepod/runtime"
+        );
+    }
+
+    #[test]
+    fn test_adaptive_tuning_rejects_non_string_scalars_with_the_documented_message() {
+        for (yaml_value, rendered) in [("true", "true"), ("false", "false"), ("1", "1")] {
+            let error = yaml::from_str::<Runtime>(&format!("adaptive_tuning: {yaml_value}\n"))
+                .expect_err("a non-string value must fail the load");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&invalid_tuning_message(rendered)),
+                "unexpected error for {yaml_value}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_adaptive_tuning_rejects_non_string_json_scalars_with_the_documented_message() {
+        for (json_value, rendered) in [
+            ("true", "true"),
+            ("false", "false"),
+            ("1", "1"),
+            ("1.5", "1.5"),
+        ] {
+            let error =
+                serde_json::from_str::<Runtime>(&format!(r#"{{"adaptive_tuning": {json_value}}}"#))
+                    .expect_err("a non-string value must fail the load");
+            assert!(
+                error
+                    .to_string()
+                    .contains(&invalid_tuning_message(rendered)),
+                "unexpected error for {json_value}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_runtime_params_adaptive_tuning_does_not_enable_it() {
+        let runtime: Runtime = yaml::from_str("params:\n  adaptive_tuning: enabled\n")
+            .expect("an unrecognized runtime param must still parse");
+        assert_eq!(runtime.adaptive_tuning, AdaptiveTuning::Disabled);
+    }
+
+    #[test]
+    fn test_adaptive_tuning_serializes_only_when_set() {
+        let enabled = Runtime {
+            adaptive_tuning: AdaptiveTuning::Enabled,
+            ..Runtime::default()
+        };
+        let yaml = yaml::to_string(&enabled).expect("serialize");
+        assert!(yaml.contains("adaptive_tuning: enabled"), "{yaml}");
+        let yaml = yaml::to_string(&Runtime::default()).expect("serialize");
+        assert!(!yaml.contains("adaptive_tuning"), "{yaml}");
+    }
+
+    #[test]
+    fn test_retired_tuning_param_warning_text() {
+        let params = HashMap::from([("cayenne_tuning".to_string(), "enabled".to_string())]);
+        assert_eq!(
+            retired_tuning_param_warnings(
+                "dataset",
+                "orders",
+                &params,
+                RETIRED_DATASET_TUNING_PARAMS
+            ),
+            vec!["Dataset 'orders' sets `cayenne_tuning`, which is no longer a dataset parameter, so it has no effect. Set `runtime.adaptive_tuning` instead. See: https://spiceai.org/docs/reference/spicepod/runtime".to_string()]
+        );
+        let params = HashMap::from([("cayenne_goal_freshness".to_string(), "5s".to_string())]);
+        assert_eq!(
+            retired_tuning_param_warnings(
+                "dataset",
+                "orders",
+                &params,
+                RETIRED_DATASET_TUNING_PARAMS
+            ),
+            vec!["Dataset 'orders' sets `cayenne_goal_freshness`, which is no longer a dataset parameter, so it has no effect. Set `runtime.params.target_freshness` instead. See: https://spiceai.org/docs/reference/spicepod/runtime".to_string()]
+        );
+        let params = HashMap::from([
+            ("tuning".to_string(), "enabled".to_string()),
+            ("goal_freshness".to_string(), "5s".to_string()),
+            ("cayenne_goal_qph".to_string(), "100".to_string()),
+            ("goal_qph".to_string(), "100".to_string()),
+        ]);
+        assert_eq!(
+            retired_tuning_param_warnings(
+                "dataset",
+                "orders",
+                &params,
+                RETIRED_DATASET_TUNING_PARAMS
+            ),
+            vec![
+                "Dataset 'orders' sets `tuning`, which is no longer a dataset parameter, so it has no effect. Set `runtime.adaptive_tuning` instead. See: https://spiceai.org/docs/reference/spicepod/runtime".to_string(),
+                "Dataset 'orders' sets `goal_freshness`, which is no longer a dataset parameter, so it has no effect. Set `runtime.params.target_freshness` instead. See: https://spiceai.org/docs/reference/spicepod/runtime".to_string(),
+                "Dataset 'orders' sets `cayenne_goal_qph`, which is no longer a dataset parameter, so it has no effect. Set `runtime.params.target_qph` instead. See: https://spiceai.org/docs/reference/spicepod/runtime".to_string(),
+                "Dataset 'orders' sets `goal_qph`, which is no longer a dataset parameter, so it has no effect. Set `runtime.params.target_qph` instead. See: https://spiceai.org/docs/reference/spicepod/runtime".to_string(),
+            ]
+        );
+        let params = HashMap::from([("cayenne_tuning".to_string(), "disabled".to_string())]);
+        assert_eq!(
+            retired_tuning_param_warnings("catalog", "lake", &params, RETIRED_CATALOG_TUNING_PARAMS),
+            vec!["Catalog 'lake' sets `cayenne_tuning`, which is no longer a catalog parameter, so it has no effect. Set `runtime.adaptive_tuning` instead. See: https://spiceai.org/docs/reference/spicepod/runtime".to_string()]
+        );
+        let params = HashMap::from([
+            ("cayenne_goal_freshness".to_string(), "5s".to_string()),
+            ("goal_qph".to_string(), "100".to_string()),
+        ]);
+        assert_eq!(
+            retired_tuning_param_warnings("catalog", "lake", &params, RETIRED_CATALOG_TUNING_PARAMS),
+            vec![
+                "Catalog 'lake' sets `cayenne_goal_freshness`, which is no longer a catalog parameter, so it has no effect. Set `runtime.params.target_freshness` instead. See: https://spiceai.org/docs/reference/spicepod/runtime".to_string(),
+                "Catalog 'lake' sets `goal_qph`, which is no longer a catalog parameter, so it has no effect. Set `runtime.params.target_qph` instead. See: https://spiceai.org/docs/reference/spicepod/runtime".to_string(),
+            ]
+        );
+        assert!(
+            retired_tuning_param_warnings(
+                "dataset",
+                "orders",
+                &HashMap::new(),
+                RETIRED_DATASET_TUNING_PARAMS
+            )
+            .is_empty()
+        );
+    }
+
+    #[test]
+    fn test_renamed_runtime_param_warning_text() {
+        assert_eq!(
+            renamed_runtime_param_warning("cayenne_goal_freshness", "target_freshness"),
+            "`runtime.params.cayenne_goal_freshness` has been renamed, so it has no effect. Set `runtime.params.target_freshness` instead. See: https://spiceai.org/docs/reference/spicepod/runtime"
+        );
     }
 
     #[test]
