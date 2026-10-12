@@ -504,12 +504,14 @@ pub enum DeletionMode {
     /// Let Cayenne choose (the default). On a table with a primary key, `Auto`
     /// keeps [`Self::Position`] deletes while the table is small enough to
     /// reclaim them by rewriting it whole — at most 1/32 of the target file
-    /// size on disk — and switches to [`Self::Key`] deletes once it outgrows
-    /// that, for the life of the process. While it uses position deletes, `Auto`
-    /// rewrites alongside writers rather than holding them off, and folds a key
-    /// repeated within one write out of the files as key mode does. A table
-    /// without a primary key has no key to record and always uses position
-    /// deletes. See [`Self::resolved`].
+    /// size on disk, and never more than 8 MiB — and switches to [`Self::Key`]
+    /// deletes once it outgrows that. The switch holds until the table is next
+    /// opened, which sizes it again. A table on object storage, in `mode:
+    /// memory`, partitioned, or with a cold tier uses key deletes throughout.
+    /// While it uses position deletes, `Auto` rewrites alongside writers rather
+    /// than holding them off, and folds a key repeated within one write out of
+    /// the files as key mode does. A table without a primary key has no key to
+    /// record and always uses position deletes. See [`Self::resolved`].
     #[default]
     Auto,
     /// Record deletions by primary-key bytes + sequence number and apply them

@@ -1780,6 +1780,15 @@ type TestSchemaStatisticsLockProbe = (
 #[cfg(test)]
 type TestPostCaptureHook = Box<dyn FnOnce() -> futures::future::BoxFuture<'static, ()> + Send>;
 
+/// Test-only probe of the writer-concurrent full rewrite's capture: the first
+/// sender fires once the rewrite holds `write_lock` to capture, the second once it
+/// has taken its cutoff. See `CayenneTableProvider::test_rewrite_capture_probe`.
+#[cfg(test)]
+type TestRewriteCaptureProbe = (
+    tokio::sync::oneshot::Sender<()>,
+    tokio::sync::oneshot::Sender<()>,
+);
+
 /// Test-only synchronous hook fired at the start of the checkpoint's fold-and-union
 /// task, on the blocking pool. See `CayenneTableProvider::test_checkpoint_union_hook`.
 #[cfg(test)]
@@ -2073,6 +2082,10 @@ pub struct CayenneTableProvider {
     /// Consumed on first fire.
     #[cfg(test)]
     test_pre_rewrite_commit_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
+    /// Test-only probe of the writer-concurrent full rewrite's capture, so a test
+    /// can order a staged write's publish against it. Consumed on first fire.
+    #[cfg(test)]
+    pub(crate) test_rewrite_capture_probe: Arc<ParkingMutex<Option<TestRewriteCaptureProbe>>>,
     /// Protected snapshot IDs that should skip deletion filtering.
     ///
     /// When data is inserted while pending deletions exist, the new data is written
@@ -9622,6 +9635,8 @@ impl CayenneTableProvider {
             test_checkpoint_union_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
             test_pre_rewrite_commit_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
+            test_rewrite_capture_probe: Arc::new(ParkingMutex::new(None)),
             table_schema: Arc::new(ArcSwap::new(Arc::<arrow_schema::Schema>::clone(
                 &table_metadata.schema,
             ))),
@@ -11950,6 +11965,8 @@ impl CayenneTableProvider {
             test_checkpoint_union_hook: Arc::clone(&self.test_checkpoint_union_hook),
             #[cfg(test)]
             test_pre_rewrite_commit_hook: Arc::clone(&self.test_pre_rewrite_commit_hook),
+            #[cfg(test)]
+            test_rewrite_capture_probe: Arc::clone(&self.test_rewrite_capture_probe),
             protected_snapshots: Arc::clone(&self.protected_snapshots),
             protected_snapshot_age_warning_keys: Arc::clone(
                 &self.protected_snapshot_age_warning_keys,
@@ -20062,27 +20079,27 @@ impl CayenneTableProvider {
         }
         // Apply-back-pressure gate, mirroring the seq-prefix bake's. The rewrite
         // competes with the CDC apply for the same write path, and it competes
-        // harder than the bake: it re-encodes the whole current snapshot and holds
-        // `write_lock` for the duration, so firing it at a table that is already
-        // replication-lag-bound starves the apply that would let the lag close —
-        // measured at SF-1000, where `order_line` bootstrapped and then never caught
-        // up. Defer; the next tick re-evaluates.
+        // harder than the bake: it re-encodes the whole current snapshot (and on an
+        // explicit position-delete table holds `write_lock` for the duration), so
+        // firing it at a table that is already replication-lag-bound starves the
+        // apply that would let the lag close — measured at SF-1000, where
+        // `order_line` bootstrapped and then never caught up. Defer; the next tick
+        // re-evaluates.
         //
         // EXCEPT over the memory ceiling, where the rewrite is the OOM guard: the
         // index is undroppable and over-commits the pool, so deferring it trades a
         // survival constraint for a throughput one.
         //
-        // This is the gate's only caller for a position table — the bake's call sits
-        // behind `key_mode`, and no table is both — so the sample counter it
-        // consumes is not shared. An `auto` table on key deletes is both, and the
-        // bake read the sample earlier in the same pass, so it skips the gate here:
-        // a second read would only see that sample as stale.
-        if !over_memory_ceiling && !key_reclaim && self.context.bake_should_defer_for_apply() {
+        // The gate reads the apply sample through its own cursor: an `auto` table on
+        // key deletes runs the bake's gate first in the same pass, and on a shared
+        // cursor that sample would read as stale here, letting the costlier rewrite
+        // through while the bake yields.
+        if !over_memory_ceiling && self.context.whole_table_reclaim_should_defer_for_apply() {
             tracing::debug!(
                 target: "cayenne::compaction",
                 table = self.table_metadata.table_name.as_str(),
                 deletion_index_len,
-                "Deferring position-mode deletion-index rewrite: CDC apply at/over capacity (back-pressure)",
+                "Deferring whole-table deletion-index rewrite: CDC apply at/over capacity (back-pressure)",
             );
             return None;
         }
@@ -23858,6 +23875,15 @@ impl CayenneTableProvider {
             )
         } else {
             let _capture_guard = self.write_lock_arc().lock_owned().await;
+            #[cfg(test)]
+            let capture_probe =
+                self.test_rewrite_capture_probe
+                    .lock()
+                    .take()
+                    .map(|(write_lock_held, captured)| {
+                        let _ = write_lock_held.send(());
+                        captured
+                    });
             // A pipelined staged write reserves its sequences under `write_lock`
             // (stage A) and publishes its rows and tombstones later without it
             // (stage B). One that reserved before the cutoff below and published
@@ -23895,6 +23921,10 @@ impl CayenneTableProvider {
             let (stream, generation_before) =
                 self.visible_file_stream_for_rewrite(&ctx, &order).await?;
             let cutoff = self.sequence_high_water().await;
+            #[cfg(test)]
+            if let Some(captured) = capture_probe {
+                let _ = captured.send(());
+            }
             let folded_after = self.protected_snapshot_ids();
             if folded_before != folded_after {
                 // A concurrent finalize published a protected snapshot during the

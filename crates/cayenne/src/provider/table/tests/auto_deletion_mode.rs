@@ -650,6 +650,40 @@ async fn the_whole_table_reclaim_trigger_covers_auto_on_key_deletes_not_explicit
     );
 }
 
+/// An auto table on key deletes defers its whole-table reclaim while the CDC apply
+/// is at or over capacity, as its bake does. The pass runs the bake's back-pressure
+/// gate first; the reclaim reads the same sample through its own cursor, so it
+/// yields too instead of running the costlier rewrite while the bake yields.
+#[tokio::test]
+async fn an_auto_table_on_key_deletes_defers_its_whole_table_reclaim_with_the_bake() {
+    let (provider, _catalog, _tmp) = table("auto_key_backpressure", DeletionMode::Auto, 256).await;
+    assert!(
+        provider.switch_auto_to_key_deletes(),
+        "premise: on key deletes"
+    );
+    install_int64_deletes(&provider, &[(0, 10), (1, 11)]);
+    assert!(
+        provider.deletion_index_reclaim_trigger().is_some(),
+        "premise: over the trigger with a healthy apply, the reclaim fires"
+    );
+    // 200 ms of apply per batch against the microsecond arrival gaps of a tight
+    // loop, past warmup: the apply is far behind its offered load.
+    for _ in 0..(crate::provider::tuning::WARMUP_BATCHES * 3) {
+        provider
+            .context
+            .record_ingest(100, 1, 10_000, Duration::from_millis(200), None);
+    }
+    assert!(
+        provider.context.bake_should_defer_for_apply(),
+        "premise: the pass's bake reads the sample first and defers"
+    );
+    assert_eq!(
+        provider.deletion_index_reclaim_trigger(),
+        None,
+        "the whole-table reclaim defers with the bake"
+    );
+}
+
 /// A writer that checked the keyset out while the table was on position deletes
 /// and returns it after the switch to key deletes records no position delete with
 /// it: the upsert path reads the table's mode, not the positions the keyset still
@@ -800,12 +834,25 @@ async fn a_staged_upsert_straddling_a_fenced_rewrite_stays_superseded() {
             .await
             .expect("stage the upsert");
 
-        // Stage B lands shortly after; the rewrite cannot commit before it has.
+        // Stage B lands once the rewrite holds `write_lock` to capture, after giving
+        // the rewrite a second to take its cutoff. A rewrite that waits for staged
+        // writes cannot take it before the publish; one that does not, takes it
+        // within that second. The rewrite cannot commit before the publish either.
+        let (lock_held_tx, lock_held_rx) = tokio::sync::oneshot::channel::<()>();
+        let (captured_tx, mut captured_rx) = tokio::sync::oneshot::channel::<()>();
+        *provider.test_rewrite_capture_probe.lock() = Some((lock_held_tx, captured_tx));
         let (published_tx, published_rx) = tokio::sync::oneshot::channel::<()>();
         let finisher = tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_millis(200)).await;
+            lock_held_rx
+                .await
+                .expect("the rewrite holds write_lock to capture");
+            let captured_first = matches!(
+                tokio::time::timeout(Duration::from_secs(1), &mut captured_rx).await,
+                Ok(Ok(()))
+            );
             staged.finish().await.expect("publish the staged upsert");
             published_tx.send(()).expect("report the publish");
+            captured_first
         });
         *provider.test_pre_rewrite_commit_hook.lock() = Some(Box::new(move || {
             Box::pin(async move {
@@ -819,7 +866,11 @@ async fn a_staged_upsert_straddling_a_fenced_rewrite_stays_superseded() {
                 .await
                 .expect("rewrite");
         }
-        finisher.await.expect("join the publish");
+        let captured_first = finisher.await.expect("join the publish");
+        assert!(
+            !captured_first,
+            "{mode:?}: the rewrite took its cutoff while a staged write was in flight"
+        );
 
         assert_eq!(
             collect_id_value_pairs(&ctx, &provider, &name).await,

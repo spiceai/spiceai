@@ -111,6 +111,12 @@ pub struct CayenneContext {
     /// that gate's own fresh-sample test (independent of the controller's
     /// `last_adjust_samples`). `0` until the first check.
     bake_gate_last_samples: std::sync::atomic::AtomicU64,
+    /// Recorded-batch count at the last whole-table deletion-index reclaim
+    /// back-pressure check: that gate's own fresh-sample cursor. An `auto` table on
+    /// key deletes runs the bake's gate and this one in the same pass, and on a
+    /// shared cursor this gate would read the sample the bake just took as stale.
+    /// `0` until the first check.
+    reclaim_gate_last_samples: std::sync::atomic::AtomicU64,
     /// Consecutive eligible control ticks on which a goal stayed violated while the
     /// controller had no move left — no eligible adjustment, whether because every
     /// relevant lever is clamped at its bound OR the helpful lever is blocked by a
@@ -317,6 +323,7 @@ impl CayenneContext {
             last_adjust: parking_lot::Mutex::new(None),
             last_adjust_samples: std::sync::atomic::AtomicU64::new(0),
             bake_gate_last_samples: std::sync::atomic::AtomicU64::new(0),
+            reclaim_gate_last_samples: std::sync::atomic::AtomicU64::new(0),
             goal_stuck_ticks: std::sync::atomic::AtomicU64::new(0),
             last_write: parking_lot::Mutex::new(None),
             coupled_writer: std::sync::atomic::AtomicBool::new(false),
@@ -665,11 +672,23 @@ impl CayenneContext {
     /// baking is free.
     #[must_use]
     pub(crate) fn bake_should_defer_for_apply(&self) -> bool {
+        self.should_defer_for_apply(&self.bake_gate_last_samples)
+    }
+
+    /// [`Self::bake_should_defer_for_apply`] for the whole-table deletion-index
+    /// reclaim, read through its own fresh-sample cursor. The reclaim re-encodes the
+    /// whole current snapshot, so it competes with the apply harder than the bake
+    /// and defers whenever the bake would — including in a pass whose bake read the
+    /// same sample first.
+    #[must_use]
+    pub(crate) fn whole_table_reclaim_should_defer_for_apply(&self) -> bool {
+        self.should_defer_for_apply(&self.reclaim_gate_last_samples)
+    }
+
+    fn should_defer_for_apply(&self, last_samples: &std::sync::atomic::AtomicU64) -> bool {
         use std::sync::atomic::Ordering;
         let snapshot = self.ingest_snapshot();
-        let last = self
-            .bake_gate_last_samples
-            .swap(snapshot.samples, Ordering::Relaxed);
+        let last = last_samples.swap(snapshot.samples, Ordering::Relaxed);
         let ingest_fresh = snapshot.samples > last;
         ingest_fresh
             && snapshot.samples >= tuning::WARMUP_BATCHES
