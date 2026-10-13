@@ -747,7 +747,7 @@ jobs:
       # Pull request and merge-queue checks keep no diagnostic artifacts.
       - name: Upload spiceio logs
         if: always() && github.event_name != 'pull_request' && github.event_name != 'merge_group'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: spiceio-lint-logs
           path: ${{ runner.temp }}/spiceio.log
@@ -944,7 +944,7 @@ jobs:
       # Pull request and merge-queue checks keep no diagnostic artifacts.
       - name: Upload spiceio logs
         if: always() && needs.check_changes.outputs.relevant_changes == 'true' && steps.setup-spiceio.outputs.pid != '' && github.event_name != 'pull_request' && github.event_name != 'merge_group'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: spiceio-build-test-logs
           path: ${{ runner.temp }}/spiceio.log
@@ -1052,7 +1052,7 @@ jobs:
       # Pull request and merge-queue checks keep no diagnostic artifacts.
       - name: Upload spiceio logs
         if: always() && needs.check_changes.outputs.relevant_changes == 'true' && steps.setup-spiceio.outputs.pid != '' && github.event_name != 'pull_request' && github.event_name != 'merge_group'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: spiceio-build-install-release-logs
           path: ${{ runner.temp }}/spiceio.log

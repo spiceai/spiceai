@@ -162,7 +162,7 @@ pub use staging_wal::{CayenneStagedAppend, PartitionedWalObjectStore, PreparedSt
 pub use table::{
     CayenneCdcWrite, CayenneTableProvider, CayenneTableProviderBuilder, FileDeletionHold,
     IndexPersistence, LastSmallFileCompactPath, LookupIndexSnapshotHold,
-    PreparedAppendSnapshotPublish, ScanViewReuse,
+    PreparedAppendSnapshotPublish, ScanViewReuse, SnapshotDirPins,
 };
 pub use transaction::{CayenneTransaction, TransactionCommit, TxnTable};
 pub use tuning::{
