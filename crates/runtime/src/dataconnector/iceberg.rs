@@ -239,8 +239,8 @@ impl IcebergDataConnector {
                 ignored_param: Some(param),
             } => {
                 tracing::warn!(
-                    "Dataset '{}' ignores `{param}`: it applies only when `from` is an object-store or file path, and this dataset reads the table through a REST catalog.",
-                    dataset.name
+                    "{}",
+                    ignored_pin_on_rest_catalog_message(&dataset.name, param)
                 );
             }
             TableSource::RestCatalog {
@@ -550,8 +550,11 @@ fn with_gcs_scheme_as_gs(location: String) -> String {
 /// Whether `source` names a metadata file rather than a table: plain
 /// (`.metadata.json`), gzip-compressed (`.gz.metadata.json`), or gzip-compressed
 /// under the older Java naming (`.metadata.json.gz`).
+/// Only a storage URL can name one: a REST catalog URL is a table address whose
+/// last segment is the table name, whatever that name ends with.
 fn is_metadata_file(source: &str) -> bool {
-    source.ends_with(".metadata.json") || source.ends_with(".metadata.json.gz")
+    is_storage_url(source)
+        && (source.ends_with(".metadata.json") || source.ends_with(".metadata.json.gz"))
 }
 
 /// The storage backend for `url`'s scheme, used when no credentials-aware factory
@@ -605,6 +608,14 @@ fn metadata_file_in_from_message(source: &str) -> String {
             "`from` names an Iceberg metadata file ('{source}'), but it must name the table root. Set `from` to the table's root directory and `iceberg_metadata_path` to the metadata file, relative to that root. See: {ICEBERG_DOCS}"
         ),
     }
+}
+
+/// The warning for a pinning parameter set on a dataset that reads its table
+/// through a REST catalog, where it has no effect.
+fn ignored_pin_on_rest_catalog_message(dataset: &impl std::fmt::Display, param: &str) -> String {
+    format!(
+        "Dataset '{dataset}' ignores `{param}`, so it reads the table's current metadata from its REST catalog: `{param}` applies only when `from` is the table root on object storage or a file path. Remove `{param}`, or set `from` to the table root to read the pinned file without a catalog. See: {ICEBERG_DOCS}"
+    )
 }
 
 /// The cause reported when the pinned metadata file cannot be loaded.
@@ -730,6 +741,22 @@ mod tests {
         assert_eq!(
             legacy_gcs.location("gcs://bucket/db/taxis"),
             Ok("gs://bucket/db/taxis/metadata/v3.metadata.json".to_string())
+        );
+    }
+
+    #[test]
+    fn a_rest_catalog_url_ending_in_metadata_json_is_not_a_metadata_file_in_from() {
+        assert!(!is_metadata_file(
+            "https://catalog.example/v1/namespaces/ns/tables/foo.metadata.json"
+        ));
+        assert!(is_metadata_file(&format!("{ROOT}/metadata/{FILE}")));
+    }
+
+    #[test]
+    fn a_pin_on_a_rest_catalog_dataset_is_reported_with_the_fix() {
+        assert_eq!(
+            ignored_pin_on_rest_catalog_message(&"taxis", "iceberg_metadata_path"),
+            "Dataset 'taxis' ignores `iceberg_metadata_path`, so it reads the table's current metadata from its REST catalog: `iceberg_metadata_path` applies only when `from` is the table root on object storage or a file path. Remove `iceberg_metadata_path`, or set `from` to the table root to read the pinned file without a catalog. See: https://spiceai.org/docs/components/data-connectors/iceberg"
         );
     }
 

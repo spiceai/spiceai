@@ -400,7 +400,7 @@ impl CatalogConnector for IcebergCatalog {
                 None
             };
 
-        if is_storage_url(catalog_id) {
+        if is_storage_url(&catalog_id) {
             return IcebergCatalog::load_hadoop_catalog(
                 props,
                 s3_credential_loader,

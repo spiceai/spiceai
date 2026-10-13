@@ -191,9 +191,9 @@ impl HadoopCatalogBuilder {
 
             let cloned_warehouse_root = warehouse_root.clone();
             let catalog = HadoopCatalog {
-                warehouse_root,
                 file_io,
                 operator,
+                warehouse_root,
             };
 
             if infer_scheme {
