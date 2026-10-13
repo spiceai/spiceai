@@ -4276,6 +4276,11 @@ pub(crate) enum EncodeFanOut {
     /// Size the fan-out from the configured write concurrency and the byte
     /// estimate. The overwhelming majority of writes.
     Sized,
+    /// One encoder for one of many writes the caller runs side by side, as the
+    /// per-file fold does. The parallelism lives in the caller, so the write
+    /// is not recorded as the table's write shape: a fan-out of one here says
+    /// nothing about how the table's own writes are sharded.
+    PerCaller,
     /// One encoder, whatever the configuration says. Required where the output
     /// must be a single sequence of files: a position-delete table's merge
     /// (its tombstones are file-path scoped and the rewrite's position bake-in
@@ -10570,7 +10575,14 @@ impl CayenneTableProvider {
         let super::delta_encoding::WritePolicy {
             class: write_class,
             fan_out,
+            routing,
         } = policy;
+        // A range plan routes on its key column, whatever the policy asked for.
+        let routing = if range.is_some() {
+            super::delta_encoding::ShardRouting::Key
+        } else {
+            routing
+        };
 
         // Materialize the snapshot directory before the write, unconditionally.
         // The Vortex sink creates it lazily when it writes its first file, so a
@@ -10648,9 +10660,10 @@ impl CayenneTableProvider {
 
         // Build the write-path Vortex format for this snapshot. Unsorted writes
         // are sharded across `target_partitions` concurrent encoders (PK-hashed
-        // for keyed tables, round-robin otherwise) so the encode saturates all
-        // cores; sorted rewrites and single-writer configs fall back to one
-        // serial writer. Scans are unaffected — they never read the write-shard
+        // for keyed tables, round-robin otherwise, and whole batches in turn
+        // when `routing` asks for them and the table requested no layout) so
+        // the encode saturates all cores; sorted rewrites and single-writer
+        // configs fall back to one serial writer. Scans are unaffected — they never read the write-shard
         // config (only `create_writer_physical_plan` does). The shard count is
         // size-aware: a write smaller than one target file stays a single shard
         // regardless of `target_partitions` (see `snapshot_shard_count`).
@@ -10669,6 +10682,7 @@ impl CayenneTableProvider {
                 target_size_bytes,
                 estimated_bytes,
                 fan_out,
+                routing,
                 range.as_ref().map(|range| range.bounds),
             )
             .map(|mut config| {
@@ -11123,6 +11137,11 @@ impl CayenneTableProvider {
         estimated_bytes: Option<u64>,
         fan_out: EncodeFanOut,
     ) -> usize {
+        // The caller runs many such writes side by side, so each takes one
+        // encoder and records no write shape.
+        if matches!(fan_out, EncodeFanOut::PerCaller) {
+            return 1;
+        }
         // The caller requires a single sequence of output files. Checked before
         // the configured concurrency, which must not be able to override it.
         if matches!(fan_out, EncodeFanOut::Serial) {
@@ -11811,6 +11830,7 @@ impl CayenneTableProvider {
             target_size_bytes,
             estimated_bytes,
             fan_out,
+            super::delta_encoding::ShardRouting::Key,
             range_bounds,
         ) {
             Some(config) => Arc::new(base.with_write_shard(config)),
@@ -11861,6 +11881,19 @@ impl CayenneTableProvider {
             .then_some(bounds)
     }
 
+    /// Whether a write routed by `routing` hands whole batches to its shards
+    /// instead of splitting them on the shard key. Only when the table requested
+    /// no layout: no shard key and no [`CayenneContext::has_requested_layout`].
+    /// This changes which file a row lands in, never which rows are written.
+    fn routes_whole_batches(&self, routing: super::delta_encoding::ShardRouting) -> bool {
+        match routing {
+            super::delta_encoding::ShardRouting::Key => false,
+            super::delta_encoding::ShardRouting::WholeBatch => {
+                self.context.shard_key_columns().is_empty() && !self.context.has_requested_layout()
+            }
+        }
+    }
+
     /// The intra-write shard configuration this write earns, or `None` for a
     /// single serial writer. Shared by [`Self::write_shard_format`] (default
     /// encoding) and the delta-encoding strategy-override path
@@ -11872,20 +11905,17 @@ impl CayenneTableProvider {
     /// source's declared shard key) and every column resolves against the
     /// schema. That is an explicit request for key-clustered files, so it wins.
     ///
-    /// Otherwise the shards are filled with CONTIGUOUS runs of the arrival
-    /// stream. This is the default because hashing destroys the arrival order,
-    /// and the arrival order is what a CDC table's zone maps are built on: with
-    /// a hash (or round-robin) split, every output file spans the whole range of
-    /// a monotonic column, so a point lookup can prune nothing and must open all
-    /// of them. A serial write never had that problem — it wrote one file per
-    /// range — and preserving contiguity is what keeps the parallel encode from
-    /// giving that pruning away.
+    /// Otherwise a keyed table hashes on its primary key and an unkeyed table
+    /// hands whole batches to the shards in turn. A keyed table's write does the
+    /// same when `routing` asks for whole batches and the table requested no
+    /// layout (see [`Self::routes_whole_batches`]).
     fn write_shard_config(
         &self,
         session_target_partitions: usize,
         target_size_bytes: usize,
         estimated_bytes: Option<u64>,
         fan_out: EncodeFanOut,
+        routing: super::delta_encoding::ShardRouting,
         range_bounds: Option<&[ScalarValue]>,
     ) -> Option<WriteShardConfig> {
         let shard_count = self.snapshot_shard_count(
@@ -11900,8 +11930,13 @@ impl CayenneTableProvider {
         // Bounds describe one column — the first `shard_key_columns` entry after
         // the caller leads with `range.column`. The rest of the key is kept so
         // an estimated-bounds hash fallback can still rebalance a composite key;
-        // a single-column key hashes that same column.
-        let shard_key_columns = self.resolved_shard_key_columns();
+        // a single-column key hashes that same column. An empty key is the
+        // sink's whole-batch round-robin.
+        let shard_key_columns = if self.routes_whole_batches(routing) {
+            Vec::new()
+        } else {
+            self.resolved_shard_key_columns()
+        };
         let range_bounds = range_bounds.filter(|bounds| !bounds.is_empty());
         Some(WriteShardConfig {
             write_concurrency: shard_count,
@@ -11987,7 +12022,7 @@ impl CayenneTableProvider {
     /// config, encode permits — equal to the shards actually written. Split
     /// points computed for more shards would be cut down to their first few,
     /// leaving the last shard nearly all of the rows.
-    fn snapshot_write_concurrency(&self, session_target_partitions: usize) -> usize {
+    pub(super) fn snapshot_write_concurrency(&self, session_target_partitions: usize) -> usize {
         let default = DEFAULT_WRITE_CONCURRENCY.min(session_target_partitions.max(1));
         let ceiling = cpu_budget::cpu_budget().cayenne_write_concurrency_ceiling();
         self.context
@@ -19105,7 +19140,7 @@ impl CayenneTableProvider {
         // for any shard count a write uses.
         const MAX_SAMPLE_ROWS: usize = 65_536;
 
-        if self.context.has_cluster_by() || self.context.sort_columns_are_authoritative() {
+        if self.context.has_requested_layout() {
             return OverwriteRouting::Hash;
         }
         let shards = self.snapshot_write_concurrency(target_partitions);
@@ -19220,7 +19255,7 @@ impl CayenneTableProvider {
         // for any shard count a write uses (as `overwrite_range_plan`).
         const MAX_SAMPLE_ROWS: usize = 65_536;
 
-        if self.context.has_cluster_by() || self.context.sort_columns_are_authoritative() {
+        if self.context.has_requested_layout() {
             return Ok((data, None));
         }
         let shards = self.snapshot_write_concurrency(target_partitions);
@@ -24521,7 +24556,14 @@ impl CayenneTableProvider {
         let target_size_bytes = cold_target_file_size_mb.saturating_mul(1024 * 1024);
 
         // Cold promotion streams its rows, so it has no key range to split on.
-        let shard = self.write_shard_config(1, target_size_bytes, None, fan_out, None);
+        let shard = self.write_shard_config(
+            1,
+            target_size_bytes,
+            None,
+            fan_out,
+            super::delta_encoding::ShardRouting::Key,
+            None,
+        );
         let write_format = self
             .context
             .cold_write_format(cold_target_file_size_mb, shard);
@@ -38908,7 +38950,7 @@ impl TableProvider for CayenneTableProvider {
         // collected. Gating this on `has_sort_columns()` instead is what made the
         // adaptive layout inert on every catalog-visible CDC deployment, since
         // inference fills `cayenne_sort_columns` on all of them.
-        if !self.context.has_cluster_by() && !self.context.sort_columns_are_authoritative() {
+        if !self.context.has_requested_layout() {
             self.filter_column_observations.record_filters(filters);
         }
 
@@ -52014,6 +52056,76 @@ mod tests {
         assert_eq!(
             provider.snapshot_shard_count(8, small_tsb, Some(17 * mib), EncodeFanOut::Sized),
             2
+        );
+    }
+
+    #[rstest::rstest]
+    #[case::no_layout(0, true)]
+    #[case::shard_key(1, false)]
+    #[case::cluster_by(2, false)]
+    #[case::user_sort(3, false)]
+    #[case::inferred_sort(4, true)]
+    #[tokio::test]
+    async fn test_bulk_load_shard_routing_respects_requested_layout(
+        #[case] layout: usize,
+        #[case] whole_batch: bool,
+    ) {
+        use crate::metadata::SortColumnsOrigin;
+        use crate::provider::delta_encoding::ShardRouting;
+
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let ctx = SessionContext::new();
+        let configs = [
+            VortexConfig::default(),
+            VortexConfig {
+                shard_key_columns: vec!["id".into()],
+                ..Default::default()
+            },
+            VortexConfig {
+                cluster_by: vec!["id".into()],
+                ..Default::default()
+            },
+            VortexConfig {
+                sort_columns: vec!["id".into()],
+                sort_columns_origin: SortColumnsOrigin::User,
+                ..Default::default()
+            },
+            VortexConfig {
+                sort_columns: vec!["id".into()],
+                sort_columns_origin: SortColumnsOrigin::Inferred,
+                ..Default::default()
+            },
+        ];
+        let (provider, _temp_dir) = create_cayenne_table_with_config(
+            "bulk_routing",
+            Arc::clone(&schema),
+            configs[layout].clone(),
+            vec!["id".into()],
+            ctx.runtime_env(),
+        )
+        .await;
+        let shard = provider
+            .write_shard_config(
+                4,
+                provider.context.target_file_size_bytes(),
+                None,
+                EncodeFanOut::Sized,
+                ShardRouting::WholeBatch,
+                None,
+            )
+            .expect("bulk load enables sharding");
+        let expected_key = if whole_batch {
+            vec![]
+        } else {
+            vec!["id".to_string()]
+        };
+        assert_eq!(
+            (
+                provider.routes_whole_batches(ShardRouting::WholeBatch),
+                provider.routes_whole_batches(ShardRouting::Key),
+                shard.shard_key_columns,
+            ),
+            (whole_batch, false, expected_key),
         );
     }
 
