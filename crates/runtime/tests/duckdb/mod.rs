@@ -2097,41 +2097,42 @@ async fn duckdb_file_acceleration_set_operations_match_nulls() -> Result<(), Str
 
             runtime_ready_check(&rt).await;
 
-            let select = |table: &str, engine: &str| format!("SELECT name, day FROM {table}_{engine}");
-            let cases: [(&str, fn(&dyn Fn(&str) -> String) -> String, Vec<&str>); 5] = [
-                (
-                    "INTERSECT",
-                    |t| format!("{} INTERSECT {}", t("a"), t("b")),
-                    vec!["NULL|1", "x|2", "y|NULL"],
-                ),
-                (
-                    "EXCEPT",
-                    |t| format!("{} EXCEPT {}", t("a"), t("b")),
-                    vec!["NULL|NULL", "z|3"],
-                ),
+            // Each `{a}`, `{b}` and `{c}` stands for `SELECT name, day` from that
+            // table, accelerated by the engine under test.
+            let cases = [
+                ("INTERSECT", "{a} INTERSECT {b}", vec!["NULL|1", "x|2", "y|NULL"]),
+                ("EXCEPT", "{a} EXCEPT {b}", vec!["NULL|NULL", "z|3"]),
                 // The shape of TPC-DS q38: a chained INTERSECT, counted.
                 (
                     "chained INTERSECT",
-                    |t| format!("SELECT count(*) FROM ({} INTERSECT {} INTERSECT {}) AS s", t("a"), t("b"), t("c")),
+                    "SELECT count(*) FROM ({a} INTERSECT {b} INTERSECT {c}) AS s",
                     vec!["2"],
                 ),
                 // The shape of TPC-DS q87: a chained EXCEPT, counted.
                 (
                     "chained EXCEPT",
-                    |t| format!("SELECT count(*) FROM ({} EXCEPT {} EXCEPT {}) AS s", t("a"), t("b"), t("c")),
+                    "SELECT count(*) FROM ({a} EXCEPT {b} EXCEPT {c}) AS s",
                     vec!["2"],
                 ),
                 (
                     "INTERSECT under a filter",
-                    |t| format!("SELECT * FROM ({} INTERSECT {}) AS s WHERE name IS NULL OR day IS NULL", t("a"), t("b")),
+                    "SELECT * FROM ({a} INTERSECT {b}) AS s WHERE name IS NULL OR day IS NULL",
                     vec!["NULL|1", "y|NULL"],
                 ),
             ];
+            let render = |template: &str, engine: &str| {
+                ["a", "b", "c"].iter().fold(template.to_string(), |sql, table| {
+                    sql.replace(
+                        &format!("{{{table}}}"),
+                        &format!("SELECT name, day FROM {table}_{engine}"),
+                    )
+                })
+            };
 
             let mut failures = Vec::new();
-            for (label, query, expected) in &cases {
-                let duckdb_sql = query(&|table| select(table, "duckdb"));
-                let arrow_sql = query(&|table| select(table, "arrow"));
+            for (label, template, expected) in &cases {
+                let duckdb_sql = render(template, "duckdb");
+                let arrow_sql = render(template, "arrow");
 
                 let plan = formatted_explain(&rt, &duckdb_sql).await?;
                 if !plan.contains("EXISTS") {
