@@ -885,12 +885,9 @@ fn changes_scan_view_lag(freshness_goal_secs: Option<f64>) -> Duration {
     }
     let default = Duration::from_millis(DEFAULT_CHANGES_SCAN_VIEW_LAG_MS);
     freshness_goal_secs
-        .filter(|secs| secs.is_finite() && *secs > 0.0)
-        .map_or(default, |secs| {
-            default.min(Duration::from_secs_f64(
-                secs * FRESHNESS_GOAL_SCAN_VIEW_SHARE,
-            ))
-        })
+        .filter(|secs| *secs > 0.0)
+        .and_then(|secs| Duration::try_from_secs_f64(secs * FRESHNESS_GOAL_SCAN_VIEW_SHARE).ok())
+        .map_or(default, |share| default.min(share))
 }
 
 /// `WithinLag` only for **read-only** `refresh_mode: changes` (analytical CDC
@@ -8637,6 +8634,11 @@ mod tests {
             changes_scan_view_lag(Some(f64::NAN)),
             Duration::from_secs(1)
         );
+        assert_eq!(
+            changes_scan_view_lag(Some(f64::INFINITY)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(changes_scan_view_lag(Some(1e300)), Duration::from_secs(1));
 
         let mut config = cayenne::metadata::VortexConfig {
             goal_freshness_secs: Some(2.0),
