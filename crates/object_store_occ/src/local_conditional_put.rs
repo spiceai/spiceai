@@ -87,7 +87,22 @@ fn worker_error(source: impl std::error::Error + Send + Sync + 'static) -> Objec
 }
 
 fn is_publication_lock(location: &Path) -> bool {
-    location.filename() == Some(".spice-occ-lock")
+    matches!(
+        location.filename(),
+        Some(".spice-occ-lock" | ".spice-object-store-occ.lock")
+    )
+}
+
+fn lock_file(path: &std::path::Path) -> Result<std::fs::File, ObjectStoreError> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .map_err(worker_error)?;
+    file.lock().map_err(worker_error)?;
+    Ok(file)
 }
 
 fn reserved_lock_error(location: &Path) -> ObjectStoreError {
@@ -137,19 +152,17 @@ fn conditional_write(
     payload: PutPayload,
     mut options: PutOptions,
 ) -> Result<PutResult, ObjectStoreError> {
-    let lock_path = publication_lock_path(root, location);
-    if let Some(parent) = lock_path.parent() {
+    let legacy_path = root.join(".spice-object-store-occ.lock");
+    let directory_path = publication_lock_path(root, location);
+    if let Some(parent) = directory_path.parent() {
         std::fs::create_dir_all(parent).map_err(worker_error)?;
     }
-    let guard = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&lock_path)
-        .map_err(worker_error)?;
-    guard.lock().map_err(worker_error)?;
-    // No async executor task owns this guard: every filesystem operation runs
+    // Take the legacy root lock before the directory lock. An older process
+    // locks only the root file. Reversing this order can deadlock with a writer
+    // that still uses this order.
+    let _legacy_guard = lock_file(&legacy_path)?;
+    let _directory_guard = lock_file(&directory_path)?;
+    // No async executor task owns these guards: every filesystem operation runs
     // to completion on this thread before its file descriptor releases the lock.
     futures::executor::block_on(async {
         if let PutMode::Update(expected) = &options.mode {
@@ -491,40 +504,56 @@ mod tests {
             .await
             .expect("update");
 
-        let lock = Path::from("cluster/.spice-occ-lock");
-        let lock_file = dir.path().join("cluster/.spice-occ-lock");
-        assert!(
-            lock_file.is_file(),
-            "conditional update must create the lock"
-        );
+        let locks = [
+            (
+                Path::from("cluster/.spice-occ-lock"),
+                dir.path().join("cluster/.spice-occ-lock"),
+            ),
+            (
+                Path::from(".spice-object-store-occ.lock"),
+                dir.path().join(".spice-object-store-occ.lock"),
+            ),
+        ];
+        for (_, lock_file) in &locks {
+            assert!(
+                lock_file.is_file(),
+                "conditional update must create {}",
+                lock_file.display()
+            );
+        }
         let listed = store
-            .list(Some(&Path::from("cluster")))
+            .list(None)
             .try_collect::<Vec<_>>()
             .await
             .expect("list");
         assert!(
-            listed.iter().all(|meta| meta.location != lock),
-            "list must hide the lock: {listed:?}"
+            listed
+                .iter()
+                .all(|meta| !is_publication_lock(&meta.location)),
+            "list must hide both locks: {listed:?}"
         );
-        assert!(
-            matches!(
-                store.get(&lock).await,
-                Err(ObjectStoreError::NotFound { .. })
-            ),
-            "get must not expose the lock"
-        );
-        assert!(
-            store.delete(&lock).await.is_err(),
-            "delete must not unlink the lock"
-        );
-        assert!(
-            store
-                .put(&lock, b"replaced".as_slice().into())
-                .await
-                .is_err()
-        );
-        assert!(lock_file.is_file(), "the original lock file must remain");
-        assert_eq!(std::fs::read(&lock_file).expect("read lock"), b"");
+        for (lock, lock_file) in locks {
+            assert!(
+                matches!(
+                    store.get(&lock).await,
+                    Err(ObjectStoreError::NotFound { .. })
+                ),
+                "get must not expose {lock}"
+            );
+            assert!(
+                store.delete(&lock).await.is_err(),
+                "delete must not unlink {lock}"
+            );
+            assert!(
+                store
+                    .put(&lock, b"replaced".as_slice().into())
+                    .await
+                    .is_err(),
+                "put must not replace {lock}"
+            );
+            assert!(lock_file.is_file(), "{} must remain", lock_file.display());
+            assert_eq!(std::fs::read(&lock_file).expect("read lock"), b"");
+        }
     }
 
     #[tokio::test]
