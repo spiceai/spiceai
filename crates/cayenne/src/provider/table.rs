@@ -1774,7 +1774,8 @@ fn carried_segments(
     let Some(first) = segments.first() else {
         return (0, 0);
     };
-    let Ok(start) = previous.binary_search_by_key(&first.data_sequence, |cached| cached.data_sequence)
+    let Ok(start) =
+        previous.binary_search_by_key(&first.data_sequence, |cached| cached.data_sequence)
     else {
         return (0, 0);
     };
@@ -31060,7 +31061,8 @@ impl CayenneTableProvider {
             .collect();
         let previous = self.scan_view_cache.merged_deletions.lock().clone();
         let extended = previous.and_then(|previous| {
-            if previous.file.index_ptr() != Some(file_ptr) || previous.shards.len() != shards.len() {
+            if previous.file.index_ptr() != Some(file_ptr) || previous.shards.len() != shards.len()
+            {
                 return None;
             }
             let mut appended = crate::provider::mem_tier::InMemTombstones::default();
@@ -31071,7 +31073,9 @@ impl CayenneTableProvider {
                 }
             }
             #[cfg(test)]
-            self.scan_view_cache.extended_merges.fetch_add(1, Ordering::Relaxed);
+            self.scan_view_cache
+                .extended_merges
+                .fetch_add(1, Ordering::Relaxed);
             Some(if appended.is_empty() {
                 previous.merged.clone()
             } else {
@@ -31598,14 +31602,14 @@ impl CayenneTableProvider {
         };
         let build = async move {
             task::spawn_blocking(move || provider.build_scan_view(raw, structural_version))
-            .await
-            .map_err(|join_error| {
-                Arc::new(datafusion_common::DataFusionError::Execution(format!(
-                    "scan-view build task failed to join: {join_error}"
-                )))
-            })?
-            .map(Arc::new)
-            .map_err(Arc::new)
+                .await
+                .map_err(|join_error| {
+                    Arc::new(datafusion_common::DataFusionError::Execution(format!(
+                        "scan-view build task failed to join: {join_error}"
+                    )))
+                })?
+                .map(Arc::new)
+                .map_err(Arc::new)
         }
         .boxed()
         .shared();
@@ -35076,10 +35080,14 @@ impl CayenneTableProvider {
                 let cached = match (carried_segment, &hidden) {
                     (Some(cached), Some(hidden)) => {
                         #[cfg(test)]
-                        self.scan_view_cache.carried_segments.fetch_add(1, Ordering::Relaxed);
+                        self.scan_view_cache
+                            .carried_segments
+                            .fetch_add(1, Ordering::Relaxed);
                         self.hide_appended_keys(cached, hidden, pk_indices)?
                     }
-                    _ => self.filter_segment_for_build(segment, &aggregate, digest_keys, pk_indices)?,
+                    _ => {
+                        self.filter_segment_for_build(segment, &aggregate, digest_keys, pk_indices)?
+                    }
                 };
                 if !cached.batches.is_empty() {
                     visible.push(VisibleMemTierSegment {
@@ -35175,14 +35183,23 @@ impl CayenneTableProvider {
                         .then(|| pks.values().iter().map(|pk| !keys.contains(pk)).collect())
                 }
                 AppendedKeys::Digests(keys) if !keys.is_empty() => {
-                    let row_digests = cached.digests.get(position).ok_or_else(|| Error::Internal {
-                        table: self.table_metadata.table_name.clone(),
-                        message: "Cached mem-tier batch has no key digests".to_string(),
-                    })?;
+                    let row_digests =
+                        cached
+                            .digests
+                            .get(position)
+                            .ok_or_else(|| Error::Internal {
+                                table: self.table_metadata.table_name.clone(),
+                                message: "Cached mem-tier batch has no key digests".to_string(),
+                            })?;
                     row_digests
                         .iter()
                         .any(|digest| keys.contains(digest))
-                        .then(|| row_digests.iter().map(|digest| !keys.contains(digest)).collect())
+                        .then(|| {
+                            row_digests
+                                .iter()
+                                .map(|digest| !keys.contains(digest))
+                                .collect()
+                        })
                 }
                 _ => None,
             };
@@ -67822,7 +67839,10 @@ mod tests {
     }
 
     async fn incremental_scan_view_case(composite: bool, seed: u64) {
-        let case = format!("{} key, seed {seed:#x}", if composite { "composite" } else { "Int64" });
+        let case = format!(
+            "{} key, seed {seed:#x}",
+            if composite { "composite" } else { "Int64" }
+        );
         let ctx = SessionContext::new();
         let key_names: Vec<&str> = if composite { vec!["a", "b"] } else { vec!["a"] };
         let mut fields: Vec<Field> = key_names
@@ -67859,10 +67879,13 @@ mod tests {
             .expect("register real provider");
 
         let columns = |keys: &[(i64, i64)], values: Option<&[i64]>| -> Vec<ArrayRef> {
-            let mut columns: Vec<ArrayRef> =
-                vec![Arc::new(Int64Array::from_iter_values(keys.iter().map(|k| k.0)))];
+            let mut columns: Vec<ArrayRef> = vec![Arc::new(Int64Array::from_iter_values(
+                keys.iter().map(|k| k.0),
+            ))];
             if composite {
-                columns.push(Arc::new(Int64Array::from_iter_values(keys.iter().map(|k| k.1))));
+                columns.push(Arc::new(Int64Array::from_iter_values(
+                    keys.iter().map(|k| k.1),
+                )));
             }
             if let Some(values) = values {
                 columns.push(Arc::new(Int64Array::from(values.to_vec())));
@@ -67873,7 +67896,8 @@ mod tests {
         let mut model: BTreeMap<(i64, i64), i64> = BTreeMap::new();
         let mut written: std::collections::BTreeSet<(i64, i64)> = std::collections::BTreeSet::new();
         for step in 0..48 {
-            let mut keys: std::collections::BTreeSet<(i64, i64)> = std::collections::BTreeSet::new();
+            let mut keys: std::collections::BTreeSet<(i64, i64)> =
+                std::collections::BTreeSet::new();
             for _ in 0..=rng.below(12) {
                 keys.insert(if composite {
                     (rng.below(4), rng.below(12))
@@ -67885,11 +67909,9 @@ mod tests {
             match rng.below(10) {
                 0..=5 => {
                     let values: Vec<i64> = keys.iter().map(|_| rng.below(1_000_000)).collect();
-                    let batch = RecordBatch::try_new(
-                        Arc::clone(&schema),
-                        columns(&keys, Some(&values)),
-                    )
-                    .expect("upsert batch");
+                    let batch =
+                        RecordBatch::try_new(Arc::clone(&schema), columns(&keys, Some(&values)))
+                            .expect("upsert batch");
                     provider
                         .write_cdc_append_stream(single_batch_stream(batch), &ctx.task_ctx())
                         .await
@@ -67957,13 +67979,16 @@ mod tests {
                 "{case}, step {step}: visible mem-tier rows"
             );
 
-            let merged = provider.merged_deletions_for_build(&raw.deletion_snapshot, &raw.mem_tier_shards);
+            let merged =
+                provider.merged_deletions_for_build(&raw.deletion_snapshot, &raw.mem_tier_shards);
             let rebuilt = CayenneTableProvider::merged_deletion_snapshot_sharded(
                 raw.deletion_snapshot.clone(),
                 &raw.mem_tier_shards,
             );
             let pk_indices: Vec<usize> = (0..key_names.len()).collect();
-            let converter = provider.build_pk_converter(&pk_indices).expect("key converter");
+            let converter = provider
+                .build_pk_converter(&pk_indices)
+                .expect("key converter");
             for key in &written {
                 let delete_sequence = |snapshot: &PkDeletionSnapshot| match snapshot {
                     PkDeletionSnapshot::Int64Pk { tombstones } => {
@@ -67973,7 +67998,9 @@ mod tests {
                         let encoded = converter
                             .convert_columns(&columns(&[*key], None))
                             .expect("encode key");
-                        tombstones.get(encoded.row(0).data()).map(|t| t.delete_sequence)
+                        tombstones
+                            .get(encoded.row(0).data())
+                            .map(|t| t.delete_sequence)
                     }
                     PkDeletionSnapshot::PositionBased => None,
                 };
@@ -68024,8 +68051,14 @@ mod tests {
                 .collect();
             assert_eq!(actual, expected, "{case}, step {step}: SQL rows");
         }
-        let carried = provider.scan_view_cache.carried_segments.load(Ordering::Relaxed);
-        let extended = provider.scan_view_cache.extended_merges.load(Ordering::Relaxed);
+        let carried = provider
+            .scan_view_cache
+            .carried_segments
+            .load(Ordering::Relaxed);
+        let extended = provider
+            .scan_view_cache
+            .extended_merges
+            .load(Ordering::Relaxed);
         assert!(carried > 0, "{case}: no build carried a segment forward");
         assert!(extended > 0, "{case}: no build extended a previous merge");
     }
