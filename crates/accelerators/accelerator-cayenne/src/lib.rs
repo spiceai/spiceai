@@ -6733,6 +6733,111 @@ mod tests {
         );
     }
 
+    /// A stored table the catalog cannot read fails the teardown before anything is
+    /// dropped. Treating it like an absent table would delete what the newly configured
+    /// location already holds, and orphan the stored table's files.
+    #[tokio::test]
+    async fn drop_table_fails_when_the_stored_table_cannot_be_read() {
+        use cayenne::{CayenneCatalog, MetadataCatalog, metadata::CreateTableOptions};
+
+        let app = Arc::new(AppBuilder::new("test").build());
+        let base = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = base.path().join("metadata");
+        let catalog_file = metadata_dir.join("cayenne.db");
+        let old_dir = base.path().join("old").join("orders");
+        let new_dir = base.path().join("new").join("orders");
+
+        // The table as an earlier configuration stored it, at `old/orders`.
+        std::fs::create_dir_all(&metadata_dir).expect("metastore dir");
+        let catalog =
+            CayenneCatalog::new(format!("sqlite://{}", catalog_file.display())).expect("catalog");
+        catalog.init().await.expect("init catalog");
+        let table_id = catalog
+            .create_table(CreateTableOptions {
+                table_name: "orders".to_string(),
+                schema: Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: old_dir.to_string_lossy().into_owned(),
+                partition_column: None,
+                vortex_config: cayenne::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("create the stored table");
+        let old_file = old_dir.join(&table_id).join("data.vortex");
+        std::fs::create_dir_all(old_file.parent().expect("parent")).expect("old table dir");
+        std::fs::write(&old_file, b"rows").expect("old file");
+        drop(catalog);
+
+        // The stored schema no longer decodes, so reading the table fails with an error
+        // other than `TableNotFound`.
+        let metastore = rusqlite::Connection::open(&catalog_file).expect("open the metastore");
+        let garbled = metastore
+            .execute(
+                "UPDATE cayenne_table SET schema_json = '!' WHERE table_name = 'orders'",
+                [],
+            )
+            .expect("garble the stored schema");
+        assert_eq!(garbled, 1, "the stored table's row must be garbled");
+
+        // The dataset now puts its data under `new/`, which already holds a file.
+        std::fs::create_dir_all(&new_dir).expect("new dir");
+        let new_file = new_dir.join("unrelated");
+        std::fs::write(&new_file, b"keep").expect("new file");
+        let mut dataset = TestAccelerationSource::new("orders").with_app(Arc::clone(&app));
+        dataset.set_acceleration(Acceleration {
+            engine: Engine::Cayenne,
+            mode: Mode::File,
+            params: [
+                (
+                    "cayenne_file_path".to_string(),
+                    base.path().join("new").to_string_lossy().into_owned(),
+                ),
+                (
+                    "cayenne_metadata_dir".to_string(),
+                    metadata_dir.to_string_lossy().into_owned(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        });
+
+        let result = CayenneAccelerator::new()
+            .drop_table("orders", &dataset)
+            .await;
+
+        assert!(
+            new_file.exists(),
+            "the newly configured location's contents must be left alone"
+        );
+        assert!(
+            old_file.exists(),
+            "the stored table's files must be kept for the retry"
+        );
+        let stored_rows: i64 = metastore
+            .query_row(
+                "SELECT COUNT(*) FROM cayenne_table WHERE table_name = 'orders'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count the stored table's rows");
+        assert_eq!(stored_rows, 1, "the stored table must not be dropped");
+        let err = result.expect_err("a stored table that cannot be read must fail the teardown");
+        assert!(
+            matches!(
+                err.downcast_ref::<cayenne::CatalogError>(),
+                Some(cayenne::CatalogError::FailedToGetTable { source })
+                    if matches!(
+                        source.as_ref(),
+                        cayenne::CatalogError::InvalidOperation { message, .. }
+                            if message == "Failed to decode schema from base64"
+                    )
+            ),
+            "the teardown must fail with the catalog's read error; got: {err}"
+        );
+    }
+
     /// A rebuild for a changed data location whose stored table is in an object store
     /// leaves the newly configured location alone: this teardown removes local
     /// directories only, so the stored files stay where they are, and the log names them.
