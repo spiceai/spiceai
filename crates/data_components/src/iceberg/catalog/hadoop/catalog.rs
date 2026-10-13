@@ -20,7 +20,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::future::BoxFuture;
 use futures::{FutureExt, StreamExt, TryStreamExt};
-use iceberg::io::{FileIO, FileIOBuilder, InputFile, StorageFactory};
+use iceberg::io::{FileIO, FileIOBuilder, StorageFactory};
 use iceberg::spec::TableMetadata;
 use iceberg::table::Table;
 use iceberg::{
@@ -28,6 +28,8 @@ use iceberg::{
     TableCreation, TableIdent,
 };
 use opendal::{Entry, Operator};
+
+use crate::iceberg::catalog::metadata_file::{MetadataListing, find_current_metadata};
 
 /// A function that builds a `StorageFactory` for a given URL scheme (e.g. `s3`, `s3a`).
 ///
@@ -414,16 +416,14 @@ impl Catalog for HadoopCatalog {
             ));
         }
 
-        let metadata_file = self.find_metadata_file(table_identifier).await?;
-
-        let metadata_file_content = metadata_file.read().await?;
-        let table_metadata = serde_json::from_slice::<TableMetadata>(&metadata_file_content)?;
+        let location = self.current_metadata_location(table_identifier).await?;
+        let table_metadata = TableMetadata::read_from(&self.file_io, &location).await?;
 
         // A table without its metadata location cannot be served to another
         // Iceberg client, which reads the table from that file.
         Table::builder()
             .metadata(table_metadata)
-            .metadata_location(metadata_file.location())
+            .metadata_location(location)
             .identifier(table_identifier.clone())
             .file_io(self.file_io.clone())
             .runtime(Runtime::current())
@@ -583,122 +583,27 @@ impl HadoopCatalog {
         Ok(false)
     }
 
-    fn version_hint_path(&self, table: &TableIdent, extension: &str) -> String {
-        format!(
-            "{warehouse_root}{namespace}/{table}/metadata/version-hint.{extension}",
+    /// The table's current metadata file: the one its `version-hint.text` names, or
+    /// else the one with the highest version number in its `metadata/` directory.
+    async fn current_metadata_location(&self, table: &TableIdent) -> Result<String> {
+        let metadata_directory = format!(
+            "{warehouse_root}{namespace}/{table}/metadata/",
             warehouse_root = self.warehouse_root,
             namespace = table.namespace.join("/"),
-            table = table.name,
-            extension = extension
-        )
-    }
-
-    async fn find_metadata_file(&self, table_identifier: &TableIdent) -> Result<InputFile> {
-        let hint_one = self
-            .file_io
-            .new_input(self.version_hint_path(table_identifier, "txt"))?;
-        let hint_two = self
-            .file_io
-            .new_input(self.version_hint_path(table_identifier, "text"))?;
-        let hint_input = if hint_one.exists().await? {
-            Some(hint_one)
-        } else if hint_two.exists().await? {
-            Some(hint_two)
-        } else {
-            None
+            table = table.name
+        );
+        let listing = MetadataListing {
+            operator: self.operator.clone(),
+            path: self.to_operator_path(&metadata_directory),
         };
-
-        if let Some(input) = hint_input {
-            // Load the version hint file to get the latest metadata file
-            let metadata_version = input.read().await?;
-            let metadata_version = std::str::from_utf8(&metadata_version).map_err(|e| {
-                Error::new(
-                    ErrorKind::DataInvalid,
-                    format!("Invalid UTF-8 in version hint file: {e}"),
-                )
-            })?;
-            let metadata_file = format!(
-                "{warehouse_root}{namespace}/{table}/metadata/v{version}.metadata.json",
-                warehouse_root = self.warehouse_root,
-                namespace = table_identifier.namespace.join("/"),
-                table = table_identifier.name,
-                version = metadata_version.trim()
-            );
-
-            self.file_io.new_input(&metadata_file)
-        } else {
-            // If there is no version hint, list the metadata files and get the latest one
-            let metadata_directory = format!(
-                "{warehouse_root}{namespace}/{table}/metadata/",
-                warehouse_root = self.warehouse_root,
-                namespace = table_identifier.namespace.join("/"),
-                table = table_identifier.name
-            );
-
-            let op_path = self.to_operator_path(&metadata_directory);
-            let mut lister = self.operator.lister(&op_path).await.map_err(|e| {
-                Error::new(
-                    ErrorKind::Unexpected,
-                    format!("Failed to list metadata directory: {e}"),
-                )
-            })?;
-            let mut latest_metadata_file: Option<Entry> = None;
-            while let Some(entry) = lister.try_next().await.map_err(|e| {
-                Error::new(
-                    ErrorKind::Unexpected,
-                    format!("Failed to read metadata entry: {e}"),
-                )
-            })? {
-                if entry.metadata().is_file() && entry.name().ends_with(".metadata.json") {
-                    if let Some(latest_file) = &latest_metadata_file {
-                        match (
-                            latest_file.metadata().last_modified(),
-                            entry.metadata().last_modified(),
-                        ) {
-                            (Some(latest_modified), Some(entry_modified)) => {
-                                // Compare last modified times
-                                if entry_modified > latest_modified {
-                                    latest_metadata_file = Some(entry);
-                                }
-                            }
-                            _ => {
-                                // compare by name if last modified times are not available
-                                if entry.name() > latest_file.name() {
-                                    latest_metadata_file = Some(entry);
-                                }
-                            }
-                        }
-                    } else {
-                        latest_metadata_file = Some(entry);
-                    }
-                }
-            }
-
-            if let Some(latest_file) = latest_metadata_file {
-                let path = format!(
-                    "{warehouse_root}{namespace}/{table}/metadata/{latest_file}",
-                    warehouse_root = self.warehouse_root,
-                    namespace = table_identifier.namespace.join("/"),
-                    table = table_identifier.name,
-                    latest_file = latest_file.name()
-                );
-
-                self.file_io.new_input(path)
-            } else {
-                Err(Error::new(
-                    ErrorKind::DataInvalid,
-                    "No metadata file found in the table directory",
-                ))
-            }
-        }
+        let hint = format!("{metadata_directory}version-hint.text");
+        Ok(find_current_metadata(&self.file_io, &hint, Some(&listing))
+            .await?
+            .location)
     }
 
     async fn load_metadata(&self, table_identifier: &TableIdent) -> Result<TableMetadata> {
-        let metadata_file = self.find_metadata_file(table_identifier).await?;
-
-        let metadata_file_content = metadata_file.read().await?;
-        Ok(serde_json::from_slice::<TableMetadata>(
-            &metadata_file_content,
-        )?)
+        let location = self.current_metadata_location(table_identifier).await?;
+        TableMetadata::read_from(&self.file_io, &location).await
     }
 }
