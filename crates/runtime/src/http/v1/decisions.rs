@@ -100,6 +100,12 @@ pub(crate) async fn post(
         let translated = match request.to_system_one() {
             Ok(translated) => translated,
             Err(invalid) => {
+                tracing::error!(
+                    target: "task_history",
+                    "Evaluation of model '{}' failed: invalid request (`{}`)",
+                    request.model,
+                    invalid.param
+                );
                 return error_response(
                     StatusCode::BAD_REQUEST,
                     "invalid_request_error",
@@ -111,6 +117,11 @@ pub(crate) async fn post(
         };
 
         let Some(model) = models.read().await.get(&request.model).cloned() else {
+            tracing::error!(
+                target: "task_history",
+                "Evaluation of model '{}' failed: model not found",
+                request.model
+            );
             return error_response(
                 StatusCode::NOT_FOUND,
                 "invalid_request_error",
@@ -126,6 +137,11 @@ pub(crate) async fn post(
         // A decision model has no reasoning effort to set; answering anyway would hide
         // that the level the caller asked for was never applied.
         if request.reasoning_effort.is_some() && model.is_decision_model() {
+            tracing::error!(
+                target: "task_history",
+                "Evaluation of model '{}' failed: unsupported parameter `reasoning_effort`",
+                request.model
+            );
             return error_response(
                 StatusCode::BAD_REQUEST,
                 "invalid_request_error",
