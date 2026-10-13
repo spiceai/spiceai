@@ -1913,6 +1913,27 @@ mod tests {
         }
     }
 
+    /// A main-scan probe must read a run holding an insert-only entry even when that
+    /// run's Bloom, which holds deletion keys only, misses the key: key 7's
+    /// re-insertion at 50, recorded in the base run, must outrank its delete at 45,
+    /// published later into the active tier. The unrelated deletes rebuild the
+    /// global Bloom, so the base run's own Bloom is no longer the one the probe
+    /// already passed.
+    #[test]
+    fn a_main_scan_probe_reads_an_insert_only_run_on_a_bloom_miss() {
+        let idx = DeletionIndex::from_maps(HashMap::new(), HashMap::from([(7, 50)]))
+            .extend_max_deletes((1000..1100).map(|pk| (pk, 10)))
+            .extend_max_deletes([(7, 45)]);
+        assert_eq!(
+            idx.get(7),
+            Some(Tombstone {
+                delete_sequence: 45,
+                insert_sequence: Some(50),
+            }),
+            "the base run's insert-only entry for key 7 must be fused into the probe"
+        );
+    }
+
     #[test]
     fn from_map_then_get() {
         let mut map = HashMap::new();
