@@ -307,7 +307,7 @@ is the same shape as the loss these guards exist to catch ([#13625](https://gith
 | Backport of apache/datafusion#25227: cast statistics propagate only through safe conversions | A `MIN`/`MAX` over a cast column is answered from the uncast Parquet statistics, so `MAX(CAST(a AS INT))` over the strings `'1'`, `'100'`, `'2'` answers `2` | silent (wrong data) | `…::a_cast_aggregate_is_not_answered_from_uncast_statistics` |
 | Backport of apache/datafusion#24516: a scalar subquery that can return no rows is nullable | `(SELECT 1 WHERE FALSE) IS NULL` answers `false`, and `WHERE (SELECT z FROM t) IS NULL` over an empty `t` whose `z` is `NOT NULL` keeps no row | silent (wrong data) | `…::an_empty_scalar_subquery_is_null` |
 | `FilterExec` estimates an `IN` list or an OR-of-equalities from NDV rather than the flat default selectivity (spiceai/datafusion#228) | Neither spelling is analyzable by interval arithmetic — `check_support` rejects `InListExpr`, and `Or` is not in `is_operator_supported` — so both fall back to `FILTER_EXEC_DEFAULT_SELECTIVITY` and a key lookup on a large accelerated table advertises 20% of the table. `JoinSelection` sizes the join inputs from that number, so the filtered 150M-row table outweighs the 15M-row table opposite it and the wrong side is collected; the chosen side is then an unfiltered scan with an *exact* row count, which is what the oversized-join memory gate reads before rewriting the join into a sort-merge that sorts a whole input to produce a handful of rows. Measured at TPC-H SF100: 15.00 M rows / 2.9 GB sorted for 128 output rows. Results stay correct either way — losing this is a plan-quality regression, not a wrong-rows one, which is why nothing fails loudly | silent (perf) | `crates/cayenne/src/optimizer_rules.rs::tests::in_list_row_estimate::{the_key_lookup_is_chosen_as_the_build_side,without_the_estimate_the_larger_side_is_chosen_instead}` run `JoinSelection` over a join of an IN-filtered 150M-row Cayenne scan against a 15M-row one and assert which side it collects — the second is the control, and fails if the rule stops swapping for a reason unrelated to this patch. Note the memory gate itself cannot serve as the guard: `build_input_row_estimate` accepts only `Precision::Exact`, and a `FilterExec` is always `Inexact`, so the gate never reads this estimate directly. `::{an_in_list_over_a_unique_key_estimates_the_list_length,an_or_chain_estimates_the_same_as_the_in_list_it_rewrites_to,a_non_unique_key_scales_by_rows_per_value}` are fast diagnostics that say whether the estimate or the rule moved; the OR-chain case is separate because the optimizer rewrites between the two spellings around a list length of three. `::without_an_ndv_the_estimate_stays_at_the_default` is the control against over-application. In the fork, the 25 tests of `filter.rs::tests::distinct_value_selectivity` |
-| Unparser: the MySQL dialect casts a timestamp to `DATETIME(p)`, with `p` from the Arrow unit (6 for micro- and nanoseconds), and cuts a timestamp literal to the six fractional digits MySQL keeps (spiceai/datafusion#255) | A filter pushed to MySQL on a fractional-second timestamp casts the value to bare `DATETIME`, whose precision is 0, so MySQL truncates it before comparing: an equality matches no row and a range bound moves by up to a second ([#14929](https://github.com/spiceai/spiceai/issues/14929)) | silent (wrong data) | **GAP** — see [Open gaps](#open-gaps) |
+| Unparser: the MySQL dialect casts a timestamp to `DATETIME(p)`, with `p` from the Arrow unit (6 for micro- and nanoseconds), and cuts a timestamp literal to the six fractional digits MySQL keeps (spiceai/datafusion#255) | A filter pushed to MySQL on a fractional-second timestamp casts the value to bare `DATETIME`, whose precision is 0, so MySQL truncates it before comparing: an equality matches no row and a range bound moves by up to a second ([#14929](https://github.com/spiceai/spiceai/issues/14929)) | silent (wrong data) | `crates/data_components/src/federation.rs::tests::a_fractional_second_filter_unparsed_for_mysql_keeps_its_precision` |
 
 ## arrow-rs
 
@@ -686,7 +686,7 @@ patch is a build failure, so no behaviour guard applies.
 
 ## Open gaps
 
-**28 rows above are marked GAP** — they have no repo-side guard. Every one of them
+**27 rows above are marked GAP** — they have no repo-side guard. Every one of them
 is accounted for below; `scripts/check_fork_patches.py` fails if that count and this
 sentence disagree, so the list cannot quietly fall behind the tables.
 
@@ -705,20 +705,14 @@ They are not equal in consequence; this is the order to close them in.
 2. `text-embeddings-inference` pooling and model-loading fixes — embeddings
    differ from the reference implementation.
 
-3. `datafusion` MySQL timestamp cast precision (spiceai/datafusion#255) — a filter
-   pushed to MySQL on a fractional-second timestamp selects the wrong rows. Needs
-   an unparse test of a timestamp filter in the MySQL dialect that asserts
-   `DATETIME(6)`; the probe through a real MySQL scan is in
-   [#14929](https://github.com/spiceai/spiceai/issues/14929).
-
 **Hangs, crashes and failures.** These take a query or the process down:
 
-4. `datafusion-ballista` scheduler lock hygiene (fork PR #60) and shuffle-fetch
+3. `datafusion-ballista` scheduler lock hygiene (fork PR #60) and shuffle-fetch
    resilience (fork PRs #36, #61–#63) — #36 is the quiet half, a `FetchFailed`
    that reaches the scheduler buried in `Shared(Arc(ArrowError(ExternalError(…))))`
    and is read as a non-retryable execution error, so the recovery that reruns
    the offending map stage never runs.
-5. `datafusion-ballista` cluster reliability, six rows across fork PRs #54, #57
+4. `datafusion-ballista` cluster reliability, six rows across fork PRs #54, #57
    and #59: a missing partition file read as an empty partition; shuffle-fetch
    clients pooled per peer; the reconciliation sweep that revives a lost stage or
    finishes a job whose graph already succeeded; job-graph persistence moved off
@@ -731,18 +725,18 @@ They are not equal in consequence; this is the order to close them in.
 **Blocked, not merely undone.** These have been looked at and cannot be closed by
 writing a test; each says what would unblock it:
 
-6. `snowflake-rs` (five rows) — no host override, private response types. Needs a
+5. `snowflake-rs` (five rows) — no host override, private response types. Needs a
    live account, or an upstream change letting the base URL be set.
-7. `vortex` session lock re-entry in writer init (fork PR #29) — the deadlock is a
+6. `vortex` session lock re-entry in writer init (fork PR #29) — the deadlock is a
    race, so any test of it is a timing test. Upstream has since removed the code
    path and the lock (vortex-data/vortex#8919); if a run confirms that, drop the row
    rather than guard it.
-8. `graph-rs-sdk` tower middleware — nothing here configures Graph middleware, so
+7. `graph-rs-sdk` tower middleware — nothing here configures Graph middleware, so
    there is no behaviour of ours to assert on.
 
 **Reported late rather than wrongly.** The right answer, after an avoidable wait:
 
-9. `async-openai` a 404 ends the retry loop instead of being retried — a mistyped
+8. `async-openai` a 404 ends the retry loop instead of being retried — a mistyped
    `endpoint` is retried through the whole backoff budget before reporting, so a
    configuration error looks like a slow provider. What changes is *when* the
    error arrives, and asserting that is a timing test.
@@ -750,7 +744,7 @@ writing a test; each says what would unblock it:
 **Diagnostics only.** The query is unaffected; what is lost is the ability to see
 how it ran:
 
-10. `datafusion-ballista` distributed `EXPLAIN ANALYZE` (fork PR #34, now
+9. `datafusion-ballista` distributed `EXPLAIN ANALYZE` (fork PR #34, now
    upstream's; `EXPLAIN FORMAT TREE` is not carried) — plain `EXPLAIN` is guarded
    through the cluster harness, and `ANALYZE` is not issued through it by anything. Closing this needs the
    harness to submit the statement rather than build its text as a label.
@@ -761,7 +755,7 @@ the scheduled TPC-H/TPC-DS jobs), which already trend these numbers over time an
 will show the regression as a step change. A unit test cannot assert a speedup
 without becoming a flaky timing test:
 
-11. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
+10. `vortex` intra-file decode parallelism; `iceberg-rust` parallel file scanning;
     `mistral.rs`/`candle` i-quant MoE kernels; `candle-index-select-cu` fallback shim; `model2vec-rs` fast WordPiece;
     `snowflake-rs` streaming batches (memory, not latency — but see the
     `snowflake-rs` note above: it is blocked with the rest of that fork);
@@ -770,7 +764,7 @@ without becoming a flaky timing test:
 **Unoptimised builds only.** No query answers anything differently; what is lost
 is stack headroom in a debug build (release builds were not measured):
 
-12. `datafusion` join-arm helper refactor (`cbda233a6`, spiceai/datafusion#249) —
+11. `datafusion` join-arm helper refactor (`cbda233a6`, spiceai/datafusion#249) —
     it keeps the unparser's opt-level-0 frame from growing with #233 and #234, which
     without it push the fork's `roundtrip_statement` past the 2 MiB default test
     thread (it needs 2,112 KiB without the refactor, 1,984 KiB with it). This repo's
