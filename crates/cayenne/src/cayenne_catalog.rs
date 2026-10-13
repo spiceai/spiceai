@@ -6203,6 +6203,15 @@ fn identity_setting_changes(
             columns_setting_value(&stored.primary_key),
             columns_setting_value(&options.primary_key),
         ));
+        // A new key already changes what the rows mean, but turning the check on with it
+        // is a change of its own, and the list names every setting that changed.
+        if !options.primary_key.is_empty() && enables_pk_conflict_detection(stored, options) {
+            changes.push(SettingChange::new(
+                "`cayenne_pk_conflict_detection`",
+                format!("'{}'", stored.vortex_config.pk_conflict_detection.as_str()),
+                format!("'{}'", options.vortex_config.pk_conflict_detection.as_str()),
+            ));
+        }
     }
 
     if stored.partition_column != options.partition_column {
@@ -11554,6 +11563,42 @@ mod tests {
         assert_eq!(
             described(&identity_setting_changes(&stored, &requested)),
             vec!["`cayenne_pk_conflict_detection`: 'none' -> 'auto'"]
+        );
+    }
+
+    /// A new key and the check turned on in the same restart are two changes, and the list
+    /// names both, though the new key alone already defines different rows.
+    #[test]
+    fn a_new_key_with_conflict_detection_turned_on_lists_both_changes() {
+        let stored = make_test_metadata(
+            vec!["id".to_string()],
+            None,
+            None,
+            "table-root",
+            with_detection(PkConflictDetection::None),
+            id_schema(),
+        );
+        let rekeyed = requested_like(&stored, |options| {
+            options.primary_key = vec!["v".to_string()];
+            options.on_conflict = Some(upsert_on(&["v"]));
+            options.vortex_config = with_detection(PkConflictDetection::Auto);
+        });
+        assert_eq!(
+            described(&identity_setting_changes(&stored, &rekeyed)),
+            vec![
+                "`primary_key`: ['id'] -> ['v']",
+                "`cayenne_pk_conflict_detection`: 'none' -> 'auto'",
+            ]
+        );
+
+        // Without a key there is nothing for the check to enforce, so only the key is listed.
+        let unkeyed = requested_like(&stored, |options| {
+            options.primary_key = vec![];
+            options.vortex_config = with_detection(PkConflictDetection::Auto);
+        });
+        assert_eq!(
+            described(&identity_setting_changes(&stored, &unkeyed)),
+            vec!["`primary_key`: ['id'] -> none"]
         );
     }
 

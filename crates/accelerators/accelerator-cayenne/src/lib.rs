@@ -1232,18 +1232,19 @@ fn rejects_stored_table(error: &(dyn std::error::Error + 'static)) -> bool {
 /// The object-store prefixes holding a stored table's files: the table's own, and each
 /// of its partitions' child tables', which write under `{path}/{table_id}/`. Read before
 /// the table is dropped, while the catalog still has the child tables.
+///
+/// # Errors
+///
+/// Any catalog read that fails, other than a child table name that is not there: the
+/// caller drops nothing then, so the prefixes can still be read when it is retried.
 async fn object_store_table_prefixes(
     catalog: &dyn cayenne::MetadataCatalog,
     table_name: &str,
     table: &cayenne::metadata::TableMetadata,
-) -> Vec<String> {
+) -> std::result::Result<Vec<String>, cayenne::CatalogError> {
     let prefix = |path: &str, table_id: &str| format!("{}/{table_id}/", path.trim_end_matches('/'));
     let mut prefixes = vec![prefix(&table.path, &table.table_id)];
-    for partition in catalog
-        .get_partitions(&table.table_id)
-        .await
-        .unwrap_or_default()
-    {
+    for partition in catalog.get_partitions(&table.table_id).await? {
         for child_name in [
             cayenne::partition_naming::partition_child_table_name(
                 table_name,
@@ -1254,15 +1255,17 @@ async fn object_store_table_prefixes(
                 &partition.partition_values,
             ),
         ] {
-            if let Ok(child) = catalog.get_table(&child_name).await
-                && child.path == partition.path
-            {
-                prefixes.push(prefix(&child.path, &child.table_id));
-                break;
+            match catalog.get_table(&child_name).await {
+                Ok(child) if child.path == partition.path => {
+                    prefixes.push(prefix(&child.path, &child.table_id));
+                    break;
+                }
+                Ok(_) | Err(cayenne::CatalogError::TableNotFound { .. }) => {}
+                Err(error) => return Err(error),
             }
         }
     }
-    prefixes
+    Ok(prefixes)
 }
 
 /// The warning an operator reads when a dataset's acceleration was recreated, and the
@@ -4609,7 +4612,9 @@ impl DataAccelerator for CayenneAccelerator {
                 if stored.path.starts_with("s3://") {
                     removed_dir = None;
                     left_in_place = Some(
-                        object_store_table_prefixes(catalog.as_ref(), table_name, &stored).await,
+                        object_store_table_prefixes(catalog.as_ref(), table_name, &stored)
+                            .await
+                            .boxed()?,
                     );
                 } else if stored.path.trim_end_matches('/') != dir_path.trim_end_matches('/') {
                     Self::ensure_metastore_outside_data_dir(source, &stored.path).await?;
@@ -6826,7 +6831,9 @@ mod tests {
             .await
             .expect("the partition's child table");
         assert_eq!(
-            object_store_table_prefixes(&stored_catalog, "orders", &stored).await,
+            object_store_table_prefixes(&stored_catalog, "orders", &stored)
+                .await
+                .expect("read the stored table's prefixes"),
             vec![
                 format!(
                     "s3://old-bucket--usw2-az1--x-s3/orders/{}/",
