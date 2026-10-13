@@ -294,8 +294,8 @@ pub(crate) async fn get_flight_info(
         Some(param_values) if transaction_statements(&sql).is_none() => {
             let sql_to_plan = match &parameter_schema {
                 Some(schema_bytes) => {
-                    let reader = StreamReader::try_new(&schema_bytes[..], None)
-                        .map_err(error_to_status)?;
+                    let reader =
+                        StreamReader::try_new(&schema_bytes[..], None).map_err(error_to_status)?;
                     rewrite_sql_with_type_casts(&sql, &reader.schema())
                 }
                 None => sql.clone(),
