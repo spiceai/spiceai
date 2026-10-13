@@ -58696,6 +58696,56 @@ mod tests {
         );
     }
 
+    /// A tombstone published after a seq-prefix bake captured its deletion index
+    /// can carry a sequence between that index's newest delete (the bake's fence)
+    /// and the prefix cutoff `T`. The merged output applies deletions above the
+    /// fence, so that tombstone still hides a row in it, and the bake's prune must
+    /// keep it. Five snapshots (ids 0..5) pinned at seqs 10, 30, 40, 50, 60; the
+    /// bake folds {0, 1} (`T = 30`); key 0 is deleted at 15 (the fence) before the
+    /// bake and key 1 at 25 after its capture.
+    #[tokio::test]
+    async fn a_bake_keeps_a_tombstone_published_after_its_capture() {
+        let ctx = SessionContext::new();
+        let (provider, _tmp, _ids) = build_seq_prefix_fixture(
+            "bake_keeps_late_tombstone",
+            ctx.runtime_env(),
+            &[10, 30, 40, 50, 60],
+        )
+        .await;
+        install_int64_deletes(&provider, &[(0, 15)]);
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "bake_keeps_late_tombstone").await,
+            vec![(1, 10), (2, 20), (3, 30), (4, 40)],
+            "precondition: key 0 hidden by its tombstone before the bake"
+        );
+        {
+            let provider_in_hook = provider.clone_for_write();
+            *provider.test_pre_publish_hook.lock() = Some(Box::new(move || {
+                Box::pin(async move {
+                    let extended =
+                        int64_tombstones(&provider_in_hook).extend_max_deletes([(1, 25)]);
+                    store_int64_tombstones(&provider_in_hook, extended);
+                })
+            }));
+        }
+
+        let baked = provider
+            .bake_seq_prefix_protected_snapshots()
+            .await
+            .expect("bake should not error");
+        assert!(baked, "the older prefix {{0,1}} must bake (>= 2 snapshots)");
+        assert_eq!(
+            int64_tombstones(&provider).get(1).map(|t| t.delete_sequence),
+            Some(25),
+            "a tombstone published after the bake's capture must survive its prune"
+        );
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "bake_keeps_late_tombstone").await,
+            vec![(2, 20), (3, 30), (4, 40)],
+            "a tombstone published after the bake's capture must keep hiding its row"
+        );
+    }
+
     /// OVERWRITE-GUARD regression (issue #11823), bake flavor — sibling of
     /// `subset_compaction_discards_output_when_snapshot_replaced_mid_pass`: an
     /// overwrite committing between the bake's catalog CAS and its fenced
