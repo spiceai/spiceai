@@ -54925,7 +54925,9 @@ mod tests {
                 Arc::clone(&schema),
                 vec![
                     Arc::new(Int64Array::from(keys.clone())),
-                    Arc::new(StringArray::from_iter_values(keys.iter().map(|id| pad(*id)))),
+                    Arc::new(StringArray::from_iter_values(
+                        keys.iter().map(|id| pad(*id)),
+                    )),
                 ],
             )
             .expect("checkpoint batch");
