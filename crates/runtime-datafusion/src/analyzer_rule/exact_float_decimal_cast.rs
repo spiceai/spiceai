@@ -54,7 +54,7 @@ impl ExactFloatLiteralDecimalCast {
 impl AnalyzerRule for ExactFloatLiteralDecimalCast {
     fn analyze(&self, plan: LogicalPlan, _config: &ConfigOptions) -> Result<LogicalPlan> {
         plan.transform_up_with_subqueries(|plan| {
-            plan.map_expressions(|expr| expr.transform_up(rewrite_expr))
+            plan.map_expressions(|expr| expr.transform_up(|expr| Ok(rewrite_expr(expr))))
         })
         .map(|transformed| transformed.data)
     }
@@ -64,19 +64,19 @@ impl AnalyzerRule for ExactFloatLiteralDecimalCast {
     }
 }
 
-fn rewrite_expr(expr: Expr) -> Result<Transformed<Expr>> {
+fn rewrite_expr(expr: Expr) -> Transformed<Expr> {
     let (inner, data_type) = match &expr {
         Expr::Cast(Cast { expr, field }) | Expr::TryCast(TryCast { expr, field }) => {
             (expr.as_ref(), field.data_type())
         }
-        _ => return Ok(Transformed::no(expr)),
+        _ => return Transformed::no(expr),
     };
     let Expr::Literal(value, metadata) = inner else {
-        return Ok(Transformed::no(expr));
+        return Transformed::no(expr);
     };
     match exact_decimal(value, data_type) {
-        Some(decimal) => Ok(Transformed::yes(Expr::Literal(decimal, metadata.clone()))),
-        None => Ok(Transformed::no(expr)),
+        Some(decimal) => Transformed::yes(Expr::Literal(decimal, metadata.clone())),
+        None => Transformed::no(expr),
     }
 }
 
