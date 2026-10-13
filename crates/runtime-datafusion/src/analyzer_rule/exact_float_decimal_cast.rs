@@ -37,7 +37,8 @@ limitations under the License.
 //!   `4.07`) cannot be recovered from the float. [`FloatLiteralSpellings`] reads
 //!   such tokens from the parsed statement and records them on the planned
 //!   literal under [`FLOAT_LITERAL_SPELLING_KEY`]; this rule parses that
-//!   spelling and removes the key.
+//!   spelling, rounded half away from zero to the cast's scale as a decimal cast
+//!   rounds, and removes the key.
 //! - **The float itself, otherwise.** The shortest decimal string that reads back
 //!   as the same `f64` (Rust's `Display`) is the token whenever the token had at
 //!   most `f64::DIGITS` significant digits, since every such decimal reads as a
@@ -105,7 +106,11 @@ fn rewrite_expr(expr: Expr) -> Transformed<Expr> {
             .as_ref()
             .and_then(|metadata| metadata.inner().get(FLOAT_LITERAL_SPELLING_KEY));
         let decimal = match token_spelling {
-            Some(spelling) => exact_decimal_from_spelling(spelling, data_type),
+            // The token is the exact value, so rounding it to the scale here is
+            // the decimal-to-decimal cast, which the binary cast cannot match.
+            Some(spelling) => decimal_scale(data_type)
+                .and_then(|scale| round_to_scale(spelling, scale))
+                .and_then(|spelling| exact_decimal_from_spelling(&spelling, data_type)),
             None => exact_decimal(value, data_type),
         };
         if let Some(decimal) = decimal {
@@ -181,6 +186,58 @@ fn exact_decimal_from_spelling(spelling: &str, data_type: &DataType) -> Option<S
         }
         _ => None,
     }
+}
+
+fn decimal_scale(data_type: &DataType) -> Option<usize> {
+    match data_type {
+        DataType::Decimal128(_, scale) | DataType::Decimal256(_, scale) => {
+            usize::try_from(*scale).ok()
+        }
+        _ => None,
+    }
+}
+
+/// A plain decimal `spelling` rounded half away from zero to at most `scale`
+/// fraction digits, as Arrow's decimal-to-decimal cast rounds. `None` for an
+/// empty or malformed spelling.
+fn round_to_scale(spelling: &str, scale: usize) -> Option<String> {
+    let (sign, unsigned) = match spelling.strip_prefix('-') {
+        Some(unsigned) => ("-", unsigned),
+        None => ("", spelling),
+    };
+    let (integer, fraction) = unsigned.split_once('.').unwrap_or((unsigned, ""));
+    if integer.is_empty()
+        || !integer.bytes().chain(fraction.bytes()).all(|b| b.is_ascii_digit())
+    {
+        return None;
+    }
+    if fraction.len() <= scale {
+        return Some(spelling.to_string());
+    }
+    let round_up = fraction.as_bytes()[scale] >= b'5';
+    let mut digits: Vec<u8> = format!("{integer}{}", &fraction[..scale]).into_bytes();
+    if round_up {
+        let mut carry = true;
+        for digit in digits.iter_mut().rev() {
+            if *digit == b'9' {
+                *digit = b'0';
+            } else {
+                *digit += 1;
+                carry = false;
+                break;
+            }
+        }
+        if carry {
+            digits.insert(0, b'1');
+        }
+    }
+    let digits = String::from_utf8(digits).ok()?;
+    let (integer, fraction) = digits.split_at(digits.len() - scale);
+    Some(if fraction.is_empty() {
+        format!("{sign}{integer}")
+    } else {
+        format!("{sign}{integer}.{fraction}")
+    })
 }
 
 /// The SQL spellings of a statement's number tokens that the `f64` they are
@@ -543,6 +600,27 @@ mod tests {
     }
 
     #[test]
+    fn round_to_scale_rounds_half_away_from_zero() {
+        for (spelling, scale, expected) in [
+            ("4.07", 4, Some("4.07")),
+            ("4.0750", 2, Some("4.08")),
+            ("4.0749", 2, Some("4.07")),
+            ("-4.075", 2, Some("-4.08")),
+            ("9.995", 2, Some("10.00")),
+            ("0.5", 0, Some("1")),
+            ("12", 0, Some("12")),
+            ("", 2, None),
+            ("1.x", 2, None),
+        ] {
+            assert_eq!(
+                round_to_scale(spelling, scale).as_deref(),
+                expected,
+                "{spelling} at {scale}"
+            );
+        }
+    }
+
+    #[test]
     fn only_tokens_the_float_loses_are_recorded() {
         // At most f64::DIGITS significant digits: the float recovers it.
         assert_eq!(
@@ -589,24 +667,38 @@ mod tests {
                 None
             )
         );
-        // More fraction digits than the scale: the cast's rounding decides,
-        // but the spelling is still dropped from the literal.
-        assert_eq!(
+        // More fraction digits than the scale: the token is rounded to the
+        // scale the way a decimal cast rounds, not through the binary value.
+        let at_scale = |spelling: &str, scale: i8| {
             rewrite_expr(Expr::Cast(Cast::new(
                 Box::new(Expr::Literal(
-                    ScalarValue::Float64(Some(4.07)),
+                    ScalarValue::Float64(spelling.parse().ok()),
                     Some(FieldMetadata::new(BTreeMap::from([(
                         FLOAT_LITERAL_SPELLING_KEY.to_string(),
-                        "4.0700000000000003".to_string(),
+                        spelling.to_string(),
                     )]))),
                 )),
-                DataType::Decimal128(38, 10),
+                DataType::Decimal128(38, scale),
             )))
-            .data,
-            Expr::Cast(Cast::new(
-                Box::new(Expr::Literal(ScalarValue::Float64(Some(4.07)), None)),
-                DataType::Decimal128(38, 10),
-            ))
+            .data
+        };
+        assert_eq!(
+            at_scale("4.0700000000000003", 15),
+            Expr::Literal(
+                ScalarValue::Decimal128(Some(4_070_000_000_000_000), 38, 15),
+                None
+            )
+        );
+        assert_eq!(
+            at_scale("4.0700000000000005", 16),
+            Expr::Literal(
+                ScalarValue::Decimal128(Some(40_700_000_000_000_005), 38, 16),
+                None
+            )
+        );
+        assert_eq!(
+            at_scale("-9.99999999999999999", 2),
+            Expr::Literal(ScalarValue::Decimal128(Some(-1000), 38, 2), None)
         );
         // Spelled two ways in one statement: no spelling is known.
         assert_eq!(
