@@ -1,0 +1,23 @@
+[package]
+description = "Compares query answers from two engines: multiset or ordered rows, sort-order checks, numeric tolerance and typed failure reasons"
+edition.workspace = true
+exclude.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+name = "result-compare"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+arrow.workspace = true
+arrow_tools = { path = "../arrow_tools" }
+chrono.workspace = true
+sqlparser.workspace = true
+
+[dev-dependencies]
+rstest = "0.26.1"
+
+[lints]
+workspace = true

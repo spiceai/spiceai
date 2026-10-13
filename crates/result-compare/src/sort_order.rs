@@ -78,12 +78,12 @@ use anyhow::Result;
 use arrow::array::{Array, ArrayRef, RecordBatch, make_comparator};
 use arrow::compute::SortOptions;
 use arrow::datatypes::SchemaRef;
-use datafusion::sql::sqlparser::ast::{
+use sqlparser::ast::{
     Expr, GroupByExpr, Ident, LimitClause, OrderBy, OrderByKind, Query as SqlQuery, Select,
     SelectItem, SetExpr, Statement, Value, Visit, Visitor,
 };
-use datafusion::sql::sqlparser::dialect::{Dialect, GenericDialect, PostgreSqlDialect};
-use datafusion::sql::sqlparser::parser::Parser;
+use sqlparser::dialect::{Dialect, GenericDialect, PostgreSqlDialect};
+use sqlparser::parser::Parser;
 
 use super::array_value_to_string;
 
