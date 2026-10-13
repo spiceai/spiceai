@@ -483,9 +483,15 @@ mod tests {
             vec!["w".to_string(), "cnt".to_string()],
             "the pinned column ranks before the bounded one"
         );
-        let (w, cnt) = (observations.pinned_hits("w"), observations.pinned_hits("cnt"));
+        let (w, cnt) = (
+            observations.pinned_hits("w"),
+            observations.pinned_hits("cnt"),
+        );
         assert!(w.lead_more_than_twice(&observations.pinned_hits("i")));
-        assert!(!cnt.lead_more_than_twice(&w), "a bound never leads a pinned column");
+        assert!(
+            !cnt.lead_more_than_twice(&w),
+            "a bound never leads a pinned column"
+        );
         for _ in 0..10 {
             observations.record_filters(&[col("ts").gt(lit(5_i64))]);
         }
