@@ -1054,7 +1054,7 @@ pub(crate) enum PkDeletionSnapshot {
 /// flushed row.
 pub(crate) enum CheckpointCorpusKeys {
     Int64(HashSet<i64>),
-    RowKeys(HashSet<u128, hash_index::PrehashedBuildHasher>),
+    RowKeys(HashSet<u128, PrehashedBuildHasher>),
     None,
 }
 

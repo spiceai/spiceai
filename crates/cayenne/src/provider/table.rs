@@ -68006,7 +68006,11 @@ mod tests {
             let by_shard = provider
                 .visible_mem_tier_batches_by_shard(&raw.mem_tier_shards)
                 .expect("checkpoint visibility");
-            assert_eq!(by_shard.len(), raw.mem_tier_shards.len(), "{case}, step {step}: shard groups");
+            assert_eq!(
+                by_shard.len(),
+                raw.mem_tier_shards.len(),
+                "{case}, step {step}: shard groups"
+            );
             for (shard, group) in raw.mem_tier_shards.iter().zip(&by_shard) {
                 let full_group = provider
                     .visible_mem_tier_batches(shard, None)
