@@ -58,11 +58,20 @@ fn table_config(deletion_mode: DeletionMode, target_vortex_file_size_mb: usize) 
 async fn auto_table_keeping_key_deletes(
     name: &str,
 ) -> (CayenneTableProvider, Arc<dyn MetadataCatalog>, TempDir) {
-    let (created, catalog, tmp) = table(name, DeletionMode::Auto, 256).await;
+    auto_table_keeping_key_deletes_with_target(name, 256).await
+}
+
+/// [`auto_table_keeping_key_deletes`] with a target file size of
+/// `target_vortex_file_size_mb`, and so a bound of a thirty-second of it.
+async fn auto_table_keeping_key_deletes_with_target(
+    name: &str,
+    target_vortex_file_size_mb: usize,
+) -> (CayenneTableProvider, Arc<dyn MetadataCatalog>, TempDir) {
+    let (created, catalog, tmp) = table(name, DeletionMode::Auto, target_vortex_file_size_mb).await;
     drop(created);
     let config = VortexConfig {
         auto_keeps_key_deletes: true,
-        ..table_config(DeletionMode::Auto, 256)
+        ..table_config(DeletionMode::Auto, target_vortex_file_size_mb)
     };
     let runtime_env = SessionContext::new().runtime_env();
     let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
@@ -1065,7 +1074,7 @@ async fn hold_every_reclaim_permit() -> tokio::sync::OwnedSemaphorePermit {
 
 /// A background compaction pass holds a compaction permit, so while every reclaim
 /// permit is held its whole-table reclaim of an auto table declines, as
-/// `declined_paced`, instead of waiting with that permit held, and rewrites
+/// `declined_reclaim_budget`, instead of waiting with that permit held, and rewrites
 /// nothing.
 #[tokio::test]
 async fn a_background_pass_declines_an_auto_reclaim_while_the_reclaim_budget_is_in_use() {
@@ -1108,8 +1117,8 @@ async fn a_background_pass_declines_an_auto_reclaim_while_the_reclaim_budget_is_
     drop(held);
     assert_eq!(
         (declined, rewrote),
-        (Some(CompactionOutcome::DeclinedPaced), false),
-        "the background pass declined as declined_paced and rewrote nothing"
+        (Some(CompactionOutcome::DeclinedReclaimBudget), false),
+        "the background pass declined as declined_reclaim_budget and rewrote nothing"
     );
     assert_eq!(
         provider.last_small_file_compact_path(),
@@ -1251,6 +1260,103 @@ async fn an_auto_tables_reclaim_on_key_deletes_within_its_bound_takes_no_encode_
     let rows = collect_id_value_pairs(&ctx, &provider, name).await;
     let expected: Vec<(i64, i64)> = keys.iter().map(|id| (*id, 205)).collect();
     assert_eq!(rows, expected, "every key shows its latest row, once");
+}
+
+/// The whole-table reclaim of an auto table past its bound takes no permit from
+/// the encode budget either: here a table that keeps key deletes from the start,
+/// seeded by an overwrite to past a 32 KiB bound. A writer holds the budget's only
+/// permit while the reclaim runs; holding a permit itself, the reclaim would make
+/// every write that asks for the budget's whole width wait out its encode, for as
+/// long as the table takes to rewrite.
+#[tokio::test]
+async fn an_auto_tables_reclaim_past_its_bound_takes_no_encode_permit() {
+    struct InstalledBudget;
+    impl Drop for InstalledBudget {
+        fn drop(&mut self) {
+            crate::provider::write_budget::clear_global_encode_budget();
+        }
+    }
+    // Dropped after `_installed`, which removes the budget first.
+    let _serialized = crate::provider::write_budget::GLOBAL_ENCODE_BUDGET_TEST_LOCK
+        .lock()
+        .await;
+    crate::provider::write_budget::set_global_encode_concurrency(1);
+    let _installed = InstalledBudget;
+
+    let name = "auto_key_reclaim_past_bound_unbudgeted";
+    // 1 MiB target file size: a 32 KiB bound.
+    let (provider, _catalog, _tmp) = auto_table_keeping_key_deletes_with_target(name, 1).await;
+    let keys: Vec<i64> = (0..20_000).collect();
+    let schema = Arc::clone(&provider.table_metadata.schema);
+    // Incompressible values, so the table is past its bound on disk.
+    let values: Vec<i64> = keys
+        .iter()
+        .map(|id| {
+            id.wrapping_mul(0x9E37_79B9_7F4A_7C15_u64.cast_signed())
+                .rotate_left(17)
+        })
+        .collect();
+    let ctx = SessionContext::new();
+    let plan = provider
+        .insert_into(
+            &ctx.state(),
+            MemorySourceConfig::try_new_exec(
+                &[vec![id_value_batch(Arc::clone(&schema), &keys, &values)]],
+                schema,
+                None,
+            )
+            .expect("source"),
+            InsertOp::Overwrite,
+        )
+        .await
+        .expect("plan");
+    collect(plan, ctx.task_ctx()).await.expect("overwrite");
+    let upserted: Vec<i64> = (0..16).collect();
+    for value in 200..206 {
+        write(&provider, &upserted, value).await;
+    }
+    let bytes = provider.warm_listed_bytes().await.expect("size the table");
+    assert!(
+        bytes > 32 * 1024,
+        "premise: the table ({bytes} B) must be past the 32 KiB bound"
+    );
+    assert!(
+        !provider.should_capture_positions(),
+        "premise: the table is on key deletes"
+    );
+    assert!(
+        deletion_index_entries(&provider) >= 2,
+        "premise: the index is past its trigger"
+    );
+
+    let held = crate::provider::write_budget::acquire_encode_permits(
+        1,
+        crate::provider::delta_encoding::WriteClass::Delta,
+        false,
+    )
+    .await
+    .expect("the budget is installed");
+    let committed = tokio::time::timeout(Duration::from_secs(30), async {
+        provider
+            .compact_current_snapshot_small_files()
+            .await
+            .expect("reclaim pass")
+    })
+    .await
+    .expect("the reclaim waited for the encode permit a writer holds");
+    drop(held);
+
+    assert!(committed, "the table rewrote itself whole");
+    assert_eq!(
+        deletion_index_entries(&provider),
+        0,
+        "the reclaim cleared the index"
+    );
+    let rows = collect_id_value_pairs(&ctx, &provider, name).await;
+    assert_eq!(rows.len(), keys.len(), "one row per key");
+    let latest: Vec<(i64, i64)> = rows.iter().copied().filter(|(id, _)| *id < 16).collect();
+    let expected: Vec<(i64, i64)> = upserted.iter().map(|id| (*id, 205)).collect();
+    assert_eq!(latest, expected, "every upserted key shows its latest row");
 }
 
 /// A position-capture pass that began while an auto table was on position deletes

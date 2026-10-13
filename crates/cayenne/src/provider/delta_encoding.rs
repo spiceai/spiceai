@@ -126,8 +126,9 @@ pub(crate) enum WriteClass {
 pub(crate) enum EncodeBudgetUse {
     /// Takes its shards' permits, capped by its class.
     Shared,
-    /// Takes none: the whole-table reclaim of an `auto` table on position deletes
-    /// (see `CayenneTableProvider::rewrite_current_snapshot_holding_bounded`).
+    /// Takes none: the whole-table reclaim of an `auto` table, at any size and on
+    /// either kind of delete (see
+    /// `CayenneTableProvider::rewrite_current_snapshot_holding_bounded`).
     Exempt,
 }
 

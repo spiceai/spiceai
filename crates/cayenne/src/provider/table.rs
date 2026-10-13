@@ -23873,7 +23873,8 @@ impl CayenneTableProvider {
     /// where the rewrite is the OOM guard and nothing may hold it back.
     ///
     /// A background pass already holds a compaction permit, so when no reclaim
-    /// permit is free it declines as `declined_paced` and a later tick tries again:
+    /// permit is free it declines as `declined_reclaim_budget` and a later tick
+    /// tries again:
     /// waiting, it would hold the compaction permit other tables' background
     /// compaction needs. Any other pass waits for one.
     async fn whole_table_reclaim_permit(
@@ -23896,7 +23897,7 @@ impl CayenneTableProvider {
             return budget
                 .try_acquire_owned()
                 .map(Some)
-                .map_err(|_| CompactionOutcome::DeclinedPaced);
+                .map_err(|_| CompactionOutcome::DeclinedReclaimBudget);
         }
         Ok(budget.acquire_owned().await.ok())
     }
@@ -24360,13 +24361,17 @@ impl CayenneTableProvider {
             (stream, scope, generation_before, snapshot_id_before)
         };
 
-        // The whole-table reclaim of an `auto` table sizes what it captured, the
-        // current snapshot and every protected snapshot it folds, before encoding
-        // any of it: the pass that scheduled it sized the table from the manifest,
-        // which can trail a just-published write. On position deletes the reclaim
-        // runs only within the bound; on either kind of delete, within the bound it
-        // takes no encode permit (below).
-        let captured_bytes = if reclaim && self.pk_deletion_mode.auto().is_some() {
+        // The whole-table reclaim of an `auto` table on position deletes sizes what
+        // it captured, the current snapshot and every protected snapshot it folds,
+        // before encoding any of it, and runs only within the bound: the pass that
+        // scheduled it sized the table from the manifest, which can trail a
+        // just-published write.
+        let captured_bytes = if reclaim
+            && self
+                .pk_deletion_mode
+                .auto()
+                .is_some_and(|auto| auto.uses_positions())
+        {
             let folded = match &scope {
                 RewriteScope::Fenced { folded, .. }
                 | RewriteScope::AllTombstonesFoldedSnapshots { folded } => Some(folded),
@@ -24441,20 +24446,21 @@ impl CayenneTableProvider {
             Self::ensure_snapshot_dir_exists(&snapshot_dir).await?;
         }
 
-        // The whole-table reclaim of an `auto` table within its bound takes no
-        // permit from the global encode budget, on either kind of delete. It reads
-        // at most `MAX_POSITION_BYTES`, takes at most a tenth of the time, and in
-        // `spiced` runs on the compaction runtime, so it needs no share of the
-        // budget. Holding one, it made every write that asked for the budget's
-        // whole width wait out its encode: on four CPUs, a two-permit budget, a
+        // The whole-table reclaim of an `auto` table takes no permit from the
+        // global encode budget, on either kind of delete and at any size. It encodes
+        // one file sequence (`target_partitions` above), so a permit buys it no
+        // parallelism, while holding one made every write that asked for the
+        // budget's whole width wait out its encode, for as long as the table takes
+        // to rewrite. Within the bound, on four CPUs with a two-permit budget, a
         // writer upserting 2,000 keys every 250 ms reached a 96 ms P99 write on
-        // position deletes, against 37–40 ms on key deletes. A larger table's
-        // reclaim, on key deletes, takes its permit.
-        let within_bound = matches!(
-            (self.pk_deletion_mode.auto(), &captured_bytes),
-            (Some(auto), Some(Ok(bytes))) if auto.fits(*bytes)
-        );
-        let write_policy = if within_bound {
+        // position deletes, against 37–40 ms on key deletes. Past it, on eight
+        // cores, 20 tables of 200K rows wrote at a 379–416 ms P99 beside one
+        // overwrite-seeded table of 5M rows rewriting itself on key deletes, against
+        // 135–136 ms with that table on explicit key deletes. The reclaim budget
+        // (`compaction::whole_table_reclaim_budget`) bounds how many such encodes run
+        // at once across tables, and in `spiced` they run on the low-priority
+        // compaction runtime.
+        let write_policy = if reclaim && self.pk_deletion_mode.auto().is_some() {
             rewrite_write_policy(rewrite_is_sorted).without_encode_budget()
         } else {
             rewrite_write_policy(rewrite_is_sorted)

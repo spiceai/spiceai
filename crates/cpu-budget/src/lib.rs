@@ -298,17 +298,18 @@ pub struct HostReadings {
     /// could read a pod spec put it there. `None` when no request is declared,
     /// which is every bare-metal and benchmark deployment.
     pub declared_request_millicores: Option<u64>,
-    /// The host's simultaneous multithreading (SMT) layout: its online logical
-    /// CPUs and the physical cores they form. `None` when it cannot be read,
-    /// which is every platform but Linux.
+    /// The simultaneous multithreading (SMT) layout of the CPUs this process may
+    /// run on: how many they are, and the physical cores they sit on. `None` when
+    /// it cannot be read, which is every platform but Linux.
     pub smt: Option<SmtLayout>,
 }
 
-/// A host's online logical CPUs and the physical cores they form. With SMT each
-/// physical core runs two (or more) logical CPUs, which share its execution units.
+/// The logical CPUs a process may run on and the physical cores they sit on.
+/// With SMT each physical core runs two (or more) logical CPUs, which share its
+/// execution units.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SmtLayout {
-    /// Online logical CPUs.
+    /// Logical CPUs: the online CPUs in the process's affinity mask.
     pub logical_cpus: usize,
     /// Distinct physical cores among them.
     pub physical_cores: usize,
@@ -335,20 +336,60 @@ impl HostReadings {
     }
 }
 
-/// The host's SMT layout, from Linux sysfs: the online CPUs, and the distinct
-/// sets of SMT siblings they form, one per physical core. `None` off Linux or
-/// when sysfs cannot be read.
+/// The SMT layout of the CPUs this process may run on, from Linux: the online
+/// CPUs (sysfs) in its affinity mask (`Cpus_allowed_list` in `/proc/self/status`,
+/// which a cpuset or `taskset` narrows), and the distinct sets of SMT siblings
+/// they sit on, one per physical core. So a process confined to one thread of
+/// each of 8 cores counts 8 physical cores, not the host's ratio of them. `None`
+/// off Linux or when sysfs cannot be read.
 fn detect_smt_layout() -> Option<SmtLayout> {
     const CPU_DIR: &str = "/sys/devices/system/cpu";
     let online = parse_cpu_list(&std::fs::read_to_string(format!("{CPU_DIR}/online")).ok()?)?;
-    let mut sibling_sets = std::collections::HashSet::new();
-    for cpu in &online {
-        let siblings =
-            std::fs::read_to_string(format!("{CPU_DIR}/cpu{cpu}/topology/thread_siblings_list"))
-                .ok()?;
-        sibling_sets.insert(parse_cpu_list(&siblings)?);
+    let allowed = std::fs::read_to_string("/proc/self/status")
+        .ok()
+        .and_then(|status| allowed_cpus(&status));
+    smt_layout_of(&usable_cpus(online, allowed), |cpu| {
+        parse_cpu_list(
+            &std::fs::read_to_string(format!("{CPU_DIR}/cpu{cpu}/topology/thread_siblings_list"))
+                .ok()?,
+        )
+    })
+}
+
+/// The online CPUs this process may run on: `online` narrowed to `allowed`, the
+/// process's affinity mask, when that is known and leaves any.
+fn usable_cpus(online: Vec<usize>, allowed: Option<Vec<usize>>) -> Vec<usize> {
+    let Some(allowed) = allowed else {
+        return online;
+    };
+    let allowed: std::collections::HashSet<usize> = allowed.into_iter().collect();
+    let usable: Vec<usize> = online
+        .iter()
+        .copied()
+        .filter(|cpu| allowed.contains(cpu))
+        .collect();
+    if usable.is_empty() { online } else { usable }
+}
+
+/// The [`SmtLayout`] of `cpus`, each CPU's SMT siblings read by `siblings_of`.
+fn smt_layout_of(
+    cpus: &[usize],
+    siblings_of: impl Fn(usize) -> Option<Vec<usize>>,
+) -> Option<SmtLayout> {
+    let mut cores = std::collections::HashSet::new();
+    for &cpu in cpus {
+        cores.insert(siblings_of(cpu)?);
     }
-    smt_layout(online.len(), sibling_sets.len())
+    smt_layout(cpus.len(), cores.len())
+}
+
+/// The CPUs on the `Cpus_allowed_list` line of a `/proc/<pid>/status` file: the
+/// process's affinity mask.
+fn allowed_cpus(status: &str) -> Option<Vec<usize>> {
+    status
+        .lines()
+        .find_map(|line| line.strip_prefix("Cpus_allowed_list:"))
+        .and_then(parse_cpu_list)
 }
 
 /// An [`SmtLayout`] of `logical_cpus` forming `physical_cores`, when both are
@@ -1168,9 +1209,11 @@ impl CpuBudget {
     }
 
     /// The physical cores behind [`Self::cores`]: the budget scaled by the
-    /// host's physical cores per online logical CPU, rounded down and at least
-    /// one. Equal to `cores` without SMT, or where the layout is unknown. A
-    /// budget of 8 logical CPUs on a host with two SMT threads per core is 4.
+    /// physical cores per logical CPU among the CPUs this process may run on,
+    /// rounded down and at least one. Equal to `cores` without SMT, or where the
+    /// layout is unknown. A budget of 8 logical CPUs on a host with two SMT
+    /// threads per core is 4; a process confined to one thread of each of 8 cores
+    /// has 8.
     #[must_use]
     pub const fn physical_cores(&self) -> usize {
         match self.smt {
@@ -1609,6 +1652,107 @@ mod tests {
         assert_eq!(smt_layout(8, 0), None);
         assert_eq!(smt_layout(4, 8), None);
         assert_eq!(smt_budget(8, 4, 8).physical_cores(), 8);
+    }
+
+    /// The SMT siblings of a host with 8 cores of two threads each, numbered as
+    /// Intel hosts number them: CPUs `i` and `i + 8` share a core.
+    #[expect(
+        clippy::unnecessary_wraps,
+        reason = "the shape `smt_layout_of` reads siblings in, which can fail"
+    )]
+    fn paired_siblings(cpu: usize) -> Option<Vec<usize>> {
+        let core = cpu % 8;
+        Some(vec![core, core + 8])
+    }
+
+    /// The layout counts the CPUs the process may run on. Confined to one thread
+    /// of each of 8 cores it has 8 physical cores, and keeps small tables
+    /// compacted, where the host's ratio would count 4; confined to both threads
+    /// of 4 cores it has 4.
+    #[test]
+    fn the_smt_layout_counts_the_cpus_this_process_may_run_on() {
+        let online: Vec<usize> = (0..16).collect();
+        let layout = |allowed: Option<Vec<usize>>| {
+            smt_layout_of(&usable_cpus(online.clone(), allowed), paired_siblings)
+        };
+        let one_thread_each: Vec<usize> = (0..8).collect();
+        let both_threads_of_four = vec![0, 1, 2, 3, 8, 9, 10, 11];
+        assert_eq!(layout(None), smt_layout(16, 8), "the whole host");
+        assert_eq!(
+            layout(Some(one_thread_each.clone())),
+            smt_layout(8, 8),
+            "one thread of each of 8 cores"
+        );
+        assert_eq!(
+            layout(Some(both_threads_of_four.clone())),
+            smt_layout(8, 4),
+            "both threads of 4 cores"
+        );
+        assert_eq!(
+            layout(Some(vec![40])),
+            smt_layout(16, 8),
+            "an affinity mask naming no online CPU is ignored"
+        );
+        for (allowed, physical, keeps) in
+            [(one_thread_each, 8, true), (both_threads_of_four, 4, false)]
+        {
+            let cores = allowed.len();
+            let host = HostReadings {
+                affinity_cores: cores,
+                smt: layout(Some(allowed)),
+                ..HostReadings::default()
+            };
+            let budget =
+                CpuBudget::resolve(&CpuConfig::default(), &host).expect("detection cannot fail");
+            assert_eq!(
+                (
+                    budget.physical_cores(),
+                    budget.cayenne_keeps_small_tables_compacted()
+                ),
+                (physical, keeps),
+                "{cores} CPUs"
+            );
+        }
+    }
+
+    #[test]
+    fn allowed_cpus_reads_the_affinity_line_of_proc_status() {
+        let status =
+            "Name:\tspiced\nCpus_allowed:\tff\nCpus_allowed_list:\t0-3,8\nMems_allowed_list:\t0\n";
+        assert_eq!(allowed_cpus(status), Some(vec![0, 1, 2, 3, 8]));
+        assert_eq!(allowed_cpus("Name:\tspiced\n"), None);
+    }
+
+    /// On Linux the detected layout counts the CPUs this process may run on: the
+    /// count `sched_getaffinity` gives, read through `available_parallelism`. A
+    /// cgroup quota lowers that count below the affinity mask, so under one the
+    /// layout counts at least as many.
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "the test's own reading of the affinity mask, independent of /proc"
+    )]
+    fn the_detected_smt_layout_counts_the_affinity_mask() {
+        let host = HostReadings::detect();
+        let parallelism = std::thread::available_parallelism()
+            .map(std::num::NonZeroUsize::get)
+            .expect("the affinity count");
+        let logical_cpus = host
+            .smt
+            .map(|layout| layout.logical_cpus)
+            .expect("Linux sysfs gives an SMT layout");
+        if host.quota_millicores.is_none() {
+            assert_eq!(
+                logical_cpus, parallelism,
+                "the layout counts the affinity mask"
+            );
+        } else {
+            assert!(
+                logical_cpus >= parallelism,
+                "under a quota the layout still counts the whole affinity mask: {logical_cpus} < {parallelism}"
+            );
+        }
     }
 
     fn quota(affinity_cores: usize, quota_millicores: u64) -> HostReadings {
