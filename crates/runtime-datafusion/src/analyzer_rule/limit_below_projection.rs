@@ -86,9 +86,19 @@ impl OptimizerRule for PushLimitBelowProjection {
         let rewritten = match limit.input.as_ref() {
             LogicalPlan::Projection(projection) => limit_below_projection(limit, projection)?,
             LogicalPlan::Sort(sort) => {
-                let rows = sort
-                    .fetch
-                    .map_or(skip + fetch, |sort_fetch| sort_fetch.min(skip + fetch));
+                // The copy fetches offset plus count in one `LIMIT`, which a
+                // source takes as a signed 64-bit integer even though each value
+                // alone fits in one; past that, the sort stays where it is.
+                let Some(rows) = skip
+                    .checked_add(fetch)
+                    .map(|needed| {
+                        sort.fetch
+                            .map_or(needed, |sort_fetch| sort_fetch.min(needed))
+                    })
+                    .filter(|rows| i64::try_from(*rows).is_ok())
+                else {
+                    return Ok(Transformed::no(plan));
+                };
                 sort_below_projection(sort, rows)?.map(|sort| {
                     LogicalPlan::Limit(Limit {
                         input: Arc::new(LogicalPlan::Sort(sort)),
@@ -436,6 +446,14 @@ mod tests {
             (
                 "SELECT json_get_str(t.val), t.id, u.id FROM t JOIN u ON t.id = u.id LIMIT 3",
                 "SELECT t.id, t.val, u.id FROM t INNER JOIN u ON (t.id = u.id)",
+            ),
+            // The copied sort would fetch offset plus count, which here is past
+            // the signed 64-bit `LIMIT` a source accepts (`PostgreSQL`: "bigint
+            // out of range"); each value alone is valid.
+            (
+                "SELECT json_get_str(val) FROM t ORDER BY id \
+                 LIMIT 9223372036854775807 OFFSET 9223372036854775807",
+                "SELECT t.id, t.val FROM t ORDER BY t.id ASC NULLS LAST",
             ),
         ] {
             let rendered = physical_plan(&ctx, sql).await;
