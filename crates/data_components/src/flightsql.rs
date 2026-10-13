@@ -73,8 +73,7 @@ use crate::Read;
 #[must_use]
 pub fn trace_parent_from_task_context(context: &TaskContext) -> Option<String> {
     let request_context = context.session_config().get_extension::<RequestContext>()?;
-    let tp = request_context.trace_parent().as_ref()?;
-    Some(format!("00-{}-{}-01", tp.trace_id, tp.span_id))
+    Some(request_context.trace_parent().as_ref()?.to_string())
 }
 
 pub mod federation;

@@ -19,12 +19,20 @@ use axum::http::HeaderMap;
 use opentelemetry::trace::{SpanId, TraceId};
 
 const MAX_VERSION: u8 = 254;
-const TRACEPARENT_HEADER: &str = "traceparent";
+/// Name of the W3C trace context header.
+pub const TRACEPARENT_HEADER: &str = "traceparent";
 
 /// Represents W3C `traceparent` header values.
 pub struct TraceParent {
     pub trace_id: TraceId,
     pub span_id: SpanId,
+}
+
+impl std::fmt::Display for TraceParent {
+    /// Formats the value to send downstream: version `00`, with the sampled flag set.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "00-{}-{}-01", self.trace_id, self.span_id)
+    }
 }
 
 pub fn extract_trace_parent(headers: &HeaderMap) -> Result<Option<TraceParent>, String> {
@@ -85,4 +93,23 @@ pub fn extract_trace_parent(headers: &HeaderMap) -> Result<Option<TraceParent>, 
     })?;
 
     Ok(Some(TraceParent { trace_id, span_id }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_round_trips_through_extract() {
+        let value = "00-4bf92f3577b34da6a3ce929d0e0e4736-00f067aa0ba902b7-01";
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            TRACEPARENT_HEADER,
+            value.parse().expect("valid header value"),
+        );
+        let trace_parent = extract_trace_parent(&headers)
+            .expect("valid traceparent")
+            .expect("traceparent present");
+        assert_eq!(trace_parent.to_string(), value);
+    }
 }
