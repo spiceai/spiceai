@@ -31906,7 +31906,10 @@ impl CayenneTableProvider {
                         .map(|&idx| Arc::clone(batch.column(idx)))
                         .collect();
                     let rows = converter.convert_columns(&pk_columns)?;
-                    keys.extend(rows.iter().map(|row| hash_index::hash_key_128(row.as_ref())));
+                    keys.extend(
+                        rows.iter()
+                            .map(|row| hash_index::hash_key_128(row.as_ref())),
+                    );
                 }
                 Ok(CheckpointCorpusKeys::RowKeys(keys))
             }
