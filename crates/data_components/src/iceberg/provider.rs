@@ -136,34 +136,32 @@ impl IcebergCatalogProvider {
         // `["spice", "public"]`); splitting them into single-level identifiers
         // would list tables under `/v1/namespaces/public` instead of
         // `/v1/namespaces/spice%1Fpublic`.
-        let child_namespaces: Vec<NamespaceIdent> = match client
-            .list_namespaces(root_namespace)
-            .await
-        {
-            Ok(namespaces) => namespaces,
-            Err(e) => match e.kind() {
-                iceberg::ErrorKind::DataInvalid => {
-                    // Unfortunately, there isn't a better way to handle this
-                    let err_msg = e.to_string();
+        let child_namespaces: Vec<NamespaceIdent> =
+            match client.list_namespaces(root_namespace).await {
+                Ok(namespaces) => namespaces,
+                Err(e) => match e.kind() {
+                    iceberg::ErrorKind::DataInvalid => {
+                        // Unfortunately, there isn't a better way to handle this
+                        let err_msg = e.to_string();
 
-                    if let Some(namespace) = root_namespace
-                        && (err_msg.contains("NoSuchNamespaceException")
-                            || err_msg.contains("Namespace does not exist"))
-                    {
-                        return Err(Error::NamespaceDoesNotExist {
-                            namespace: namespace.join("."),
-                        });
+                        if let Some(namespace) = root_namespace
+                            && (err_msg.contains("NoSuchNamespaceException")
+                                || err_msg.contains("Namespace does not exist"))
+                        {
+                            return Err(Error::NamespaceDoesNotExist {
+                                namespace: namespace.join("."),
+                            });
+                        }
+
+                        return Err(handle_iceberg_error(e));
                     }
-
-                    return Err(handle_iceberg_error(e));
-                }
-                _ => return Err(handle_iceberg_error(e)),
-            },
-        };
+                    _ => return Err(handle_iceberg_error(e)),
+                },
+            };
 
         let schema_names: Vec<String> = child_namespaces
             .iter()
-            .map(|ns| schema_name_for_namespace(ns))
+            .map(schema_name_for_namespace)
             .collect();
 
         let providers = try_join_all(child_namespaces.iter().map(|namespace| {
@@ -193,11 +191,7 @@ impl IcebergCatalogProvider {
 
 /// The schema name a child namespace is registered under: its last level.
 fn schema_name_for_namespace(namespace: &NamespaceIdent) -> String {
-    namespace
-        .as_ref()
-        .last()
-        .cloned()
-        .unwrap_or_default()
+    namespace.as_ref().last().cloned().unwrap_or_default()
 }
 
 impl CatalogProvider for IcebergCatalogProvider {
@@ -591,7 +585,9 @@ mod tests {
             .mount(&server)
             .await;
         Mock::given(method("GET"))
-            .and(path_regex(r"^/v1/namespaces/spice(%1F|%1f|\x1f)public/tables$"))
+            .and(path_regex(
+                r"^/v1/namespaces/spice(%1F|%1f|\x1f)public/tables$",
+            ))
             .respond_with(
                 ResponseTemplate::new(200).set_body_json(serde_json::json!({"identifiers": []})),
             )
