@@ -34617,6 +34617,7 @@ impl CayenneTableProvider {
                         || self
                             .mem_tier_shadow_present
                             .load(std::sync::atomic::Ordering::Acquire),
+                    Vec::new(),
                 )
                 .await?;
             } else {
@@ -34632,6 +34633,7 @@ impl CayenneTableProvider {
                         || self
                             .mem_tier_shadow_present
                             .load(std::sync::atomic::Ordering::Acquire),
+                    Vec::new(),
                 )
                 .await?;
             }
@@ -34736,6 +34738,7 @@ impl CayenneTableProvider {
                     || self
                         .mem_tier_shadow_present
                         .load(std::sync::atomic::Ordering::Acquire),
+                Vec::new(),
             )
             .await?;
             self.refresh_listing_table_under_held_fence().await?;
@@ -34820,6 +34823,10 @@ impl CayenneTableProvider {
             // index on meanwhile).
             let prepared_deletion =
                 Box::pin(self.prepare_on_conflict_deletion_update(deletion_update)).await?;
+            // Likewise the fold of the survivors' tombstones, which grows with
+            // every append made while this checkpoint encoded and committed: the
+            // fenced clear folds only what is appended from here on.
+            let prepared_retains = self.prepare_mem_tier_retains(&flushed_counts).await;
             #[cfg(test)]
             self.run_test_pre_checkpoint_deletion_publish_hook().await;
 
@@ -34875,6 +34882,7 @@ impl CayenneTableProvider {
                         || self
                             .mem_tier_shadow_present
                             .load(std::sync::atomic::Ordering::Acquire),
+                    prepared_retains,
                 )
                 .await?;
                 self.refresh_listing_table_under_held_fence().await?;
@@ -35328,9 +35336,10 @@ impl CayenneTableProvider {
         &self,
         shard_id: usize,
         flushed_segment_count: usize,
+        prepared: Option<crate::provider::mem_tier::PreparedRetain>,
     ) -> u64 {
         let cur = self.mem_tier.shard(shard_id).load_full();
-        let survivors = cur.retain_after(flushed_segment_count);
+        let survivors = cur.retain_after_prepared(flushed_segment_count, prepared);
         let released = cur.bytes.saturating_sub(survivors.bytes);
         self.mem_tier.shard(shard_id).store(Arc::new(survivors));
         // A cached `ScanView` holds the pre-clear visible segments only until a fresh
@@ -35383,10 +35392,37 @@ impl CayenneTableProvider {
         Ok(())
     }
 
+    /// Fold each shard's checkpoint survivors ahead of the listing fence, off the
+    /// async runtime ([`crate::provider::mem_tier::MemTier::prepare_retain`]), so
+    /// the fenced clear folds only the segments appended after this. A fold that
+    /// fails to run costs only that: the clear then folds every survivor itself.
+    async fn prepare_mem_tier_retains(
+        &self,
+        flushed_counts: &[usize],
+    ) -> Vec<Option<crate::provider::mem_tier::PreparedRetain>> {
+        let tiers: Vec<(Arc<crate::provider::mem_tier::MemTier>, usize)> = flushed_counts
+            .iter()
+            .enumerate()
+            .map(|(shard_id, &flushed_count)| {
+                (self.mem_tier.shard(shard_id).load_full(), flushed_count)
+            })
+            .collect();
+        let shards = tiers.len();
+        tokio::task::spawn_blocking(move || {
+            tiers
+                .into_iter()
+                .map(|(tier, flushed_count)| Some(tier.prepare_retain(flushed_count)))
+                .collect()
+        })
+        .await
+        .unwrap_or_else(|_| (0..shards).map(|_| None).collect())
+    }
+
     async fn clear_flushed_mem_tier_state_all_shards(
         &self,
         flushed_counts: &[usize],
         inlined_view_nonempty: bool,
+        prepared: Vec<Option<crate::provider::mem_tier::PreparedRetain>>,
     ) -> Result<()> {
         let mut released_total = 0u64;
         {
@@ -35396,10 +35432,14 @@ impl CayenneTableProvider {
             for lock in self.mem_tier_publish_locks.iter() {
                 guards.push(lock.lock().await);
             }
+            let mut prepared = prepared.into_iter();
             for (shard_id, &flushed_count) in flushed_counts.iter().enumerate() {
-                released_total = released_total.saturating_add(
-                    self.clear_mem_tier_flushed_prefix_for_shard(shard_id, flushed_count),
-                );
+                released_total =
+                    released_total.saturating_add(self.clear_mem_tier_flushed_prefix_for_shard(
+                        shard_id,
+                        flushed_count,
+                        prepared.next().flatten(),
+                    ));
             }
             drop(guards);
         }
@@ -35479,7 +35519,7 @@ impl CayenneTableProvider {
         // an overwrite's catalog commit), not here, so this must not also run the
         // checkpoint-time inline-metadata clear — which is also what makes this
         // step unable to fail.
-        self.clear_flushed_mem_tier_state_all_shards(&flushed_counts, false)
+        self.clear_flushed_mem_tier_state_all_shards(&flushed_counts, false, Vec::new())
             .await?;
         Ok(Some(source_epoch))
     }
