@@ -188,6 +188,28 @@ const STAGED_WRITE_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
 /// before pruning under the fence instead
 /// ([`CayenneTableProvider::prune_deletion_index_after_bake`]).
 const BAKE_PRUNE_OFF_FENCE_ATTEMPTS: usize = 3;
+
+/// What a seq-prefix bake published, so its deferred deletion-index prune can
+/// confirm the swap is still in place before it lands
+/// ([`CayenneTableProvider::bake_output_is_live`]).
+struct BakeOutput<'a> {
+    snapshot_at_capture: &'a str,
+    merged_snapshot_id: &'a str,
+    input_ids: &'a [String],
+}
+
+/// Outcome of one off-fence deletion-index prune attempt.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OffFencePrune {
+    /// The pruned index replaced the one it was built from.
+    Published,
+    /// The index had no deletion to prune.
+    NothingToPrune,
+    /// A writer replaced the index while the prune was being built.
+    LostRace,
+    /// The bake's swap is no longer what scans see; nothing may be pruned.
+    OutputNotLive,
+}
 /// Default intra-write encode-shard count for an unsorted write when no per-table
 /// `cayenne_write_concurrency` is configured. Deliberately small — NOT the host
 /// core count: the value is sized per table in isolation, so a high default makes
@@ -27244,8 +27266,13 @@ impl CayenneTableProvider {
             let off_fence_cutoff = prune_cutoff.min(fence_max_delete_seq);
             // Boxed: the bake is one of the crate's largest futures (see
             // `snapshot_bytes_for_merge_budget`), and the prune's state need not grow it.
-            Box::pin(self.prune_deletion_index_after_bake(off_fence_cutoff, &snapshot_at_capture))
-                .await?;
+            Box::pin(self.prune_deletion_index_after_bake(
+                off_fence_cutoff,
+                &snapshot_at_capture,
+                &new_snapshot_id,
+                &old_ids,
+            ))
+            .await?;
         }
 
         if clean_prefix_holds {
@@ -28837,24 +28864,35 @@ impl CayenneTableProvider {
     /// prune is rebuilt from the result. It is the deletion reservation's only
     /// shrink (see [`Self::deletion_index_over_memory_ceiling`]), so after
     /// [`BAKE_PRUNE_OFF_FENCE_ATTEMPTS`] lost races it falls back to pruning under
-    /// the write fence, which no writer of the index runs concurrently with. A
-    /// table replaced mid-pass (overwrite, datalake move) is not pruned: its
-    /// index was rebuilt for the replacement.
+    /// the write fence, which no writer of the index runs concurrently with.
+    ///
+    /// Every publication — the compare-and-swap and the fallback — happens under
+    /// the write fence and only while the bake's output is still live: the table
+    /// keeps the snapshot the bake captured, `merged_snapshot_id` is protected and
+    /// none of `input_ids` is. A recovery that read the catalog before the bake
+    /// committed can republish the inputs, with the index rebuilt from their
+    /// deletion vectors, after the swap; pruning that index would show the inputs'
+    /// deleted rows again, so the prune is dropped and the next bake reclaims it.
     async fn prune_deletion_index_after_bake(
         &self,
         cutoff: i64,
         snapshot_at_capture: &str,
+        merged_snapshot_id: &str,
+        input_ids: &[String],
     ) -> Result<()> {
+        let bake = BakeOutput {
+            snapshot_at_capture,
+            merged_snapshot_id,
+            input_ids,
+        };
         for _ in 0..BAKE_PRUNE_OFF_FENCE_ATTEMPTS {
-            if self.get_current_snapshot_id() != snapshot_at_capture {
-                return Ok(());
-            }
-            let published = match &self.pk_deletion_strategy {
+            let outcome = match &self.pk_deletion_strategy {
                 PkDeletionStrategyWithCache::Int64Pk {
                     deletion_snapshot, ..
                 } => {
                     self.prune_deletion_snapshot_off_fence(
                         deletion_snapshot,
+                        &bake,
                         |snapshot| snapshot.tombstones.has_deletions(),
                         move |snapshot| {
                             Int64PkDeletionSnapshot::from_index(
@@ -28869,6 +28907,7 @@ impl CayenneTableProvider {
                 } => {
                     self.prune_deletion_snapshot_off_fence(
                         deletion_snapshot,
+                        &bake,
                         |snapshot| snapshot.tombstones.has_deletions(),
                         move |snapshot| {
                             RowConverterDeletionSnapshot::from_index(
@@ -28880,31 +28919,35 @@ impl CayenneTableProvider {
                 }
                 PkDeletionStrategyWithCache::PositionBased { .. } => return Ok(()),
             };
-            if published {
-                self.refresh_deletion_memory_accounting();
-                return Ok(());
+            match outcome {
+                OffFencePrune::Published => {
+                    self.refresh_deletion_memory_accounting();
+                    return Ok(());
+                }
+                OffFencePrune::NothingToPrune | OffFencePrune::OutputNotLive => return Ok(()),
+                OffFencePrune::LostRace => {}
             }
         }
         let _fence = self.listing_fence.write().await;
-        if self.get_current_snapshot_id() == snapshot_at_capture {
+        if self.bake_output_is_live(&bake) {
             self.prune_deletion_index_at_or_below(cutoff);
         }
         Ok(())
     }
 
     /// One off-fence prune attempt on `cell`: build the pruned snapshot from the
-    /// current one on a blocking thread, then publish it only if `cell` still
-    /// holds that snapshot. Returns whether the prune is in place, which it also
-    /// is when there was nothing to prune.
+    /// current one on a blocking thread, then, under the write fence and only while
+    /// the bake's output is live, publish it if `cell` still holds that snapshot.
     async fn prune_deletion_snapshot_off_fence<T: Send + Sync + 'static>(
         &self,
         cell: &ArcSwap<T>,
+        bake: &BakeOutput<'_>,
         has_deletions: impl Fn(&T) -> bool,
         prune: impl FnOnce(&T) -> T + Send + 'static,
-    ) -> Result<bool> {
+    ) -> Result<OffFencePrune> {
         let current = cell.load_full();
         if !has_deletions(&current) {
-            return Ok(true);
+            return Ok(OffFencePrune::NothingToPrune);
         }
         let input = Arc::clone(&current);
         let pruned = tokio::task::spawn_blocking(move || prune(&input))
@@ -28913,8 +28956,29 @@ impl CayenneTableProvider {
                 table: self.table_metadata.table_name.clone(),
                 source,
             })?;
+        let _fence = self.listing_fence.write().await;
+        if !self.bake_output_is_live(bake) {
+            return Ok(OffFencePrune::OutputNotLive);
+        }
         let previous = cell.compare_and_swap(&current, Arc::new(pruned));
-        Ok(Arc::ptr_eq(&previous, &current))
+        Ok(if Arc::ptr_eq(&previous, &current) {
+            OffFencePrune::Published
+        } else {
+            OffFencePrune::LostRace
+        })
+    }
+
+    /// Whether a seq-prefix bake's swap is still what scans see: the table keeps
+    /// the snapshot the bake captured, its merged output is protected and none of
+    /// its inputs is. The caller holds the listing fence, so the answer holds
+    /// until it publishes.
+    fn bake_output_is_live(&self, bake: &BakeOutput<'_>) -> bool {
+        if self.get_current_snapshot_id() != bake.snapshot_at_capture {
+            return false;
+        }
+        let protected = self.protected_snapshots.load();
+        protected.contains_key(bake.merged_snapshot_id)
+            && !bake.input_ids.iter().any(|id| protected.contains_key(id))
     }
 
     /// Seq-prefix clear of the in-memory deletion index: drop every PK tombstone
