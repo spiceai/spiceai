@@ -35039,7 +35039,7 @@ impl CayenneTableProvider {
                         .is_none_or(|max| max < oldest_carried)
                 });
             if !reusable {
-                plans.iter_mut().for_each(|plan| *plan = (0, 0));
+                plans.fill((0, 0));
             }
         }
         // Hiding a carried row by key alone requires every appended tombstone
@@ -67804,7 +67804,7 @@ mod tests {
         );
     }
 
-    /// SplitMix64, so a differential case reproduces from its printed seed.
+    /// `SplitMix64`, so a differential case reproduces from its printed seed.
     struct SplitMix64(u64);
 
     impl SplitMix64 {
