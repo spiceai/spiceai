@@ -26,8 +26,12 @@ limitations under the License.
 //!
 //! This rule rewrites `CAST(<float literal> AS DECIMAL(p, s))` to the decimal
 //! literal parsed exactly from the literal's decimal spelling, at the cast's
-//! precision and scale, when that spelling fits the scale without rounding;
-//! anything else is left to the cast as before, so overflow and out-of-range
+//! precision and scale. How a spelling with more fraction digits than the scale
+//! is handled depends on where the spelling came from (below): a retained SQL
+//! token spelling is the exact value, so it is rounded half away from zero to
+//! the scale, as a decimal-to-decimal cast rounds; a spelling derived from the
+//! float is left to the cast. Anything that does not parse at the cast's
+//! precision is left to the cast as before, so overflow and out-of-range
 //! behaviour is unchanged.
 //!
 //! The spelling comes from one of two places:
@@ -43,9 +47,17 @@ limitations under the License.
 //!   as the same `f64` (Rust's `Display`) is the token whenever the token had at
 //!   most `f64::DIGITS` significant digits, since every such decimal reads as a
 //!   distinct `f64`: `12345678.90` is recovered as `12345678.9`. A bound float
-//!   parameter has no token, and is converted the same way. A float whose
-//!   shortest spelling is longer than the type's decimal digits (`f64::DIGITS` /
+//!   parameter has no token, and is converted the same way. This spelling is used
+//!   only when it fits the cast's scale without rounding. A float whose shortest
+//!   spelling is longer than the type's decimal digits (`f64::DIGITS` /
 //!   `f32::DIGITS` / ~3 for `f16`) is left to the cast.
+//!
+//! The logical plan does not record which token a literal was planned from, so
+//! spellings are matched to literals by their `f64`. When one statement spells
+//! the same `f64` two different ways and at least one of them is lossy
+//! (`4.07` and `4.0700000000000003`), no literal of that `f64` can be told
+//! apart from the other, and every such cast keeps the binary cast it had
+//! before this rule.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::ControlFlow;
@@ -207,7 +219,10 @@ fn round_to_scale(spelling: &str, scale: usize) -> Option<String> {
     };
     let (integer, fraction) = unsigned.split_once('.').unwrap_or((unsigned, ""));
     if integer.is_empty()
-        || !integer.bytes().chain(fraction.bytes()).all(|b| b.is_ascii_digit())
+        || !integer
+            .bytes()
+            .chain(fraction.bytes())
+            .all(|b| b.is_ascii_digit())
     {
         return None;
     }
@@ -790,8 +805,10 @@ mod tests {
             "the token is 4.0700000000000003, even though its f64 is 4.07's"
         );
         assert_eq!(matching_ids("-dec = -4.0700000000000003").await, vec![2]);
-        // Both spellings in one statement share one f64: neither is known, so
-        // each comparison falls back to the cast.
+        // Both spellings in one statement share one f64, and the plan does not
+        // record which token each literal came from: neither spelling is
+        // known, so each comparison keeps the binary cast it had without the
+        // rule (see the module docs).
         let ambiguous = "dec = 4.0700000000000003 OR dec = 4.07";
         assert_eq!(
             matching_ids(ambiguous).await,

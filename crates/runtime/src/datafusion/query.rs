@@ -3625,6 +3625,100 @@ mod tests {
         assert!(is_dml_extension(&plan));
     }
 
+    /// The ids `sql` returns through the runtime query path (runtime planner,
+    /// built analyzer rules, parameter binding) from a `Decimal128(38, 17)`
+    /// column holding 4.07 (id 1) and 4.0700000000000003 (id 2), two decimals
+    /// whose nearest `f64` is the same.
+    async fn ids_matching_decimal_literal(sql: &str, parameters: Option<ParamValues>) -> Vec<i64> {
+        let df = Arc::new(
+            DataFusionBuilder::new(
+                RuntimeStatus::new(),
+                Arc::new(AcceleratorEngineRegistry::new()),
+                Handle::current(),
+            )
+            .build(),
+        );
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("amount", DataType::Decimal128(38, 17), false),
+        ]));
+        let amounts = arrow::array::Decimal128Array::from(vec![
+            407_000_000_000_000_000_i128,
+            407_000_000_000_000_030,
+        ])
+        .with_precision_and_scale(38, 17)
+        .expect("valid decimal");
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![Arc::new(Int64Array::from(vec![1, 2])), Arc::new(amounts)],
+        )
+        .expect("valid batch");
+        df.ctx
+            .register_batch("decimals", batch)
+            .expect("register table");
+
+        let mut query = QueryBuilder::new(sql, df)
+            .parameters(parameters)
+            .build()
+            .run()
+            .await
+            .expect("Query::run");
+        let mut ids = Vec::new();
+        while let Some(batch) = query.data.next().await {
+            let batch = batch.expect("batch");
+            let column = batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<Int64Array>()
+                .expect("ids");
+            ids.extend(column.values().iter().copied());
+        }
+        ids
+    }
+
+    /// #14970 through the production path: the runtime planner must retain a
+    /// lossy token's spelling and the built analyzer rules must cast from it,
+    /// and a bound float parameter must cast through its decimal spelling.
+    #[tokio::test]
+    async fn runtime_query_casts_float_literals_to_the_decimal_they_spell() {
+        assert_eq!(
+            ids_matching_decimal_literal(
+                "SELECT id FROM decimals WHERE amount = 4.07 ORDER BY id",
+                None
+            )
+            .await,
+            vec![1]
+        );
+        // The token's f64 is 4.07's, so only its retained spelling selects id 2.
+        assert_eq!(
+            ids_matching_decimal_literal(
+                "SELECT id FROM decimals WHERE amount = 4.0700000000000003 ORDER BY id",
+                None
+            )
+            .await,
+            vec![2]
+        );
+        assert_eq!(
+            ids_matching_decimal_literal(
+                "SELECT id FROM decimals WHERE id IN \
+                 (SELECT id FROM decimals WHERE amount = 4.0700000000000003) ORDER BY id",
+                None
+            )
+            .await,
+            vec![2]
+        );
+        // The binary cast of the f64 4.07 at scale 17 is 4.07000000000000028.
+        let parameters = convert_json_to_param_values(json!([4.07])).expect("json to paramvalues");
+        assert_eq!(
+            ids_matching_decimal_literal(
+                "SELECT id FROM decimals WHERE amount = $1 ORDER BY id",
+                Some(parameters)
+            )
+            .await,
+            vec![1]
+        );
+    }
+
     #[tokio::test]
     async fn parameterized_query() {
         let parameters = convert_json_to_param_values(json!([41])).expect("json to paramvalues");
