@@ -24,12 +24,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use app::AppBuilder;
-use arrow::array::{AsArray as _, RecordBatch};
+use arrow::array::AsArray as _;
 use arrow::datatypes::Int64Type;
 use aws_sdk_s3::config::{Credentials, Region};
 use bollard::secret::HealthConfig;
 use datafusion::prelude::SessionContext;
-use futures::StreamExt;
 use iceberg::io::{LocalFsStorageFactory, StorageFactory};
 use iceberg::memory::{MEMORY_CATALOG_WAREHOUSE, MemoryCatalogBuilder};
 use iceberg::spec::{NestedField, PrimitiveType, Type};
@@ -47,7 +46,7 @@ use crate::{
     configure_test_datafusion,
     docker::{ContainerRunnerBuilder, RunningContainer, wait_for_tcp_port},
     init_tracing,
-    utils::test_request_context,
+    utils::{run_query, test_request_context},
 };
 
 const NAMESPACE: &str = "db";
@@ -123,17 +122,31 @@ async fn write_table_at(
     Ok(())
 }
 
-/// The metadata file name for each version, indexed by version.
+/// The metadata file name for each version of the table at `table_root`, indexed
+/// by version.
 pub(crate) fn metadata_file_names(table_root: &Path) -> anyhow::Result<Vec<String>> {
-    let mut files: Vec<(u64, String)> = Vec::new();
+    let mut names = Vec::new();
     for entry in std::fs::read_dir(table_root.join("metadata"))? {
-        let name = entry?.file_name().to_string_lossy().to_string();
-        if let Some(stem) = name.strip_suffix(".metadata.json")
-            && let Some(Ok(version)) = stem.split('-').next().map(str::parse::<u64>)
-        {
-            files.push((version, name));
-        }
+        names.push(entry?.file_name().to_string_lossy().to_string());
     }
+    ordered_metadata_names(names)
+}
+
+/// The `<N>-<uuid>.metadata.json` names among `names`, indexed by version `N`,
+/// which must run contiguously from 0.
+fn ordered_metadata_names(names: impl IntoIterator<Item = String>) -> anyhow::Result<Vec<String>> {
+    let mut files: Vec<(u64, String)> = names
+        .into_iter()
+        .filter_map(|name| {
+            let version = name
+                .strip_suffix(".metadata.json")?
+                .split('-')
+                .next()?
+                .parse()
+                .ok()?;
+            Some((version, name))
+        })
+        .collect();
     files.sort();
     anyhow::ensure!(
         files.iter().enumerate().all(|(i, (v, _))| *v == i as u64),
@@ -142,43 +155,41 @@ pub(crate) fn metadata_file_names(table_root: &Path) -> anyhow::Result<Vec<Strin
     Ok(files.into_iter().map(|(_, name)| name).collect())
 }
 
-pub(crate) fn pinned_dataset(table_root: &Path, name: &str, param: &str, value: &str) -> Dataset {
-    let mut dataset = Dataset::new(format!("iceberg:file://{}", table_root.display()), name);
-    dataset.params = Some(DatasetParams::from_string_map(HashMap::from([(
-        param.to_string(),
-        value.to_string(),
-    )])));
+/// A dataset reading the table at `from` with `params`.
+fn dataset_with_params(from: String, name: &str, params: HashMap<String, String>) -> Dataset {
+    let mut dataset = Dataset::new(from, name);
+    dataset.params = Some(DatasetParams::from_string_map(params));
     dataset
 }
 
-async fn start_runtime(app_name: &str, datasets: Vec<Dataset>) -> Runtime {
+pub(crate) fn pinned_dataset(table_root: &Path, name: &str, param: &str, value: &str) -> Dataset {
+    dataset_with_params(
+        format!("iceberg:file://{}", table_root.display()),
+        name,
+        HashMap::from([(param.to_string(), value.to_string())]),
+    )
+}
+
+async fn start_runtime(app_name: &str, datasets: Vec<Dataset>) -> Arc<Runtime> {
     let mut builder = AppBuilder::new(app_name);
     for dataset in datasets {
         builder = builder.with_dataset(dataset);
     }
     configure_test_datafusion();
-    let rt = Runtime::builder().with_app(builder.build()).build().await;
+    let rt = Arc::new(Runtime::builder().with_app(builder.build()).build().await);
     tokio::select! {
         () = tokio::time::sleep(Duration::from_mins(2)) => {
             panic!("Timeout waiting for components to load");
         }
-        () = Arc::new(rt.clone()).load_components() => {}
+        () = Arc::clone(&rt).load_components() => {}
     }
     rt
 }
 
-async fn ids(rt: &Runtime, table: &str) -> anyhow::Result<Vec<i64>> {
-    let mut result = rt
-        .datafusion()
-        .query_builder(&format!("SELECT id FROM {table} ORDER BY id"))
-        .build()
-        .run()
-        .await?;
-    let mut batches: Vec<RecordBatch> = Vec::new();
-    while let Some(batch) = result.data.next().await {
-        batches.push(batch?);
-    }
-    Ok(batches
+/// The first column of `sql`'s result, as `i64`s, in result order.
+async fn int64_column(rt: &Arc<Runtime>, sql: &str) -> anyhow::Result<Vec<i64>> {
+    Ok(run_query(rt, sql)
+        .await?
         .iter()
         .flat_map(|batch| {
             batch
@@ -189,6 +200,49 @@ async fn ids(rt: &Runtime, table: &str) -> anyhow::Result<Vec<i64>> {
                 .collect::<Vec<_>>()
         })
         .collect())
+}
+
+async fn ids(rt: &Arc<Runtime>, table: &str) -> anyhow::Result<Vec<i64>> {
+    int64_column(rt, &format!("SELECT id FROM {table} ORDER BY id")).await
+}
+
+/// Starts loading `datasets` and waits for every one of them to fail, returning
+/// each dataset's error message by name.
+async fn dataset_errors(
+    app_name: &str,
+    datasets: Vec<Dataset>,
+) -> anyhow::Result<HashMap<String, Option<String>>> {
+    let names: Vec<String> = datasets.iter().map(|d| d.name.clone()).collect();
+    let mut builder = AppBuilder::new(app_name);
+    for dataset in datasets {
+        builder = builder.with_dataset(dataset);
+    }
+    configure_test_datafusion();
+    let rt = Arc::new(Runtime::builder().with_app(builder.build()).build().await);
+    let load = tokio::spawn(Arc::clone(&rt).load_components());
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    let mut last_seen = HashMap::new();
+    while std::time::Instant::now() < deadline {
+        let statuses = rt.status().get_dataset_statuses();
+        let errors: HashMap<String, Option<String>> = statuses
+            .iter()
+            .filter_map(|(name, status)| match status {
+                runtime::status::ComponentStatus::Error(message) => {
+                    Some((name.table().to_string(), message.clone()))
+                }
+                _ => None,
+            })
+            .collect();
+        if names.iter().all(|name| errors.contains_key(name)) {
+            load.abort();
+            return Ok(errors);
+        }
+        last_seen = statuses;
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    load.abort();
+    anyhow::bail!("datasets {names:?} must all fail to load (last seen: {last_seen:?})")
 }
 
 /// Every spelling of the pinned metadata file reads exactly the snapshot that file
@@ -223,7 +277,7 @@ async fn iceberg_metadata_path_reads_the_pinned_snapshot_in_every_spelling() -> 
                 (
                     "legacy_name",
                     "metadata_path",
-                    format!("/metadata/{}", files[2]),
+                    format!("file://{}/metadata/{}", table_root.display(), files[2]),
                     &[1, 2],
                 ),
             ];
@@ -287,9 +341,10 @@ async fn a_pinned_table_accelerates_into_cayenne() -> anyhow::Result<()> {
         .await
 }
 
-/// A table read without a catalog cannot take writes, and saying so when the
-/// dataset loads stops an insert from writing data files the rejected commit would
-/// orphan in the table's location.
+/// A table pinned to one metadata file has no catalog to commit to, so it cannot
+/// take writes. Refusing `access: read_write` when the dataset loads stops an
+/// insert from writing data files the rejected commit would orphan in the table's
+/// location. Both spellings of the parameter are refused.
 #[cfg(feature = "iceberg-write")]
 #[tokio::test]
 async fn a_pinned_table_refuses_read_write_access() -> anyhow::Result<()> {
@@ -301,45 +356,38 @@ async fn a_pinned_table_refuses_read_write_access() -> anyhow::Result<()> {
             let files = metadata_file_names(&table_root)?;
             let data_files_before = std::fs::read_dir(table_root.join("data"))?.count();
 
-            let mut dataset = pinned_dataset(
+            let mut pinned = pinned_dataset(
                 &table_root,
-                "writable",
+                "pinned_writable",
                 "iceberg_metadata_path",
                 &format!("/metadata/{}", files[1]),
             );
-            dataset.access = spicepod::component::access::AccessMode::ReadWrite;
+            pinned.access = spicepod::component::access::AccessMode::ReadWrite;
+            let mut legacy = pinned_dataset(
+                &table_root,
+                "legacy_writable",
+                "metadata_path",
+                &format!("file://{}/metadata/{}", table_root.display(), files[1]),
+            );
+            legacy.access = spicepod::component::access::AccessMode::ReadWrite;
 
-            let mut builder = AppBuilder::new("iceberg_metadata_path_read_write");
-            builder = builder.with_dataset(dataset);
-            configure_test_datafusion();
-            let rt = Runtime::builder().with_app(builder.build()).build().await;
-            let load = tokio::spawn(Arc::new(rt.clone()).load_components());
-
-            let expected = "Failed to setup the dataset writable (iceberg). Unable to resolve table provider: Cannot setup the dataset writable (iceberg) with an invalid configuration. An Iceberg table read from its metadata file (`iceberg_metadata_path`) has no catalog, so it is read-only. Remove `access: read_write` from the dataset, or read the table through an Iceberg catalog to write to it. See: https://spiceai.org/docs/components/data-connectors/iceberg";
-            let deadline = std::time::Instant::now() + Duration::from_secs(30);
-            let mut last_seen = None;
-            while std::time::Instant::now() < deadline {
-                let status = rt
-                    .status()
-                    .get_dataset_statuses()
-                    .into_iter()
-                    .find(|(name, _)| name.table() == "writable")
-                    .map(|(_, status)| status);
-                if let Some(runtime::status::ComponentStatus::Error(message)) = &status {
-                    load.abort();
-                    assert_eq!(message.as_deref(), Some(expected));
-                    assert_eq!(
-                        std::fs::read_dir(table_root.join("data"))?.count(),
-                        data_files_before,
-                        "refusing the dataset must not write into the table"
-                    );
-                    return Ok(());
-                }
-                last_seen = status;
-                tokio::time::sleep(Duration::from_millis(200)).await;
+            let errors =
+                dataset_errors("iceberg_metadata_path_read_write", vec![pinned, legacy]).await?;
+            for name in ["pinned_writable", "legacy_writable"] {
+                assert_eq!(
+                    errors.get(name),
+                    Some(&Some(format!(
+                        "Failed to setup the dataset {name} (iceberg). Unable to resolve table provider: Cannot setup the dataset {name} (iceberg) with an invalid configuration. An Iceberg table read from its metadata file (`iceberg_metadata_path`) has no catalog to commit to, so it is read-only. Remove `access: read_write` from the dataset, or read the table through an Iceberg catalog to write to it. See: https://spiceai.org/docs/components/data-connectors/iceberg"
+                    ))),
+                    "dataset {name}"
+                );
             }
-            load.abort();
-            anyhow::bail!("dataset writable never reached the Error state (last seen: {last_seen:?})")
+            assert_eq!(
+                std::fs::read_dir(table_root.join("data"))?.count(),
+                data_files_before,
+                "refusing the datasets must not write into the table"
+            );
+            Ok(())
         })
         .await
 }
@@ -360,41 +408,16 @@ async fn a_from_naming_a_metadata_file_is_refused_with_the_corrected_configurati
                 format!("iceberg:file://{}/metadata/{}", table_root.display(), files[1]),
                 "misplaced",
             );
-            configure_test_datafusion();
-            let rt = Runtime::builder()
-                .with_app(
-                    AppBuilder::new("iceberg_metadata_file_in_from")
-                        .with_dataset(dataset)
-                        .build(),
-                )
-                .build()
-                .await;
-            let load = tokio::spawn(Arc::new(rt.clone()).load_components());
-
-            let expected = format!(
-                "Cannot setup the dataset misplaced (iceberg) with an invalid configuration. `from` names an Iceberg metadata file, but it must name the table root. Set `from` to 'iceberg:file://{}' and `iceberg_metadata_path` to '/metadata/{}'. See: https://spiceai.org/docs/components/data-connectors/iceberg",
-                table_root.display(),
-                files[1]
+            let errors = dataset_errors("iceberg_metadata_file_in_from", vec![dataset]).await?;
+            assert_eq!(
+                errors.get("misplaced"),
+                Some(&Some(format!(
+                    "Cannot setup the dataset misplaced (iceberg) with an invalid configuration. `from` names an Iceberg metadata file, but it must name the table root. Set `from` to 'iceberg:file://{}' and `iceberg_metadata_path` to '/metadata/{}'. See: https://spiceai.org/docs/components/data-connectors/iceberg",
+                    table_root.display(),
+                    files[1]
+                )))
             );
-            let deadline = std::time::Instant::now() + Duration::from_secs(30);
-            let mut last_seen = None;
-            while std::time::Instant::now() < deadline {
-                let status = rt
-                    .status()
-                    .get_dataset_statuses()
-                    .into_iter()
-                    .find(|(name, _)| name.table() == "misplaced")
-                    .map(|(_, status)| status);
-                if let Some(runtime::status::ComponentStatus::Error(message)) = &status {
-                    load.abort();
-                    assert_eq!(message.as_deref(), Some(expected.as_str()));
-                    return Ok(());
-                }
-                last_seen = status;
-                tokio::time::sleep(Duration::from_millis(200)).await;
-            }
-            load.abort();
-            anyhow::bail!("dataset misplaced never reached the Error state (last seen: {last_seen:?})")
+            Ok(())
         })
         .await
 }
@@ -433,21 +456,26 @@ async fn start_object_store() -> anyhow::Result<RunningContainer> {
     Ok(container)
 }
 
+fn s3_client(endpoint: &str) -> aws_sdk_s3::Client {
+    aws_sdk_s3::Client::from_conf(
+        aws_sdk_s3::Config::builder()
+            .credentials_provider(Credentials::new(
+                S3_ACCESS_KEY,
+                S3_SECRET_KEY,
+                None,
+                None,
+                "test",
+            ))
+            .region(Region::new("us-east-1"))
+            .endpoint_url(endpoint)
+            .force_path_style(true)
+            .behavior_version_latest()
+            .build(),
+    )
+}
+
 async fn create_bucket(endpoint: &str) -> anyhow::Result<()> {
-    let config = aws_sdk_s3::Config::builder()
-        .credentials_provider(Credentials::new(
-            S3_ACCESS_KEY,
-            S3_SECRET_KEY,
-            None,
-            None,
-            "test",
-        ))
-        .region(Region::new("us-east-1"))
-        .endpoint_url(endpoint)
-        .force_path_style(true)
-        .behavior_version_latest()
-        .build();
-    let s3 = aws_sdk_s3::Client::from_conf(config);
+    let s3 = s3_client(endpoint);
     // The store can accept connections a moment before it accepts requests.
     let mut last_error = None;
     for _ in 0..50 {
@@ -462,45 +490,18 @@ async fn create_bucket(endpoint: &str) -> anyhow::Result<()> {
 
 /// The metadata file name for each version under `prefix`, indexed by version.
 async fn s3_metadata_file_names(endpoint: &str, prefix: &str) -> anyhow::Result<Vec<String>> {
-    let config = aws_sdk_s3::Config::builder()
-        .credentials_provider(Credentials::new(
-            S3_ACCESS_KEY,
-            S3_SECRET_KEY,
-            None,
-            None,
-            "test",
-        ))
-        .region(Region::new("us-east-1"))
-        .endpoint_url(endpoint)
-        .force_path_style(true)
-        .behavior_version_latest()
-        .build();
-    let listed = aws_sdk_s3::Client::from_conf(config)
+    let listed = s3_client(endpoint)
         .list_objects_v2()
         .bucket(S3_BUCKET)
         .prefix(prefix)
         .send()
         .await?;
-    let mut files: Vec<(u64, String)> = listed
-        .contents()
-        .iter()
-        .filter_map(|object| {
-            let name = object.key()?.rsplit('/').next()?.to_string();
-            let version = name
-                .strip_suffix(".metadata.json")?
-                .split('-')
-                .next()?
-                .parse()
-                .ok()?;
-            Some((version, name))
-        })
-        .collect();
-    files.sort();
-    anyhow::ensure!(
-        files.iter().enumerate().all(|(i, (v, _))| *v == i as u64),
-        "expected contiguous metadata versions from 0, found {files:?}"
-    );
-    Ok(files.into_iter().map(|(_, name)| name).collect())
+    ordered_metadata_names(
+        listed
+            .contents()
+            .iter()
+            .filter_map(|object| Some(object.key()?.rsplit('/').next()?.to_string())),
+    )
 }
 
 /// A table written to S3 is read from its pinned metadata file through both S3
@@ -542,27 +543,26 @@ async fn iceberg_metadata_path_reads_a_pinned_table_from_s3() -> anyhow::Result<
             anyhow::ensure!(files.len() == 4, "fixture has {files:?}");
 
             let s3_dataset = |scheme: &str, name: &str| {
-                let mut dataset = Dataset::new(
+                dataset_with_params(
                     format!("iceberg:{scheme}://{S3_BUCKET}/warehouse/{NAMESPACE}/{TABLE}"),
                     name,
-                );
-                dataset.params = Some(DatasetParams::from_string_map(HashMap::from([
-                    (
-                        "iceberg_metadata_path".to_string(),
-                        format!("/metadata/{}", files[2]),
-                    ),
-                    ("iceberg_s3_endpoint".to_string(), endpoint.clone()),
-                    (
-                        "iceberg_s3_access_key_id".to_string(),
-                        S3_ACCESS_KEY.to_string(),
-                    ),
-                    (
-                        "iceberg_s3_secret_access_key".to_string(),
-                        S3_SECRET_KEY.to_string(),
-                    ),
-                    ("iceberg_s3_region".to_string(), "us-east-1".to_string()),
-                ])));
-                dataset
+                    HashMap::from([
+                        (
+                            "iceberg_metadata_path".to_string(),
+                            format!("/metadata/{}", files[2]),
+                        ),
+                        ("iceberg_s3_endpoint".to_string(), endpoint.clone()),
+                        (
+                            "iceberg_s3_access_key_id".to_string(),
+                            S3_ACCESS_KEY.to_string(),
+                        ),
+                        (
+                            "iceberg_s3_secret_access_key".to_string(),
+                            S3_SECRET_KEY.to_string(),
+                        ),
+                        ("iceberg_s3_region".to_string(), "us-east-1".to_string()),
+                    ]),
+                )
             };
             let rt = start_runtime(
                 "iceberg_metadata_path_s3",
@@ -625,26 +625,12 @@ pub(crate) fn pinned_glue_dataset(metadata_location: &str, name: &str) -> anyhow
     let (root, file) = metadata_location.rsplit_once("/metadata/").ok_or_else(|| {
         anyhow::anyhow!("'{metadata_location}' is not under a metadata/ directory")
     })?;
-    let mut dataset = Dataset::new(format!("iceberg:{root}"), name);
-    dataset.params = Some(DatasetParams::from_string_map(HashMap::from([
-        (
-            "iceberg_metadata_path".to_string(),
-            format!("/metadata/{file}"),
-        ),
-        (
-            "iceberg_s3_region".to_string(),
-            "${ env:AWS_ICEBERG_REGION }".to_string(),
-        ),
-        (
-            "iceberg_s3_access_key_id".to_string(),
-            "${ env:AWS_ICEBERG_ACCESS_KEY_ID }".to_string(),
-        ),
-        (
-            "iceberg_s3_secret_access_key".to_string(),
-            "${ env:AWS_ICEBERG_SECRET_ACCESS_KEY }".to_string(),
-        ),
-    ])));
-    Ok(dataset)
+    let mut params = crate::iceberg::connector::glue_s3_params();
+    params.insert(
+        "iceberg_metadata_path".to_string(),
+        format!("/metadata/{file}"),
+    );
+    Ok(dataset_with_params(format!("iceberg:{root}"), name, params))
 }
 
 /// The differential check against a real catalog: a table AWS Glue manages, on S3,
@@ -691,19 +677,8 @@ async fn a_glue_table_reads_the_same_rows_pinned_as_through_the_glue_catalog() -
         .await
 }
 
-async fn count(rt: &Runtime, sql: &str) -> anyhow::Result<i64> {
-    let mut result = rt.datafusion().query_builder(sql).build().run().await?;
-    let mut counts = Vec::new();
-    while let Some(batch) = result.data.next().await {
-        counts.extend(
-            batch?
-                .column(0)
-                .as_primitive::<Int64Type>()
-                .iter()
-                .flatten(),
-        );
-    }
-    match counts.as_slice() {
+async fn count(rt: &Arc<Runtime>, sql: &str) -> anyhow::Result<i64> {
+    match int64_column(rt, sql).await?.as_slice() {
         [count] => Ok(*count),
         other => anyhow::bail!("{sql} returned {other:?}, not one count"),
     }

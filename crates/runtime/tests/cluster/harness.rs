@@ -249,6 +249,27 @@ impl ClusterHarness {
             .map_err(|e| anyhow::Error::msg(format!("query stream failed: {e}")))
     }
 
+    /// Run `sql` as a Ballista job and collect all result batches. Unlike
+    /// [`query`](Self::query), which runs on the scheduler alone, the plan is
+    /// serialized and its tasks run on the executors.
+    pub async fn query_distributed(
+        &self,
+        sql: &str,
+        job_id: &str,
+    ) -> Result<Vec<RecordBatch>, anyhow::Error> {
+        QueryBuilder::new(sql, self.scheduler.datafusion())
+            .build()
+            .submit_distributed(job_id)
+            .await
+            .map_err(|e| anyhow::Error::msg(format!("submitting {job_id} failed: {e}")))?
+            .into_stream()
+            .await
+            .map_err(|e| anyhow::Error::msg(format!("{job_id} failed: {e}")))?
+            .try_collect::<Vec<_>>()
+            .await
+            .map_err(|e| anyhow::Error::msg(format!("{job_id} stream failed: {e}")))
+    }
+
     /// Run `EXPLAIN <sql>` through the scheduler and collect all result batches.
     pub async fn explain(&self, sql: &str) -> Result<Vec<RecordBatch>, anyhow::Error> {
         self.query(&format!("EXPLAIN {sql}")).await

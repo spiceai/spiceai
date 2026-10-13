@@ -192,7 +192,14 @@ pub(crate) fn make_iceberg_dataset(
         "iceberg:https://glue.ap-northeast-2.amazonaws.com/iceberg/v1/catalogs/{account_id}/namespaces/{namespace}/tables/{table}"
     );
     let mut dataset = Dataset::new(from, name);
-    dataset.params = Some(DatasetParams::from_string_map(HashMap::from([
+    dataset.params = Some(DatasetParams::from_string_map(glue_s3_params()));
+    Ok(dataset)
+}
+
+/// The S3 parameters that read the shared Glue fixture's data, from the
+/// `AWS_ICEBERG_*` environment.
+pub(crate) fn glue_s3_params() -> HashMap<String, String> {
+    HashMap::from([
         (
             "iceberg_s3_region".to_string(),
             "${ env:AWS_ICEBERG_REGION }".to_string(),
@@ -205,6 +212,5 @@ pub(crate) fn make_iceberg_dataset(
             "iceberg_s3_secret_access_key".to_string(),
             "${ env:AWS_ICEBERG_SECRET_ACCESS_KEY }".to_string(),
         ),
-    ])));
-    Ok(dataset)
+    ])
 }

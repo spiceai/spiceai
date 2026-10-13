@@ -267,30 +267,6 @@ async fn test_distributed_iceberg_dataset_scan() -> Result<(), anyhow::Error> {
         .await
 }
 
-/// Runs `sql` as a Ballista job, so the plan is serialized and shipped to an
-/// executor. A plain `harness.query` runs on the scheduler alone. An Iceberg scan
-/// crosses to the executor only as a serializable `IcebergScanExec`, so the job
-/// succeeding is what shows the scan was rebuilt there.
-async fn distributed_query(
-    harness: &ClusterHarness,
-    sql: &str,
-    job_id: &str,
-) -> Result<Vec<RecordBatch>, anyhow::Error> {
-    use futures::TryStreamExt as _;
-    let handle = runtime::datafusion::query::QueryBuilder::new(sql, harness.scheduler.datafusion())
-        .build()
-        .submit_distributed(job_id)
-        .await
-        .map_err(|e| anyhow::anyhow!("submitting {job_id} failed: {e}"))?;
-    handle
-        .into_stream()
-        .await
-        .map_err(|e| anyhow::anyhow!("{job_id} failed: {e}"))?
-        .try_collect::<Vec<_>>()
-        .await
-        .map_err(|e| anyhow::anyhow!("{job_id} stream failed: {e}"))
-}
-
 /// The `id` column of `batches`, in order.
 fn ids(batches: &[RecordBatch]) -> Vec<i64> {
     use arrow::array::AsArray as _;
@@ -357,12 +333,15 @@ async fn test_distributed_pinned_iceberg_dataset_scan() -> Result<(), anyhow::Er
                 Box::pin(async move {
                     harness.wait_for_executors(Duration::from_secs(30)).await?;
 
-                    let batches = distributed_query(
-                        harness,
-                        "SELECT id FROM pinned ORDER BY id",
-                        "pinned_iceberg_scan",
-                    )
-                    .await?;
+                    // An Iceberg scan reaches the executor only as a serializable
+                    // `IcebergScanExec`, so the job succeeding shows the pinned
+                    // scan was rebuilt there.
+                    let batches = harness
+                        .query_distributed(
+                            "SELECT id FROM pinned ORDER BY id",
+                            "pinned_iceberg_scan",
+                        )
+                        .await?;
                     assert_eq!(ids(&batches), vec![1, 2, 3]);
                     Ok(())
                 })
@@ -414,12 +393,12 @@ async fn test_distributed_pinned_glue_iceberg_dataset_scan() -> Result<(), anyho
                 Box::pin(async move {
                     harness.wait_for_executors(Duration::from_secs(30)).await?;
 
-                    let batches = distributed_query(
-                        harness,
-                        "SELECT c_custkey FROM customer_pinned",
-                        "pinned_glue_iceberg_scan",
-                    )
-                    .await?;
+                    let batches = harness
+                        .query_distributed(
+                            "SELECT c_custkey FROM customer_pinned",
+                            "pinned_glue_iceberg_scan",
+                        )
+                        .await?;
                     assert_eq!(total_rows(&batches), 150_000);
                     Ok(())
                 })

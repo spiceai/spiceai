@@ -63,12 +63,6 @@ impl MetadataFileCatalog {
         Ok(Self { table })
     }
 
-    /// The identifier the table is served under.
-    #[must_use]
-    pub fn table_ident(&self) -> &TableIdent {
-        self.table.identifier()
-    }
-
     fn is_table(&self, ident: &TableIdent) -> bool {
         ident == self.table.identifier()
     }
@@ -403,7 +397,7 @@ mod tests {
     /// Every `id` visible through `catalog`, read the way the data connector reads
     /// it: an `IcebergTableProvider` over the catalog.
     async fn ids_through(catalog: MetadataFileCatalog) -> Vec<i64> {
-        let ident = catalog.table_ident().clone();
+        let ident = served_ident();
         let catalog: Arc<dyn Catalog> = Arc::new(catalog);
         let provider = IcebergTableProvider::try_new(
             catalog,

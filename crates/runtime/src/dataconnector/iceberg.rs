@@ -38,7 +38,7 @@ use super::DataConnectorFactory;
 use super::iceberg_cluster::IcebergClusterTableProvider;
 use crate::{
     catalogconnector::iceberg::{
-        ICEBERG_PARAM_LEN, get_rest_catalog, map_param_name_to_iceberg_prop,
+        ICEBERG_PARAM_LEN, get_rest_catalog, is_storage_url, map_param_name_to_iceberg_prop,
         parse_hadoop_table_url, parse_table_url, verify_s3_endpoint,
     },
     component::dataset::DatasetSpec,
@@ -79,7 +79,7 @@ pub(crate) const HADOOP_PARAMETERS: [ParameterSpec; HADOOP_PARAM_LEN] = [
     ParameterSpec::runtime(METADATA_PATH_PARAM)
         .description("The Iceberg metadata file to read the table from, as a path relative to the table root in `from` (for example, `/metadata/00003-8f2c.metadata.json`) or as a full URL. When set, the table is read from exactly this file, without a catalog."),
     ParameterSpec::runtime(LEGACY_METADATA_PATH_PARAM)
-        .deprecated("Use `iceberg_metadata_path`, which takes the same value and also accepts a path relative to `from`, such as `/metadata/v1.metadata.json`."),
+        .deprecated("Use `iceberg_metadata_path`, which accepts the same full URL and also a path relative to `from`, such as `/metadata/v1.metadata.json`."),
 ];
 
 pub(crate) const PARAMETERS: &[ParameterSpec] = &concat_arrays::<
@@ -150,8 +150,9 @@ impl IcebergDataConnector {
         dataset: &DatasetSpec,
     ) -> super::DataConnectorResult<IcebergTableParts> {
         let source = dataset.path();
+        let table_source = self.table_source(source);
 
-        if is_metadata_file(source) {
+        if let TableSource::MetadataFileInFrom = table_source {
             return Err(Error::InvalidConfigurationNoSource {
                 dataconnector: "iceberg".into(),
                 connector_component: ConnectorComponent::from(dataset),
@@ -214,32 +215,38 @@ impl IcebergDataConnector {
                 None
             };
 
-        if is_storage_url(source) {
-            if let Some(metadata_path) = self.metadata_path() {
+        match table_source {
+            TableSource::Pinned(pinned) => {
                 return IcebergDataConnector::load_pinned_table(
                     &props,
                     storage_factory,
                     dataset,
                     source,
-                    &metadata_path,
+                    &pinned,
                 )
                 .await;
             }
-
-            return IcebergDataConnector::load_hadoop_catalog(
-                props,
-                storage_factory,
-                dataset,
-                source,
-            )
-            .await;
-        }
-
-        if self.metadata_path().is_some() {
-            tracing::warn!(
-                "Dataset {} ignores `iceberg_metadata_path`: it applies only when `from` is an object-store or file path, and this dataset reads the table through a REST catalog.",
-                dataset.name
-            );
+            TableSource::StoragePath => {
+                return IcebergDataConnector::load_hadoop_catalog(
+                    props,
+                    storage_factory,
+                    dataset,
+                    source,
+                )
+                .await;
+            }
+            TableSource::RestCatalog {
+                ignored_param: Some(param),
+            } => {
+                tracing::warn!(
+                    "Dataset '{}' ignores `{param}`: it applies only when `from` is an object-store or file path, and this dataset reads the table through a REST catalog.",
+                    dataset.name
+                );
+            }
+            TableSource::RestCatalog {
+                ignored_param: None,
+            }
+            | TableSource::MetadataFileInFrom => {}
         }
 
         let (base_uri, new_props, namespace, table_name) = match parse_table_url(source) {
@@ -272,36 +279,34 @@ impl IcebergDataConnector {
         let namespace_ident = namespace.name().clone();
         let table_identifier = TableIdent::new(namespace_ident, table_name.clone());
 
-        let table_provider = IcebergTableProvider::try_new(
-            Arc::clone(&catalog_client),
-            table_identifier.namespace().clone(),
-            table_identifier.name().to_string(),
-        )
-        .await
-        .map_err(|e| Error::UnableToGetReadProvider {
-            dataconnector: "iceberg".into(),
-            connector_component: ConnectorComponent::from(dataset),
-            source: Box::new(e),
-        })?;
-
-        Ok(IcebergTableParts {
-            provider: Arc::new(table_provider),
-            #[cfg(feature = "iceberg-write")]
-            catalog: catalog_client,
-            #[cfg(feature = "iceberg-write")]
-            table_identifier,
-        })
+        table_parts(catalog_client, table_identifier, dataset).await
     }
 
-    /// The metadata file the dataset pins, under either accepted spelling.
-    fn metadata_path(&self) -> Option<String> {
+    /// Where the dataset's table is read from, decided from its configuration
+    /// alone. The read path and the write refusal both match on it, so they cannot
+    /// disagree about which datasets are pinned.
+    fn table_source(&self, source: &str) -> TableSource {
+        if is_metadata_file(source) {
+            TableSource::MetadataFileInFrom
+        } else if is_storage_url(source) {
+            self.pinned_metadata()
+                .map_or(TableSource::StoragePath, TableSource::Pinned)
+        } else {
+            TableSource::RestCatalog {
+                ignored_param: self.pinned_metadata().map(|pinned| pinned.param),
+            }
+        }
+    }
+
+    /// The metadata file the dataset pins, and the parameter that names it.
+    fn pinned_metadata(&self) -> Option<PinnedMetadata> {
         [METADATA_PATH_PARAM, LEGACY_METADATA_PATH_PARAM]
             .into_iter()
-            .find_map(|name| {
-                self.params
-                    .get(name)
-                    .ok()
-                    .map(|value| value.expose_secret().to_string())
+            .find_map(|param| {
+                self.params.get(param).ok().map(|value| PinnedMetadata {
+                    param,
+                    value: value.expose_secret().to_string(),
+                })
             })
     }
 
@@ -313,15 +318,16 @@ impl IcebergDataConnector {
         storage_factory: Option<Arc<dyn StorageFactory>>,
         dataset: &DatasetSpec,
         source: &str,
-        metadata_path: &str,
+        pinned: &PinnedMetadata,
     ) -> super::DataConnectorResult<IcebergTableParts> {
-        let location = resolve_metadata_location(source, metadata_path).map_err(|message| {
-            Error::InvalidConfigurationNoSource {
-                dataconnector: "iceberg".into(),
-                connector_component: ConnectorComponent::from(dataset),
-                message,
-            }
-        })?;
+        let location =
+            pinned
+                .location(source)
+                .map_err(|message| Error::InvalidConfigurationNoSource {
+                    dataconnector: "iceberg".into(),
+                    connector_component: ConnectorComponent::from(dataset),
+                    message,
+                })?;
 
         let factory = storage_factory.unwrap_or_else(|| default_storage_factory(&location));
         let file_io = FileIOBuilder::new(factory)
@@ -336,7 +342,7 @@ impl IcebergDataConnector {
         );
 
         tracing::debug!(
-            "Dataset {} reads Iceberg metadata file '{location}'",
+            "Dataset '{}' reads Iceberg metadata file '{location}'",
             dataset.name
         );
         let catalog = MetadataFileCatalog::try_new(&location, table_identifier.clone(), file_io)
@@ -348,25 +354,7 @@ impl IcebergDataConnector {
             })?;
         let catalog_client: Arc<dyn Catalog> = Arc::new(catalog);
 
-        let table_provider = IcebergTableProvider::try_new(
-            Arc::clone(&catalog_client),
-            table_identifier.namespace().clone(),
-            table_identifier.name().to_string(),
-        )
-        .await
-        .map_err(|e| Error::UnableToGetReadProvider {
-            dataconnector: "iceberg".into(),
-            connector_component: ConnectorComponent::from(dataset),
-            source: Box::new(e),
-        })?;
-
-        Ok(IcebergTableParts {
-            provider: Arc::new(table_provider),
-            #[cfg(feature = "iceberg-write")]
-            catalog: catalog_client,
-            #[cfg(feature = "iceberg-write")]
-            table_identifier,
-        })
+        table_parts(catalog_client, table_identifier, dataset).await
     }
 
     async fn load_hadoop_catalog(
@@ -413,25 +401,7 @@ impl IcebergDataConnector {
                 }
             })?);
 
-        let table_provider = IcebergTableProvider::try_new(
-            Arc::clone(&catalog_client),
-            table_identifier.namespace().clone(),
-            table_identifier.name().to_string(),
-        )
-        .await
-        .map_err(|e| Error::UnableToGetReadProvider {
-            dataconnector: "iceberg".into(),
-            connector_component: ConnectorComponent::from(dataset),
-            source: Box::new(e),
-        })?;
-
-        Ok(IcebergTableParts {
-            provider: Arc::new(table_provider),
-            #[cfg(feature = "iceberg-write")]
-            catalog: catalog_client,
-            #[cfg(feature = "iceberg-write")]
-            table_identifier,
-        })
+        table_parts(catalog_client, table_identifier, dataset).await
     }
 }
 
@@ -464,10 +434,11 @@ impl DataConnector for IcebergDataConnector {
         _context: &dyn ConnectorContext,
         dataset: &DatasetSpec,
     ) -> Option<super::DataConnectorResult<Arc<dyn TableProvider>>> {
-        // Refused before anything is built: an Iceberg insert writes its data files
-        // before the commit the catalog-less table would reject, which would leave
-        // orphan files in the table's location.
-        if is_storage_url(dataset.path()) && self.metadata_path().is_some() {
+        // A table pinned to one metadata file has no catalog to commit to. Refused
+        // before anything is built: an Iceberg insert writes its data files before
+        // the commit that would be rejected, which would leave orphan files in a
+        // table location Spice usually does not own.
+        if let TableSource::Pinned(_) = self.table_source(dataset.path()) {
             return Some(Err(Error::InvalidConfigurationNoSource {
                 dataconnector: "iceberg".into(),
                 connector_component: ConnectorComponent::from(dataset),
@@ -503,14 +474,77 @@ impl DataConnector for IcebergDataConnector {
 data_connector_api::register_data_connector!("iceberg", IcebergDataConnectorFactory);
 
 #[cfg(feature = "iceberg-write")]
-const READ_ONLY_PINNED_TABLE_MESSAGE: &str = "An Iceberg table read from its metadata file (`iceberg_metadata_path`) has no catalog, so it is read-only. Remove `access: read_write` from the dataset, or read the table through an Iceberg catalog to write to it. See: https://spiceai.org/docs/components/data-connectors/iceberg";
+const READ_ONLY_PINNED_TABLE_MESSAGE: &str = "An Iceberg table read from its metadata file (`iceberg_metadata_path`) has no catalog to commit to, so it is read-only. Remove `access: read_write` from the dataset, or read the table through an Iceberg catalog to write to it. See: https://spiceai.org/docs/components/data-connectors/iceberg";
 
-/// Whether `source` addresses object storage or the local filesystem, rather than a
-/// catalog service.
-fn is_storage_url(source: &str) -> bool {
-    ["file://", "s3://", "s3a://", "gs://", "gcs://"]
-        .iter()
-        .any(|scheme| source.starts_with(scheme))
+/// Where an Iceberg dataset's table is read from.
+enum TableSource {
+    /// `from` names a metadata file instead of the table root.
+    MetadataFileInFrom,
+    /// A table root on storage, read from the metadata file the dataset pins.
+    Pinned(PinnedMetadata),
+    /// A table root on storage whose current metadata file is found from its
+    /// `metadata/` directory.
+    StoragePath,
+    /// A table served by an Iceberg REST catalog. `ignored_param` names a pinning
+    /// parameter that was set but does not apply.
+    RestCatalog { ignored_param: Option<&'static str> },
+}
+
+/// Builds the table provider for `table_identifier` in `catalog_client`, keeping
+/// the catalog and identity the read-write and distributed providers need.
+async fn table_parts(
+    catalog_client: Arc<dyn Catalog>,
+    table_identifier: TableIdent,
+    dataset: &DatasetSpec,
+) -> super::DataConnectorResult<IcebergTableParts> {
+    let table_provider = IcebergTableProvider::try_new(
+        Arc::clone(&catalog_client),
+        table_identifier.namespace().clone(),
+        table_identifier.name().to_string(),
+    )
+    .await
+    .map_err(|e| Error::UnableToGetReadProvider {
+        dataconnector: "iceberg".into(),
+        connector_component: ConnectorComponent::from(dataset),
+        source: Box::new(e),
+    })?;
+
+    Ok(IcebergTableParts {
+        provider: Arc::new(table_provider),
+        #[cfg(feature = "iceberg-write")]
+        catalog: catalog_client,
+        #[cfg(feature = "iceberg-write")]
+        table_identifier,
+    })
+}
+
+/// The metadata file a dataset pins, with the parameter that named it.
+struct PinnedMetadata {
+    param: &'static str,
+    value: String,
+}
+
+impl PinnedMetadata {
+    /// The URL of the pinned file. `iceberg_metadata_path` resolves against the
+    /// table root in `from`; the earlier `metadata_path` keeps its meaning and is
+    /// used as given.
+    fn location(&self, table_root: &str) -> Result<String, String> {
+        let location = if self.param == METADATA_PATH_PARAM {
+            resolve_metadata_location(table_root, &self.value)?
+        } else {
+            self.value.clone()
+        };
+        Ok(with_gcs_scheme_as_gs(location))
+    }
+}
+
+/// Iceberg's GCS storage addresses objects only as `gs://`; `gcs://` names the
+/// same location.
+fn with_gcs_scheme_as_gs(location: String) -> String {
+    match location.strip_prefix("gcs://") {
+        Some(rest) => format!("gs://{rest}"),
+        None => location,
+    }
 }
 
 /// Whether `source` names a metadata file rather than a table: plain
@@ -666,6 +700,36 @@ mod tests {
         assert_eq!(
             metadata_file_in_from_message(&source),
             "`from` names an Iceberg metadata file, but it must name the table root. Set `from` to 'iceberg:s3://my-bucket/warehouse/db/taxis' and `iceberg_metadata_path` to '/metadata/00003-8f2c.metadata.json'. See: https://spiceai.org/docs/components/data-connectors/iceberg"
+        );
+    }
+
+    #[test]
+    fn the_earlier_metadata_path_is_used_as_given_and_both_names_take_gcs_urls_as_gs() {
+        let legacy = PinnedMetadata {
+            param: LEGACY_METADATA_PATH_PARAM,
+            value: "/srv/warehouse/db/taxis/metadata/v3.metadata.json".to_string(),
+        };
+        assert_eq!(
+            legacy.location("file:///srv/warehouse/db/taxis"),
+            Ok("/srv/warehouse/db/taxis/metadata/v3.metadata.json".to_string()),
+            "`metadata_path` must keep its earlier meaning, not resolve against `from`"
+        );
+
+        let relative = PinnedMetadata {
+            param: METADATA_PATH_PARAM,
+            value: "/metadata/v3.metadata.json".to_string(),
+        };
+        assert_eq!(
+            relative.location("gcs://bucket/db/taxis"),
+            Ok("gs://bucket/db/taxis/metadata/v3.metadata.json".to_string())
+        );
+        let legacy_gcs = PinnedMetadata {
+            param: LEGACY_METADATA_PATH_PARAM,
+            value: "gcs://bucket/db/taxis/metadata/v3.metadata.json".to_string(),
+        };
+        assert_eq!(
+            legacy_gcs.location("gcs://bucket/db/taxis"),
+            Ok("gs://bucket/db/taxis/metadata/v3.metadata.json".to_string())
         );
     }
 
