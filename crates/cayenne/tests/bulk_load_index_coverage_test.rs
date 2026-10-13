@@ -18,7 +18,7 @@ limitations under the License.
 //! secondary index the moment it returns: the first lookup after it reads only
 //! indexed files, though the fold rewrote every file the load wrote.
 
-mod common;
+use crate::common;
 
 use arrow::array::{Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};

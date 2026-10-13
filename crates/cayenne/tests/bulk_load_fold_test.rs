@@ -16,7 +16,7 @@ limitations under the License.
 
 //! Differential coverage of a first keyed load with repeated composite keys.
 
-mod common;
+use crate::common;
 
 use arrow::array::{AsArray, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Int64Type, Schema};
