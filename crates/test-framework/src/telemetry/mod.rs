@@ -248,7 +248,7 @@ mod tests {
     use opentelemetry_sdk::{
         Resource,
         metrics::{
-            data::{AggregatedMetrics, MetricData, ResourceMetrics},
+            data::{AggregatedMetrics, MetricData, ResourceMetrics, ScopeMetrics},
             reader::MetricReader,
         },
     };
@@ -257,6 +257,7 @@ mod tests {
     #[test]
     fn gauge_keeps_more_attribute_sets_than_the_sdk_default() {
         const QUERIES: usize = 2_500;
+        const { assert!(QUERIES < CARDINALITY_LIMIT) }
         let reader = InitialReader::default();
         let provider = meter_provider(Resource::builder_empty().build(), reader.clone());
         let gauge = provider.meter("test").f64_gauge("per_query").build();
@@ -268,7 +269,7 @@ mod tests {
         reader.collect(&mut rm).expect("collects");
         let metric = rm
             .scope_metrics()
-            .flat_map(|scope| scope.metrics())
+            .flat_map(ScopeMetrics::metrics)
             .find(|metric| metric.name() == "per_query")
             .expect("the gauge is collected");
         let AggregatedMetrics::F64(MetricData::Gauge(gauge)) = metric.data() else {
@@ -284,6 +285,5 @@ mod tests {
             .count();
         assert_eq!(overflowed, 0);
         assert_eq!(gauge.data_points().count(), QUERIES);
-        assert!(QUERIES < CARDINALITY_LIMIT);
     }
 }
