@@ -593,18 +593,18 @@ mod served_from_acceleration {
     use app::AppBuilder;
     use arrow::array::Int64Array;
     use arrow_tools::metadata_keys::ACCELERATION_PRIMARY_KEY_METADATA_KEY;
+    use cache::result::CacheStatus;
+    use futures::TryStreamExt;
     use runtime::{Runtime, status::ComponentStatus};
+    use spicepod::component::{
+        caching::{Caching, SQLResultsCacheConfig},
+        runtime::Runtime as SpicepodRuntime,
+    };
     use spicepod::{
         acceleration::{Acceleration, Mode, RefreshMode},
         component::dataset::{Dataset as SpicepodDataset, ReadyState},
         param::Params,
         semantic::Column,
-    };
-    use cache::result::CacheStatus;
-    use futures::TryStreamExt;
-    use spicepod::component::{
-        caching::{Caching, SQLResultsCacheConfig},
-        runtime::Runtime as SpicepodRuntime,
     };
     use tempfile::TempDir;
 
@@ -745,8 +745,7 @@ mod served_from_acceleration {
                 caching: Caching {
                     sql_results: Some(SQLResultsCacheConfig {
                         item_ttl: Some(item_ttl.to_string()),
-                        stale_while_revalidate_ttl: stale_while_revalidate_ttl
-                            .map(str::to_string),
+                        stale_while_revalidate_ttl: stale_while_revalidate_ttl.map(str::to_string),
                         ..Default::default()
                     }),
                     ..Default::default()
@@ -2274,8 +2273,7 @@ mod served_from_acceleration {
         source.take_down();
         source.set_value(2);
         let (rt, loader) =
-            start_with_results_cache(fixture.dataset(ReadyState::OnLoad), "1s", Some("30s"))
-                .await;
+            start_with_results_cache(fixture.dataset(ReadyState::OnLoad), "1s", Some("30s")).await;
         assert!(
             served_from_acceleration(&rt, Duration::from_secs(10)).await,
             "queries must be answered from the existing acceleration, got {:?} ({:?})",
