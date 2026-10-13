@@ -159,11 +159,6 @@ impl IcebergCatalogProvider {
                 },
             };
 
-        let schema_names: Vec<String> = child_namespaces
-            .iter()
-            .map(schema_name_for_namespace)
-            .collect();
-
         let providers = try_join_all(child_namespaces.iter().map(|namespace| {
             let semaphore_clone = Arc::clone(&load_semaphore);
             IcebergSchemaProvider::try_new(
@@ -176,8 +171,9 @@ impl IcebergCatalogProvider {
         }))
         .await?;
 
-        let schemas: HashMap<String, Arc<dyn SchemaProvider>> = schema_names
-            .into_iter()
+        let schemas: HashMap<String, Arc<dyn SchemaProvider>> = child_namespaces
+            .iter()
+            .map(schema_name_for_namespace)
             .zip(providers)
             .map(|(name, provider)| {
                 let provider = Arc::new(provider) as Arc<dyn SchemaProvider>;
