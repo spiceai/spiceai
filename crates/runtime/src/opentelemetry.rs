@@ -220,18 +220,20 @@ impl MetricsService for Service {
                         data_points_count
                     );
                     if stored_in_metrics_store {
-                        // Stored already; a per-metric dataset is optional in this mode.
+                        // Stored already; a per-metric dataset is optional in this mode, but
+                        // when one exists a failed write to it still rejects those points.
                         if self
                             .datafusion
                             .is_writable(&TableReference::bare(metric.name.clone()))
                         {
-                            self.ingest_metric(
-                                &metric.name,
-                                &data,
-                                resource_attrs,
-                                data_points_count,
-                            )
-                            .await;
+                            rejected_data_points += self
+                                .ingest_metric(
+                                    &metric.name,
+                                    &data,
+                                    resource_attrs,
+                                    data_points_count,
+                                )
+                                .await;
                         }
                         continue;
                     }
@@ -3089,6 +3091,8 @@ mod tests {
         tables_written: Mutex<Vec<String>>,
         /// Tables that accept writes. `None`: every table does.
         writable_tables: Option<Vec<String>>,
+        /// Writable tables whose every write fails.
+        failing_tables: Vec<String>,
     }
 
     // `QueryEngine` requires `Debug`, and `SessionContext` does not implement it.
@@ -3123,12 +3127,19 @@ mod tests {
                 batches_written: Mutex::new(Vec::new()),
                 tables_written: Mutex::new(Vec::new()),
                 writable_tables: None,
+                failing_tables: Vec::new(),
             }
         }
 
         /// Only `tables` accept writes.
         fn writable_only(mut self, tables: &[&str]) -> Self {
             self.writable_tables = Some(tables.iter().map(ToString::to_string).collect());
+            self
+        }
+
+        /// Every write to `tables` fails.
+        fn failing_on(mut self, tables: &[&str]) -> Self {
+            self.failing_tables = tables.iter().map(ToString::to_string).collect();
             self
         }
 
@@ -3223,7 +3234,12 @@ mod tests {
             _update_type: UpdateType,
         ) -> QueryEngineResult<()> {
             let call = self.write_calls.fetch_add(1, Ordering::SeqCst);
-            if call < self.failing_writes {
+            if call < self.failing_writes
+                || self
+                    .failing_tables
+                    .iter()
+                    .any(|t| *t == table_ref.to_string())
+            {
                 return Err(match self.failure_mode {
                     WriteFailureMode::SchemaMismatch => schema_mismatch_write_error(table_ref),
                     WriteFailureMode::Generic => QueryEngineError::WriteData {
@@ -3371,6 +3387,37 @@ mod tests {
         assert_eq!(
             engine.tables_written(),
             vec!["otel_metrics".to_string(), "svc_requests".to_string()]
+        );
+    }
+
+    /// A failed write to a per-metric dataset is still rejected when the metrics store took the
+    /// export, so the exporter learns that dataset missed those points.
+    #[tokio::test]
+    async fn failed_per_metric_write_is_rejected_next_to_the_metrics_store() {
+        let engine = Arc::new(
+            FakeQueryEngine::unregistered()
+                .writable_only(&["otel_metrics", "svc_requests"])
+                .failing_on(&["svc_requests"]),
+        );
+        let service = store_service(&engine, &["otel_metrics"]);
+
+        let request = otlp_request(vec![
+            otlp_metric("svc_requests", Some(gauge(1.0))),
+            otlp_metric("other", Some(gauge(2.0))),
+        ]);
+        let response = service
+            .export(Request::new(request))
+            .await
+            .expect("the store took every point")
+            .into_inner();
+
+        assert_eq!(engine.tables_written(), vec!["otel_metrics".to_string()]);
+        assert_eq!(
+            response
+                .partial_success
+                .expect("the per-metric dataset missed its point")
+                .rejected_data_points,
+            1
         );
     }
 
