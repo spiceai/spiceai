@@ -67109,9 +67109,10 @@ mod tests {
             early_capture.is_err(),
             "a cancelled request must not admit another snapshot capture while its build runs"
         );
-        captured_rx
+        tokio::time::timeout(Duration::from_secs(10), captured_rx)
             .await
-            .expect("queued query captures after admission");
+            .expect("queued query captures after admission")
+            .expect("capture signal");
         assert_eq!(
             collect_id_value_pairs_from_batches(&rows),
             vec![(1, 12), (2, 20), (3, 30)],
