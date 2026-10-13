@@ -719,6 +719,10 @@ impl CpuBudget {
                 "dedicated_runtime_worker_threads",
                 self.dedicated_runtime_worker_threads(),
             ),
+            (
+                "interactive_query_worker_threads",
+                self.interactive_query_worker_threads(),
+            ),
             ("target_partitions", self.target_partitions()),
             ("scan_split_concurrency", self.scan_split_concurrency()),
             ("vortex_parallelism", self.vortex_parallelism()),
@@ -1103,6 +1107,18 @@ impl CpuBudget {
     pub const fn dedicated_runtime_worker_threads(&self) -> usize {
         let reserved = self.cores.saturating_sub(1);
         if reserved == 0 { 1 } else { reserved }
+    }
+
+    /// Worker threads for the interactive query runtime, which runs queries
+    /// that read a bounded set of rows by primary key apart from the analytical
+    /// queries on the `cpu` runtime: a fifth of the cores, at least two. A key
+    /// lookup costs milliseconds of CPU, so a few threads keep up with a high
+    /// lookup rate, and they are runnable beside the `cpu` runtime's rather
+    /// than queued behind its tasks.
+    #[must_use]
+    pub const fn interactive_query_worker_threads(&self) -> usize {
+        let threads = self.cores / 5;
+        if threads < 2 { 2 } else { threads }
     }
 
     // ---- query engine ----
@@ -2036,7 +2052,7 @@ mod tests {
 
     /// The claim in `configured_above_ceiling_warning` is that lowering changes
     /// no pool size — not that every pool equals the core budget, which is false
-    /// and was what the message said. Three of the fifteen derived quantities
+    /// and was what the message said. Four of the sixteen derived quantities
     /// diverge from `cores` at `cores = 3`, and a reword checked only against
     /// `derived_sizing()` being *unchanged* cannot see that, because unchanged
     /// and equal are different properties. This pins the divergence itself, so
@@ -2060,6 +2076,7 @@ mod tests {
             divergent,
             vec![
                 ("dedicated_runtime_worker_threads", 2),
+                ("interactive_query_worker_threads", 2),
                 ("max_concurrent_queries", 12),
                 ("cayenne_encode_permits", 1),
             ],
@@ -2673,6 +2690,7 @@ mod tests {
         for name in [
             "main_runtime_worker_threads",
             "dedicated_runtime_worker_threads",
+            "interactive_query_worker_threads",
             "target_partitions",
             "max_concurrent_queries",
             "cayenne_encode_permits",

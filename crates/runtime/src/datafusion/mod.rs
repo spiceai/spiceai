@@ -1342,6 +1342,10 @@ pub struct DataFusion {
     pub(crate) task_history_captured_output: bool,
     // Dedicated runtime for CPU-bound DataFusion queries
     cpu_runtime: OnceLock<ManagedTokioRuntime>,
+    // Small runtime for queries that read a bounded set of rows by primary key
+    // (`point_lookup::is_bounded_key_lookup`), so a lookup does not queue behind
+    // analytical work on `cpu_runtime`.
+    interactive_runtime: OnceLock<ManagedTokioRuntime>,
     // Dedicated runtime for CPU-bound DataFusion acceleration for dataset acceleration refresh tasks
     refresh_runtime: OnceLock<ManagedTokioRuntime>,
     // Dedicated, DEFAULT-priority (nice 0) runtime for the CDC changes-apply loop
@@ -2192,6 +2196,26 @@ impl DataFusion {
     #[must_use]
     pub fn cpu_runtime(&self) -> Option<&tokio::runtime::Handle> {
         self.cpu_runtime.get().map(ManagedTokioRuntime::handle)
+    }
+
+    /// Set the runtime that queries reading a bounded set of rows by primary key
+    /// run on, apart from the analytical queries on [`Self::cpu_runtime`]. Used
+    /// only while a CPU runtime is set too.
+    pub fn set_interactive_runtime(&self, handle: ManagedTokioRuntime) {
+        if self.interactive_runtime.set(handle).is_err() {
+            // Failure to set means this was already set - that shouldn't happen.
+            tracing::error!(
+                "Failed to set interactive tokio runtime on the Datafusion struct, this is an unexpected internal error"
+            );
+        }
+    }
+
+    /// The runtime bounded key lookups run on; see [`Self::set_interactive_runtime`].
+    #[must_use]
+    pub fn interactive_runtime(&self) -> Option<&tokio::runtime::Handle> {
+        self.interactive_runtime
+            .get()
+            .map(ManagedTokioRuntime::handle)
     }
 
     /// Set the dedicated refresh runtime for acceleration refresh workers.

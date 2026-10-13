@@ -28,6 +28,10 @@ limitations under the License.
 //! recognised lookup they hand their input back untouched. Every other rule runs as it always
 //! does, including any rule a `DataFusion` upgrade adds: this is a list of rules to skip, not a
 //! list of rules to keep, so a new rule is never skipped by omission.
+//!
+//! [`is_bounded_key_lookup`] recognises the wider family of queries that read a bounded number of
+//! rows by primary key — several keys, `IN` lists, a disjunction of whole keys — which the query
+//! runtime runs apart from analytical work (see `Query::run`).
 
 use std::fmt::{self, Debug, Formatter};
 use std::sync::Arc;
@@ -38,8 +42,8 @@ use datafusion::common::{Constraint, ScalarValue};
 use datafusion::error::Result;
 use datafusion::execution::SessionStateBuilder;
 use datafusion::execution::session_state::SessionState;
-use datafusion::logical_expr::utils::split_conjunction;
-use datafusion::logical_expr::{BinaryExpr, Expr, LogicalPlan, Operator, TableScan};
+use datafusion::logical_expr::utils::{split_binary, split_conjunction};
+use datafusion::logical_expr::{BinaryExpr, Expr, InList, LogicalPlan, Operator, TableScan};
 use datafusion::optimizer::{AnalyzerRule, ApplyOrder, Optimizer, OptimizerConfig, OptimizerRule};
 use datafusion::physical_optimizer::optimizer::PhysicalOptimizer;
 use datafusion::physical_optimizer::{PhysicalOptimizerContext, PhysicalOptimizerRule};
@@ -233,6 +237,164 @@ fn scan_is_keyed_by(scan: &TableScan, predicates: &[&Expr]) -> bool {
                 .any(|conjunct| is_equality_on(conjunct, name))
         }
     })
+}
+
+/// The most primary keys a query may name and still count as a [bounded key
+/// lookup](is_bounded_key_lookup): enough for a batch of lookups by key, few enough that reading
+/// them is a handful of rows whatever the table's size.
+pub(crate) const MAX_BOUNDED_LOOKUP_KEYS: usize = 4096;
+
+/// Whether `plan` (unoptimized) reads at most a bounded set of rows by primary key: one table scan
+/// under filters that pin every primary-key column of the scanned table to finitely many constants,
+/// naming at most [`MAX_BOUNDED_LOOKUP_KEYS`] keys, with nothing above the scan but projections,
+/// filters, aliases, a sort or a limit, and no subquery, aggregate or window anywhere.
+///
+/// A key column is pinned by `column = constant`, by `column IN (constants)`, or by a disjunction of
+/// those; a disjunction of conjunctions that each pin the whole key — the shape of a batch of
+/// composite-key lookups, `(a = 1 AND b = 2) OR (a = 3 AND b = 4)` — names one key per branch.
+/// Other predicates may narrow the rows further and are ignored. Unlike [`is_point_lookup`] this
+/// says nothing about which optimizer rules can change the plan; it bounds the rows the query reads.
+pub(crate) fn is_bounded_key_lookup(plan: &LogicalPlan) -> bool {
+    let mut node = plan;
+    let mut predicates: Vec<&Expr> = Vec::new();
+    loop {
+        match node {
+            LogicalPlan::Projection(projection) => {
+                if projection.expr.iter().any(reads_beyond_its_row) {
+                    return false;
+                }
+                node = projection.input.as_ref();
+            }
+            LogicalPlan::SubqueryAlias(alias) => node = alias.input.as_ref(),
+            LogicalPlan::Filter(filter) => {
+                if reads_beyond_its_row(&filter.predicate) {
+                    return false;
+                }
+                predicates.push(&filter.predicate);
+                node = filter.input.as_ref();
+            }
+            LogicalPlan::Sort(sort) => {
+                if sort.expr.iter().any(|sort| reads_beyond_its_row(&sort.expr)) {
+                    return false;
+                }
+                node = sort.input.as_ref();
+            }
+            LogicalPlan::Limit(limit) => {
+                if [&limit.skip, &limit.fetch]
+                    .into_iter()
+                    .flatten()
+                    .any(|expr| reads_beyond_its_row(expr))
+                {
+                    return false;
+                }
+                node = limit.input.as_ref();
+            }
+            LogicalPlan::TableScan(scan) => return scan_has_bounded_keys(scan, &predicates),
+            _ => return false,
+        }
+    }
+}
+
+/// Whether `expr` needs more than the row it is evaluated on: a subquery, an outer reference, an
+/// aggregate, a window or an unnest.
+fn reads_beyond_its_row(expr: &Expr) -> bool {
+    expr.exists(|expr| {
+        Ok(matches!(
+            expr,
+            Expr::Exists(_)
+                | Expr::InSubquery(_)
+                | Expr::SetComparison(_)
+                | Expr::ScalarSubquery(_)
+                | Expr::OuterReferenceColumn(..)
+                | Expr::AggregateFunction(_)
+                | Expr::WindowFunction(_)
+                | Expr::Unnest(_)
+                | Expr::GroupingSet(_)
+        ))
+    })
+    .unwrap_or(true)
+}
+
+fn scan_has_bounded_keys(scan: &TableScan, predicates: &[&Expr]) -> bool {
+    let Some(primary_key) = scan.source.constraints().and_then(|constraints| {
+        constraints.iter().find_map(|constraint| match constraint {
+            Constraint::PrimaryKey(indices) => Some(indices),
+            Constraint::Unique(_) => None,
+        })
+    }) else {
+        return false;
+    };
+    let schema = scan.source.schema();
+    let Some(key_columns) = primary_key
+        .iter()
+        .map(|&index| (index < schema.fields().len()).then(|| schema.field(index).name().as_str()))
+        .collect::<Option<Vec<&str>>>()
+    else {
+        return false;
+    };
+    if key_columns.is_empty() {
+        return false;
+    }
+    let conjuncts: Vec<&Expr> = predicates
+        .iter()
+        .copied()
+        .chain(scan.filters.iter())
+        .flat_map(split_conjunction)
+        .collect();
+    keys_named(&conjuncts, &key_columns).is_some_and(|keys| keys <= MAX_BOUNDED_LOOKUP_KEYS)
+}
+
+/// How many primary keys the conjunction of `conjuncts` can match at most, or `None` when it leaves
+/// some key column unbounded: the product of what each key column is pinned to, or the keys a
+/// disjunction among the conjuncts names branch by branch, whichever is fewer.
+fn keys_named(conjuncts: &[&Expr], key_columns: &[&str]) -> Option<usize> {
+    let by_column = key_columns.iter().try_fold(1_usize, |keys, column| {
+        conjuncts
+            .iter()
+            .filter_map(|conjunct| values_pinned(conjunct, column))
+            .min()
+            .map(|values| keys.saturating_mul(values))
+    });
+    let by_disjunction = conjuncts
+        .iter()
+        .filter_map(|conjunct| {
+            let branches = split_binary(conjunct, Operator::Or);
+            if branches.len() < 2 {
+                return None;
+            }
+            branches.iter().try_fold(0_usize, |keys, branch| {
+                keys_named(&split_conjunction(branch), key_columns)
+                    .map(|named| keys.saturating_add(named))
+            })
+        })
+        .min();
+    match (by_column, by_disjunction) {
+        (Some(by_column), Some(by_disjunction)) => Some(by_column.min(by_disjunction)),
+        (by_column, by_disjunction) => by_column.or(by_disjunction),
+    }
+}
+
+/// How many values `expr` allows `column`: one for `column = constant`, the list's length for
+/// `column IN (constants)`, and the sum over its branches for a disjunction of those.
+fn values_pinned(expr: &Expr, column: &str) -> Option<usize> {
+    let branches = split_binary(expr, Operator::Or);
+    if branches.len() > 1 {
+        return branches.iter().try_fold(0_usize, |values, branch| {
+            values_pinned(branch, column).map(|pinned| values.saturating_add(pinned))
+        });
+    }
+    match expr {
+        Expr::InList(InList {
+            expr,
+            list,
+            negated: false,
+        }) if matches!(expr.as_ref(), Expr::Column(c) if c.name == column)
+            && list.iter().all(is_constant) =>
+        {
+            Some(list.len())
+        }
+        _ => is_equality_on(expr, column).then_some(1),
+    }
 }
 
 fn is_plain_column(expr: &Expr) -> bool {
@@ -478,7 +640,10 @@ mod tests {
     use datafusion::physical_plan::displayable;
     use datafusion::prelude::SessionContext;
 
-    use super::{create_physical_plan, is_point_lookup, wrap_skippable_rules};
+    use super::{
+        MAX_BOUNDED_LOOKUP_KEYS, create_physical_plan, is_bounded_key_lookup, is_point_lookup,
+        wrap_skippable_rules,
+    };
 
     fn context() -> SessionContext {
         let schema = Arc::new(Schema::new(vec![
@@ -561,6 +726,51 @@ mod tests {
         ] {
             assert!(!is_point_lookup(&unoptimized(&ctx, sql).await), "{sql}");
         }
+    }
+
+    #[tokio::test]
+    async fn bounded_key_lookups_name_finitely_many_keys() {
+        let ctx = context();
+        for sql in [
+            "SELECT * FROM keyed WHERE id = 5",
+            "SELECT * FROM keyed WHERE id = 5 OR id = 6",
+            "SELECT * FROM keyed WHERE id IN (5, 6, 7)",
+            "SELECT CAST(id AS VARCHAR), upper(name) FROM keyed WHERE id = 5",
+            "SELECT * FROM keyed WHERE id = 5 AND name LIKE 'n%'",
+            "SELECT * FROM keyed WHERE id = 5 ORDER BY name LIMIT 1",
+            "SELECT * FROM composite WHERE (region = 1 AND id = 5) OR (region = 2 AND id = 6)",
+            "SELECT * FROM composite WHERE region IN (1, 2) AND id IN (5, 6)",
+            "SELECT * FROM composite WHERE region = 1 AND (id = 5 OR id = 6)",
+        ] {
+            assert!(is_bounded_key_lookup(&unoptimized(&ctx, sql).await), "{sql}");
+        }
+        for sql in [
+            "SELECT * FROM unkeyed WHERE id = 5",
+            "SELECT * FROM keyed",
+            "SELECT * FROM keyed WHERE id > 5",
+            "SELECT * FROM keyed WHERE id NOT IN (5, 6)",
+            "SELECT * FROM keyed WHERE id = 5 OR name = 'n6'",
+            "SELECT * FROM composite WHERE id = 5",
+            "SELECT * FROM composite WHERE (region = 1 AND id = 5) OR id = 6",
+            "SELECT count(*) FROM keyed WHERE id = 5",
+            "SELECT DISTINCT id FROM keyed WHERE id = 5",
+            "SELECT * FROM keyed WHERE id IN (SELECT id FROM keyed)",
+            "SELECT * FROM keyed WHERE id = (SELECT max(id) FROM keyed)",
+            "SELECT a.id FROM keyed a JOIN keyed b ON a.id = b.id WHERE a.id = 5",
+        ] {
+            assert!(!is_bounded_key_lookup(&unoptimized(&ctx, sql).await), "{sql}");
+        }
+        // The key bound is inclusive: one more key than it allows reads like a scan.
+        let in_list = |keys: usize| {
+            let values: Vec<String> = (0..keys).map(|key| key.to_string()).collect();
+            format!("SELECT * FROM keyed WHERE id IN ({})", values.join(", "))
+        };
+        assert!(is_bounded_key_lookup(
+            &unoptimized(&ctx, &in_list(MAX_BOUNDED_LOOKUP_KEYS)).await
+        ));
+        assert!(!is_bounded_key_lookup(
+            &unoptimized(&ctx, &in_list(MAX_BOUNDED_LOOKUP_KEYS + 1)).await
+        ));
     }
 
     /// Neither the rules a point lookup skips nor the optimizer pass it does without may change

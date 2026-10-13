@@ -92,6 +92,7 @@ impl ManagedTokioRuntime {
 pub struct ManagedTokioRuntimeBuilder {
     low_priority: bool,
     thread_name: Option<String>,
+    worker_threads: Option<usize>,
 }
 
 impl Default for ManagedTokioRuntimeBuilder {
@@ -107,6 +108,7 @@ impl ManagedTokioRuntimeBuilder {
         Self {
             low_priority: false,
             thread_name: None,
+            worker_threads: None,
         }
     }
 
@@ -125,6 +127,15 @@ impl ManagedTokioRuntimeBuilder {
         self
     }
 
+    /// Run `threads` worker threads instead of the dedicated-runtime default
+    /// (`cpu_budget().dedicated_runtime_worker_threads()`). Size it from a
+    /// [`cpu_budget::CpuBudget`] method, never from a count taken here.
+    #[must_use]
+    pub fn with_worker_threads(mut self, threads: usize) -> Self {
+        self.worker_threads = Some(threads.max(1));
+        self
+    }
+
     /// Build the runtime.
     ///
     /// # Errors
@@ -134,7 +145,10 @@ impl ManagedTokioRuntimeBuilder {
         let mut builder = tokio::runtime::Builder::new_multi_thread();
         builder
             // Reserve one core for the primary Tokio runtime handling HTTP and control-plane work.
-            .worker_threads(cpu_budget::cpu_budget().dedicated_runtime_worker_threads())
+            .worker_threads(
+                self.worker_threads
+                    .unwrap_or_else(|| cpu_budget::cpu_budget().dedicated_runtime_worker_threads()),
+            )
             .enable_all();
 
         if let Some(name) = &self.thread_name {
