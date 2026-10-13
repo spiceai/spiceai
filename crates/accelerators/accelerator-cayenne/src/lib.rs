@@ -4827,7 +4827,7 @@ fn partitioning_setting_value(partitioning: &[String]) -> String {
             "[{}]",
             partitioning
                 .iter()
-                .map(|partition| format!("'{partition}'"))
+                .map(|partition| format!("'{}'", util::single_line(partition)))
                 .collect::<Vec<_>>()
                 .join(", ")
         )

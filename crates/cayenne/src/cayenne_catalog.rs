@@ -6070,13 +6070,25 @@ struct SettingChange {
 }
 
 impl SettingChange {
+    /// A setting value can hold a control character, as a quoted column identifier
+    /// may, and must not break the single line the message that embeds it is logged on.
     fn new(setting: &'static str, stored: String, requested: String) -> Self {
         Self {
             setting,
-            stored,
-            requested,
+            stored: single_line_value(stored),
+            requested: single_line_value(requested),
         }
     }
+}
+
+/// `value` with its control characters replaced ([`util::single_line`]), moved through
+/// unchanged when it has none.
+fn single_line_value(value: String) -> String {
+    let collapsed = match util::single_line(&value) {
+        std::borrow::Cow::Owned(collapsed) => Some(collapsed),
+        std::borrow::Cow::Borrowed(_) => None,
+    };
+    collapsed.unwrap_or(value)
 }
 
 impl std::fmt::Display for SettingChange {
@@ -11722,6 +11734,22 @@ mod tests {
                 "`cayenne_shard_key_columns`: none -> ['id']",
             ]
         );
+    }
+
+    /// A setting value can hold a control character (a quoted column identifier may
+    /// contain a newline), and must not break the single line a message is logged on.
+    #[test]
+    fn a_setting_value_with_a_newline_stays_on_one_line() {
+        let change = SettingChange::new(
+            "`primary_key`",
+            columns_setting_value(&["id\nWARN forged".to_string()]),
+            "none".to_string(),
+        );
+        assert_eq!(
+            change.to_string(),
+            "`primary_key`: ['id WARN forged'] -> none"
+        );
+        assert!(!settings_kept_warning("trips", &[change], false).contains('\n'));
     }
 
     #[test]
