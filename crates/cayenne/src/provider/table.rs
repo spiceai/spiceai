@@ -2292,6 +2292,11 @@ pub struct CayenneTableProvider {
     /// first fire.
     #[cfg(test)]
     test_pre_bake_prune_publish_hook: Arc<ParkingMutex<Option<TestPrePublishHook>>>,
+    /// Test-only seam fired after a mem-tier checkpoint has built its deletion-index
+    /// extension and before it takes the listing fence to publish it. Consumed on
+    /// first fire.
+    #[cfg(test)]
+    test_pre_checkpoint_deletion_publish_hook: Arc<ParkingMutex<Option<TestPrePublishHook>>>,
     /// Test-only seam fired by `sort_and_rewrite_data` after its catalog commit
     /// and before its in-memory flip, so a test can commit an overwrite between
     /// the two. Consumed on first fire.
@@ -9912,6 +9917,8 @@ impl CayenneTableProvider {
             #[cfg(test)]
             test_pre_bake_prune_publish_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
+            test_pre_checkpoint_deletion_publish_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
             test_post_catalog_commit_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
             test_post_capture_hook: Arc::new(ParkingMutex::new(None)),
@@ -12246,6 +12253,10 @@ impl CayenneTableProvider {
             test_pre_publish_hook: Arc::clone(&self.test_pre_publish_hook),
             #[cfg(test)]
             test_pre_bake_prune_publish_hook: Arc::clone(&self.test_pre_bake_prune_publish_hook),
+            #[cfg(test)]
+            test_pre_checkpoint_deletion_publish_hook: Arc::clone(
+                &self.test_pre_checkpoint_deletion_publish_hook,
+            ),
             #[cfg(test)]
             test_post_catalog_commit_hook: Arc::clone(&self.test_post_catalog_commit_hook),
             #[cfg(test)]
@@ -29313,6 +29324,17 @@ impl CayenneTableProvider {
         }
     }
 
+    /// Fire (and consume) the test-only hook between a checkpoint's deletion-index
+    /// extension and its fenced publication, if one is installed. See
+    /// [`Self::test_pre_checkpoint_deletion_publish_hook`].
+    #[cfg(test)]
+    async fn run_test_pre_checkpoint_deletion_publish_hook(&self) {
+        let hook = self.test_pre_checkpoint_deletion_publish_hook.lock().take();
+        if let Some(hook) = hook {
+            hook().await;
+        }
+    }
+
     /// Fire (and consume) the test-only post-catalog-commit hook, if one is
     /// installed. See [`Self::test_post_catalog_commit_hook`].
     #[cfg(test)]
@@ -34512,6 +34534,8 @@ impl CayenneTableProvider {
             // index on meanwhile).
             let prepared_deletion =
                 Box::pin(self.prepare_on_conflict_deletion_update(deletion_update)).await?;
+            #[cfg(test)]
+            self.run_test_pre_checkpoint_deletion_publish_hook().await;
 
             // PHASE 2 — in-memory visibility swap, UNDER the fence. Cheap: an
             // ArcSwap publish, a tier clear, and a listing-table refresh — no
@@ -51617,6 +51641,126 @@ mod tests {
             .await
             .expect("sharded CDC upsert burst");
         write.in_memory_epoch()
+    }
+
+    /// A mem-tier checkpoint builds the deletion-index extension it publishes before
+    /// it takes the listing fence. A writer that publishes another tombstone in
+    /// between moves the index on: the checkpoint must not publish its stale
+    /// extension over that tombstone, and must still publish its own. Keys 7 and 9
+    /// sit in a checkpoint file; key 7 is upserted in the RAM tier; the writer hides
+    /// key 9.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_checkpoint_keeps_a_tombstone_published_while_it_built_its_own() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_sharded_cdc_upsert_table_with_cap(
+            "prepared_deletions_race",
+            ctx.runtime_env(),
+            1,
+            0,
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), &[(7, 1), (9, 1)]).await;
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("checkpoint keys 7 and 9 into a file");
+        apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), &[(7, 2)]).await;
+
+        let published = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let provider_in_hook = provider.clone_for_write();
+            let published = Arc::clone(&published);
+            *provider.test_pre_checkpoint_deletion_publish_hook.lock() = Some(Box::new(move || {
+                Box::pin(async move {
+                    let extended =
+                        int64_tombstones(&provider_in_hook).extend_max_deletes([(9, 1_000_000)]);
+                    store_int64_tombstones(&provider_in_hook, extended);
+                    published.store(true, Ordering::SeqCst);
+                })
+            }));
+        }
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("checkpoint key 7's upsert");
+        assert!(
+            published.load(Ordering::SeqCst),
+            "precondition: the writer published between the checkpoint's extension and its publication"
+        );
+        let tombstones = int64_tombstones(&provider);
+        assert_eq!(
+            tombstones.get(9).map(|t| t.delete_sequence),
+            Some(1_000_000),
+            "the other writer's tombstone must survive the checkpoint's publication"
+        );
+        assert!(
+            tombstones.get(7).is_some(),
+            "the checkpoint must publish the tombstone hiding key 7's file copy"
+        );
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "prepared_deletions_race").await,
+            vec![(7, 2)],
+            "key 7 once, with its upserted value, and key 9 hidden"
+        );
+    }
+
+    /// A scan started while a mem-tier checkpoint builds its deletion-index
+    /// extension completes: the extension is built before the listing fence, and
+    /// the scan reads the RAM tier's upsert over the file copy it supersedes.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_scan_completes_while_a_checkpoint_builds_its_deletion_extension() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_sharded_cdc_upsert_table_with_cap(
+            "prepared_deletions_scan",
+            ctx.runtime_env(),
+            1,
+            0,
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), &[(7, 1), (9, 1)]).await;
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("checkpoint keys 7 and 9 into a file");
+        apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), &[(7, 2)]).await;
+
+        let scanned: Arc<ParkingMutex<Option<Vec<(i64, i64)>>>> = Arc::new(ParkingMutex::new(None));
+        {
+            let provider_in_hook = provider.clone_for_write();
+            let ctx_in_hook = ctx.clone();
+            let scanned = Arc::clone(&scanned);
+            *provider.test_pre_checkpoint_deletion_publish_hook.lock() = Some(Box::new(move || {
+                Box::pin(async move {
+                    let rows = tokio::time::timeout(
+                        std::time::Duration::from_secs(10),
+                        collect_id_value_pairs(
+                            &ctx_in_hook,
+                            &provider_in_hook,
+                            "prepared_deletions_scan",
+                        ),
+                    )
+                    .await
+                    .expect("a scan must not wait on the checkpoint's deletion extension");
+                    *scanned.lock() = Some(rows);
+                })
+            }));
+        }
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("checkpoint key 7's upsert");
+        assert_eq!(
+            scanned.lock().take(),
+            Some(vec![(7, 2), (9, 1)]),
+            "the scan in the window reads key 7's upsert and not its file copy"
+        );
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "prepared_deletions_scan").await,
+            vec![(7, 2), (9, 1)],
+            "after the checkpoint: key 7 once with its upserted value, key 9 unchanged"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
