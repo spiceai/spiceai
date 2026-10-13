@@ -1949,6 +1949,171 @@ jobs:
         with:
           working-directory: test_app
 
+  test_results_caching_source_down:
+    name: 'Test results caching with the source down on ${{ matrix.target.name }}'
+    runs-on: ${{ matrix.target.runner }}
+    needs:
+      - build
+      - setup-matrix
+    timeout-minutes: 5
+
+    strategy:
+      matrix:
+        target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
+
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        with:
+          name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+          path: ./build
+
+      - name: Install spice
+        uses: ./.github/actions/install-spice
+        with:
+          build-path: ./build
+
+      - name: Init spice app
+        run: |
+          spice init test_app
+
+      - name: Spice configure
+        working-directory: test_app
+        run: |
+          printf 'id,v\n1,1\n2,1\n3,1\n' > orders.csv
+          echo "runtime:" >> spicepod.yaml
+          echo "  caching:" >> spicepod.yaml
+          echo "    sql_results:" >> spicepod.yaml
+          echo "      enabled: true" >> spicepod.yaml
+          echo "      item_ttl: 5s" >> spicepod.yaml
+          echo "datasets:" >> spicepod.yaml
+          echo "  - from: file:./orders.csv" >> spicepod.yaml
+          echo "    name: orders" >> spicepod.yaml
+          echo "    params:" >> spicepod.yaml
+          echo "      file_format: csv" >> spicepod.yaml
+          echo "    acceleration:" >> spicepod.yaml
+          echo "      enabled: true" >> spicepod.yaml
+          cat spicepod.yaml
+
+      - name: Start spice runtime
+        working-directory: test_app
+        run: |
+          spice run &> spice.log &
+
+      - name: Wait for dataset to be ready
+        uses: ./.github/actions/wait-for-spice-ready
+        with:
+          working-directory: test_app
+          timeout: '60'
+
+      - name: Cache the result while the source is reachable
+        working-directory: test_app
+        run: |
+          sql="SELECT CAST(SUM(v) AS BIGINT) AS s, COUNT(*) AS n FROM orders"
+          for expected in MISS HIT; do
+            response=$(curl -sS -i --max-time 5 -XPOST "127.0.0.1:8090/v1/sql" --data "$sql")
+            echo "$response"
+            if ! echo "$response" | grep -q "results-cache-status: $expected"; then
+              echo "::error::Expected results-cache-status $expected while the source is reachable." >&2
+              exit 1
+            fi
+            if ! echo "$response" | grep -q '"s":3,"n":3'; then
+              echo "::error::Expected the three source rows, SUM(v) = 3." >&2
+              exit 1
+            fi
+          done
+
+      - name: Make the source unreadable and wait for the refresh to fail
+        working-directory: test_app
+        run: |
+          # An unreadable file makes the refresh fail. A missing one does not: the file
+          # connector reads it as an empty source.
+          chmod 000 orders.csv
+          if [ -r orders.csv ]; then
+            echo "::error::orders.csv is still readable after chmod 000 (is the job running as root?), so the source cannot be taken down." >&2
+            exit 1
+          fi
+          output=$(spice refresh orders 2>&1)
+          echo "$output"
+          deadline=$((SECONDS + 30))
+          until curl -sS "127.0.0.1:8090/v1/datasets?status=true" | grep -q '"status":"Error"'; do
+            if (( SECONDS >= deadline )); then
+              curl -sS "127.0.0.1:8090/v1/datasets?status=true"
+              grep -E "dataset orders" spice.log || true
+              echo "::error::Dataset orders did not report an error within 30s of its source becoming unreadable." >&2
+              exit 1
+            fi
+            sleep 1
+          done
+          curl -sS "127.0.0.1:8090/v1/datasets?status=true"
+
+      - name: Run SQL query and check misses are answered from the acceleration
+        working-directory: test_app
+        run: |
+          # item_ttl is 5s, so the entry cached above expires while the source is down.
+          # The miss that follows must be answered from the acceleration, then cached.
+          sql="SELECT CAST(SUM(v) AS BIGINT) AS s, COUNT(*) AS n FROM orders"
+          deadline=$((SECONDS + 30))
+          while :; do
+            response=$(curl -sS -i --max-time 5 -XPOST "127.0.0.1:8090/v1/sql" --data "$sql")
+            if ! echo "$response" | head -1 | grep -qE '^HTTP/[0-9.]+ 200'; then
+              echo "$response"
+              echo "::error::A query on orders failed while its source was down; a cache miss must be answered from the acceleration." >&2
+              exit 1
+            fi
+            if echo "$response" | grep -q "results-cache-status: MISS"; then
+              break
+            fi
+            if (( SECONDS >= deadline )); then
+              echo "$response"
+              echo "::error::The cached result for orders was still served 30s after the source went down; item_ttl is 5s." >&2
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "$response"
+          if ! echo "$response" | grep -q '"s":3,"n":3'; then
+            echo "::error::A cache miss with the source down must be answered from the acceleration (SUM(v) = 3, 3 rows)." >&2
+            exit 1
+          fi
+          response=$(curl -sS -i --max-time 5 -XPOST "127.0.0.1:8090/v1/sql" --data "$sql")
+          echo "$response"
+          if ! echo "$response" | grep -q "results-cache-status: HIT" || ! echo "$response" | grep -q '"s":3,"n":3'; then
+            echo "::error::The result answered from the acceleration must be cached." >&2
+            exit 1
+          fi
+
+      - name: Restore the source with new rows and check the results catch up
+        working-directory: test_app
+        run: |
+          printf 'id,v\n1,2\n2,2\n3,2\n' > orders.csv.new
+          mv orders.csv.new orders.csv
+          chmod 644 orders.csv
+          output=$(spice refresh orders 2>&1)
+          echo "$output"
+          # The refresh replaces the acceleration; cached results reflect it once they
+          # age past item_ttl (5s).
+          sql="SELECT CAST(SUM(v) AS BIGINT) AS s, COUNT(*) AS n FROM orders"
+          deadline=$((SECONDS + 45))
+          until response=$(curl -sS -i --max-time 5 -XPOST "127.0.0.1:8090/v1/sql" --data "$sql") && echo "$response" | grep -q '"s":6,"n":3'; do
+            if (( SECONDS >= deadline )); then
+              echo "$response"
+              grep -E "dataset orders" spice.log || true
+              echo "::error::Results for orders did not reflect the restored source within 45s." >&2
+              exit 1
+            fi
+            sleep 1
+          done
+          echo "$response"
+
+      - name: Stop spice and check logs
+        if: always()
+        uses: ./.github/actions/stop-spice
+        with:
+          working-directory: test_app
+
   gh_connector_quickstart:
     name: 'Test GitHub connector on ${{ matrix.target.name }}'
     runs-on: ${{ matrix.target.runner }}
@@ -2714,6 +2879,7 @@ jobs:
       - test_quickstart_duckdb
       - test_local_acceleration
       - test_results_caching
+      - test_results_caching_source_down
       - gh_connector_quickstart
       - hf_connector_live
       - mssql_connector_quickstart
