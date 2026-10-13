@@ -267,6 +267,46 @@ fn extended_row_key_snapshot(
     )
 }
 
+/// Background work a table still has in flight, so a caller can wait for it to
+/// finish.
+#[derive(Debug, Default)]
+struct PendingWork {
+    count: AtomicUsize,
+    drained: tokio::sync::Notify,
+}
+
+impl PendingWork {
+    /// Counts one piece of work in; it counts out when the guard drops.
+    fn start(self: &Arc<Self>) -> PendingWorkGuard {
+        self.count.fetch_add(1, Ordering::AcqRel);
+        PendingWorkGuard(Arc::clone(self))
+    }
+
+    /// Waits until nothing is in flight.
+    async fn drained(&self) {
+        loop {
+            // Registered before the check, so a guard dropped in between still
+            // wakes it.
+            let notified = self.drained.notified();
+            if self.count.load(Ordering::Acquire) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// One piece of [`PendingWork`], counted out on drop.
+struct PendingWorkGuard(Arc<PendingWork>);
+
+impl Drop for PendingWorkGuard {
+    fn drop(&mut self) {
+        if self.0.count.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.0.drained.notify_waiters();
+        }
+    }
+}
+
 /// Outcome of one off-fence deletion-index prune attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OffFencePrune {
@@ -2180,6 +2220,12 @@ pub struct CayenneTableProvider {
     /// concurrent maintenance tasks cannot merge from the same cached base and
     /// overwrite each other's row-count or column-stat deltas.
     table_statistics_persistence_lock: Arc<tokio::sync::Mutex<()>>,
+    /// When this table was opened. A data file modified later was written by this
+    /// process, so no earlier process persisted its scan statistics.
+    opened_at: chrono::DateTime<chrono::Utc>,
+    /// Scan-statistics rows still being persisted in the background
+    /// ([`Self::persist_scan_file_statistics`]).
+    scan_statistics_persistence: Arc<PendingWork>,
     /// Set when a durable `num_rows_exact` taint (or an authoritative `Set`) failed
     /// to persist, so the metastore's exactness bit is known to over-claim.
     ///
@@ -9992,6 +10038,8 @@ impl CayenneTableProvider {
                 count_exact: table_statistics_count_exact,
             })),
             table_statistics_persistence_lock: Arc::new(tokio::sync::Mutex::new(())),
+            opened_at: chrono::Utc::now(),
+            scan_statistics_persistence: Arc::new(PendingWork::default()),
             row_count_taint_pending: Arc::new(AtomicBool::new(false)),
             retention_filters,
             time_retention_filter_builder,
@@ -12235,6 +12283,8 @@ impl CayenneTableProvider {
             listing_cache_epoch: Arc::clone(&self.listing_cache_epoch),
             table_statistics: Arc::clone(&self.table_statistics),
             table_statistics_persistence_lock: Arc::clone(&self.table_statistics_persistence_lock),
+            opened_at: self.opened_at,
+            scan_statistics_persistence: Arc::clone(&self.scan_statistics_persistence),
             row_count_taint_pending: Arc::clone(&self.row_count_taint_pending),
             context: Arc::clone(&self.context),
             retention_filters: self.retention_filters.clone(),
@@ -38706,9 +38756,17 @@ impl CayenneTableProvider {
         let file_path = part_file.object_meta.location.to_string();
         let file_size_bytes = i64::try_from(part_file.object_meta.size).unwrap_or(i64::MAX);
 
+        // A file modified after this table was opened was written by this process:
+        // no earlier process persisted a row for it, and a row this one persisted
+        // is in the cache unless evicted, so its footer answers without the
+        // metastore. A misjudged clock only trades a catalog read for a footer
+        // read, or the reverse.
+        let written_since_open = part_file.object_meta.last_modified >= self.opened_at;
         // Schema validation and catalog reads share evolution's publication fence.
         // Footer I/O below remains outside this mutex.
-        let persisted = {
+        let persisted = if written_since_open {
+            None
+        } else {
             let _guard = self.table_statistics_persistence_lock.lock().await;
             if table_schema.as_ref() == self.table_schema().as_ref() {
                 self.catalog
@@ -38778,41 +38836,74 @@ impl CayenneTableProvider {
                     hook().await;
                 }
             }
-            let _guard = self.table_statistics_persistence_lock.lock().await;
-            // The footer statistics are adjusted for the file's position deletes as
-            // they stood at the read. A cache clear since then means that state may
-            // have changed, so persisting this answer would hand it to the next
-            // collection; leave the row for a collection that starts after the
-            // clear to read and persist.
-            if table_schema.as_ref() == self.table_schema().as_ref()
-                && self
-                    .scan_file_statistics_flights
-                    .is_current(request.generation)
-            {
-                match self
-                    .catalog
-                    .upsert_snapshot_file_statistics(&SnapshotFileStatistics {
-                        table_id: self.table_metadata.table_id.clone(),
-                        snapshot_id: request.snapshot_id.to_string(),
-                        file_path,
-                        file_size_bytes,
-                        num_rows,
-                        statistics_blob: blob,
-                    })
-                    .await
-                {
-                    Ok(()) => self.scan_file_statistics_flights.record_persisted_upsert(),
-                    Err(error) => tracing::debug!(
-                        table = %self.table_metadata.table_name,
-                        error = %error,
-                        "Failed to persist per-file snapshot statistics; continuing with footer stats"
-                    ),
-                }
-            }
+            self.persist_scan_file_statistics(
+                SnapshotFileStatistics {
+                    table_id: self.table_metadata.table_id.clone(),
+                    snapshot_id: request.snapshot_id.to_string(),
+                    file_path,
+                    file_size_bytes,
+                    num_rows,
+                    statistics_blob: blob,
+                },
+                request.generation,
+                Arc::clone(table_schema),
+            );
         }
 
         self.publish_scan_file_statistics(request, &statistics);
         Ok(statistics)
+    }
+
+    /// Persists one file's scan statistics for the processes that open this table
+    /// after this one, in a background task rather than in the scan that collected
+    /// them: the row is only ever read by a later process, and writing it on the
+    /// scan's path made the scan wait on the metastore and on every other
+    /// collection holding the persistence lock.
+    ///
+    /// The task writes under that lock, and only while the schema and the cache
+    /// generation are still the ones the statistics were collected under. The
+    /// footer statistics are adjusted for the file's position deletes as they
+    /// stood at the read; a cache clear since then means that state may have
+    /// changed, so persisting this answer would hand it to the next collection —
+    /// the row is left for a collection that starts after the clear. A schema
+    /// evolved since would read the blob against columns it no longer describes.
+    fn persist_scan_file_statistics(
+        &self,
+        row: SnapshotFileStatistics,
+        generation: u64,
+        collected_under: SchemaRef,
+    ) {
+        let pending = self.scan_statistics_persistence.start();
+        let catalog = Arc::clone(&self.catalog);
+        let lock = Arc::clone(&self.table_statistics_persistence_lock);
+        let live_schema = Arc::clone(&self.table_schema);
+        let flights = Arc::clone(&self.scan_file_statistics_flights);
+        let table = self.table_metadata.table_name.clone();
+        tokio::spawn(async move {
+            let _pending = pending;
+            let _guard = lock.lock().await;
+            if collected_under.as_ref() != live_schema.load_full().as_ref()
+                || !flights.is_current(generation)
+            {
+                return;
+            }
+            match catalog.upsert_snapshot_file_statistics(&row).await {
+                Ok(()) => flights.record_persisted_upsert(),
+                Err(error) => tracing::debug!(
+                    table = %table,
+                    error = %error,
+                    "Failed to persist per-file snapshot statistics; continuing with footer stats"
+                ),
+            }
+        });
+    }
+
+    /// Waits until every scan-statistics row this table started persisting in the
+    /// background ([`Self::persist_scan_file_statistics`]) has been written or
+    /// dropped.
+    #[doc(hidden)]
+    pub async fn wait_for_scan_file_statistics_persistence(&self) {
+        self.scan_statistics_persistence.drained().await;
     }
 
     /// Cache a collected file's statistics, unless a cache clear began after the

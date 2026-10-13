@@ -196,6 +196,8 @@ async fn file_scan_byte_size_statistics_do_not_depend_on_their_source(
     table.drain_in_flight_maintenance().await?;
 
     let (footer_total, footer_columns) = scan_statistics(&table, &ctx).await?;
+    // The scan persists the blob in the background; session 2 must find it.
+    table.wait_for_scan_file_statistics_persistence().await;
 
     // The footer path is only interesting if it reports a size at all — if it
     // did not, the two sources would agree trivially and this test would pass
@@ -302,6 +304,9 @@ async fn a_blob_without_byte_sizes_is_re_inferred_from_its_footer(
         matches!(footer_total, Precision::Exact(_) | Precision::Inexact(_)),
         "the footer path must report a total for this test to mean anything, got {footer_total:?}"
     );
+    // The scan persists in the background; seeding first would let it overwrite
+    // the seeded rows.
+    table.wait_for_scan_file_statistics_persistence().await;
 
     // Overwrite every per-file row with a pre-change blob, which is the state an
     // installation that upgrades into this change is already in.
@@ -357,6 +362,7 @@ async fn a_blob_without_byte_sizes_is_re_inferred_from_its_footer(
     );
 
     let (migrated_total, _) = scan_statistics(&reopened, &ctx).await?;
+    reopened.wait_for_scan_file_statistics_persistence().await;
     assert_eq!(
         migrated_total, footer_total,
         "a blob with no total must be re-inferred from the footer, not served as absent"
@@ -463,6 +469,7 @@ async fn a_widened_table_still_serves_its_files_from_the_persisted_blob(
         matches!(footer_total, Precision::Exact(_) | Precision::Inexact(_)),
         "the footer path must report a total for this test to mean anything, got {footer_total:?}"
     );
+    table.wait_for_scan_file_statistics_persistence().await;
 
     // Poison every per-file row with a size no footer would produce. A later scan
     // that reports it was served from the blob; one that reports the footer value
@@ -825,6 +832,7 @@ async fn concurrent_cold_scans_share_one_footer_read_and_upsert_per_file(
     }
     let (table, ctx, store) = open_cold(&fixture).await?;
     let reference = plan_statistics(&table, &ctx).await?;
+    table.wait_for_scan_file_statistics_persistence().await;
     let lone_reads = store.reads();
     let lone_writes = match &write_log {
         Some(log) => Some(log.writes().await?),
@@ -863,6 +871,7 @@ async fn concurrent_cold_scans_share_one_footer_read_and_upsert_per_file(
         futures::future::try_join_all((0..CONCURRENT_SCANS).map(|_| plan_statistics(&table, &ctx)))
             .await?;
     let elapsed = started.elapsed();
+    table.wait_for_scan_file_statistics_persistence().await;
     let concurrent_reads = store.reads();
     eprintln!(
         "SINGLE_FLIGHT {CONCURRENT_SCANS} concurrent cold scans planned in {} us",
@@ -921,6 +930,7 @@ async fn concurrent_cold_scans_share_one_footer_read_and_upsert_per_file(
         i64::try_from(expected_rows)?,
         "every id joins itself once"
     );
+    table.wait_for_scan_file_statistics_persistence().await;
     if let Some(log) = &write_log {
         let writes = log.writes().await?;
         eprintln!("SINGLE_FLIGHT statistics writes per file for one self-join: {writes:?}");
@@ -948,6 +958,7 @@ async fn scan_file_statistics_counters_match_the_store_and_the_metastore(
     let (table, ctx, store) = open_cold(&fixture).await?;
     futures::future::try_join_all((0..CONCURRENT_SCANS).map(|_| plan_statistics(&table, &ctx)))
         .await?;
+    table.wait_for_scan_file_statistics_persistence().await;
     let counters = table.scan_file_statistics_counters();
     eprintln!("SINGLE_FLIGHT counters, cold without persisted rows: {counters:?}");
     assert_eq!(counters.footer_reads, u64::try_from(SINGLE_FLIGHT_FILES)?);
@@ -972,6 +983,7 @@ async fn scan_file_statistics_counters_match_the_store_and_the_metastore(
     let (table, ctx, store) = open_cold(&fixture).await?;
     futures::future::try_join_all((0..CONCURRENT_SCANS).map(|_| plan_statistics(&table, &ctx)))
         .await?;
+    table.wait_for_scan_file_statistics_persistence().await;
     let counters = table.scan_file_statistics_counters();
     eprintln!("SINGLE_FLIGHT counters, cold over persisted rows: {counters:?}");
     assert_eq!(counters.footer_reads, 0);
