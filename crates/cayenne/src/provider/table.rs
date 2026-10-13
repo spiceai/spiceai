@@ -17506,6 +17506,38 @@ impl CayenneTableProvider {
         Ok(Some(results))
     }
 
+    /// Write one key-based deletion-vector file per `(delete_sequence, keys)`
+    /// group, each recorded at its own group's sequence, in a single
+    /// [`DeletionVectorWriter::write`]: the files are written concurrently and
+    /// the deletions directory is synced once, rather than a file write, a file
+    /// sync and a directory sync per group in turn. A mem-tier checkpoint
+    /// carries one group per appended segment that holds tombstones — thousands
+    /// on a table whose every CDC batch deletes, and a sequential pass over them
+    /// held such a checkpoint for minutes.
+    async fn write_key_deletion_vectors_by_sequence(
+        &self,
+        groups: Vec<(i64, Vec<Box<[u8]>>)>,
+    ) -> CatalogResult<Vec<crate::metadata::DeleteFile>> {
+        let specs: Vec<DeletionVectorWriteSpec> = groups
+            .into_iter()
+            .filter(|(_, row_keys)| !row_keys.is_empty())
+            .map(|(delete_sequence, row_keys)| {
+                DeletionVectorWriteSpec::new_key_based(row_keys)
+                    .with_sequence_number(delete_sequence)
+            })
+            .collect();
+        if specs.is_empty() {
+            return Ok(Vec::new());
+        }
+        let results = DeletionVectorWriter::new(&self.table_metadata)
+            .write(specs)
+            .await?;
+        Ok(results
+            .into_iter()
+            .map(|result| result.delete_file)
+            .collect())
+    }
+
     /// Durably commit one mem-tier checkpoint's deletion metadata, splitting
     /// the tier's tombstones by flushed-corpus membership:
     ///
@@ -17554,30 +17586,24 @@ impl CayenneTableProvider {
                         }
                     }
 
-                    // Write the durable delete vectors per group. The in-memory
+                    // Write the durable delete vectors, one file per group. The in-memory
                     // fold is DEFERRED to the publish step (`commit_on_conflict_deletion_update`),
                     // which replays this delta under `rcu` against the live index —
                     // so no `load_full` of the deletion snapshot here.
-                    for (&delete_sequence, pks) in &pure_by_seq {
-                        let row_keys = pks.iter().copied().map(i64_key).collect::<Vec<_>>();
-                        if let Some(results) = self
-                            .write_key_deletion_vectors(delete_sequence, row_keys)
-                            .await?
-                        {
-                            pure_delete_files
-                                .extend(results.iter().map(|result| result.delete_file.clone()));
-                        }
-                    }
-                    for (&delete_sequence, pks) in &reinsert_by_seq {
-                        let row_keys = pks.iter().copied().map(i64_key).collect::<Vec<_>>();
-                        if let Some(results) = self
-                            .write_key_deletion_vectors(delete_sequence, row_keys)
-                            .await?
-                        {
-                            reinsert_delete_files
-                                .extend(results.iter().map(|result| result.delete_file.clone()));
-                        }
-                    }
+                    let int64_groups = |by_seq: &BTreeMap<i64, Vec<i64>>| {
+                        by_seq
+                            .iter()
+                            .map(|(&delete_sequence, pks)| {
+                                (delete_sequence, pks.iter().copied().map(i64_key).collect())
+                            })
+                            .collect()
+                    };
+                    pure_delete_files = self
+                        .write_key_deletion_vectors_by_sequence(int64_groups(&pure_by_seq))
+                        .await?;
+                    reinsert_delete_files = self
+                        .write_key_deletion_vectors_by_sequence(int64_groups(&reinsert_by_seq))
+                        .await?;
 
                     OnConflictDeletionUpdate::Int64Pk(Int64DeletionDelta {
                         pure: pure_by_seq.into_iter().collect(),
@@ -17609,26 +17635,20 @@ impl CayenneTableProvider {
                         }
                     }
 
-                    // Durable delete vectors per group; in-memory fold deferred to
-                    // the publish step's `rcu` (see the Int64 arm above).
-                    for (&delete_sequence, row_keys) in &pure_by_seq {
-                        if let Some(results) = self
-                            .write_key_deletion_vectors(delete_sequence, row_keys.clone())
-                            .await?
-                        {
-                            pure_delete_files
-                                .extend(results.iter().map(|result| result.delete_file.clone()));
-                        }
-                    }
-                    for (&delete_sequence, row_keys) in &reinsert_by_seq {
-                        if let Some(results) = self
-                            .write_key_deletion_vectors(delete_sequence, row_keys.clone())
-                            .await?
-                        {
-                            reinsert_delete_files
-                                .extend(results.iter().map(|result| result.delete_file.clone()));
-                        }
-                    }
+                    // Durable delete vectors, one file per group; in-memory fold
+                    // deferred to the publish step's `rcu` (see the Int64 arm above).
+                    let row_key_groups = |by_seq: &BTreeMap<i64, Vec<Box<[u8]>>>| {
+                        by_seq
+                            .iter()
+                            .map(|(&delete_sequence, row_keys)| (delete_sequence, row_keys.clone()))
+                            .collect()
+                    };
+                    pure_delete_files = self
+                        .write_key_deletion_vectors_by_sequence(row_key_groups(&pure_by_seq))
+                        .await?;
+                    reinsert_delete_files = self
+                        .write_key_deletion_vectors_by_sequence(row_key_groups(&reinsert_by_seq))
+                        .await?;
 
                     OnConflictDeletionUpdate::RowConverter(RowKeyDeletionDelta {
                         pure: pure_by_seq.into_iter().collect(),
