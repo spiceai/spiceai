@@ -117,7 +117,7 @@ own section below — a count here would be one more thing to keep true by hand.
 | [datafusion](#datafusion) | `7bf101c408b422ed11692518d1dcbcbc109c94db` | `spiceai-55` |
 | [datafusion-ballista](#datafusion-ballista) | `a7c4c58502a16e2181a26fdb8e937ee005807e5e` | `spiceai-55` |
 | [datafusion-federation](#datafusion-federation-and-datafusion-table-providers) | `0ef7d349b1f6608151d7d575f71b89d52ece350c` | `spiceai-55` |
-| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `ad4e0865fe7e440316867ca626079354f5eaeb2a` | `viktor/sqltable-sort-pushdown` (TEMPORARY: spiceai/datafusion-table-providers#91) |
+| [datafusion-table-providers](#datafusion-federation-and-datafusion-table-providers) | `201f51920580adb289c93342d9282a3f913d4650` | `spiceai-55` |
 | [delta-kernel-rs](#delta-kernel-rs) | `16ac28606464d742b6837de4a51f41011c3f6dc0` | `spiceai-0.27` |
 | [docx-rs](#docx-rs) | `2a85dce57d0128e2cd7c369545516c347cb8c529` | `spiceai` |
 | [duckdb-rs](#duckdb-rs) | `504debbf8269a76aef74daa2247b6296c2fe2290` | `spiceai-1.4.4` (datafusion-table-providers pins this exact revision; the two move together) |
@@ -406,7 +406,8 @@ re-confirmed present at both pinned revisions, and each new pin descends from th
 previous one. Between `2fc4617` and `0ef7d34` (spiceai/datafusion-federation#93,
 squash-merged), `datafusion-federation` adds only the sort pushdown of the federated-scan row
 below (`sql/executor.rs`, `sql/mod.rs`, `schema_cast/mod.rs`) and its tests.
-Between `ef2e590` and `ad4e086` (spiceai/datafusion-table-providers#91),
+Between `ef2e590` and `201f519` (spiceai/datafusion-table-providers#91,
+squash-merged),
 `datafusion-table-providers` adds only the `SqlTable` opt-in row below and its
 test, and moves its own federation pin:
 

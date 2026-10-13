@@ -288,7 +288,7 @@ datafusion-proto-common = "55.2.0"
 datafusion-pruning = "55.2.0"
 datafusion-spark = "55.2.0"
 datafusion-substrait = "55.2.0"
-datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "ad4e0865fe7e440316867ca626079354f5eaeb2a" } # branch: viktor/sqltable-sort-pushdown (spiceai/datafusion-table-providers#91)
+datafusion-table-providers = { git = "https://github.com/spiceai/datafusion-table-providers.git", rev = "201f51920580adb289c93342d9282a3f913d4650" } # branch: spiceai-55
 delta_kernel = { version = "0.27.1", features = ["arrow-59", "internal-api"] }
 delta_kernel_default_engine = { version = "0.27.1", default-features = false, features = [
     "arrow-59",
