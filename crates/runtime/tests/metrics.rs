@@ -1119,6 +1119,15 @@ fn counter_with_label(
         .sum()
 }
 
+/// Asserts a counter moved by exactly `expected`. Counter values are whole numbers
+/// held in an `f64`, so the comparison is exact up to rounding.
+fn assert_counter_delta(recorded: f64, expected: f64, what: &str) {
+    assert!(
+        (recorded - expected).abs() < f64::EPSILON,
+        "{what}: recorded {recorded}, expected {expected}"
+    );
+}
+
 /// The sum of every series of a counter family.
 fn counter_total(registry: &prometheus::Registry, name: &str) -> f64 {
     registry
@@ -1361,27 +1370,27 @@ async fn results_cache_invalidation_metrics_contract() {
         .invalidate_for_table(table.clone())
         .await
         .expect("invalidate for client write");
-    assert_eq!(
+    assert_counter_delta(
         counter_total(registry, "results_cache_table_invalidations") - invalidations_before,
         1.0,
-        "a client write records exactly one eviction invalidation"
+        "a client write records exactly one eviction invalidation",
     );
     // Two entries read `scores`: the result the fixture query above stored, and the
     // captured one. Each is counted as its own eviction.
-    assert_eq!(
+    assert_counter_delta(
         counter_with_label(registry, "results_cache_evictions", "reason", "invalidated")
             - evicted_before,
         2.0,
-        "every entry a client write drops is counted as an eviction with reason `invalidated`"
+        "every entry a client write drops is counted as an eviction with reason `invalidated`",
     );
     df.caching()
         .invalidate_for_refresh(table)
         .await
         .expect("invalidate for accelerated refresh");
-    assert_eq!(
+    assert_counter_delta(
         counter_total(registry, "results_cache_table_invalidations") - invalidations_before,
         1.0,
-        "an accelerated refresh must not record a SQL results invalidation"
+        "an accelerated refresh must not record a SQL results invalidation",
     );
 
     // Publish the pre-write read after eviction, reproducing an in-flight read
@@ -1397,9 +1406,10 @@ async fn results_cache_invalidation_metrics_contract() {
             .expect("lookup invalidated read")
             .is_none()
     );
-    assert_eq!(
+    assert_counter_delta(
         counter_total(registry, "results_cache_stale_rejections") - rejections_before,
-        1.0
+        1.0,
+        "a read published after a client write is rejected once as `write_during_read`",
     );
     for (name, label_name, expected_value) in [
         ("results_cache_table_invalidations", "mode", "evict"),
@@ -1423,7 +1433,7 @@ async fn results_cache_invalidation_metrics_contract() {
             .get_label()
             .iter()
             .filter(|label| label.name() == label_name)
-            .map(|label| label.value())
+            .map(prometheus::proto::LabelPair::value)
             .collect();
         assert_eq!(
             labels,

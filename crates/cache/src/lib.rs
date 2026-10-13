@@ -2033,7 +2033,9 @@ mod tests {
             QueryResultsCacheProvider::try_new(&config_with_stale_window("5m"), Box::new([]))
                 .expect("valid provider");
         let key = RawCacheKey::new(90);
-        let read_started_at = Instant::now() - std::time::Duration::from_secs(901);
+        let read_started_at = Instant::now()
+            .checked_sub(std::time::Duration::from_secs(901))
+            .expect("monotonic clock exceeds 901 seconds");
         provider
             .put_raw_key(&key, cached_result_for("customer", read_started_at).await)
             .await
