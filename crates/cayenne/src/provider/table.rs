@@ -227,18 +227,20 @@ fn extended_int64_snapshot(
     current: &Int64PkDeletionSnapshot,
     delta: &Int64DeletionDelta,
 ) -> Int64PkDeletionSnapshot {
-    Int64PkDeletionSnapshot::from_index(current.tombstones.extend_max(
-        delta
-            .pure
-            .iter()
-            .flat_map(|(delete_seq, pks)| pks.iter().map(move |&pk| (pk, *delete_seq))),
-        delta
-            .reinsert
-            .iter()
-            .flat_map(|(delete_seq, pks, insert_seq)| {
-                pks.iter().map(move |&pk| (pk, *delete_seq, *insert_seq))
-            }),
-    ))
+    Int64PkDeletionSnapshot::from_index(
+        current.tombstones.extend_max(
+            delta
+                .pure
+                .iter()
+                .flat_map(|(delete_seq, pks)| pks.iter().map(move |&pk| (pk, *delete_seq))),
+            delta
+                .reinsert
+                .iter()
+                .flat_map(|(delete_seq, pks, insert_seq)| {
+                    pks.iter().map(move |&pk| (pk, *delete_seq, *insert_seq))
+                }),
+        ),
+    )
 }
 
 /// Row-key counterpart of [`extended_int64_snapshot`]; see
@@ -247,18 +249,20 @@ fn extended_row_key_snapshot(
     current: &RowConverterDeletionSnapshot,
     delta: &RowKeyDeletionDelta,
 ) -> RowConverterDeletionSnapshot {
-    RowConverterDeletionSnapshot::from_index(current.tombstones.extend_max(
-        delta
-            .pure
-            .iter()
-            .flat_map(|(delete_seq, keys)| keys.iter().map(move |k| (&**k, *delete_seq))),
-        delta
-            .reinsert
-            .iter()
-            .flat_map(|(delete_seq, keys, insert_seq)| {
-                keys.iter().map(move |k| (&**k, *delete_seq, *insert_seq))
-            }),
-    ))
+    RowConverterDeletionSnapshot::from_index(
+        current.tombstones.extend_max(
+            delta
+                .pure
+                .iter()
+                .flat_map(|(delete_seq, keys)| keys.iter().map(move |k| (&**k, *delete_seq))),
+            delta
+                .reinsert
+                .iter()
+                .flat_map(|(delete_seq, keys, insert_seq)| {
+                    keys.iter().map(move |k| (&**k, *delete_seq, *insert_seq))
+                }),
+        ),
+    )
 }
 
 /// Outcome of one off-fence deletion-index prune attempt.
@@ -19097,7 +19101,8 @@ impl CayenneTableProvider {
                     deletion_snapshot, ..
                 } = &self.pk_deletion_strategy
                 {
-                    deletion_snapshot.rcu(|current| Arc::new(extended_int64_snapshot(current, &delta)));
+                    deletion_snapshot
+                        .rcu(|current| Arc::new(extended_int64_snapshot(current, &delta)));
                 }
                 self.refresh_deletion_memory_accounting();
             }
@@ -19106,7 +19111,8 @@ impl CayenneTableProvider {
                     deletion_snapshot, ..
                 } = &self.pk_deletion_strategy
                 {
-                    deletion_snapshot.rcu(|current| Arc::new(extended_row_key_snapshot(current, &delta)));
+                    deletion_snapshot
+                        .rcu(|current| Arc::new(extended_row_key_snapshot(current, &delta)));
                 }
                 self.refresh_deletion_memory_accounting();
             }
@@ -51671,14 +51677,15 @@ mod tests {
         {
             let provider_in_hook = provider.clone_for_write();
             let published = Arc::clone(&published);
-            *provider.test_pre_checkpoint_deletion_publish_hook.lock() = Some(Box::new(move || {
-                Box::pin(async move {
-                    let extended =
-                        int64_tombstones(&provider_in_hook).extend_max_deletes([(9, 1_000_000)]);
-                    store_int64_tombstones(&provider_in_hook, extended);
-                    published.store(true, Ordering::SeqCst);
-                })
-            }));
+            *provider.test_pre_checkpoint_deletion_publish_hook.lock() =
+                Some(Box::new(move || {
+                    Box::pin(async move {
+                        let extended = int64_tombstones(&provider_in_hook)
+                            .extend_max_deletes([(9, 1_000_000)]);
+                        store_int64_tombstones(&provider_in_hook, extended);
+                        published.store(true, Ordering::SeqCst);
+                    })
+                }));
         }
         provider
             .checkpoint_mem_tier()
@@ -51731,21 +51738,22 @@ mod tests {
             let provider_in_hook = provider.clone_for_write();
             let ctx_in_hook = ctx.clone();
             let scanned = Arc::clone(&scanned);
-            *provider.test_pre_checkpoint_deletion_publish_hook.lock() = Some(Box::new(move || {
-                Box::pin(async move {
-                    let rows = tokio::time::timeout(
-                        std::time::Duration::from_secs(10),
-                        collect_id_value_pairs(
-                            &ctx_in_hook,
-                            &provider_in_hook,
-                            "prepared_deletions_scan",
-                        ),
-                    )
-                    .await
-                    .expect("a scan must not wait on the checkpoint's deletion extension");
-                    *scanned.lock() = Some(rows);
-                })
-            }));
+            *provider.test_pre_checkpoint_deletion_publish_hook.lock() =
+                Some(Box::new(move || {
+                    Box::pin(async move {
+                        let rows = tokio::time::timeout(
+                            std::time::Duration::from_secs(10),
+                            collect_id_value_pairs(
+                                &ctx_in_hook,
+                                &provider_in_hook,
+                                "prepared_deletions_scan",
+                            ),
+                        )
+                        .await
+                        .expect("a scan must not wait on the checkpoint's deletion extension");
+                        *scanned.lock() = Some(rows);
+                    })
+                }));
         }
         provider
             .checkpoint_mem_tier()
@@ -59000,7 +59008,9 @@ mod tests {
             "the inputs must be republished between the prune's build and its publication"
         );
         assert_eq!(
-            int64_tombstones(&provider).get(0).map(|t| t.delete_sequence),
+            int64_tombstones(&provider)
+                .get(0)
+                .map(|t| t.delete_sequence),
             Some(15),
             "the tombstone the republished inputs need must survive the bake"
         );
@@ -59050,7 +59060,9 @@ mod tests {
             .expect("bake should not error");
         assert!(baked, "the older prefix {{0,1}} must bake (>= 2 snapshots)");
         assert_eq!(
-            int64_tombstones(&provider).get(1).map(|t| t.delete_sequence),
+            int64_tombstones(&provider)
+                .get(1)
+                .map(|t| t.delete_sequence),
             Some(25),
             "a tombstone published after the bake's capture must survive its prune"
         );
