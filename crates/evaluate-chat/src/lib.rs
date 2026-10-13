@@ -282,7 +282,7 @@ impl Evaluate for ChatEvaluator {
                 json_schema: ResponseFormatJsonSchema {
                     name: "evaluation".to_string(),
                     description: None,
-                    schema: Some(schema),
+                    schema,
                     strict: Some(true),
                 },
             },
@@ -795,7 +795,7 @@ mod tests {
             );
         };
         assert_eq!(json_schema.strict, Some(true));
-        let schema = json_schema.schema.as_ref().expect("schema");
+        let schema = &json_schema.schema;
         assert_eq!(
             schema["properties"]["answers"]["required"],
             json!(["is_urgent", "team", "tone"])

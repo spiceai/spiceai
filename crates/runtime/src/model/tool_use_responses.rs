@@ -129,6 +129,7 @@ impl ToolUsingResponses {
                     strict: t.strict(),
                     name: encode_tool_name(t.name().to_string().as_str()),
                     description: t.description().map(|d| d.to_string()),
+                    defer_loading: None,
                     parameters: Some(
                         t.parameters()
                             .map(|mut params| {
@@ -234,6 +235,11 @@ impl ToolUsingResponses {
             | OutputItem::LocalShellCall(_)
             | OutputItem::ShellCall(_)
             | OutputItem::ShellCallOutput(_)
+            | OutputItem::FunctionCallOutput(_)
+            | OutputItem::ComputerCallOutput(_)
+            | OutputItem::CustomToolCallOutput(_)
+            | OutputItem::ToolSearchCall(_)
+            | OutputItem::ToolSearchOutput(_)
             | OutputItem::ApplyPatchCall(_)
             | OutputItem::ApplyPatchCallOutput(_)
             | OutputItem::McpApprovalRequest(_)
@@ -720,6 +726,7 @@ fn to_input_item(input: InputParam) -> Vec<InputItem> {
             content: EasyInputContent::Text(text),
             role: Role::User,
             r#type: MessageType::Message,
+            phase: None,
         })],
         InputParam::Items(items) => items,
     }

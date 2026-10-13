@@ -1030,8 +1030,8 @@ fn convert_tool_choice(x: &ChatCompletionToolChoiceOption) -> Result<ToolChoice,
     }
 }
 
-/// Maps an `allowed_tools` choice onto `mistral.rs`'s equivalent: the same mode over the same
-/// tools, each of which must be a named function.
+/// Maps an `allowed_tools` choice onto `mistral.rs`'s equivalent, which can restrict the model
+/// only to named function tools.
 fn convert_allowed_tools(
     choice: &ChatCompletionAllowedToolsChoice,
 ) -> Result<ToolChoice, OpenAIError> {
@@ -1042,6 +1042,9 @@ fn convert_allowed_tools(
     };
 
     let allowed = &choice.allowed_tools;
+    if allowed.tools.is_empty() {
+        return Err(invalid("lists no tools"));
+    }
     let mode = match allowed.mode {
         ToolChoiceAllowedMode::Auto => AllowedToolsMode::Auto,
         ToolChoiceAllowedMode::Required => AllowedToolsMode::Required,
@@ -1058,9 +1061,7 @@ fn convert_allowed_tools(
             )),
         })
         .collect::<Result<Vec<_>, _>>()?;
-    if tools.is_empty() {
-        return Err(invalid("lists no tools"));
-    }
+
     Ok(ToolChoice::AllowedTools(AllowedToolsToolChoice {
         tp: AllowedToolsToolChoiceType::AllowedTools,
         mode,

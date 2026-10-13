@@ -155,7 +155,17 @@ jobs:
       - name: Set up Rust
         uses: ./.github/actions/setup-rust
 
+      # Not on the macOS leg. Its self-hosted runner instances share one user, so one
+      # `~/.cargo`, and rust-cache's save step deletes every file it found in
+      # `~/.cargo/bin` when it restored — the rustup proxies (`cargo`, `rustc`,
+      # `rustup`) included. A trunk push saving the cache therefore pulls `cargo` out
+      # from under whatever job a sibling instance on the same Mac is running, which
+      # then fails `cargo: command not found` (exit 127) mid-build. Nothing is lost by
+      # skipping it there: `~/.cargo` and `target/` persist on those hosts and sccache
+      # serves the compile, while the restore of this multi-GB cache spends up to ten
+      # minutes before it lands or gives up.
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        if: matrix.target.target_os != 'darwin'
         with:
           save-if: ${{ github.ref == 'refs/heads/trunk' }}
 

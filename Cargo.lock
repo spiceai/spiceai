@@ -1320,18 +1320,17 @@ dependencies = [
 [[package]]
 name = "async-openai"
 version = "0.32.0"
-source = "git+https://github.com/spiceai/async-openai?rev=216da93659954431a5d197968118b922cac3fcff#216da93659954431a5d197968118b922cac3fcff"
+source = "git+https://github.com/spiceai/async-openai?rev=307eaf407cbf71afa967f3008250ba96c79626b7#307eaf407cbf71afa967f3008250ba96c79626b7"
 dependencies = [
  "async-openai-macros",
- "backoff",
  "base64 0.22.1",
  "bytes",
  "derive_builder",
  "eventsource-stream",
  "futures",
+ "getrandom 0.3.4",
  "rand 0.9.4",
  "reqwest 0.13.4",
- "reqwest-eventsource",
  "secrecy",
  "serde",
  "serde_json",
@@ -1340,6 +1339,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-util",
+ "tower 0.5.3",
  "tracing",
  "url",
  "utoipa 5.5.0",
@@ -1347,8 +1347,8 @@ dependencies = [
 
 [[package]]
 name = "async-openai-macros"
-version = "0.1.1"
-source = "git+https://github.com/spiceai/async-openai?rev=216da93659954431a5d197968118b922cac3fcff#216da93659954431a5d197968118b922cac3fcff"
+version = "0.3.0"
+source = "git+https://github.com/spiceai/async-openai?rev=307eaf407cbf71afa967f3008250ba96c79626b7#307eaf407cbf71afa967f3008250ba96c79626b7"
 dependencies = [
  "proc-macro2",
  "quote",
