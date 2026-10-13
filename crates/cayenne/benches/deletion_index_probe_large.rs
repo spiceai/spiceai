@@ -172,7 +172,8 @@ fn bench_row_keys_layered(c: &mut Criterion) {
     for batch in 0..BATCHES {
         let start = BASE + batch * BATCH;
         let sequence = 2 + i64::try_from(batch).unwrap_or(i64::MAX - 2);
-        index = index.extend_max_deletes((start..start + BATCH).map(|key| (key_bytes(key), sequence)));
+        index =
+            index.extend_max_deletes((start..start + BATCH).map(|key| (key_bytes(key), sequence)));
     }
     let total = BASE + BATCHES * BATCH;
     let hit_keys: Vec<[u8; 8]> = (0..PROBES_PER_BATCH)

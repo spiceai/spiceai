@@ -2839,7 +2839,10 @@ mod tests {
         // A 1,000-key base keeps the freeze threshold at 250, so the active tier
         // grows past the bloom's first sizing (64) and the bloom is rebuilt.
         let base = DeletionIndex::from_map((0..1_000_i64).map(|pk| (pk, 1)).collect());
-        assert!(base.core.active_bloom.is_none(), "an empty active tier has no bloom");
+        assert!(
+            base.core.active_bloom.is_none(),
+            "an empty active tier has no bloom"
+        );
         let mut generations = vec![base];
         let mut first_bloom_capacity = None;
         for batch in 0..12_i64 {
@@ -2878,13 +2881,20 @@ mod tests {
                 } else {
                     None
                 };
-                assert_eq!(delete_seq_of(generation, pk), expected, "generation {age}, pk={pk}");
+                assert_eq!(
+                    delete_seq_of(generation, pk),
+                    expected,
+                    "generation {age}, pk={pk}"
+                );
             }
         }
         // A freeze empties the active tier and drops its bloom.
         let frozen = newest.extend_max_deletes((1_240..1_260_i64).map(|pk| (pk, 50)));
         assert_eq!(frozen.core.active.len(), 0, "precondition: the tier froze");
-        assert!(frozen.core.active_bloom.is_none(), "a frozen tier leaves no bloom");
+        assert!(
+            frozen.core.active_bloom.is_none(),
+            "a frozen tier leaves no bloom"
+        );
         assert_eq!(delete_seq_of(&frozen, 1_250), Some(50));
         assert_eq!(delete_seq_of(&frozen, 1_100), Some(7));
     }

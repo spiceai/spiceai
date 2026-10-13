@@ -274,7 +274,11 @@ pub(crate) fn is_bounded_key_lookup(plan: &LogicalPlan) -> bool {
                 node = filter.input.as_ref();
             }
             LogicalPlan::Sort(sort) => {
-                if sort.expr.iter().any(|sort| reads_beyond_its_row(&sort.expr)) {
+                if sort
+                    .expr
+                    .iter()
+                    .any(|sort| reads_beyond_its_row(&sort.expr))
+                {
                     return false;
                 }
                 node = sort.input.as_ref();
@@ -742,7 +746,10 @@ mod tests {
             "SELECT * FROM composite WHERE region IN (1, 2) AND id IN (5, 6)",
             "SELECT * FROM composite WHERE region = 1 AND (id = 5 OR id = 6)",
         ] {
-            assert!(is_bounded_key_lookup(&unoptimized(&ctx, sql).await), "{sql}");
+            assert!(
+                is_bounded_key_lookup(&unoptimized(&ctx, sql).await),
+                "{sql}"
+            );
         }
         for sql in [
             "SELECT * FROM unkeyed WHERE id = 5",
@@ -758,7 +765,10 @@ mod tests {
             "SELECT * FROM keyed WHERE id = (SELECT max(id) FROM keyed)",
             "SELECT a.id FROM keyed a JOIN keyed b ON a.id = b.id WHERE a.id = 5",
         ] {
-            assert!(!is_bounded_key_lookup(&unoptimized(&ctx, sql).await), "{sql}");
+            assert!(
+                !is_bounded_key_lookup(&unoptimized(&ctx, sql).await),
+                "{sql}"
+            );
         }
         // The key bound is inclusive: one more key than it allows reads like a scan.
         let in_list = |keys: usize| {
