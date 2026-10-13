@@ -1104,7 +1104,11 @@ async fn a_background_pass_declines_an_auto_reclaim_while_the_reclaim_budget_is_
     let (declined, rewrote) = tokio::time::timeout(
         Duration::from_secs(10),
         crate::provider::compaction::run_holding_compaction_permit(async {
-            let declined = provider.whole_table_reclaim_permit(trigger).await.err();
+            let declined = provider
+                .whole_table_reclaim_permit(trigger)
+                .await
+                .err()
+                .flatten();
             let rewrote = provider
                 .compact_current_snapshot_small_files()
                 .await
@@ -1292,6 +1296,77 @@ async fn a_reclaim_waiting_for_a_permit_holds_back_no_reclaim_over_the_memory_ce
     let rows = collect_id_value_pairs(&ctx, &provider, name).await;
     let expected: Vec<(i64, i64)> = keys.iter().map(|id| (*id, 100)).collect();
     assert_eq!(rows, expected, "every key shows its row, once");
+}
+
+/// Quiescing a table ends its post-write pass's wait for a reclaim permit. The
+/// runtime quiesces a table before it reloads or removes its dataset, and
+/// `quiesce` waits for the post-write pass to finish; a pass still waiting for a
+/// permit would hold the reload until other tables' reclaims freed one. It stops
+/// at its next re-check instead, having rewritten nothing.
+#[tokio::test]
+async fn quiescing_a_table_ends_its_wait_for_a_reclaim_permit() {
+    let name = "auto_quiesce_waiting_reclaim";
+    let (provider, _catalog, _tmp) = table(name, DeletionMode::Auto, 256).await;
+    let keys: Vec<i64> = (0..16).collect();
+    write(&provider, &keys, 100).await;
+    // Delete-only tombstones for keys the table never held: they put the index
+    // past its trigger and hide no row.
+    let absent: Vec<(i64, i64)> = (1_000_000..1_000_016).map(|key| (key, 1)).collect();
+    install_int64_deletes(&provider, &absent);
+    assert!(
+        provider.should_capture_positions(),
+        "premise: the table is on position deletes"
+    );
+    assert!(
+        provider.deletion_index_reclaim_trigger().is_some(),
+        "premise: the whole-table reclaim is due"
+    );
+    assert!(
+        !provider.deletion_index_over_memory_ceiling(),
+        "premise: the index is under its memory ceiling"
+    );
+
+    let held = hold_every_reclaim_permit().await;
+    // Stand in for the appends that make a post-write pass due; the pass then
+    // waits for a permit to reclaim the index.
+    provider.new_files_since_last_compaction.store(
+        provider.context.compaction_picker_config().trigger_files,
+        std::sync::atomic::Ordering::Relaxed,
+    );
+    assert!(
+        provider.post_write_compaction_due(),
+        "premise: a post-write pass is due"
+    );
+    provider.schedule_post_write_compaction();
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert_ne!(
+        provider
+            .post_write_compaction_state
+            .load(std::sync::atomic::Ordering::Acquire),
+        COALESCED_TASK_IDLE,
+        "premise: the post-write pass is still running"
+    );
+    let snapshot_before = provider.get_current_snapshot_id();
+    let index_before = provider.deletion_index_len();
+    tokio::time::timeout(Duration::from_secs(5), provider.quiesce())
+        .await
+        .expect("quiesce returned while every reclaim permit was still held");
+    drop(held);
+    assert_eq!(
+        (
+            provider.get_current_snapshot_id(),
+            provider.last_small_file_compact_path(),
+            provider.deletion_index_len(),
+        ),
+        (
+            snapshot_before,
+            LastSmallFileCompactPath::None,
+            index_before
+        ),
+        "the waiting pass rewrote nothing"
+    );
 }
 
 /// The whole-table reclaim of an auto table on key deletes takes no permit from

@@ -20506,11 +20506,13 @@ impl CayenneTableProvider {
             Some(trigger) => match self.whole_table_reclaim_permit(trigger).await {
                 Ok(permit) => permit,
                 Err(declined) => {
-                    maintenance_metrics::track_compaction(
-                        table_name,
-                        CompactionKind::SubsetCurrent,
-                        declined,
-                    );
+                    if let Some(declined) = declined {
+                        maintenance_metrics::track_compaction(
+                            table_name,
+                            CompactionKind::SubsetCurrent,
+                            declined,
+                        );
+                    }
                     return Ok(false);
                 }
             },
@@ -23900,13 +23902,21 @@ impl CayenneTableProvider {
     /// permit is free it declines as `declined_reclaim_budget_busy` and a later
     /// tick tries again: waiting, it would hold the compaction permit other
     /// tables' background compaction needs. Any other pass waits for one, before
-    /// it takes the table's `compaction_lock`, and re-checks the deletion index
-    /// every [`RECLAIM_PERMIT_CEILING_RECHECK`] while it waits: a table that
-    /// crosses its memory ceiling meanwhile reclaims without a permit.
+    /// it takes the table's `compaction_lock`, and re-checks the table every
+    /// [`RECLAIM_PERMIT_CEILING_RECHECK`] while it waits: a table that crosses its
+    /// memory ceiling meanwhile reclaims without a permit, and one whose
+    /// maintenance [`Self::quiesce`] has closed stops waiting. The runtime quiesces
+    /// a table before it reloads or removes its dataset, and waits for this pass
+    /// to finish; nothing has started, so nothing is lost.
+    ///
+    /// `Err(Some(outcome))` declines the reclaim and counts `outcome`; `Err(None)`
+    /// stops it and counts nothing, as a pass that finds its maintenance closed
+    /// under `compaction_lock` does.
     async fn whole_table_reclaim_permit(
         &self,
         trigger: SnapshotMaintenanceTrigger,
-    ) -> std::result::Result<Option<tokio::sync::OwnedSemaphorePermit>, CompactionOutcome> {
+    ) -> std::result::Result<Option<tokio::sync::OwnedSemaphorePermit>, Option<CompactionOutcome>>
+    {
         if self.pk_deletion_mode.auto().is_none()
             || matches!(
                 trigger,
@@ -23923,7 +23933,7 @@ impl CayenneTableProvider {
             return budget
                 .try_acquire_owned()
                 .map(Some)
-                .map_err(|_| CompactionOutcome::DeclinedReclaimBudgetBusy);
+                .map_err(|_| Some(CompactionOutcome::DeclinedReclaimBudgetBusy));
         }
         // One acquisition for the whole wait, so the pass keeps its place in the
         // queue across the re-checks.
@@ -23933,6 +23943,9 @@ impl CayenneTableProvider {
             tokio::select! {
                 permit = &mut acquire => return Ok(permit.ok()),
                 () = tokio::time::sleep(RECLAIM_PERMIT_CEILING_RECHECK) => {
+                    if self.is_maintenance_closed() {
+                        return Err(None);
+                    }
                     if self.deletion_index_over_memory_ceiling() {
                         return Ok(None);
                     }
@@ -41218,7 +41231,8 @@ fn auto_switched_to_key_deletes_message(dataset: &str, max_position_bytes: u64) 
 
 /// How often a pass waiting for a whole-table reclaim permit re-checks its
 /// table's deletion index against the memory ceiling: over it, the reclaim is the
-/// OOM guard and runs without a permit.
+/// OOM guard and runs without a permit. The same re-check ends the wait of a pass
+/// whose table [`CayenneTableProvider::quiesce`] has closed.
 const RECLAIM_PERMIT_CEILING_RECHECK: Duration = Duration::from_secs(1);
 
 /// The line a table logs when `deletion_mode: auto` cannot size it as it loads,
