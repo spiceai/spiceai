@@ -748,16 +748,14 @@ impl Query {
             // A lookup of a few rows by primary key runs apart from the analytical
             // queries the CPU runtime is shared by: behind hundreds of their tasks,
             // a lookup that takes milliseconds waits for seconds.
-            let runtime_handle = match self.df.interactive_runtime().cloned() {
-                Some(interactive)
-                    if self
-                        .reads_bounded_keys(&request_context, &interactive)
-                        .await =>
-                {
-                    interactive
-                }
-                _ => cpu_runtime,
+            let lookup_runtime = match self.df.interactive_runtime().cloned() {
+                Some(interactive) => self
+                    .reads_bounded_keys(&request_context, &interactive)
+                    .await
+                    .then_some(interactive),
+                None => None,
             };
+            let runtime_handle = lookup_runtime.unwrap_or(cpu_runtime);
             return self
                 .run_with_managed_runtime(request_context, runtime_handle, probe, guards)
                 .await;
