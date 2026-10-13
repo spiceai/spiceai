@@ -47,8 +47,11 @@ limitations under the License.
 //! share the previous runs by `Arc`.
 //!
 //! A probe fuses `active` with the *applicable* runs, per-side max:
-//! - **main-scan** (cutoff `None`): every run is fused, behind the global bloom
-//!   fast-reject (the base run's bloom *is* the global one).
+//! - **main-scan** (cutoff `None`): every run that may hold the key is fused,
+//!   behind the global bloom fast-reject (the base run's bloom *is* the global
+//!   one); the active tier and the other runs are walked only when their own
+//!   blooms admit the key — a run holding insert-only entries, which its
+//!   deletion-key bloom cannot see, is always walked.
 //! - **protected-snapshot** (cutoff `Some(S)`): runs with `max_delete_seq <= S`
 //!   are skipped wholesale (no delete in them can be newer than `S`), and the
 //!   remaining recent runs are gated by their own per-run blooms — so a protected
@@ -294,6 +297,10 @@ where
     /// can therefore avoid the large global bloom entirely and consult only the
     /// recent runs' (smaller) blooms (v1.1).
     bloom: Arc<SplitBlockBloomFilter>,
+    /// Whether some entry in `map` carries only an insert side. `bloom` holds
+    /// deletion keys alone, so it rules a key out of this run for a main-scan
+    /// probe — which needs the insert side too — only when this is false.
+    has_insert_only_entries: bool,
 }
 
 /// Seq-partitioned deletion-index core: an ordered set of frozen `runs` (oldest
@@ -410,6 +417,9 @@ where
             map.insert(key, outcome.entry);
         }
         let entry_count = map.len();
+        let has_insert_only_entries = map
+            .values()
+            .any(|entry| entry.delete_seq == SEQUENCE_ABSENT);
         let bloom = Arc::new(bloom);
         let runs = if entry_count == 0 {
             Vec::new()
@@ -419,6 +429,7 @@ where
                 max_delete_seq: run_max_delete_seq,
                 // The base run holds every deletion, so its bloom IS the global one.
                 bloom: Arc::clone(&bloom),
+                has_insert_only_entries,
             })]
         };
         Self {
@@ -482,9 +493,8 @@ where
     #[inline]
     fn tombstone_of(&self, key: &K, hash: u64, min_delete_seq: Option<i64>) -> Option<Tombstone> {
         // Reuse the per-side-max fold (`fuse`) with the run-skip gate:
-        // - None (main scan): the wrapper already applied the global bloom, so
-        //   every run is included (re-checking per-run blooms here — the base
-        //   run's bloom IS the global one — would regress the hot path ~+30%).
+        // - None (main scan): the wrapper already applied the global bloom; the
+        //   other runs' blooms skip the map GETs that would miss.
         // - Some(S) (protected): skip runs that can't carry an applicable delete
         //   or whose per-run bloom misses, never touching the large global bloom.
         let active = self
@@ -493,7 +503,15 @@ where
             .filter(|bloom| bloom.might_contain(hash))
             .and_then(|_| self.active.get(key).copied());
         Self::fuse_runs(active, &self.runs, key, |run| match min_delete_seq {
-            None => true,
+            // The wrapper already passed the global bloom, so a run whose bloom
+            // IS the global one is probed without checking it again; any other
+            // run is skipped when its bloom rules the key out and it holds no
+            // insert-only entry the bloom cannot see.
+            None => {
+                run.has_insert_only_entries
+                    || Arc::ptr_eq(&run.bloom, &self.bloom)
+                    || run.bloom.might_contain(hash)
+            }
             Some(s) => run.max_delete_seq > s && run.bloom.might_contain(hash),
         })
         .as_ref()
@@ -652,6 +670,7 @@ where
                 map: Arc::new(map),
                 max_delete_seq: run_max,
                 bloom: Arc::new(run_bloom),
+                has_insert_only_entries: active_deletes < active.len(),
             }));
             active = PersistentHashMap::default();
             active_bloom = None;
@@ -717,6 +736,10 @@ where
                     map: Arc::new(map),
                     max_delete_seq,
                     bloom: Arc::new(bloom),
+                    // A key can lose its insert-only status in the merge, so this
+                    // may over-report, which only skips fewer probes.
+                    has_insert_only_entries: older.has_insert_only_entries
+                        || newer.has_insert_only_entries,
                 }),
             );
         }
@@ -857,11 +880,14 @@ where
             Vec::new()
         } else {
             vec![Arc::new(RunData {
-                map: Arc::new(survivors),
                 max_delete_seq: run_max_delete_seq,
                 // Single consolidated run holds every surviving deletion, so its
                 // bloom IS the global one (mirrors `from_iters`' base run).
                 bloom: Arc::clone(&bloom),
+                has_insert_only_entries: survivors
+                    .values()
+                    .any(|entry| entry.delete_seq == SEQUENCE_ABSENT),
+                map: Arc::new(survivors),
             })]
         };
 
