@@ -322,6 +322,14 @@ where
     /// Mutable tier: writes since the last freeze, per-side-max WITHIN active but
     /// NOT pre-fused with the runs (so the runs stay independently seq-skippable).
     active: PersistentHashMap<K, TombstoneEntry, S>,
+    /// Bloom over every key in `active`, `None` exactly while `active` is empty.
+    /// A probe walks the active tier only for a key this may contain: the walk
+    /// is a chain of dependent cache misses down the persistent map, and the
+    /// keys a scan probes mostly live in the runs, not among the writes since
+    /// the last freeze. An `extend` shares it with the generation it derives
+    /// from and adds the keys it writes, which can cost that older generation a
+    /// false positive, never a miss.
+    active_bloom: Option<Arc<SplitBlockBloomFilter>>,
     bloom: Arc<SplitBlockBloomFilter>,
     /// Global monotonic max delete sequence (over runs + active). Feeds the
     /// protected-snapshot install-skip + compaction fence; recompute on removal.
@@ -346,6 +354,7 @@ where
         Self {
             runs: Vec::new(),
             active: PersistentHashMap::default(),
+            active_bloom: None,
             bloom: Arc::new(SplitBlockBloomFilter::new(MIN_BLOOM_CAPACITY)),
             max_sequence_number: None,
             min_deleted_key: None,
@@ -415,6 +424,7 @@ where
         Self {
             runs,
             active: PersistentHashMap::default(),
+            active_bloom: None,
             bloom,
             max_sequence_number,
             min_deleted_key,
@@ -434,7 +444,19 @@ where
         key: &K,
         applicable: impl Fn(&RunData<K, S>) -> bool,
     ) -> Option<TombstoneEntry> {
-        let mut acc = active.get(key).copied();
+        Self::fuse_runs(active.get(key).copied(), runs, key, applicable)
+    }
+
+    /// Fuse `key`'s `active` entry, already looked up, with `runs` (filtered by
+    /// `applicable`), per-side max.
+    #[inline]
+    fn fuse_runs(
+        active: Option<TombstoneEntry>,
+        runs: &[Arc<RunData<K, S>>],
+        key: &K,
+        applicable: impl Fn(&RunData<K, S>) -> bool,
+    ) -> Option<TombstoneEntry> {
+        let mut acc = active;
         for run in runs {
             if !applicable(run) {
                 continue;
@@ -465,7 +487,12 @@ where
         //   run's bloom IS the global one — would regress the hot path ~+30%).
         // - Some(S) (protected): skip runs that can't carry an applicable delete
         //   or whose per-run bloom misses, never touching the large global bloom.
-        Self::fuse(&self.active, &self.runs, key, |run| match min_delete_seq {
+        let active = self
+            .active_bloom
+            .as_ref()
+            .filter(|bloom| bloom.might_contain(hash))
+            .and_then(|_| self.active.get(key).copied());
+        Self::fuse_runs(active, &self.runs, key, |run| match min_delete_seq {
             None => true,
             Some(s) => run.max_delete_seq > s && run.bloom.might_contain(hash),
         })
@@ -501,6 +528,8 @@ where
         bloom_hash_of: impl Fn(&K) -> u64,
     ) -> Self {
         let mut active = self.active.clone();
+        let mut active_bloom = self.active_bloom.clone();
+        let mut new_active_hashes: Vec<u64> = Vec::new();
         let mut runs = self.runs.clone();
         let mut max_sequence_number = self.max_sequence_number;
         let mut min_deleted_key = self.min_deleted_key;
@@ -546,7 +575,28 @@ where
                 let active_current = active.get(&key).copied();
                 let active_merged = merged_entry(active_current, delete_seq, insert_seq).entry;
                 active.insert(key, active_merged);
+                new_active_hashes.push(bloom_hash_of(&key));
             }
+        }
+        // Cover the keys just written to `active`: add them to the shared bloom
+        // while it has room, else rebuild it at twice `active`'s size from every
+        // key in `active` (doubling keeps the rebuilds amortized).
+        if !new_active_hashes.is_empty() {
+            active_bloom = Some(match active_bloom {
+                Some(bloom) if bloom.capacity() >= active.len() => {
+                    for hash in &new_active_hashes {
+                        bloom.insert(*hash);
+                    }
+                    bloom
+                }
+                _ => {
+                    let fresh = SplitBlockBloomFilter::new(bloom_capacity_for(active.len()));
+                    for (key, _) in active.iter() {
+                        fresh.insert(bloom_hash_of(key));
+                    }
+                    Arc::new(fresh)
+                }
+            });
         }
 
         // Bloom policy (global over runs+active deletions) — mirrors the old core.
@@ -604,6 +654,7 @@ where
                 bloom: Arc::new(run_bloom),
             }));
             active = PersistentHashMap::default();
+            active_bloom = None;
         }
 
         // Fold: while over the cap, merge the adjacent pair with the smallest
@@ -673,6 +724,7 @@ where
         Self {
             runs,
             active,
+            active_bloom,
             bloom,
             max_sequence_number,
             min_deleted_key,
@@ -816,6 +868,7 @@ where
         Self {
             runs,
             active: PersistentHashMap::default(),
+            active_bloom: None,
             bloom,
             max_sequence_number,
             min_deleted_key,
@@ -2775,6 +2828,65 @@ mod tests {
             assert_eq!(delete_seq_of(&idx, pk), Some(1), "missing pk={pk}");
         }
         assert_eq!(idx.len(), 64);
+    }
+
+    /// The active tier's bloom gates every probe of the active tier, so it must
+    /// cover every key written there however the tier grows, and an older
+    /// generation that shares it must still answer exactly — only for its own
+    /// keys — after later generations add theirs.
+    #[test]
+    fn the_active_bloom_never_hides_an_active_key() {
+        // A 1,000-key base keeps the freeze threshold at 250, so the active tier
+        // grows past the bloom's first sizing (64) and the bloom is rebuilt.
+        let base = DeletionIndex::from_map((0..1_000_i64).map(|pk| (pk, 1)).collect());
+        assert!(base.core.active_bloom.is_none(), "an empty active tier has no bloom");
+        let mut generations = vec![base];
+        let mut first_bloom_capacity = None;
+        for batch in 0..12_i64 {
+            let keys = (1_000 + batch * 20..1_000 + (batch + 1) * 20).map(|pk| (pk, 2 + batch));
+            let next = generations
+                .last()
+                .expect("a generation")
+                .extend_max_deletes(keys);
+            let bloom = next
+                .core
+                .active_bloom
+                .as_ref()
+                .expect("a non-empty active tier has a bloom");
+            first_bloom_capacity.get_or_insert(bloom.capacity());
+            generations.push(next);
+        }
+        let newest = generations.last().expect("a generation");
+        assert_eq!(newest.core.active.len(), 240, "precondition: no freeze yet");
+        assert!(
+            newest
+                .core
+                .active_bloom
+                .as_ref()
+                .is_some_and(|bloom| bloom.capacity() > first_bloom_capacity.unwrap_or(0)),
+            "precondition: the active bloom was rebuilt larger"
+        );
+        // Every generation answers exactly for its own keys, including the old
+        // ones whose bloom later generations kept adding to.
+        for (age, generation) in generations.iter().enumerate() {
+            let written = 1_000 + 20 * i64::try_from(age).expect("small");
+            for pk in 0..1_240_i64 {
+                let expected = if pk < 1_000 {
+                    Some(1)
+                } else if pk < written {
+                    Some(2 + (pk - 1_000) / 20)
+                } else {
+                    None
+                };
+                assert_eq!(delete_seq_of(generation, pk), expected, "generation {age}, pk={pk}");
+            }
+        }
+        // A freeze empties the active tier and drops its bloom.
+        let frozen = newest.extend_max_deletes((1_240..1_260_i64).map(|pk| (pk, 50)));
+        assert_eq!(frozen.core.active.len(), 0, "precondition: the tier froze");
+        assert!(frozen.core.active_bloom.is_none(), "a frozen tier leaves no bloom");
+        assert_eq!(delete_seq_of(&frozen, 1_250), Some(50));
+        assert_eq!(delete_seq_of(&frozen, 1_100), Some(7));
     }
 
     #[test]
