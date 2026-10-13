@@ -4608,19 +4608,27 @@ impl DataAccelerator for CayenneAccelerator {
             let catalog = self
                 .get_or_create_catalog(&metadata_dir, metastore_type)
                 .await?;
-            if let Ok(stored) = catalog.get_table(table_name).await {
-                if stored.path.starts_with("s3://") {
+            // A failed lookup must not fall back to the configured directory: that is
+            // where the dataset now puts its data, which may already hold files. Only a
+            // table that is not there leaves the configured directory to clear.
+            match catalog.get_table(table_name).await {
+                Ok(stored) if stored.path.starts_with("s3://") => {
                     removed_dir = None;
                     left_in_place = Some(
                         object_store_table_prefixes(catalog.as_ref(), table_name, &stored)
                             .await
                             .boxed()?,
                     );
-                } else if stored.path.trim_end_matches('/') != dir_path.trim_end_matches('/') {
+                }
+                Ok(stored)
+                    if stored.path.trim_end_matches('/') != dir_path.trim_end_matches('/') =>
+                {
                     Self::ensure_metastore_outside_data_dir(source, &stored.path).await?;
                     Self::ensure_no_catalog_under_data_dir(source, &stored.path).await?;
                     removed_dir = Some(stored.path);
                 }
+                Ok(_) | Err(cayenne::CatalogError::TableNotFound { .. }) => {}
+                Err(error) => return Err(Box::new(error)),
             }
             catalog.drop_table(table_name).await.boxed()?;
         }
