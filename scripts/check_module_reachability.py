@@ -310,7 +310,11 @@ def walk_from_root(
             for override in overrides or (None,):
                 child = resolve_child(base, name, override)
                 if child is not None:
-                    stack.append((child, child.name in MOD_RS_NAMES))
+                    # rustc treats a file loaded through `#[path]` as a mod-rs
+                    # file whatever its name: its own `mod` declarations
+                    # resolve beside it, not in a directory named after it.
+                    owns = override is not None or child.name in MOD_RS_NAMES
+                    stack.append((child, owns))
 
 
 # The directories whose `.rs` files must each be compiled by some target. Cargo

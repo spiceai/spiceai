@@ -259,18 +259,18 @@ with tempfile.TemporaryDirectory() as d:
 # live source. Following only the last candidate fails the gate on the rest.
 with tempfile.TemporaryDirectory() as d:
     src = tmp_src(d)
-    (src / "platform" / "unix").mkdir(parents=True)
+    (src / "platform").mkdir(parents=True)
     (src / "lib.rs").write_text(
         '#[cfg_attr(unix, path = "platform/unix.rs")]\n'
         '#[cfg_attr(windows, path = "platform/windows.rs")]\n'
         "mod platform;\n",
         encoding="utf-8",
     )
-    # `platform/unix.rs` is not a mod-rs file, so its own children live in the
-    # sibling directory named after it — the walk has to keep descending from
-    # each candidate, not merely mark the candidate itself.
+    # A file loaded through `#[path]` is a mod-rs file to rustc whatever its
+    # name, so `platform/unix.rs`'s own children live beside it — and the walk
+    # has to keep descending from each candidate, not merely mark it.
     (src / "platform" / "unix.rs").write_text("mod unix_leaf;\n", encoding="utf-8")
-    (src / "platform" / "unix" / "unix_leaf.rs").write_text("", encoding="utf-8")
+    (src / "platform" / "unix_leaf.rs").write_text("", encoding="utf-8")
     (src / "platform" / "windows.rs").write_text("", encoding="utf-8")
 
     reached = set()
@@ -281,7 +281,7 @@ with tempfile.TemporaryDirectory() as d:
         [
             "lib.rs",
             "platform/unix.rs",
-            "platform/unix/unix_leaf.rs",
+            "platform/unix_leaf.rs",
             "platform/windows.rs",
         ],
     )
@@ -393,6 +393,23 @@ for order in (("tests/a.rs", "tests/b.rs"), ("tests/b.rs", "tests/a.rs")):
             unreached(crate, fake_package(crate, *order)),
             [],
         )
+
+# What rustc 1.98 accepts for `#[path = "custom.rs"] mod foo;` when `custom.rs`
+# declares `mod leaf;`: only `src/leaf.rs`. It rejects both `src/foo/leaf.rs`
+# and `src/custom/leaf.rs` with E0583. Resolving under either reports the one
+# file that compiles as dead.
+with tempfile.TemporaryDirectory() as d:
+    crate = Path(d).resolve()
+    write_tree(crate, {
+        "src/lib.rs": '#[path = "custom.rs"]\nmod foo;\n',
+        "src/custom.rs": "mod leaf;\n",
+        "src/leaf.rs": "",
+    })
+    check(
+        "a #[path] module's children resolve beside the file it loads",
+        unreached(crate, fake_package(crate, "src/lib.rs")),
+        [],
+    )
 
 # `src/bin/tool.rs` is a crate root too: its `mod helper;` is `src/bin/helper.rs`.
 with tempfile.TemporaryDirectory() as d:

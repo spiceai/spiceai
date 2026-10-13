@@ -6,9 +6,9 @@ Each crate compiles its integration tests (`tests/`) into **one test binary**, `
 
 Cargo builds every top-level `tests/<name>.rs` as a separate executable, and each one statically links the crate and its whole dependency graph. With one binary per file the link step and the disk footprint grow with the number of test files, not with the code under test.
 
-Measured on `cayenne` when its 104 test binaries were folded into one (#14976; 18-core macOS, `cargo test -p cayenne --no-run --tests`, two runs each):
+Measured on `cayenne` when #14976 folded its 104 test binaries into `integration`, leaving 5: `integration` plus four allocator binaries, which #15010 later merged into one. Measured on 18-core macOS with `cargo test -p cayenne --no-run --tests`, two runs each:
 
-| | Before (104 binaries) | After (1 binary) |
+| | Before (104 binaries) | After (5 binaries) |
 |---|---|---|
 | Rebuild after a library edit, wall | 888 s / 1000 s | 116 s / 128 s |
 | Rebuild after a library edit, CPU | 6723 s / 7078 s | 398 s / 413 s |
