@@ -1269,7 +1269,7 @@ async fn object_store_table_prefixes(
 /// files of the previous one, in an object store, are left in place under `prefixes`.
 fn previous_acceleration_left_in_place_warning(table_name: &str, prefixes: &[String]) -> String {
     format!(
-        "Dataset '{table_name}' recreated its acceleration, and the files of the previous one were not removed from the object store, so they keep using storage. Delete the objects under {} to reclaim it.",
+        "Dataset '{table_name}' recreated its acceleration, and the files of the previous one were not removed from the object store, so they keep using storage. Delete the objects under {}, and under the same paths in any other S3 Express One Zone bucket the dataset replicates to, to reclaim it.",
         prefixes
             .iter()
             .map(|prefix| format!("'{prefix}'"))
@@ -6875,7 +6875,7 @@ mod tests {
                     "s3://old-bucket--usw2-az1--x-s3/orders/expr0=v1.i64.v1/0190a2/".to_string(),
                 ]
             ),
-            "Dataset 'orders' recreated its acceleration, and the files of the previous one were not removed from the object store, so they keep using storage. Delete the objects under 's3://old-bucket--usw2-az1--x-s3/orders/0190a1/', 's3://old-bucket--usw2-az1--x-s3/orders/expr0=v1.i64.v1/0190a2/' to reclaim it."
+            "Dataset 'orders' recreated its acceleration, and the files of the previous one were not removed from the object store, so they keep using storage. Delete the objects under 's3://old-bucket--usw2-az1--x-s3/orders/0190a1/', 's3://old-bucket--usw2-az1--x-s3/orders/expr0=v1.i64.v1/0190a2/', and under the same paths in any other S3 Express One Zone bucket the dataset replicates to, to reclaim it."
         );
     }
 
