@@ -198,6 +198,69 @@ struct BakeOutput<'a> {
     input_ids: &'a [String],
 }
 
+/// An on-conflict deletion update with the deletion index it extends to, built
+/// before its publication's locks
+/// ([`CayenneTableProvider::prepare_on_conflict_deletion_update`]).
+pub(crate) struct PreparedOnConflictDeletion {
+    /// The update itself, folded under the locks if the index moved on.
+    update: OnConflictDeletionUpdate,
+    built: BuiltDeletionIndex,
+}
+
+/// The deletion snapshot a prepared extension was built from, and the result.
+enum BuiltDeletionIndex {
+    Nothing,
+    Int64Pk {
+        from: Arc<Int64PkDeletionSnapshot>,
+        to: Arc<Int64PkDeletionSnapshot>,
+    },
+    RowConverter {
+        from: Arc<RowConverterDeletionSnapshot>,
+        to: Arc<RowConverterDeletionSnapshot>,
+    },
+}
+
+/// `current` extended with an on-conflict delta's pure deletes and
+/// reinsertions, in one pass (a single Bloom rebuild) — see
+/// `DeletionIndex::extend_max`.
+fn extended_int64_snapshot(
+    current: &Int64PkDeletionSnapshot,
+    delta: &Int64DeletionDelta,
+) -> Int64PkDeletionSnapshot {
+    Int64PkDeletionSnapshot::from_index(current.tombstones.extend_max(
+        delta
+            .pure
+            .iter()
+            .flat_map(|(delete_seq, pks)| pks.iter().map(move |&pk| (pk, *delete_seq))),
+        delta
+            .reinsert
+            .iter()
+            .flat_map(|(delete_seq, pks, insert_seq)| {
+                pks.iter().map(move |&pk| (pk, *delete_seq, *insert_seq))
+            }),
+    ))
+}
+
+/// Row-key counterpart of [`extended_int64_snapshot`]; see
+/// `KeyDeletionIndex::extend_max`.
+fn extended_row_key_snapshot(
+    current: &RowConverterDeletionSnapshot,
+    delta: &RowKeyDeletionDelta,
+) -> RowConverterDeletionSnapshot {
+    RowConverterDeletionSnapshot::from_index(current.tombstones.extend_max(
+        delta
+            .pure
+            .iter()
+            .flat_map(|(delete_seq, keys)| keys.iter().map(move |k| (&**k, *delete_seq))),
+        delta
+            .reinsert
+            .iter()
+            .flat_map(|(delete_seq, keys, insert_seq)| {
+                keys.iter().map(move |k| (&**k, *delete_seq, *insert_seq))
+            }),
+    ))
+}
+
 /// Outcome of one off-fence deletion-index prune attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OffFencePrune {
@@ -19023,23 +19086,7 @@ impl CayenneTableProvider {
                     deletion_snapshot, ..
                 } = &self.pk_deletion_strategy
                 {
-                    deletion_snapshot.rcu(|current| {
-                        // Fold the pure-delete and reinsert groups in ONE pass
-                        // (single bloom rebuild) instead of one `extend_max_*`
-                        // call per group — see `DeletionIndex::extend_max`.
-                        let updated = current.tombstones.extend_max(
-                            delta.pure.iter().flat_map(|(delete_seq, pks)| {
-                                pks.iter().map(move |&pk| (pk, *delete_seq))
-                            }),
-                            delta
-                                .reinsert
-                                .iter()
-                                .flat_map(|(delete_seq, pks, insert_seq)| {
-                                    pks.iter().map(move |&pk| (pk, *delete_seq, *insert_seq))
-                                }),
-                        );
-                        Arc::new(Int64PkDeletionSnapshot::from_index(updated))
-                    });
+                    deletion_snapshot.rcu(|current| Arc::new(extended_int64_snapshot(current, &delta)));
                 }
                 self.refresh_deletion_memory_accounting();
             }
@@ -19048,22 +19095,7 @@ impl CayenneTableProvider {
                     deletion_snapshot, ..
                 } = &self.pk_deletion_strategy
                 {
-                    deletion_snapshot.rcu(|current| {
-                        // One-pass fold (single bloom rebuild) over both groups;
-                        // see `KeyDeletionIndex::extend_max`.
-                        let updated = current.tombstones.extend_max(
-                            delta.pure.iter().flat_map(|(delete_seq, keys)| {
-                                keys.iter().map(move |k| (&**k, *delete_seq))
-                            }),
-                            delta
-                                .reinsert
-                                .iter()
-                                .flat_map(|(delete_seq, keys, insert_seq)| {
-                                    keys.iter().map(move |k| (&**k, *delete_seq, *insert_seq))
-                                }),
-                        );
-                        Arc::new(RowConverterDeletionSnapshot::from_index(updated))
-                    });
+                    deletion_snapshot.rcu(|current| Arc::new(extended_row_key_snapshot(current, &delta)));
                 }
                 self.refresh_deletion_memory_accounting();
             }
@@ -19161,6 +19193,132 @@ impl CayenneTableProvider {
                 self.notify_scan_input_change();
                 return;
             }
+        }
+    }
+
+    /// [`Self::commit_on_conflict_publish`] for a protected snapshot whose
+    /// deletion-index extension was built before the caller took its locks
+    /// ([`Self::prepare_on_conflict_deletion_update`]). The prepared index is
+    /// published only if it was built from the index still in place; otherwise
+    /// the extension is redone here, under the same guard.
+    pub(crate) async fn commit_on_conflict_publish_prepared(
+        &self,
+        inlined_tombstone_written: bool,
+        deletion: PreparedOnConflictDeletion,
+        protected_snapshot: (&str, i64),
+    ) {
+        let (snapshot_id, threshold) = protected_snapshot;
+        let mut deletion = Some(deletion);
+        loop {
+            let prepared = self.prepare_protected_snapshot_update(snapshot_id, threshold);
+            let _view_guard = self.scan_state_lock.write().await;
+            if self.try_commit_prepared_protected_snapshot(prepared) {
+                self.mark_maintained_aggregates_stale_on_checkpoint();
+                // As in `publish_on_conflict_update`.
+                if inlined_tombstone_written {
+                    self.bump_inlined_structural_epoch();
+                }
+                if let Some(deletion) = deletion.take() {
+                    self.commit_prepared_on_conflict_deletion(deletion);
+                }
+                self.notify_scan_input_change();
+                return;
+            }
+        }
+    }
+
+    /// Fold an on-conflict deletion update into a copy of the live deletion index
+    /// on a blocking thread, ahead of the locks its publication takes
+    /// ([`Self::commit_on_conflict_publish_prepared`]). The fold visits every key
+    /// the update supersedes and probes each tier of an index that can hold
+    /// millions of keys, so run under the listing fence it held every scan of the
+    /// table for as long.
+    async fn prepare_on_conflict_deletion_update(
+        &self,
+        update: OnConflictDeletionUpdate,
+    ) -> Result<PreparedOnConflictDeletion> {
+        match (update, &self.pk_deletion_strategy) {
+            (
+                OnConflictDeletionUpdate::Int64Pk(delta),
+                PkDeletionStrategyWithCache::Int64Pk {
+                    deletion_snapshot, ..
+                },
+            ) => {
+                let from = deletion_snapshot.load_full();
+                let input = Arc::clone(&from);
+                let (delta, to) = tokio::task::spawn_blocking(move || {
+                    let to = extended_int64_snapshot(&input, &delta);
+                    (delta, to)
+                })
+                .await
+                .map_err(|source| Error::TaskPanicked {
+                    table: self.table_metadata.table_name.clone(),
+                    source,
+                })?;
+                Ok(PreparedOnConflictDeletion {
+                    update: OnConflictDeletionUpdate::Int64Pk(delta),
+                    built: BuiltDeletionIndex::Int64Pk {
+                        from,
+                        to: Arc::new(to),
+                    },
+                })
+            }
+            (
+                OnConflictDeletionUpdate::RowConverter(delta),
+                PkDeletionStrategyWithCache::RowConverterBased {
+                    deletion_snapshot, ..
+                },
+            ) => {
+                let from = deletion_snapshot.load_full();
+                let input = Arc::clone(&from);
+                let (delta, to) = tokio::task::spawn_blocking(move || {
+                    let to = extended_row_key_snapshot(&input, &delta);
+                    (delta, to)
+                })
+                .await
+                .map_err(|source| Error::TaskPanicked {
+                    table: self.table_metadata.table_name.clone(),
+                    source,
+                })?;
+                Ok(PreparedOnConflictDeletion {
+                    update: OnConflictDeletionUpdate::RowConverter(delta),
+                    built: BuiltDeletionIndex::RowConverter {
+                        from,
+                        to: Arc::new(to),
+                    },
+                })
+            }
+            (update, _) => Ok(PreparedOnConflictDeletion {
+                update,
+                built: BuiltDeletionIndex::Nothing,
+            }),
+        }
+    }
+
+    /// Publish a prepared deletion-index extension if the index it was built from
+    /// is still the live one, else fold its update into the live index here. The
+    /// caller holds `scan_state_lock.write()`.
+    fn commit_prepared_on_conflict_deletion(&self, deletion: PreparedOnConflictDeletion) {
+        let PreparedOnConflictDeletion { update, built } = deletion;
+        let published = match (built, &self.pk_deletion_strategy) {
+            (
+                BuiltDeletionIndex::Int64Pk { from, to },
+                PkDeletionStrategyWithCache::Int64Pk {
+                    deletion_snapshot, ..
+                },
+            ) => Arc::ptr_eq(&deletion_snapshot.compare_and_swap(&from, to), &from),
+            (
+                BuiltDeletionIndex::RowConverter { from, to },
+                PkDeletionStrategyWithCache::RowConverterBased {
+                    deletion_snapshot, ..
+                },
+            ) => Arc::ptr_eq(&deletion_snapshot.compare_and_swap(&from, to), &from),
+            _ => false,
+        };
+        if published {
+            self.refresh_deletion_memory_accounting();
+        } else {
+            self.commit_on_conflict_deletion_update(update);
         }
     }
 
@@ -34337,7 +34495,10 @@ impl CayenneTableProvider {
                 Self::sync_snapshot_dir(&snapshot_dir).await?;
             }
 
-            let update = self
+            let OnConflictUpdate {
+                deletion_update,
+                inlined_tombstone_written,
+            } = self
                 .commit_mem_tier_checkpoint_metadata(
                     &snapshot,
                     Some(&new_snapshot_id),
@@ -34345,6 +34506,12 @@ impl CayenneTableProvider {
                     &corpus_keys,
                 )
                 .await?;
+            // Folding every key the corpus supersedes into the deletion index is
+            // the costly part of the publication below; built here, the fenced
+            // section only swaps it in (redoing it there if a writer moved the
+            // index on meanwhile).
+            let prepared_deletion =
+                Box::pin(self.prepare_on_conflict_deletion_update(deletion_update)).await?;
 
             // PHASE 2 — in-memory visibility swap, UNDER the fence. Cheap: an
             // ArcSwap publish, a tier clear, and a listing-table refresh — no
@@ -34372,8 +34539,12 @@ impl CayenneTableProvider {
             // union file on restart.
             {
                 let _fence = self.listing_fence.write().await;
-                self.commit_on_conflict_publish(update, Some((&new_snapshot_id, sequence_number)))
-                    .await;
+                self.commit_on_conflict_publish_prepared(
+                    inlined_tombstone_written,
+                    prepared_deletion,
+                    (&new_snapshot_id, sequence_number),
+                )
+                .await;
                 // Pair every flushed PK with this checkpoint's sequence on any
                 // PRE-EXISTING delete-only tombstone (a re-insert after an
                 // absorbed delete from an earlier checkpoint): the
