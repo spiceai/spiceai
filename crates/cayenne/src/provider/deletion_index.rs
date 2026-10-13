@@ -2031,7 +2031,7 @@ mod tests {
             // Bursts of keys new to the index each freeze a run, so the prefix
             // spans several runs that later folds can merge among themselves.
             for burst in 0..(rng() % 3) {
-                let first = 1_000 + 100 * burst;
+                let first = 1_000 + 100 * burst as i64;
                 let adds: Vec<_> = (0..100_i64)
                     .map(|i| (first + i, seq + 1 + i, SEQUENCE_ABSENT))
                     .collect();
