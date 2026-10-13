@@ -183,6 +183,11 @@ const OBJECT_STORE_MOVE_CONCURRENCY: usize = 16;
 /// drain before giving up. A Stage-B finalize normally completes within
 /// milliseconds; the timeout only guards against a wedged background task.
 const STAGED_WRITE_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
+/// How many times a seq-prefix bake rebuilds its deletion-index prune off the
+/// listing fence after a concurrent writer replaced the index it was built from,
+/// before pruning under the fence instead
+/// ([`CayenneTableProvider::prune_deletion_index_after_bake`]).
+const BAKE_PRUNE_OFF_FENCE_ATTEMPTS: usize = 3;
 /// Default intra-write encode-shard count for an unsorted write when no per-table
 /// `cayenne_write_concurrency` is configured. Deliberately small — NOT the host
 /// core count: the value is sized per table in isolation, so a high default makes
@@ -27189,10 +27194,15 @@ impl CayenneTableProvider {
         let cold_cap = self.cold_tombstone_prune_cap().await;
         let prune_cutoff = cold_cap.map_or(prefix_cutoff, |cap| prefix_cutoff.min(cap));
 
-        // Publish the protected-set swap AND (when the clean-prefix invariant holds)
-        // the deletion-index prune together under ONE write-fence hold, so a scan
-        // never observes a torn state (swapped-but-not-pruned, or vice versa). Only
-        // in-memory work runs here — no I/O — so the fence is held briefly.
+        // Publish the protected-set swap under the write fence, then (when the
+        // clean-prefix invariant holds) prune the deletion index after releasing
+        // it. A scan captures the protected set and the deletion snapshot in one
+        // read-fence hold, so it never pairs the retired inputs with a pruned
+        // index; pairing the merged output with the unpruned index is harmless,
+        // because no live row is old enough for a tombstone at or below the
+        // cutoff to hide it (see `prune_deletion_index_after_bake`). The prune
+        // rebuilds the whole index, which under the fence stalls every scan of
+        // the table for as long as it takes.
         {
             let fence = self.listing_fence.write().await;
             // OVERWRITE GUARD (resurrection-critical) — see the subset-merge
@@ -27224,9 +27234,12 @@ impl CayenneTableProvider {
                 new_map.insert(new_snapshot_id.clone(), fence_max_delete_seq);
                 Arc::new(new_map)
             });
-            if clean_prefix_holds {
-                self.prune_deletion_index_at_or_below(prune_cutoff);
-            }
+        }
+        if clean_prefix_holds {
+            // Boxed: the bake is one of the crate's largest futures (see
+            // `snapshot_bytes_for_merge_budget`), and the prune's state need not grow it.
+            Box::pin(self.prune_deletion_index_after_bake(prune_cutoff, &snapshot_at_capture))
+                .await?;
         }
 
         if clean_prefix_holds {
@@ -28796,6 +28809,106 @@ impl CayenneTableProvider {
                 Some(i64::MIN)
             }
         }
+    }
+
+    /// Drop the deletion index's tombstones at or below `cutoff` after a
+    /// seq-prefix bake has published its protected-set swap, without holding the
+    /// listing fence while the pruned index is built.
+    ///
+    /// The swap retired every snapshot holding a row at or below `cutoff` (the
+    /// clean-prefix gate): the merged output applies only deletions above its
+    /// threshold, which is at least `cutoff`, and every other live snapshot and
+    /// the in-memory tier hold only newer rows. From the swap on, a tombstone at
+    /// or below `cutoff` hides no row a scan can read, so dropping it changes no
+    /// answer, and a scan that captured the protected set before the swap
+    /// captured the deletion snapshot in the same read-fence hold, so it never
+    /// pairs the retired inputs with the pruned index. The prune only reclaims
+    /// memory and probe work, and it may be published whenever it is ready.
+    ///
+    /// Building the pruned index costs a pass over every entry, so it runs on a
+    /// blocking thread and is published by compare-and-swap against the index it
+    /// was built from; a writer that extended the index meanwhile wins, and the
+    /// prune is rebuilt from the result. It is the deletion reservation's only
+    /// shrink (see [`Self::deletion_index_over_memory_ceiling`]), so after
+    /// [`BAKE_PRUNE_OFF_FENCE_ATTEMPTS`] lost races it falls back to pruning under
+    /// the write fence, which no writer of the index runs concurrently with. A
+    /// table replaced mid-pass (overwrite, datalake move) is not pruned: its
+    /// index was rebuilt for the replacement.
+    async fn prune_deletion_index_after_bake(
+        &self,
+        cutoff: i64,
+        snapshot_at_capture: &str,
+    ) -> Result<()> {
+        for _ in 0..BAKE_PRUNE_OFF_FENCE_ATTEMPTS {
+            if self.get_current_snapshot_id() != snapshot_at_capture {
+                return Ok(());
+            }
+            let published = match &self.pk_deletion_strategy {
+                PkDeletionStrategyWithCache::Int64Pk {
+                    deletion_snapshot, ..
+                } => {
+                    self.prune_deletion_snapshot_off_fence(
+                        deletion_snapshot,
+                        |snapshot| snapshot.tombstones.has_deletions(),
+                        move |snapshot| {
+                            Int64PkDeletionSnapshot::from_index(
+                                snapshot.tombstones.prune_deletes_at_or_below(cutoff),
+                            )
+                        },
+                    )
+                    .await?
+                }
+                PkDeletionStrategyWithCache::RowConverterBased {
+                    deletion_snapshot, ..
+                } => {
+                    self.prune_deletion_snapshot_off_fence(
+                        deletion_snapshot,
+                        |snapshot| snapshot.tombstones.has_deletions(),
+                        move |snapshot| {
+                            RowConverterDeletionSnapshot::from_index(
+                                snapshot.tombstones.prune_deletes_at_or_below(cutoff),
+                            )
+                        },
+                    )
+                    .await?
+                }
+                PkDeletionStrategyWithCache::PositionBased { .. } => return Ok(()),
+            };
+            if published {
+                self.refresh_deletion_memory_accounting();
+                return Ok(());
+            }
+        }
+        let _fence = self.listing_fence.write().await;
+        if self.get_current_snapshot_id() == snapshot_at_capture {
+            self.prune_deletion_index_at_or_below(cutoff);
+        }
+        Ok(())
+    }
+
+    /// One off-fence prune attempt on `cell`: build the pruned snapshot from the
+    /// current one on a blocking thread, then publish it only if `cell` still
+    /// holds that snapshot. Returns whether the prune is in place, which it also
+    /// is when there was nothing to prune.
+    async fn prune_deletion_snapshot_off_fence<T: Send + Sync + 'static>(
+        &self,
+        cell: &ArcSwap<T>,
+        has_deletions: impl Fn(&T) -> bool,
+        prune: impl FnOnce(&T) -> T + Send + 'static,
+    ) -> Result<bool> {
+        let current = cell.load_full();
+        if !has_deletions(&current) {
+            return Ok(true);
+        }
+        let input = Arc::clone(&current);
+        let pruned = tokio::task::spawn_blocking(move || prune(&input))
+            .await
+            .map_err(|source| Error::TaskPanicked {
+                table: self.table_metadata.table_name.clone(),
+                source,
+            })?;
+        let previous = cell.compare_and_swap(&current, Arc::new(pruned));
+        Ok(Arc::ptr_eq(&previous, &current))
     }
 
     /// Seq-prefix clear of the in-memory deletion index: drop every PK tombstone
