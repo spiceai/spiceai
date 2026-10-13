@@ -24,20 +24,17 @@ limitations under the License.
 #![expect(clippy::expect_used, dead_code)]
 
 // Accelerator engines self-register through a linkme slice; the linker drops an unreferenced
-// slice static, so a binary exercising Cayenne must name the crate itself.
+// slice static, so a test exercising Cayenne names the crate itself.
 use accelerator_cayenne as _;
-
-#[path = "cluster/harness.rs"]
-mod harness;
 
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
+use crate::cluster::harness::ClusterHarness;
 use app::AppBuilder;
 use datafusion::common::TableReference;
-use harness::ClusterHarness;
 use parking_lot::Mutex;
 use spicepod::component::access::AccessMode;
 use spicepod::component::catalog::Catalog;
@@ -227,6 +224,9 @@ async fn catalog_table_tuning(
     ignore = "the Cayenne catalog connector requires the spicebench feature"
 )]
 async fn adaptive_tuning_enabled_turns_adaptive_on_for_catalog_tables() {
+    crate::utils::require_process_per_test(
+        "this test installs the process-global tracing subscriber its log assertions read",
+    );
     assert!(
         catalog_table_tuning(AdaptiveTuning::Enabled, &[], &[])
             .await
@@ -241,6 +241,9 @@ async fn adaptive_tuning_enabled_turns_adaptive_on_for_catalog_tables() {
     ignore = "the Cayenne catalog connector requires the spicebench feature"
 )]
 async fn catalog_tables_are_static_by_default() {
+    crate::utils::require_process_per_test(
+        "this test installs the process-global tracing subscriber its log assertions read",
+    );
     assert!(
         !catalog_table_tuning(AdaptiveTuning::Disabled, &[], &[])
             .await
@@ -255,6 +258,9 @@ async fn catalog_tables_are_static_by_default() {
     ignore = "the Cayenne catalog connector requires the spicebench feature"
 )]
 async fn retired_catalog_tuning_param_warns_once_per_node_and_is_not_applied() {
+    crate::utils::require_process_per_test(
+        "this test installs the process-global tracing subscriber its log assertions read",
+    );
     let dynamic = catalog_table_tuning(
         AdaptiveTuning::Disabled,
         &[],
@@ -306,6 +312,9 @@ async fn retired_catalog_tuning_param_warns_once_per_node_and_is_not_applied() {
     ignore = "the Cayenne catalog connector requires the spicebench feature"
 )]
 async fn runtime_targets_reach_catalog_tables() {
+    crate::utils::require_process_per_test(
+        "this test installs the process-global tracing subscriber its log assertions read",
+    );
     let resolved = catalog_table_tuning(
         AdaptiveTuning::Enabled,
         &[
@@ -338,6 +347,9 @@ async fn runtime_targets_reach_catalog_tables() {
     ignore = "the Cayenne catalog connector requires the spicebench feature"
 )]
 async fn targets_without_adaptive_tuning_warn_once_and_leave_the_loop_off() {
+    crate::utils::require_process_per_test(
+        "this test installs the process-global tracing subscriber its log assertions read",
+    );
     let resolved =
         catalog_table_tuning(AdaptiveTuning::Disabled, &[("target_freshness", "5s")], &[]).await;
     assert!(

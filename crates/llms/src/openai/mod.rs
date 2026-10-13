@@ -195,7 +195,7 @@ pub fn new_azure_client_with_chat_backend(
     }
 
     Openai {
-        client: Client::with_config(cfg),
+        client: crate::provider::client_without_retry(cfg),
         model,
         rate_controller: default_rate_controller(),
         chat_backend,
@@ -251,7 +251,7 @@ pub fn new_openai_client_with_chat_backend(
     }
 
     Openai {
-        client: Client::with_config(cfg),
+        client: crate::provider::client_without_retry(cfg),
         model,
         rate_controller: usage_tier.map_or_else(default_rate_controller, Into::into),
         chat_backend,
@@ -264,7 +264,7 @@ pub fn new_openai_client_with_config<C: async_openai::config::Config + Clone>(
     cfg: C,
 ) -> Openai<C> {
     Openai {
-        client: Client::with_config(cfg),
+        client: crate::provider::client_without_retry(cfg),
         model,
         rate_controller: default_rate_controller(),
         chat_backend: ChatBackend::ChatCompletions,
@@ -367,7 +367,7 @@ mod chat_backend_tests {
     clippy::expect_used,
     reason = "a failed set-up in a test should name itself and stop"
 )]
-mod authorization_header_tests {
+pub(crate) mod authorization_header_tests {
     use std::io::{Read as _, Write as _};
     use std::net::TcpListener;
     use std::sync::mpsc;
@@ -378,7 +378,7 @@ mod authorization_header_tests {
 
     /// Stand a one-shot HTTP server up and hand back its base URL together with a
     /// channel carrying the request headers it receives.
-    fn capture_one_request() -> (String, mpsc::Receiver<String>) {
+    pub(crate) fn capture_one_request() -> (String, mpsc::Receiver<String>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind a local port");
         let port = listener
             .local_addr()

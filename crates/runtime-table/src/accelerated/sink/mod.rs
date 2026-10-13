@@ -211,6 +211,25 @@ pub(crate) async fn rollback_indexes<'a>(
     }
 }
 
+/// Builds each Cayenne table's scan view and file listing for the data a refresh
+/// just wrote, so the queries the refresh releases when it completes do not all
+/// stall listing the new files at once.
+///
+/// Call it last, after the index hooks: a refresh superseded by a newer request is
+/// dropped mid-await, and dropping it here skips nothing the write still owes.
+pub(crate) async fn prepare_tables_for_reads(
+    providers: &[Arc<dyn datafusion::datasource::TableProvider>],
+) {
+    for provider in providers {
+        if let Some(cayenne) = spice_table::find_concrete::<cayenne::CayenneTableProvider>(
+            provider.as_ref(),
+            spice_table::LayerWalk::Write,
+        ) {
+            cayenne.prepare_scan_view_for_reads().await;
+        }
+    }
+}
+
 /// Runs [`Index::on_write_complete`] for every index after a successful write, and
 /// reports the first failure from an index that declares a finalize failure fatal.
 ///
