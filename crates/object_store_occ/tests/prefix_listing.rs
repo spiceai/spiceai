@@ -24,7 +24,10 @@ async fn listed_keys_include_state_written_with_a_leading_slash_prefix() {
         let directory = tempfile::tempdir().expect("state directory");
         let store = Arc::new(LocalConditionalPut::new(directory.path()).expect("local store"));
         let state = ObjectState::<u64>::new(store).with_prefix(prefix);
-        assert_eq!(state.insert("job-42", &42).await.expect("insert"), InsertResult::Ok);
+        assert_eq!(
+            state.insert("job-42", &42).await.expect("insert"),
+            InsertResult::Ok
+        );
         assert_eq!(state.get("job-42").await.expect("read"), Some(42));
         let keys = state.list_keys().await.expect("list");
         assert_eq!(keys, vec!["job-42"], "prefix={prefix:?}");

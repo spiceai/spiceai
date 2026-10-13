@@ -46,7 +46,10 @@ async fn conditional_writes_to_the_same_file_have_one_winner() {
                 .await
                 .expect("create initial state");
             let expected = Expected::at_version(UpdateVersion::from(initial)).expect("local ETag");
-            let observed = second.head(&second_key).await.expect("same physical object");
+            let observed = second
+                .head(&second_key)
+                .await
+                .expect("same physical object");
             assert_eq!(
                 expected,
                 Expected::Version(UpdateVersion {
