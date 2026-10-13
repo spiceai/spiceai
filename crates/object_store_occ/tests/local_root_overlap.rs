@@ -90,5 +90,15 @@ async fn conditional_writes_to_the_same_file_have_one_winner() {
                 other => panic!("expected one applied write and one conflict: {other:?}"),
             }
         }
+        let locks: Vec<_> = std::fs::read_dir(nested)
+            .expect("list feature directory")
+            .map(|entry| entry.expect("feature entry").file_name())
+            .filter(|name| name.to_string_lossy().contains("spice-occ-lock"))
+            .collect();
+        assert_eq!(
+            locks.len(),
+            1,
+            "one directory lock must cover every object: {locks:?}"
+        );
     }
 }

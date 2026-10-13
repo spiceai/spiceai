@@ -85,14 +85,15 @@ fn worker_error(source: impl std::error::Error + Send + Sync + 'static) -> Objec
     }
 }
 
+/// One lock file per directory. Equivalent store roots then share it, and
+/// deleting an object does not leave a lock behind for every key.
 fn publication_lock_path(root: &std::path::Path, location: &Path) -> PathBuf {
     let object_path = root.join(location.as_ref());
-    let mut file_name = object_path
-        .file_name()
-        .map(std::ffi::OsStr::to_os_string)
-        .unwrap_or_default();
-    file_name.push(".spice-occ-lock");
-    object_path.with_file_name(file_name)
+    object_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(root)
+        .join(".spice-occ-lock")
 }
 
 /// Runs outside any Tokio runtime so `LocalFileSystem` performs its filesystem
