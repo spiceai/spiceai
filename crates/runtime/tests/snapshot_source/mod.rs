@@ -28,7 +28,7 @@ limitations under the License.
 //! `.spice/data`, so each test names its datasets uniquely and removes their copies.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeSet, HashMap},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
@@ -1170,19 +1170,7 @@ async fn custom_paths_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
 
     let data_dir = dir.path().join("reader").join(modules);
     let metadata_dir = dir.path().join("reader").join("metadata");
-    let mut dataset = reader_dataset(rustfs, modules, &prefix);
-    if let Some(acceleration) = dataset.acceleration.as_mut() {
-        acceleration.params = Some(Params::from_string_map(HashMap::from([
-            (
-                "cayenne_file_path".to_string(),
-                data_dir.display().to_string(),
-            ),
-            (
-                "cayenne_metadata_dir".to_string(),
-                metadata_dir.display().to_string(),
-            ),
-        ])));
-    }
+    let dataset = reader_dataset_at(rustfs, modules, &prefix, &data_dir, &metadata_dir);
     let reader = Arc::new(
         Runtime::builder()
             .with_app(
@@ -1212,6 +1200,219 @@ async fn custom_paths_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
         Vec::<PathBuf>::new(),
         "nothing is restored under `.spice/data`"
     );
+
+    reader.shutdown().await;
+    writer.shutdown().await;
+    Ok(())
+}
+
+const RECLAIM: &str = "spice_test_rustfs_snapshot_source_reclaim";
+
+/// A reader keeps only the snapshot directory it serves: each reload reclaims the
+/// one it supersedes, and a restart reclaims directories an earlier process left
+/// (spiceai/spiceai#14981).
+#[tokio::test]
+async fn a_reader_reclaims_the_snapshot_directories_a_reload_supersedes() -> Result<()> {
+    let _tracing = init_tracing(Some("integration=debug,runtime=info,info"));
+    let modules = unique("modules");
+    test_request_context()
+        .scope(async {
+            let (rustfs, container) = start_rustfs(RECLAIM).await?;
+            let result = reclaim_scenario(rustfs, &modules).await;
+            remove_local_copies(&[&modules]);
+            container.remove().await?;
+            result
+        })
+        .await
+}
+
+/// A reader dataset with its copy under `data_dir` and its metastore under
+/// `metadata_dir`.
+fn reader_dataset_at(
+    rustfs: Rustfs,
+    name: &str,
+    prefix: &str,
+    data_dir: &Path,
+    metadata_dir: &Path,
+) -> Dataset {
+    let mut dataset = reader_dataset(rustfs, name, prefix);
+    if let Some(acceleration) = dataset.acceleration.as_mut() {
+        acceleration.params = Some(Params::from_string_map(HashMap::from([
+            (
+                "cayenne_file_path".to_string(),
+                data_dir.display().to_string(),
+            ),
+            (
+                "cayenne_metadata_dir".to_string(),
+                metadata_dir.display().to_string(),
+            ),
+        ])));
+    }
+    dataset
+}
+
+/// The `<table_id>/<snapshot_id>/` directories (both uuids) under a data directory.
+fn snapshot_dirs_under(data_dir: &Path) -> BTreeSet<PathBuf> {
+    fn is_uuid(path: &Path) -> bool {
+        path.file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| uuid::Uuid::parse_str(name).is_ok())
+    }
+    fn walk(dir: &Path, parent_is_uuid: bool, found: &mut BTreeSet<PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for path in entries.flatten().map(|entry| entry.path()) {
+            if !path.is_dir() {
+                continue;
+            }
+            if parent_is_uuid && is_uuid(&path) {
+                found.insert(path);
+            } else {
+                walk(&path, is_uuid(&path), found);
+            }
+        }
+    }
+    let mut found = BTreeSet::new();
+    walk(data_dir, false, &mut found);
+    found
+}
+
+/// Wait for `data_dir` to hold exactly `expected` snapshot directories; reclamation
+/// runs after a grace.
+async fn wait_for_snapshot_dirs(data_dir: &Path, expected: usize) -> Result<BTreeSet<PathBuf>> {
+    let deadline = Instant::now() + Duration::from_mins(1);
+    let mut seen = BTreeSet::new();
+    while Instant::now() < deadline {
+        seen = snapshot_dirs_under(data_dir);
+        if seen.len() == expected {
+            return Ok(seen);
+        }
+        tokio::time::sleep(Duration::from_millis(200)).await;
+    }
+    Err(anyhow!(
+        "the copy under {} should hold {expected} snapshot directories, holds {}: {seen:?}",
+        data_dir.display(),
+        seen.len()
+    ))
+}
+
+fn csv_with_rows(rows: usize) -> String {
+    use std::fmt::Write as _;
+    let mut csv = String::from("id,name\n");
+    for id in 1..=rows {
+        writeln!(csv, "{id},row{id}").expect("writing to a String cannot fail");
+    }
+    csv
+}
+
+async fn reclaim_scenario(rustfs: Rustfs, modules: &str) -> Result<()> {
+    let prefix = unique("snapshots");
+    let dir = TempDir::new()?;
+    let modules_csv = dir.path().join("modules.csv");
+    std::fs::write(&modules_csv, csv_with_rows(3))?;
+    // Files, not inlined rows: an inlined snapshot has no directory to reclaim.
+    let mut writer_modules = writer_dataset(modules, &modules_csv, "cayenne", dir.path());
+    if let Some(acceleration) = writer_modules.acceleration.as_mut() {
+        let mut params = acceleration
+            .params
+            .as_ref()
+            .map(Params::as_string_map)
+            .unwrap_or_default();
+        params.insert("cayenne_inline_max_rows".to_string(), "0".to_string());
+        acceleration.params = Some(Params::from_string_map(params));
+    }
+    let writer = Arc::new(
+        Runtime::builder()
+            .with_app(
+                AppBuilder::new("snapshot_source_reclaim_writer")
+                    .with_snapshots(writer_snapshots(rustfs, &prefix))
+                    .with_dataset(writer_modules)
+                    .build(),
+            )
+            .build()
+            .await,
+    );
+    load(&writer).await?;
+    wait_for_writer_snapshot(rustfs, &prefix, modules, 0).await?;
+    replicate_snapshots(rustfs, &prefix).await?;
+
+    let data_dir = dir.path().join("reader").join(modules);
+    let metadata_dir = dir.path().join("reader").join("metadata");
+    let reader_app = || {
+        AppBuilder::new("snapshot_source_reclaim_reader")
+            .with_dataset(reader_dataset_at(
+                rustfs,
+                modules,
+                &prefix,
+                &data_dir,
+                &metadata_dir,
+            ))
+            .build()
+    };
+    let reader = Arc::new(Runtime::builder().with_app(reader_app()).build().await);
+    load(&reader).await?;
+    wait_for_rows(&reader, modules, 3).await?;
+    let mut served = wait_for_snapshot_dirs(&data_dir, 1).await?;
+
+    // Each reload supersedes the previous directory; only the served one remains.
+    for round in 1..=5 {
+        let rows_now = 3 + round;
+        std::fs::write(&modules_csv, csv_with_rows(rows_now))?;
+        wait_for_rows(&writer, modules, rows_now).await?;
+        let deadline = Instant::now() + Duration::from_mins(1);
+        loop {
+            replicate_snapshots(rustfs, &prefix).await?;
+            if rows(&reader, modules).await?.len() == rows_now {
+                break;
+            }
+            ensure!(
+                Instant::now() < deadline,
+                "reload {round}: the reader should follow the writer to {rows_now} rows"
+            );
+            tokio::time::sleep(Duration::from_millis(500)).await;
+        }
+        let now_served = wait_for_snapshot_dirs(&data_dir, 1)
+            .await
+            .with_context(|| {
+                format!("reload {round} should reclaim the superseded snapshot directory")
+            })?;
+        ensure!(
+            now_served != served,
+            "reload {round} should serve a new snapshot directory, serves {now_served:?}"
+        );
+        served = now_served;
+    }
+    assert_eq!(rows(&reader, modules).await?, rows(&writer, modules).await?);
+
+    // A restart reclaims directories an earlier process leaked.
+    reader.shutdown().await;
+    let table_dir = served
+        .iter()
+        .next()
+        .and_then(|dir| dir.parent())
+        .map(Path::to_path_buf)
+        .ok_or_else(|| anyhow!("the served snapshot directory has a table root"))?;
+    for _ in 0..3 {
+        let leaked = table_dir.join(uuid::Uuid::now_v7().to_string());
+        std::fs::create_dir_all(&leaked)?;
+        std::fs::write(leaked.join("stale.vortex"), b"stale")?;
+    }
+    ensure!(
+        snapshot_dirs_under(&data_dir).len() == 4,
+        "precondition: three leaked directories beside the served one"
+    );
+    let reader = Arc::new(Runtime::builder().with_app(reader_app()).build().await);
+    load(&reader).await?;
+    wait_for_rows(&reader, modules, 8).await?;
+    let after_restart = wait_for_snapshot_dirs(&data_dir, 1)
+        .await
+        .context("a restart should reclaim the directories an earlier process left")?;
+    assert_eq!(
+        after_restart, served,
+        "the served snapshot directory is kept"
+    );
+    assert_eq!(rows(&reader, modules).await?, rows(&writer, modules).await?);
 
     reader.shutdown().await;
     writer.shutdown().await;
