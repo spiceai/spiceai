@@ -161,7 +161,9 @@ use vortex_datafusion::WriteShardConfig;
 
 use super::compaction::{CompactionCandidate, FileEntry, pick_candidates};
 use super::context::CayenneContext;
-use super::deletion_index::{DeletionIndex, KeyDeletionIndex};
+use super::deletion_index::{
+    DeletionIndex, KeyDeletionIndex, PrunedDeletionPrefix, PrunedKeyDeletionPrefix,
+};
 use super::deletion_strategy::{
     Int64PkDeletionSnapshot, PkDeletionStrategy, PkDeletionStrategyWithCache, PositionBitmap,
     PositionDeletionVector, RowConverterDeletionSnapshot,
@@ -183,10 +185,9 @@ const OBJECT_STORE_MOVE_CONCURRENCY: usize = 16;
 /// drain before giving up. A Stage-B finalize normally completes within
 /// milliseconds; the timeout only guards against a wedged background task.
 const STAGED_WRITE_DRAIN_TIMEOUT: Duration = Duration::from_secs(30);
-/// How many times a seq-prefix bake rebuilds its deletion-index prune off the
-/// listing fence after a concurrent writer replaced the index it was built from,
-/// before pruning under the fence instead
-/// ([`CayenneTableProvider::prune_deletion_index_after_bake`]).
+/// How many times a seq-prefix bake splices its off-fence deletion-index prune
+/// over the live index and tries to swap it in, before pruning under the fence
+/// instead ([`CayenneTableProvider::prune_deletion_index_after_bake`]).
 const BAKE_PRUNE_OFF_FENCE_ATTEMPTS: usize = 3;
 
 /// What a seq-prefix bake published, so its deferred deletion-index prune can
@@ -29043,12 +29044,16 @@ impl CayenneTableProvider {
     /// pairs the retired inputs with the pruned index. The prune only reclaims
     /// memory and probe work, and it may be published whenever it is ready.
     ///
-    /// Building the pruned index costs a pass over every entry, so it runs on a
-    /// blocking thread and is published by compare-and-swap against the index it
-    /// was built from; a writer that extended the index meanwhile wins, and the
-    /// prune is rebuilt from the result. It is the deletion reservation's only
-    /// shrink (see [`Self::deletion_index_over_memory_ceiling`]), so after
-    /// [`BAKE_PRUNE_OFF_FENCE_ATTEMPTS`] lost races it falls back to pruning under
+    /// Pruning costs a pass over every entry of the index's frozen runs, which are
+    /// immutable, so it runs once on a blocking thread however long it takes, and
+    /// only the result is spliced over the index then live — which keeps every
+    /// run frozen and every entry written meanwhile (a mem-tier checkpoint
+    /// publishes every few seconds) — and swapped in by compare-and-swap. The
+    /// splice costs a pass over the newer tiers alone, so a writer that wins the
+    /// swap only costs a re-splice; a fold that merged the pruned runs costs a
+    /// rebuild. It is the deletion reservation's only shrink (see
+    /// [`Self::deletion_index_over_memory_ceiling`]), so after
+    /// [`BAKE_PRUNE_OFF_FENCE_ATTEMPTS`] lost swaps it falls back to pruning under
     /// the write fence, which no writer of the index runs concurrently with.
     ///
     /// Every publication — the compare-and-swap and the fallback — happens under
@@ -29070,46 +29075,78 @@ impl CayenneTableProvider {
             merged_snapshot_id,
             input_ids,
         };
-        for _ in 0..BAKE_PRUNE_OFF_FENCE_ATTEMPTS {
-            let outcome = match &self.pk_deletion_strategy {
-                PkDeletionStrategyWithCache::Int64Pk {
-                    deletion_snapshot, ..
-                } => {
-                    self.prune_deletion_snapshot_off_fence(
-                        deletion_snapshot,
-                        &bake,
-                        |snapshot| snapshot.tombstones.has_deletions(),
-                        move |snapshot| {
-                            Int64PkDeletionSnapshot::from_index(
-                                snapshot.tombstones.prune_deletes_at_or_below(cutoff),
-                            )
-                        },
-                    )
-                    .await?
-                }
-                PkDeletionStrategyWithCache::RowConverterBased {
-                    deletion_snapshot, ..
-                } => {
-                    self.prune_deletion_snapshot_off_fence(
-                        deletion_snapshot,
-                        &bake,
-                        |snapshot| snapshot.tombstones.has_deletions(),
-                        move |snapshot| {
-                            RowConverterDeletionSnapshot::from_index(
-                                snapshot.tombstones.prune_deletes_at_or_below(cutoff),
-                            )
-                        },
-                    )
-                    .await?
-                }
-                PkDeletionStrategyWithCache::PositionBased { .. } => return Ok(()),
-            };
-            match outcome {
-                OffFencePrune::Published
-                | OffFencePrune::NothingToPrune
-                | OffFencePrune::OutputNotLive => return Ok(()),
-                OffFencePrune::LostRace => {}
+        let outcome = match &self.pk_deletion_strategy {
+            PkDeletionStrategyWithCache::Int64Pk {
+                deletion_snapshot, ..
+            } => {
+                let build: Arc<
+                    dyn Fn(&Int64PkDeletionSnapshot) -> PrunedDeletionPrefix + Send + Sync,
+                > = Arc::new(move |snapshot: &Int64PkDeletionSnapshot| {
+                    snapshot.tombstones.prune_frozen_prefix(cutoff)
+                });
+                let splice: Arc<
+                    dyn Fn(
+                            &Int64PkDeletionSnapshot,
+                            &PrunedDeletionPrefix,
+                        ) -> Option<Int64PkDeletionSnapshot>
+                        + Send
+                        + Sync,
+                > = Arc::new(
+                    |snapshot: &Int64PkDeletionSnapshot, prefix: &PrunedDeletionPrefix| {
+                        snapshot
+                            .tombstones
+                            .with_pruned_prefix(prefix)
+                            .map(Int64PkDeletionSnapshot::from_index)
+                    },
+                );
+                self.prune_deletion_snapshot_off_fence(
+                    deletion_snapshot,
+                    &bake,
+                    |snapshot| snapshot.tombstones.has_deletions(),
+                    build,
+                    splice,
+                )
+                .await?
             }
+            PkDeletionStrategyWithCache::RowConverterBased {
+                deletion_snapshot, ..
+            } => {
+                let build: Arc<
+                    dyn Fn(&RowConverterDeletionSnapshot) -> PrunedKeyDeletionPrefix + Send + Sync,
+                > = Arc::new(move |snapshot: &RowConverterDeletionSnapshot| {
+                    snapshot.tombstones.prune_frozen_prefix(cutoff)
+                });
+                let splice: Arc<
+                    dyn Fn(
+                            &RowConverterDeletionSnapshot,
+                            &PrunedKeyDeletionPrefix,
+                        ) -> Option<RowConverterDeletionSnapshot>
+                        + Send
+                        + Sync,
+                > = Arc::new(
+                    |snapshot: &RowConverterDeletionSnapshot, prefix: &PrunedKeyDeletionPrefix| {
+                        snapshot
+                            .tombstones
+                            .with_pruned_prefix(prefix)
+                            .map(RowConverterDeletionSnapshot::from_index)
+                    },
+                );
+                self.prune_deletion_snapshot_off_fence(
+                    deletion_snapshot,
+                    &bake,
+                    |snapshot| snapshot.tombstones.has_deletions(),
+                    build,
+                    splice,
+                )
+                .await?
+            }
+            PkDeletionStrategyWithCache::PositionBased { .. } => return Ok(()),
+        };
+        match outcome {
+            OffFencePrune::Published
+            | OffFencePrune::NothingToPrune
+            | OffFencePrune::OutputNotLive => return Ok(()),
+            OffFencePrune::LostRace => {}
         }
         let _fence = self.listing_fence.write().await;
         if self.bake_output_is_live(&bake) {
@@ -29118,42 +29155,78 @@ impl CayenneTableProvider {
         Ok(())
     }
 
-    /// One off-fence prune attempt on `cell`: build the pruned snapshot from the
-    /// current one on a blocking thread, then, under the write fence and only while
-    /// the bake's output is live, publish it if `cell` still holds that snapshot.
-    async fn prune_deletion_snapshot_off_fence<T: Send + Sync + 'static>(
+    /// The off-fence prune of one deletion cell: `build` the pruned frozen prefix
+    /// of the index on a blocking thread, then up to
+    /// [`BAKE_PRUNE_OFF_FENCE_ATTEMPTS`] times `splice` it over the index live at
+    /// that moment (also off the fence) and, under the write fence and only while
+    /// the bake's output is live, swap the result in if `cell` still holds the
+    /// index it was spliced over. A lost swap re-splices; a declined splice (a
+    /// fold merged the prefix's runs) rebuilds the prefix.
+    async fn prune_deletion_snapshot_off_fence<T, P>(
         &self,
         cell: &ArcSwap<T>,
         bake: &BakeOutput<'_>,
         has_deletions: impl Fn(&T) -> bool,
-        prune: impl FnOnce(&T) -> T + Send + 'static,
-    ) -> Result<OffFencePrune> {
-        let current = cell.load_full();
-        if !has_deletions(&current) {
-            return Ok(OffFencePrune::NothingToPrune);
+        build: Arc<dyn Fn(&T) -> P + Send + Sync>,
+        splice: Arc<dyn Fn(&T, &P) -> Option<T> + Send + Sync>,
+    ) -> Result<OffFencePrune>
+    where
+        T: Send + Sync + 'static,
+        P: Send + Sync + 'static,
+    {
+        let table = &self.table_metadata.table_name;
+        let mut prefix: Option<Arc<P>> = None;
+        for _ in 0..BAKE_PRUNE_OFF_FENCE_ATTEMPTS {
+            let current = cell.load_full();
+            if !has_deletions(&current) {
+                return Ok(OffFencePrune::NothingToPrune);
+            }
+            let built = match &prefix {
+                Some(built) => Arc::clone(built),
+                None => {
+                    let (input, build) = (Arc::clone(&current), Arc::clone(&build));
+                    let built = Arc::new(
+                        tokio::task::spawn_blocking(move || build(&input))
+                            .await
+                            .map_err(|source| Error::TaskPanicked {
+                                table: table.clone(),
+                                source,
+                            })?,
+                    );
+                    prefix = Some(Arc::clone(&built));
+                    built
+                }
+            };
+            // The build may have taken long enough for writers to move the index
+            // on; splice over the index live now.
+            let current = cell.load_full();
+            let (input, splice) = (Arc::clone(&current), Arc::clone(&splice));
+            let spliced = tokio::task::spawn_blocking(move || splice(&input, &built))
+                .await
+                .map_err(|source| Error::TaskPanicked {
+                    table: table.clone(),
+                    source,
+                })?;
+            let Some(spliced) = spliced else {
+                prefix = None;
+                continue;
+            };
+            #[cfg(test)]
+            self.run_test_pre_bake_prune_publish_hook().await;
+            let _fence = self.listing_fence.write().await;
+            if !self.bake_output_is_live(bake) {
+                return Ok(OffFencePrune::OutputNotLive);
+            }
+            let previous = cell.compare_and_swap(&current, Arc::new(spliced));
+            if Arc::ptr_eq(&previous, &current) {
+                // Still under the fence: refreshed after it, this smaller figure
+                // could overwrite the larger one a fenced writer (checkpoint,
+                // inline or staged publish) accounted for an index it grew since.
+                self.refresh_deletion_memory_accounting();
+                return Ok(OffFencePrune::Published);
+            }
         }
-        let input = Arc::clone(&current);
-        let pruned = tokio::task::spawn_blocking(move || prune(&input))
-            .await
-            .map_err(|source| Error::TaskPanicked {
-                table: self.table_metadata.table_name.clone(),
-                source,
-            })?;
-        #[cfg(test)]
-        self.run_test_pre_bake_prune_publish_hook().await;
-        let _fence = self.listing_fence.write().await;
-        if !self.bake_output_is_live(bake) {
-            return Ok(OffFencePrune::OutputNotLive);
-        }
-        let previous = cell.compare_and_swap(&current, Arc::new(pruned));
-        if !Arc::ptr_eq(&previous, &current) {
-            return Ok(OffFencePrune::LostRace);
-        }
-        // Still under the fence: refreshed after it, this smaller figure could
-        // overwrite the larger one a fenced writer (checkpoint, inline or staged
-        // publish) accounted for an index it grew in between.
-        self.refresh_deletion_memory_accounting();
-        Ok(OffFencePrune::Published)
+        Ok(OffFencePrune::LostRace)
     }
 
     /// Whether a seq-prefix bake's swap is still what scans see: the table keeps
