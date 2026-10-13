@@ -33,3 +33,24 @@ async fn listed_keys_include_state_written_with_a_leading_slash_prefix() {
         assert_eq!(keys, vec!["job-42"], "prefix={prefix:?}");
     }
 }
+
+#[tokio::test]
+async fn a_prefix_without_a_trailing_slash_stays_a_textual_prefix() {
+    for prefix in ["tenant", "/tenant"] {
+        let directory = tempfile::tempdir().expect("state directory");
+        let store = Arc::new(LocalConditionalPut::new(directory.path()).expect("local store"));
+        let state = ObjectState::<u64>::new(store).with_prefix(prefix);
+        assert_eq!(
+            state.insert("job", &7).await.expect("insert"),
+            InsertResult::Ok
+        );
+        let written = directory.path().join("tenantjob.json");
+        assert!(
+            written.is_file(),
+            "prefix {prefix:?} must write {}",
+            written.display()
+        );
+        assert!(!directory.path().join("tenant").join("job.json").exists());
+        assert_eq!(state.get("job").await.expect("read"), Some(7));
+    }
+}
