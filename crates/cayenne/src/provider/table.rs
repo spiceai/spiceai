@@ -54868,6 +54868,126 @@ mod tests {
             .await;
     }
 
+    /// A seq-prefix bake routes its merged output into key-range files: each file
+    /// holds one slice of the key in key order and the slices do not overlap, so a
+    /// lookup on the key opens one file of the merged snapshot rather than every
+    /// one. Five checkpoints of scrambled keys, each small enough to be one hashed
+    /// file; the bake folds the oldest two into an output large enough for several
+    /// encode shards.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_bake_routes_its_merged_output_into_key_range_files() {
+        use arrow::array::StringArray;
+
+        const ROWS_PER_CHECKPOINT: usize = 4_000;
+        const CHECKPOINTS: usize = 5;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("pad", DataType::Utf8, false),
+        ]));
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_table_with_schema(
+            "bake_range_routed",
+            ctx.runtime_env(),
+            Arc::clone(&schema),
+            vec!["id".to_string()],
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                compaction_background_interval_ms: 0,
+                write_concurrency: Some(4),
+                // ~0.8 MiB per checkpoint stays one hashed file; the bake's
+                // ~1.6 MiB merge fills at least two encode shards.
+                target_vortex_file_size_mb: 1,
+                ..VortexConfig::default()
+            },
+            OnConflict::Upsert(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "id".to_string(),
+                ]),
+            ),
+        )
+        .await;
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+
+        for checkpoint in 0..CHECKPOINTS {
+            let base = checkpoint * ROWS_PER_CHECKPOINT;
+            let keys: Vec<i64> = (0..ROWS_PER_CHECKPOINT)
+                .map(|i| {
+                    i64::try_from(base + (i * 7919) % ROWS_PER_CHECKPOINT).expect("key fits i64")
+                })
+                .collect();
+            let batch = RecordBatch::try_new(
+                Arc::clone(&schema),
+                vec![
+                    Arc::new(Int64Array::from(keys.clone())),
+                    Arc::new(StringArray::from_iter_values(
+                        keys.iter().map(|id| format!("{id:0>200}")),
+                    )),
+                ],
+            )
+            .expect("checkpoint batch");
+            provider
+                .write_cdc_append_stream(single_batch_stream(batch), &ctx.task_ctx())
+                .await
+                .expect("CDC upsert")
+                .finish()
+                .await
+                .expect("CDC upsert published");
+            provider
+                .checkpoint_mem_tier()
+                .await
+                .expect("checkpoint");
+        }
+        let before: HashSet<String> = provider
+            .protected_snapshots
+            .load()
+            .keys()
+            .cloned()
+            .collect();
+        assert_eq!(
+            before.len(),
+            CHECKPOINTS,
+            "precondition: one protected snapshot per checkpoint"
+        );
+
+        assert!(
+            provider
+                .bake_seq_prefix_protected_snapshots()
+                .await
+                .expect("bake"),
+            "the oldest checkpoints bake"
+        );
+        let after: HashSet<String> = provider
+            .protected_snapshots
+            .load()
+            .keys()
+            .cloned()
+            .collect();
+        let merged: Vec<&String> = after.difference(&before).collect();
+        let [merged] = merged.as_slice() else {
+            panic!("a bake publishes one merged snapshot: {after:?}");
+        };
+        let baked = CHECKPOINTS + 1 - after.len();
+        let files = provider
+            .list_snapshot_files_with_sizes(merged)
+            .await
+            .expect("list merged files")
+            .len();
+        assert!(
+            files >= 2,
+            "precondition: the merged output spans several encode shards ({files} files)"
+        );
+        assert_disjoint_sorted_key_range_files_in(
+            &provider,
+            merged,
+            &schema,
+            files,
+            baked * ROWS_PER_CHECKPOINT,
+        )
+        .await;
+    }
+
     /// A whole-table replace of a keyed table routes its rows into key-range
     /// files once a previous snapshot exists to sample: each file holds its own
     /// slice of the key domain in key order, the slices do not overlap, and no
