@@ -76798,6 +76798,9 @@ mod tests {
         let attempt = attempt.lock().take().expect(
             "precondition: the upsert reached the window between its index checkout and its validation",
         );
+        // A fresh RAM-tier row, so this checkpoint folds the inline corpus even when
+        // the attempt above already flushed the tier (an empty tier returns early).
+        apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), &[(101, 1)]).await;
         provider
             .checkpoint_mem_tier()
             .await
