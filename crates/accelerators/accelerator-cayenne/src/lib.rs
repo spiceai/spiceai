@@ -1229,6 +1229,18 @@ fn rejects_stored_table(error: &(dyn std::error::Error + 'static)) -> bool {
     })
 }
 
+/// The warning an operator reads when a dataset's acceleration was rebuilt at a new data
+/// location, and the files of the previous one, in an object store, are left in place.
+fn previous_location_left_in_place_warning(
+    table_name: &str,
+    data_dir: &str,
+    previous_dir: &str,
+) -> String {
+    format!(
+        "Dataset '{table_name}' moved its acceleration to '{data_dir}', and the files of its previous acceleration at '{previous_dir}' were not removed, so they keep using storage. Delete them to reclaim it."
+    )
+}
+
 /// Whether the runtime holds this registration's rebuild for changed settings until its
 /// source can be read ([`SettingsRebuild::HeldUntilSourceReadable`]).
 fn rebuild_held(acceleration: Option<&Acceleration>) -> bool {
@@ -4539,10 +4551,14 @@ impl DataAccelerator for CayenneAccelerator {
         //
         // The files removed are the ones the stored table was written to. When
         // the dataset's settings now put its data elsewhere — a rebuild for a
-        // changed data location — that is the stored location, not the configured
-        // one: removing the configured directory would orphan the table's files
-        // and delete whatever the new location already holds.
-        let mut removed_dir = dir_path.clone();
+        // changed data location — that is the stored location, never the
+        // configured one: removing the configured directory would orphan the
+        // table's files and delete whatever the new location already holds. A
+        // stored object-store location is not removed here, since this teardown
+        // deletes local directories only, so its files are left where they are
+        // and the log says so.
+        let mut removed_dir = Some(dir_path.clone());
+        let mut left_in_place = None;
         if let Some(acceleration) = source.acceleration() {
             let metadata_dir = Self::resolve_metadata_dir(Some(acceleration));
             let metastore_type = acceleration
@@ -4558,26 +4574,41 @@ impl DataAccelerator for CayenneAccelerator {
                 .ok()
                 .map(|table| table.path)
                 .filter(|stored_dir| {
-                    !stored_dir.starts_with("s3://")
-                        && stored_dir.trim_end_matches('/') != dir_path.trim_end_matches('/')
+                    stored_dir.trim_end_matches('/') != dir_path.trim_end_matches('/')
                 })
             {
-                Self::ensure_metastore_outside_data_dir(source, &stored_dir).await?;
-                Self::ensure_no_catalog_under_data_dir(source, &stored_dir).await?;
-                removed_dir = stored_dir;
+                if stored_dir.starts_with("s3://") {
+                    removed_dir = None;
+                    left_in_place = Some(stored_dir);
+                } else {
+                    Self::ensure_metastore_outside_data_dir(source, &stored_dir).await?;
+                    Self::ensure_no_catalog_under_data_dir(source, &stored_dir).await?;
+                    removed_dir = Some(stored_dir);
+                }
             }
             catalog.drop_table(table_name).await.boxed()?;
         }
 
-        if path_exists(&removed_dir).await {
+        if let Some(removed_dir) = removed_dir
+            && path_exists(&removed_dir).await
+        {
             Self::remove_acceleration_data_dir(source, &removed_dir).await?;
             tracing::info!(
                 "Removed the Cayenne data directory '{removed_dir}' of dataset '{table_name}' to recreate its acceleration"
             );
         }
+        if let Some(stored_dir) = left_in_place {
+            tracing::warn!(
+                "{}",
+                previous_location_left_in_place_warning(table_name, &dir_path, &stored_dir)
+            );
+        }
 
-        // Recreate the data directory so the next create_external_table works
-        tokio::fs::create_dir_all(&path_buf).await.boxed()?;
+        // Recreate the local data directory so the next create_external_table works.
+        // An object-store location has no directory to create.
+        if !dir_path.starts_with("s3://") {
+            tokio::fs::create_dir_all(&path_buf).await.boxed()?;
+        }
         Ok(())
     }
 
@@ -6655,6 +6686,99 @@ mod tests {
         assert!(
             new_file.exists(),
             "the newly configured location's contents must be left alone"
+        );
+    }
+
+    /// A rebuild for a changed data location whose stored table is in an object store
+    /// leaves the newly configured location alone: this teardown removes local
+    /// directories only, so the stored files stay where they are, and the log names them.
+    #[tokio::test]
+    async fn drop_table_leaves_the_configured_location_of_a_table_stored_in_an_object_store() {
+        use cayenne::{CayenneCatalog, MetadataCatalog, metadata::CreateTableOptions};
+
+        let app = Arc::new(AppBuilder::new("test").build());
+        let base = tempfile::tempdir().expect("temp dir");
+        let metadata_dir = base.path().join("metadata");
+        let new_dir = base.path().join("new").join("orders");
+
+        // The table as an earlier configuration stored it, in an object store.
+        std::fs::create_dir_all(&metadata_dir).expect("metastore dir");
+        let catalog = CayenneCatalog::new(format!(
+            "sqlite://{}",
+            metadata_dir.join("cayenne.db").display()
+        ))
+        .expect("catalog");
+        catalog.init().await.expect("init catalog");
+        catalog
+            .create_table(CreateTableOptions {
+                table_name: "orders".to_string(),
+                schema: Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: "s3://old-bucket--usw2-az1--x-s3/orders/".to_string(),
+                partition_column: None,
+                vortex_config: cayenne::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("create the stored table");
+        drop(catalog);
+
+        // The dataset now puts its data under `new/`, which already holds a file.
+        std::fs::create_dir_all(&new_dir).expect("new dir");
+        let new_file = new_dir.join("unrelated");
+        std::fs::write(&new_file, b"keep").expect("new file");
+        let mut dataset = TestAccelerationSource::new("orders").with_app(Arc::clone(&app));
+        dataset.set_acceleration(Acceleration {
+            engine: Engine::Cayenne,
+            mode: Mode::File,
+            params: [
+                (
+                    "cayenne_file_path".to_string(),
+                    base.path().join("new").to_string_lossy().into_owned(),
+                ),
+                (
+                    "cayenne_metadata_dir".to_string(),
+                    metadata_dir.to_string_lossy().into_owned(),
+                ),
+            ]
+            .into_iter()
+            .collect(),
+            ..Default::default()
+        });
+
+        CayenneAccelerator::new()
+            .drop_table("orders", &dataset)
+            .await
+            .expect("drop the stored table");
+
+        assert!(
+            new_file.exists(),
+            "the newly configured location's contents must be left alone"
+        );
+        let catalog = CayenneCatalog::new(format!(
+            "sqlite://{}",
+            metadata_dir.join("cayenne.db").display()
+        ))
+        .expect("catalog");
+        catalog.init().await.expect("init catalog");
+        assert!(
+            matches!(
+                catalog.get_table("orders").await,
+                Err(cayenne::CatalogError::TableNotFound { .. })
+            ),
+            "the stored table's catalog rows must be dropped"
+        );
+    }
+
+    #[test]
+    fn previous_location_warning_names_the_dataset_both_locations_and_the_fix() {
+        assert_eq!(
+            previous_location_left_in_place_warning(
+                "orders",
+                "/var/spice/data/orders",
+                "s3://old-bucket--usw2-az1--x-s3/orders/"
+            ),
+            "Dataset 'orders' moved its acceleration to '/var/spice/data/orders', and the files of its previous acceleration at 's3://old-bucket--usw2-az1--x-s3/orders/' were not removed, so they keep using storage. Delete them to reclaim it."
         );
     }
 
