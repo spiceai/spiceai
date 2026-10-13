@@ -1357,14 +1357,15 @@ impl PendingPkKeys {
     /// Only sound for an index whose `Inlined` entries all name rows this flush
     /// moved: an entry for a row written to the inline memtable after the flush
     /// would be relabeled too, and that row is still inline. The per-shard index
-    /// and the table-wide index both qualify. Each is checked out, built and
-    /// restored by one write holding `write_lock`, which every inline write also
-    /// takes, so no row reaches the inline memtable while it is out (an off-lock
-    /// staged write builds a private index and never checks the shared one out);
-    /// validation only reads it, and keys join it after the restore. An index
-    /// rebuilt during the checkout holds the moved keys too: the rebuild reads the
-    /// inline rows under the same listing fence as the snapshot list the flush
-    /// registers its file in, so each moved row is in one or the other.
+    /// qualifies. It is checked out, built and restored by one apply holding
+    /// `write_lock`, which every inline write also takes, so no row reaches the
+    /// inline memtable while it is out; validation only reads it, and keys join
+    /// it in `append_to_shard`, after the restore. An index rebuilt during the
+    /// checkout holds the moved keys too: the rebuild reads the inline rows under
+    /// the same listing fence as the snapshot list the flush registers its file
+    /// in, so each moved row is in one or the other. The table-wide restore keeps
+    /// only a Bloom across the flush and drops an Exact keyset, whose per-key OCC
+    /// stamps the flush would leave stale (`store_cached_pk_index`).
     pub(crate) fn relocate_inlined_after_flush(&mut self) {
         if self.outstanding == 0 {
             return;
