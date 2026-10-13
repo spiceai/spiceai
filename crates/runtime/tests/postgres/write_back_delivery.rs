@@ -322,7 +322,30 @@ async fn create_bumping_table(source: &Client, table: &str) -> Result<(), anyhow
 }
 
 /// Wait for the dataset's bootstrap snapshot — the one seed row.
+///
+/// Waits for the dataset to report `Ready` first: until then a query against it
+/// fails with "Acceleration not ready" rather than returning a count, and
+/// `wait_for` treats a failed probe as the answer instead of polling past it.
+/// A runtime with a dataset that is refused on purpose never passes
+/// `runtime_ready_check`, so a test like that reaches this with its other
+/// datasets still loading.
 async fn wait_for_bootstrap(rt: &Arc<Runtime>, table: &str) -> Result<(), anyhow::Error> {
+    use runtime::status::ComponentStatus;
+
+    let name = datafusion::common::TableReference::from(table);
+    let ready = wait_until_true(PROPAGATION_TIMEOUT, || async {
+        matches!(
+            rt.status().get_dataset_statuses().get(&name),
+            Some(ComponentStatus::Ready)
+        )
+    })
+    .await;
+    let status = rt.status().get_dataset_statuses().get(&name).cloned();
+    anyhow::ensure!(
+        ready,
+        "timed out waiting for {table} to load before reading its bootstrap snapshot; status {status:?}"
+    );
+
     let sql = format!("SELECT count(*) FROM {table}");
     wait_for("the bootstrap snapshot", Some(1), || accel_scalar(rt, &sql)).await
 }
