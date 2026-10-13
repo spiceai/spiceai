@@ -965,6 +965,7 @@ mod tests {
             calculate_retrieval_metrics(&qrels, &results, 10).is_err(),
             "expected an error when no query relevance judgments are provided"
         );
-        RetrievalEvaluation::up_to_longest_result_list(&qrels, &results).unwrap_err();
+        RetrievalEvaluation::up_to_longest_result_list(&qrels, &results)
+            .expect_err("expected an error when no query relevance judgments are provided");
     }
 }
