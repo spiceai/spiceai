@@ -94,23 +94,87 @@ runs:
           toolchain='stable'
         fi
 
-        # If the toolchain is already installed (e.g. spiceai-macos self-hosted
-        # runners), just verify it. Otherwise install it.
-        if rustup run "$toolchain" cargo --version >/dev/null 2>&1; then
-          echo "Toolchain $toolchain already available, skipping install"
-        else
-          if [ ! -x "$cargo_home/bin/rustup" ]; then
-            curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused -fsSL "https://sh.rustup.rs" | sh -s -- --default-toolchain none -y
-            if [ -f "$cargo_home/env" ]; then
-              source "$cargo_home/env" || true
-            fi
+        # Several Actions runner services on one Mac share this user's RUSTUP_HOME.
+        # Two jobs installing the same toolchain race: cargo can land first, the
+        # other job skips install, then `rustup which rustc` tries to recover a
+        # half-written tree and dies with "Directory not empty" (os error 66).
+        # One lock covers the whole home. A toolchain counts as present only when
+        # rustc and cargo are on disk. If either is missing, remove the partial
+        # tree before install so rustup does not rename components onto leftovers.
+        rustup_home="${RUSTUP_HOME:-$HOME/.rustup}"
+        mkdir -p "$rustup_home"
+        # The lock is an OS advisory lock (flock(2)) on a file, not a directory or
+        # PID-file lock. The kernel drops it when the shell that holds it exits,
+        # however it exits (a cancelled job's SIGKILL included), so nothing ever
+        # has to decide a holder is dead and delete its lock. Every stale-reaping
+        # scheme has a check/delete race: a waiter that decided the old lock was
+        # stale can run its `rm` after another waiter has already recreated it,
+        # deleting a live lock and letting two installs in at once.
+        lockfile="$rustup_home/setup-rust.flock"
+        exec 9>>"$lockfile"
+        if command -v flock >/dev/null 2>&1; then
+          # util-linux flock(1) (Linux runners).
+          if ! flock -w 900 9; then
+            echo "Timed out waiting for $lockfile" >&2
+            exit 1
           fi
+        else
+          # macOS has no flock(1), but ships perl. flock(2) locks the open file
+          # description, which perl shares with this shell's fd 9, so the lock
+          # outlives the perl process and is held until this shell closes fd 9.
+          if ! perl -MFcntl=:flock -e '
+            open(my $fh, ">>&=", 9) or die "cannot open fd 9: $!\n";
+            my $deadline = time + 900;
+            until (flock($fh, LOCK_EX | LOCK_NB)) {
+              die "flock: $!\n" unless $!{EWOULDBLOCK} || $!{EAGAIN};
+              die "timed out\n" if time >= $deadline;
+              sleep 2;
+            }
+          '; then
+            echo "Could not lock $lockfile" >&2
+            exit 1
+          fi
+        fi
+
+        if [ ! -x "$cargo_home/bin/rustup" ]; then
+          curl --proto '=https' --tlsv1.2 --retry 10 --retry-connrefused -fsSL "https://sh.rustup.rs" | sh -s -- --default-toolchain none -y
+          if [ -f "$cargo_home/env" ]; then
+            source "$cargo_home/env" || true
+          fi
+        fi
+
+        case "$toolchain" in
+          *[!A-Za-z0-9._-]*)
+            echo "Invalid toolchain name: $toolchain" >&2
+            exit 1
+            ;;
+        esac
+
+        host="$(rustup show | awk '/^Default host:/ { print $3; exit }')"
+        if [ -z "$host" ]; then
+          echo "rustup did not report a default host" >&2
+          exit 1
+        fi
+        tool_dir="$rustup_home/toolchains/${toolchain}-${host}"
+
+        if [ -x "$tool_dir/bin/rustc" ] && [ -x "$tool_dir/bin/cargo" ] && [ -x "$tool_dir/bin/rustfmt" ] && [ -x "$tool_dir/bin/cargo-clippy" ]; then
+          echo "Toolchain $toolchain already available, skipping install"
+        elif [ -x "$tool_dir/bin/rustc" ] && [ -x "$tool_dir/bin/cargo" ]; then
+          echo "Toolchain $toolchain is missing rustfmt or clippy; adding them"
+          rustup component add rustfmt clippy --toolchain "$toolchain"
+        else
+          echo "Toolchain $toolchain is missing or incomplete; reinstalling"
+          rm -rf "$tool_dir"
+          rm -f "$rustup_home/update-hashes/${toolchain}-${host}"
           rustup toolchain install "$toolchain" \
             --component cargo \
             --component rustc \
             --component rustfmt \
             --component clippy
         fi
+
+        # Release the install lock; nothing below writes to RUSTUP_HOME.
+        exec 9>&-
 
         resolved="$(basename "$(dirname "$(dirname "$(rustup which --toolchain "$toolchain" rustc)")")")"
         if [ -z "$resolved" ]; then

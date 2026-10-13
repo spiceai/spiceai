@@ -2,9 +2,13 @@
 name: integration tests (management API)
 
 on:
-  schedule:
-    - cron: '0 2 * * *' # Daily at 02:00 UTC
-
+  # Manual dispatch only: the dev OAuth client behind SPICE_MANAGEMENT_CLIENT_ID_DEV is
+  # inactive, so a scheduled run fails in 'Authenticate with Spice Cloud dev API' before
+  # the suite runs (https://github.com/spiceai/spiceai/issues/12376). Restore the schedule
+  # once a manual dispatch is green; the `event_name == 'schedule'` branches below are
+  # kept so that is a one-line change:
+  #   schedule:
+  #     - cron: '0 2 * * *' # Daily at 02:00 UTC
   workflow_dispatch:
     inputs:
       update_snapshots:

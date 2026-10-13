@@ -359,7 +359,7 @@ async fn prepare_transaction(
         let table_name = table_ref.table();
         let Some(provider) = resolve_cayenne_staged(df, table_name).await else {
             return Err(TransactionError::Rejected(format!(
-                "transaction target '{table_name}' must be an accelerator-only, non-partitioned Cayenne dataset (configure on_conflict without CDC); other modes route writes to the federated source"
+                "transaction target '{table_name}' must be a non-partitioned Cayenne dataset with 'acceleration.write_mode: acceleration', or 'write_mode: write_back' with 'refresh_mode: changes'; other modes route writes to the federated source"
             )));
         };
         let token = provider.transaction_write_token().await;
@@ -421,7 +421,9 @@ fn classify_transaction_write(plan: &LogicalPlan) -> Option<Result<TableReferenc
         LogicalPlan::Dml(dml) => Some(match &dml.op {
             WriteOp::Insert(_) | WriteOp::Update => Ok(dml.table_name.clone()),
             WriteOp::Delete => Err("DELETE"),
-            WriteOp::Ctas | WriteOp::Truncate => Err("this operation"),
+            // `WriteOp` is non-exhaustive (DataFusion 55 added MERGE INTO): any
+            // other write cannot be staged atomically, so it aborts the transaction.
+            _ => Err("this operation"),
         }),
         LogicalPlan::Extension(ext) => {
             let dml = ext

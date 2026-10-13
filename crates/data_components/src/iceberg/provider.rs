@@ -498,14 +498,14 @@ fn handle_iceberg_error(e: iceberg::Error) -> Error {
                     return Error::CertificateError {
                         url: url.to_string(),
                         detail: err_in_detail,
-                        source: e,
+                        source: Box::new(e),
                     };
                 }
 
                 // Return a generic connection error for all other cases
                 return Error::FailedToConnect {
                     url: url.to_string(),
-                    source: e,
+                    source: Box::new(e),
                 };
             }
 

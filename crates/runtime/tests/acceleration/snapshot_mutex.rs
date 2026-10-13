@@ -26,8 +26,8 @@ use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use async_trait::async_trait;
 use data_components::arrow::write::MemTable;
+use datafusion::common::TableReference;
 use datafusion::datasource::TableProvider;
-use datafusion::sql::TableReference;
 use runtime::Runtime;
 use runtime::accelerated::refresh::{AccelerationRefreshMode, Refresh, Refresher};
 use runtime::accelerated::{SnapshotCreateTrigger, SnapshotCreationConfig};
@@ -96,6 +96,36 @@ fn unique_temp_dir(prefix: &str) -> PathBuf {
     std::env::temp_dir().join(format!("{prefix}_{nanos}"))
 }
 
+/// Whether a snapshot has been published under `root` and nothing is still writing:
+/// `metadata.json` exists, no multipart upload is staged (a `#` file beside its
+/// destination), and the local copy staged for the upload has been removed.
+async fn snapshot_published(root: &Path, staged_copy: &Path) -> anyhow::Result<bool> {
+    if tokio::fs::try_exists(staged_copy).await? {
+        return Ok(false);
+    }
+    let mut pending = vec![root.to_path_buf()];
+    let mut metadata = false;
+    while let Some(dir) = pending.pop() {
+        let Ok(mut entries) = tokio::fs::read_dir(&dir).await else {
+            continue;
+        };
+        while let Some(entry) = entries.next_entry().await? {
+            let path = entry.path();
+            if entry.file_type().await?.is_dir() {
+                pending.push(path);
+                continue;
+            }
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.contains('#') {
+                return Ok(false);
+            }
+            metadata |= name == "metadata.json";
+        }
+    }
+    Ok(metadata)
+}
+
 async fn count_files(root: &Path) -> anyhow::Result<usize> {
     let mut pending = vec![root.to_path_buf()];
     let mut count = 0usize;
@@ -128,7 +158,14 @@ async fn test_snapshot_interval_serializes_with_accelerator_writes() -> anyhow::
     let local_snapshot_file = temp_root.join("acceleration.db");
 
     tokio::fs::create_dir_all(&snapshot_dir).await?;
-    tokio::fs::write(&local_snapshot_file, b"snapshot-data").await?;
+    // A real DuckDB database: the snapshot opens the acceleration file to
+    // checkpoint its write-ahead log before copying it, and refuses a file it
+    // cannot open.
+    let db_path = local_snapshot_file.clone();
+    tokio::task::spawn_blocking(move || {
+        duckdb::Connection::open(&db_path)?.execute_batch("CREATE TABLE t(id INTEGER)")
+    })
+    .await??;
 
     let snapshots = Snapshots {
         enabled: true,
@@ -206,9 +243,13 @@ async fn test_snapshot_interval_serializes_with_accelerator_writes() -> anyhow::
     );
     drop(lock_guard);
 
-    let snapshot_wait = tokio::time::timeout(Duration::from_secs(3), async move {
+    // A file appears as soon as the upload starts, so wait for the snapshot to be
+    // published: the temp dir is removed below, and a snapshot still writing into it
+    // fails that removal.
+    let staged_copy = local_snapshot_file.with_extension("snapshot_tmp");
+    let snapshot_wait = tokio::time::timeout(Duration::from_secs(10), async move {
         loop {
-            if count_files(&snapshot_dir).await? > 0 {
+            if snapshot_published(&snapshot_dir, &staged_copy).await? {
                 return Ok::<(), anyhow::Error>(());
             }
             tokio::time::sleep(Duration::from_millis(50)).await;

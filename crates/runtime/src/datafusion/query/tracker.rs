@@ -17,7 +17,7 @@ limitations under the License.
 use std::{collections::HashSet, sync::Arc};
 
 use arrow::datatypes::SchemaRef;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use opentelemetry::KeyValue;
 use tokio::time::Instant;
 

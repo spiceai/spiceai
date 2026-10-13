@@ -54,8 +54,8 @@ use object_store::ObjectMeta;
 use object_store::ObjectStore;
 use object_store::path::Path;
 use vortex::VortexSessionDefault;
+use vortex::array::stats::StatsSet;
 use vortex::arrow::ArrowSessionExt;
-use vortex::arrow::FromArrowType;
 use vortex::dtype::DType;
 use vortex::dtype::Nullability;
 use vortex::dtype::PType;
@@ -269,19 +269,31 @@ pub struct WriteShardConfig {
     /// partition value), resolved by name against the write schema. Empty ⇒
     /// distribute whole batches instead of splitting them row-wise.
     pub shard_key_columns: Vec<String>,
-    /// Ascending split points that RANGE-partition rows on the single
+    /// Ascending split points that RANGE-partition rows on the first
     /// `shard_key_columns` entry, giving each output file a disjoint, contiguous
-    /// slice of that key's domain so a predicate on it prunes. `None` ⇒ hash the
-    /// key instead, which spreads every key range across every file.
+    /// slice of that column's domain so a predicate on it prunes. `None` ⇒ hash
+    /// the key instead, which spreads every key range across every file.
     ///
-    /// Supply `write_concurrency - 1` bounds. Ignored unless exactly one shard
-    /// key column is set: ordering a composite key needs a lexicographic
-    /// comparison this does not implement, so a multi-column key hashes.
+    /// Supply `write_concurrency - 1` bounds. Ignored when `shard_key_columns`
+    /// is empty. A composite key still range-splits on its leading column —
+    /// ordering every column would need a lexicographic comparison this does
+    /// not implement — and the remaining columns ride on the spec so an
+    /// estimated-bounds hash fallback can rebalance when the unsampled
+    /// remainder is one value of that leading column.
     pub range_bounds: Option<Vec<ScalarValue>>,
-    /// Sort each range shard's rows by the shard key in runs of at most this
-    /// many uncompressed bytes before encoding them. Ignored unless the write is
-    /// range-partitioned. `None` ⇒ rows keep their arrival order within a shard.
-    pub range_run_sort_bytes: Option<u64>,
+    /// Sort each shard's rows by the leading shard key column in runs of at
+    /// most this many uncompressed bytes before encoding them. Applies to
+    /// range- and hash-partitioned writes; a round-robin or single-writer write
+    /// has no key to sort by and ignores it. `None` ⇒ rows keep their arrival
+    /// order within a shard.
+    pub run_sort_bytes: Option<u64>,
+    /// The `range_bounds` were estimated from a sample that may not describe
+    /// every row the write will see (a table's first load samples the head of
+    /// its own input). If one range shard then receives far more than its share
+    /// of the rows, the writer hashes the key for the rest of the write instead
+    /// of leaving one encoder the remainder. Bounds read off the rows being
+    /// rewritten keep their split however the rows fall.
+    pub range_bounds_estimated: bool,
 }
 
 /// Vortex implementation of a `DataFusion` [`FileFormat`].
@@ -656,8 +668,8 @@ impl VortexFormat {
 
     /// Returns a format that fans writes across `config.write_concurrency`
     /// concurrent shard writers (clamped to the session `target_partitions`),
-    /// routing rows by `config.shard_key_columns` — range-partitioned when
-    /// `config.range_bounds` supplies split points for a single key column,
+    /// routing rows by `config.shard_key_columns` — range-partitioned on the
+    /// first key column when `config.range_bounds` supplies split points,
     /// hashed otherwise, and round-robin when no key is set. Used by the Cayenne
     /// accelerator to parallelize the Vortex encode.
     #[must_use]
@@ -770,21 +782,31 @@ impl VortexFormat {
                 return ShardSpec::RoundRobin(partitions);
             }
         }
-        // Range-partition when the caller supplied bounds for a single key
-        // column: same row-wise split as `Hash`, so every encoder is fed from
-        // the first batch, but the shards tile the key domain in order instead
-        // of scattering it, which is what lets a file's zone maps prune.
-        if let (Some(bounds), [expr]) = (write_shard.range_bounds.as_ref(), exprs.as_slice())
+        // Range-partition when the caller supplied bounds: same row-wise split
+        // as `Hash`, so every encoder is fed from the first batch, but the
+        // shards tile the first key column's domain in order instead of
+        // scattering it, which is what lets a file's zone maps prune. Remaining
+        // key columns are not part of the range comparison; they ride on
+        // `hash_exprs` so an estimated-bounds fallback can still rebalance a
+        // composite key.
+        if let Some(bounds) = write_shard.range_bounds.as_ref()
             && !bounds.is_empty()
+            && let Some(expr) = exprs.first()
         {
             return ShardSpec::Range {
                 expr: Arc::clone(expr),
+                hash_exprs: exprs,
                 bounds: bounds.clone(),
                 partitions,
-                run_sort_bytes: write_shard.range_run_sort_bytes,
+                run_sort_bytes: write_shard.run_sort_bytes,
+                hash_fallback: write_shard.range_bounds_estimated,
             };
         }
-        ShardSpec::Hash { exprs, partitions }
+        ShardSpec::Hash {
+            exprs,
+            partitions,
+            run_sort_bytes: write_shard.run_sort_bytes,
+        }
     }
 }
 
@@ -904,7 +926,9 @@ impl FileFormat for VortexFormat {
                         })
                 })
             })
-            .buffer_unordered(state.config_options().execution.meta_fetch_concurrency)
+            .buffer_unordered(usize::from(
+                state.config_options().execution.meta_fetch_concurrency,
+            ))
             .try_collect::<Vec<_>>()
             .await?;
 
@@ -1030,22 +1054,30 @@ impl FileFormat for VortexFormat {
                     .zip(column_size)
                     .map(|(acc, size)| acc + size);
 
-                let target_dtype = DType::from_arrow(field.as_ref());
-                let min = stat_bound_to_df(
-                    Stat::Min,
-                    stats_set.get(Stat::Min),
-                    stats_dtype,
-                    &target_dtype,
-                    field.data_type(),
-                );
-
-                let max = stat_bound_to_df(
-                    Stat::Max,
-                    stats_set.get(Stat::Max),
-                    stats_dtype,
-                    &target_dtype,
-                    field.data_type(),
-                );
+                let target_dtype = session.arrow().from_arrow_field(field.as_ref()).map_err(|e| {
+                    DataFusionError::Execution(format!(
+                        "Failed to infer statistics for Vortex file {}: column '{}' has no Vortex type: {e}",
+                        object.location,
+                        field.name()
+                    ))
+                })?;
+                // Float bounds and sums leave NaN out; see `bounds_account_for_nan`.
+                let bounds_usable = bounds_account_for_nan(stats_set, stats_dtype);
+                let bound = |stat: Stat| {
+                    if bounds_usable {
+                        stat_bound_to_df(
+                            stat,
+                            stats_set.get(stat),
+                            stats_dtype,
+                            &target_dtype,
+                            field.data_type(),
+                        )
+                    } else {
+                        stats::Precision::Absent
+                    }
+                };
+                let min = bound(Stat::Min);
+                let max = bound(Stat::Max);
 
                 let null_count = stats_set.get_as::<usize>(Stat::NullCount, &PType::U64.into());
 
@@ -1056,13 +1088,13 @@ impl FileFormat for VortexFormat {
                 // arrow type: the sum of e.g. an `Int32` column is an `Int64` in
                 // DataFusion, and narrowing here would lose width or overflow.
                 let sum = match Stat::Sum.dtype(stats_dtype) {
-                    Some(sum_dtype) => scalar_stat_to_df(
+                    Some(sum_dtype) if bounds_usable => scalar_stat_to_df(
                         Stat::Sum,
                         stats_set.get(Stat::Sum),
                         stats_dtype,
                         &sum_dtype,
                     ),
-                    None => stats::Precision::Absent,
+                    _ => stats::Precision::Absent,
                 };
 
                 column_statistics.push(ColumnStatistics {
@@ -1194,6 +1226,23 @@ impl FileFormat for VortexFormat {
 
         Arc::new(source) as _
     }
+}
+
+/// Whether a column's min, max and sum can be used as `DataFusion` statistics.
+///
+/// Vortex leaves NaN out of a float column's min, max and sum, while `DataFusion`
+/// orders a NaN like any other value (`NaN = NaN`; a positive NaN sorts above
+/// `+inf`, a negative one below `-inf`) and sums it to NaN. Bounds that left a NaN
+/// out would let pruning skip the rows a NaN probe or an `x > c` matches, and let
+/// `MIN`/`MAX`/`SUM` be answered from metadata without them, so a float column's
+/// are usable only when its stats record that it holds no NaN.
+#[must_use]
+pub fn bounds_account_for_nan(stats: &StatsSet, dtype: &DType) -> bool {
+    !dtype.is_float()
+        || stats
+            .get_as::<u64>(Stat::NaNCount, &PType::U64.into())
+            .as_exact()
+            == Some(0)
 }
 
 /// A `Min` or `Max` bound, tagged as the column's own Arrow type.
@@ -1347,6 +1396,7 @@ mod tests {
     use crate::common_tests::TestSessionContext;
     use crate::convert::FromDataFusion;
     use datafusion_common::arrow::datatypes::i256;
+    use datafusion_physical_plan::{StatisticsArgs, StatisticsContext};
 
     #[test]
     fn decimal_bounds_preserve_arrow_width_and_statistical_precision() -> anyhow::Result<()> {
@@ -1520,6 +1570,22 @@ mod tests {
             .collect()
             .await?;
 
+        // The table's OPTIONS must reach the Vortex format the table reads with.
+        let provider = ctx.session.table_provider("my_tbl").await?;
+        let listing = provider
+            .downcast_ref::<datafusion::datasource::listing::ListingTable>()
+            .ok_or_else(|| anyhow::anyhow!("a Vortex external table is a listing table"))?;
+        let format = listing
+            .options()
+            .format
+            .downcast_ref::<VortexFormat>()
+            .ok_or_else(|| anyhow::anyhow!("the table must read with the Vortex format"))?;
+        assert_eq!(format.options().footer_initial_read_size_bytes, 12345);
+        assert_eq!(
+            format.options().scan_concurrency,
+            ScanConcurrency::Explicit(3)
+        );
+
         Ok(())
     }
 
@@ -1562,10 +1628,8 @@ mod tests {
         let state = ctx.session.state();
 
         // --- All columns: per-column byte_size present, total == sum ---------
-        let all = provider
-            .scan(&state, None, &[], None)
-            .await?
-            .partition_statistics(None)?;
+        let all_plan = provider.scan(&state, None, &[], None).await?;
+        let all = StatisticsContext::new().compute(&*all_plan, &StatisticsArgs::new())?;
         assert_eq!(all.num_rows.get_value(), Some(&n), "row count");
 
         let id_bytes = *all.column_statistics[0]
@@ -1603,10 +1667,10 @@ mod tests {
         // --- Projected scans: total reflects ONLY the projected columns ------
         // Project [id] (fixed-width): total is just the int column.
         let proj_id_cols = vec![0usize];
-        let proj_id = provider
+        let proj_id_plan = provider
             .scan(&state, Some(&proj_id_cols), &[], None)
-            .await?
-            .partition_statistics(None)?;
+            .await?;
+        let proj_id = StatisticsContext::new().compute(&*proj_id_plan, &StatisticsArgs::new())?;
         assert_eq!(
             proj_id.total_byte_size.get_value(),
             Some(&id_bytes),
@@ -1615,10 +1679,8 @@ mod tests {
 
         // Project [s] (variable-width survives, fat `data` dropped).
         let proj_s_cols = vec![1usize];
-        let proj_s = provider
-            .scan(&state, Some(&proj_s_cols), &[], None)
-            .await?
-            .partition_statistics(None)?;
+        let proj_s_plan = provider.scan(&state, Some(&proj_s_cols), &[], None).await?;
+        let proj_s = StatisticsContext::new().compute(&*proj_s_plan, &StatisticsArgs::new())?;
         assert_eq!(
             proj_s.total_byte_size.get_value(),
             Some(&s_bytes),
@@ -1751,7 +1813,8 @@ mod tests {
             write_concurrency,
             shard_key_columns: keys.iter().map(|s| (*s).to_string()).collect(),
             range_bounds,
-            range_run_sort_bytes: None,
+            run_sort_bytes: None,
+            range_bounds_estimated: false,
         })
     }
 
@@ -1811,19 +1874,37 @@ mod tests {
         }
     }
 
-    /// A composite key hashes: ordering it needs a lexicographic comparison the
-    /// range split does not implement.
+    /// A composite key with bounds range-splits on the leading column and keeps
+    /// every key column for a hash fallback. Ordering the full key would need a
+    /// lexicographic comparison the range split does not implement.
     #[test]
-    fn build_shard_spec_composite_key_with_bounds_still_hashes() {
+    fn build_shard_spec_composite_key_with_bounds_ranges_on_the_leading_column() {
         let schema = schema_with(&[
             ("k", arrow_schema::DataType::Int64),
             ("j", arrow_schema::DataType::Int64),
         ]);
         let bounds = vec![ScalarValue::Int64(Some(10))];
-        assert!(matches!(
-            shard_format_with_bounds(2, &["k", "j"], Some(bounds)).build_shard_spec(&schema, 8),
-            ShardSpec::Hash { .. }
-        ));
+        match shard_format_with_bounds(2, &["k", "j"], Some(bounds)).build_shard_spec(&schema, 8) {
+            ShardSpec::Range {
+                expr, hash_exprs, ..
+            } => {
+                assert!(
+                    expr.to_string().contains('k'),
+                    "range routing uses the leading shard key column, got {expr}"
+                );
+                assert_eq!(
+                    hash_exprs.len(),
+                    2,
+                    "the fallback must hash every shard key column"
+                );
+                let names: String = hash_exprs.iter().map(ToString::to_string).collect();
+                assert!(
+                    names.contains('k') && names.contains('j'),
+                    "hash exprs must reference both key columns, got: {names}"
+                );
+            }
+            other => panic!("expected Range on the leading column, got {other:?}"),
+        }
     }
 
     /// Without bounds a keyed write hashes, which is the behavior that predates
@@ -1856,7 +1937,9 @@ mod tests {
             ("payload", arrow_schema::DataType::Utf8),
         ]);
         match shard_format(4, &["w_id", "d_id"]).build_shard_spec(&schema, 8) {
-            ShardSpec::Hash { exprs, partitions } => {
+            ShardSpec::Hash {
+                exprs, partitions, ..
+            } => {
                 assert_eq!(partitions, 4);
                 assert_eq!(exprs.len(), 2, "composite key must hash both columns");
                 let names: String = exprs.iter().map(ToString::to_string).collect();

@@ -23,7 +23,7 @@ limitations under the License.
 //! inline memtable), and `run_position_capture()` is called explicitly to make
 //! the write-time read-back deterministic in tests.
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 

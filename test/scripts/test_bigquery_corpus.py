@@ -85,6 +85,63 @@ class CorpusTests(unittest.TestCase):
         corpus.check_plan(241, explain(PARTIAL))
         corpus.check_plan(0, explain("DataSourceExec: values"))
 
+    def test_rounding_cast_partial_pins_its_remote_count_and_its_local_cast(self):
+        # Query 147 keeps its one scan and lifts the aggregate over it; the
+        # local `CAST(… AS Int32)` is what the connector policy refused to push
+        # down, so a plan without it is no longer this case.
+        aggregate = (
+            "AggregateExec: gby=[CAST(v0006@0 / 1000 AS Int32) * 10 as v0120]\n  "
+            + FULL
+        )
+        corpus.check_plan(147, explain(aggregate))
+        with self.assertRaises(HarnessError):
+            corpus.check_plan(147, explain(FULL))
+        # Query 033 splits into three scans, so neither one nor five will do.
+        scan = "  SchemaCastScanExec\n    " + REMOTE
+        three = "ProjectionExec: expr=[CAST(v0201@1 AS Int32) as v0316]\n" + "\n".join(
+            [scan] * 3
+        )
+        corpus.check_plan(33, explain(three))
+        for wrong in (5, 124):
+            with self.assertRaises(HarnessError):
+                corpus.check_plan(wrong, explain(three))
+
+    def test_ordered_aggregate_partial_pins_its_remote_count_and_its_local_aggregate(
+        self,
+    ):
+        # Query 226 keeps its one scan under a local `STRING_AGG(… ORDER BY …)`.
+        # The BigQuery dialect does not render the ordering, so a plan that sent
+        # the aggregate to BigQuery, or lost its ordering, is no longer this case.
+        ordered = (
+            "AggregateExec: mode=Single, gby=[], "
+            "aggr=[string_agg(DISTINCT v1169.rule, Utf8(\", \")) "
+            "ORDER BY [v1169.rule ASC NULLS LAST]]\n  " + FULL
+        )
+        corpus.check_plan(226, explain(ordered))
+        unordered = ordered.replace(" ORDER BY [v1169.rule ASC NULLS LAST]", "")
+        for plan in (FULL, unordered):
+            with self.assertRaises(HarnessError):
+                corpus.check_plan(226, explain(plan))
+        # Query 085 splits into three scans, so neither one nor six will do.
+        scan = "  SchemaCastScanExec\n    " + REMOTE
+        three = (
+            "AggregateExec: mode=Single, gby=[], "
+            "aggr=[array_agg(v0177) ORDER BY [v0479 ASC NULLS LAST]]\n"
+            + "\n".join([scan] * 3)
+        )
+        corpus.check_plan(85, explain(three))
+        for wrong in (86, 226):
+            with self.assertRaises(HarnessError):
+                corpus.check_plan(wrong, explain(three))
+
+    def test_expected_jobs_exclude_subtrees_an_empty_build_side_skips(self):
+        # 278 planned remote subtrees, 14 of them behind an empty join build
+        # side (#14848).
+        self.assertEqual(corpus.expected_execution_jobs(corpus.corpus()), 264)
+        partial = corpus.ROUNDING_CAST_PARTIAL | corpus.ORDERED_AGGREGATE_PARTIAL
+        for index, skipped in corpus.EMPTY_BUILD_SKIPPED.items():
+            self.assertLess(skipped, partial[index])
+
     def test_transport_cannot_change_field_type_name_or_nullability(self):
         for name in corpus.TRANSPORT:
             physical = name + "\n  " + REMOTE

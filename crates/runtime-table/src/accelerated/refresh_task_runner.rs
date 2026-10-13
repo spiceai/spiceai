@@ -18,8 +18,11 @@ use crate::federated::FederatedTable;
 use runtime_status as status;
 
 use super::{
-    metrics, refresh::RefreshOverrides, refresh_completion::RefreshRequestId,
-    refresh_task::RefreshTask, synchronized_table::SynchronizedTable,
+    metrics,
+    refresh::RefreshOverrides,
+    refresh_completion::RefreshRequestId,
+    refresh_task::{RefreshOutcome, RefreshTask},
+    synchronized_table::SynchronizedTable,
 };
 use futures::{FutureExt, future::BoxFuture};
 use tokio::{
@@ -37,7 +40,7 @@ use std::{any::Any, panic::AssertUnwindSafe, sync::Arc};
 use tokio::sync::{Mutex, RwLock};
 
 use super::refresh::Refresh;
-use datafusion::{datasource::TableProvider, sql::TableReference};
+use datafusion::{common::TableReference, datasource::TableProvider};
 use opentelemetry::KeyValue;
 use spicepod::metric::Metrics;
 
@@ -48,12 +51,18 @@ pub struct RefreshTaskRunnerBuilder {
     federated_source: Option<String>,
     refresh: Arc<RwLock<Refresh>>,
     accelerator: Arc<dyn TableProvider>,
+    change_sink: Option<runtime_acceleration::change_sink::ChangeSink>,
+    cache_write_sender: Option<super::caching::CacheWriteSender>,
     disable_federation: bool,
     semaphore: Option<Arc<Semaphore>>,
     metrics: Option<Metrics>,
     cpu_runtime: Option<Handle>,
     io_runtime: Handle,
     resource_monitor: Option<runtime_resources::ResourceMonitor>,
+    /// The runtime's query `RuntimeEnv`: its memory pool bounds what a refresh holds in
+    /// memory, and its disk manager is where the refresh spills. `None` uses an unbounded
+    /// default.
+    query_runtime_env: Option<Arc<datafusion::execution::runtime_env::RuntimeEnv>>,
     /// Mutex to protect concurrent access to the accelerator during cache/snapshot operations.
     /// Shared with `CachingAccelerationScanExec`.
     accelerator_write_mutex: Arc<Mutex<()>>,
@@ -88,12 +97,15 @@ impl RefreshTaskRunnerBuilder {
             federated_source,
             refresh,
             accelerator,
+            change_sink: None,
+            cache_write_sender: None,
             disable_federation: false,
             semaphore: None,
             metrics: None,
             cpu_runtime: None,
             io_runtime,
             resource_monitor: None,
+            query_runtime_env: None,
             accelerator_write_mutex,
             last_updated_at: Arc::new(AtomicI64::new(0)),
             initial_load_completed: None,
@@ -102,6 +114,24 @@ impl RefreshTaskRunnerBuilder {
             snapshot_refresh_state: None,
             in_flight_revalidations: None,
         }
+    }
+
+    #[must_use]
+    pub fn with_change_sink(
+        mut self,
+        sink: Option<runtime_acceleration::change_sink::ChangeSink>,
+    ) -> Self {
+        self.change_sink = sink;
+        self
+    }
+
+    #[must_use]
+    pub fn with_cache_write_sender(
+        mut self,
+        sender: Option<super::caching::CacheWriteSender>,
+    ) -> Self {
+        self.cache_write_sender = sender;
+        self
     }
 
     /// Sets the `disable_federation` flag
@@ -132,6 +162,15 @@ impl RefreshTaskRunnerBuilder {
     #[must_use]
     pub fn with_resource_monitor(mut self, monitor: runtime_resources::ResourceMonitor) -> Self {
         self.resource_monitor = Some(monitor);
+        self
+    }
+
+    #[must_use]
+    pub fn with_query_runtime_env(
+        mut self,
+        runtime_env: Arc<datafusion::execution::runtime_env::RuntimeEnv>,
+    ) -> Self {
+        self.query_runtime_env = Some(runtime_env);
         self
     }
 
@@ -197,6 +236,8 @@ impl RefreshTaskRunnerBuilder {
             self.accelerator_write_mutex,
         )
         .with_disable_federation(self.disable_federation)
+        .with_change_sink(self.change_sink)
+        .with_cache_write_sender(self.cache_write_sender)
         .with_last_updated_at(Arc::clone(&self.last_updated_at))
         .with_metrics(self.metrics);
 
@@ -208,6 +249,10 @@ impl RefreshTaskRunnerBuilder {
 
         if let Some(resource_monitor) = self.resource_monitor {
             refresh_task_builder = refresh_task_builder.with_resource_monitor(resource_monitor);
+        }
+
+        if let Some(runtime_env) = self.query_runtime_env {
+            refresh_task_builder = refresh_task_builder.with_query_runtime_env(runtime_env);
         }
 
         refresh_task_builder =
@@ -251,7 +296,7 @@ pub struct RefreshTaskRunner {
 }
 
 type RefreshRunFuture =
-    BoxFuture<'static, std::result::Result<super::Result<()>, Box<dyn Any + Send>>>;
+    BoxFuture<'static, std::result::Result<super::Result<RefreshOutcome>, Box<dyn Any + Send>>>;
 
 /// One refresh request: the id it was issued under, and the overrides it
 /// carries.
@@ -263,7 +308,7 @@ type RefreshRunFuture =
 pub type RefreshRequest = (RefreshRequestId, Option<RefreshOverrides>);
 
 /// A finished refresh, reported under the id of the request that started it.
-pub type RefreshTaskCompletion = (RefreshRequestId, super::Result<()>);
+pub type RefreshTaskCompletion = (RefreshRequestId, super::Result<RefreshOutcome>);
 
 type RefreshTaskStartSender = Sender<RefreshRequest>;
 type RefreshTaskCompletionReceiver = Receiver<RefreshTaskCompletion>;
@@ -328,9 +373,9 @@ impl RefreshTaskRunner {
                     select! {
                         res = task => {
                             match res {
-                                Ok(Ok(())) => {
-                                    tracing::debug!("Dataset {dataset_name} refreshed successfully");
-                                    if let Err(err) = notify_refresh_complete.send((running_request, Ok(()))).await {
+                                Ok(Ok(outcome)) => {
+                                    tracing::debug!("Dataset {dataset_name} refreshed successfully ({outcome:?})");
+                                    if let Err(err) = notify_refresh_complete.send((running_request, Ok(outcome))).await {
                                         tracing::debug!("Failed to send refresh task completion for dataset {dataset_name}: {err}");
                                     }
                                 },
@@ -425,6 +470,11 @@ impl RefreshTaskRunner {
                 Err(_) => "refresh worker panicked with a non-string payload".to_string(),
             },
         }
+    }
+
+    /// Transfer the worker to the table generation's cancellation and drain owner.
+    pub(crate) fn take_task(&mut self) -> Option<JoinHandle<()>> {
+        self.task.take()
     }
 
     pub fn abort(&mut self) {

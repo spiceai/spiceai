@@ -50,6 +50,9 @@ util = { path = "../util", default-features = false }
 uuid.workspace = true
 
 [dev-dependencies]
+# An SDK meter provider, so the metrics tests can collect what the cluster
+# instruments actually export.
+opentelemetry_sdk = { workspace = true }
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 
 [lints]

@@ -21,6 +21,9 @@ datafusion-common.workspace = true
 datafusion-federation.workspace = true
 datafusion-datasource = { workspace = true }
 datafusion-expr.workspace = true
+# `ExecutionPlan::try_to_proto` exists only with datafusion-physical-plan's `proto`
+# feature, which datafusion-proto enables.
+datafusion-proto.workspace = true
 datafusion-table-providers.workspace = true
 flight_client = { path = "../flight_client" }
 r2d2 = { optional = true, workspace = true }

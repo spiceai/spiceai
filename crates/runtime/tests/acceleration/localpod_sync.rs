@@ -25,7 +25,7 @@ limitations under the License.
 //!
 //! - Engines backed by a `PolyTableProvider` (duckdb/sqlite/postgres/cayenne) expose a federated
 //!   source, so the parent is wrapped in a `FederatedTableProviderAdaptor`.
-//! - The default in-memory Arrow accelerator has no federated source, so the parent is registered
+//! - The in-memory Arrow accelerator has no federated source, so the parent is registered
 //!   as a bare `AcceleratedTable`.
 //!
 //! Regression test for <https://github.com/spiceai/spiceai/issues/11137>: a child of an
@@ -294,7 +294,7 @@ async fn test_localpod_refresh_invalidates_child_cached_results() -> Result<(), 
         .await
 }
 
-/// A localpod child whose parent uses the default in-memory (Arrow) accelerator must keep tracking
+/// A localpod child whose parent uses the in-memory Arrow accelerator must keep tracking
 /// the parent's full refreshes at runtime, not just load once at startup.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn test_localpod_full_refresh_synchronization_with_arrow_parent() -> Result<(), anyhow::Error>
@@ -313,7 +313,7 @@ async fn test_localpod_full_refresh_synchronization_with_arrow_parent() -> Resul
                 .await
                 .expect("write initial csv");
 
-            // Parent: file connector, full refresh, default (Arrow / in-memory) accelerator.
+            // Parent: file connector, full refresh, in-memory Arrow accelerator.
             // No refresh_check_interval, so the parent only refreshes when triggered manually,
             // keeping the test deterministic.
             let mut parent = Dataset::new(format!("file://{}", csv_path.display()), "time_series");
@@ -327,6 +327,7 @@ async fn test_localpod_full_refresh_synchronization_with_arrow_parent() -> Resul
             ));
             parent.acceleration = Some(Acceleration {
                 enabled: true,
+                engine: Some("arrow".to_string()),
                 refresh_mode: Some(RefreshMode::Full),
                 ..Acceleration::default()
             });
@@ -336,6 +337,7 @@ async fn test_localpod_full_refresh_synchronization_with_arrow_parent() -> Resul
             let mut child = Dataset::new("localpod:time_series", "local_time_series");
             child.acceleration = Some(Acceleration {
                 enabled: true,
+                engine: Some("arrow".to_string()),
                 refresh_mode: Some(RefreshMode::Full),
                 ..Acceleration::default()
             });
@@ -781,6 +783,45 @@ async fn test_localpod_passthrough_child_follows_parent_removed_and_added_back()
                 "the query path should answer from the re-added parent's rows, not from a plan \
                  or result cached over the removed parent's table"
             );
+
+            Ok(())
+        })
+        .await
+}
+
+/// Every `localpod` dataset reading from one parent must load at startup, and so must a
+/// `localpod` dataset listed ahead of the `localpod` dataset it reads from.
+///
+/// Regression test for <https://github.com/spiceai/spiceai/issues/13087>: startup chained each
+/// `localpod` dataset behind its parent by taking the parent's load out of the queue, so the
+/// second sibling found no parent and failed with `Parent dataset 'time_series' doesn't exist`,
+/// and a grandchild listed before its parent failed the same way.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn test_localpod_siblings_and_out_of_order_grandchild_load_at_startup()
+-> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,runtime=debug"));
+
+    test_request_context()
+        .scope(async {
+            let temp_dir = TempDir::new().expect("create temp dir");
+            let csv_path = temp_dir.path().join("data.csv");
+            let runtime = boot_with_five_rows(&csv_path, |csv_path| {
+                AppBuilder::new("test_localpod_siblings_load_at_startup")
+                    .with_dataset(file_parent(csv_path, None))
+                    .with_dataset(localpod_dataset("localpod:local_b", "local_local_b"))
+                    .with_dataset(localpod_dataset("localpod:time_series", "local_a"))
+                    .with_dataset(localpod_dataset("localpod:time_series", "local_b"))
+                    .build()
+            })
+            .await?;
+
+            for table in ["time_series", "local_a", "local_b", "local_local_b"] {
+                assert_eq!(
+                    wait_for_registered_count(&runtime, table, 5, Duration::from_secs(30)).await,
+                    Some(5),
+                    "dataset '{table}' should load the five startup rows"
+                );
+            }
 
             Ok(())
         })

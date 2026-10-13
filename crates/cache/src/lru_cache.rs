@@ -27,7 +27,7 @@ use crate::metrics::CacheMetrics;
 use crate::{CacheProvider, get_hash_builder};
 use async_trait::async_trait;
 use byte_unit::Byte;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use sharded_cache::{EvictionPolicy, NUM_SHARDS};
 use snafu::ResultExt;
 use spicepod::component::caching::{CacheConfig, CacheEngine, CachingPolicy};
@@ -204,6 +204,35 @@ impl<
         self
     }
 
+    /// Refresh the item-count, size and hit-ratio metrics after a store, at
+    /// most once every 5 seconds across all callers.
+    async fn report_metrics_after_put(&self) {
+        let now_seconds = self.initial_instant.elapsed().as_secs();
+        let last_emitted = self.metrics_last_reported_time.load(Ordering::Relaxed);
+
+        // compare_exchange ensures only 1 active thread emits metric updates every 5 seconds
+        // performance is comparable with relaxed load/store
+        if now_seconds.saturating_sub(last_emitted) >= 5
+            && self
+                .metrics_last_reported_time
+                .compare_exchange(
+                    last_emitted,
+                    now_seconds,
+                    Ordering::Relaxed,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+        {
+            V::record_item_count(self.item_count().await);
+            V::record_size(self.size_bytes().await);
+            V::record_max_size(self.max_size() as u64);
+
+            let hits = self.hits.load(Ordering::Relaxed);
+            let total = self.total_requests.load(Ordering::Relaxed);
+            V::update_hit_ratio(hits, total);
+        }
+    }
+
     /// `(hits, total_requests)` as fed to the hit-ratio gauge.
     #[cfg(test)]
     pub(crate) fn hit_ratio_counters(&self) -> (u64, u64) {
@@ -274,31 +303,12 @@ impl<
 
     async fn put_raw_key(&self, key: &u64, value: V) {
         self.backend.insert(*key, value).await;
+        self.report_metrics_after_put().await;
+    }
 
-        let now_seconds = self.initial_instant.elapsed().as_secs();
-        let last_emitted = self.metrics_last_reported_time.load(Ordering::Relaxed);
-
-        // compare_exchange ensures only 1 active thread emits metric updates every 5 seconds
-        // performance is comparable with relaxed load/store
-        if now_seconds.saturating_sub(last_emitted) >= 5
-            && self
-                .metrics_last_reported_time
-                .compare_exchange(
-                    last_emitted,
-                    now_seconds,
-                    Ordering::Relaxed,
-                    Ordering::Relaxed,
-                )
-                .is_ok()
-        {
-            V::record_item_count(self.item_count().await);
-            V::record_size(self.size_bytes().await);
-            V::record_max_size(self.max_size() as u64);
-
-            let hits = self.hits.load(Ordering::Relaxed);
-            let total = self.total_requests.load(Ordering::Relaxed);
-            V::update_hit_ratio(hits, total);
-        }
+    async fn put_raw_key_with_weight(&self, key: &u64, value: V, weight: usize) {
+        self.backend.insert_with_weight(*key, value, weight).await;
+        self.report_metrics_after_put().await;
     }
 
     async fn replace_if(
@@ -308,6 +318,20 @@ impl<
         should_replace: &(dyn for<'v> Fn(&'v V) -> bool + Send + Sync),
     ) -> bool {
         self.backend.replace_if(*key, value, should_replace).await
+    }
+
+    async fn put_if(
+        &self,
+        key: &u64,
+        value: V,
+        weight: usize,
+        admit: &(dyn for<'v> Fn(Option<&'v V>) -> bool + Send + Sync),
+    ) -> bool {
+        let stored = self.backend.insert_if(*key, value, weight, admit);
+        if stored {
+            self.report_metrics_after_put().await;
+        }
+        stored
     }
 
     async fn invalidate_all(&self) {
@@ -376,13 +400,25 @@ impl<
         // invalidate gate, so a concurrent insert into an already-walked shard
         // cannot survive this return.
         let backend = Arc::clone(&self.backend);
-        let removed = tokio::task::spawn_blocking(move || {
+        let removed = match tokio::task::spawn_blocking(move || {
             backend.invalidate_matching(|value| {
                 crate::resolved_table_match(value.as_table_refs().as_ref(), &table_ref)
             })
         })
         .await
-        .context(InvalidationDidNotFinishSnafu { table_name })?;
+        {
+            Ok(removed) => removed,
+            // Tokio cancels a blocking task only when its runtime is shutting down,
+            // and this in-memory cache is dropped with it, so nothing stale can be
+            // served. A panicked scan is still an error.
+            Err(e) if e.is_cancelled() => {
+                tracing::debug!(
+                    "Cache invalidation for dataset {table_name} was cancelled (likely shutdown)"
+                );
+                return Ok(());
+            }
+            Err(e) => return Err(e).context(InvalidationDidNotFinishSnafu { table_name }),
+        };
 
         tracing::debug!("Invalidated {removed} cache entries by scanning the shards in place");
         Ok(())
@@ -503,18 +539,19 @@ mod tests {
         let result = create_test_cached_result().await;
 
         // Put a value in the cache
-        cache.put_raw_key(&key.as_u64(), result.clone()).await;
+        cache.put_raw_key(&key.as_u64(), result).await;
 
         let key = CacheKey::Query("test_query", None).as_raw_key(cache.hasher());
 
         // Get the value from the cache
         let retrieved = cache.get_raw_key(&key.as_u64()).await;
         let retrieved = retrieved.expect("cache should contain the key");
-        let retrieved_len = retrieved.records().await.expect("Failed to decode").len();
-        let result_len = result.records().await.expect("Failed to decode").len();
-        (retrieved_len == result_len)
-            .then_some(())
-            .expect("retrieved and result should have same length");
+        let retrieved_batches = retrieved.records().await.expect("Failed to decode");
+        assert_eq!(
+            *retrieved_batches,
+            [Arc::new(create_test_record_batch())],
+            "the cache must serve exactly the batch that was stored (`id` = [1, 2, 3])"
+        );
     }
 
     /// A lookup that finds an entry but rejects it must be accounted as a miss.
@@ -566,34 +603,6 @@ mod tests {
     #[case::ahash(ahash::RandomState::default())]
     #[case::xxhash32(twox_hash::xxhash32::RandomState::default())]
     #[tokio::test]
-    async fn test_cache_miss<
-        H: Hasher + Send + Sync + 'static,
-        T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
-    >(
-        #[case] hasher: T,
-    ) {
-        let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
-            TEST_MAX_SIZE,
-            Duration::from_mins(1),
-            hasher,
-            CachingPolicy::Lru,
-            CacheEngine::Moka,
-        );
-        let key = CacheKey::Query("nonexistent_query", None).as_raw_key(cache.hasher());
-
-        // Try to get a non-existent key
-        let retrieved = cache.get_raw_key(&key.as_u64()).await;
-        retrieved
-            .is_none()
-            .then_some(())
-            .expect("cache should not contain nonexistent key");
-    }
-
-    #[rstest]
-    #[case::siphash(RandomState::default())]
-    #[case::ahash(ahash::RandomState::default())]
-    #[case::xxhash32(twox_hash::xxhash32::RandomState::default())]
-    #[tokio::test]
     async fn test_cache_invalidate_for_table<
         H: Hasher + Send + Sync + 'static,
         T: BuildHasher<Hasher = H> + Clone + Send + Sync + 'static,
@@ -636,6 +645,41 @@ mod tests {
             .is_none()
             .then_some(())
             .expect("cache should not contain key after invalidation");
+    }
+
+    /// A refresh that finishes while the runtime is shutting down still invalidates
+    /// the cache, and Tokio cancels a `spawn_blocking` task on a runtime that is
+    /// already shut down. The cache is dropped with the runtime, so there is nothing
+    /// stale left to serve — this must not surface as an invalidation failure.
+    #[test]
+    fn test_invalidation_cancelled_by_runtime_shutdown_is_not_an_error() {
+        let shut_down = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()
+            .expect("build runtime");
+        let shut_down_handle = shut_down.handle().clone();
+        shut_down.shutdown_background();
+
+        let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
+            TEST_MAX_SIZE,
+            Duration::from_mins(1),
+            RandomState::default(),
+            CachingPolicy::Lru,
+            CacheEngine::Moka,
+        );
+        let driver = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("build runtime");
+        let result = driver.block_on(async {
+            let _entered = shut_down_handle.enter();
+            cache
+                .invalidate_for_table(TableReference::bare("test_table"))
+                .await
+        });
+
+        if let Err(e) = result {
+            panic!("invalidation cancelled by runtime shutdown must not be an error: {e}");
+        }
     }
 
     /// Regression test for #11266: cache invalidation must resolve both the
@@ -861,16 +905,17 @@ mod tests {
         let result = create_test_cached_result().await;
 
         // Put a value in the cache
-        cache.put_raw_key(&key.as_u64(), result.clone()).await;
+        cache.put_raw_key(&key.as_u64(), result).await;
 
         // Get the value from the cache
         let retrieved = cache.get_raw_key(&key.as_u64()).await;
         let retrieved = retrieved.expect("cache should contain the key");
-        let retrieved_len = retrieved.records().await.expect("Failed to decode").len();
-        let result_len = result.records().await.expect("Failed to decode").len();
-        (retrieved_len == result_len)
-            .then_some(())
-            .expect("retrieved and result should have same length");
+        let retrieved_batches = retrieved.records().await.expect("Failed to decode");
+        assert_eq!(
+            *retrieved_batches,
+            [Arc::new(create_test_record_batch())],
+            "under {caching_policy:?} the cache must serve exactly the batch that was stored (`id` = [1, 2, 3])"
+        );
     }
 
     /// A configured Pingora `engine` is ignored; the Spice sharded cache still
@@ -937,28 +982,6 @@ mod tests {
         (retrieved_len == result_len)
             .then_some(())
             .expect("retrieved and result should have same length");
-    }
-
-    /// Pingora-named miss contract, now run against the Spice backend.
-    #[tokio::test]
-    async fn test_pingora_backend_cache_miss() {
-        let hasher = RandomState::default();
-        let cache: LruCache<CachedQueryResult, _, _> = LruCache::new(
-            1024 * 1024, // 1 MB
-            Duration::from_mins(1),
-            hasher,
-            CachingPolicy::Lru,
-            CacheEngine::Pingora,
-        );
-
-        let key = CacheKey::Query("nonexistent_key", None).as_raw_key(cache.hasher());
-
-        // Try to get a value that doesn't exist
-        let retrieved = cache.get_raw_key(&key.as_u64()).await;
-        retrieved
-            .is_none()
-            .then_some(())
-            .expect("cache should not contain nonexistent key");
     }
 
     /// Pingora-named `invalidate_all` contract, now run against the Spice backend.

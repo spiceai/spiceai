@@ -32,7 +32,7 @@ mod tool_use_responses;
 mod util;
 mod wrapper;
 
-pub use chat::{LLMChatCompletionsModelStore, try_to_chat_model};
+pub use chat::{LLMChatCompletionsModelStore, LoadedChatModel, try_to_chat_model};
 pub use embed::{EmbeddingModelStore, try_to_embedding};
 pub use evaluate::{EvaluateModelStore, is_evaluate_only, try_to_evaluate_model};
 pub use model_context::{

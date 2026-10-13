@@ -45,8 +45,12 @@ getSystemInfo() {
             USE_SUDO="true"
         fi
     else
-        # Directory doesn't exist, check parent directory
+        # Directory doesn't exist: check the nearest existing ancestor, which is
+        # where mkdir -p starts. A missing ~/.spice is not a reason to need sudo.
         local parent_dir=$(dirname "$SPICE_CLI_INSTALL_DIR")
+        while [[ ! -e "$parent_dir" ]]; do
+            parent_dir=$(dirname "$parent_dir")
+        done
         if [[ ! -w "$parent_dir" ]]; then
             USE_SUDO="true"
         fi

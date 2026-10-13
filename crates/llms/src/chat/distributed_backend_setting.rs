@@ -77,9 +77,16 @@ mod tests {
 
     #[test]
     fn rejects_values_outside_the_spec() {
-        for raw in ["nccl", "true", "false", "1", "0"] {
-            assert!(
-                raw.parse::<DistributedBackendSetting>().is_err(),
+        for (raw, expected) in [
+            ("nccl", "must be one of: none, ring. Found nccl"),
+            ("true", "must be one of: none, ring. Found true"),
+            ("false", "must be one of: none, ring. Found false"),
+            ("1", "must be one of: none, ring. Found 1"),
+            ("0", "must be one of: none, ring. Found 0"),
+        ] {
+            assert_eq!(
+                raw.parse::<DistributedBackendSetting>(),
+                Err(expected.to_string()),
                 "{raw:?} should be rejected"
             );
         }

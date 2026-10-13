@@ -44,6 +44,7 @@ spicepod = { path = "../../spicepod" }
 tracing.workspace = true
 rusqlite.workspace = true
 snafu.workspace = true
+util = { path = "../../util" }
 
 [dev-dependencies]
 runtime-acceleration = { path = "../../runtime-acceleration", features = ["sqlite", "test-support"] }

@@ -1,0 +1,39 @@
+[package]
+name = "key-index"
+description = "Secondary indexes over compound Arrow keys: immutable sorted runs, one per write"
+edition.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+arc-swap.workspace = true
+arrow-array.workspace = true
+arrow-buffer.workspace = true
+arrow-schema.workspace = true
+hash-index = { path = "../hash-index" }
+parking_lot.workspace = true
+snafu.workspace = true
+# The Verus specification of the key encoding (`escape_proof`); erased by a
+# normal build. The workspace pins it to the Verus release CI runs.
+vstd.workspace = true
+
+[dev-dependencies]
+rand.workspace = true
+
+[lints]
+workspace = true
+
+# Opts this crate into `cargo verus focus`.
+[package.metadata.verus]
+verify = true
+
+[[bench]]
+harness = false
+name = "in_list"
+
+[[bench]]
+harness = false
+name = "run_finish"

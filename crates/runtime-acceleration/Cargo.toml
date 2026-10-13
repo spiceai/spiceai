@@ -20,6 +20,11 @@ aws-sdk-credential-bridge = { path = "../aws-sdk-credential-bridge" }
 bytes.workspace = true
 chrono.workspace = true
 datafusion.workspace = true
+data_components = { path = "../data_components" }
+runtime-metrics = { path = "../runtime-metrics" }
+runtime-table-partition = { path = "../runtime-table-partition" }
+twox-hash.workspace = true
+spice-table = { path = "../spice-table" }
 duckdb = { workspace = true, features = [
     "bundled",
     "r2d2",
@@ -27,7 +32,10 @@ duckdb = { workspace = true, features = [
 ], optional = true }
 fundu.workspace = true
 futures.workspace = true
+gethostname.workspace = true
 object_store.workspace = true
+object_store_occ = { path = "../object_store_occ" }
+parking_lot.workspace = true
 opentelemetry.workspace = true
 runtime-checkpoint-api = { path = "../runtime-checkpoint-api" }
 runtime-datafusion = { path = "../runtime-datafusion" }
@@ -36,6 +44,8 @@ telemetry = { path = "../telemetry" }
 runtime-parameters = { path = "../runtime-parameters" }
 runtime-object-store = { path = "../runtime-object-store" }
 runtime-secrets = { path = "../runtime-secrets" }
+s3-event-notifications = { path = "../s3-event-notifications" }
+secrecy.workspace = true
 rusqlite = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
@@ -51,6 +61,9 @@ url.workspace = true
 util = { path = "../util", features = ["datafusion"] }
 utoipa = { workspace = true, optional = true }
 uuid = { version = "1", features = ["v7"] }
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
 
 [features]
 default = []

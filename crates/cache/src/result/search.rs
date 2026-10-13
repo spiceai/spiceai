@@ -20,7 +20,7 @@ use std::time::Instant;
 
 use arrow::array::RecordBatch;
 use arrow::datatypes::{Schema, SchemaRef};
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 
 use crate::intern::Interned;
 use crate::intern::table_set::table_reference_heap_size;

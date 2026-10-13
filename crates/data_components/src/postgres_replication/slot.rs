@@ -983,15 +983,8 @@ async fn ensure_publication(
         ensure_publish_via_partition_root(client, publication_name).await?;
 
         // Verify the publication includes our table; if not, add it.
-        let has_table: bool = client
-            .query_one(
-                "SELECT EXISTS(SELECT 1 FROM pg_publication_tables \
-                 WHERE pubname = $1 AND schemaname = $2 AND tablename = $3)",
-                &[&publication_name, &schema_name, &table_name],
-            )
-            .await
-            .context(SetupExecSnafu)?
-            .get(0);
+        let has_table =
+            publication_has_table(client, publication_name, schema_name, table_name).await?;
         if !has_table {
             let stmt = format!(
                 "ALTER PUBLICATION {pub} ADD TABLE {schema}.{table}",
@@ -1108,38 +1101,93 @@ async fn list_publication_tables(
         .collect())
 }
 
+/// Whether `publication_name` publishes `schema_name.table_name`, however it
+/// includes it — named, `FOR ALL TABLES`, or `FOR TABLES IN SCHEMA`.
+async fn publication_has_table(
+    client: &tokio_postgres::Client,
+    publication_name: &str,
+    schema_name: &str,
+    table_name: &str,
+) -> Result<bool> {
+    Ok(client
+        .query_one(
+            "SELECT EXISTS(SELECT 1 FROM pg_publication_tables \
+             WHERE pubname = $1 AND schemaname = $2 AND tablename = $3)",
+            &[&publication_name, &schema_name, &table_name],
+        )
+        .await
+        .context(SetupExecSnafu)?
+        .get(0))
+}
+
+/// What [`remove_table_from_publication`] left the table as.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PublicationRemoval {
+    /// The table is not in the publication (or the publication is gone).
+    Removed,
+    /// The publication includes the table through `FOR ALL TABLES` or
+    /// `FOR TABLES IN SCHEMA`, which `ALTER PUBLICATION ... DROP TABLE` cannot
+    /// undo, so its changes keep streaming on the slot.
+    StillPublished,
+}
+
 /// Best-effort removal of a table from a (shared) publication. Used when a
 /// member detaches while its initial snapshot is still running: tearing the
 /// table out of the publication forces any future rejoin — in-process or after
 /// a restart — back through the ADD TABLE + fresh-snapshot path, instead of
-/// resuming over an accelerator that is missing base rows.
+/// resuming over an accelerator that is missing base rows. Also used to retire
+/// a published table no dataset ever subscribed to.
 ///
-/// "Already absent" outcomes (publication or membership gone) are success.
+/// "Already absent" outcomes (publication or membership gone) are
+/// [`PublicationRemoval::Removed`]. A table the publication includes without
+/// naming it is [`PublicationRemoval::StillPublished`]: Postgres refuses the
+/// `DROP TABLE` for a `FOR ALL TABLES` publication (55000), and answers a
+/// schema publication's with the same 42704 it gives a table that is truly
+/// absent — so membership is read back rather than inferred from the error.
 pub async fn remove_table_from_publication(
     params: &ReplicationParams,
     schema_name: &str,
     table_name: &str,
-) -> Result<()> {
+) -> Result<PublicationRemoval> {
     let (client, conn_task) = connect_setup(params).await?;
-    let stmt = format!(
-        "ALTER PUBLICATION {pub} DROP TABLE {schema}.{table}",
-        pub = quote_ident(&params.publication_name),
-        schema = quote_ident(schema_name),
-        table = quote_ident(table_name),
-    );
-    let outcome = match client.simple_query(&stmt).await {
-        Ok(_) => Ok(()),
-        // 42704 undefined_object: table is not a member; 42P01 undefined_table:
-        // the publication (or table) no longer exists. Both mean the desired
-        // state — "table not published" — already holds.
-        Err(e)
-            if e.as_db_error()
-                .is_some_and(|db| matches!(db.code().code(), "42704" | "42P01")) =>
-        {
-            Ok(())
+    let outcome = async {
+        let publishes_all_tables = client
+            .query_opt(
+                "SELECT puballtables FROM pg_publication WHERE pubname = $1",
+                &[&params.publication_name],
+            )
+            .await
+            .context(SetupExecSnafu)?
+            .is_some_and(|row| row.get::<_, bool>(0));
+        if publishes_all_tables {
+            return Ok(PublicationRemoval::StillPublished);
         }
-        Err(e) => Err(e).context(SetupExecSnafu),
-    };
+        let stmt = format!(
+            "ALTER PUBLICATION {pub} DROP TABLE {schema}.{table}",
+            pub = quote_ident(&params.publication_name),
+            schema = quote_ident(schema_name),
+            table = quote_ident(table_name),
+        );
+        match client.simple_query(&stmt).await {
+            Ok(_) => {}
+            // 42704 undefined_object: table is not a named member; 42P01
+            // undefined_table: the publication (or table) no longer exists.
+            // Whether it is still published is read back below.
+            Err(e)
+                if e.as_db_error()
+                    .is_some_and(|db| matches!(db.code().code(), "42704" | "42P01")) => {}
+            Err(e) => return Err(e).context(SetupExecSnafu),
+        }
+        let still_published =
+            publication_has_table(&client, &params.publication_name, schema_name, table_name)
+                .await?;
+        Ok(if still_published {
+            PublicationRemoval::StillPublished
+        } else {
+            PublicationRemoval::Removed
+        })
+    }
+    .await;
     drop(client);
     let _ = conn_task.await;
     outcome

@@ -26,15 +26,12 @@ use aws_sdk_credential_bridge::S3CredentialProvider;
 use data_components::{
     RefreshableCatalogProvider,
     iceberg::{
-        catalog::{
-            hadoop::{HadoopCatalogBuilder, MetadataMode},
-            rest::RestCatalog,
-        },
+        catalog::{hadoop::HadoopCatalogBuilder, rest::RestCatalog},
         provider::{CatalogTableWrapper, IcebergCatalogProvider},
     },
 };
 use datafusion::catalog::TableProvider;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 
 use crate::dataconnector::iceberg_cluster::IcebergClusterTableProvider;
 
@@ -153,7 +150,6 @@ impl IcebergCatalog {
         // Not much we can check with this path for Hadoop, because a namespace could be an empty folder, there could be no namespaces, etc.
         let mut catalog_builder = HadoopCatalogBuilder::default()
             .with_warehouse_root(catalog_id)
-            .with_metadata_mode(MetadataMode::Infer)
             .with_operator(operator)
             .with_properties(props);
 
@@ -404,12 +400,7 @@ impl CatalogConnector for IcebergCatalog {
                 None
             };
 
-        if catalog_id.starts_with("file://")
-            || catalog_id.starts_with("s3://")
-            || catalog_id.starts_with("s3a://")
-            || catalog_id.starts_with("gs://")
-            || catalog_id.starts_with("gcs://")
-        {
+        if is_storage_url(&catalog_id) {
             return IcebergCatalog::load_hadoop_catalog(
                 props,
                 s3_credential_loader,
@@ -730,6 +721,14 @@ fn get_warehouse(url: &Url) -> Option<String> {
     None
 }
 
+/// Whether `url` addresses object storage or the local filesystem, rather than an
+/// Iceberg REST catalog.
+pub(crate) fn is_storage_url(url: &str) -> bool {
+    ["file://", "s3://", "s3a://", "gs://", "gcs://"]
+        .iter()
+        .any(|scheme| url.starts_with(scheme))
+}
+
 pub fn parse_hadoop_table_url(
     url: &str,
     warehouse_uri: Option<&str>,
@@ -875,7 +874,7 @@ pub(crate) fn build_opendal_operator(
         }
 
         let builder = config.into_builder();
-        Ok(Operator::new(builder)?.finish())
+        Ok(Operator::new(builder)?)
     } else if warehouse_url.starts_with("gs://") || warehouse_url.starts_with("gcs://") {
         let mut config = opendal::services::GcsConfig::default();
         let parsed = Url::parse(warehouse_url)?;
@@ -890,7 +889,7 @@ pub(crate) fn build_opendal_operator(
         }
 
         let builder = config.into_builder();
-        Ok(Operator::new(builder)?.finish())
+        Ok(Operator::new(builder)?)
     } else if warehouse_url.starts_with("file://") || warehouse_url.starts_with('/') {
         let mut config = opendal::services::FsConfig::default();
         if let Ok(parsed) = Url::parse(warehouse_url) {
@@ -900,7 +899,7 @@ pub(crate) fn build_opendal_operator(
             config.root = Some(warehouse_url.to_string());
         }
         let builder = config.into_builder();
-        Ok(Operator::new(builder)?.finish())
+        Ok(Operator::new(builder)?)
     } else {
         Err(format!("Unsupported scheme in warehouse URL: {warehouse_url}").into())
     }
@@ -1069,22 +1068,50 @@ mod tests {
     #[test]
     fn test_invalid_scheme() {
         let url = "ftp://my.iceberg.com/v1/namespaces/spiceai_sandbox";
-        let result = parse_catalog_url(url);
-        result.expect_err("should error parsing url");
+        let err = parse_catalog_url(url).expect_err("should error parsing url");
+        assert!(
+            matches!(&err, Error::InvalidScheme { scheme } if scheme == "ftp"),
+            "expected InvalidScheme for 'ftp', got {err:?}"
+        );
+        // The connector routes file/s3/s3a/gs/gcs catalog paths to the Hadoop
+        // catalog before this parser runs, so the list is the connector's.
+        assert_eq!(
+            err.to_string(),
+            "Invalid URL scheme 'ftp'. Must be 'http', 'https', 'file', 's3', or 's3a'."
+        );
     }
 
     #[test]
     fn test_no_host() {
-        let url = "https:///v1/namespaces/spiceai_sandbox";
-        let result = parse_catalog_url(url);
-        result.expect_err("should error parsing url");
+        // An http(s) URL cannot have an empty host: the URL parser rejects it
+        // before the host check runs.
+        let err = parse_catalog_url("https://").expect_err("an empty host should not parse");
+        assert!(
+            matches!(&err, Error::UrlParse { source } if *source == url::ParseError::EmptyHost),
+            "expected UrlParse(EmptyHost), got {err:?}"
+        );
+        assert_eq!(err.to_string(), "Failed to parse URL: empty host");
+
+        // With a path and no host, the WHATWG URL parser skips the extra slash
+        // and takes the first path segment as the host, so `v1` is consumed as
+        // the host and the path is reported as missing it.
+        let err = parse_catalog_url("https:///v1/namespaces/spiceai_sandbox")
+            .expect_err("should error parsing url");
+        assert!(
+            matches!(err, Error::MissingV1Segment),
+            "expected MissingV1Segment, got {err:?}"
+        );
     }
 
     #[test]
     fn test_missing_namespace_segment() {
         let url = "https://my.iceberg.com/v1/";
-        let result = parse_catalog_url(url);
-        result.expect_err("should error parsing url");
+        let err = parse_catalog_url(url).expect_err("should error parsing url");
+        assert!(
+            matches!(err, Error::MissingNamespacesSegment),
+            "expected MissingNamespacesSegment, got {err:?}"
+        );
+        assert_eq!(err.to_string(), "Path must contain 'namespaces' segment");
     }
 
     #[test]
@@ -1240,46 +1267,102 @@ mod tests {
         assert_eq!(warehouse, None);
     }
 
+    /// The `(scheme, name, root)` an operator lists under: `name` is the bucket
+    /// for object stores, and `root` the prefix within it.
+    fn operator_location(op: &Operator) -> (&'static str, String, String) {
+        let info = op.info();
+        (info.scheme(), info.name(), info.root())
+    }
+
+    /// The root the local filesystem backend reports for `dir`: canonicalized
+    /// (so `/tmp` is `/private/tmp` on macOS), with no trailing slash.
+    fn canonical_root(dir: &std::path::Path) -> String {
+        std::fs::canonicalize(dir)
+            .expect("canonicalize the warehouse directory")
+            .to_string_lossy()
+            .into_owned()
+    }
+
     #[test]
     fn test_build_opendal_operator_s3() {
         let props = HashMap::new();
-        let op = build_opendal_operator("s3://my-bucket/prefix/warehouse", &props);
-        assert!(op.is_ok(), "S3 operator should be created: {op:?}");
+        let op = build_opendal_operator("s3://my-bucket/prefix/warehouse", &props)
+            .expect("S3 operator should be created");
+        assert_eq!(
+            operator_location(&op),
+            (
+                "s3",
+                "my-bucket".to_string(),
+                "/prefix/warehouse/".to_string()
+            )
+        );
     }
 
     #[test]
     fn test_build_opendal_operator_s3a() {
         let props = HashMap::new();
-        let op = build_opendal_operator("s3a://my-bucket/prefix/warehouse", &props);
-        assert!(op.is_ok(), "S3A operator should be created: {op:?}");
+        let op = build_opendal_operator("s3a://my-bucket/prefix/warehouse", &props)
+            .expect("S3A operator should be created");
+        assert_eq!(
+            operator_location(&op),
+            (
+                "s3",
+                "my-bucket".to_string(),
+                "/prefix/warehouse/".to_string()
+            )
+        );
     }
 
     #[test]
     fn test_build_opendal_operator_gcs() {
         let props = HashMap::new();
-        let op = build_opendal_operator("gs://my-bucket/prefix", &props);
-        assert!(op.is_ok(), "GCS operator should be created: {op:?}");
+        let op = build_opendal_operator("gs://my-bucket/prefix", &props)
+            .expect("GCS operator should be created");
+        assert_eq!(
+            operator_location(&op),
+            ("gcs", "my-bucket".to_string(), "/prefix/".to_string())
+        );
     }
 
     #[test]
     fn test_build_opendal_operator_file_url() {
-        let props = HashMap::new();
-        let op = build_opendal_operator("file:///tmp", &props);
-        assert!(op.is_ok(), "File operator should be created: {op:?}");
+        let dir = tempfile::tempdir().expect("create a temporary warehouse directory");
+        let path = dir
+            .path()
+            .to_str()
+            .expect("temporary directory path is UTF-8");
+        let op = build_opendal_operator(&format!("file://{path}"), &HashMap::new())
+            .expect("File operator should be created");
+        assert_eq!(
+            operator_location(&op),
+            ("fs", String::new(), canonical_root(dir.path()))
+        );
     }
 
     #[test]
     fn test_build_opendal_operator_bare_path() {
-        let props = HashMap::new();
-        let op = build_opendal_operator("/tmp", &props);
-        assert!(op.is_ok(), "Bare path operator should be created: {op:?}");
+        let dir = tempfile::tempdir().expect("create a temporary warehouse directory");
+        let path = dir
+            .path()
+            .to_str()
+            .expect("temporary directory path is UTF-8");
+        let op = build_opendal_operator(path, &HashMap::new())
+            .expect("Bare path operator should be created");
+        assert_eq!(
+            operator_location(&op),
+            ("fs", String::new(), canonical_root(dir.path()))
+        );
     }
 
     #[test]
     fn test_build_opendal_operator_unsupported_scheme() {
         let props = HashMap::new();
-        let op = build_opendal_operator("ftp://my-host/path", &props);
-        assert!(op.is_err(), "Unsupported scheme should fail");
+        let err = build_opendal_operator("ftp://my-host/path", &props)
+            .expect_err("Unsupported scheme should fail");
+        assert_eq!(
+            err.to_string(),
+            "Unsupported scheme in warehouse URL: ftp://my-host/path"
+        );
     }
 
     /// A Hadoop table URL must name both a namespace and a table. Anything shorter is rejected

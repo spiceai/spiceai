@@ -150,13 +150,13 @@ async fn vault_token_auth_resolves_pg_password() -> Result<(), anyhow::Error> {
     test_request_context()
         .scope(async {
             // 1. Spin up Postgres and seed it.
-            let pg_port = pg_common::get_random_port()?;
-            let pg = pg_common::start_postgres_docker_container(pg_port).await?;
+            let pg = pg_common::start_postgres_docker_container().await?;
+            let pg_port = usize::from(pg.host_port(5432)?);
             seed_orders(pg_port.try_into()?).await?;
 
             // 2. Spin up Vault dev mode and write the Postgres password.
-            let vault_port: u16 = pg_common::get_random_port()?.try_into()?;
-            let vault = common::start_vault_docker_container(vault_port).await?;
+            let vault = common::start_vault_docker_container().await?;
+            let vault_port = vault.host_port(8200)?;
             let mut data = serde_json::Map::new();
             data.insert(
                 "password".to_string(),
@@ -225,12 +225,12 @@ async fn vault_approle_auth_resolves_pg_password() -> Result<(), anyhow::Error> 
 
     test_request_context()
         .scope(async {
-            let pg_port = pg_common::get_random_port()?;
-            let pg = pg_common::start_postgres_docker_container(pg_port).await?;
+            let pg = pg_common::start_postgres_docker_container().await?;
+            let pg_port = usize::from(pg.host_port(5432)?);
             seed_orders(pg_port.try_into()?).await?;
 
-            let vault_port: u16 = pg_common::get_random_port()?.try_into()?;
-            let vault = common::start_vault_docker_container(vault_port).await?;
+            let vault = common::start_vault_docker_container().await?;
+            let vault_port = vault.host_port(8200)?;
 
             let mut data = serde_json::Map::new();
             data.insert(

@@ -1,0 +1,15 @@
+turso_version=0.7.2
+accelerator_row_count=32
+accelerator_sum_value=5280
+accelerator_names=row-1,row-2,row-3,row-4,row-5,row-6,row-7,row-8,row-9,row-10,row-11,row-12,row-13,row-14,row-15,row-16,row-17,row-18,row-19,row-20,row-21,row-22,row-23,row-24,row-25,row-26,row-27,row-28,row-29,row-30,row-31,row-32
+accelerator_note_row=2
+accelerator_note=utf8-✓
+checkpoint_dataset=compat_from_072
+checkpoint_refresh_sql=SELECT id, name FROM source WHERE id <= 32
+cayenne_table_id=07200000-0000-7000-8000-000000000001
+cayenne_table_name=compat_from_072
+cayenne_snapshot_id=07200000-0000-7000-8000-000000000002
+cayenne_sequence=42
+cayenne_inlined_id=07200000-0000-7000-8000-000000000003
+cayenne_inlined_bytes=07,72,00,81
+cayenne_inlined_record_count=1

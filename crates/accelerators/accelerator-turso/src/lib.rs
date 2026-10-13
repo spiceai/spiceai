@@ -625,6 +625,40 @@ impl DataAccelerator for TursoAccelerator {
         Ok(Arc::new(TursoSidecar::new(pool, source.name().to_string())))
     }
 
+    async fn validate_init(
+        &self,
+        source: &dyn AccelerationSource,
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        if let Some(acceleration) = source.acceleration()
+            && (acceleration.params.contains_key("turso_url")
+                || acceleration.params.contains_key("turso_auth_token"))
+        {
+            return Err(Error::RemoteDatabaseNotSupported.into());
+        }
+        let path = self.file_path(source)?;
+        if path == ":memory:" {
+            return Ok(());
+        }
+        if let Some(acceleration) = source.acceleration()
+            && acceleration.params.contains_key("turso_file")
+            && !self.is_valid_file(source)
+        {
+            if std::path::Path::new(&path).is_dir() {
+                return Err(Error::InvalidFileIsDirectory.into());
+            }
+            let extension = std::path::Path::new(&path)
+                .extension()
+                .and_then(OsStr::to_str)
+                .unwrap_or("");
+            return Err(Error::InvalidFileExtension {
+                valid_extensions: self.valid_file_extensions().join(","),
+                extension: extension.to_string(),
+            }
+            .into());
+        }
+        Ok(())
+    }
+
     /// Initializes a Turso database for the dataset.
     ///
     /// Supports two acceleration modes:
@@ -649,16 +683,7 @@ impl DataAccelerator for TursoAccelerator {
         &self,
         source: &dyn AccelerationSource,
     ) -> Result<BootstrapStatus, Box<dyn std::error::Error + Send + Sync>> {
-        // Reject remote database configurations (not supported as accelerators)
-        // Note: This is an accelerator-specific limitation. Remote databases will be
-        // supported when Turso is used as a data connector.
-        if let Some(acceleration) = source.acceleration()
-            && (acceleration.params.contains_key("turso_url")
-                || acceleration.params.contains_key("turso_auth_token"))
-        {
-            return Err(Error::RemoteDatabaseNotSupported.into());
-        }
-
+        self.validate_init(source).await?;
         let path = self.file_path(source)?;
 
         // Handle memory mode: no file operations needed
@@ -674,21 +699,6 @@ impl DataAccelerator for TursoAccelerator {
             if !acceleration.params.contains_key("turso_file") {
                 make_spice_data_directory()
                     .map_err(|err| Error::AccelerationCreationFailed { source: err.into() })?;
-            } else if !self.is_valid_file(source) {
-                if std::path::Path::new(&path).is_dir() {
-                    return Err(Error::InvalidFileIsDirectory.into());
-                }
-
-                let extension = std::path::Path::new(&path)
-                    .extension()
-                    .and_then(OsStr::to_str)
-                    .unwrap_or("");
-
-                return Err(Error::InvalidFileExtension {
-                    valid_extensions: self.valid_file_extensions().join(","),
-                    extension: extension.to_string(),
-                }
-                .into());
             }
 
             // If mode is FileCreate, snapshot the existing file (if enabled) then delete it to start fresh
@@ -741,11 +751,13 @@ impl DataAccelerator for TursoAccelerator {
                 None,
                 resolved_refresh_mode(source, acceleration),
             )
-            .await;
+            .await?;
 
-            // Initialize the database file using the shared pool
-            let pool = self.get_shared_pool(source).await?;
-            pool.connect().await?;
+            // A pending bootstrap must restore the file before any connection opens it.
+            if !matches!(bootstrap_status, BootstrapStatus::Pending { .. }) {
+                let pool = self.get_shared_pool(source).await?;
+                pool.connect().await?;
+            }
 
             return Ok(bootstrap_status);
         }
@@ -1177,7 +1189,7 @@ mod tests {
         let external_table = CreateExternalTable {
             schema: df_schema,
             name: TableReference::bare("test_turso_table"),
-            location: String::new(),
+            locations: vec![],
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
@@ -1275,7 +1287,7 @@ mod tests {
         let external_table = CreateExternalTable {
             schema: df_schema,
             name: TableReference::bare("test_pushdown_table"),
-            location: String::new(),
+            locations: vec![],
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
@@ -1383,14 +1395,22 @@ mod tests {
 
     #[tokio::test]
     async fn test_file_mode_turso_creation() {
-        // Test that file mode creates a Turso database at a specified path
-        let test_path = "/tmp/test_turso_file_mode.db";
-
-        // Clean up if file exists from previous test
-        let _ = std::fs::remove_file(test_path);
-        let _ = std::fs::remove_file(format!("{test_path}-wal"));
-        let _ = std::fs::remove_file(format!("{test_path}-shm"));
-        let _ = std::fs::remove_file(format!("{test_path}-log"));
+        // Test that file mode creates a Turso database at a specified path. The
+        // database lives in a directory owned by this process, so two concurrent runs
+        // (a second checkout, a retried test) never open one file, and removing the
+        // directory removes every sidecar Turso leaves beside the database.
+        let dir = std::env::temp_dir().join(format!(
+            "spice_turso_file_mode_creation_{}",
+            std::process::id()
+        ));
+        // Only a crashed earlier process that reused this pid can have left the
+        // directory behind; a stale MVCC log in it would fail the open below.
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp directory should be creatable");
+        let test_path = dir
+            .join("test_turso_file_mode.db")
+            .to_string_lossy()
+            .to_string();
 
         let schema = Arc::new(Schema::new(vec![
             arrow::datatypes::Field::new("id", DataType::Int64, false),
@@ -1400,12 +1420,12 @@ mod tests {
         let df_schema = ToDFSchema::to_dfschema_ref(Arc::clone(&schema)).expect("df schema");
 
         let mut options = HashMap::new();
-        options.insert("file".to_string(), test_path.to_string());
+        options.insert("file".to_string(), test_path.clone());
 
         let external_table = CreateExternalTable {
             schema: df_schema,
             name: TableReference::bare("test_file_mode_table"),
-            location: String::new(),
+            locations: vec![],
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
@@ -1427,7 +1447,7 @@ mod tests {
 
         // Verify the file was created
         assert!(
-            std::path::Path::new(test_path).exists(),
+            std::path::Path::new(&test_path).exists(),
             "Turso database file should be created at specified path"
         );
 
@@ -1484,18 +1504,12 @@ mod tests {
         assert_eq!(name_col.value(1), "Bob");
         assert_eq!(name_col.value(2), "Charlie");
 
-        // Clean up - drop the table first to close connections
+        // Clean up: drop the table to close its connections, then remove the database
+        // and its sidecars with the directory. Cleanup is best effort, as before, and
+        // nothing waits on it: the directory is private to this process.
         drop(table);
         drop(ctx);
-
-        // Give a moment for connections to close
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
-        // Clean up all database files
-        let _ = std::fs::remove_file(test_path);
-        let _ = std::fs::remove_file(format!("{test_path}-wal"));
-        let _ = std::fs::remove_file(format!("{test_path}-shm"));
-        let _ = std::fs::remove_file(format!("{test_path}-log"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -1550,7 +1564,7 @@ mod tests {
         let external_table = CreateExternalTable {
             schema: df_schema,
             name: TableReference::bare("test_default_path_table"),
-            location: file_path.clone(),
+            locations: vec![file_path.clone()],
             file_type: String::new(),
             table_partition_cols: vec![],
             if_not_exists: true,
@@ -1640,7 +1654,7 @@ mod tests {
             let external_table = CreateExternalTable {
                 schema: df_schema,
                 name: TableReference::bare("test_ts_seconds"),
-                location: String::new(),
+                locations: vec![],
                 file_type: String::new(),
                 table_partition_cols: vec![],
                 if_not_exists: true,
@@ -1706,7 +1720,7 @@ mod tests {
             let external_table = CreateExternalTable {
                 schema: df_schema,
                 name: TableReference::bare("test_ts_millis"),
-                location: String::new(),
+                locations: vec![],
                 file_type: String::new(),
                 table_partition_cols: vec![],
                 if_not_exists: true,
@@ -1772,7 +1786,7 @@ mod tests {
             let external_table = CreateExternalTable {
                 schema: df_schema,
                 name: TableReference::bare("test_ts_micros"),
-                location: String::new(),
+                locations: vec![],
                 file_type: String::new(),
                 table_partition_cols: vec![],
                 if_not_exists: true,
@@ -1838,7 +1852,7 @@ mod tests {
             let external_table = CreateExternalTable {
                 schema: df_schema,
                 name: TableReference::bare("test_ts_nanos"),
-                location: String::new(),
+                locations: vec![],
                 file_type: String::new(),
                 table_partition_cols: vec![],
                 if_not_exists: true,

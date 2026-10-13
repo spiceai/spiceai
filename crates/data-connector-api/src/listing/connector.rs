@@ -37,10 +37,14 @@ use datafusion::datasource::file_format::{
     parquet::ParquetFormat,
 };
 use datafusion::datasource::listing::{
-    ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
+    ListingFileFilter, ListingOptions, ListingTable, ListingTableConfig, ListingTableUrl,
 };
 use datafusion::error::DataFusionError;
-use datafusion::execution::cache::file_statistics_cache::DefaultFileStatisticsCache;
+use datafusion::execution::cache::TableScopedPath;
+use datafusion::execution::cache::cache_manager::{
+    CachedFileMetadata, DEFAULT_FILE_STATISTICS_MEMORY_LIMIT,
+};
+use datafusion::execution::cache::default_cache::DefaultCache;
 use datafusion::execution::context::SessionContext;
 use datafusion::execution::object_store::ObjectStoreUrl;
 use datafusion::physical_plan::empty::EmptyExec;
@@ -91,11 +95,91 @@ const SCHEMA_SOURCE_PATH_FILE_SCAN_LIMIT: usize = 10_000;
 /// publish an incomplete schema for that full scan.
 const ORC_COLLECTION_SCHEMA_INFER_FILE_LIMIT: usize = 10_000;
 
+/// The listing options and file schema a dataset's listing table is built from, as
+/// [`ListingTableConnector::listing_table_template`] resolves them.
+///
+/// [`Self::build`] builds the table over any path from them, so a connector that reads a
+/// dataset from more than one location over its lifetime exposes the same schema at each.
+#[derive(Clone, Debug)]
+pub struct ListingTableTemplate {
+    options: ListingOptions,
+    /// The columns physically stored in the data files, without partition or metadata
+    /// columns.
+    schema: SchemaRef,
+    object_store: Arc<dyn ObjectStore>,
+    /// Listing extension from [`ListingTableConnector::get_file_format_and_extension`].
+    extension: String,
+}
+
+impl ListingTableTemplate {
+    /// The columns physically stored in the data files, without partition or metadata
+    /// columns.
+    #[must_use]
+    pub fn file_schema(&self) -> &SchemaRef {
+        &self.schema
+    }
+
+    /// Builds the dataset's table over `table_path`: a [`ListingTable`] with a
+    /// file-statistics cache that selects its data files with [`FormatSelectedDataFiles`] for a
+    /// format-selected listing, wrapped for `location` pruning when the dataset has a
+    /// `_location` column.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the listing options do not fit the file schema, such as a metadata
+    /// column whose name a file column already uses.
+    pub fn build(&self, table_path: ListingTableUrl) -> DFResult<Arc<dyn TableProvider>> {
+        let table = Arc::new(self.listing_table(table_path.clone())?);
+        Ok(self.wrap(table, table_path))
+    }
+
+    fn listing_table(&self, table_path: ListingTableUrl) -> DFResult<ListingTable> {
+        let options =
+            with_format_selected_file_filter(self.options.clone(), &table_path, &self.extension);
+        let config = ListingTableConfig::new(table_path)
+            .with_listing_options(options)
+            .with_schema(Arc::clone(&self.schema));
+
+        // Attach a file-statistics cache. With `collect_stat = true` (the
+        // DataFusion default), resolving a scan's statistics parses every
+        // file's Parquet footer; without a cache, `ListingTable` re-parses all
+        // footers on every plan. That makes stat-only queries (e.g. an
+        // unfiltered `COUNT(*)`, which the `AggregateStatistics` rule answers
+        // purely from statistics) scale linearly with file count on each query.
+        // The stock DataFusion `CREATE EXTERNAL TABLE` path wires this same
+        // cache; we mirror it so per-file footer stats are reused across
+        // queries. The cache invalidates per file on `ObjectMeta` change, so
+        // refreshing datasets still pick up new data.
+        Ok(ListingTable::try_new(config)?.with_cache(Some(Arc::new(
+            DefaultCache::<TableScopedPath, CachedFileMetadata>::new(
+                DEFAULT_FILE_STATISTICS_MEMORY_LIMIT,
+            )
+            .with_name("DefaultFileStatisticsCache"),
+        ))))
+    }
+
+    fn wrap(
+        &self,
+        table: Arc<ListingTable>,
+        table_path: ListingTableUrl,
+    ) -> Arc<dyn TableProvider> {
+        if has_location_metadata(table.options()) {
+            Arc::new(LocationPruningListingTable::new(
+                table,
+                Arc::clone(&self.object_store),
+                table_path,
+                Arc::clone(&self.schema),
+                self.extension.as_str(),
+            ))
+        } else {
+            table
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 /// Wraps a `ListingTable` to short-circuit broad object-store listings when
-/// queries include `location` predicates, and to apply format-selected Hive
-/// listing (`*.orc` / `*.parquet`) so extensionless data objects are scanned
-/// without picking up job-marker files.
+/// queries include `location` predicates.
 struct LocationPruningListingTable {
     inner: Arc<ListingTable>,
     object_store: Arc<dyn ObjectStore>,
@@ -107,8 +191,8 @@ struct LocationPruningListingTable {
     /// appear in the file (causing duplicates in `table_schema`).
     file_schema: SchemaRef,
     /// Listing extension from [`ListingTableConnector::get_file_format_and_extension`].
-    /// Format-selected values (`*.orc`, `*.parquet`) list through
-    /// [`file_matches_extension`] instead of `DataFusion`'s suffix filter.
+    /// A `location` predicate names objects without listing them, so the objects it names
+    /// are checked against it with [`file_matches_extension`].
     listing_extension: String,
 }
 
@@ -131,6 +215,13 @@ impl LocationPruningListingTable {
 
     fn uses_format_selected_listing(&self) -> bool {
         format_selected_data_suffix(&self.listing_extension).is_some()
+    }
+
+    /// Whether a query can name objects through `_location`, the column
+    /// [`extract_location_predicates`] reads. Without it the wrapper passes every call
+    /// through to `inner`.
+    fn has_location_column(&self) -> bool {
+        self.inner.schema().field_with_name("_location").is_ok()
     }
 
     fn partition_column_types(&self) -> &[(String, datafusion::arrow::datatypes::DataType)] {
@@ -190,42 +281,8 @@ impl LocationPruningListingTable {
             metadata_size_hint: None,
             ordering: None,
             table_reference: None,
+            arrow_schema: None,
         })
-    }
-
-    async fn format_selected_listing_files(
-        &self,
-        state: &dyn Session,
-    ) -> DFResult<Vec<PartitionedFile>> {
-        let mut file_stream = self
-            .table_path
-            .list_all_files(state, self.object_store.as_ref(), "")
-            .await?;
-
-        let mut files: Vec<PartitionedFile> = Vec::new();
-        while let Some(meta) = file_stream.try_next().await? {
-            if !file_matches_extension(&meta.location, &self.listing_extension) {
-                continue;
-            }
-            files.push(self.partitioned_file_for_meta(meta)?);
-        }
-        Ok(files)
-    }
-
-    async fn scan_format_selected_listing(
-        &self,
-        state: &dyn Session,
-        projection: Option<&Vec<usize>>,
-        limit: Option<usize>,
-    ) -> DFResult<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
-        state.runtime_env().register_object_store(
-            self.object_store_url().as_ref(),
-            Arc::clone(&self.object_store),
-        );
-
-        let files = self.format_selected_listing_files(state).await?;
-        self.scan_partitioned_files(state, files, projection, limit)
-            .await
     }
 
     async fn scan_partitioned_files(
@@ -251,13 +308,14 @@ impl LocationPruningListingTable {
             .map(|(name, dtype)| Field::new(name, dtype.clone(), true))
             .collect();
 
-        let table_schema = TableSchema::new(
-            self.file_schema(),
-            partition_fields
-                .iter()
-                .map(|f| Arc::new(f.clone()))
-                .collect(),
-        );
+        let table_schema = TableSchema::builder(self.file_schema())
+            .with_table_partition_cols(
+                partition_fields
+                    .iter()
+                    .map(|f| Arc::new(f.clone()))
+                    .collect::<Vec<_>>(),
+            )
+            .build();
         let file_source = self.inner.options().format.file_source(table_schema);
 
         let mut builder = FileScanConfigBuilder::new(self.object_store_url(), file_source)
@@ -385,15 +443,46 @@ impl TableProvider for LocationPruningListingTable {
         &self,
         filters: &[&datafusion_expr::Expr],
     ) -> DFResult<Vec<datafusion_expr::TableProviderFilterPushDown>> {
-        // Format-selected listing builds its own file list, so partition
-        // predicates are applied as residual filters rather than pruned here.
-        if self.uses_format_selected_listing() {
-            return Ok(vec![
-                datafusion_expr::TableProviderFilterPushDown::Inexact;
-                filters.len()
-            ]);
+        let inner_results = self.inner.supports_filters_pushdown(filters)?;
+        if !self.has_location_column() {
+            return Ok(inner_results);
         }
-        self.inner.supports_filters_pushdown(filters)
+
+        // Names of the configured metadata columns other than `_location` (i.e.
+        // `_last_modified`, `_size`) — the ones the head()-based fast path prunes on.
+        let options = self.inner.options();
+        let non_location_metadata: Vec<&str> = options
+            .metadata_cols
+            .iter()
+            .map(datafusion_datasource::metadata::MetadataColumn::name)
+            .filter(|name| *name != "_location")
+            .collect();
+
+        // `scan` applies exactly two kinds of metadata predicate before opening a file, so
+        // only those may be reported `Exact` (which drops the `FilterExec` above the scan):
+        //   - `_location`: the fast path head()s exactly those keys;
+        //   - `_last_modified`/`_size`: the fast path evaluates them against each head()ed
+        //     `ObjectMeta`, and the fall-through path prunes on `inner`'s listing.
+        // Everything else (partition and data columns, or a single predicate mixing
+        // `_location` with another metadata column) is forced `Inexact` so DataFusion keeps
+        // re-applying it above the scan.
+        Ok(filters
+            .iter()
+            .zip(inner_results)
+            .map(|(filter, inner_result)| {
+                let refs = filter.column_refs();
+                let location_only = refs.iter().all(|c| c.name == "_location");
+                let non_location_metadata_only = !refs.is_empty()
+                    && refs
+                        .iter()
+                        .all(|c| non_location_metadata.contains(&c.name.as_str()));
+                if location_only || non_location_metadata_only {
+                    inner_result
+                } else {
+                    datafusion_expr::TableProviderFilterPushDown::Inexact
+                }
+            })
+            .collect())
     }
 
     fn constraints(&self) -> Option<&Constraints> {
@@ -407,12 +496,27 @@ impl TableProvider for LocationPruningListingTable {
         filters: &[datafusion_expr::Expr],
         limit: Option<usize>,
     ) -> DFResult<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
-        let Some(locations) = extract_location_predicates(filters) else {
-            if self.uses_format_selected_listing() {
-                return self
-                    .scan_format_selected_listing(state, projection, limit)
-                    .await;
-            }
+        // The planner hands a pushed-down conjunction it has proven unsatisfiable to
+        // `scan` as a `false` (or NULL) literal: `_location = 'a' AND _location = 'b'`
+        // arrives as `[false]`. No row passes it, so answer with an empty scan instead
+        // of listing the whole prefix only to prune every file.
+        if filters.iter().any(|filter| {
+            matches!(
+                filter,
+                datafusion_expr::Expr::Literal(ScalarValue::Boolean(None | Some(false)), _)
+            )
+        }) {
+            return self
+                .scan_partitioned_files(state, Vec::new(), projection, limit)
+                .await;
+        }
+
+        let locations = if self.has_location_column() {
+            extract_location_predicates(filters)
+        } else {
+            None
+        };
+        let Some(locations) = locations else {
             return self.inner.scan(state, projection, filters, limit).await;
         };
 
@@ -422,6 +526,29 @@ impl TableProvider for LocationPruningListingTable {
             self.object_store_url().as_ref(),
             Arc::clone(&self.object_store),
         );
+
+        // Metadata predicates (`_location`, `_last_modified`, `_size`) are computable from each
+        // object's `ObjectMeta`, so evaluate them against the head()ed metadata and skip a file
+        // before opening it (e.g. `_location = X AND _last_modified > W` head()s X and never
+        // GETs it when its mtime fails the bound). `supports_filters_pushdown` reports these
+        // `Exact`, so every one must be enforced here.
+        //
+        // `locations` is only a candidate set: it unions the values of every conjunct, which
+        // is a superset of the true matches (`_location = 'A' AND _location = 'B'` heads both
+        // and keeps neither). `_location` predicates that the extractor does not understand,
+        // such as `LIKE`, are likewise enforced by this check.
+        let metadata_cols = &self.inner.options().metadata_cols;
+        let metadata_filters: Vec<datafusion_expr::Expr> = filters
+            .iter()
+            .filter(|f| {
+                let refs = f.column_refs();
+                !refs.is_empty()
+                    && refs
+                        .iter()
+                        .all(|c| metadata_cols.iter().any(|m| m.name() == c.name))
+            })
+            .cloned()
+            .collect();
 
         let mut files: Vec<PartitionedFile> = Vec::with_capacity(locations.len());
 
@@ -459,11 +586,26 @@ impl TableProvider for LocationPruningListingTable {
                 }
             };
 
-            if self.uses_format_selected_listing()
-                && !file_matches_extension(&meta.location, &self.listing_extension)
+            // `ListingTable` never reads a zero-byte object (see
+            // [`listed_object_is_data_file`]), so a named one holds no rows.
+            if meta.size == 0
+                || (self.uses_format_selected_listing()
+                    && !file_matches_extension(&meta.location, &self.listing_extension))
             {
                 continue;
             }
+
+            // Prune by the metadata predicates before opening the object; a file that
+            // fails one is never GETed.
+            let Some(meta) = datafusion::datasource::listing::helpers::filter_by_metadata(
+                meta,
+                &metadata_filters,
+                metadata_cols,
+                state.execution_props(),
+            )?
+            else {
+                continue;
+            };
 
             files.push(self.partitioned_file_for_meta(meta)?);
         }
@@ -499,12 +641,6 @@ impl TableProvider for LocationPruningListingTable {
     }
 
     fn statistics(&self) -> Option<datafusion::common::Statistics> {
-        if self.uses_format_selected_listing() {
-            // The inner `ListingTable` suffixes with an empty extension and
-            // would either miss extensionless objects or treat marker-only
-            // listings as an exact empty table.
-            return None;
-        }
         self.inner.statistics()
     }
 
@@ -539,6 +675,19 @@ impl TableProvider for LocationPruningListingTable {
         state: &dyn datafusion::catalog::Session,
     ) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
         self.inner.truncate(state).await
+    }
+
+    async fn merge_into(
+        &self,
+        state: &dyn datafusion::catalog::Session,
+        source: Arc<dyn datafusion::physical_plan::ExecutionPlan>,
+        merge_schema: datafusion::common::DFSchemaRef,
+        on: datafusion_expr::Expr,
+        clauses: Vec<datafusion::logical_expr::dml::MergeIntoClause>,
+    ) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+        self.inner
+            .merge_into(state, source, merge_schema, on, clauses)
+            .await
     }
 }
 
@@ -633,6 +782,10 @@ fn extract_location_predicates(filters: &[datafusion_expr::Expr]) -> Option<Vec<
     if !safe {
         return None;
     }
+
+    // Drop repeated literals (order preserved) so a file is never scanned twice.
+    let mut seen = std::collections::HashSet::new();
+    values.retain(|v| seen.insert(v.clone()));
 
     if values.is_empty() {
         None
@@ -1379,6 +1532,69 @@ pub trait ListingTableConnector: DataConnector {
     where
         Self: Display,
     {
+        let template = self
+            .listing_table_template(dataset, url, extension, file_format)
+            .await?;
+
+        // This shouldn't error because `listing_table_template` already parsed the same URL.
+        let table_path =
+            ListingTableUrl::parse(url.clone())
+                .boxed()
+                .context(crate::InternalSnafu {
+                    dataconnector: format!("{self}"),
+                    connector_component: ConnectorComponent::from(dataset),
+                    code: "LTC-RP-LTUP".to_string(), // ListingTableConnector-ReadProvider-ListingTableUrlParse
+                })?;
+
+        // This shouldn't error because we're passing the schema and options correctly.
+        let table_arc = Arc::new(template.listing_table(table_path.clone()).boxed().context(
+            crate::InternalSnafu {
+                dataconnector: format!("{self}"),
+                connector_component: ConnectorComponent::from(dataset),
+                code: "LTC-RP-LTTN".to_string(), // ListingTableConnector-ReadProvider-ListingTableTryNew
+            },
+        )?);
+
+        // For S3 single-file datasets with acceleration enabled, wrap with a caching layer
+        // that checks ETag/Version ID to skip unnecessary re-fetches when file hasn't changed.
+        if self.supports_single_file_version_cache()
+            && refresh_skip_enabled(dataset)
+            && !table_path.is_collection()
+            && dataset.acceleration.is_some()
+            && let Some(cached_table) =
+                data_components::s3_single_file_cached::S3SingleFileCached::try_new(
+                    Arc::clone(&table_arc),
+                    Arc::clone(&template.object_store),
+                    dataset.name.to_string(),
+                )
+        {
+            tracing::debug!(
+                "Enabled single-file ETag/Version caching for {}",
+                dataset.name
+            );
+            return Ok(Arc::new(cached_table));
+        }
+
+        Ok(template.wrap(table_arc, table_path))
+    }
+
+    /// Resolves the listing options and schema [`Self::create_listing_table`] builds the
+    /// dataset's table from, without building it.
+    ///
+    /// A connector whose files are read from a location that changes over the dataset's
+    /// lifetime — a path pinned to a source revision — resolves this once and builds the table
+    /// at each location with [`ListingTableTemplate::build`], so the dataset keeps the schema
+    /// it registered with.
+    async fn listing_table_template(
+        &self,
+        dataset: &DatasetSpec,
+        url: &Url,
+        extension: &str,
+        file_format: Arc<dyn FileFormat>,
+    ) -> DataConnectorResult<ListingTableTemplate>
+    where
+        Self: Display,
+    {
         // This shouldn't error because we've already validated the URL in `get_object_store_url`.
         let table_path =
             ListingTableUrl::parse(url.clone())
@@ -1462,10 +1678,10 @@ pub trait ListingTableConnector: DataConnector {
             sanitized_url = schema_infer_url.sanitized_url(),
         );
 
-        let session_state = ctx.state();
+        // `target_partitions` and `collect_statistics` are read from the scanning
+        // session's config at scan time, so they are no longer copied onto the options.
         let mut options = ListingOptions::new(Arc::clone(&file_format))
-            .with_file_extension(datafusion_listing_file_extension(extension))
-            .with_session_config_options(session_state.config());
+            .with_file_extension(datafusion_listing_file_extension(extension));
 
         options =
             options.with_object_versioning_type(self.object_versioning_type().map(|v| match v {
@@ -1567,74 +1783,12 @@ pub trait ListingTableConnector: DataConnector {
             expanded_schema
         };
 
-        // Keep a reference to the file schema for LocationPruningListingTable
-        let file_schema = Arc::clone(&final_schema);
-
-        let config = ListingTableConfig::new(table_path.clone())
-            .with_listing_options(options)
-            .with_schema(final_schema);
-
-        // This shouldn't error because we're passing the schema and options correctly.
-        //
-        // Attach a file-statistics cache. With `collect_stat = true` (the
-        // DataFusion default), resolving a scan's statistics parses every
-        // file's Parquet footer; without a cache, `ListingTable` re-parses all
-        // footers on every plan. That makes stat-only queries (e.g. an
-        // unfiltered `COUNT(*)`, which the `AggregateStatistics` rule answers
-        // purely from statistics) scale linearly with file count on each query.
-        // The stock DataFusion `CREATE EXTERNAL TABLE` path wires this same
-        // cache; we mirror it so per-file footer stats are reused across
-        // queries. The cache invalidates per file on `ObjectMeta` change, so
-        // refreshing datasets still pick up new data.
-        let table = ListingTable::try_new(config)
-            .boxed()
-            .context(crate::InternalSnafu {
-                dataconnector: format!("{self}"),
-                connector_component: ConnectorComponent::from(dataset),
-                code: "LTC-RP-LTTN".to_string(), // ListingTableConnector-ReadProvider-ListingTableTryNew
-            })?
-            .with_cache(Some(Arc::new(DefaultFileStatisticsCache::default())));
-
-        // For S3 single-file datasets with acceleration enabled, wrap with a caching layer
-        // that checks ETag/Version ID to skip unnecessary re-fetches when file hasn't changed.
-        let table_arc = Arc::new(table);
-        if self.supports_single_file_version_cache()
-            && refresh_skip_enabled(dataset)
-            && !table_path.is_collection()
-            && dataset.acceleration.is_some()
-            && let Some(cached_table) =
-                data_components::s3_single_file_cached::S3SingleFileCached::try_new(
-                    Arc::clone(&table_arc),
-                    Arc::clone(&object_store),
-                    dataset.name.to_string(),
-                )
-        {
-            tracing::debug!(
-                "Enabled single-file ETag/Version caching for {}",
-                dataset.name
-            );
-            return Ok(Arc::new(cached_table));
-        }
-
-        let has_location_metadata = table_arc.options().metadata_cols.iter().any(|c| {
-            matches!(
-                c,
-                datafusion_datasource::metadata::MetadataColumn::Location(_)
-            )
-        });
-
-        if has_location_metadata || format_selected_data_suffix(extension).is_some() {
-            let wrapped = LocationPruningListingTable::new(
-                table_arc,
-                Arc::clone(&object_store),
-                table_path,
-                file_schema,
-                extension,
-            );
-            Ok(Arc::new(wrapped))
-        } else {
-            Ok(table_arc)
-        }
+        Ok(ListingTableTemplate {
+            options,
+            schema: final_schema,
+            object_store,
+            extension: extension.to_string(),
+        })
     }
 
     /// Drops partition columns from `schema` that the files already carry, so a
@@ -2022,7 +2176,7 @@ async fn get_last_modified(
             found_extensions.insert(NO_EXTENSION_SENTINEL.to_string());
         }
 
-        if file_matches_extension(&file.location, extension) {
+        if listed_object_is_data_file(&file, extension) {
             if let Some(ref current) = last_modified_file {
                 if current.last_modified < file.last_modified {
                     last_modified_file = Some(file);
@@ -2103,7 +2257,7 @@ async fn verify_schema_source_path(
                 source: err.into(),
             })?
     {
-        if file_matches_extension(&file.location, extension) {
+        if listed_object_is_data_file(&file, extension) {
             return Ok(Some(file));
         }
 
@@ -2224,6 +2378,79 @@ pub fn file_matches_extension(location: &Path, extension: &str) -> bool {
     location.as_ref().ends_with(extension)
 }
 
+/// Whether a listed object is a data file the listing table reads for
+/// `extension`: non-empty, and named as [`file_matches_extension`] accepts.
+///
+/// `DataFusion`'s `ListingTable` skips zero-byte objects, so every listing Spice
+/// builds itself has to skip them too. An S3 folder marker (key `table/`, 0
+/// bytes) lists as `table`, an extensionless name a format-selected listing
+/// (`*.parquet`) would otherwise read as a Hive data object and fail on.
+fn listed_object_is_data_file(meta: &ObjectMeta, extension: &str) -> bool {
+    meta.size > 0 && file_matches_extension(&meta.location, extension)
+}
+
+fn has_location_metadata(options: &ListingOptions) -> bool {
+    options.metadata_cols.iter().any(|c| {
+        matches!(
+            c,
+            datafusion_datasource::metadata::MetadataColumn::Location(_)
+        )
+    })
+}
+
+/// Attaches [`FormatSelectedDataFiles`] to `options` when `extension` is
+/// format-selected (`*.orc`, `*.parquet`). The `ListingTable` built from them
+/// then lists exactly the objects [`listed_object_is_data_file`] accepts and
+/// scans them on its regular path, with per-file statistics, partition pruning
+/// and file splitting.
+fn with_format_selected_file_filter(
+    options: ListingOptions,
+    table_path: &ListingTableUrl,
+    extension: &str,
+) -> ListingOptions {
+    if format_selected_data_suffix(extension).is_none() {
+        return options;
+    }
+    let file_filter = FormatSelectedDataFiles {
+        table_path: table_path.clone(),
+        extension: extension.to_string(),
+        partition_cols: options.table_partition_cols.clone(),
+    };
+    options.with_file_filter(Some(Arc::new(file_filter)))
+}
+
+/// The data files of a format-selected listing: non-empty objects that
+/// [`file_matches_extension`] accepts. A selected object outside the table's
+/// Hive `key=value` directories fails the listing, where `DataFusion`'s
+/// partition parsing would skip it and the scan would return incomplete
+/// results.
+#[derive(Debug)]
+struct FormatSelectedDataFiles {
+    table_path: ListingTableUrl,
+    extension: String,
+    partition_cols: Vec<(String, DataType)>,
+}
+
+impl ListingFileFilter for FormatSelectedDataFiles {
+    fn is_data_file(&self, object: &ObjectMeta) -> DFResult<bool> {
+        if !listed_object_is_data_file(object, &self.extension) {
+            return Ok(false);
+        }
+        if !self.partition_cols.is_empty() {
+            parse_partition_values(&self.table_path, &object.location, &self.partition_cols)?;
+        }
+        Ok(true)
+    }
+
+    fn accepts_inserted_files(&self, file_extension: &str) -> bool {
+        // An insert names its files `<16 alphanumeric write id>_<n>.<file_extension>`.
+        file_matches_extension(
+            &Path::from(format!("0000000000000000_0.{file_extension}")),
+            &self.extension,
+        )
+    }
+}
+
 /// List matching `ORC` objects and merge their footers. Used instead of
 /// [`ListingOptions::infer_schema`] on a collection so format-selected
 /// listings (`*.orc`) skip job-marker files and so a last-modified-only
@@ -2289,7 +2516,7 @@ async fn list_matching_listing_files(
     let mut file_stream = table_path.list_all_files(state, object_store, "").await?;
     let mut files = Vec::new();
     while let Some(file) = file_stream.try_next().await? {
-        if file_matches_extension(&file.location, extension) {
+        if listed_object_is_data_file(&file, extension) {
             files.push(file);
             if files.len() >= limit {
                 break;
@@ -2423,7 +2650,7 @@ fn parquet_page_index_options(app: &Arc<App>) -> ParquetPageIndexOptions {
 mod tests {
     use arrow::array::{Array, RecordBatch};
     use chrono::{TimeZone, Utc};
-    use datafusion::sql::TableReference;
+    use datafusion::common::TableReference;
     use datafusion_table_providers::util::secrets::to_secret_map;
     use futures::StreamExt;
     use futures::stream::{self, BoxStream};
@@ -3306,10 +3533,12 @@ mod tests {
 
         let listing = ListingTable::try_new(
             ListingTableConfig::new(table_path.clone())
-                .with_listing_options(
+                .with_listing_options(with_format_selected_file_filter(
                     ListingOptions::new(Arc::clone(&file_format) as Arc<dyn FileFormat>)
                         .with_file_extension(""),
-                )
+                    &table_path,
+                    "*.orc",
+                ))
                 .with_schema(Arc::clone(&schema)),
         )
         .expect("listing table");
@@ -3511,6 +3740,14 @@ mod tests {
         vec![("dt".to_string(), DataType::Utf8)]
     }
 
+    /// A session that plans without reading file footers, for tests whose
+    /// [`TestObjectStore`] only lists.
+    fn listing_only_session() -> SessionContext {
+        SessionContext::new_with_config(
+            datafusion::prelude::SessionConfig::new().with_collect_statistics(false),
+        )
+    }
+
     fn format_selected_hive_listing_table(
         ctx: &SessionContext,
         store: Arc<dyn ObjectStore>,
@@ -3521,9 +3758,13 @@ mod tests {
             .register_object_store(table_path.object_store().as_ref(), Arc::clone(&store));
 
         let file_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int32, true)]));
-        let options = ListingOptions::new(Arc::new(OrcFormat::new()) as Arc<dyn FileFormat>)
-            .with_file_extension("")
-            .with_table_partition_cols(partition_cols);
+        let options = with_format_selected_file_filter(
+            ListingOptions::new(Arc::new(OrcFormat::new()) as Arc<dyn FileFormat>)
+                .with_file_extension("")
+                .with_table_partition_cols(partition_cols),
+            &table_path,
+            "*.orc",
+        );
         let listing = ListingTable::try_new(
             ListingTableConfig::new(table_path.clone())
                 .with_listing_options(options)
@@ -3587,7 +3828,7 @@ mod tests {
     #[tokio::test]
     async fn format_selected_listing_scan_errors_when_a_matching_object_lacks_hive_partition_segments()
      {
-        let ctx = SessionContext::new();
+        let ctx = listing_only_session();
         let store = Arc::new(TestObjectStore::new(vec![
             create_meta("table/dt=2024-01-01/good.orc", 1, 10),
             create_meta("table/late.orc", 2, 10),
@@ -3610,18 +3851,24 @@ mod tests {
 
     #[tokio::test]
     async fn format_selected_listing_files_include_well_formed_hive_objects_and_skip_markers() {
-        let ctx = SessionContext::new();
+        let ctx = listing_only_session();
         let store = Arc::new(TestObjectStore::new(vec![
             create_meta("table/dt=2024-01-01/good.orc", 1, 10),
             create_meta("table/_SUCCESS", 2, 0),
-            create_meta("table/notes.txt", 3, 10),
+            create_meta("table/_committed_000", 3, 10),
+            create_meta("table/notes.txt", 4, 10),
         ])) as Arc<dyn ObjectStore>;
         let provider = format_selected_hive_listing_table(&ctx, store, hive_dt_partition_cols());
 
-        let files = provider
-            .format_selected_listing_files(&ctx.state())
+        let files: Vec<PartitionedFile> = provider
+            .inner
+            .list_files_for_scan(&ctx.state(), &[], None)
             .await
-            .expect("well-formed hive object must be listed");
+            .expect("well-formed hive object must be listed")
+            .file_groups
+            .into_iter()
+            .flat_map(FileGroup::into_inner)
+            .collect();
         assert_eq!(
             files.len(),
             1,
@@ -3634,6 +3881,268 @@ mod tests {
         assert_eq!(
             files[0].partition_values,
             vec![ScalarValue::Utf8(Some("2024-01-01".to_string()))]
+        );
+    }
+
+    /// Registers the hive-partitioned Parquet dataset at `table_url` under `name`
+    /// through the production `create_listing_table` path.
+    async fn register_parquet_listing(
+        ctx: &SessionContext,
+        name: &str,
+        table_url: &str,
+        file_extension: Option<&str>,
+    ) {
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "parquet".to_string());
+        if let Some(file_extension) = file_extension {
+            params.insert("file_extension".to_string(), file_extension.to_string());
+        }
+        let (connector, mut dataset) = setup_connector(table_url.to_string(), params);
+        dataset
+            .params
+            .insert("hive_partitioning_enabled".to_string(), "true".to_string());
+        let url = Url::parse(table_url).expect("table url");
+        let (Some(file_format), extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("parquet listing format")
+        else {
+            panic!("expected a parquet file format");
+        };
+        let provider = connector
+            .create_listing_table(&dataset, &url, &extension, file_format)
+            .await
+            .expect("create_listing_table production path");
+        ctx.register_table(name, provider)
+            .expect("register listing table");
+    }
+
+    async fn physical_plan_with_statistics(ctx: &SessionContext, sql: &str) -> String {
+        let plan = ctx
+            .sql(sql)
+            .await
+            .expect("plan sql")
+            .create_physical_plan()
+            .await
+            .expect("physical plan");
+        datafusion::physical_plan::displayable(plan.as_ref())
+            .set_show_statistics(true)
+            .indent(true)
+            .to_string()
+    }
+
+    async fn pretty_rows(ctx: &SessionContext, sql: &str) -> String {
+        let batches = ctx
+            .sql(sql)
+            .await
+            .expect("plan sql")
+            .collect()
+            .await
+            .expect("collect rows");
+        arrow::util::pretty::pretty_format_batches(&batches)
+            .expect("format rows")
+            .to_string()
+    }
+
+    /// Regression test for Glue TPC-H plans that switched every `HashJoinExec`
+    /// from `CollectLeft` to `Partitioned`. Glue lists Parquet and ORC tables
+    /// with `file_extension: '*'`, and that format-selected listing scanned its
+    /// files without statistics, in one file group, and without partition
+    /// pruning, so join selection had no sizes to choose a broadcast build side
+    /// from. Over the same data files it must plan exactly as the suffix
+    /// listing does, statistics included, and return the same rows.
+    #[tokio::test]
+    async fn format_selected_parquet_plans_and_answers_like_the_suffix_listing() {
+        use datafusion::parquet::arrow::ArrowWriter;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        for (partition, first_id) in [("1", 0_i64), ("2", 100), ("3", 200)] {
+            let partition_dir = dir.path().join(format!("p={partition}"));
+            std::fs::create_dir_all(&partition_dir).expect("create partition directory");
+            let batch = RecordBatch::try_new(
+                Arc::clone(&file_schema),
+                vec![
+                    Arc::new(arrow::array::Int64Array::from_iter_values(
+                        first_id..first_id + 10,
+                    )),
+                    Arc::new(arrow::array::Int64Array::from_iter_values(
+                        (0..10).map(|i| i * 2),
+                    )),
+                ],
+            )
+            .expect("valid batch");
+            let mut writer = ArrowWriter::try_new(
+                std::fs::File::create(partition_dir.join("part-0.parquet"))
+                    .expect("create parquet"),
+                Arc::clone(&file_schema),
+                None,
+            )
+            .expect("parquet writer");
+            writer.write(&batch).expect("write parquet");
+            writer.close().expect("close parquet");
+            // A checksum a Hadoop writer leaves beside its output. Neither listing reads it.
+            std::fs::write(partition_dir.join(".part-0.parquet.crc"), b"crc")
+                .expect("write checksum");
+        }
+        std::fs::write(dir.path().join("_SUCCESS"), b"ok").expect("write _SUCCESS marker");
+
+        let table_url = format!("file://{}/", dir.path().display());
+        let ctx = SessionContext::new_with_config(
+            datafusion::prelude::SessionConfig::new().with_target_partitions(4),
+        );
+        register_parquet_listing(&ctx, "suffix", &table_url, None).await;
+        register_parquet_listing(&ctx, "format_selected", &table_url, Some("*")).await;
+
+        let join = "SELECT a.p, count(*) AS n, sum(b.v) AS s FROM {t} a JOIN {t} b ON a.id = b.id GROUP BY a.p ORDER BY a.p";
+        let pruned = "SELECT count(*) AS n, sum(t.v) AS s FROM {t} AS t WHERE t.p = 2";
+        for query in [join, pruned] {
+            let suffix_plan =
+                physical_plan_with_statistics(&ctx, &query.replace("{t}", "suffix")).await;
+            let format_selected_plan =
+                physical_plan_with_statistics(&ctx, &query.replace("{t}", "format_selected")).await;
+            assert_eq!(
+                format_selected_plan, suffix_plan,
+                "the format-selected listing must plan like the suffix listing for {query}"
+            );
+            assert_eq!(
+                pretty_rows(&ctx, &query.replace("{t}", "format_selected")).await,
+                pretty_rows(&ctx, &query.replace("{t}", "suffix")).await,
+                "the format-selected listing must return the suffix listing's rows for {query}"
+            );
+        }
+
+        // The comparison above is only as strong as what the suffix plan shows.
+        let join_plan = physical_plan_with_statistics(&ctx, &join.replace("{t}", "suffix")).await;
+        assert!(
+            join_plan.contains("HashJoinExec: mode=CollectLeft"),
+            "join selection must broadcast from the scans' statistics:\n{join_plan}"
+        );
+        assert!(
+            join_plan.contains("statistics=[Rows=Exact(30)"),
+            "the scan must carry the files' exact row count:\n{join_plan}"
+        );
+        let pruned_plan =
+            physical_plan_with_statistics(&ctx, &pruned.replace("{t}", "suffix")).await;
+        assert!(
+            pruned_plan.contains("p=2/part-0.parquet")
+                && !pruned_plan.contains("p=1/")
+                && !pruned_plan.contains("p=3/"),
+            "the partition filter must prune the listing to `p=2`:\n{pruned_plan}"
+        );
+        assert_eq!(
+            pretty_rows(&ctx, &join.replace("{t}", "format_selected")).await,
+            [
+                "+---+----+----+",
+                "| p | n  | s  |",
+                "+---+----+----+",
+                "| 1 | 10 | 90 |",
+                "| 2 | 10 | 90 |",
+                "| 3 | 10 | 90 |",
+                "+---+----+----+",
+            ]
+            .join("\n")
+        );
+        assert_eq!(
+            pretty_rows(&ctx, &pruned.replace("{t}", "format_selected")).await,
+            [
+                "+----+----+",
+                "| n  | s  |",
+                "+----+----+",
+                "| 10 | 90 |",
+                "+----+----+"
+            ]
+            .join("\n")
+        );
+    }
+
+    /// An insert into a format-selected listing writes `<write id>_<n>.parquet`
+    /// files, which its later scans read back exactly as the suffix listing's do.
+    #[tokio::test]
+    async fn format_selected_parquet_listing_reads_back_what_an_insert_writes() {
+        use datafusion::parquet::arrow::ArrowWriter;
+
+        let file_schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int64, false),
+            Field::new("v", DataType::Int64, false),
+        ]));
+        let ctx = SessionContext::new();
+        let mut dirs = Vec::new();
+        for (name, file_extension) in [("suffix", None), ("format_selected", Some("*"))] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let batch = RecordBatch::try_new(
+                Arc::clone(&file_schema),
+                vec![
+                    Arc::new(arrow::array::Int64Array::from(vec![1, 2, 3])),
+                    Arc::new(arrow::array::Int64Array::from(vec![10, 20, 30])),
+                ],
+            )
+            .expect("valid batch");
+            let mut writer = ArrowWriter::try_new(
+                std::fs::File::create(dir.path().join("part-0.parquet")).expect("create parquet"),
+                Arc::clone(&file_schema),
+                None,
+            )
+            .expect("parquet writer");
+            writer.write(&batch).expect("write parquet");
+            writer.close().expect("close parquet");
+            std::fs::write(dir.path().join("_SUCCESS"), b"ok").expect("write _SUCCESS marker");
+            let table_url = format!("file://{}/", dir.path().display());
+            register_parquet_listing(&ctx, name, &table_url, file_extension).await;
+            dirs.push(dir);
+        }
+
+        for table in ["suffix", "format_selected"] {
+            assert_eq!(
+                pretty_rows(
+                    &ctx,
+                    &format!("INSERT INTO {table} VALUES (4, 40), (5, 50)")
+                )
+                .await,
+                [
+                    "+-------+",
+                    "| count |",
+                    "+-------+",
+                    "| 2     |",
+                    "+-------+"
+                ]
+                .join("\n"),
+                "the insert into {table} writes two rows"
+            );
+        }
+        let read_back = "SELECT count(*) AS n, sum(t.id) AS ids, sum(t.v) AS vs FROM {t} AS t";
+        assert_eq!(
+            pretty_rows(&ctx, &read_back.replace("{t}", "format_selected")).await,
+            pretty_rows(&ctx, &read_back.replace("{t}", "suffix")).await,
+        );
+        assert_eq!(
+            pretty_rows(&ctx, &read_back.replace("{t}", "format_selected")).await,
+            [
+                "+---+-----+-----+",
+                "| n | ids | vs  |",
+                "+---+-----+-----+",
+                "| 5 | 15  | 150 |",
+                "+---+-----+-----+",
+            ]
+            .join("\n")
+        );
+        let written: Vec<String> = std::fs::read_dir(dirs[1].path())
+            .expect("list the format-selected table")
+            .map(|entry| {
+                entry
+                    .expect("directory entry")
+                    .file_name()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|name| name != "part-0.parquet" && name != "_SUCCESS")
+            .collect();
+        assert!(
+            written.len() == 1 && written[0].ends_with("_0.parquet"),
+            "the insert writes one `<write id>_0.parquet` file: {written:?}"
         );
     }
 
@@ -3994,6 +4503,353 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn test_location_pushdown_stays_inexact_for_other_metadata_filters() {
+        use datafusion_expr::{col, lit};
+        // `scan`'s head()-based fast path only ever applies the `_location`
+        // predicates it can extract — it never evaluates any other filter. A
+        // `_last_modified` predicate combined with a `_location` predicate must
+        // stay `Inexact` so DataFusion keeps re-applying it above the scan;
+        // otherwise the fast path silently drops it (regression test for
+        // spiceai#14264: mixed `_location` + metadata-column predicates
+        // returning wrong rows once the metadata predicate is reported `Exact`
+        // with no residual filter re-applying it).
+        let ctx = SessionContext::new();
+        let no_list_store = Arc::new(NoListObjectStore::new(create_meta(
+            "prefix/file.parquet",
+            100,
+            128,
+        )));
+        let store_url = Url::parse("s3://bucket").expect("store url");
+        ctx.runtime_env().register_object_store(
+            &store_url,
+            Arc::clone(&no_list_store) as Arc<dyn ObjectStore>,
+        );
+
+        let table_path =
+            ListingTableUrl::parse("s3://bucket/prefix/").expect("to parse listing table url");
+        let file_format = Arc::new(ParquetFormat::default());
+        let options = ListingOptions::new(file_format)
+            .with_file_extension(".parquet")
+            .with_table_partition_cols(vec![]);
+
+        let file_schema = Arc::new(Schema::new(vec![
+            Field::new("value", arrow_schema::DataType::Utf8, true),
+            MetadataColumn::Location(Some("s3://bucket/".into())).field(),
+            MetadataColumn::LastModified.field(),
+        ]));
+
+        let listing = ListingTable::try_new(
+            ListingTableConfig::new(table_path.clone())
+                .with_listing_options(options)
+                .with_schema(Arc::clone(&file_schema)),
+        )
+        .expect("create listing table");
+
+        let provider = LocationPruningListingTable::new(
+            Arc::new(listing),
+            ctx.runtime_env()
+                .object_store(&table_path)
+                .expect("object store"),
+            table_path,
+            file_schema,
+            ".parquet",
+        );
+
+        let location_filter = col("_location").eq(lit("s3://bucket/prefix/file.parquet"));
+        let last_modified_filter = col("_last_modified").gt(lit(
+            ScalarValue::TimestampMicrosecond(Some(0), Some("UTC".into())),
+        ));
+
+        let pushdown = provider
+            .supports_filters_pushdown(&[&location_filter, &last_modified_filter])
+            .expect("supports_filters_pushdown");
+
+        assert_eq!(
+            pushdown[1],
+            datafusion_expr::TableProviderFilterPushDown::Inexact,
+            "a filter on any column other than _location must stay Inexact, since \
+             the location fast path never evaluates it"
+        );
+    }
+
+    /// A partition directory holding only an empty file contributes no row, so
+    /// `MAX` of the partition column must not be that partition's value. With
+    /// exact row counts collected, `MIN`/`MAX` of a partition column is answered
+    /// from the listing's statistics, and the `spiceai/datafusion` fork gives a
+    /// file that holds no rows no bounds for its partition columns
+    /// (spiceai/datafusion#251).
+    #[tokio::test]
+    async fn max_of_a_partition_column_skips_a_partition_holding_only_an_empty_file() {
+        use datafusion::parquet::arrow::ArrowWriter;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        for (partition, rows) in [("1", 5_i64), ("2", 5), ("3", 5), ("99", 0)] {
+            let partition_dir = dir.path().join(format!("p={partition}"));
+            std::fs::create_dir_all(&partition_dir).expect("create partition directory");
+            let batch = RecordBatch::try_new(
+                Arc::clone(&file_schema),
+                vec![Arc::new(arrow::array::Int64Array::from_iter_values(
+                    0..rows,
+                ))],
+            )
+            .expect("valid batch");
+            let mut writer = ArrowWriter::try_new(
+                std::fs::File::create(partition_dir.join("f.parquet")).expect("create parquet"),
+                Arc::clone(&file_schema),
+                None,
+            )
+            .expect("parquet writer");
+            writer.write(&batch).expect("write parquet");
+            writer.close().expect("close parquet");
+        }
+
+        let table_url = format!("file://{}/", dir.path().display());
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "parquet".to_string());
+        let (connector, mut dataset) = setup_connector(table_url.clone(), params);
+        dataset
+            .params
+            .insert("hive_partitioning_enabled".to_string(), "true".to_string());
+
+        let url = Url::parse(&table_url).expect("table url");
+        let (Some(file_format), extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("parquet listing format")
+        else {
+            panic!("expected a parquet file format");
+        };
+        let provider = connector
+            .create_listing_table(&dataset, &url, &extension, file_format)
+            .await
+            .expect("create_listing_table production path");
+
+        let ctx = SessionContext::new();
+        ctx.register_table("hive", provider)
+            .expect("register listing table");
+
+        // The listing carries exact row counts, so an aggregate the statistics
+        // can answer is answered from them; otherwise this test would pass
+        // without ever reaching the bounds it is about.
+        let count_plan = ctx
+            .sql("SELECT count(*) FROM hive")
+            .await
+            .expect("plan count")
+            .create_physical_plan()
+            .await
+            .expect("physical count plan");
+        let count_plan = datafusion::physical_plan::displayable(count_plan.as_ref())
+            .indent(true)
+            .to_string();
+        assert!(
+            count_plan.contains("PlaceholderRowExec"),
+            "precondition: count(*) must be answered from exact statistics:\n{count_plan}"
+        );
+
+        let batches = ctx
+            .sql("SELECT min(p) AS lo, max(p) AS hi FROM hive")
+            .await
+            .expect("plan min/max")
+            .collect()
+            .await
+            .expect("run min/max");
+        let rendered: Vec<String> = ["lo", "hi"]
+            .iter()
+            .map(|name| {
+                let column = batches[0].column_by_name(name).expect("min/max column");
+                arrow::util::display::array_value_to_string(column, 0).expect("value renders")
+            })
+            .collect();
+        assert_eq!(
+            rendered,
+            ["1", "3"],
+            "partition 99 holds no rows, so it is neither the minimum nor the maximum"
+        );
+    }
+
+    /// `ListingTable` prunes the listing by a predicate on a metadata column
+    /// before it opens a file, and reports that predicate `Exact`
+    /// (spiceai/datafusion#240): with `_size < 50` only the small files are
+    /// scanned.
+    #[tokio::test]
+    async fn listing_table_prunes_files_by_a_metadata_column_predicate() {
+        use datafusion::datasource::file_format::json::JsonFormat;
+        use datafusion::datasource::physical_plan::FileScanConfig;
+        use datafusion::datasource::source::DataSourceExec;
+        use datafusion::logical_expr::TableProviderFilterPushDown;
+        use datafusion::physical_plan::ExecutionPlan;
+        use datafusion_expr::{col, lit};
+        use std::fmt::Write;
+
+        fn scanned_files(plan: &Arc<dyn ExecutionPlan>) -> usize {
+            if let Some(scan) = plan.downcast_ref::<DataSourceExec>()
+                && let Some(config) = scan.data_source().downcast_ref::<FileScanConfig>()
+            {
+                return config
+                    .file_groups
+                    .iter()
+                    .map(datafusion_datasource::file_groups::FileGroup::len)
+                    .sum();
+            }
+            plan.children()
+                .iter()
+                .map(|child| scanned_files(child))
+                .sum()
+        }
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Three one-row files and one fifty-row file, told apart by `_size`.
+        for (name, rows) in [("a", 1), ("b", 1), ("c", 1), ("d", 50)] {
+            let content = (0..rows).fold(String::new(), |mut content, n| {
+                writeln!(content, "{{\"id\": {n}}}").expect("write to a String");
+                content
+            });
+            std::fs::write(dir.path().join(format!("{name}.json")), content)
+                .expect("write json file");
+        }
+
+        let ctx = SessionContext::new();
+        let options = ListingOptions::new(Arc::new(JsonFormat::default()))
+            .with_file_extension(".json")
+            .with_metadata_cols(vec![datafusion_datasource::metadata::MetadataColumn::Size]);
+        let config = ListingTableConfig::new(
+            ListingTableUrl::parse(format!("file://{}/", dir.path().display()))
+                .expect("listing url"),
+        )
+        .with_listing_options(options)
+        .infer_schema(&ctx.state())
+        .await
+        .expect("infer schema");
+        let table = Arc::new(ListingTable::try_new(config).expect("listing table"));
+
+        let filter = col("_size").lt(lit(50_u64));
+        assert_eq!(
+            table
+                .supports_filters_pushdown(&[&filter])
+                .expect("filter pushdown"),
+            vec![TableProviderFilterPushDown::Exact],
+            "a predicate on a metadata column is decided per file, so the listing answers it exactly"
+        );
+
+        ctx.register_table("t", table)
+            .expect("register listing table");
+        let plan = ctx
+            .table("t")
+            .await
+            .expect("open table")
+            .filter(filter)
+            .expect("apply `_size <` filter")
+            .select_columns(&["id"])
+            .expect("project id")
+            .create_physical_plan()
+            .await
+            .expect("physical plan");
+        assert_eq!(
+            scanned_files(&plan),
+            3,
+            "the fifty-row file must be pruned from the listing:\n{}",
+            datafusion::physical_plan::displayable(plan.as_ref()).indent(true)
+        );
+    }
+
+    /// A `_location` predicate sends `scan` down its fast path, which opens the
+    /// named objects and applies no other predicate, while the inner listing
+    /// reports a metadata-column predicate `Exact` (spiceai/datafusion#240). A
+    /// `_size` predicate beside `_location` must still remove the rows of the
+    /// file it excludes, through the table `create_listing_table` builds.
+    #[tokio::test]
+    async fn location_fast_path_keeps_a_size_predicate_beside_it() {
+        use datafusion::parquet::arrow::ArrowWriter;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let file_schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let batch = RecordBatch::try_new(
+            Arc::clone(&file_schema),
+            vec![Arc::new(arrow::array::Int64Array::from(vec![1, 2, 3]))],
+        )
+        .expect("valid batch");
+        let parquet_path = dir.path().join("data.parquet");
+        let mut writer = ArrowWriter::try_new(
+            std::fs::File::create(&parquet_path).expect("create parquet"),
+            Arc::clone(&file_schema),
+            None,
+        )
+        .expect("parquet writer");
+        writer.write(&batch).expect("write parquet");
+        writer.close().expect("close parquet");
+        let file_size = std::fs::metadata(&parquet_path)
+            .expect("parquet file metadata")
+            .len();
+        assert!(
+            file_size > 50,
+            "precondition: the file must be larger than the `_size` bound, got {file_size} bytes"
+        );
+
+        let table_url = Url::from_directory_path(dir.path())
+            .expect("directory url")
+            .to_string();
+        let mut params = HashMap::new();
+        params.insert("file_format".to_string(), "parquet".to_string());
+        let (connector, mut dataset) = setup_connector(table_url.clone(), params);
+        dataset.metadata = HashMap::from([
+            (
+                MetadataColumn::Location(None).name().to_string(),
+                "enabled".to_string(),
+            ),
+            (
+                MetadataColumn::Size.name().to_string(),
+                "enabled".to_string(),
+            ),
+        ]);
+
+        let url = Url::parse(&table_url).expect("table url");
+        let (Some(file_format), extension) = connector
+            .get_file_format_and_extension(&dataset)
+            .await
+            .expect("parquet listing format")
+        else {
+            panic!("expected a parquet file format");
+        };
+        let provider = connector
+            .create_listing_table(&dataset, &url, &extension, file_format)
+            .await
+            .expect("create_listing_table production path");
+
+        let ctx = SessionContext::new();
+        ctx.register_table("t", provider)
+            .expect("register listing table");
+
+        let location = Url::from_file_path(&parquet_path)
+            .expect("file url")
+            .to_string();
+        let rows = async |predicate: &str| -> usize {
+            let sql = format!("SELECT id FROM t WHERE _location = '{location}'{predicate}");
+            ctx.sql(&sql)
+                .await
+                .expect("plan query")
+                .collect()
+                .await
+                .expect("run query")
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum()
+        };
+
+        assert_eq!(
+            rows("").await,
+            3,
+            "precondition: the `_location` predicate alone selects the file"
+        );
+        assert_eq!(rows(" AND _size > 50").await, 3);
+        assert_eq!(
+            rows(" AND _size < 50").await,
+            0,
+            "a `_size` predicate the file does not satisfy must remove its rows"
+        );
+    }
+
     /// Location predicates used to warn and skip a matching object whose Hive
     /// path could not be parsed, which is the same silent-omit as the
     /// format-selected listing scan.
@@ -4257,30 +5113,59 @@ mod tests {
 
     #[tokio::test]
     async fn test_listing_table_metadata_columns_are_applied() {
-        let mut dataset = DatasetSpec::new("s3://bucket/prefix/", TableReference::bare("test"));
-        dataset.metadata = HashMap::from([(
-            MetadataColumn::Location(None).name().to_string(),
-            "enabled".to_string(),
-        )]);
+        use datafusion_datasource::metadata::MetadataColumn as ListingMetadataColumn;
 
-        let options =
-            ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension(".parquet");
+        let table_url = Url::parse("s3://bucket/prefix/").expect("parse table url");
         let schema = Schema::new(vec![Field::new(
             "compression",
             arrow_schema::DataType::Utf8,
             true,
         )]);
+        let listing_options = || {
+            ListingOptions::new(Arc::new(ParquetFormat::default())).with_file_extension(".parquet")
+        };
 
-        let result = add_metadata_columns_if_required(
-            options,
-            &Url::parse("s3://bucket/prefix/").expect("parse table url"),
-            &schema,
-            &dataset,
+        let mut dataset = DatasetSpec::new("s3://bucket/prefix/", TableReference::bare("test"));
+        dataset.metadata = HashMap::from([(
+            MetadataColumn::Location(None).name().to_string(),
+            "enabled".to_string(),
+        )]);
+        let result =
+            add_metadata_columns_if_required(listing_options(), &table_url, &schema, &dataset);
+        // `_location` values are built from the bucket-level prefix, not the
+        // table path.
+        assert_eq!(
+            result.metadata_cols,
+            vec![ListingMetadataColumn::Location(Some(Arc::from(
+                "s3://bucket/"
+            )))]
         );
 
-        assert!(
-            !result.metadata_cols.is_empty(),
-            "metadata columns should be set on listing options"
+        // Every enabled column is forwarded as its DataFusion counterpart, in
+        // a fixed order.
+        dataset.metadata = HashMap::from([
+            (
+                MetadataColumn::LastModified.name().to_string(),
+                "enabled".to_string(),
+            ),
+            (
+                MetadataColumn::Location(None).name().to_string(),
+                "enabled".to_string(),
+            ),
+            (
+                MetadataColumn::Size.name().to_string(),
+                "enabled".to_string(),
+            ),
+        ]);
+        let result =
+            add_metadata_columns_if_required(listing_options(), &table_url, &schema, &dataset);
+        assert_eq!(
+            result.metadata_cols,
+            vec![
+                ListingMetadataColumn::LastModified,
+                ListingMetadataColumn::Location(Some(Arc::from("s3://bucket/"))),
+                ListingMetadataColumn::Size,
+            ]
         );
     }
 
@@ -4308,7 +5193,24 @@ mod tests {
         )
         .await;
 
-        result.expect_err("should error on no matching extension");
+        let err = result.expect_err("should error on no matching extension");
+        let DataConnectorError::InvalidConfigurationNoSource {
+            dataconnector,
+            message,
+            ..
+        } = &err
+        else {
+            panic!("an extension mismatch must be a configuration error, got: {err:?}");
+        };
+        assert_eq!(dataconnector, "TestListingConnector");
+        assert_eq!(
+            message,
+            "Failed to find any files matching the extension '.csv'. Is your `file_format` parameter correct? Spice found the following file extensions: '.parquet'. For details, visit: https://spiceai.org/docs/components/data-connectors#object-store-file-formats"
+        );
+        assert!(
+            !err.is_retriable(),
+            "files that are present but none match `file_format` is a permanent configuration error, not a wait-for-data retry"
+        );
     }
 
     #[tokio::test]
@@ -4796,6 +5698,10 @@ mod tests {
     /// Azure Blob Storage does not serve suffix ranges, so a reader that falls back to
     /// one cannot read Parquet from ABFS at all.
     #[tokio::test]
+    #[expect(
+        deprecated,
+        reason = "guards the Spice patches to arrow-rs's `ParquetObjectReader`, which is deprecated upstream but still carries them (docs/dev/fork_patches.md)"
+    )]
     async fn a_versioned_parquet_read_pins_every_request_to_one_object_version() {
         use datafusion::parquet::arrow::ArrowWriter;
         use datafusion::parquet::arrow::async_reader::{
@@ -5062,6 +5968,10 @@ mod tests {
     /// `Version` pin that only sends `version=` is then a no-op; every request
     /// has to carry `If-Match` instead, or a replacement is read as a mixture.
     #[tokio::test]
+    #[expect(
+        deprecated,
+        reason = "guards the Spice patches to arrow-rs's `ParquetObjectReader`, which is deprecated upstream but still carries them (docs/dev/fork_patches.md)"
+    )]
     async fn a_versioned_parquet_read_pins_by_etag_when_the_listing_has_no_version_id() {
         use datafusion::parquet::arrow::ArrowWriter;
         use datafusion::parquet::arrow::async_reader::{
@@ -5235,6 +6145,451 @@ mod tests {
             options: object_store::CopyOptions,
         ) -> object_store::Result<()> {
             self.inner.copy_opts(from, to, options).await
+        }
+    }
+
+    /// Regression matrix for the object-store request pattern of the `_location`
+    /// fast path and the metadata-column prune (spiceai/spiceai#14264):
+    ///
+    /// | # | predicate                                  | LIST | opens the file? | residual `FilterExec` |
+    /// |---|--------------------------------------------|------|-----------------|---------------------|
+    /// | 1 | `_location = X`                            | no   | yes             | no                  |
+    /// | 2 | `_location = X AND _last_modified > W`     | no   | only if it passes W | no              |
+    /// | 3 | `_location = X AND other_col = 'foo'`      | no   | yes             | yes (`other_col`)   |
+    /// | 4 | `_last_modified > W`                       | yes  | survivors only  | no                  |
+    /// | 5 | `_last_modified > W AND other_col = 'foo'` | yes  | survivors only  | yes (`other_col`)   |
+    ///
+    /// Asserted at plan time (`create_physical_plan`, as the other fast-path tests do):
+    /// a pruned scan becomes an `EmptyExec` (the object is never opened), and a `_size`/
+    /// `_last_modified`/`_location` predicate carries no residual `FilterExec` while a data
+    /// column does. `MatrixStore` panics if the fast path ever lists.
+    mod metadata_prune_matrix {
+        use super::*;
+        use datafusion::physical_plan::displayable;
+        use datafusion_datasource::metadata::MetadataColumn as DfMeta;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        /// Serves a fixed set of controlled `ObjectMeta` and counts list/head requests.
+        /// With `forbid_list`, any listing panics — proving the `_location` fast path
+        /// never lists. Only `HEAD`s occur during `create_physical_plan`; an actual
+        /// object read (a non-head GET) is an execution-time step the plan-level tests
+        /// never trigger, so it is refused here.
+        #[derive(Debug)]
+        struct MatrixStore {
+            metas: Vec<ObjectMeta>,
+            forbid_list: bool,
+            list_calls: AtomicUsize,
+            head_calls: AtomicUsize,
+        }
+
+        impl MatrixStore {
+            fn new(metas: Vec<ObjectMeta>, forbid_list: bool) -> Arc<Self> {
+                Arc::new(Self {
+                    metas,
+                    forbid_list,
+                    list_calls: AtomicUsize::new(0),
+                    head_calls: AtomicUsize::new(0),
+                })
+            }
+            fn lists(&self) -> usize {
+                self.list_calls.load(Ordering::SeqCst)
+            }
+            fn heads(&self) -> usize {
+                self.head_calls.load(Ordering::SeqCst)
+            }
+        }
+
+        impl std::fmt::Display for MatrixStore {
+            fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                write!(f, "MatrixStore")
+            }
+        }
+
+        #[async_trait]
+        impl ObjectStore for MatrixStore {
+            fn list(
+                &self,
+                prefix: Option<&Path>,
+            ) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+                assert!(
+                    !self.forbid_list,
+                    "list must not be called on the _location fast path"
+                );
+                self.list_calls.fetch_add(1, Ordering::SeqCst);
+                let prefix = prefix.cloned();
+                #[expect(
+                    clippy::needless_collect,
+                    reason = "the returned stream is 'static and cannot borrow self"
+                )]
+                let metas: Vec<_> = self
+                    .metas
+                    .iter()
+                    .filter(|m| {
+                        prefix
+                            .as_ref()
+                            .is_none_or(|p| m.location.as_ref().starts_with(p.as_ref()))
+                    })
+                    .cloned()
+                    .collect();
+                stream::iter(metas.into_iter().map(Ok)).boxed()
+            }
+
+            async fn put_opts(
+                &self,
+                _location: &Path,
+                _payload: object_store::PutPayload,
+                _opts: object_store::PutOptions,
+            ) -> object_store::Result<object_store::PutResult> {
+                unimplemented!()
+            }
+
+            async fn put_multipart_opts(
+                &self,
+                _location: &Path,
+                _opts: object_store::PutMultipartOptions,
+            ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+                unimplemented!()
+            }
+
+            async fn get_opts(
+                &self,
+                location: &Path,
+                options: object_store::GetOptions,
+            ) -> object_store::Result<object_store::GetResult> {
+                if !options.head {
+                    return Err(object_store::Error::NotImplemented {
+                        operation: "non-head get".to_string(),
+                        implementer: "MatrixStore".to_string(),
+                    });
+                }
+                self.head_calls.fetch_add(1, Ordering::SeqCst);
+                let meta = self
+                    .metas
+                    .iter()
+                    .find(|m| &m.location == location)
+                    .cloned()
+                    .expect("head() for a controlled object");
+                Ok(object_store::GetResult {
+                    payload: object_store::GetResultPayload::Stream(Box::pin(
+                        futures::stream::empty(),
+                    )),
+                    attributes: object_store::Attributes::default(),
+                    range: 0..0,
+                    meta,
+                })
+            }
+
+            fn delete_stream(
+                &self,
+                _locations: BoxStream<'static, object_store::Result<Path>>,
+            ) -> BoxStream<'static, object_store::Result<Path>> {
+                unimplemented!()
+            }
+
+            async fn list_with_delimiter(
+                &self,
+                _prefix: Option<&Path>,
+            ) -> object_store::Result<object_store::ListResult> {
+                unimplemented!()
+            }
+
+            async fn copy_opts(
+                &self,
+                _from: &Path,
+                _to: &Path,
+                _options: object_store::CopyOptions,
+            ) -> object_store::Result<()> {
+                unimplemented!()
+            }
+        }
+
+        const OLD_LOC: &str = "s3://bucket/prefix/old.csv";
+
+        // `old.csv` mtime = 2001-09-09; `new.csv` mtime = 2033-05-18.
+        fn old_meta() -> ObjectMeta {
+            create_meta("prefix/old.csv", 1_000_000_000, 10)
+        }
+        fn new_meta() -> ObjectMeta {
+            create_meta("prefix/new.csv", 2_000_000_000, 20)
+        }
+
+        fn provider(ctx: &SessionContext, store: &Arc<MatrixStore>) -> LocationPruningListingTable {
+            let store_url = Url::parse("s3://bucket").expect("store url");
+            ctx.runtime_env()
+                .register_object_store(&store_url, Arc::clone(store) as Arc<dyn ObjectStore>);
+
+            let table_path = ListingTableUrl::parse("s3://bucket/prefix/").expect("listing url");
+            let file_schema = Arc::new(Schema::new(vec![Field::new(
+                "other_col",
+                DataType::Utf8,
+                true,
+            )]));
+            let options =
+                ListingOptions::new(Arc::new(CsvFormat::default()) as Arc<dyn FileFormat>)
+                    .with_file_extension(".csv")
+                    .with_table_partition_cols(vec![])
+                    .with_metadata_cols(vec![
+                        DfMeta::Location(Some("s3://bucket/".into())),
+                        DfMeta::LastModified,
+                        DfMeta::Size,
+                    ]);
+            let listing = ListingTable::try_new(
+                ListingTableConfig::new(table_path.clone())
+                    .with_listing_options(options)
+                    .with_schema(Arc::clone(&file_schema)),
+            )
+            .expect("listing table");
+            LocationPruningListingTable::new(
+                Arc::new(listing),
+                Arc::clone(store) as Arc<dyn ObjectStore>,
+                table_path,
+                file_schema,
+                ".csv",
+            )
+        }
+
+        /// Plan `sql` against a freshly registered provider and return the indented
+        /// physical plan string.
+        async fn plan_of(store: Arc<MatrixStore>, sql: &str) -> String {
+            let ctx = SessionContext::new_with_config(
+                datafusion::prelude::SessionConfig::new().with_collect_statistics(false),
+            );
+            ctx.register_table("t", Arc::new(provider(&ctx, &store)))
+                .expect("register table");
+            let plan = ctx
+                .sql(sql)
+                .await
+                .expect("build logical plan")
+                .create_physical_plan()
+                .await
+                .expect("build physical plan");
+            displayable(plan.as_ref()).indent(true).to_string()
+        }
+
+        // Case 1: `_location = X` — no LIST, opens the object, no residual filter.
+        #[tokio::test]
+        async fn case1_location_only_skips_listing_and_scans() {
+            let store = MatrixStore::new(vec![old_meta()], true);
+            let plan = plan_of(
+                Arc::clone(&store),
+                &format!("SELECT other_col FROM t WHERE _location = '{OLD_LOC}'"),
+            )
+            .await;
+            assert_eq!(store.lists(), 0, "fast path must not LIST");
+            assert!(store.heads() >= 1, "fast path HEADs the object");
+            assert!(
+                !plan.contains("EmptyExec"),
+                "the object is scanned, not pruned"
+            );
+            assert!(
+                !plan.contains("FilterExec"),
+                "a pure _location scan needs no residual filter"
+            );
+        }
+
+        // Case 2: `_location = X AND _last_modified > W` — no LIST; the object is pruned
+        // on its HEADed ObjectMeta (EmptyExec) when it fails W, and scanned when it passes.
+        #[tokio::test]
+        async fn case2_location_and_last_modified_prunes_before_opening() {
+            // old.csv (2001) fails `> 2020` → pruned to EmptyExec, never opened.
+            let store = MatrixStore::new(vec![old_meta()], true);
+            let plan = plan_of(
+                Arc::clone(&store),
+                &format!(
+                    "SELECT other_col FROM t \
+                     WHERE _location = '{OLD_LOC}' AND _last_modified > TIMESTAMP '2020-01-01T00:00:00Z'"
+                ),
+            )
+            .await;
+            assert_eq!(store.lists(), 0, "fast path must not LIST");
+            assert!(
+                store.heads() >= 1,
+                "the object is HEADed before it is pruned"
+            );
+            assert!(
+                plan.contains("EmptyExec"),
+                "a stale object is pruned before it is opened"
+            );
+            assert!(
+                !plan.contains("FilterExec"),
+                "_last_modified is applied by the prune, not a residual filter"
+            );
+        }
+
+        #[tokio::test]
+        async fn case2_location_and_last_modified_scans_when_it_passes() {
+            // old.csv (2001) passes `> 1990` → kept and scanned.
+            let store = MatrixStore::new(vec![old_meta()], true);
+            let plan = plan_of(
+                Arc::clone(&store),
+                &format!(
+                    "SELECT other_col FROM t \
+                     WHERE _location = '{OLD_LOC}' AND _last_modified > TIMESTAMP '1990-01-01T00:00:00Z'"
+                ),
+            )
+            .await;
+            assert_eq!(store.lists(), 0, "fast path must not LIST");
+            assert!(!plan.contains("EmptyExec"), "a passing object is scanned");
+            assert!(
+                !plan.contains("FilterExec"),
+                "_last_modified is applied by the prune, not a residual filter"
+            );
+        }
+
+        const NEW_LOC: &str = "s3://bucket/prefix/new.csv";
+
+        // Conjoined `_location` equalities naming different objects match nothing. The
+        // planner folds them to `false` before `scan`, which answers without listing.
+        #[tokio::test]
+        async fn case2b_conflicting_location_equalities_match_nothing() {
+            let store = MatrixStore::new(vec![old_meta(), new_meta()], true);
+            let plan = plan_of(
+                Arc::clone(&store),
+                &format!(
+                    "SELECT other_col FROM t WHERE _location = '{OLD_LOC}' AND _location = '{NEW_LOC}'"
+                ),
+            )
+            .await;
+            assert_eq!(store.lists(), 0, "fast path must not LIST");
+            assert_eq!(
+                store.heads(),
+                0,
+                "an unsatisfiable predicate opens no object"
+            );
+            assert!(
+                plan.contains("EmptyExec"),
+                "no object satisfies both equalities: {plan}"
+            );
+            assert!(!plan.contains("FilterExec"), "{plan}");
+        }
+
+        // An equality plus a `_location` predicate the extractor ignores (`LIKE`) must
+        // still enforce the `LIKE`.
+        #[tokio::test]
+        async fn case2c_location_equality_and_like_enforces_the_like() {
+            let store = MatrixStore::new(vec![old_meta()], true);
+            let plan = plan_of(
+                Arc::clone(&store),
+                &format!(
+                    "SELECT other_col FROM t WHERE _location = '{OLD_LOC}' AND _location LIKE '%/new.csv'"
+                ),
+            )
+            .await;
+            assert!(
+                plan.contains("EmptyExec"),
+                "the LIKE excludes old.csv: {plan}"
+            );
+            assert!(!plan.contains("FilterExec"), "{plan}");
+        }
+
+        // Overlapping `IN` lists keep only the shared object. The planner intersects the
+        // lists before `scan`, so only that object is head()ed.
+        #[tokio::test]
+        async fn case2d_overlapping_location_in_lists_keep_the_intersection() {
+            let store = MatrixStore::new(vec![old_meta(), new_meta()], true);
+            let plan = plan_of(
+                Arc::clone(&store),
+                &format!(
+                    "SELECT other_col FROM t WHERE _location IN ('{OLD_LOC}', '{NEW_LOC}') \
+                     AND _location IN ('{NEW_LOC}')"
+                ),
+            )
+            .await;
+            assert!(!plan.contains("EmptyExec"), "new.csv matches: {plan}");
+            assert!(plan.contains("new.csv"), "{plan}");
+            assert!(!plan.contains("old.csv"), "old.csv is pruned: {plan}");
+            assert_eq!(store.heads(), 1, "only the shared candidate is head()ed");
+        }
+
+        // Repeated literals must not scan the same object twice.
+        #[tokio::test]
+        async fn case2e_repeated_location_literals_head_the_object_once() {
+            for predicate in [
+                format!("_location = '{NEW_LOC}' AND _location = '{NEW_LOC}'"),
+                format!("_location IN ('{NEW_LOC}', '{NEW_LOC}')"),
+            ] {
+                let store = MatrixStore::new(vec![new_meta()], true);
+                let plan = plan_of(
+                    Arc::clone(&store),
+                    &format!("SELECT other_col FROM t WHERE {predicate}"),
+                )
+                .await;
+                assert!(!plan.contains("EmptyExec"), "new.csv matches: {plan}");
+                assert_eq!(store.heads(), 1, "`{predicate}` heads new.csv once");
+            }
+        }
+
+        // Case 3: `_location = X AND other_col = 'foo'` — no LIST, scans, and the data
+        // column stays a residual FilterExec above the scan.
+        #[tokio::test]
+        async fn case3_location_and_data_column_post_filters() {
+            let store = MatrixStore::new(vec![old_meta()], true);
+            let plan = plan_of(
+                Arc::clone(&store),
+                &format!(
+                    "SELECT other_col FROM t WHERE _location = '{OLD_LOC}' AND other_col = 'foo'"
+                ),
+            )
+            .await;
+            assert_eq!(store.lists(), 0, "fast path must not LIST");
+            assert!(!plan.contains("EmptyExec"), "the object is scanned");
+            assert!(
+                plan.contains("FilterExec"),
+                "a data column is applied as a residual filter"
+            );
+        }
+
+        // Case 4: `_last_modified > W` (no _location) — LISTs, prunes the listing on
+        // ObjectMeta, no residual filter.
+        #[tokio::test]
+        async fn case4_last_modified_only_lists_and_prunes() {
+            let store = MatrixStore::new(vec![old_meta(), new_meta()], false);
+            let plan = plan_of(
+                Arc::clone(&store),
+                "SELECT other_col FROM t WHERE _last_modified > TIMESTAMP '2020-01-01T00:00:00Z'",
+            )
+            .await;
+            assert!(store.lists() >= 1, "no _location predicate → must LIST");
+            // new.csv (2033) survives, old.csv (2001) is pruned; the scan is non-empty.
+            assert!(!plan.contains("EmptyExec"), "a surviving object is scanned");
+            assert!(
+                !plan.contains("FilterExec"),
+                "_last_modified is applied by the listing prune"
+            );
+        }
+
+        #[tokio::test]
+        async fn case4_last_modified_prunes_all_to_empty() {
+            let store = MatrixStore::new(vec![old_meta(), new_meta()], false);
+            let plan = plan_of(
+                Arc::clone(&store),
+                "SELECT other_col FROM t WHERE _last_modified > TIMESTAMP '2099-01-01T00:00:00Z'",
+            )
+            .await;
+            assert!(store.lists() >= 1, "no _location predicate → must LIST");
+            assert!(
+                plan.contains("EmptyExec"),
+                "both objects are pruned by the listing prune"
+            );
+        }
+
+        // Case 5: `_last_modified > W AND other_col = 'foo'` — LISTs, prunes the listing,
+        // and the data column stays a residual FilterExec.
+        #[tokio::test]
+        async fn case5_last_modified_and_data_column_lists_prunes_and_post_filters() {
+            let store = MatrixStore::new(vec![old_meta(), new_meta()], false);
+            let plan = plan_of(
+                Arc::clone(&store),
+                "SELECT other_col FROM t \
+                 WHERE _last_modified > TIMESTAMP '2020-01-01T00:00:00Z' AND other_col = 'foo'",
+            )
+            .await;
+            assert!(store.lists() >= 1, "no _location predicate → must LIST");
+            assert!(!plan.contains("EmptyExec"), "a surviving object is scanned");
+            assert!(
+                plan.contains("FilterExec"),
+                "a data column is applied as a residual filter"
+            );
         }
     }
 }

@@ -267,7 +267,8 @@ fn handle_unsupported_type(
 /// table stores the precision its source reports.
 ///
 /// Types Vortex has no encoding for (`Interval`, `Duration`, `FixedSizeBinary`,
-/// `Union`, `RunEndEncoded`) are handled according to `unsupported_type_action`
+/// `Union`), and `RunEndEncoded`, which Cayenne does not accept yet, are handled
+/// according to `unsupported_type_action`
 /// at the top level. Nested unsupported types error unless the action is `warn`,
 /// because schema-only string conversion or field removal would not preserve
 /// nested data correctly.
@@ -322,9 +323,8 @@ mod tests {
     use arrow_tools::type_rewrite::apply_rules;
     use datafusion_table_providers::UnsupportedTypeAction;
     use vortex::VortexSessionDefault;
-    use vortex::array::ArrayRef as VortexArrayRef;
     use vortex::array::VortexSessionExecute;
-    use vortex::arrow::{ArrowSessionExt, FromArrowArray};
+    use vortex::arrow::ArrowSessionExt;
     use vortex_session::VortexSession;
 
     use super::{
@@ -511,13 +511,22 @@ mod tests {
         let mut disagreements = Vec::new();
         for data_type in arrow_type_families() {
             let claimed = is_vortex_supported_type(&data_type);
+            let refused_by_policy = matches!(data_type, DataType::RunEndEncoded(..));
             match (claimed, vortex_can_encode(&session, &data_type)) {
                 (true, Err(why)) => disagreements.push(format!(
                     "{data_type} is listed as supported but Vortex cannot encode it: {why}"
                 )),
+                // Vortex stores run-end encoded columns, but accepting them widens what a
+                // Cayenne table can be created with, so it stays refused until that is a
+                // reviewed product change.
+                (false, Ok(())) if refused_by_policy => {}
                 (false, Ok(())) => disagreements.push(format!(
                     "{data_type} is listed as unsupported but Vortex encodes it, so Cayenne \
                      rejects a column it could store"
+                )),
+                (false, Err(_)) if refused_by_policy => disagreements.push(format!(
+                    "{data_type} is refused by policy as storable, but Vortex no longer \
+                     encodes it; list it with the types Vortex cannot encode"
                 )),
                 _ => {}
             }
@@ -533,7 +542,9 @@ mod tests {
     /// Round-trip an empty array of `data_type` through Vortex's Arrow conversions.
     fn vortex_can_encode(session: &VortexSession, data_type: &DataType) -> Result<(), String> {
         let empty = new_empty_array(data_type);
-        let array = VortexArrayRef::from_arrow(empty.as_ref(), true)
+        let array = session
+            .arrow()
+            .from_arrow_array(empty, true)
             .map_err(|e| format!("writing it fails: {e}"))?;
         session
             .arrow()
@@ -637,8 +648,22 @@ mod tests {
             DataType::Duration(TimeUnit::Second),
             false,
         )]);
-        transform_schema_for_vortex(&schema, UnsupportedTypeAction::Error)
+        let err = transform_schema_for_vortex(&schema, UnsupportedTypeAction::Error)
             .expect_err("Duration should be unsupported");
+        // The message a user sees names the column and its type, and the setting that
+        // converts it instead.
+        assert!(
+            matches!(
+                &err,
+                datafusion::error::DataFusionError::Execution(message) if message
+                    == "Unsupported data type(s) in schema: 'd' (type: Duration(Second)). By \
+                        default, unsupported types cause an error. To convert top-level \
+                        unsupported columns to strings, set 'unsupported_type_action: string'; \
+                        nested unsupported types must be removed or rewritten to preserve data \
+                        correctness."
+            ),
+            "{err:?}"
+        );
     }
 
     #[test]
@@ -816,10 +841,10 @@ mod tests {
         );
     }
 
-    /// Vortex cannot encode `Union` or `RunEndEncoded` at all, so a column of either type
-    /// has to be refused while the table is being created. Accepting it produces a table
-    /// that reports itself created and then fails every write to it - the shape of
-    /// spiceai/spiceai#13524.
+    /// Vortex cannot encode `Union` at all, so a column of that type has to be refused while
+    /// the table is being created: accepting it produces a table that reports itself created
+    /// and then fails every write to it - the shape of spiceai/spiceai#13524. A
+    /// `RunEndEncoded` column is refused the same way, as Cayenne does not accept it yet.
     #[test]
     fn types_vortex_cannot_encode_are_refused_by_name_and_type() {
         for data_type in [

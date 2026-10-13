@@ -78,13 +78,44 @@ mod tests {
         assert_eq!(proj.columns().len(), 3);
     }
 
+    /// Asserts `err` is the invalid-configuration error `connector` reports for
+    /// dataset `tbl`, carrying exactly `message`.
+    fn assert_invalid_configuration(
+        err: &data_connector_api::DataConnectorError,
+        connector: &str,
+        message: &str,
+    ) {
+        assert!(
+            matches!(
+                err,
+                data_connector_api::DataConnectorError::InvalidConfigurationNoSource {
+                    dataconnector,
+                    message: actual,
+                    ..
+                } if dataconnector == connector && actual == message
+            ),
+            "expected InvalidConfigurationNoSource from {connector} with message {message:?}, got {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Cannot setup the dataset tbl ({connector}) with an invalid configuration. {message}"
+            )
+        );
+    }
+
     #[tokio::test]
     async fn rejects_non_wildcard_marker() {
         let mut metadata = HashMap::new();
         metadata.insert("json_object".to_string(), Value::String("nope".to_string()));
         let ds = dataset_with_columns(vec![Column::new("data").with_metadata(metadata)]).await;
         let policy = ProjectionPolicy::new("dynamodb");
-        parse_schema_projection(&ds, &policy).expect_err("non-'*' marker should error");
+        let err = parse_schema_projection(&ds, &policy).expect_err("non-'*' marker should error");
+        assert_invalid_configuration(
+            &err,
+            "dynamodb",
+            "Column 'data' has invalid 'json_object' value: String(\"nope\"). Only '*' is supported.",
+        );
     }
 
     #[tokio::test]
@@ -92,9 +123,15 @@ mod tests {
         let ds = dataset_with_columns(vec![catch_all_column("data")]).await;
         let policy =
             ProjectionPolicy::new("debezium").with_required_columns(vec!["id".to_string()]);
-        // `id` is required but only the catch-all is declared.
-        parse_schema_projection(&ds, &policy)
+        // `id` is required but only the catch-all is declared: a CDC key folded
+        // into the JSON object would break key-based upserts and deletes.
+        let err = parse_schema_projection(&ds, &policy)
             .expect_err("required PK folded into catch-all should error");
+        assert_invalid_configuration(
+            &err,
+            "debezium",
+            "column 'id' must be declared explicitly and cannot be folded into the 'json_object' catch-all",
+        );
     }
 
     #[tokio::test]

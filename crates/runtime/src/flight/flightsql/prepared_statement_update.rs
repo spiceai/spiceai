@@ -30,17 +30,19 @@ use std::sync::{Arc, LazyLock};
 use tokio_stream::{StreamExt, adapters::Peekable};
 use tonic::{Request, Response, Status, Streaming};
 
+use arrow_tools::map_entries::MapEntriesNormalizer;
+
+use super::DecodableSchema;
+use super::prepared_statement_query::{
+    PreparedStatement, decode_param_values, encode_single_row_parameters, error_to_status,
+    param_error_to_status,
+};
 use crate::flight::is_auth_read_only;
 use crate::{
     datafusion::{query::QueryBuilder, request_context_extension::get_current_datafusion},
     flight::{Service, handle_query_error, metrics, to_tonic_err, util::set_flightsql_protocol},
 };
 use runtime_request_context::{AsyncMarker, RequestContext};
-
-use super::prepared_statement_query::{
-    PreparedStatement, decode_param_values, encode_single_row_parameters, error_to_status,
-    param_error_to_status,
-};
 
 /// Static schema for `affected_rows` result to avoid allocation on each request.
 static AFFECTED_ROWS_SCHEMA: LazyLock<SchemaRef> = LazyLock::new(|| {
@@ -183,13 +185,24 @@ pub(crate) async fn do_put_update(
     streaming_flight: Peekable<Streaming<FlightData>>,
 ) -> Result<Response<<Service as FlightService>::DoPutStream>, Status> {
     let _start = metrics::track_flight_request("do_put", Some("prepared_statement_update")).await;
-    let streaming_flight = streaming_flight
-        .map(|flight_data| flight_data.map_err(|status| FlightError::Tonic(Box::new(status))));
+    let decodable = DecodableSchema::default();
+    let streaming_flight = streaming_flight.map({
+        let decodable = decodable.clone();
+        move |flight_data| {
+            flight_data
+                .map_err(|status| FlightError::Tonic(Box::new(status)))
+                .map(|message| decodable.repair(message))
+        }
+    });
 
     let mut decoder = FlightDataDecoder::new(streaming_flight);
-    let schema = decode_schema(&mut decoder).await?;
+    let schema = decodable.declared(decode_schema(&mut decoder).await?);
 
-    let parameters = encode_single_row_parameters(&mut decoder, &schema).await?;
+    // Bound the same way the query path binds: what is stored is what the statement will run
+    // with, so a `MAP` whose `entries` the client declared nullable is brought into line before
+    // it is written rather than at the next execution.
+    let normalizer = MapEntriesNormalizer::for_schema(&schema);
+    let parameters = encode_single_row_parameters(&mut decoder, &normalizer).await?;
 
     let mut stmt: PreparedStatement =
         from_bytes(&query.prepared_statement_handle).map_err(error_to_status)?;

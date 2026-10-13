@@ -16,7 +16,7 @@ limitations under the License.
 
 use std::{fmt::Write, sync::Arc};
 
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use runtime_rate_control::RateController;
 use serde::Deserialize;
 use snafu::prelude::*;

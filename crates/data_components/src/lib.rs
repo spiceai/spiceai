@@ -21,9 +21,9 @@ use async_trait::async_trait;
 use datafusion::arrow::datatypes::{Schema, SchemaRef};
 use datafusion::{
     catalog::CatalogProvider,
+    common::TableReference,
     common::{Statistics, stats::Precision},
     datasource::TableProvider,
-    sql::TableReference,
 };
 use datafusion_federation::FederatedTableProviderAdaptor;
 use spice_table::{LayerWalk, SpiceTable, TableLayer};
@@ -60,7 +60,6 @@ pub mod duckdb;
 pub mod ducklake;
 #[cfg(feature = "elasticsearch")]
 pub mod elasticsearch;
-#[cfg(feature = "federation")]
 pub mod federation;
 pub mod flight;
 #[cfg(feature = "flightsql")]
@@ -249,11 +248,13 @@ impl TableLayer for MetadataEnrichedTableProvider {
         // Exhaustive on purpose: a wildcard would answer a future walk kind
         // for this layer without anyone deciding what it should say.
         match walk {
+            // Table and column descriptions change no row, column, or type.
             LayerWalk::Read
             | LayerWalk::CdcDetection
             | LayerWalk::Source
             | LayerWalk::RetentionDelete
-            | LayerWalk::Index => Some(below),
+            | LayerWalk::Index
+            | LayerWalk::Passthrough => Some(below),
             LayerWalk::Write => None,
         }
     }

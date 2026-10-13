@@ -28,8 +28,8 @@ use arrow_tools::ipc::{declares_ipc_data, declares_record_batch};
 use arrow_tools::map_entries::{self, MapEntriesNormalizer};
 use arrow_tools::schema::verify_schema;
 use datafusion::{
-    error::DataFusionError, execution::SendableRecordBatchStream,
-    physical_plan::stream::RecordBatchStreamAdapter, sql::TableReference,
+    common::TableReference, error::DataFusionError, execution::SendableRecordBatchStream,
+    physical_plan::stream::RecordBatchStreamAdapter,
 };
 use opentelemetry::{KeyValue, Value};
 use prost::Message as _;
@@ -278,7 +278,7 @@ pub(crate) async fn handle(
 
     // One stream carries one schema, so what its batches need is resolved once — and the dataset is
     // checked against the shape that will actually be written. See [`MapEntriesGuard`].
-    let guard = MapEntriesGuard::for_declared(schema);
+    let guard = MapEntriesGuard::for_declared(&schema);
 
     let target_schema = datafusion
         .get_arrow_schema(path.clone())
@@ -387,25 +387,23 @@ where
 /// What a `DoPut` stream's `MAP` columns need, resolved once from the client's schema message.
 ///
 /// A client is free to declare a `MAP`'s `entries` field nullable, which the Arrow map layout
-/// forbids. Every batch is therefore decoded under the client's own declarations and relabelled
-/// afterwards, so that an entries array carrying nulls — the one shape relabelling cannot fix — is
-/// refused rather than written under a declaration that says it holds none.
+/// forbids — and which the decode itself refuses, over the one part of the column that holds no
+/// data, naming neither the dataset nor the column. Every batch is therefore decoded under the
+/// form of the client's declarations that an Arrow decoder can build against, where a map is
+/// labelled as the list it is laid out as, and relabelled afterwards — so that an entries array
+/// carrying nulls, the one shape relabelling cannot fix, is refused by name rather than written
+/// under a declaration that says it holds none.
 ///
 /// The two decisions the write makes about that live together here because they have to agree: the
 /// schema the write stream advertises, and the shape of the batches pushed into it.
 struct MapEntriesGuard {
-    /// The client's own declaration. Batches are decoded under it — the IPC buffers are laid out
-    /// the way it describes.
-    declared: SchemaRef,
     normalizer: MapEntriesNormalizer,
 }
 
 impl MapEntriesGuard {
-    fn for_declared(declared: SchemaRef) -> Self {
-        let normalizer = MapEntriesNormalizer::for_schema(&declared);
+    fn for_declared(declared: &SchemaRef) -> Self {
         Self {
-            declared,
-            normalizer,
+            normalizer: MapEntriesNormalizer::for_schema(declared),
         }
     }
 
@@ -439,7 +437,7 @@ impl MapEntriesGuard {
 
         let batch = arrow_flight::utils::flight_data_to_arrow_batch(
             message,
-            Arc::clone(&self.declared),
+            Arc::clone(self.normalizer.decode_schema()),
             dictionaries_by_id,
         )
         .map_err(|e| {
@@ -1189,12 +1187,15 @@ mod tests {
         .expect("entries struct");
 
         let offsets: Vec<i32> = (0..=i32::try_from(rows).expect("row count")).collect();
-        let data = ArrayData::builder(data_type.clone())
+        let builder = ArrayData::builder(data_type.clone())
             .len(rows)
             .add_buffer(Buffer::from_slice_ref(&offsets))
-            .add_child_data(entries.to_data())
-            .build()
-            .expect("map array data");
+            .add_child_data(entries.to_data());
+        // SAFETY: the offsets, buffers and child data are well formed. Only the
+        // `entries` nullability declaration is what `ArrayData::validate` rejects,
+        // and reproducing it is the point of the fixture — the IPC reader builds
+        // such a map without either entries check.
+        let data = unsafe { builder.build_unchecked() };
 
         RecordBatch::try_new(
             Arc::new(Schema::new(vec![Field::new("m", data_type, true)])),
@@ -1228,7 +1229,7 @@ mod tests {
             false,
         )]));
         let batch = RecordBatch::new_empty(Arc::clone(&schema));
-        let guard = MapEntriesGuard::for_declared(Arc::clone(&schema));
+        let guard = MapEntriesGuard::for_declared(&schema);
         let path = TableReference::bare("orders");
         let dictionaries = HashMap::new();
 
@@ -1266,7 +1267,7 @@ mod tests {
     #[test]
     fn a_clients_nullable_map_entries_declaration_is_corrected_before_the_sink() {
         let batch = map_batch(None);
-        let guard = MapEntriesGuard::for_declared(batch.schema());
+        let guard = MapEntriesGuard::for_declared(&batch.schema());
         let path = TableReference::bare("orders");
         let dictionaries = HashMap::new();
 
@@ -1297,7 +1298,7 @@ mod tests {
     #[test]
     fn a_map_whose_entries_carry_nulls_is_refused_before_the_sink() {
         let batch = map_batch(Some(arrow::buffer::NullBuffer::from(vec![true, false])));
-        let guard = MapEntriesGuard::for_declared(batch.schema());
+        let guard = MapEntriesGuard::for_declared(&batch.schema());
         let path = TableReference::bare("orders");
         let dictionaries = HashMap::new();
 
@@ -1348,7 +1349,7 @@ mod tests {
     #[test]
     fn a_message_carrying_no_batch_is_skipped() {
         let batch = map_batch(None);
-        let guard = MapEntriesGuard::for_declared(batch.schema());
+        let guard = MapEntriesGuard::for_declared(&batch.schema());
         let messages = flight_messages(&batch);
         let schema_message = messages.first().expect("a schema message");
 
@@ -1368,7 +1369,7 @@ mod tests {
     /// misread, so it is skipped exactly as a schema message is.
     #[test]
     fn a_message_with_no_header_carries_no_batch() {
-        let guard = MapEntriesGuard::for_declared(map_batch(None).schema());
+        let guard = MapEntriesGuard::for_declared(&map_batch(None).schema());
 
         assert!(
             guard
@@ -1387,7 +1388,7 @@ mod tests {
     /// rejected, so it is refused with the parse failure the client can act on.
     #[test]
     fn a_malformed_header_is_refused_with_the_parse_failure() {
-        let guard = MapEntriesGuard::for_declared(map_batch(None).schema());
+        let guard = MapEntriesGuard::for_declared(&map_batch(None).schema());
         let malformed = FlightData {
             data_header: (&b"this is not a flatbuffer"[..]).into(),
             ..Default::default()

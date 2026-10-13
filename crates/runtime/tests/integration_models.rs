@@ -51,8 +51,6 @@ fn configure_test_datafusion() {
 
     match DEFAULT_DATAFUSION_CONFIG.write() {
         Ok(mut config) => {
-            config.options_mut().execution.target_partitions = TEST_CPU_CORES;
-
             config.options_mut().execution.coalesce_batches = false;
 
             config.options_mut().optimizer.repartition_joins = false;
@@ -63,10 +61,8 @@ fn configure_test_datafusion() {
 
 /// Pin the process-wide CPU budget to [`TEST_CPU_CORES`].
 ///
-/// Setting `target_partitions` on the default session config is not enough on its
-/// own: with `runtime.query.target_partitions` unset the session builder sizes
-/// partitions from the CPU budget, overwriting whatever the config carried. Both
-/// are pinned to the same constant so they cannot disagree.
+/// Every session sizes `target_partitions` from the CPU budget, so pinning the
+/// budget is what makes plans reproducible across machines.
 ///
 /// Installing is idempotent by intent — the budget is a process-wide `OnceLock`
 /// and every caller asks for the same value, so each call after the first is an

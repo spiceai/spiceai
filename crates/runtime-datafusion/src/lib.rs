@@ -1,5 +1,5 @@
 /*
-Copyright 2024-2025 The Spice.ai OSS Authors
+Copyright 2024-2026 The Spice.ai OSS Authors
 
 Licensed under the Apache License, Version 2.0 (the "License");
 you may not use this file except in compliance with the License.
@@ -22,6 +22,8 @@ pub mod dml_guard;
 pub mod error;
 pub mod execution_plan;
 pub mod extension;
+#[cfg(test)]
+mod fork_backport_guards;
 pub mod function_support;
 pub mod join_accumulator;
 pub mod managed_runtime;
@@ -31,6 +33,7 @@ pub mod pg_catalog;
 pub mod query_cancel_registry;
 pub mod refresh_scan;
 pub mod refresh_sql;
+pub mod retention_keep;
 pub mod retention_sql;
 pub mod schema_provider;
 pub mod session_config;
@@ -64,7 +67,7 @@ pub fn is_spice_internal_schema(catalog: &str, schema: &str) -> bool {
 /// Whether `dataset` names a table in one of Spice's reserved schemas. A
 /// reference with no catalog is resolved against [`SPICE_DEFAULT_CATALOG`].
 #[must_use]
-pub fn is_spice_internal_dataset(dataset: &datafusion::sql::TableReference) -> bool {
+pub fn is_spice_internal_dataset(dataset: &datafusion::common::TableReference) -> bool {
     match (dataset.catalog(), dataset.schema()) {
         (Some(catalog), Some(schema)) => is_spice_internal_schema(catalog, schema),
         (None, Some(schema)) => is_spice_internal_schema(SPICE_DEFAULT_CATALOG, schema),

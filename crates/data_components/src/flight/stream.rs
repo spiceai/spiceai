@@ -21,6 +21,7 @@ use async_stream::stream;
 use async_trait::async_trait;
 use datafusion::{
     catalog::Session,
+    common::TableReference,
     datasource::{TableProvider, TableType},
     error::{DataFusionError, Result as DataFusionResult},
     execution::{SendableRecordBatchStream, TaskContext},
@@ -31,7 +32,6 @@ use datafusion::{
         execution_plan::{Boundedness, EmissionType},
         stream::RecordBatchStreamAdapter,
     },
-    sql::TableReference,
 };
 use flight_client::FlightClient;
 use futures::{Stream, StreamExt};
@@ -199,6 +199,17 @@ impl ExecutionPlan for FlightStreamExec {
         &self.properties
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
@@ -268,9 +279,9 @@ mod tests {
     use arrow::array::MapArray;
     use arrow::datatypes::{DataType, SchemaRef};
     use datafusion::catalog::TableProvider;
+    use datafusion::common::TableReference;
     use datafusion::physical_plan::collect;
     use datafusion::prelude::SessionContext;
-    use datafusion::sql::TableReference;
     use flight_client::{Credentials, FlightClient};
     use std::sync::Arc;
 
@@ -333,6 +344,48 @@ mod tests {
         let (field, offsets, entries, nulls, ordered) = map.clone().into_parts();
         MapArray::try_new(field, offsets, entries, nulls, ordered)
             .expect("the corrected column can be rebuilt by a kernel");
+
+        server.shutdown().await;
+    }
+
+    /// Regression test: correcting the map declaration must keep the producer's dictionary ids,
+    /// or a producer numbering its dictionaries in another order has each dictionary column of
+    /// the subscription decoded against another column's dictionary.
+    #[tokio::test]
+    async fn correcting_the_map_declaration_keeps_the_producers_dictionary_ids_on_subscribe() {
+        use crate::flight::dictionary_id_fixture::{expected_values, values};
+        use crate::flight::tests::Payload;
+
+        let server = TestServer::serving(Payload::MapWithReorderedDictionaryIds).await;
+        let client = FlightClient::try_new(
+            Arc::from(format!("http://{}", server.addr)),
+            Credentials::anonymous(),
+            None,
+            None,
+        )
+        .await
+        .expect("client should connect");
+
+        let table = FlightTableStreamer::create(TableReference::bare("t"), client)
+            .await
+            .expect("table should be created");
+
+        let ctx = SessionContext::new();
+        let plan = table
+            .scan(&ctx.state(), None, &[], None)
+            .await
+            .expect("scan should plan");
+        let batches = collect(plan, ctx.task_ctx())
+            .await
+            .expect("a nullable entries declaration is relabelled, not refused");
+
+        let [batch] = batches.as_slice() else {
+            panic!(
+                "the producer serves exactly one batch, got {}",
+                batches.len()
+            );
+        };
+        assert_eq!(values(batch), expected_values());
 
         server.shutdown().await;
     }

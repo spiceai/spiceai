@@ -156,7 +156,7 @@ impl SearchIndex for S3Vector {
                 let input_dfschema = DFSchema::try_from(Arc::clone(&input_schema))?;
                 let execution_props = ExecutionProps::new();
                 let physical_expr =
-                    create_physical_expr(partition_by, &input_dfschema, &execution_props)?;
+                    create_physical_expr(partition_by, &input_dfschema, &execution_props, &datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext::default())?;
                 let partitions = partition_batch(&record, physical_expr.as_ref())?;
 
                 let mut data = vec![];

@@ -51,7 +51,6 @@ use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{DisplayAs, DisplayFormatType, ExecutionPlan};
-use datafusion::prelude::SessionContext;
 use datafusion_datasource::sink::{DataSink, DataSinkExec};
 use futures::StreamExt;
 use tokio::sync::mpsc;
@@ -421,7 +420,7 @@ fn spawn_federated_insert(
     receiver: mpsc::Receiver<datafusion::common::Result<arrow::record_batch::RecordBatch>>,
 ) -> JoinHandle<datafusion::common::Result<()>> {
     tokio::spawn(async move {
-        let ctx = SessionContext::new();
+        let ctx = util::session_state::session_context();
         let stream = RecordBatchStreamAdapter::new(schema, ReceiverStream::new(receiver));
         let input: Arc<dyn ExecutionPlan> = Arc::new(SchemaCastScanExec::new(
             Arc::new(StreamingDataUpdateExecutionPlan::new(Box::pin(stream))),
@@ -486,7 +485,7 @@ fn create_partition_physical_exprs(
             datafusion::physical_expr::create_physical_expr(
                 &partitioned_by.expression,
                 &input_dfschema,
-                &execution_props,
+                &execution_props, &datafusion::logical_expr::physical_planning_context::PhysicalPlanningContext::default(),
             )
         })
         .collect()
@@ -538,6 +537,46 @@ pub fn extract_cayenne_write_target(
     }
 
     None
+}
+
+/// Stop the background maintenance of every Cayenne instance `table_provider`
+/// serves from — the provider itself, each partition of a partitioned table, and
+/// what a poly or upsert-dedup wrapper writes to — and wait for maintenance they
+/// already started.
+///
+/// Called when a dataset generation is drained for replacement or removal: the
+/// replacement opens the same table on the same catalog, and nothing in memory
+/// serializes the two instances' maintenance (#11581). Every instance is
+/// quiesced at once, and the wait is not bounded: a drain publishes completion
+/// only once the work it drains has ended, and a pass still running when the
+/// replacement starts is exactly the overlap this exists to prevent.
+pub async fn quiesce_cayenne_maintenance(table_provider: &Arc<dyn TableProvider>) {
+    let mut instances = Vec::new();
+    let mut pending = vec![Arc::clone(table_provider)];
+    while let Some(provider) = pending.pop() {
+        if let Some(cayenne) = spice_table::find_concrete::<CayenneTableProvider>(
+            provider.as_ref(),
+            spice_table::LayerWalk::Write,
+        ) {
+            instances.push(cayenne.clone_for_write_operations());
+        } else if let Some(partitioned) = spice_table::find_concrete::<PartitionTableProvider>(
+            provider.as_ref(),
+            spice_table::LayerWalk::Write,
+        ) {
+            pending.extend(partitioned.partition_table_providers().await);
+        } else if let Some(poly) = spice_table::find_layer::<PolyTableProvider>(
+            provider.as_ref(),
+            spice_table::LayerWalk::Write,
+        ) {
+            pending.push(poly.writer());
+        } else if let Some(upsert_dedup) = spice_table::find_concrete::<UpsertDedupTableProvider>(
+            provider.as_ref(),
+            spice_table::LayerWalk::Write,
+        ) {
+            pending.push(Arc::clone(upsert_dedup.inner()));
+        }
+    }
+    futures::future::join_all(instances.iter().map(CayenneTableProvider::quiesce)).await;
 }
 
 fn spawn_staged_append(
@@ -797,6 +836,17 @@ mod tests {
         fn properties(&self) -> &Arc<PlanProperties> {
             &self.properties
         }
+        fn apply_expressions(
+            &self,
+            _f: &mut dyn FnMut(
+                &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+            ) -> datafusion::error::Result<
+                datafusion::common::tree_node::TreeNodeRecursion,
+            >,
+        ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+            Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+        }
+
         fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
             vec![]
         }
@@ -925,11 +975,11 @@ mod tests {
             CayenneCatalog, CayennePartitionCreator, CayenneTableProvider, MetadataCatalog,
         };
         use datafusion::catalog::TableProvider;
+        use datafusion::common::TableReference;
         use datafusion::datasource::MemTable;
         use datafusion::logical_expr::col;
         use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
         use datafusion::scalar::ScalarValue;
-        use datafusion::sql::TableReference;
         use datafusion_table_providers::UnsupportedTypeAction;
         use runtime_component::dataset::acceleration::RefreshMode;
         use runtime_table_partition::expression::PartitionedBy;
@@ -1051,7 +1101,14 @@ mod tests {
             .await
             .expect("stage a");
 
-        // The dual write reaches `b` first, then `a`.
+        // Every clone of the coordinator is a holder or a waiter. With the lock
+        // held here, a dual write that adds one is parked on it: a positive,
+        // deterministic signal that it serializes with this writer, rather than a
+        // window in which a writer ignoring the coordinator might take `b`.
+        let coordinator_handle = partitioned.write_coordinator();
+        let idle_holders = Arc::strong_count(&coordinator_handle);
+
+        // The dual write would reach `b` first, then `a`.
         let (input, input_rx) = mpsc::channel(4);
         let dual_write = tokio::spawn(super::write_all_with_partitioned_cayenne(
             refresher,
@@ -1063,34 +1120,33 @@ mod tests {
             )),
             1,
         ));
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        while Arc::strong_count(&coordinator_handle) == idle_holders {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the dual write never queued on the table's write coordinator \
+                 ({idle_holders} holder(s) throughout)"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+
+        // Parked on the coordinator it reads none of its input, so it cannot take
+        // `b` whatever order the input reaches the partitions in.
         input
             .send(Ok(rows(vec![1, 2], "b")))
             .await
             .expect("the dual write accepts input");
-        // Give a dual write that ignores the coordinator every chance to take `b`
-        // before it sees `a`: poll until something holds `b`, briefly releasing
-        // each probe that gets it.
-        let b = partition("b").await;
-        for _ in 0..40 {
-            match tokio::time::timeout(Duration::from_millis(50), b.begin_overwrite(nothing(), 1))
-                .await
-            {
-                Ok(probe) => {
-                    probe
-                        .expect("probe b")
-                        .rollback()
-                        .await
-                        .expect("release the probe");
-                    tokio::time::sleep(Duration::from_millis(25)).await;
-                }
-                Err(_) => break,
-            }
-        }
         input
             .send(Ok(rows(vec![3], "a")))
             .await
             .expect("the dual write accepts input");
+        assert_eq!(
+            input.capacity(),
+            2,
+            "a dual write parked on the coordinator must not have read its input"
+        );
 
+        let b = partition("b").await;
         let staged_b =
             tokio::time::timeout(Duration::from_secs(10), b.begin_overwrite(nothing(), 1))
                 .await

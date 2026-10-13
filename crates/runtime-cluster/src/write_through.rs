@@ -28,13 +28,17 @@ use arrow::array::{Array, RecordBatch};
 use arrow_flight::{FlightData, FlightDescriptor, PutResult, utils::flight_data_to_arrow_batch};
 use arrow_ipc::convert::try_schema_from_flatbuffer_bytes;
 use arrow_schema::{DataType, SchemaRef};
-use arrow_tools::{ipc, map_entries::MapEntriesNormalizer};
-use datafusion::{
-    common::DFSchema,
-    scalar::ScalarValue,
-    sql::{ResolvedTableReference, TableReference},
+use arrow_tools::{
+    ipc,
+    map_entries::{MapEntriesNormalizer, decodable_schema},
 };
-use datafusion_expr::{Expr, execution_props::ExecutionProps, lit};
+use datafusion::{
+    common::{DFSchema, ResolvedTableReference, TableReference},
+    scalar::ScalarValue,
+};
+use datafusion_expr::{
+    Expr, execution_props::ExecutionProps, lit, physical_planning_context::PhysicalPlanningContext,
+};
 use futures::{Stream, TryStreamExt as _, stream::BoxStream};
 use runtime_datafusion::{SPICE_DEFAULT_CATALOG, SPICE_DEFAULT_SCHEMA};
 use runtime_request_context::{AsyncMarker, RequestContext};
@@ -43,7 +47,7 @@ use tokio::sync::mpsc::{self, Sender};
 use tokio_stream::{StreamExt, adapters::Peekable, wrappers::ReceiverStream};
 use tonic::{Response, Streaming};
 
-use crate::flight_config::{KEEPALIVE_APP_METADATA, do_put_idle_timeout};
+use crate::flight_config::{self, do_put_idle_timeout};
 use crate::{ExecutorRegistry, PartitionStore, PartitionValue, store};
 
 /// Stream type used by Arrow Flight `DoPut` responses — matches what the runtime
@@ -260,7 +264,7 @@ pub async fn forward_federated_partitioned_write(
     let batch_stream = decode_client_batches(
         &first_message,
         streaming_flight,
-        declared,
+        &declared,
         normalizer,
         path.to_string(),
     )?;
@@ -303,7 +307,7 @@ pub async fn forward_federated_partitioned_write(
 fn decode_client_batches<S>(
     first_message: &FlightData,
     mut messages: S,
-    declared: SchemaRef,
+    declared: &SchemaRef,
     normalizer: MapEntriesNormalizer,
     table_name: String,
 ) -> Result<impl Stream<Item = Result<RecordBatch>> + Send + 'static>
@@ -311,12 +315,8 @@ where
     S: Stream<Item = std::result::Result<FlightData, tonic::Status>> + Unpin + Send + 'static,
 {
     let dictionaries_by_id = HashMap::new();
-    let first_batch = maybe_read_first_batch(
-        first_message,
-        Arc::clone(&declared),
-        &dictionaries_by_id,
-        &table_name,
-    )?;
+    let first_batch =
+        maybe_read_first_batch(first_message, declared, &dictionaries_by_id, &table_name)?;
 
     Ok(async_stream::try_stream! {
         if let Some(batch) = first_batch {
@@ -327,26 +327,7 @@ where
         while let Some(result) = messages.next().await {
             let message = result.context(StreamReadSnafu)?;
 
-            // The sentinel alone cannot decide this. On this path `app_metadata` is the
-            // client's to set, so a message carrying data can wear it, and skipping on the
-            // metadata alone discards that data while the write still reports success. A
-            // heartbeat declares no IPC data at all, so requiring that too keeps the skip to
-            // real heartbeats and sends anything data-bearing on to the check below, which
-            // decodes it or fails loudly. The predicate is `declares_ipc_data` rather than
-            // `declares_record_batch` because a dictionary is client data too: the batches
-            // referring to it carry nothing without it, so a tagged dictionary must be refused
-            // rather than dropped. The empty body is a floor under that: the header can only
-            // ever add to what the body already establishes, never narrow it. `declares_ipc_data`
-            // answers `false` for a schema message, a trailer, a `Tensor` and any IPC header a
-            // later Arrow adds, so without the floor a sentinel-tagged message of those kinds
-            // would take its body with it and the write would still report success. A real
-            // heartbeat carries neither header nor body. `do_put.rs`'s discarded-message count
-            // keeps the same header-vs-body floor, for the same reason -- though it applies the
-            // floor only *after* its own sentinel check, which still skips unconditionally.
-            if message.app_metadata.as_ref() == KEEPALIVE_APP_METADATA
-                && message.data_body.is_empty()
-                && !declares_ipc_data(&message.data_header, &table_name)?
-            {
+            if flight_config::is_keepalive(&message) {
                 continue;
             }
 
@@ -360,7 +341,7 @@ where
 
             let batch = flight_data_to_arrow_batch(
                 &message,
-                Arc::clone(&declared),
+                Arc::clone(normalizer.decode_schema()),
                 &dictionaries_by_id,
             )
             .context(DecodeBatchSnafu)?;
@@ -370,16 +351,6 @@ where
                     .with_context(|_| MapEntriesNotNormalizableSnafu { table: table_name.clone() })?;
             }
         }
-    })
-}
-
-/// Whether a message's IPC header declares data the client sent — a record batch, or a
-/// dictionary the batches referencing it cannot be decoded without — reporting an unreadable
-/// header the same way [`declares_record_batch`] does.
-fn declares_ipc_data(data_header: &[u8], table: &str) -> Result<bool> {
-    ipc::declares_ipc_data(data_header).map_err(|message| Error::UnreadableMessageHeader {
-        table: table.to_string(),
-        message,
     })
 }
 
@@ -410,7 +381,7 @@ fn declares_record_batch(data_header: &[u8], table: &str) -> Result<bool> {
 /// is reported as such.
 fn maybe_read_first_batch(
     first_message: &FlightData,
-    schema: SchemaRef,
+    schema: &SchemaRef,
     dictionaries_by_id: &HashMap<i64, Arc<dyn Array>>,
     table: &str,
 ) -> Result<Option<RecordBatch>> {
@@ -427,8 +398,14 @@ fn maybe_read_first_batch(
         return Ok(None);
     }
 
-    let batch = flight_data_to_arrow_batch(first_message, schema, dictionaries_by_id)
-        .context(DecodeBatchSnafu)?;
+    // `schema` is the client's own declaration, which a decoder cannot always be given: a map
+    // whose `entries` it declares nullable is refused inside the decode, over the one part of the
+    // column that holds no data. The batch is built against the form that decodes instead, and
+    // the caller's normalizer puts the map label back — or refuses, naming the column, the one
+    // shape that has no map to go back to.
+    let batch =
+        flight_data_to_arrow_batch(first_message, decodable_schema(schema), dictionaries_by_id)
+            .context(DecodeBatchSnafu)?;
     Ok(Some(batch))
 }
 
@@ -732,6 +709,7 @@ async fn route_batch_and_assign_unseen(
                     &combined,
                     &df_schema,
                     &ExecutionProps::new(),
+                    &PhysicalPlanningContext::default(),
                 )
                 .context(CreatePhysicalFilterSnafu {
                     executor_id: executor_id.clone(),
@@ -910,6 +888,7 @@ fn build_partition_physical_exprs(
                 e,
                 &df_schema,
                 &ExecutionProps::new(),
+                &PhysicalPlanningContext::default(),
             )
             .context(ParsePartitionExprSnafu)?;
             Ok((e.clone(), physical))
@@ -974,6 +953,7 @@ fn build_executor_filters(
             &combined,
             &df_schema,
             &ExecutionProps::new(),
+            &PhysicalPlanningContext::default(),
         )
         .context(CreatePhysicalFilterSnafu {
             executor_id: executor_id.clone(),
@@ -1140,11 +1120,7 @@ async fn forward_batches_to_executor(
                     }
                     // No data for a while — send a keepalive to prevent the
                     // executor's DoPut idle timeout from firing.
-                    let keepalive = arrow_flight::FlightData {
-                        app_metadata: bytes::Bytes::from_static(KEEPALIVE_APP_METADATA),
-                        ..Default::default()
-                    };
-                    if tx.send(keepalive).await.is_err() {
+                    if tx.send(flight_config::keepalive()).await.is_err() {
                         let _ = encode_result_tx.send(Ok(()));
                         return;
                     }
@@ -1225,6 +1201,8 @@ mod tests {
     use arrow::datatypes::{DataType, Field, Fields, Int32Type, Schema};
     use arrow_flight::utils::batches_to_flight_data;
 
+    use crate::flight_config::{KEEPALIVE_APP_METADATA, keepalive};
+
     fn test_schema() -> SchemaRef {
         Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, false)]))
     }
@@ -1272,12 +1250,15 @@ mod tests {
         )
         .expect("entries struct");
 
-        let data = ArrayData::builder(map_type(entries_nullable))
+        let builder = ArrayData::builder(map_type(entries_nullable))
             .len(2)
             .add_buffer(Buffer::from_slice_ref([0i32, 1, 2]))
-            .add_child_data(entries.to_data())
-            .build()
-            .expect("map array data");
+            .add_child_data(entries.to_data());
+        // SAFETY: the offsets, buffers and child data are well formed. Only the
+        // `entries` nullability declaration is what `ArrayData::validate` rejects,
+        // and reproducing it is the point of the fixture — the IPC reader builds
+        // such a map without either entries check.
+        let data = unsafe { builder.build_unchecked() };
 
         RecordBatch::try_new(
             map_schema(entries_nullable),
@@ -1309,13 +1290,9 @@ mod tests {
             "schema message should have empty body"
         );
 
-        let result = maybe_read_first_batch(
-            &flight_data[0],
-            Arc::clone(&schema),
-            &dictionaries_by_id,
-            "test.table",
-        )
-        .expect("should succeed");
+        let result =
+            maybe_read_first_batch(&flight_data[0], &schema, &dictionaries_by_id, "test.table")
+                .expect("should succeed");
         assert!(result.is_none(), "empty body should return None");
     }
 
@@ -1345,13 +1322,8 @@ mod tests {
             "data message should have non-empty body"
         );
 
-        let result = maybe_read_first_batch(
-            &data_fd,
-            Arc::clone(&schema),
-            &dictionaries_by_id,
-            "test.table",
-        )
-        .expect("should succeed");
+        let result = maybe_read_first_batch(&data_fd, &schema, &dictionaries_by_id, "test.table")
+            .expect("should succeed");
 
         let decoded = result.expect("non-empty body should return Some");
         assert_eq!(decoded.num_rows(), 3);
@@ -1382,13 +1354,8 @@ mod tests {
             .nth(1)
             .expect("should have data message");
 
-        let result = maybe_read_first_batch(
-            &data_fd,
-            Arc::clone(&schema),
-            &dictionaries_by_id,
-            "test.table",
-        )
-        .expect("should succeed");
+        let result = maybe_read_first_batch(&data_fd, &schema, &dictionaries_by_id, "test.table")
+            .expect("should succeed");
 
         let decoded = result.expect("should return Some for single row");
         assert_eq!(decoded.num_rows(), 1);
@@ -1409,14 +1376,10 @@ mod tests {
             .nth(1)
             .expect("should have a data message");
 
-        let decoded = maybe_read_first_batch(
-            &data_fd,
-            Arc::clone(&declared),
-            &dictionaries_by_id,
-            "test.table",
-        )
-        .expect("decode should succeed")
-        .expect("data message should carry a batch");
+        let decoded =
+            maybe_read_first_batch(&data_fd, &declared, &dictionaries_by_id, "test.table")
+                .expect("decode should succeed")
+                .expect("data message should carry a batch");
 
         let normalizer = MapEntriesNormalizer::for_schema(&declared);
 
@@ -1459,14 +1422,10 @@ mod tests {
             .nth(1)
             .expect("should have a data message");
 
-        let decoded = maybe_read_first_batch(
-            &data_fd,
-            Arc::clone(&declared),
-            &dictionaries_by_id,
-            "test.table",
-        )
-        .expect("decode should succeed")
-        .expect("data message should carry a batch");
+        let decoded =
+            maybe_read_first_batch(&data_fd, &declared, &dictionaries_by_id, "test.table")
+                .expect("decode should succeed")
+                .expect("data message should carry a batch");
 
         let err = MapEntriesNormalizer::for_schema(&declared)
             .normalize(decoded)
@@ -1513,13 +1472,6 @@ mod tests {
         .expect("client batch")
     }
 
-    fn keepalive() -> FlightData {
-        FlightData {
-            app_metadata: bytes::Bytes::from_static(KEEPALIVE_APP_METADATA),
-            ..Default::default()
-        }
-    }
-
     /// Drives the production decode over `messages`, with `first` as the message the caller
     /// already took off the stream.
     async fn decode(
@@ -1530,7 +1482,7 @@ mod tests {
         let stream = decode_client_batches(
             &first,
             futures::stream::iter(messages.into_iter().map(Ok::<_, tonic::Status>)),
-            Arc::clone(schema),
+            schema,
             MapEntriesNormalizer::for_schema(schema),
             "test.s.events".to_string(),
         )?;
@@ -1626,7 +1578,7 @@ mod tests {
     #[tokio::test]
     async fn a_dictionary_message_wearing_the_keepalive_sentinel_is_refused_not_skipped() {
         use arrow::ipc::writer::{
-            CompressionContext, DictionaryTracker, IpcDataGenerator, IpcWriteOptions,
+            DictionaryTracker, IpcDataGenerator, IpcWriteContext, IpcWriteOptions,
         };
 
         let schema: SchemaRef = Arc::new(Schema::new(vec![Field::new(
@@ -1654,7 +1606,7 @@ mod tests {
                 &batch,
                 &mut tracker,
                 &options,
-                &mut CompressionContext::default(),
+                &mut IpcWriteContext::default(),
             )
             .expect("encoding a dictionary batch");
         let encoded_dictionary = dictionaries
@@ -1795,53 +1747,124 @@ mod tests {
         assert!(batches.is_empty());
     }
 
-    /// A message wearing the keepalive sentinel whose header declares something other than IPC
-    /// data — a schema re-declaration, a trailer, a `Tensor`, any header a later Arrow adds —
-    /// but which carries a body, is client data, not a heartbeat.
-    ///
-    /// `declares_ipc_data` answers `false` for all of those, so the sentinel check alone would
-    /// skip the message and take its body with it while the write still reported success: the
-    /// exact silent-row-loss shape this PR exists to remove, reintroduced one layer up. The
-    /// empty-body floor is what refuses it. `do_put.rs` keeps the same header-vs-body floor in
-    /// its discarded-message count, but reaches it only past a sentinel check that still skips
-    /// unconditionally, so on that one point the two receivers do not yet agree.
-    ///
-    /// A schema message is used because it is the shape a real client is likeliest to send; the
-    /// arm it exercises is shared by every non-data header.
-    #[tokio::test]
-    async fn a_sentinel_tagged_message_carrying_a_body_is_not_skipped_as_a_heartbeat() {
+    /// A schema message: the non-empty header a real client is likeliest to send, standing in
+    /// for every header kind, since the arm they take is the same one.
+    fn schema_message() -> FlightData {
+        batches_to_flight_data(&test_schema(), vec![])
+            .expect("encoding a schema as flight data")
+            .remove(0)
+    }
+
+    /// Drives `tagged` through an otherwise well-formed write -- schema, one batch, then it --
+    /// and asserts it earns a named refusal that tells the writer which dataset it was for.
+    async fn assert_refused(tagged: FlightData) {
         let schema = client_schema();
         let mut msgs = encode_batch_to_flight_data(&schema, &client_batch(vec!["US"], vec![1]));
         let first = msgs.remove(0);
+        let batch = msgs.remove(0);
 
-        let mut tagged = batches_to_flight_data(
-            &Schema::new(vec![Field::new("id", DataType::Int32, false)]),
-            vec![],
-        )
-        .expect("encoding a schema as flight data")
-        .remove(0);
-        tagged.data_body = bytes::Bytes::from_static(b"rows the client sent");
-        tagged.app_metadata = bytes::Bytes::from_static(KEEPALIVE_APP_METADATA);
-
-        // Asserted so the case cannot quietly stop exercising the confusion: it needs a header
-        // that parses into a non-data kind, and a body under it.
-        assert_eq!(
-            ipc::declares_ipc_data(&tagged.data_header),
-            Ok(false),
-            "the case needs a header that declares something other than IPC data"
-        );
-        assert!(
-            !tagged.data_body.is_empty(),
-            "the case needs a body; without one this is a real heartbeat"
-        );
-
-        let err = decode(first, vec![msgs.remove(0), tagged], &schema)
+        let err = decode(first, vec![batch, tagged], &schema)
             .await
-            .expect_err("a sentinel-tagged message carrying a body must not be skipped");
+            .expect_err("a message that is not an empty envelope must not be skipped");
 
         assert!(matches!(err, Error::NonBatchMessage { .. }), "{err:?}");
         assert!(err.to_string().contains("'test.s.events'"), "{err}");
     }
+
+    /// A message wearing the keepalive sentinel that carries a body is client data, not a
+    /// heartbeat.
+    ///
+    /// This is the sentinel-alone arm: the fixture carries a header as well as a body, so it
+    /// stays green under any predicate stricter than the sentinel by itself. The tests below
+    /// are the ones that pin a clause each.
+    ///
+    /// Skipping on the sentinel alone takes that body with it while the write still reports
+    /// success -- the silent row loss this module refuses everywhere else, reintroduced one
+    /// layer up.
+    #[tokio::test]
+    async fn a_sentinel_tagged_message_carrying_a_body_is_not_skipped_as_a_heartbeat() {
+        let mut tagged = schema_message();
+        tagged.data_body = bytes::Bytes::from_static(b"rows the client sent");
+        tagged.app_metadata = bytes::Bytes::from_static(KEEPALIVE_APP_METADATA);
+
+        // `schema_message` is a helper, so assert what this case needs of it rather than
+        // trusting it: a change there must not quietly leave this exercising a real heartbeat.
+        assert!(!tagged.data_header.is_empty(), "the case needs a header");
+
+        assert_refused(tagged).await;
+    }
+
+    /// A mid-stream schema re-declaration wearing the keepalive sentinel is a re-declaration,
+    /// not a heartbeat.
+    ///
+    /// This is the header clause: delete `data_header.is_empty()` from [`is_keepalive`] and only
+    /// this test fails. Untagged the same message already fails the write -- the stream has gone
+    /// out of step with what it declared -- and that half is run here rather than assumed,
+    /// because what the sentinel would otherwise buy is silence, not acceptance.
+    #[tokio::test]
+    async fn a_sentinel_tagged_schema_redeclaration_is_refused_not_skipped() {
+        let mut tagged = schema_message();
+        tagged.app_metadata = bytes::Bytes::from_static(KEEPALIVE_APP_METADATA);
+
+        // `schema_message` is a helper: this case needs the header it supplies, and the empty
+        // body a real heartbeat also has, or it stops exercising the clause it names.
+        assert!(!tagged.data_header.is_empty(), "the case needs a header");
+        assert!(tagged.data_body.is_empty(), "the case needs an empty body");
+
+        let mut untagged = tagged.clone();
+        untagged.app_metadata = bytes::Bytes::new();
+        assert_refused(untagged).await;
+
+        assert_refused(tagged).await;
+    }
+
+    /// A sentinel-tagged message with no header but a body is client data, not a heartbeat.
+    ///
+    /// This is the body clause, and it is the half a header check cannot reach at all: with no
+    /// header there is no declaration to read, so the body is the only thing saying the message
+    /// carries something. Flight allows that shape, and `flight_data_to_arrow_batch` is what
+    /// says whether those bytes are a batch -- so the write must refuse them rather than skip
+    /// them and acknowledge the rows as written.
+    #[tokio::test]
+    async fn a_sentinel_tagged_message_with_a_body_but_no_header_is_refused_not_skipped() {
+        assert_refused(FlightData {
+            app_metadata: bytes::Bytes::from_static(KEEPALIVE_APP_METADATA),
+            data_body: bytes::Bytes::from_static(b"rows the client sent"),
+            ..Default::default()
+        })
+        .await;
+    }
+
+    /// A sentinel-tagged message carrying a `flight_descriptor` names a stream; it is not a
+    /// heartbeat.
+    ///
+    /// This is the descriptor clause, and it is the half neither a header nor a body check can
+    /// reach: `flight_descriptor` is a fourth field, so a message can be empty in every other
+    /// respect and still be saying something. Untagged the same message is already refused as
+    /// carrying no record batch, and that half is run here rather than assumed -- without the
+    /// clause the sentinel buys it a silent skip and the write is acknowledged, which is the
+    /// exact trade this predicate exists to refuse.
+    #[tokio::test]
+    async fn a_sentinel_tagged_message_carrying_a_descriptor_is_refused_not_skipped() {
+        // The path is the shape the real sender attaches to its *first* message
+        // (catalog/schema/table); its contents are never read here, only its presence.
+        let tagged = FlightData {
+            app_metadata: bytes::Bytes::from_static(KEEPALIVE_APP_METADATA),
+            flight_descriptor: Some(arrow_flight::FlightDescriptor::new_path(vec![
+                "test".to_string(),
+                "s".to_string(),
+                "events".to_string(),
+            ])),
+            ..Default::default()
+        };
+
+        let mut untagged = tagged.clone();
+        untagged.app_metadata = bytes::Bytes::new();
+        assert_refused(untagged).await;
+
+        assert_refused(tagged).await;
+    }
+
     /// A first message whose header declares a schema but which carries a body is lost client
     /// data, not an absent batch.
     ///
@@ -1866,7 +1889,7 @@ mod tests {
         );
         assert!(!first.data_body.is_empty(), "the case needs a body");
 
-        let err = maybe_read_first_batch(&first, schema, &HashMap::new(), "test.s.events")
+        let err = maybe_read_first_batch(&first, &schema, &HashMap::new(), "test.s.events")
             .expect_err("a body no batch describes must not be silently dropped");
 
         assert!(

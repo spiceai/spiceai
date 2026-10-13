@@ -101,8 +101,8 @@ pub trait SecretAutoload: Send + Sync + Clone {
 pub struct NoSecretResolver;
 
 impl SecretAutoload for NoSecretResolver {
-    async fn autoload_get(&self, _key: &str) -> Option<SecretString> {
-        None
+    fn autoload_get(&self, _key: &str) -> impl Future<Output = Option<SecretString>> + Send {
+        std::future::ready(None)
     }
 }
 

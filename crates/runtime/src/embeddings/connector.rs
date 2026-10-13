@@ -718,7 +718,7 @@ pub(crate) fn duckdb_embedding_columns_from_view(
 #[cfg(feature = "duckdb")]
 pub(crate) async fn try_wrap_view_accelerator_with_hnsw(
     view: &View,
-    table: &datafusion::sql::TableReference,
+    table: &datafusion::common::TableReference,
     builder: &mut crate::accelerated::Builder,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let Some(vector_engine) = duckdb_vector_store_for_view(view) else {
@@ -778,10 +778,43 @@ mod tests {
     use datafusion::datasource::MemTable;
     use datafusion::logical_expr::{EmptyRelation, LogicalPlan};
 
+    /// The one item every [`StreamingSource`] stream yields. An error item
+    /// passes through every wrapper arm unchanged, so it identifies the
+    /// source's stream wherever it comes out.
+    const MARKER: &str = "marker item from the source stream";
+
     /// A source connector that offers both stream kinds, so a `None` from
     /// [`EmbeddingConnector`] can only come from its own provider resolution.
-    #[derive(Debug)]
-    struct StreamingSource;
+    /// It records the table each stream is requested for.
+    #[derive(Debug, Default)]
+    struct StreamingSource {
+        handed: parking_lot::Mutex<Vec<Arc<dyn TableProvider>>>,
+    }
+
+    impl StreamingSource {
+        fn record(&self, federated_table: &Arc<dyn FederatedTableProvider>) -> ChangesStream {
+            let table = federated_table
+                .try_table_provider_sync()
+                .expect("the wrapper hands the source an immediate table");
+            self.handed.lock().push(table);
+            futures::stream::once(async { Err(StreamError::External(MARKER.to_string())) }).boxed()
+        }
+
+        /// Asserts exactly one stream was requested, for `expected` itself.
+        fn assert_handed_only(&self, expected: &Arc<dyn TableProvider>) {
+            let handed = self.handed.lock();
+            assert_eq!(
+                handed.len(),
+                1,
+                "expected one stream request, got {handed:?}"
+            );
+            assert!(
+                Arc::ptr_eq(&handed[0], expected),
+                "the source must be handed the wrapped table itself, got {:?}",
+                handed[0]
+            );
+        }
+    }
 
     #[async_trait]
     impl DataConnector for StreamingSource {
@@ -804,11 +837,11 @@ mod tests {
         async fn changes_stream(
             &self,
             _context: &dyn ConnectorContext,
-            _federated_table: Arc<dyn FederatedTableProvider>,
+            federated_table: Arc<dyn FederatedTableProvider>,
             _dataset: &DatasetSpec,
             _acceleration: AccelerationContents,
         ) -> Option<ChangesStream> {
-            Some(futures::stream::empty().boxed())
+            Some(self.record(&federated_table))
         }
 
         fn supports_append_stream(&self) -> bool {
@@ -817,10 +850,24 @@ mod tests {
 
         fn append_stream(
             &self,
-            _federated_table: Arc<dyn FederatedTableProvider>,
+            federated_table: Arc<dyn FederatedTableProvider>,
         ) -> Option<ChangesStream> {
-            Some(futures::stream::empty().boxed())
+            Some(self.record(&federated_table))
         }
+    }
+
+    /// Asserts `stream` yields exactly the source's marker item, then ends.
+    async fn assert_yields_only_the_marker(stream: &mut ChangesStream) {
+        match stream.next().await {
+            Some(Err(StreamError::External(message))) if message == MARKER => {}
+            Some(Ok(_)) => panic!("expected the source's marker item, got a change envelope"),
+            Some(Err(other)) => panic!("expected the source's marker item, got {other:?}"),
+            None => panic!("expected the source's marker item, but the stream ended"),
+        }
+        assert!(
+            stream.next().await.is_none(),
+            "the source stream carries only the marker item"
+        );
     }
 
     fn memtable() -> Arc<dyn TableProvider> {
@@ -834,10 +881,10 @@ mod tests {
 
     /// The provider stack an `EmbeddingConnector` is handed when the dataset also has
     /// full-text search: the outer `FullTextConnector` peels its own `IndexLayer`
-    /// off before delegating, leaving the vector scan on top.
-    fn vector_scan_over_memtable() -> Arc<dyn FederatedTableProvider> {
+    /// off before delegating, leaving the vector scan (over `table`) on top.
+    fn vector_scan_over(table: &Arc<dyn TableProvider>) -> Arc<dyn FederatedTableProvider> {
         let vector_scan = VectorScanTableProvider {
-            table_provider: memtable(),
+            table_provider: Arc::clone(table),
             primary_key: vec!["id".to_string()],
             index_list_plans: vec![Arc::new(LogicalPlan::EmptyRelation(EmptyRelation {
                 produce_one_row: false,
@@ -849,9 +896,9 @@ mod tests {
         ))
     }
 
-    fn embedding_connector() -> EmbeddingConnector {
+    fn embedding_connector(source: &Arc<StreamingSource>) -> EmbeddingConnector {
         EmbeddingConnector::new(
-            Arc::new(StreamingSource),
+            Arc::clone(source) as Arc<dyn DataConnector>,
             Arc::new(RwLock::new(EmbeddingModelStore::default())),
             Arc::new(RwLock::new(Secrets::default())),
         )
@@ -865,21 +912,27 @@ mod tests {
     /// `AppendRequiresTimeColumn` (or, on Cayenne, silently stops streaming).
     ///
     /// `changes_stream` has handled this stack since #12086; the two must not diverge again.
-    #[test]
-    fn append_stream_resolves_through_a_vector_scan() {
-        assert!(
-            embedding_connector()
-                .append_stream(vector_scan_over_memtable())
-                .is_some(),
-            "a vector scan must resolve to the source's append stream"
-        );
+    #[tokio::test]
+    async fn append_stream_resolves_through_a_vector_scan() {
+        let source = Arc::new(StreamingSource::default());
+        let table = memtable();
+        let mut stream = embedding_connector(&source)
+            .append_stream(vector_scan_over(&table))
+            .expect("a vector scan must resolve to the source's append stream");
+
+        // The scan's inner table is what the source streams from, and the
+        // source's own stream is what comes back out.
+        source.assert_handed_only(&table);
+        assert_yields_only_the_marker(&mut stream).await;
     }
 
     /// The `EmbeddingTable` arm still works, so the new arm did not shadow it.
-    #[test]
-    fn append_stream_resolves_through_an_embedding_table() {
+    #[tokio::test]
+    async fn append_stream_resolves_through_an_embedding_table() {
+        let source = Arc::new(StreamingSource::default());
+        let base_table = memtable();
         let embedding_table = EmbeddingTable {
-            base_table: memtable(),
+            base_table: Arc::clone(&base_table),
             embedded_columns: std::collections::HashMap::new(),
             embedding_models: Arc::new(RwLock::new(EmbeddingModelStore::default())),
         };
@@ -887,12 +940,14 @@ mod tests {
             Arc::new(embedding_table).into_table() as Arc<dyn TableProvider>,
         ));
 
-        assert!(
-            embedding_connector()
-                .append_stream(federated_table)
-                .is_some(),
-            "an embedding table must still resolve to the source's append stream"
-        );
+        let mut stream = embedding_connector(&source)
+            .append_stream(federated_table)
+            .expect("an embedding table must still resolve to the source's append stream");
+
+        // The base table is what the source streams from, and the items the
+        // source emits are forwarded through the embedding step.
+        source.assert_handed_only(&base_table);
+        assert_yields_only_the_marker(&mut stream).await;
     }
 
     /// The `changes_stream` half of the invariant the test above pins: it has resolved
@@ -916,17 +971,19 @@ mod tests {
 
         let context =
             crate::dataconnector::parameters::RuntimeConnectorContext::for_dataset(&dataset);
-        assert!(
-            embedding_connector()
-                .changes_stream(
-                    &context,
-                    vector_scan_over_memtable(),
-                    &dataset,
-                    AccelerationContents::Unknown,
-                )
-                .await
-                .is_some(),
-            "a vector scan must resolve to the source's changes stream"
-        );
+        let source = Arc::new(StreamingSource::default());
+        let table = memtable();
+        let mut stream = embedding_connector(&source)
+            .changes_stream(
+                &context,
+                vector_scan_over(&table),
+                &dataset,
+                AccelerationContents::Unknown,
+            )
+            .await
+            .expect("a vector scan must resolve to the source's changes stream");
+
+        source.assert_handed_only(&table);
+        assert_yields_only_the_marker(&mut stream).await;
     }
 }

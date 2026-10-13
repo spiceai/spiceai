@@ -82,7 +82,7 @@ mod tests {
 
     use arrow::array::{ArrayRef, Int32Array, NullArray, RecordBatch};
     use arrow_ipc::writer::{
-        CompressionContext, DictionaryTracker, IpcDataGenerator, IpcWriteOptions,
+        DictionaryTracker, IpcDataGenerator, IpcWriteContext, IpcWriteOptions,
     };
     use arrow_schema::{DataType, Field, Schema};
 
@@ -106,7 +106,7 @@ mod tests {
                 batch,
                 &mut tracker,
                 &options,
-                &mut CompressionContext::default(),
+                &mut IpcWriteContext::default(),
             )
             .expect("encoding a batch");
         assert!(
@@ -193,15 +193,24 @@ mod tests {
     #[test]
     fn an_unparseable_header_is_an_error_not_an_absence() {
         let garbage = [0xff_u8; 8];
-        declared_message_header(&garbage).expect_err("a garbage header should not parse");
-        declares_record_batch(&garbage).expect_err("a garbage header should not parse");
-        declares_ipc_data(&garbage).expect_err("a garbage header should not parse");
+        // The root offset points far past the eight bytes, so the flatbuffer verifier refuses
+        // it. Both predicates must pass that exact failure through rather than substitute
+        // their own message or report `Ok(false)`.
+        let refused = "Type `i32` at position 4294967295 is unaligned.\n\n".to_string();
+        assert_eq!(declared_message_header(&garbage), Err(refused.clone()));
+        assert_eq!(declares_record_batch(&garbage), Err(refused.clone()));
+        assert_eq!(declares_ipc_data(&garbage), Err(refused));
     }
 
     /// A truncated header is the shape a keepalive-sized message has: fewer bytes than the
     /// flatbuffer root needs.
     #[test]
     fn a_truncated_header_is_an_error() {
-        declared_message_header(&[0x01, 0x02]).expect_err("a truncated header should not parse");
+        let truncated = [0x01_u8, 0x02];
+        // The four-byte root offset does not fit in two bytes.
+        let refused = "Range [0, 4) is out of bounds.\n\n".to_string();
+        assert_eq!(declared_message_header(&truncated), Err(refused.clone()));
+        assert_eq!(declares_record_batch(&truncated), Err(refused.clone()));
+        assert_eq!(declares_ipc_data(&truncated), Err(refused));
     }
 }

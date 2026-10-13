@@ -1,0 +1,23 @@
+[package]
+description = "object_store HTTP connector that runs request I/O on a dedicated Tokio runtime"
+edition.workspace = true
+homepage.workspace = true
+license-file.workspace = true
+name = "object_store_spawn"
+repository.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+bytes.workspace = true
+http-body = "1.0.1"
+object_store.workspace = true
+snafu.workspace = true
+tokio = { workspace = true, features = ["rt", "sync"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["io-util", "macros", "net", "rt-multi-thread", "time"] }
+
+[lints]
+workspace = true

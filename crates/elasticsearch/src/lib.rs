@@ -102,6 +102,12 @@ pub struct FieldMapping {
     /// parse is worse than one whose `index` needs interpreting — see [`FieldMapping::is_indexed`].
     #[serde(default)]
     pub index: Option<serde_json::Value>,
+    /// The normalizer applied to a `keyword` field's values, if any. Elasticsearch normalizes a
+    /// `term` query's value with it too, so a normalized field matches every value that
+    /// normalizes the same way — `A` and `a` under `lowercase` — which makes it unusable for
+    /// addressing one row's documents exactly. Captured so a caller resolving a key column to a
+    /// field path can refuse it rather than reach a sibling row.
+    pub normalizer: Option<String>,
     /// For `dense_vector` fields.
     pub dims: Option<i64>,
     /// Similarity metric for `dense_vector` (e.g. `cosine`, `l2_norm`, `dot_product`).

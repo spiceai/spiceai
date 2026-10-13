@@ -21,9 +21,9 @@ limitations under the License.
 //! (`SQLite`, Turso, etc.).
 
 use super::metadata::{
-    ColdTierFile, CreateTableOptions, DeleteFile, InlinedData, InlinedDataStats, InlinedDelete,
-    PartitionMetadata, SnapshotFile, SnapshotFileStatistics, TableMetadata, TableStatistics,
-    TableStorageStats,
+    ColdTierFile, CreateTableOptions, DeleteFile, IndexRunRecord, InlinedData, InlinedDataStats,
+    InlinedDelete, PartitionMetadata, SnapshotFile, SnapshotFileStatistics, TableMetadata,
+    TableStatistics, TableStorageStats,
 };
 use arrow_schema::SchemaRef;
 use async_trait::async_trait;
@@ -69,6 +69,35 @@ pub enum CatalogError {
     InvalidOperationNoSource {
         /// Description of the invalid operation
         message: String,
+    },
+
+    /// A compaction's commit found the table on a snapshot other than the one
+    /// the compaction was built from.
+    #[snafu(display(
+        "Table {table_id} moved from snapshot {replaced} to {current} while it was compacted, so the compacted snapshot was not committed"
+    ))]
+    SnapshotReplaced {
+        /// The table the compaction ran on
+        table_id: String,
+        /// The snapshot the compaction was built from
+        replaced: String,
+        /// The snapshot the table points at instead
+        current: String,
+    },
+
+    /// A compaction's commit found that protected snapshots it folded into its
+    /// output are no longer registered: another writer merged or removed them
+    /// while it ran, so committing would register the folded rows twice.
+    #[snafu(display(
+        "Table {table_id} no longer registers {missing} of the {folded} protected snapshots it compacted, so the compacted snapshot was not committed"
+    ))]
+    ProtectedSnapshotsReplaced {
+        /// The table the compaction ran on
+        table_id: String,
+        /// How many protected snapshots the compaction folded
+        folded: usize,
+        /// How many of them the catalog no longer registers
+        missing: usize,
     },
 
     /// IO error
@@ -209,6 +238,11 @@ pub enum CatalogError {
     },
 
     #[snafu(display(
+        "Failed to load table '{table_name}': it was created with 'cayenne_pk_conflict_detection: none', so it can hold more than one row per primary key, and the setting is now 'auto'. An existing table keeps the setting it was created with. To rebuild it from the source with one row per primary key, restart once with 'acceleration.mode: file_create', and with 'write_mode: write_through' if the dataset uses 'write_mode: write_back', then set both back. Rows that exist only in the acceleration are not kept."
+    ))]
+    PkConflictDetectionEnabledOnExistingTable { table_name: String },
+
+    #[snafu(display(
         "Table '{table_name}' metadata is invalid or corrupted. Delete the acceleration, and try again. {source}"
     ))]
     InvalidMetadata {
@@ -275,6 +309,8 @@ pub trait MetadataCatalog: Send + Sync {
     /// in the same transaction: the table aggregate, the snapshot-file cache,
     /// and `cayenne_cold_tier_file.statistics_blob`.
     ///
+    /// Also used when schema evolution has an outstanding row-count delta,
+    /// whose process-local reservation cannot protect the count after reopening.
     /// Used when a widening changes a decimal column's scale. Vortex stores
     /// unscaled integers and decodes them with the current schema's scale, so
     /// publishing the new schema while leaving those blobs in place would
@@ -285,8 +321,20 @@ pub trait MetadataCatalog: Send + Sync {
         schema: &SchemaRef,
     ) -> CatalogResult<()>;
 
-    /// Set the current snapshot ID for a table (`UUIDv7` string).
-    async fn set_current_snapshot(&self, table_id: &str, snapshot_id: &str) -> CatalogResult<()>;
+    /// Point `table_id` at `new_snapshot_id` (`UUIDv7` string) if it still points
+    /// at `replaced_snapshot_id`. Only the pointer changes: unlike
+    /// [`Self::commit_compaction`], delete files, insert records and protected
+    /// snapshots are left as they are.
+    ///
+    /// Changes nothing and returns [`CatalogError::SnapshotReplaced`] when the
+    /// table no longer points at `replaced_snapshot_id`, as
+    /// [`Self::commit_compaction`] does.
+    async fn set_current_snapshot(
+        &self,
+        table_id: &str,
+        replaced_snapshot_id: &str,
+        new_snapshot_id: &str,
+    ) -> CatalogResult<()>;
 
     /// Increment the table's sequence number and return the new value.
     ///
@@ -588,7 +636,17 @@ pub trait MetadataCatalog: Send + Sync {
     /// rows for the table. This is only correct when the rewrite excluded
     /// concurrent writers (it held `write_lock` throughout). For the concurrent
     /// key-delete path use [`Self::commit_compaction_fenced`] instead.
-    async fn commit_compaction(&self, table_id: &str, new_snapshot_id: &str) -> CatalogResult<()>;
+    ///
+    /// `replaced_snapshot_id` is the snapshot the compaction was built from. The
+    /// commit changes nothing and returns [`CatalogError::SnapshotReplaced`] when
+    /// the table no longer points at it: a replacement committed while the
+    /// compaction ran, and committing over it would bring the replaced rows back.
+    async fn commit_compaction(
+        &self,
+        table_id: &str,
+        replaced_snapshot_id: &str,
+        new_snapshot_id: &str,
+    ) -> CatalogResult<()>;
 
     /// Sequence-fenced variant of [`Self::commit_compaction`] for compactions
     /// that ran concurrently with writers.
@@ -607,9 +665,17 @@ pub trait MetadataCatalog: Send + Sync {
     /// Protected snapshots are cleared by explicit id rather than by sequence
     /// because their `sequence_number` column records the delete-fence at
     /// creation, not the snapshot's own creation sequence.
+    ///
+    /// `replaced_snapshot_id` is checked as in [`Self::commit_compaction`]. Every
+    /// id in `protected_snapshot_ids_to_clear` must also still be registered: the
+    /// commit changes nothing and returns
+    /// [`CatalogError::ProtectedSnapshotsReplaced`] when one is not, because a
+    /// writer that merged or removed it since the rewrite folded it would
+    /// otherwise leave the rewritten rows registered twice.
     async fn commit_compaction_fenced(
         &self,
         table_id: &str,
+        replaced_snapshot_id: &str,
         new_snapshot_id: &str,
         cutoff: i64,
         protected_snapshot_ids_to_clear: &[String],
@@ -662,11 +728,15 @@ pub trait MetadataCatalog: Send + Sync {
     /// # Errors
     ///
     /// Returns an error if the transaction cannot be committed.
+    ///
+    /// `delete_files` are position deletion vectors on the new snapshot, hiding
+    /// the copies of keys its incoming data repeated across record batches.
     async fn commit_overwrite(
         &self,
         table_id: &str,
         new_snapshot_id: &str,
         inlined: Option<&InlinedData>,
+        delete_files: &[crate::metadata::DeleteFile],
     ) -> CatalogResult<()>;
 
     /// Add a partition to a table.
@@ -803,6 +873,20 @@ pub trait MetadataCatalog: Send + Sync {
 
     /// Clear the persisted PK existence index for a table.
     async fn clear_pk_index(&self, table_id: &str) -> CatalogResult<()>;
+
+    /// Record a persisted secondary index run, after its file is written.
+    async fn register_index_run(&self, run: &IndexRunRecord) -> CatalogResult<()>;
+
+    /// Every persisted secondary index run of a table.
+    async fn list_index_runs(&self, table_id: &str) -> CatalogResult<Vec<IndexRunRecord>>;
+
+    /// Forget a persisted secondary index run, before its file is deleted.
+    async fn remove_index_run(
+        &self,
+        table_id: &str,
+        index_key: &str,
+        run_name: &str,
+    ) -> CatalogResult<()>;
 
     // ── Inlined data (data inlining for small writes) ──────────────────
 

@@ -102,6 +102,7 @@ impl ReplicationClient {
     /// - TLS requested with Unix socket connection
     #[expect(
         clippy::unused_async,
+        clippy::unused_async_trait_impl,
         reason = "public async constructor: callers await it, and it spawns the worker task"
     )]
     pub async fn connect(cfg: ReplicationConfig) -> Result<Self> {

@@ -36,8 +36,6 @@ use crate::{
     utils::{register_test_connectors, run_query, runtime_ready_check, test_request_context},
 };
 
-const MYSQL_COMMENTS_PORT: u16 = 13320;
-
 fn commented_dataset(port: u16) -> Dataset {
     let mut ds = make_mysql_dataset("orders", "orders", port, false);
     ds.acceleration = Some(Acceleration {
@@ -150,19 +148,20 @@ async fn test_mysql_comments_with_duckdb_acceleration() -> Result<(), anyhow::Er
 
     test_request_context()
         .scope(async {
-            let _container = start_mysql_docker_container(MYSQL_COMMENTS_PORT).await?;
+            let container = start_mysql_docker_container().await?;
+            let port = container.host_port(3306)?;
 
-            wait_for_ddl_ready(MYSQL_COMMENTS_PORT).await?;
+            wait_for_ddl_ready(port).await?;
 
             let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(3)).build();
             retry(retry_strategy, || async {
-                seed_orders(MYSQL_COMMENTS_PORT)
+                seed_orders(port)
                     .await
                     .map_err(RetryError::transient)
             })
             .await?;
 
-            let rt = start_runtime(commented_dataset(MYSQL_COMMENTS_PORT)).await?;
+            let rt = start_runtime(commented_dataset(port)).await?;
 
             let obj_results =
                 run_query(&rt, "SELECT obj_description('orders') AS table_comment").await?;

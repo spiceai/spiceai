@@ -48,6 +48,7 @@ limitations under the License.
 //! below `broadcast_threshold_rows` — broadcasting a large table would move
 //! `N_executors × dim_size` rows and lose.
 
+use datafusion::physical_plan::{StatisticsArgs, StatisticsContext};
 use std::fmt;
 use std::sync::Arc;
 
@@ -162,6 +163,17 @@ impl ExecutionPlan for BroadcastJoinFlightSqlExec {
 
     fn properties(&self) -> &Arc<PlanProperties> {
         &self.properties
+    }
+
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
     }
 
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
@@ -395,7 +407,7 @@ fn side_num_rows(side: &FederatedSide) -> Option<usize> {
     let mut total = 0usize;
     let mut any = false;
     for fe in &side.flight_execs {
-        if let Ok(stats) = fe.partition_statistics(None)
+        if let Ok(stats) = StatisticsContext::new().compute(*fe, &StatisticsArgs::new())
             && let Some(n) = stats.num_rows.get_value()
         {
             total += *n;
@@ -432,6 +444,9 @@ fn safe_output_partitioning(part: &Partitioning, out_schema: &SchemaRef) -> Opti
             Some(Partitioning::Hash(mapped, *n))
         }
         Partitioning::RoundRobinBatch(n) => Some(Partitioning::RoundRobinBatch(*n)),
+        // Range keys are not remapped onto `out_schema`; keep the partition count the
+        // same way an unmappable hash key does.
+        Partitioning::Range(range) => Some(Partitioning::RoundRobinBatch(range.partition_count())),
         Partitioning::UnknownPartitioning(_) => None,
     }
 }
@@ -684,11 +699,11 @@ mod tests {
 
     use arrow_flight::sql::client::FlightSqlServiceClient;
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::common::TableReference;
     use datafusion::common::stats::Precision;
     use datafusion::physical_expr::expressions::IsNotNullExpr;
     use datafusion::physical_plan::filter::FilterExec;
     use datafusion::physical_plan::joins::PartitionMode;
-    use datafusion::sql::TableReference;
     use tonic::transport::Channel;
 
     fn dummy_client() -> FlightSqlClient {

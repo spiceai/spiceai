@@ -34,10 +34,12 @@ use std::sync::Arc;
 
 use datafusion::catalog::TableFunctionImpl;
 use datafusion::logical_expr::ScalarUDF;
-use datafusion::sql::{
-    TableReference,
-    parser::{self, DFParser},
-    sqlparser::{ast, dialect::PostgreSqlDialect},
+use datafusion::{
+    common::TableReference,
+    sql::{
+        parser::{self, DFParser},
+        sqlparser::{ast, dialect::PostgreSqlDialect},
+    },
 };
 use snafu::Snafu;
 use spicepod::component::function::{Function, FunctionKind};
@@ -147,6 +149,24 @@ pub fn supported_schemes() -> &'static str {
         (true, false) => "`sql`, `http://`, `https://`",
         (false, true) => "`sql`, `wasm`",
         (false, false) => "`sql`",
+    }
+}
+
+/// The [`TableType`](datafusion::datasource::TableType) a declared table
+/// function's provider reports. A call lowers to a `TableScan` of that
+/// provider, which carries no function volatility, and a SQL body is only
+/// planned inside `scan`, so the SQL results cache cannot see what the
+/// function calls. It refuses every `Temporary` scan instead, so only an
+/// `immutable` declaration reports `Base` and stays cacheable.
+pub(crate) fn table_type_for_volatility(
+    volatility: spicepod::component::function::Volatility,
+) -> datafusion::datasource::TableType {
+    use datafusion::datasource::TableType;
+    use spicepod::component::function::Volatility;
+
+    match volatility {
+        Volatility::Immutable => TableType::Base,
+        Volatility::Stable | Volatility::Volatile => TableType::Temporary,
     }
 }
 
@@ -781,7 +801,14 @@ mod tests {
             body: None,
             body_ref: None,
             metadata: HashMap::default(),
-            params: HashMap::default(),
+            // The mock endpoint is on loopback, which the SSRF guard refuses unless the
+            // function allows it.
+            params: HashMap::from([(
+                "allowed_endpoint_ranges".to_string(),
+                serde_json::Value::Array(vec![serde_json::Value::String(
+                    "127.0.0.0/8".to_string(),
+                )]),
+            )]),
             depends_on: vec![],
             metrics: None,
             as_tool: true,

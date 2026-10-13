@@ -38,7 +38,7 @@ use std::hash::{Hash, Hasher};
 use std::mem::size_of;
 use std::sync::{Arc, LazyLock};
 
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 
 use super::{Internable, Interner};
 

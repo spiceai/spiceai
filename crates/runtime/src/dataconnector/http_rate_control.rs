@@ -88,6 +88,8 @@ mod tests {
             requests_per_minute: None,
             jitter_min: Duration::ZERO,
             jitter_max: Duration::ZERO,
+            adaptive: AdaptiveRateControl::default(),
+            acquire_timeout: None,
         }
     }
 
@@ -101,6 +103,8 @@ mod tests {
             requests_per_minute: None,
             jitter_min: Duration::ZERO,
             jitter_max: Duration::ZERO,
+            adaptive: AdaptiveRateControl::default(),
+            acquire_timeout: None,
         }
     }
 

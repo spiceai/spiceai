@@ -39,11 +39,16 @@ use http::{HeaderMap, HeaderValue, header::CONTENT_TYPE};
 use mediatype::{MediaType, names};
 use runtime_request_context::{AsyncMarker, RequestContext};
 
+use async_openai::types::chat::ReasoningEffort;
 use futures::StreamExt;
-use llms::chat::nsql::{FailedAttempt, QueryGenerationContext, default::DefaultSqlGeneration};
+use llms::chat::{
+    Chat,
+    nsql::{FailedAttempt, QueryGenerationContext, default::DefaultSqlGeneration},
+};
 use serde::{Deserialize, Serialize};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::RwLock;
+use tracing::Span;
 use tracing_futures::Instrument;
 
 use crate::datafusion::query::QueryBuilder;
@@ -130,6 +135,10 @@ pub struct Request {
     /// Stable prompt-cache key forwarded to the configured NSQL model for provider-specific cache handling.
     #[serde(skip_serializing_if = "Option::is_none", alias = "promptcachekey")]
     pub prompt_cache_key: Option<String>,
+
+    /// How much the model reasons before it writes SQL. Omitted keeps the model setting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<ReasoningEffort>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -516,8 +525,16 @@ pub(crate) async fn post(
     // track ai_inferences_with_spice_count metric
     let context = RequestContext::current(AsyncMarker::new().await);
 
+    // Resolved before the response starts, so a model that cannot serve the request is rejected
+    // with the same status and message whether or not it streams: once an event stream opens,
+    // its status is already 200.
+    let target = match resolve_nsql_target(&rt, &llms, &context, &payload).await {
+        Ok(target) => target,
+        Err((status, message)) => return (status, message).into_response(),
+    };
+
     if payload.stream {
-        let stream = futures::stream::once(handle_nsql_query(rt, context, llms, accept, payload))
+        let stream = futures::stream::once(handle_nsql_query(rt, context, target, accept, payload))
             .map(|(status, _, body)| {
                 if status.is_success() {
                     Ok(Event::default().data(body))
@@ -533,16 +550,56 @@ pub(crate) async fn post(
             )
             .into_response()
     } else {
-        handle_nsql_query(rt, context, llms, accept, payload)
+        handle_nsql_query(rt, context, target, accept, payload)
             .await
             .into_response()
     }
 }
 
-pub(crate) async fn handle_nsql_query(
+/// The model an NSQL request runs on, confirmed loaded, and the `nsql` task span it is recorded
+/// under.
+struct NsqlTarget {
+    model: String,
+    nql_model: Arc<dyn Chat>,
+    span: Span,
+}
+
+/// Resolves the model a request uses and confirms it can serve the request. The task span opens
+/// first, so a rejected request is still recorded in `runtime.task_history`.
+async fn resolve_nsql_target(
+    rt: &Arc<Runtime>,
+    llms: &RwLock<LLMChatCompletionsModelStore>,
+    context: &Arc<RequestContext>,
+    payload: &Request,
+) -> Result<NsqlTarget, (StatusCode, String)> {
+    let model = resolve_nsql_model_name(payload.model.clone(), rt).await?;
+
+    crate::model::add_tools_used(context, 1);
+
+    let span = tracing::span!(target: "task_history", tracing::Level::INFO, "nsql", input = %payload.query, model = %model, "labels");
+
+    crate::task_history::correlation::record_task_history_trace_id(&span, context);
+
+    let nql_model = llms.read().await.get(&model).cloned();
+    let Some(nql_model) = nql_model else {
+        let message = rt
+            .status()
+            .unavailable_model_reason(&model)
+            .unwrap_or_else(|| format!("Model {model} not found"));
+        return Err((StatusCode::BAD_REQUEST, message));
+    };
+
+    Ok(NsqlTarget {
+        model,
+        nql_model,
+        span,
+    })
+}
+
+async fn handle_nsql_query(
     rt: Arc<Runtime>,
     context: Arc<RequestContext>,
-    llms: Arc<RwLock<LLMChatCompletionsModelStore>>,
+    target: NsqlTarget,
     accept: Option<TypedHeader<Accept>>,
     payload: Request,
 ) -> (StatusCode, HeaderMap, String) {
@@ -558,23 +615,17 @@ pub(crate) async fn handle_nsql_query(
 
     let Request {
         query,
-        model: requested_model,
         sample_data_enabled,
         datasets,
         prompt_cache_key,
+        reasoning_effort,
         ..
     } = payload;
-
-    let model = match resolve_nsql_model_name(requested_model, &rt).await {
-        Ok(model) => model,
-        Err((status, message)) => return (status, headers, message),
-    };
-
-    crate::model::add_tools_used(&context, 1);
-
-    let span = tracing::span!(target: "task_history", tracing::Level::INFO, "nsql", input = %query, model = %model, "labels");
-
-    crate::task_history::correlation::record_task_history_trace_id(&span, &context);
+    let NsqlTarget {
+        model,
+        nql_model,
+        span,
+    } = target;
 
     let nsql_context = match build_nsql_context(
         Arc::clone(&rt),
@@ -593,18 +644,6 @@ pub(crate) async fn handle_nsql_query(
         }
     };
     let table_allowlist_opt = nsql_context.table_allowlist.clone();
-
-    let nql_model = {
-        let models = llms.read().await;
-        let Some(nql_model) = models.get(&model) else {
-            return (
-                StatusCode::BAD_REQUEST,
-                headers,
-                format!("Model {model} not found"),
-            );
-        };
-        Arc::clone(nql_model)
-    };
 
     let default_sql_generation = DefaultSqlGeneration {};
     let sql_gen = nql_model.as_sql().unwrap_or(&default_sql_generation);
@@ -636,6 +675,10 @@ pub(crate) async fn handle_nsql_query(
         req.messages.push(nsql_context.message.clone());
         if let Some(prompt_cache_key) = &prompt_cache_key {
             req.prompt_cache_key = Some(prompt_cache_key.clone());
+        }
+        // ReasoningEffort is not Copy. Clone it so a SQL retry keeps the level.
+        if let Some(effort) = reasoning_effort.clone() {
+            req.reasoning_effort = Some(effort);
         }
 
         // Race the LLM call against the NSQL cancellation token so that a
@@ -789,7 +832,9 @@ fn resolve_nsql_model_name_from_app(app: &app::App) -> Result<String, String> {
 mod tests {
     use super::*;
     use crate::{
-        datafusion::udf::UserFunctionInfo,
+        datafusion::{
+            request_context_extension::DataFusionContextExtension, udf::UserFunctionInfo,
+        },
         model::nsql::{
             NsqlColumnContext, NsqlDatasetContext, NsqlDatasetSearchContext, NsqlForeignKeyContext,
             NsqlFullTextSearchContext, NsqlIndexContext, NsqlVectorSearchContext,
@@ -800,9 +845,11 @@ mod tests {
     };
     use app::AppBuilder;
     use axum_extra::extract::Query as ExtraQuery;
-    use datafusion::sql::TableReference;
+    use datafusion::common::TableReference;
     use http::Uri;
     use http_body_util::BodyExt;
+    use runtime_request_context::Protocol;
+    use secrecy::SecretString;
     use serde_json::json;
     use spicepod::component::{
         function::{
@@ -815,6 +862,7 @@ mod tests {
     use std::{
         collections::{BTreeMap, HashMap, HashSet},
         str::FromStr,
+        sync::atomic::{AtomicUsize, Ordering},
     };
 
     fn app_with_models(models: Vec<Model>) -> app::App {
@@ -926,6 +974,226 @@ mod tests {
 
         assert!(request.sample_data_enabled);
         assert_eq!(request.prompt_cache_key.as_deref(), Some("sales-dashboard"));
+    }
+
+    #[test]
+    fn request_accepts_reasoning_effort_and_rejects_unknown_levels() {
+        let request: Request = serde_json::from_value(json!({
+            "query": "show total sales",
+            "reasoning_effort": "low"
+        }))
+        .expect("request should accept a known effort");
+
+        assert_eq!(
+            request.reasoning_effort,
+            Some(async_openai::types::chat::ReasoningEffort::Low)
+        );
+
+        assert!(
+            serde_json::from_value::<Request>(json!({
+                "query": "show total sales",
+                "reasoning_effort": "max"
+            }))
+            .is_err(),
+            "max is not a Spice reasoning effort"
+        );
+    }
+
+    /// Serves `OpenAI` chat completions on a local port. Each request body is sent to the
+    /// returned receiver, and each reply carries the next of `answers` as the generated SQL.
+    async fn serve_scripted_chat_completions(
+        answers: &'static [&'static str],
+    ) -> (
+        String,
+        tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
+    ) {
+        let (requests, received) = tokio::sync::mpsc::unbounded_channel();
+        let next_answer = Arc::new(AtomicUsize::new(0));
+        let router = axum::Router::new().route(
+            "/v1/chat/completions",
+            axum::routing::post(move |Json(body): Json<serde_json::Value>| {
+                let requests = requests.clone();
+                let next_answer = Arc::clone(&next_answer);
+                async move {
+                    requests.send(body).ok();
+                    let sql = answers
+                        .get(next_answer.fetch_add(1, Ordering::SeqCst))
+                        .copied()
+                        .unwrap_or("SELECT 'no scripted answer left' AS answer");
+                    Json(json!({
+                        "id": "chatcmpl-test",
+                        "object": "chat.completion",
+                        "created": 0,
+                        "model": "gpt-test",
+                        "choices": [{
+                            "index": 0,
+                            "message": {
+                                "role": "assistant",
+                                "content": json!({ "sql": sql }).to_string()
+                            },
+                            "finish_reason": "stop"
+                        }],
+                        "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+                    }))
+                }
+            }),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind the test model endpoint");
+        let address = listener
+            .local_addr()
+            .expect("the test model endpoint has an address");
+        tokio::spawn(async move {
+            axum::serve(listener, router)
+                .await
+                .expect("the test model endpoint serves");
+        });
+        (format!("http://{address}/v1"), received)
+    }
+
+    /// Loads `nsql_model`, an `openai:` model served at `endpoint` with the Spicepod `params`
+    /// given, the way the runtime loads a Spicepod model, and sends `request` to `POST /v1/nsql`.
+    async fn post_nsql_to_openai_model(
+        endpoint: &str,
+        params: &[(&str, &str)],
+        request: serde_json::Value,
+    ) -> (StatusCode, String) {
+        let mut model = Model::new("openai:gpt-test", "nsql_model");
+        model.params.insert("endpoint".to_string(), json!(endpoint));
+        model
+            .params
+            .insert("openai_api_key".to_string(), json!("test-key"));
+        for (key, value) in params {
+            model.params.insert((*key).to_string(), json!(value));
+        }
+        let resolved_params: HashMap<String, SecretString> = model
+            .params
+            .iter()
+            .map(|(key, value)| {
+                let value = value.as_str().expect("test model params are strings");
+                (key.clone(), SecretString::from(value.to_string()))
+            })
+            .collect();
+
+        let rt = Arc::new(Runtime::builder().build().await);
+        *rt.app().write().await = Some(Arc::new(app_with_models(vec![model.clone()])));
+        // Loading a Spicepod registers `list_udfs`, which the NSQL context lists functions from.
+        let df = rt.datafusion();
+        df.ctx.register_udtf(
+            crate::udtfs::LIST_UDFS_UDTF_NAME,
+            Arc::new(crate::udtfs::ListUDFTableFunc::new(Arc::clone(&df.ctx))),
+        );
+        let loaded = crate::model::try_to_chat_model(&model, &resolved_params, Arc::clone(&rt))
+            .await
+            .expect("the model should load");
+        let llms: Arc<RwLock<LLMChatCompletionsModelStore>> = Arc::new(RwLock::new(HashMap::from(
+            [("nsql_model".to_string(), loaded.chat)],
+        )));
+
+        // The HTTP router gives each `/v1/nsql` request a context that carries the runtime's
+        // DataFusion, which the handler runs the generated SQL on, and the model context.
+        let context = Arc::new(
+            RequestContext::builder(Protocol::Http)
+                .with_extension(DataFusionContextExtension::new(df))
+                .with_extension(crate::model::ModelContextExtension::new())
+                .build(),
+        );
+        let payload: Request = serde_json::from_value(request).expect("request should deserialize");
+        let response = context
+            .scope(post(
+                Extension(Arc::clone(&rt)),
+                Extension(llms),
+                None,
+                Json(payload),
+            ))
+            .await;
+
+        let status = response.status();
+        let body = response
+            .into_body()
+            .collect()
+            .await
+            .expect("response body should collect")
+            .to_bytes();
+        (
+            status,
+            String::from_utf8(body.to_vec()).expect("response body should be UTF-8"),
+        )
+    }
+
+    /// The `reasoning_effort` of each chat completion request the model endpoint received, in
+    /// order, with `None` for a request that carried none.
+    fn sent_reasoning_efforts(
+        sent: &mut tokio::sync::mpsc::UnboundedReceiver<serde_json::Value>,
+    ) -> Vec<Option<serde_json::Value>> {
+        let mut efforts = Vec::new();
+        while let Ok(request) = sent.try_recv() {
+            efforts.push(request.get("reasoning_effort").cloned());
+        }
+        efforts
+    }
+
+    /// A level the request sets reaches the model on the first attempt and on the retry after
+    /// the generated SQL fails, in place of the model's own setting.
+    #[tokio::test]
+    async fn requested_reasoning_effort_reaches_every_attempt() {
+        let (endpoint, mut sent) = serve_scripted_chat_completions(&[
+            "SELECT no_such_column FROM no_such_table",
+            "SELECT 1 AS answer",
+        ])
+        .await;
+
+        let (status, body) = post_nsql_to_openai_model(
+            &endpoint,
+            &[("reasoning_effort", "high")],
+            json!({ "query": "how many rows", "model": "nsql_model", "reasoning_effort": "low" }),
+        )
+        .await;
+
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&body)
+                .expect("response body should be JSON rows"),
+            json!([{ "answer": 1 }])
+        );
+        assert_eq!(
+            sent_reasoning_efforts(&mut sent),
+            vec![Some(json!("low")), Some(json!("low"))],
+            "the first attempt and the retry each carry the requested level, not the model's"
+        );
+    }
+
+    /// Omitting `reasoning_effort` sends the model's own setting, and no level when the model
+    /// sets none.
+    #[tokio::test]
+    async fn omitted_reasoning_effort_keeps_the_model_setting() {
+        for (params, expected) in [
+            (&[("reasoning_effort", "high")][..], Some(json!("high"))),
+            (&[][..], None),
+        ] {
+            let (endpoint, mut sent) =
+                serve_scripted_chat_completions(&["SELECT 1 AS answer"]).await;
+
+            let (status, body) = post_nsql_to_openai_model(
+                &endpoint,
+                params,
+                json!({ "query": "how many rows", "model": "nsql_model" }),
+            )
+            .await;
+
+            assert_eq!(status, StatusCode::OK, "{body}");
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&body)
+                    .expect("response body should be JSON rows"),
+                json!([{ "answer": 1 }])
+            );
+            assert_eq!(
+                sent_reasoning_efforts(&mut sent),
+                vec![expected],
+                "model params: {params:?}"
+            );
+        }
     }
 
     #[test]
@@ -1457,6 +1725,58 @@ mod tests {
         );
 
         assert!(entries.is_empty());
+    }
+
+    // regression test for #14394
+    #[tokio::test]
+    async fn model_that_failed_to_load_is_rejected_before_any_response_streams() {
+        let rt = Arc::new(Runtime::builder().build().await);
+        *rt.app().write().await = Some(Arc::new(app_with_models(vec![Model::new(
+            "openai:deepseek-chat",
+            "deepseek",
+        )])));
+        rt.status().update_model(
+            "deepseek",
+            crate::status::ComponentStatus::error_with_message("Insufficient Balance"),
+        );
+        // A model that failed to load is never inserted into the chat model store.
+        let llms: Arc<RwLock<LLMChatCompletionsModelStore>> = Arc::default();
+
+        for stream in [true, false] {
+            for model in [Some("deepseek"), None] {
+                let mut request = json!({ "query": "how many rows", "stream": stream });
+                if let Some(model) = model {
+                    request["model"] = json!(model);
+                }
+                let payload: Request =
+                    serde_json::from_value(request).expect("request should deserialize");
+
+                let response = post(
+                    Extension(Arc::clone(&rt)),
+                    Extension(Arc::clone(&llms)),
+                    None,
+                    Json(payload),
+                )
+                .await;
+
+                assert_eq!(
+                    response.status(),
+                    StatusCode::BAD_REQUEST,
+                    "stream: {stream}, model: {model:?}"
+                );
+                let body = response
+                    .into_body()
+                    .collect()
+                    .await
+                    .expect("response body should collect")
+                    .to_bytes();
+                assert_eq!(
+                    String::from_utf8(body.to_vec()).expect("response body should be UTF-8"),
+                    "Model 'deepseek' failed to load, so it cannot serve requests. Cause: Insufficient Balance",
+                    "stream: {stream}, model: {model:?}"
+                );
+            }
+        }
     }
 
     #[test]

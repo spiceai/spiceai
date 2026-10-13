@@ -79,23 +79,26 @@ self-hosted runner — dispatch `signoff.yml` with `run_targeted_prechecks=true`
 to get them back.
 
 **The scoped steps build each crate the way the workspace builds it.** The
-features come from a `cargo metadata` resolve of the whole workspace,
+features come from a `cargo metadata` resolve of the whole workspace with the
+gate's feature set,
 package-qualified (`runtime/debezium,…`), rather than from the crate's own
-defaults. That matters because a crate's defaults are not what it is ever built
-with: `runtime` declares 54 features and **no `default`**, so a bare
-`cargo clippy -p runtime` compiles it with *zero* features, while the workspace
-resolve gives it 35 — `spiced`'s defaults unify them in. Linting and testing a
-configuration no real build produces is what makes a scoped pre-lint fail on code
-the full gate accepts, and it guarantees a cache miss against the gate that
-follows. The resolve is derived on every run, so there is no feature list to
-drift. If `cargo metadata` or `python3` is unavailable the steps fall back to
-package defaults rather than failing.
+defaults. A scoped crate's own defaults can omit capabilities enabled by its
+workspace consumers. `RUST_GATE_FEATURES` in the Makefile defines the features
+shared by full lint, nextest, CLI verification, and this metadata resolve. It
+includes the Cayenne DuckDB differential tests and HTTP/Wasm function features.
+If `cargo metadata` or `python3` is unavailable the targeted steps fall back to
+package defaults; the full workspace gate still runs.
 
-The CLI is built with the same profile as the lint and test passes
-(`build-cli-dev`), not a release build: a release build shares no artifacts with
-them and would recompile its whole dependency graph just to prove the binary
-links. The merge queue's required `Build (release profile)` job builds the CLI,
-`spiced`, and the release install for real.
+Nextest's test build also builds the CLI. `verify-cli` checks cargo's emitted
+artifacts and executes the CLI, using the same selection, features, and profile.
+The merge queue's required `Build (release profile)` job separately builds the
+CLI, `spiced`, and the release install.
+
+Sign-off clears inherited Make flags and nextest filters, profile, retry, and
+empty-suite overrides before invoking the gate. A focused `make nextest` remains
+available for development, but cannot silently narrow a sign-off. The default
+nextest policy retries failures **three times**; the zero-retry correctness
+overrides remain in force. A test that succeeds on a permitted retry still passes.
 
 On success it posts a `signoff` commit status on your current `HEAD`. If the
 **Attestation** check already ran and failed before the sign-off existed, the
@@ -133,7 +136,8 @@ sign-off.
 `scripts/signoff status` reports only a commit's own status; the inheritance
 check runs in the PR's **Attestation** workflow.
 
-A sign-off that **failed** on `HEAD` disqualifies that commit. **Attestation**
+A completed sign-off that **failed**, locally or remotely, posts a failure on
+`HEAD` and refreshes **Attestation**, replacing any previous success. **Attestation**
 rejects it before anything else, so an earlier sign-off cannot be inherited past
 it and the fast-track paths below cannot route around it: a merge of the base
 can be textually clean and still be semantically broken, and a sign-off run
@@ -178,13 +182,20 @@ only, like the other fast-tracks.
 Rust-affecting means Rust sources, the Cargo/toolchain config, **and the config
 files the gate itself reads**:
 
-- `*.rs`, `Cargo.toml`, `Cargo.lock`, `rust-toolchain[.toml]`, `.cargo/`
+- Every file under `crates/`, `bin/`, `tools/`, and `vendor/`, including test
+  fixtures and build inputs; `*.rs`, `*.snap`, and `*.proto` elsewhere
+- Files outside those trees that a Rust source names by a relative path —
+  compiled in with `include_bytes!`/`include_str!` or opened by a test — such
+  as the `test/tls/` PEM files, one of which a `runtime-tls` unit test pins by
+  SHA-256
+- `Cargo.toml`, `Cargo.lock`, `rust-toolchain[.toml]`, `.cargo/`, and `version.txt`
 - `.ci/clippy.toml` (the config `make lint-rust` uses via `CLIPPY_CONF_DIR`) and
   the root `clippy.toml`; `[.]rustfmt.toml`
 - `.config/nextest.toml` — retries, slow-test timeouts, test groups
 - `layers.toml`, `scripts/check_crate_layers.py`,
   `scripts/check_rust_gate_paths.py`, and
-  `scripts/check_module_reachability.py` — the no-compile guards it runs
+  `scripts/check_module_reachability.py` — the no-compile guards it runs — and
+  `scripts/rust_guard_common.py`, the helpers those guards import
 - the root `Makefile` — it holds every `-Dclippy::…` flag the gate enforces
 
 The merge queue still runs the full suite on the merged result — its
@@ -197,8 +208,10 @@ paths), and the `code_changes` filter in `.github/actions/check-code-changes`
 also gates integration and E2E, and it only has to *cover* the set). A path
 missing from all three lands on trunk having never been linted, built, or
 tested, so `make lint-rust` runs `scripts/check_rust_gate_paths.py`. It derives
-what must be gated from what the `lint-rust` recipe reads, from the tracked
-config-file names, and from every tracked `.rs` file — rather than from a list
+what must be gated from what the `lint-rust` recipe reads (including the
+`scripts/` modules its guards import), from the tracked config-file names, from
+tracked sources, fixtures, and build inputs, and from the `../` path literals in
+Rust sources that reach outside the source trees — rather than from a list
 someone has to remember — and fails when the three drift. Change them together.
 
 Deriving from the tracked sources is what catches a whole source *tree* going

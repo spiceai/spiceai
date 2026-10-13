@@ -14,14 +14,10 @@ ignore = [
   "RUSTSEC-2025-0052",
   # Runtime serialization pulls `atomic-polyfill` through `postcard`/`heapless`; no safe upgrade is available yet. Owner: runtime.
   "RUSTSEC-2023-0089",
-  # Retry utilities and async-openai pull `backoff`; no safe upgrade is available yet. Owner: runtime/llms.
-  "RUSTSEC-2025-0012",
   # A transitive local-model dependency still pulls `dotenv`; no safe upgrade is available yet. Owner: llms.
   "RUSTSEC-2021-0141",
   # Local model search dependencies pull `fxhash`; no safe upgrade is available yet. Owner: llms.
   "RUSTSEC-2025-0057",
-  # `instant` is pulled through `backoff`; no safe upgrade is available yet. Owner: runtime/llms.
-  "RUSTSEC-2024-0384",
   # Progress-display dependencies pull `number_prefix`; no safe upgrade is available yet. Owner: llms.
   "RUSTSEC-2025-0119",
   # `paste` is widely used by proc-macro/data connector dependencies; no safe upgrade is available yet. Owner: runtime/data connectors.

@@ -33,7 +33,7 @@ use crate::init_tracing;
 use anyhow::Context;
 use app::AppBuilder;
 use arrow::array::RecordBatch;
-use datafusion::sql::TableReference;
+use datafusion::common::TableReference;
 use datafusion_table_providers::sql::arrow_sql_gen::statement::{
     CreateTableBuilder, InsertBuilder,
 };
@@ -111,13 +111,14 @@ async fn spill_to_disk_and_rehydration() -> Result<(), anyhow::Error> {
 /// 4. Simulate federated dataset access issue after the runtime is restarted, ensure query result remain consistent.
 #[expect(clippy::expect_used)]
 async fn execute_spill_to_disk_and_rehydration(
-    federated_dataset_container: Arc<RunningContainer<'static>>,
+    federated_dataset_container: Arc<RunningContainer>,
     engine: &str,
     db_file_path: Option<&str>,
 ) -> Result<(), anyhow::Error> {
     // retrieve number of rows using native mysql connection
     // this also ensures that federated dataset is available
-    let num_rows = get_lineitem_count().await?;
+    let port = federated_dataset_container.host_port(3306)?;
+    let num_rows = get_lineitem_count(port).await?;
     anyhow::ensure!(num_rows > 0, "lineitem table should contain rows");
 
     let accelerated_db_file_path = resolve_local_db_file_path(engine, db_file_path);
@@ -139,7 +140,7 @@ async fn execute_spill_to_disk_and_rehydration(
         }
     }
 
-    let rt = init_spice_app(engine, db_file_path, false).await?;
+    let rt = init_spice_app(port, engine, db_file_path, false).await?;
     runtime_ready_check(&rt).await;
 
     if std::fs::metadata(&accelerated_db_file_path).is_err() {
@@ -182,7 +183,7 @@ async fn execute_spill_to_disk_and_rehydration(
     .await?;
 
     // Restart the runtime and ensure the loaded items remain consistent
-    let rt = init_spice_app(engine, db_file_path, false).await?;
+    let rt = init_spice_app(port, engine, db_file_path, false).await?;
     // Do request immediately after restart w/o waiting for ready status (dataset is refreshed)
     let restart1_items = run_query(test_query, &rt).await?;
     let restart1_items_pretty =
@@ -192,7 +193,7 @@ async fn execute_spill_to_disk_and_rehydration(
     drop(rt);
 
     // Restart the runtime with updated app definition that includes primary key and indexes
-    let rt = init_spice_app(engine, db_file_path, true).await?;
+    let rt = init_spice_app(port, engine, db_file_path, true).await?;
     let restart2_items = run_query(test_query, &rt).await?;
     let restart2_items_pretty =
         arrow::util::pretty::pretty_format_batches(&restart2_items).expect("pretty format");
@@ -202,7 +203,7 @@ async fn execute_spill_to_disk_and_rehydration(
     drop(rt);
 
     // Simulate federated dataset access issue after the runtime is restarted, ensure query result remain consistent
-    let rt = init_spice_app(engine, db_file_path, false).await?;
+    let rt = init_spice_app(port, engine, db_file_path, false).await?;
     federated_dataset_container.stop().await?;
     let restart3_items = run_query(test_query, &rt).await?;
     let restart3_items_pretty =
@@ -215,18 +216,18 @@ async fn execute_spill_to_disk_and_rehydration(
     Ok(())
 }
 
-async fn get_lineitem_count() -> Result<u64, anyhow::Error> {
+async fn get_lineitem_count(port: u16) -> Result<u64, anyhow::Error> {
     let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
     retry(retry_strategy, || async {
-        get_lineitem_count_once()
+        get_lineitem_count_once(port)
             .await
             .map_err(RetryError::transient)
     })
     .await
 }
 
-async fn get_lineitem_count_once() -> Result<u64, anyhow::Error> {
-    let pool = get_mysql_conn(MYSQL_PORT)?;
+async fn get_lineitem_count_once(port: u16) -> Result<u64, anyhow::Error> {
+    let pool = get_mysql_conn(port)?;
     let mut conn = pool
         .get_conn()
         .await
@@ -296,6 +297,7 @@ async fn run_query(query: &str, rt: &Runtime) -> Result<Vec<RecordBatch>, anyhow
 }
 
 async fn init_spice_app(
+    port: u16,
     acceleration_engine: &str,
     db_file_path: Option<&str>,
     with_pk_and_indexes: bool,
@@ -303,7 +305,7 @@ async fn init_spice_app(
     // Re-register connectors in case a previous runtime shutdown cleared them
     register_test_connectors().await;
 
-    let ds = create_test_dataset(acceleration_engine, db_file_path, with_pk_and_indexes);
+    let ds = create_test_dataset(port, acceleration_engine, db_file_path, with_pk_and_indexes);
 
     let app = AppBuilder::new("spiceapp").with_dataset(ds).build();
 
@@ -323,11 +325,12 @@ async fn init_spice_app(
 }
 
 fn create_test_dataset(
+    port: u16,
     acceleration_engine: &str,
     db_file_path: Option<&str>,
     with_pk_and_indexes: bool,
 ) -> Dataset {
-    let mut ds = make_mysql_dataset("lineitem", "lineitem", MYSQL_PORT, false);
+    let mut ds = make_mysql_dataset("lineitem", "lineitem", port, false);
 
     let mut acceleration = Acceleration {
         enabled: true,
@@ -360,11 +363,9 @@ fn create_test_dataset(
     ds
 }
 
-const MYSQL_PORT: u16 = 13337;
-
 #[instrument]
-async fn init_mysql_db() -> Result<(), anyhow::Error> {
-    let pool = get_mysql_conn(MYSQL_PORT)?;
+async fn init_mysql_db(port: u16) -> Result<(), anyhow::Error> {
+    let pool = get_mysql_conn(port)?;
     let mut conn = pool.get_conn().await?;
 
     tracing::debug!("DROP TABLE IF EXISTS lineitem");
@@ -391,17 +392,18 @@ async fn init_mysql_db() -> Result<(), anyhow::Error> {
 }
 
 #[instrument]
-async fn prepare_test_environment() -> Result<RunningContainer<'static>, String> {
-    let running_container = start_mysql_docker_container(MYSQL_PORT)
-        .await
-        .map_err(|e| {
-            tracing::error!("Failed to start MySQL Docker container: {e}");
-            e.to_string()
-        })?;
+async fn prepare_test_environment() -> Result<RunningContainer, String> {
+    let running_container = start_mysql_docker_container().await.map_err(|e| {
+        tracing::error!("Failed to start MySQL Docker container: {e}");
+        e.to_string()
+    })?;
+    let port = running_container
+        .host_port(3306)
+        .map_err(|e| e.to_string())?;
     tracing::debug!("Container started");
     let retry_strategy = FibonacciBackoffBuilder::new().max_retries(Some(10)).build();
     retry(retry_strategy, || async {
-        init_mysql_db().await.map_err(RetryError::transient)
+        init_mysql_db(port).await.map_err(RetryError::transient)
     })
     .await
     .map_err(|e| {

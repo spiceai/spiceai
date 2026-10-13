@@ -21,7 +21,7 @@ use arrow::{
     compute::cast,
     datatypes::Schema,
 };
-use arrow_tools::map_entries::{self, StreamNormalizer};
+use arrow_tools::map_entries;
 use async_stream::stream;
 use async_trait::async_trait;
 use flight_client::{
@@ -35,6 +35,7 @@ use std::{fmt, sync::Arc, vec};
 
 use arrow_flight::{
     FlightEndpoint, IpcMessage,
+    decode::FlightRecordBatchStream,
     error::FlightError,
     flight_service_client::FlightServiceClient,
     sql::{CommandGetTables, client::FlightSqlServiceClient},
@@ -43,6 +44,7 @@ use datafusion::{
     arrow::datatypes::SchemaRef,
     catalog::Session,
     common::Statistics,
+    common::TableReference,
     common::utils::quote_identifier,
     datasource::TableProvider,
     error::{DataFusionError, Result as DataFusionResult},
@@ -57,7 +59,6 @@ use datafusion::{
         project_schema,
         stream::RecordBatchStreamAdapter,
     },
-    sql::TableReference,
 };
 use runtime_request_context::RequestContext;
 use tonic::codegen::Bytes;
@@ -812,6 +813,20 @@ impl ExecutionPlan for FlightSqlExec {
         &self.properties
     }
 
+    fn apply_expressions(
+        &self,
+        f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        datafusion::physical_plan::apply_expression_roots(
+            self.sort_exprs.iter().map(|sort_expr| &sort_expr.expr),
+            f,
+        )
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![]
     }
@@ -1074,9 +1089,6 @@ pub fn query_to_stream(
     table_name: String,
 ) -> impl Stream<Item = DataFusionResult<RecordBatch>> {
     stream! {
-        // The stream's schema is whatever its batches carry, so the normalizer is resolved from
-        // the first one and reused for the rest.
-        let mut normalizer = StreamNormalizer::new();
         let flight_info = client
             .execute(sql, None)
             .await
@@ -1084,6 +1096,10 @@ pub fn query_to_stream(
 
         for ep in flight_info.endpoint {
             if let Some(tkt) = ep.clone().ticket {
+                // The raw stream rather than `do_get`, which decodes internally: arrow 59 refuses
+                // a schema message that declares a map's `entries` nullable (#13495), so the
+                // message is replaced with the form that decodes before the decoder sees it, and
+                // the batches are put back as the maps the server declared.
                 match get_client_for_flight_endpoint(
                     &client,
                     ep,
@@ -1091,13 +1107,35 @@ pub fn query_to_stream(
                 )
                 .await
                     .map_err(to_execution_error)?
-                    .do_get(tkt.clone()).await {
-                        Ok(mut flight_stream) => {
+                    .do_get_flight_data(tkt.clone()).await {
+                        Ok(response) => {
+                            let declared = DeclaredSchema::default();
+                            let repair = declared.clone();
+                            let (headers, flight_data, _) = response.into_parts();
+                            let flight_data = flight_data
+                                .map_ok(move |message| repair.repair(message))
+                                .map_err(FlightError::from);
+                            let mut flight_stream =
+                                FlightRecordBatchStream::new_from_flight_data(flight_data)
+                                    .with_headers(headers);
+                            let mut normalizer: Option<(SchemaRef, map_entries::MapEntriesNormalizer)> = None;
                             while let Some(batch) = flight_stream.next().await {
                                 match batch {
-                                    Ok(batch) => yield normalizer
-                                        .normalize(batch)
-                                        .map_err(|source| to_execution_error(Error::MapEntriesNotNormalizable { table_name: table_name.clone(), source })),
+                                    Ok(batch) => {
+                                        let schema = declared.get(batch.schema());
+                                        let resolved = match normalizer.take() {
+                                            Some((seen, resolved)) if Arc::ptr_eq(&seen, &schema) => resolved,
+                                            _ => map_entries::MapEntriesNormalizer::for_schema(&schema),
+                                        };
+                                        let outcome = resolved.normalize(batch).map_err(|source| {
+                                            to_execution_error(Error::MapEntriesNotNormalizable {
+                                                table_name: table_name.clone(),
+                                                source,
+                                            })
+                                        });
+                                        normalizer = Some((schema, resolved));
+                                        yield outcome;
+                                    }
                                     Err(error) => yield Err(to_execution_error(Error::UnableToQueryArrowFlight { source: error }))
                                 }
                             }
@@ -1106,6 +1144,34 @@ pub fn query_to_stream(
                 }
             }
         };
+    }
+}
+
+/// The schema a `DoGet` stream's server declared, recorded while its schema messages are
+/// replaced with the form arrow can decode (see [`map_entries::decodable_schema_message`]).
+///
+/// The decoder only ever reports the substituted form, and that is not what a
+/// [`map_entries::MapEntriesNormalizer`] must be built from to put the batches back as the maps
+/// they describe.
+#[derive(Clone, Default)]
+struct DeclaredSchema(Arc<parking_lot::Mutex<Option<SchemaRef>>>);
+
+impl DeclaredSchema {
+    /// Returns `message` with its schema message, if it is one that needs it, replaced by the
+    /// decodable form, recording what it declared. Any other message passes through untouched.
+    fn repair(&self, mut message: arrow_flight::FlightData) -> arrow_flight::FlightData {
+        if let Some((declared, header)) =
+            map_entries::decodable_schema_message(&message.data_header)
+        {
+            *self.0.lock() = Some(declared);
+            message.data_header = header.into();
+        }
+        message
+    }
+
+    /// What the server declared, or `decoded` when no schema message needed replacing.
+    fn get(&self, decoded: SchemaRef) -> SchemaRef {
+        self.0.lock().as_ref().map_or(decoded, Arc::clone)
     }
 }
 
@@ -1154,8 +1220,8 @@ mod tests {
     };
     use bytes::Bytes;
     use datafusion::{
-        execution::TaskContext, physical_expr::PhysicalSortExpr, physical_plan::ExecutionPlan,
-        sql::TableReference,
+        common::TableReference, execution::TaskContext, physical_expr::PhysicalSortExpr,
+        physical_plan::ExecutionPlan,
     };
     use flight_client::cookie::{CookieService, CookieStore};
     use futures::{StreamExt, TryStreamExt};
@@ -1205,12 +1271,15 @@ mod tests {
         )
         .expect("entries struct");
 
-        let data = ArrayData::builder(data_type.clone())
+        let builder = ArrayData::builder(data_type.clone())
             .len(1)
             .add_buffer(Buffer::from_slice_ref([0_i32, 1]))
-            .add_child_data(entries.to_data())
-            .build()
-            .expect("map array data");
+            .add_child_data(entries.to_data());
+        // SAFETY: the offsets, buffers and child data are well formed. Only the
+        // `entries` nullability declaration is what `ArrayData::validate` rejects,
+        // and reproducing it is the point of the fixture — the IPC reader builds
+        // such a map without either entries check.
+        let data = unsafe { builder.build_unchecked() };
 
         (data_type, Arc::new(MapArray::from(data)))
     }
@@ -1284,6 +1353,10 @@ mod tests {
         /// Serves one batch holding a `MAP` column whose `entries` field the server declares
         /// nullable — the shape the Arrow map layout forbids and the IPC reader lets through.
         NullableMapEntries,
+        /// Serves a `MAP` column declaring its `entries` nullable between two dictionary columns,
+        /// with a dictionary nested in the map, numbered the way a server other than `arrow-rs`
+        /// may number them (see [`crate::flight::dictionary_id_fixture`]).
+        NullableMapEntriesWithReorderedDictionaryIds,
     }
 
     struct TestServer {
@@ -1450,6 +1523,12 @@ mod tests {
                         data.into_iter().map(Ok),
                     ))))
                 }
+                DoGetMode::NullableMapEntriesWithReorderedDictionaryIds => {
+                    let data = crate::flight::dictionary_id_fixture::reordered_ids_flight_data();
+                    Ok(Response::new(Box::pin(futures::stream::iter(
+                        data.into_iter().map(Ok),
+                    ))))
+                }
             }
         }
 
@@ -1538,6 +1617,7 @@ mod tests {
     async fn scan_marks_stamped_statistics_inexact_when_filter_pushed() {
         use datafusion::catalog::TableProvider;
         use datafusion::common::stats::Precision;
+        use datafusion::physical_plan::{StatisticsArgs, StatisticsContext};
         use datafusion::prelude::{SessionContext, col, lit};
 
         let table = stamped_table();
@@ -1548,8 +1628,8 @@ mod tests {
             .scan(&session, None, &[], None)
             .await
             .expect("unfiltered scan should build");
-        let unfiltered = plan
-            .partition_statistics(None)
+        let unfiltered = StatisticsContext::new()
+            .compute(&*plan, &StatisticsArgs::new())
             .expect("statistics should be available");
         assert_eq!(
             unfiltered.num_rows,
@@ -1564,8 +1644,8 @@ mod tests {
             .scan(&session, None, std::slice::from_ref(&filter), None)
             .await
             .expect("filtered scan should build");
-        let filtered = plan
-            .partition_statistics(None)
+        let filtered = StatisticsContext::new()
+            .compute(&*plan, &StatisticsArgs::new())
             .expect("statistics should be available");
         assert_eq!(
             filtered.num_rows,
@@ -1588,6 +1668,7 @@ mod tests {
     async fn scan_marks_stamped_statistics_inexact_when_limit_pushed() {
         use datafusion::catalog::TableProvider;
         use datafusion::common::stats::Precision;
+        use datafusion::physical_plan::{StatisticsArgs, StatisticsContext};
         use datafusion::prelude::SessionContext;
 
         let table = stamped_table();
@@ -1597,8 +1678,8 @@ mod tests {
             .scan(&session, None, &[], Some(10))
             .await
             .expect("limited scan should build");
-        let limited = plan
-            .partition_statistics(None)
+        let limited = StatisticsContext::new()
+            .compute(&*plan, &StatisticsArgs::new())
             .expect("statistics should be available");
         assert_eq!(
             limited.num_rows,
@@ -1620,13 +1701,15 @@ mod tests {
     #[tokio::test]
     async fn with_fetch_marks_stamped_statistics_inexact() {
         use datafusion::common::stats::Precision;
+        use datafusion::physical_plan::{StatisticsArgs, StatisticsContext};
 
         let exec = build_exec(lazy_client(), Arc::new(CookieStore::new()))
             .with_statistics(stamped_statistics());
 
         // No limit anywhere: the scan returns the whole stamped slice.
         assert_eq!(
-            exec.partition_statistics(None)
+            StatisticsContext::new()
+                .compute(&exec, &StatisticsArgs::new())
                 .expect("statistics should be available")
                 .num_rows,
             Precision::Exact(150_000),
@@ -1636,8 +1719,8 @@ mod tests {
         let limited = exec
             .with_fetch(Some(10))
             .expect("with_fetch should produce a plan");
-        let stats = limited
-            .partition_statistics(None)
+        let stats = StatisticsContext::new()
+            .compute(&*limited, &StatisticsArgs::new())
             .expect("statistics should be available");
         assert_eq!(
             stats.num_rows,
@@ -1655,8 +1738,8 @@ mod tests {
             .with_fetch(None)
             .expect("with_fetch should produce a plan");
         assert_eq!(
-            unchanged
-                .partition_statistics(None)
+            StatisticsContext::new()
+                .compute(&*unchanged, &StatisticsArgs::new())
                 .expect("statistics should be available")
                 .num_rows,
             Precision::Exact(150_000),
@@ -1925,10 +2008,13 @@ mod tests {
     }
 
     /// Regression test for #13495 over the whole connector read path: a Flight SQL server that
-    /// declares a `MAP`'s `entries` field nullable — which the Arrow map layout forbids and the
-    /// IPC reader lets through — yields a column that no kernel can rebuild. `query_to_stream`
-    /// corrects the declaration as each batch is decoded, so the column that reaches the plan is
-    /// one a kernel can touch.
+    /// declares a `MAP`'s `entries` field nullable — which the Arrow map layout forbids — yields a
+    /// column that no kernel can rebuild. `query_to_stream` corrects the declaration as each batch
+    /// is decoded, so the column that reaches the plan is one a kernel can touch.
+    ///
+    /// It runs through `FlightSqlServiceClient::do_get_flight_data`, a method the
+    /// `spiceai/arrow-rs` fork adds: the stock `do_get` decodes internally, leaving no place to
+    /// replace the schema message before arrow refuses it.
     #[tokio::test]
     async fn query_to_stream_corrects_a_servers_nullable_map_entries_declaration() {
         use arrow::array::MapArray;
@@ -1977,6 +2063,48 @@ mod tests {
         let (field, offsets, entries, nulls, ordered) = map.clone().into_parts();
         MapArray::try_new(field, offsets, entries, nulls, ordered)
             .expect("the corrected column can be rebuilt by a kernel");
+
+        server.shutdown().await;
+    }
+
+    /// Regression test: correcting the map declaration must keep the server's dictionary ids.
+    /// The correction re-encoded the schema message, which numbered the dictionaries afresh, so a
+    /// server numbering its dictionaries in another order had each dictionary column decoded
+    /// against another column's dictionary — wrong values, and no error.
+    #[tokio::test]
+    async fn query_to_stream_keeps_the_servers_dictionary_ids_when_correcting_a_map() {
+        use crate::flight::dictionary_id_fixture::{expected_values, values};
+
+        let cookie_seen = Arc::new(AtomicBool::new(false));
+        let server = TestServer::start(
+            Arc::clone(&cookie_seen),
+            DoGetMode::NullableMapEntriesWithReorderedDictionaryIds,
+        )
+        .await;
+        let cookie_store = Arc::new(CookieStore::new());
+        let channel = Channel::from_shared(format!("http://{}", server.addr))
+            .expect("channel should parse")
+            .connect()
+            .await
+            .expect("channel should connect");
+        let channel = CookieService::new(channel, Arc::clone(&cookie_store));
+        let client: FlightSqlClient =
+            arrow_flight::sql::client::FlightSqlServiceClient::new(channel);
+
+        let batches = query_to_stream(
+            client,
+            "SELECT a, m, c FROM t".to_string(),
+            cookie_store,
+            "\"t\"".to_string(),
+        )
+        .try_collect::<Vec<_>>()
+        .await
+        .expect("a nullable entries declaration is relabelled, not refused");
+
+        let [batch] = batches.as_slice() else {
+            panic!("the server serves exactly one batch, got {}", batches.len());
+        };
+        assert_eq!(values(batch), expected_values());
 
         server.shutdown().await;
     }

@@ -203,8 +203,8 @@ async fn wait_for_ready(
 async fn bootstrap_then_stream_changes() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
 
-    let port = common::get_random_port()?;
-    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let container = common::start_postgres_docker_container_with_logical_wal().await?;
+    let port = usize::from(container.host_port(5432)?);
     let source = setup_source_table(u16::try_from(port).expect("port fits in u16")).await?;
 
     let params = params_for(
@@ -383,8 +383,8 @@ async fn large_value_and_burst_replicate_intact() -> Result<(), anyhow::Error> {
 
     let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
 
-    let port = common::get_random_port()?;
-    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let container = common::start_postgres_docker_container_with_logical_wal().await?;
+    let port = usize::from(container.host_port(5432)?);
     let port_u16 = u16::try_from(port).expect("port fits in u16");
     let source = setup_big_table(port_u16).await?;
 
@@ -505,8 +505,8 @@ async fn large_value_and_burst_replicate_intact() -> Result<(), anyhow::Error> {
 async fn two_replicas_have_independent_slots() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
 
-    let port = common::get_random_port()?;
-    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let container = common::start_postgres_docker_container_with_logical_wal().await?;
+    let port = usize::from(container.host_port(5432)?);
     let source = setup_source_table(u16::try_from(port).expect("port fits in u16")).await?;
 
     // Two independent consumers — same publication, distinct slots.
@@ -1087,8 +1087,8 @@ async fn run_wide_types_scenario(
 async fn resume_with_stale_backlog_is_not_ready_until_caught_up() -> Result<(), anyhow::Error> {
     let _tracing = init_tracing(Some("data_components::postgres_replication=debug,info"));
 
-    let port = common::get_random_port()?;
-    let _container = common::start_postgres_docker_container_with_logical_wal(port).await?;
+    let container = common::start_postgres_docker_container_with_logical_wal().await?;
+    let port = usize::from(container.host_port(5432)?);
     let port = u16::try_from(port).expect("port fits in u16");
     let source = setup_source_table(port).await?;
 

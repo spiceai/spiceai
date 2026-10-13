@@ -1,3 +1,5 @@
+# Spice Cloud is a hosted service, so this runs on the weekly schedule instead of daily.
+schedule: weekly
 tests:
   bench:
     spicepod_path: federated/spicecloud[catalog].yaml

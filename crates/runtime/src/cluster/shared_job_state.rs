@@ -737,4 +737,166 @@ mod tests {
             "graph blob should be gone after removal"
         );
     }
+
+    /// The graph a scheduler persists for a job whose map stage has succeeded: one
+    /// multi-partition task that covered input partitions `0`, `1` and `2` of the
+    /// stage's four and consumed two vcores — deliberately not one per partition, so
+    /// the decoder's fallback of one vcore per partition cannot produce it.
+    fn graph_with_a_multi_partition_task(
+        codec: &BallistaCodec<
+            datafusion_proto::protobuf::LogicalPlanNode,
+            datafusion_proto::protobuf::PhysicalPlanNode,
+        >,
+    ) -> Vec<u8> {
+        use ballista_core::serde::protobuf::{
+            ExecutionGraph, ExecutionGraphStage, ShuffleWritePartition, SuccessfulStage,
+            SuccessfulTask, TaskInfo, execution_graph_stage::StageType, task_info,
+        };
+        use datafusion::arrow::datatypes::Schema;
+        use datafusion::physical_plan::ExecutionPlan;
+        use datafusion::physical_plan::empty::EmptyExec;
+
+        let plan: Arc<dyn ExecutionPlan> = Arc::new(EmptyExec::new(Arc::new(Schema::empty())));
+        let mut plan_bytes = Vec::new();
+        datafusion_proto::protobuf::PhysicalPlanNode::try_from_physical_plan(
+            plan,
+            codec.physical_extension_codec(),
+        )
+        .and_then(|node| node.try_encode(&mut plan_bytes))
+        .expect("encode the stage plan");
+
+        let task = TaskInfo {
+            task_id: 0,
+            partition_id: 0,
+            status: Some(task_info::Status::Successful(SuccessfulTask {
+                executor_id: "executor-1".to_string(),
+                partitions: vec![ShuffleWritePartition {
+                    partition_id: 0,
+                    path: "/job/1/0".to_string(),
+                    num_batches: 1,
+                    num_rows: 1,
+                    num_bytes: 1,
+                    ..Default::default()
+                }],
+                ..Default::default()
+            })),
+            global_input_partition_ids: vec![0, 1, 2],
+            vcores_consumed: 2,
+            ..Default::default()
+        };
+        ExecutionGraph {
+            job_id: "j".to_string(),
+            session_id: "session".to_string(),
+            status: Some(job_status("j", Status::Running(RunningJob::default()))),
+            stages: vec![ExecutionGraphStage {
+                stage_type: Some(StageType::SuccessfulStage(SuccessfulStage {
+                    stage_id: 1,
+                    partitions: 4,
+                    plan: plan_bytes,
+                    task_infos: vec![task],
+                    ..Default::default()
+                })),
+            }],
+            ..Default::default()
+        }
+        .encode_to_vec()
+    }
+
+    /// The task info of stage 1's only task in an encoded graph.
+    fn persisted_task(bytes: &[u8]) -> ballista_core::serde::protobuf::TaskInfo {
+        use ballista_core::serde::protobuf::ExecutionGraph;
+        use ballista_core::serde::protobuf::execution_graph_stage::StageType;
+
+        let graph = ExecutionGraph::decode(bytes).expect("decode the persisted graph");
+        let Some(StageType::SuccessfulStage(stage)) =
+            graph.stages.into_iter().find_map(|stage| stage.stage_type)
+        else {
+            panic!("the persisted graph lost its successful stage");
+        };
+        let [task] = <[_; 1]>::try_from(stage.task_infos).unwrap_or_else(|infos: Vec<_>| {
+            panic!("expected one persisted task, found {}", infos.len())
+        });
+        task
+    }
+
+    /// Regression test for `TaskInfo` proto fields 11 and 12 —
+    /// `global_input_partition_ids` and `vcores_consumed` — which the
+    /// `spiceai/datafusion-ballista` fork adds so its execution-graph serialization
+    /// can persist them. Upstream's tasks cover several input partitions, but
+    /// upstream persists no task info, so its proto has neither field; a merge that
+    /// takes upstream's proto still builds, because the decoder falls back to
+    /// `[partition_id]` and one vcore per partition.
+    ///
+    /// Without them a scheduler that takes over a job keeps only the first partition
+    /// of each recovered multi-partition task, so after an executor loss the others
+    /// are never rescheduled, and it refunds the wrong number of vcores, so the
+    /// executor's budget drifts. The graph goes through the same `load_graph` and
+    /// `put_graph` a takeover and a save use: decoded, the task has to cover all
+    /// three partitions and two vcores, and saved again, the bytes have to carry
+    /// both fields.
+    #[tokio::test]
+    async fn a_persisted_multi_partition_task_keeps_its_partitions_and_vcores() {
+        use ballista_scheduler::state::execution_stage::ExecutionStage;
+
+        let state = test_state();
+        let meta = meta_with(
+            "j",
+            Status::Running(RunningJob::default()),
+            state.owner_instance_id,
+            0,
+        );
+        state
+            .store
+            .put(
+                &state.graph_path("j"),
+                graph_with_a_multi_partition_task(&state.codec).into(),
+            )
+            .await
+            .expect("persist the graph");
+
+        let graph = state.load_graph("j", &meta).await.expect("load the graph");
+        let Some(ExecutionStage::Successful(map_stage)) = graph.stages().get(&1) else {
+            panic!("the loaded graph lost its successful stage");
+        };
+        let [task] = map_stage.task_infos.as_slice() else {
+            panic!(
+                "expected one loaded task, found {}",
+                map_stage.task_infos.len()
+            );
+        };
+        assert_eq!(
+            task.global_input_partition_ids,
+            vec![0, 1, 2],
+            "a recovered multi-partition task has to keep every partition it covered, or \
+             the ones after the first are never rescheduled after an executor loss"
+        );
+        assert_eq!(
+            task.vcores_consumed, 2,
+            "a recovered task has to keep the vcores it consumed, or the executor's budget \
+             is refunded the wrong amount"
+        );
+
+        state
+            .put_graph("j", &graph)
+            .await
+            .expect("save the graph again");
+        let saved = state
+            .store
+            .get(&state.graph_path("j"))
+            .await
+            .expect("read the saved graph")
+            .bytes()
+            .await
+            .expect("read the saved graph's bytes");
+        let task = persisted_task(&saved);
+        assert_eq!(
+            task.global_input_partition_ids,
+            vec![0, 1, 2],
+            "a saved graph has to carry `global_input_partition_ids`"
+        );
+        assert_eq!(
+            task.vcores_consumed, 2,
+            "a saved graph has to carry `vcores_consumed`"
+        );
+    }
 }

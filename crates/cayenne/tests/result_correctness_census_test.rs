@@ -32,10 +32,12 @@
 //!
 //! - a DuckDB parser/syntax rejection (`result_correctness_vs_duckdb_test.rs`,
 //!   the `(Ok, Err)` arm)
-//! - both engines erroring on the same query (the `(Err, Err)` arm — "both
-//!   engines error")
-//! - **a Cayenne/DuckDB result disagreement that is reclassified as `Excluded`
-//!   whenever Cayenne matches the DataFusion baseline** (the `parquet_dir` arm)
+//!
+//! Nothing else is excluded at run time: a Cayenne error is a failure even when
+//! DuckDB fails too, and the SQLite and chDB lanes skip only what the inventory
+//! names. Every lane also reports a cell whose two answers hold no
+//! value as `Vacuous` rather than `Pass`, and accepts it only where the inventory
+//! reviews it; the "reviewed-empty" table below counts those holes.
 //!
 //! So read this number as the **static ceiling**, and get observed outcomes from
 //! an actual run via `support::report::{write_coverage_report, summary_line}`,
@@ -67,8 +69,7 @@
 #![allow(clippy::doc_markdown)]
 #![allow(clippy::cast_precision_loss)]
 
-#[path = "correctness/support/mod.rs"]
-mod support;
+use crate::support;
 
 use std::collections::BTreeMap;
 
@@ -78,7 +79,7 @@ use test_framework::queries::validation::{has_top_level_limit, has_top_level_ord
 /// Engines the inventory carries an exclusion field for.
 const ENGINES: [&str; 3] = ["duckdb", "sqlite", "chdb"];
 
-/// Load modes each suite exercises today.
+/// Load modes each engine's lane exercises per suite today.
 ///
 /// A comparison cell is (query, engine, load mode) — a query only tests something
 /// when it is executed on two engines and the results compared, and the same
@@ -88,18 +89,73 @@ const ENGINES: [&str; 3] = ["duckdb", "sqlite", "chdb"];
 ///
 /// **Maintained by hand against the test binaries** (`InsertOp::Overwrite`,
 /// repeated `InsertOp::Append`, `write_cdc_append_stream` + `finish()`). Update it
-/// when a suite gains a mode, or the load-mode delta it reports goes stale. Today
-/// only CH-benCHmark runs the matrix.
-const SUITE_LOAD_MODES: &[(&str, &[&str])] = &[("chbench", &["full", "append", "changes"])];
+/// when a lane gains a mode, or the load-mode delta it reports goes stale. Today
+/// only CH-benCHmark runs the matrix, on the DuckDB and chDB lanes; the SQLite
+/// lane compares its full load.
+const LANE_LOAD_MODES: &[(&str, &str, &[&str])] = &[
+    ("chbench", "duckdb", &["full", "append", "changes"]),
+    ("chbench", "chdb", &["full", "append", "changes"]),
+];
 
-/// Every suite not named in `SUITE_LOAD_MODES` loads exactly one way.
+/// Every (suite, engine) lane not named in `LANE_LOAD_MODES` loads one way.
 const DEFAULT_LOAD_MODES: &[&str] = &["full"];
 
-fn load_modes_for(suite: &str) -> &'static [&'static str] {
-    SUITE_LOAD_MODES
+/// Layouts each engine's lane loads Cayenne under per suite, besides Cayenne's
+/// default (`support::CayenneLayout`, on the keys in `test_framework::layout`).
+/// The same query compared under another layout exercises another write and
+/// scan path: a keyed table, secondary indexes, a sort or clustering order.
+///
+/// **Maintained by hand against the test binaries** (`support::with_layouts`
+/// calls), like `LANE_LOAD_MODES`. The DuckDB lane runs Cayenne's default only.
+const LANE_LAYOUTS: &[(&str, &str, &[&str])] = &[
+    (
+        "tpch",
+        "sqlite",
+        &["primary_key,indexes,sort", "primary_key,cluster"],
+    ),
+    (
+        "tpcds",
+        "sqlite",
+        &["primary_key,indexes,sort", "primary_key,cluster"],
+    ),
+    ("clickbench", "sqlite", &["indexes,sort", "cluster"]),
+    (
+        "tpch",
+        "chdb",
+        &["primary_key,indexes,sort", "primary_key,cluster"],
+    ),
+    (
+        "tpcds",
+        "chdb",
+        &["primary_key,indexes,sort", "primary_key,cluster"],
+    ),
+    ("clickbench", "chdb", &["indexes,sort", "cluster"]),
+    (
+        "chbench",
+        "chdb",
+        &["primary_key,indexes,sort", "primary_key,cluster"],
+    ),
+];
+
+/// The layouts a lane loads under: Cayenne's default, then `LANE_LAYOUTS`'.
+fn layouts_for(suite: &str, engine: &str) -> Vec<&'static str> {
+    std::iter::once("default")
+        .chain(
+            LANE_LAYOUTS
+                .iter()
+                .find(|(s, e, _)| *s == suite && *e == engine)
+                .map_or(&[][..], |(_, _, layouts)| *layouts)
+                .iter()
+                .copied(),
+        )
+        .collect()
+}
+
+fn load_modes_for(suite: &str, engine: &str) -> &'static [&'static str] {
+    LANE_LOAD_MODES
         .iter()
-        .find(|(s, _)| *s == suite)
-        .map_or(DEFAULT_LOAD_MODES, |(_, modes)| *modes)
+        .find(|(s, e, _)| *s == suite && *e == engine)
+        .map_or(DEFAULT_LOAD_MODES, |(_, _, modes)| *modes)
 }
 
 fn exclusion_for(entry: &InventoryEntry, engine: &str) -> Option<&'static str> {
@@ -182,7 +238,7 @@ fn print_comparison_cell_census() {
     );
     println!("Cells statically excluded: **{}**", overall.excluded);
     println!(
-        "\n> Upper bound. Runtime exclusions (parser rejects, both-engine errors, and\n> Cayenne-matches-DataFusion disagreements) are NOT counted here — take observed\n> outcomes from a run via support::report::summary_line.\n"
+        "\n> Upper bound. The DuckDB lane's runtime exclusions (DuckDB parser rejects) and\n> every lane's reviewed-empty cells are NOT subtracted here — take observed\n> outcomes from a run via support::report::summary_line.\n"
     );
 
     println!("### Cells not statically excluded, per suite\n");
@@ -231,16 +287,63 @@ fn print_comparison_cell_census() {
     let mut mode_cells_total = 0usize;
     let mut flat_cells_total = 0usize;
     for (suite, engines) in &by_suite {
-        let modes = load_modes_for(suite);
-        let flat: usize = engines.values().map(|c| c.compared).sum();
-        let with_modes = flat * modes.len();
+        let mut flat = 0usize;
+        let mut with_modes = 0usize;
+        for engine in ENGINES {
+            let compared = engines.get(engine).map_or(0, |c| c.compared);
+            flat += compared;
+            with_modes += compared * load_modes_for(suite, engine).len();
+        }
+        let modes = if ENGINES
+            .iter()
+            .all(|engine| load_modes_for(suite, engine) == DEFAULT_LOAD_MODES)
+        {
+            DEFAULT_LOAD_MODES.join("/")
+        } else {
+            ENGINES
+                .iter()
+                .map(|engine| format!("{engine} {}", load_modes_for(suite, engine).join("/")))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
         mode_cells_total += with_modes;
         flat_cells_total += flat;
-        println!("| {suite} | {} | {flat} | {with_modes} |", modes.join("/"));
+        println!("| {suite} | {modes} | {flat} | {with_modes} |");
     }
     println!("| **total** | | **{flat_cells_total}** | **{mode_cells_total}** |");
     println!(
-        "\n> Load modes come from a hand-maintained table in this file, not the\n> inventory. Only CH-benCHmark runs full/append/changes today; every other\n> suite loads one way, so the two totals differ only by that suite.\n"
+        "\n> Load modes come from a hand-maintained table in this file, not the\n> inventory. Only CH-benCHmark runs full/append/changes today, on the DuckDB\n> and chDB lanes; every other lane loads one way, so the two totals differ\n> only by those two.\n"
+    );
+
+    // Layout is a third dimension the inventory does not model.
+    println!("\n### Layout cells\n");
+    println!("| suite | layouts | query x engine | query x engine x layout |");
+    println!("|---|---|---|---|");
+    let mut layout_cells_total = 0usize;
+    for (suite, engines) in &by_suite {
+        let mut flat = 0usize;
+        let mut with_layouts = 0usize;
+        let mut described = Vec::new();
+        for engine in ENGINES {
+            let compared = engines.get(engine).map_or(0, |c| c.compared);
+            let layouts = layouts_for(suite, engine);
+            flat += compared;
+            with_layouts += compared * layouts.len();
+            if layouts.len() > 1 {
+                described.push(format!("{engine} {}", layouts.join(" / ")));
+            }
+        }
+        layout_cells_total += with_layouts;
+        let layouts = if described.is_empty() {
+            "default".to_string()
+        } else {
+            described.join("; ")
+        };
+        println!("| {suite} | {layouts} | {flat} | {with_layouts} |");
+    }
+    println!("| **total** | | **{flat_cells_total}** | **{layout_cells_total}** |");
+    println!(
+        "\n> Layouts come from a hand-maintained table in this file. The SQLite and\n> chDB lanes reload TPC-H, TPC-DS and ClickBench, and the chDB lane CH-benCH,\n> under two layouts besides Cayenne's default; every other lane uses the default.\n"
     );
 
     // Row order is a third thing a cell can check. Content compared as a multiset
@@ -287,6 +390,32 @@ fn print_comparison_cell_census() {
     println!(
         "\n> Counted per query, not per cell: the sort check is a self-check on one\n> engine's output, so it runs on every engine lane the query reaches.\n"
     );
+
+    // Compared on paper, but on the fixture a lane loads the answer holds no
+    // value: a cell that compares nothing. Counted per query and fixture, since
+    // emptiness is a property of the fixture's rows, not of an engine.
+    println!("\n### Reviewed-empty queries (compared on paper, nothing to compare)\n");
+    let mut empty_by_fixture: BTreeMap<&'static str, usize> = BTreeMap::new();
+    let mut empty_reasons: BTreeMap<&'static str, usize> = BTreeMap::new();
+    for entry in &inv {
+        if let Some(review) = entry.empty_result_review {
+            for fixture in review.fixtures {
+                *empty_by_fixture.entry(fixture).or_default() += 1;
+            }
+            *empty_reasons.entry(review.reason).or_default() += 1;
+        }
+    }
+    println!("| fixture | reviewed-empty queries |");
+    println!("|---|---|");
+    for (fixture, count) in &empty_by_fixture {
+        println!("| {fixture} | {count} |");
+    }
+    println!("\n| queries | reason |");
+    println!("|---|---|");
+    for (reason, count) in &empty_reasons {
+        let flat = reason.split_whitespace().collect::<Vec<_>>().join(" ");
+        println!("| {count} | {flat} |");
+    }
 
     // The ranking that picks where to expand next: one reason blocking many cells is
     // one dialect shim away from becoming that many cells of real coverage.

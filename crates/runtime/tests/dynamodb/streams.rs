@@ -46,25 +46,14 @@ use tokio::time::sleep;
 use tracing::instrument;
 
 const DYNAMODB_DOCKER_CONTAINER: &str = "runtime-integration-test-dynamodb";
-const PORT1: u16 = 8001;
-const PORT2: u16 = 8002;
-const PORT3: u16 = 8003;
-const PORT4: u16 = 8004;
-const PORT5: u16 = 8005;
-const PORT6: u16 = 8006;
-const PORT7: u16 = 8007;
-const PORT8: u16 = 8008;
+
 const DYNAMODB_HOST_READY_TIMEOUT: Duration = Duration::from_mins(1);
 
 #[instrument]
-pub async fn start_dynamodb_docker_container(
-    port: u16,
-) -> Result<RunningContainer<'static>, anyhow::Error> {
-    let container_name = format!("{DYNAMODB_DOCKER_CONTAINER}-{port}");
-    let container_name: &'static str = Box::leak(container_name.into_boxed_str());
-    let running_container = ContainerRunnerBuilder::new(container_name)
+pub async fn start_dynamodb_docker_container() -> Result<RunningContainer, anyhow::Error> {
+    let running_container = ContainerRunnerBuilder::new(DYNAMODB_DOCKER_CONTAINER)
         .image("amazon/dynamodb-local:latest".to_string())
-        .add_port_binding(8000, port)
+        .publish_port(8000)
         .healthcheck(HealthConfig {
             test: Some(vec![
                 "CMD-SHELL".to_string(),
@@ -81,7 +70,7 @@ pub async fn start_dynamodb_docker_container(
         .run(None)
         .await?;
 
-    wait_for_dynamodb_host_port(port).await?;
+    wait_for_dynamodb_host_port(running_container.host_port(8000)?).await?;
     Ok(running_container)
 }
 
@@ -291,9 +280,10 @@ async fn dynamodb_streams() -> anyhow::Result<()> {
 
     test_request_context()
         .scope(async {
-            let running_container = start_dynamodb_docker_container(PORT2).await?;
+            let running_container = start_dynamodb_docker_container().await?;
+            let port = running_container.host_port(8000)?;
 
-            let client = get_client(PORT2, access_key, secret_key);
+            let client = get_client(port, access_key, secret_key);
 
             create_table(&client, table_name).await;
             insert_rows(&client, "test_table", 0..5).await;
@@ -301,7 +291,7 @@ async fn dynamodb_streams() -> anyhow::Result<()> {
 
             let app = AppBuilder::new("dynamodb_integration_test")
                 .with_dataset(make_dynamodb_dataset(
-                    table_name, PORT2, access_key, secret_key, true,
+                    table_name, port, access_key, secret_key, true,
                 ))
                 .with_sql_cache(SQLResultsCacheConfig {
                     enabled: false,
@@ -370,8 +360,9 @@ async fn dynamodb_streams_delete() -> anyhow::Result<()> {
 
     test_request_context()
         .scope(async {
-            let running_container = start_dynamodb_docker_container(PORT1).await?;
-            let client = get_client(PORT1, access_key, secret_key);
+            let running_container = start_dynamodb_docker_container().await?;
+            let port = running_container.host_port(8000)?;
+            let client = get_client(port, access_key, secret_key);
 
             create_table(&client, table_name).await;
             for i in 0..5 {
@@ -403,7 +394,7 @@ async fn dynamodb_streams_delete() -> anyhow::Result<()> {
 
             let app = AppBuilder::new("dynamodb_batch_delete_test")
                 .with_dataset(make_dynamodb_dataset(
-                    table_name, PORT1, access_key, secret_key, true,
+                    table_name, port, access_key, secret_key, true,
                 ))
                 .with_sql_cache(SQLResultsCacheConfig {
                     enabled: false,
@@ -676,7 +667,7 @@ fn get_acceleration_row_count(duckdb_path: &str, table_name: &str) -> usize {
 }
 
 async fn wait_for_dataset_error(rt: &Runtime, dataset_name: &str, timeout_secs: u64) -> bool {
-    use datafusion::sql::TableReference;
+    use datafusion::common::TableReference;
 
     let table_ref = TableReference::bare(dataset_name);
     let start = std::time::Instant::now();
@@ -808,8 +799,9 @@ async fn dynamodb_rebootstrap_removes_rows_deleted_from_source() -> anyhow::Resu
 
     test_request_context()
         .scope(async {
-            let running_container = start_dynamodb_docker_container(PORT7).await?;
-            let client = get_client(PORT7, access_key, secret_key);
+            let running_container = start_dynamodb_docker_container().await?;
+            let port = running_container.host_port(8000)?;
+            let client = get_client(port, access_key, secret_key);
 
             create_table(&client, table_name).await;
             insert_rows(&client, table_name, 0..5).await;
@@ -824,7 +816,7 @@ async fn dynamodb_rebootstrap_removes_rows_deleted_from_source() -> anyhow::Resu
                 let app = AppBuilder::new("dynamodb_rebootstrap_stale_phase1")
                     .with_dataset(make_dynamodb_dataset_with_file_accel(
                         table_name,
-                        PORT7,
+                        port,
                         access_key,
                         secret_key,
                         duckdb_path_str,
@@ -874,7 +866,7 @@ async fn dynamodb_rebootstrap_removes_rows_deleted_from_source() -> anyhow::Resu
                 let app = AppBuilder::new("dynamodb_rebootstrap_stale_phase3")
                     .with_dataset(make_dynamodb_dataset_with_file_accel(
                         table_name,
-                        PORT7,
+                        port,
                         access_key,
                         secret_key,
                         duckdb_path_str,
@@ -930,8 +922,9 @@ async fn dynamodb_shard_not_found_fresh_checkpoint_propagates_error() -> anyhow:
 
     test_request_context()
         .scope(async {
-            let running_container = start_dynamodb_docker_container(PORT3).await?;
-            let client = get_client(PORT3, access_key, secret_key);
+            let running_container = start_dynamodb_docker_container().await?;
+            let port = running_container.host_port(8000)?;
+            let client = get_client(port, access_key, secret_key);
 
             create_table(&client, table_name).await;
             insert_rows(&client, table_name, 0..5).await;
@@ -949,7 +942,7 @@ async fn dynamodb_shard_not_found_fresh_checkpoint_propagates_error() -> anyhow:
             let app = AppBuilder::new("dynamodb_fresh_checkpoint_test")
                 .with_dataset(make_dynamodb_dataset_with_file_accel(
                     table_name,
-                    PORT3,
+                    port,
                     access_key,
                     secret_key,
                     duckdb_path_str,
@@ -999,8 +992,9 @@ async fn dynamodb_shard_not_found_expired_checkpoint_ready_after_load() -> anyho
 
     test_request_context()
         .scope(async {
-            let running_container = start_dynamodb_docker_container(PORT4).await?;
-            let client = get_client(PORT4, access_key, secret_key);
+            let running_container = start_dynamodb_docker_container().await?;
+            let port = running_container.host_port(8000)?;
+            let client = get_client(port, access_key, secret_key);
 
             create_table(&client, table_name).await;
             insert_rows(&client, table_name, 0..5).await;
@@ -1016,7 +1010,7 @@ async fn dynamodb_shard_not_found_expired_checkpoint_ready_after_load() -> anyho
                 let app = AppBuilder::new("dynamodb_ready_after_load_phase1")
                     .with_dataset(make_dynamodb_dataset_with_file_accel(
                         table_name,
-                        PORT4,
+                        port,
                         access_key,
                         secret_key,
                         duckdb_path_str,
@@ -1068,7 +1062,7 @@ async fn dynamodb_shard_not_found_expired_checkpoint_ready_after_load() -> anyho
                 let app = AppBuilder::new("dynamodb_ready_after_load_phase3")
                     .with_dataset(make_dynamodb_dataset_with_file_accel(
                         table_name,
-                        PORT4,
+                        port,
                         access_key,
                         secret_key,
                         duckdb_path_str,
@@ -1120,8 +1114,9 @@ async fn dynamodb_shard_not_found_expired_checkpoint_ready_before_load() -> anyh
 
     test_request_context()
         .scope(async {
-            let running_container = start_dynamodb_docker_container(PORT5).await?;
-            let client = get_client(PORT5, access_key, secret_key);
+            let running_container = start_dynamodb_docker_container().await?;
+            let port = running_container.host_port(8000)?;
+            let client = get_client(port, access_key, secret_key);
 
             create_table(&client, table_name).await;
             insert_rows(&client, table_name, 0..5).await;
@@ -1137,7 +1132,7 @@ async fn dynamodb_shard_not_found_expired_checkpoint_ready_before_load() -> anyh
                 let app = AppBuilder::new("dynamodb_ready_before_load_phase1")
                     .with_dataset(make_dynamodb_dataset_with_file_accel(
                         table_name,
-                        PORT5,
+                        port,
                         access_key,
                         secret_key,
                         duckdb_path_str,
@@ -1189,7 +1184,7 @@ async fn dynamodb_shard_not_found_expired_checkpoint_ready_before_load() -> anyh
                 let app = AppBuilder::new("dynamodb_ready_before_load_phase3")
                     .with_dataset(make_dynamodb_dataset_with_file_accel(
                         table_name,
-                        PORT5,
+                        port,
                         access_key,
                         secret_key,
                         duckdb_path_str,
@@ -1299,8 +1294,9 @@ async fn dynamodb_streams_cayenne_file_acceleration() -> anyhow::Result<()> {
 
     test_request_context()
         .scope(async {
-            let running_container = start_dynamodb_docker_container(PORT6).await?;
-            let client = get_client(PORT6, access_key, secret_key);
+            let running_container = start_dynamodb_docker_container().await?;
+            let port = running_container.host_port(8000)?;
+            let client = get_client(port, access_key, secret_key);
 
             // Create table with just `id` as hash key (created_at is a non-key attribute)
             create_table(&client, table_name).await;
@@ -1322,7 +1318,7 @@ async fn dynamodb_streams_cayenne_file_acceleration() -> anyhow::Result<()> {
 
             let app = AppBuilder::new("dynamodb_duckdb_file_accel_test")
                 .with_dataset(make_dynamodb_dataset_with_cayenne_acceleration(
-                    table_name, PORT6, access_key, secret_key,
+                    table_name, port, access_key, secret_key,
                 ))
                 .with_sql_cache(SQLResultsCacheConfig {
                     enabled: false,
@@ -1375,15 +1371,16 @@ async fn dynamodb_streams_declared_schema_empty_table() -> anyhow::Result<()> {
 
     test_request_context()
         .scope(async {
-            let running_container = start_dynamodb_docker_container(PORT8).await?;
-            let client = get_client(PORT8, access_key, secret_key);
+            let running_container = start_dynamodb_docker_container().await?;
+            let port = running_container.host_port(8000)?;
+            let client = get_client(port, access_key, secret_key);
 
             // Create table with streams but do NOT insert any rows yet.
             create_table(&client, table_name).await;
 
             // Build dataset with explicit column type declarations so the runtime
             // can initialize schema without scanning any rows.
-            let mut ds = make_dynamodb_dataset(table_name, PORT8, access_key, secret_key, true);
+            let mut ds = make_dynamodb_dataset(table_name, port, access_key, secret_key, true);
             ds.columns = vec![
                 Column::new("id").with_type("text"),
                 Column::new("name").with_type("text"),

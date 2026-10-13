@@ -1,3 +1,5 @@
+# AWS Glue bills per use, so this runs on the weekly schedule instead of daily.
+schedule: weekly
 tests:
   bench:
     spicepod_path: federated/glue[parquet].yaml

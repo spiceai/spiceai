@@ -220,13 +220,90 @@ mod tests {
         )
     }
 
+    /// The exact `Debug` rendering of a config built from individual params for
+    /// user `sa` on host `localhost`. tiberius keeps its `Config` fields
+    /// crate-private, so this is how a test reads back every mapped value.
+    fn individual_config_debug(
+        port: Option<u16>,
+        database: Option<&str>,
+        encryption: &str,
+        trust: &str,
+    ) -> String {
+        format!(
+            "Config {{ host: Some(\"localhost\"), port: {port:?}, database: {database:?}, \
+             instance_name: None, application_name: None, encryption: {encryption}, \
+             trust: {trust}, auth: SqlServer(SqlServerAuth {{ user: \"sa\", password: \"<HIDDEN>\" }}), \
+             readonly: false }}"
+        )
+    }
+
+    fn required_params_with(extra: (&'static str, &'static str)) -> Parameters {
+        make_params(vec![
+            ("username", "sa"),
+            ("password", "pass"),
+            ("host", "localhost"),
+            extra,
+        ])
+    }
+
+    fn expect_missing_parameter(params: &Parameters, expected: &str) {
+        let err = MssqlCatalog::create_config(params)
+            .expect_err("create_config should fail when a required parameter is absent");
+        assert!(
+            matches!(&err, Error::MissingParameter { parameter } if parameter == expected),
+            "expected MissingParameter for '{expected}', got {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!("Missing required parameter: '{expected}'. Specify a value.")
+        );
+    }
+
+    fn expect_invalid_parameter_value(params: &Parameters, expected: &str) {
+        let err = MssqlCatalog::create_config(params)
+            .expect_err("create_config should reject an unrecognized parameter value");
+        assert!(
+            matches!(&err, Error::InvalidParameterValue { parameter } if parameter == expected),
+            "expected InvalidParameterValue for '{expected}', got {err:?}"
+        );
+        assert_eq!(
+            err.to_string(),
+            format!("Invalid parameter value for '{expected}'")
+        );
+    }
+
+    fn expect_failed_to_parse_port(params: &Parameters, expected: &str) {
+        let err = MssqlCatalog::create_config(params)
+            .expect_err("create_config should reject a port that is not a u16");
+        assert!(
+            matches!(&err, Error::FailedToParsePort { port } if port == expected),
+            "expected FailedToParsePort for '{expected}', got {err:?}"
+        );
+        assert_eq!(err.to_string(), format!("Invalid port value: {expected}"));
+    }
+
     #[test]
     fn test_create_config_from_connection_string() {
         let params = make_params(vec![(
             "connection_string",
             "Server=localhost,1433;Database=mydb;User Id=sa;Password=pass;",
         )]);
-        MssqlCatalog::create_config(&params).expect("should create config from connection string");
+        let config = MssqlCatalog::create_config(&params)
+            .expect("should create config from connection string");
+        assert_eq!(config.get_addr(), "localhost:1433");
+        let debug = format!("{config:?}");
+        assert!(
+            debug.starts_with(
+                "Config { host: Some(\"localhost\"), port: Some(1433), database: Some(\"mydb\"), "
+            ),
+            "host, port and database should come from the connection string, got {debug}"
+        );
+        assert!(
+            debug.contains(
+                "auth: SqlServer(SqlServerAuth { user: \"sa\", password: \"<HIDDEN>\" })"
+            ),
+            "the connection string's 'User Id' should authenticate, got {debug}"
+        );
     }
 
     #[test]
@@ -238,142 +315,111 @@ mod tests {
             ("port", "1433"),
             ("database", "testdb"),
         ]);
-        MssqlCatalog::create_config(&params).expect("should create config from individual params");
+        let config = MssqlCatalog::create_config(&params)
+            .expect("should create config from individual params");
+        assert_eq!(config.get_addr(), "localhost:1433");
+        assert_eq!(
+            format!("{config:?}"),
+            individual_config_debug(Some(1433), Some("testdb"), "Required", "Default")
+        );
     }
 
     #[test]
     fn test_create_config_missing_username() {
         let params = make_params(vec![("password", "pass"), ("host", "localhost")]);
-        assert!(
-            MssqlCatalog::create_config(&params).is_err(),
-            "should fail without username"
-        );
+        expect_missing_parameter(&params, "mssql_username");
     }
 
     #[test]
     fn test_create_config_missing_password() {
         let params = make_params(vec![("username", "sa"), ("host", "localhost")]);
-        assert!(
-            MssqlCatalog::create_config(&params).is_err(),
-            "should fail without password"
-        );
+        expect_missing_parameter(&params, "mssql_password");
     }
 
     #[test]
     fn test_create_config_missing_host() {
         let params = make_params(vec![("username", "sa"), ("password", "pass")]);
-        assert!(
-            MssqlCatalog::create_config(&params).is_err(),
-            "should fail without host"
-        );
+        expect_missing_parameter(&params, "mssql_host");
     }
 
     #[test]
     fn test_create_config_invalid_port() {
-        let params = make_params(vec![
-            ("username", "sa"),
-            ("password", "pass"),
-            ("host", "localhost"),
-            ("port", "not_a_number"),
-        ]);
-        assert!(
-            MssqlCatalog::create_config(&params).is_err(),
-            "should fail with invalid port"
-        );
+        let params = required_params_with(("port", "not_a_number"));
+        expect_failed_to_parse_port(&params, "not_a_number");
     }
 
     #[test]
     fn test_create_config_encrypt_true() {
-        let params = make_params(vec![
-            ("username", "sa"),
-            ("password", "pass"),
-            ("host", "localhost"),
-            ("encrypt", "true"),
-        ]);
-        MssqlCatalog::create_config(&params).expect("should accept encrypt=true");
+        let params = required_params_with(("encrypt", "true"));
+        let config = MssqlCatalog::create_config(&params).expect("should accept encrypt=true");
+        assert_eq!(
+            format!("{config:?}"),
+            individual_config_debug(None, None, "Required", "Default")
+        );
     }
 
     #[test]
     fn test_create_config_encrypt_false() {
-        let params = make_params(vec![
-            ("username", "sa"),
-            ("password", "pass"),
-            ("host", "localhost"),
-            ("encrypt", "false"),
-        ]);
-        MssqlCatalog::create_config(&params).expect("should accept encrypt=false");
+        let params = required_params_with(("encrypt", "false"));
+        let config = MssqlCatalog::create_config(&params).expect("should accept encrypt=false");
+        assert_eq!(
+            format!("{config:?}"),
+            individual_config_debug(None, None, "Off", "Default")
+        );
     }
 
     #[test]
     fn test_create_config_encrypt_require() {
-        let params = make_params(vec![
-            ("username", "sa"),
-            ("password", "pass"),
-            ("host", "localhost"),
-            ("encrypt", "require"),
-        ]);
-        MssqlCatalog::create_config(&params).expect("should accept encrypt=require");
+        let params = required_params_with(("encrypt", "require"));
+        let config = MssqlCatalog::create_config(&params).expect("should accept encrypt=require");
+        assert_eq!(
+            format!("{config:?}"),
+            individual_config_debug(None, None, "Required", "Default")
+        );
     }
 
     #[test]
     fn test_create_config_encrypt_disable() {
-        let params = make_params(vec![
-            ("username", "sa"),
-            ("password", "pass"),
-            ("host", "localhost"),
-            ("encrypt", "disable"),
-        ]);
-        MssqlCatalog::create_config(&params).expect("should accept encrypt=disable");
+        let params = required_params_with(("encrypt", "disable"));
+        let config = MssqlCatalog::create_config(&params).expect("should accept encrypt=disable");
+        assert_eq!(
+            format!("{config:?}"),
+            individual_config_debug(None, None, "Off", "Default")
+        );
     }
 
     #[test]
     fn test_create_config_invalid_encrypt() {
-        let params = make_params(vec![
-            ("username", "sa"),
-            ("password", "pass"),
-            ("host", "localhost"),
-            ("encrypt", "invalid"),
-        ]);
-        assert!(
-            MssqlCatalog::create_config(&params).is_err(),
-            "should fail with invalid encrypt value"
-        );
+        let params = required_params_with(("encrypt", "invalid"));
+        expect_invalid_parameter_value(&params, "encrypt");
     }
 
     #[test]
     fn test_create_config_trust_server_certificate_true() {
-        let params = make_params(vec![
-            ("username", "sa"),
-            ("password", "pass"),
-            ("host", "localhost"),
-            ("trust_server_certificate", "true"),
-        ]);
-        MssqlCatalog::create_config(&params).expect("should accept trust_server_certificate=true");
+        let params = required_params_with(("trust_server_certificate", "true"));
+        let config = MssqlCatalog::create_config(&params)
+            .expect("should accept trust_server_certificate=true");
+        assert_eq!(
+            format!("{config:?}"),
+            individual_config_debug(None, None, "Required", "TrustAll")
+        );
     }
 
     #[test]
     fn test_create_config_trust_server_certificate_false() {
-        let params = make_params(vec![
-            ("username", "sa"),
-            ("password", "pass"),
-            ("host", "localhost"),
-            ("trust_server_certificate", "false"),
-        ]);
-        MssqlCatalog::create_config(&params).expect("should accept trust_server_certificate=false");
+        let params = required_params_with(("trust_server_certificate", "false"));
+        let config = MssqlCatalog::create_config(&params)
+            .expect("should accept trust_server_certificate=false");
+        assert_eq!(
+            format!("{config:?}"),
+            individual_config_debug(None, None, "Required", "Default")
+        );
     }
 
     #[test]
     fn test_create_config_invalid_trust_server_certificate() {
-        let params = make_params(vec![
-            ("username", "sa"),
-            ("password", "pass"),
-            ("host", "localhost"),
-            ("trust_server_certificate", "maybe"),
-        ]);
-        assert!(
-            MssqlCatalog::create_config(&params).is_err(),
-            "should fail with invalid trust_server_certificate"
-        );
+        let params = required_params_with(("trust_server_certificate", "maybe"));
+        expect_invalid_parameter_value(&params, "trust_server_certificate");
     }
 
     #[test]
@@ -383,40 +429,39 @@ mod tests {
             ("password", "pass"),
             ("host", "localhost"),
         ]);
-        MssqlCatalog::create_config(&params).expect("should succeed with only required params");
+        let config =
+            MssqlCatalog::create_config(&params).expect("should succeed with only required params");
+        // The secure defaults: the SQL Server port, TLS required, and the
+        // server certificate validated.
+        assert_eq!(config.get_addr(), "localhost:1433");
+        assert_eq!(
+            format!("{config:?}"),
+            individual_config_debug(None, None, "Required", "Default")
+        );
     }
 
     #[test]
     fn test_create_config_encrypt_case_insensitive() {
-        let params = make_params(vec![
-            ("username", "sa"),
-            ("password", "pass"),
-            ("host", "localhost"),
-            ("encrypt", "TRUE"),
-        ]);
-        MssqlCatalog::create_config(&params).expect("should accept case-insensitive encrypt value");
+        for (raw, expected_encryption) in [("TRUE", "Required"), ("FALSE", "Off")] {
+            let params = required_params_with(("encrypt", raw));
+            let config = MssqlCatalog::create_config(&params)
+                .unwrap_or_else(|e| panic!("should accept encrypt={raw}: {e}"));
+            assert_eq!(
+                format!("{config:?}"),
+                individual_config_debug(None, None, expected_encryption, "Default"),
+                "encrypt={raw}"
+            );
+        }
     }
 
     #[test]
     fn test_create_config_port_overflow() {
-        let params = make_params(vec![
-            ("username", "sa"),
-            ("password", "pass"),
-            ("host", "localhost"),
-            ("port", "99999"),
-        ]);
-        assert!(
-            MssqlCatalog::create_config(&params).is_err(),
-            "should fail with port exceeding u16 range"
-        );
-    }
+        let params = required_params_with(("port", "99999"));
+        expect_failed_to_parse_port(&params, "99999");
 
-    #[test]
-    fn test_create_config_empty_params() {
-        let params = make_params(vec![]);
-        assert!(
-            MssqlCatalog::create_config(&params).is_err(),
-            "should fail with no params at all"
-        );
+        // The largest u16 is the last accepted port.
+        let params = required_params_with(("port", "65535"));
+        let config = MssqlCatalog::create_config(&params).expect("port 65535 should be accepted");
+        assert_eq!(config.get_addr(), "localhost:65535");
     }
 }

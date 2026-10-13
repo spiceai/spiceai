@@ -19,7 +19,6 @@ use crate::acceleration::refresh::common::{
     test_append_unix_seconds_for_engine,
 };
 use crate::postgres::common;
-use crate::postgres::common::get_random_port;
 use crate::{
     init_tracing,
     utils::{register_test_connectors, test_request_context},
@@ -33,8 +32,8 @@ async fn test_acceleration_refresh_duckdb_append() -> Result<(), anyhow::Error> 
 
     test_request_context()
         .scope(async {
-            let port: usize = get_random_port()?;
-            let running_container = common::start_postgres_docker_container(port).await?;
+            let running_container = common::start_postgres_docker_container().await?;
+            let port = usize::from(running_container.host_port(5432)?);
 
             let db_conn = initialize_postgres(port).await?;
             let acceleration_config = get_acceleration_config_append("duckdb", None);
@@ -91,8 +90,8 @@ async fn test_acceleration_refresh_duckdb_full() -> Result<(), anyhow::Error> {
 
     test_request_context()
         .scope(async {
-            let port: usize = get_random_port()?;
-            let running_container = common::start_postgres_docker_container(port).await?;
+            let running_container = common::start_postgres_docker_container().await?;
+            let port = usize::from(running_container.host_port(5432)?);
 
             let db_conn = initialize_postgres(port).await?;
             let acceleration_config = get_acceleration_config_full("duckdb", None);

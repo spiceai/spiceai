@@ -140,7 +140,36 @@ impl JobExecutor {
     /// Re-drives an existing job whose owning scheduler was lost, resuming its
     /// distributed execution on this scheduler. No-op if this scheduler is
     /// already driving the job locally.
-    pub async fn resume(&self, job_id: &str) {
+    ///
+    /// Resuming re-plans the job's SQL on this scheduler, and planning is where a
+    /// principal's table access and masking apply. The job records only its
+    /// submitter's opaque storage id, not an identity a plan can be authorized
+    /// against, so a job submitted by an authenticated principal is failed with a
+    /// request to resubmit rather than re-planned without that principal.
+    pub async fn resume(&self, job: &JobState) {
+        let job_id = job.job_id.as_str();
+        if !job.is_owned_by(super::PUBLIC_JOB_OWNER) {
+            tracing::warn!(
+                job_id,
+                "Async query job '{job_id}' was running on a scheduler that stopped, and it cannot be resumed under the identity that submitted it, so it is marked failed; resubmit the query."
+            );
+            if let Err(e) = self
+                .job_store
+                .fail_job(
+                    job_id,
+                    JobErrorCode::SchedulerUnavailable,
+                    "The scheduler running this query stopped before it finished, and the query cannot be resumed under the identity that submitted it. Resubmit the query.",
+                )
+                .await
+            {
+                tracing::warn!(
+                    job_id,
+                    "Failed to mark async query job '{job_id}' failed after its scheduler stopped: {e}"
+                );
+            }
+            return;
+        }
+
         let cancel_token = CancellationToken::new();
         {
             let mut active = self.active_jobs.write().await;
@@ -280,6 +309,13 @@ impl JobExecutor {
         Ok(jobs)
     }
 
+    /// Deletes jobs whose results have expired, with their result chunks.
+    ///
+    /// Returns how many were deleted.
+    pub async fn cleanup_expired_jobs(&self) -> Result<usize> {
+        self.job_store.cleanup_expired_jobs().await
+    }
+
     /// Lists every job regardless of who submitted it.
     ///
     /// For internal schedulers only — the recovery sweep has to see jobs
@@ -304,6 +340,8 @@ impl JobExecutor {
         let state = match job_store.set_job_running(job_id).await {
             Ok(state) => state,
             Err(super::error::Error::ConcurrentModification { .. }) if resume => return Ok(()),
+            // Cancelled (or otherwise finished) before this task started it.
+            Err(super::error::Error::JobAlreadyFinished { .. }) => return Ok(()),
             Err(e) => return Err(e),
         };
 
@@ -503,6 +541,76 @@ mod tests {
             .await
             .expect("job should be created")
             .job_id
+    }
+
+    /// Waits until `job_id` leaves the running state, for at most ten seconds.
+    async fn wait_until_finished(job_store: &JobStore, job_id: &str) -> JobState {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let state = job_store.get_job(job_id).await.expect("job exists");
+            if state.is_terminal() {
+                return state;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "job {job_id} still {} after 10s",
+                state.status
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// Resuming re-plans the job's SQL, and planning is where a principal's access and
+    /// masking apply. The job records only its submitter's opaque id, so a principal's
+    /// job is failed with a request to resubmit rather than re-planned without them.
+    #[tokio::test]
+    async fn resume_fails_a_principals_job_instead_of_running_it_without_the_principal() {
+        let job_store = Arc::new(JobStore::new(Arc::new(InMemory::new()), "test", "node-1"));
+        let job_id = seed_job(&job_store, OWNER).await;
+        let running = job_store
+            .set_job_running(&job_id)
+            .await
+            .expect("the lost scheduler had started the job");
+
+        let executor = executor(Arc::clone(&job_store));
+        executor.resume(&running).await;
+
+        assert!(
+            executor.active_jobs.read().await.is_empty(),
+            "the job must not be re-driven"
+        );
+        let state = job_store.get_job(&job_id).await.expect("job exists");
+        assert_eq!(state.status, JobStatus::Failed);
+        let error = state.error.expect("the failure is recorded");
+        assert!(
+            matches!(error.error_code, JobErrorCode::SchedulerUnavailable),
+            "{:?}",
+            error.error_code
+        );
+        assert!(error.message.contains("Resubmit"), "{}", error.message);
+    }
+
+    /// A job submitted without a principal carries no identity to lose, so it is still
+    /// re-driven. With no distributed scheduler here the re-drive fails, but with the
+    /// submission error rather than the identity refusal.
+    #[tokio::test]
+    async fn resume_still_redrives_a_public_job() {
+        let job_store = Arc::new(JobStore::new(Arc::new(InMemory::new()), "test", "node-1"));
+        let job_id = seed_job(&job_store, PUBLIC_JOB_OWNER).await;
+        let running = job_store
+            .set_job_running(&job_id)
+            .await
+            .expect("the lost scheduler had started the job");
+
+        let executor = executor(Arc::clone(&job_store));
+        executor.resume(&running).await;
+
+        let state = wait_until_finished(&job_store, &job_id).await;
+        let message = state.error.map(|e| e.message).unwrap_or_default();
+        assert!(
+            !message.contains("identity that submitted it"),
+            "a public job is re-driven, not refused: {message}"
+        );
     }
 
     #[tokio::test]

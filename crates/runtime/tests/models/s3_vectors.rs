@@ -48,7 +48,7 @@ pub(crate) mod search {
 
     use anyhow::anyhow;
     use app::AppBuilder;
-    use datafusion::sql::TableReference;
+    use datafusion::common::TableReference;
     use serde_json::json;
     use spicepod::{
         component::{dataset::Dataset, embeddings::EmbeddingChunkConfig},
@@ -782,8 +782,6 @@ pub(crate) mod search {
     async fn s3_vectors_kafka_stream() -> Result<(), anyhow::Error> {
         use crate::utils::test_request_context;
 
-        const KAFKA_PORT: u16 = 19193;
-
         let _tracing: tracing::subscriber::DefaultGuard =
             crate::init_tracing(DEFAULT_TRACING_MODELS);
 
@@ -796,11 +794,9 @@ pub(crate) mod search {
         test_request_context()
             .scope(async {
                 let (running_container, producer) =
-                    crate::kafka::bootstrap::start_kafka_docker_container(
-                        KAFKA_PORT,
-                        &["megascience"],
-                    )
+                    crate::kafka::bootstrap::start_kafka_docker_container(&["megascience"])
                     .await?;
+                let port = running_container.host_port(19092)?;
 
                 tracing::debug!("Container started");
 
@@ -812,7 +808,7 @@ pub(crate) mod search {
                 let mut ds = crate::kafka::bootstrap::make_kafka_dataset(
                     "megascience",
                     "qs",
-                    KAFKA_PORT,
+                    port,
                     None,
                 );
 

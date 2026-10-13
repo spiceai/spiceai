@@ -87,7 +87,12 @@ pub(crate) fn graphql_secondary_quota() -> Quota {
 /// Honours GitHub's own rate-limit headers (`x-ratelimit-*`, `retry-after`).
 /// GraphQL CPU is not estimated locally: HTTP duration is not GitHub CPU, and
 /// a local 60s/min budget serializes scans that GitHub would still accept.
-#[derive(Debug)]
+///
+/// `Clone` shares both maps: use it for every REST client on one token.
+/// [`Self::split_primary_quotas`] is the GraphQL/REST split, not a per-client
+/// constructor — calling it per dataset isolates `core` state that GitHub
+/// meters on the token.
+#[derive(Debug, Clone)]
 pub struct GitHubRateLimiter {
     /// Latest primary state per `x-ratelimit-resource`. GitHub meters each
     /// resource separately, so a `core` response must not answer for the quota
@@ -747,6 +752,41 @@ mod tests {
         assert!(
             poll!(&mut rest_wait).is_pending(),
             "the handle that spent core must wait for it to reset"
+        );
+
+        graphql
+            .check_rate_limit()
+            .now_or_never()
+            .expect("a spent core quota must not hold back a graphql request")
+            .expect("rate limit check failed");
+    }
+
+    /// REST clients on one token share `core`. Cloning the REST handle is how
+    /// two datasets see the same exhaustion; `split_primary_quotas` would give
+    /// each a fresh `core` map.
+    #[tokio::test]
+    async fn cloned_rest_handles_share_core_quota() {
+        let graphql = GitHubRateLimiter::new();
+        let rest_a = graphql.split_primary_quotas();
+        let rest_b = rest_a.clone();
+
+        rest_a
+            .update_from_headers(&create_test_headers(HashMap::from([
+                ("x-ratelimit-limit", s("5000")),
+                ("x-ratelimit-remaining", s("0")),
+                ("x-ratelimit-used", s("5000")),
+                (
+                    "x-ratelimit-reset",
+                    (Utc::now() + Duration::hours(1)).timestamp().to_string(),
+                ),
+                ("x-ratelimit-resource", s("core")),
+            ])))
+            .await;
+
+        let mut wait = std::pin::pin!(rest_b.check_rate_limit());
+        assert!(
+            poll!(&mut wait).is_pending(),
+            "a sibling REST client on the same token must wait on the core quota the first client exhausted"
         );
 
         graphql

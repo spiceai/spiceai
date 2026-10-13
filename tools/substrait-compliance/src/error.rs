@@ -23,6 +23,15 @@ pub type Result<T, E = Error> = std::result::Result<T, E>;
 #[derive(Snafu, Debug)]
 #[snafu(visibility(pub(crate)))]
 pub enum Error {
+    #[snafu(display(
+        "Failed to resolve '{}' against the working directory: {source}",
+        path.display()
+    ))]
+    AbsolutePath {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
     #[snafu(display("Failed to read '{}': {source}", path.display()))]
     ReadFile {
         path: PathBuf,
@@ -61,8 +70,92 @@ pub enum Error {
     ))]
     MissingGolden { test_id: String, path: PathBuf },
 
+    #[snafu(display(
+        "Expected-output directory '{}' does not exist, so no case can be certified. Generate \
+         it with `tools/substrait-compliance/scripts/generate_expected.py` or pass \
+         `--expected <dir>`",
+        path.display()
+    ))]
+    MissingExpectedDir { path: PathBuf },
+
+    #[snafu(display(
+        "Test '{test_id}' has no expected output '{}'. Every case needs one in an `--expected` \
+         directory: a case without its golden would be reported SKIPPED and silently weaken the \
+         run. Regenerate the directory with `tools/substrait-compliance/scripts/generate_expected.py`",
+        path.display()
+    ))]
+    MissingExpectedFile { test_id: String, path: PathBuf },
+
     #[snafu(display("Unknown TPC-H table '{name}' referenced by test '{test_id}'"))]
     UnknownTable { name: String, test_id: String },
+
+    #[snafu(display(
+        "TPC-H scale factor {scale_factor} is not a positive number. Pass `--scale-factor` a \
+         value above 0, such as 1"
+    ))]
+    InvalidScaleFactor { scale_factor: f64 },
+
+    #[snafu(display(
+        "Generated TPC-H key {value} in '{table}.{column}' does not fit the 32-bit key type the \
+         suite's plans declare, so this scale factor cannot run. Lower `--scale-factor`"
+    ))]
+    KeyOutOfRange {
+        table: String,
+        column: String,
+        value: i64,
+    },
+
+    #[snafu(display(
+        "Generated row for '{table}' has {actual} values but the table has {expected} columns"
+    ))]
+    RowWidth {
+        table: String,
+        actual: usize,
+        expected: usize,
+    },
+
+    #[snafu(display(
+        "Generated value for '{table}.{column}' does not match the column's type {data_type}"
+    ))]
+    CellTypeMismatch {
+        table: String,
+        column: String,
+        data_type: String,
+    },
+
+    #[snafu(display(
+        "Column '{table}.{column}' has type {data_type}, which the TPC-H data generator does \
+         not produce"
+    ))]
+    UnsupportedColumnType {
+        table: String,
+        column: String,
+        data_type: String,
+    },
+
+    #[snafu(display("Failed to format a generated '{table}.{column}' value"))]
+    FormatText { table: String, column: String },
+
+    #[snafu(display("Failed to build a generated '{table}' record batch: {source}"))]
+    BuildBatch {
+        table: String,
+        source: arrow::error::ArrowError,
+    },
+
+    #[snafu(display("A TPC-H data generation task failed: {source}"))]
+    GenerateTask { source: tokio::task::JoinError },
+
+    #[snafu(display("Failed to write generated rows to '{}': {source}", path.display()))]
+    WriteCsv {
+        path: PathBuf,
+        source: arrow::error::ArrowError,
+    },
+
+    #[snafu(display("Failed to register generated table '{table}': {source}"))]
+    RegisterGeneratedTable {
+        table: String,
+        source: datafusion::error::DataFusionError,
+    },
 
     #[snafu(display(
         "No TPC-H case matches `--query` '{query}'. Known ids: {known}. \
@@ -86,8 +179,42 @@ pub enum Error {
         source: datafusion::error::DataFusionError,
     },
 
+    #[snafu(display("Mode B could not serve the TPC-H tables through spiced: {detail}"))]
+    ModeBServe { detail: String },
+
     #[snafu(display(
-        "Mode B FlightSQL engine is a stub: start `spiced` with TPC-H datasets and invoke CommandStatementSubstraitPlan (see tools/substrait-compliance/README.md). {detail}"
+        "Mode B needs generated tables to serve through spiced; pass --scale-factor, and --spiced-path for the spiced binary"
     ))]
-    ModeBNotImplemented { detail: String },
+    ModeBNeedsGeneratedData,
+
+    #[snafu(display("Failed to write parquet '{}': {source}", path.display()))]
+    WriteParquet {
+        path: PathBuf,
+        source: datafusion::parquet::errors::ParquetError,
+    },
+
+    #[snafu(display(
+        "`{flag}` applies to Mode B only, and Mode A would ignore it. Pass `--mode mode-b`, or \
+         drop `{flag}`"
+    ))]
+    ModeBOnlyFlag { flag: &'static str },
+
+    #[snafu(display(
+        "`{flag}` configures an acceleration, and `--acceleration-engine none` serves the tables \
+         federated, without one. Pass an acceleration engine, or drop `{flag}`"
+    ))]
+    AccelerationOnlyFlag { flag: &'static str },
+
+    #[snafu(display(
+        "The baseline report '{}' passed none of the cases this run selected, so comparing \
+         against it would check nothing. Pass a baseline that passed them",
+        path.display()
+    ))]
+    BaselineVacuous { path: PathBuf },
+
+    #[snafu(display(
+        "Failed to read the baseline report '{}': {detail}",
+        path.display()
+    ))]
+    Baseline { path: PathBuf, detail: String },
 }

@@ -489,8 +489,14 @@ impl SpicedInstance {
 /// original error should be reported without it.
 const DATASETS_DIAGNOSTIC_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How many unready datasets [`format_unready_summary`] names before folding
+/// the rest into a count, so a pod with hundreds of failing datasets still
+/// produces a one-line error.
+const UNREADY_DATASETS_NAMED: usize = 10;
+
 /// Best-effort diagnostic appended to the readiness-timeout error: how many
-/// datasets are not `Ready`, and the first error among them.
+/// datasets are not `Ready`, which ones and in what status, and the first error
+/// among them.
 ///
 /// The runtime stays up and serving `/v1/datasets` while its datasets fail, so
 /// this is usually available exactly when the timeout fires. It is purely
@@ -537,6 +543,27 @@ fn format_unready_summary(datasets: &[serde_json::Value]) -> String {
     }
 
     let mut summary = format!(". {}/{} datasets not ready", unready.len(), datasets.len());
+
+    // Name every unready dataset with its status. A dataset still loading has
+    // no error message, so without its name and `Initializing`/`Refreshing`
+    // status a slow load reads the same as an unreachable backing service.
+    for (i, dataset) in unready.iter().take(UNREADY_DATASETS_NAMED).enumerate() {
+        let name = dataset
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("<unknown>");
+        let status = dataset
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("<unknown>");
+        let separator = if i == 0 { ": " } else { ", " };
+        let _ = write!(summary, "{separator}`{name}` ({status})");
+    }
+    if let Some(rest) = unready.len().checked_sub(UNREADY_DATASETS_NAMED)
+        && rest > 0
+    {
+        let _ = write!(summary, " and {rest} more");
+    }
 
     // The first dataset carrying a message explains the rest: these arms fail
     // because one shared backing service is unreachable, so every dataset on it
@@ -649,7 +676,64 @@ mod tests {
 
         let summary = format_unready_summary(&datasets);
 
-        assert_eq!(summary, ". 1/2 datasets not ready");
+        assert_eq!(summary, ". 1/2 datasets not ready: `orders` (Initializing)");
+    }
+
+    /// The signature from #13973: every dataset loaded but the largest, which
+    /// was still refreshing when the wait ran out. The message has to say
+    /// which one, and that it was loading rather than failing.
+    #[test]
+    fn unready_summary_names_a_dataset_still_loading() {
+        let mut datasets: Vec<serde_json::Value> = (0..15)
+            .map(|i| serde_json::json!({"name": format!("t{i}"), "status": "Ready"}))
+            .collect();
+        datasets.push(serde_json::json!({
+            "name": "lineitem",
+            "status": "Refreshing",
+            "error_message": null
+        }));
+
+        let summary = format_unready_summary(&datasets);
+
+        assert_eq!(
+            summary,
+            ". 1/16 datasets not ready: `lineitem` (Refreshing)"
+        );
+    }
+
+    /// Past [`UNREADY_DATASETS_NAMED`] the rest are counted, not listed, so
+    /// the error stays one readable line.
+    #[test]
+    fn unready_summary_caps_the_named_datasets() {
+        let datasets: Vec<serde_json::Value> = (0..12)
+            .map(|i| serde_json::json!({"name": format!("t{i}"), "status": "Initializing"}))
+            .collect();
+
+        let summary = format_unready_summary(&datasets);
+
+        assert_eq!(
+            summary,
+            ". 12/12 datasets not ready: `t0` (Initializing), `t1` (Initializing), \
+             `t2` (Initializing), `t3` (Initializing), `t4` (Initializing), \
+             `t5` (Initializing), `t6` (Initializing), `t7` (Initializing), \
+             `t8` (Initializing), `t9` (Initializing) and 2 more"
+        );
+    }
+
+    /// Exactly [`UNREADY_DATASETS_NAMED`] unready datasets are all named, with
+    /// no dangling "and 0 more".
+    #[test]
+    fn unready_summary_names_all_at_the_cap() {
+        let datasets: Vec<serde_json::Value> = (0..UNREADY_DATASETS_NAMED)
+            .map(|i| serde_json::json!({"name": format!("t{i}"), "status": "Refreshing"}))
+            .collect();
+
+        let summary = format_unready_summary(&datasets);
+
+        assert!(
+            summary.ends_with("`t9` (Refreshing)"),
+            "all {UNREADY_DATASETS_NAMED} are named and nothing is folded, got: {summary}"
+        );
     }
 
     /// The diagnostic must add nothing when it has nothing to say, so the
@@ -677,7 +761,8 @@ mod tests {
 
         assert_eq!(
             summary,
-            ". 3/3 datasets not ready; first error on `c`: the real one"
+            ". 3/3 datasets not ready: `a` (Error), `b` (Error), `c` (Error); \
+             first error on `c`: the real one"
         );
     }
 

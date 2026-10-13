@@ -1,5 +1,5 @@
 name: htap benchmark tests
-run-name: CH-BenCHmark - ${{ github.event.inputs.spicepod_path }} - SF${{ github.event.inputs.scale_factor }} - ${{ github.event.inputs.duration }}s
+run-name: CH-BenCHmark - ${{ github.event.inputs.spicepod_path }} - SF${{ github.event.inputs.scale_factor }} - ${{ github.event.inputs.duration }}s${{ github.event.inputs.source_version != '' && format(' - source {0}', github.event.inputs.source_version) || '' }}${{ github.event.inputs.layout != '' && format(' - layout {0}', github.event.inputs.layout) || '' }}
 
 on:
   workflow_dispatch:
@@ -72,6 +72,16 @@ on:
         required: false
         default: ''
         type: string
+      source_version:
+        description: 'Source database release line, one of its versions in test/source_versions.json; empty = PostgreSQL 16 or MySQL 8.4. Only for runners that start the source in Docker: the in-cluster sources on spiceai-dev-xlarge-runners have fixed versions.'
+        required: false
+        default: ''
+        type: string
+      layout:
+        description: 'Acceleration layout to configure on every accelerated dataset (testoperator --layout): features from indexes, sort, cluster, time_column, partition, joined by commas; empty = the spicepod as written'
+        required: false
+        default: ''
+        type: string
 
 # Serialize ALL SF100 + SF1000 CH-benCHmark runs across every variant (sqlite/turso cdc-tuned,
 # adaptive, duckdb): they share ONE concurrency group keyed only by scale factor, so
@@ -122,6 +132,16 @@ jobs:
           echo "SOURCE_TYPE=${SOURCE_TYPE}" >> $GITHUB_OUTPUT
           echo "Derived source_type=${SOURCE_TYPE} from spicepod $(basename "${SPICEPOD_PATH}")"
 
+      # Refuse a version the run could not honour rather than report results for a
+      # different server than the one asked for.
+      - name: Check the source version can be honoured
+        if: github.event.inputs.source_version != '' && github.event.inputs.runner_type == 'spiceai-dev-xlarge-runners'
+        env:
+          SOURCE_VERSION: ${{ github.event.inputs.source_version }}
+        run: |
+          echo "::error::source_version=${SOURCE_VERSION} needs a runner that starts the source in Docker; the in-cluster sources on spiceai-dev-xlarge-runners have fixed versions. Pick another runner_type, or leave source_version empty."
+          exit 1
+
       - name: Validate spicepod file exists
         run: |
           if [ ! -f "${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}" ]; then
@@ -129,6 +149,26 @@ jobs:
             exit 1
           fi
           echo "Spicepod file found at ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}"
+
+      # The adaptive configs place their Cayenne datalake tier under this run's id, via
+      # `${env:GITHUB_RUN_ID}` in `cayenne_datalake_location`. spiced does not resolve references
+      # in that parameter yet (#14711) and would write under a literal `${env:GITHUB_RUN_ID}`
+      # prefix that every run shares and the cleanup step below never deletes, so the reference is
+      # substituted into the checked-out spicepod before spiced reads it.
+      - name: Scope the Cayenne datalake tier to this run
+        env:
+          SPICEPOD: ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}
+        run: |
+          if ! grep -q 'cayenne_datalake_location:.*\${env:GITHUB_RUN_ID}' "${SPICEPOD}"; then
+            echo "No run-scoped datalake location in ${SPICEPOD}; nothing to substitute."
+            exit 0
+          fi
+          sed -i "/cayenne_datalake_location:/ s|\${env:GITHUB_RUN_ID}|${GITHUB_RUN_ID}|g" "${SPICEPOD}"
+          if grep -q 'cayenne_datalake_location:.*\${' "${SPICEPOD}"; then
+            echo "::error::A reference is still left in cayenne_datalake_location in ${SPICEPOD}; spiced would write the datalake tier under it literally."
+            exit 1
+          fi
+          grep -n 'cayenne_datalake_location:' "${SPICEPOD}"
 
       - name: Install MinIO
         uses: ./.github/actions/setup-minio
@@ -200,6 +240,8 @@ jobs:
       - name: Setup CH-benCH PostgreSQL
         if: steps.set_spicepod_path.outputs.SOURCE_TYPE != 'mysql' && github.event.inputs.runner_type != 'spiceai-dev-xlarge-runners'
         uses: ./.github/actions/setup-chbench-postgres
+        with:
+          version: ${{ github.event.inputs.source_version || '16' }}
 
       # MySQL source: on spiceai-dev-xlarge-runners a dedicated in-cluster MySQL
       # pod is used (chbench-mysql.dataplatform.svc.cluster.local, like Postgres),
@@ -207,6 +249,8 @@ jobs:
       - name: Setup CH-benCH MySQL
         if: steps.set_spicepod_path.outputs.SOURCE_TYPE == 'mysql' && github.event.inputs.runner_type != 'spiceai-dev-xlarge-runners'
         uses: ./.github/actions/setup-chbench-mysql
+        with:
+          version: ${{ github.event.inputs.source_version || '8.4' }}
 
       # The xlarge PG pod is long-lived, so cache a pristine seed as a Postgres
       # template database and restore chbench from it (FILE_COPY, seconds) instead
@@ -358,6 +402,7 @@ jobs:
             ${{ steps.set_spicepod_path.outputs.SOURCE_TYPE == 'mysql' && '--analytic-gate-concurrency 16' || '' }} \
             --disable-progress-bars \
             --metrics \
+            ${LAYOUT:+--layout "$LAYOUT"} \
             --metrics-dump "${GITHUB_WORKSPACE}/htap-metrics.json" \
             --summary-out "${GITHUB_WORKSPACE}/htap-summary.md" 2>&1 | tee "${GITHUB_WORKSPACE}/htap-run.log"
           # ${PIPESTATUS[0]} is testoperator's real exit (not tee's), so a failed
@@ -372,6 +417,7 @@ jobs:
           [ -n "$DIAG_PIDS" ] && kill $DIAG_PIDS 2>/dev/null || true
           exit $testop_exit
         env:
+          LAYOUT: ${{ github.event.inputs.layout }}
           SPICEAI_BENCHMARK_METRICS_KEY: ${{ secrets.SPICEAI_BENCHMARK_METRICS_KEY }}
           SPICED_COMMIT: ${{ steps.setup-spiced.outputs.SPICED_COMMIT }}
           # Dedicated in-cluster PG pod on xlarge; per-run docker container (loopback) elsewhere.
@@ -388,7 +434,7 @@ jobs:
       # Upload the under-load diagnostics dir
       - name: Upload HTAP diagnostics
         if: always() && github.event.inputs.collect_diagnostics == 'true'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: htap-diagnostics-sf${{ github.event.inputs.scale_factor }}-${{ github.run_id }}
           path: htap-diagnostics/
@@ -429,7 +475,7 @@ jobs:
       # waterfall can be re-run offline against different thresholds.
       - name: Upload metrics dump + run log
         if: always()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: htap-metrics-sf${{ github.event.inputs.scale_factor }}-${{ github.run_id }}
           path: |
@@ -486,25 +532,37 @@ jobs:
           fi
 
       # The MinIO `benchmarks` bucket is shared across runs, so the Cayenne datalake (cold) tier
-      # (cayenne_datalake_location: s3://benchmarks/cayenne-cold-*/) would otherwise accumulate
-      # cold files every run: each promotion writes a new UUID-named prefix and nothing GCs them
-      # (the query path reads the metastore manifest, never an S3 listing, so a fresh run never
-      # references a prior run's objects — they are dead weight, not a collision). Drop the whole
-      # cold prefix after the run. Gated to the cold configs (any `-cold` spicepod); `mc` + the
-      # `spice-minio` alias come from the Install MinIO step above. Runs on failure/cancel too so a
-      # crashed run leaves no orphans.
+      # would otherwise accumulate cold files every run: each promotion writes a new UUID-named
+      # prefix and nothing GCs them (the query path reads the metastore manifest, never an S3
+      # listing, so a fresh run never references a prior run's objects — they are dead weight, not
+      # a collision). The adaptive configs write under `s3://benchmarks/cayenne-datalake/<run id>/`
+      # (substituted by the "Scope the Cayenne datalake tier to this run" step), so this drops
+      # exactly this run's objects, never those of a run still in flight; the
+      # hand-tuned `-cold` configs use fixed `cayenne-cold-sf*` prefixes, dropped after their own
+      # runs. `mc` + the `spice-minio` alias come from the Install MinIO step above. Runs on
+      # failure/cancel too so a crashed run leaves no orphans.
       - name: Clean up Cayenne datalake-tier S3 objects
-        if: always() && contains(github.event.inputs.spicepod_path, '-cold')
+        if: always()
+        env:
+          SPICEPOD: ${{ steps.set_spicepod_path.outputs.SPICEPOD_PATH }}
         run: |
-          if command -v mc >/dev/null 2>&1; then
-            # Non-fatal: a cleanup miss must never fail the benchmark run, so every mc call is guarded
-            # with `|| true`. We print a one-line size/count summary per prefix (mc du) before deleting.
-            for prefix in cayenne-cold-sf1000 cayenne-cold-sf10; do
-              target="spice-minio/benchmarks/${prefix}/"
-              summary=$(mc du "${target}" 2>/dev/null || true)
-              echo "Cleaning ${target} — ${summary:-empty (no promotion ran)}"
-              mc rm --recursive --force "${target}" >/dev/null 2>&1 || true
-            done
-          else
-            echo "mc client not found; skipping datalake-tier S3 cleanup."
+          if ! grep -q 'cayenne_datalake_location' "${SPICEPOD}" 2>/dev/null; then
+            echo "No datalake tier in ${SPICEPOD:-<unset>}; nothing to clean."
+            exit 0
           fi
+          if ! command -v mc >/dev/null 2>&1; then
+            echo "mc client not found; skipping datalake-tier S3 cleanup."
+            exit 0
+          fi
+          prefixes=("cayenne-datalake/${GITHUB_RUN_ID}")
+          case "${SPICEPOD}" in
+            *-cold*) prefixes+=(cayenne-cold-sf1000 cayenne-cold-sf10) ;;
+          esac
+          # Non-fatal: a cleanup miss must never fail the benchmark run, so every mc call is guarded
+          # with `|| true`. We print a one-line size/count summary per prefix (mc du) before deleting.
+          for prefix in "${prefixes[@]}"; do
+            target="spice-minio/benchmarks/${prefix}/"
+            summary=$(mc du "${target}" 2>/dev/null || true)
+            echo "Cleaning ${target} — ${summary:-empty (no promotion ran)}"
+            mc rm --recursive --force "${target}" >/dev/null 2>&1 || true
+          done

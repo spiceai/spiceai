@@ -19,7 +19,7 @@ use crate::component::dataset::acceleration::ZeroResultsAction;
 use crate::model::EmbeddingModelStore;
 use crate::secrets::Secrets;
 use datafusion::datasource::TableProvider;
-use datafusion::{prelude::SessionContext, sql::TableReference};
+use datafusion::{common::TableReference, prelude::SessionContext};
 #[cfg(any(feature = "s3_vectors", feature = "elasticsearch"))]
 use runtime_datafusion_udfs::EMBED_UDF_NAME;
 use spicepod::vector::VectorStore;

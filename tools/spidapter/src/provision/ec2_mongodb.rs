@@ -166,6 +166,8 @@ pub(crate) async fn launch_mongodb_ec2(
 
 /// Build the cloud-init user-data script that installs and configures `MongoDB`.
 ///
+/// The apt suite is Ubuntu 24.04 (`noble`). The EC2 AMI must be Ubuntu 24.04.
+///
 /// `MongoDB` is started as a single-node replica set (`rs0`) so that Change Streams
 /// are available. The replica set member is explicitly set to `localhost:27017`
 /// so that the connection URI the caller uses (`localhost`) matches the RS member
@@ -188,7 +190,7 @@ apt-get install -y curl gnupg
 curl -fsSL https://www.mongodb.org/static/pgp/server-8.0.asc \
     | gpg --dearmor -o /usr/share/keyrings/mongodb-server-8.0.gpg
 echo "deb [ arch=amd64,arm64 signed-by=/usr/share/keyrings/mongodb-server-8.0.gpg ] \
-    https://repo.mongodb.org/apt/ubuntu jammy/mongodb-org/8.0 multiverse" \
+    https://repo.mongodb.org/apt/ubuntu noble/mongodb-org/8.0 multiverse" \
     > /etc/apt/sources.list.d/mongodb-org-8.0.list
 apt-get update -y
 apt-get install -y mongodb-org

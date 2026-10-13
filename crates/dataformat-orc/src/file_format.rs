@@ -515,13 +515,31 @@ mod tests {
     #[tokio::test]
     async fn infer_schema_rejects_invalid_bytes() {
         let memory = Arc::new(InMemory::new());
+        // 15 bytes whose final byte ('c' = 99) claims a 99-byte postscript.
         let meta = put_orc(memory.as_ref(), "data/not.orc", b"this is not orc".to_vec()).await;
         let store: Arc<dyn ObjectStore> = memory;
         let ctx = SessionContext::new();
-        OrcFormat::new()
+        let err = OrcFormat::new()
             .infer_schema(&ctx.state(), &store, &[meta])
             .await
             .expect_err("invalid ORC must fail schema inference");
+
+        // The object was read; it is the ORC tail that is refused. An object
+        // store or version-pin failure would surface as a different error.
+        let DataFusionError::External(source) = &err else {
+            panic!("expected the ORC decoder's error, got: {err:?}");
+        };
+        let Some(orc_error) = source.downcast_ref::<orc_rust::error::OrcError>() else {
+            panic!("expected an ORC decode error, got: {source:?}");
+        };
+        assert!(
+            matches!(
+                orc_error,
+                orc_rust::error::OrcError::OutOfSpec { msg, .. }
+                    if msg == "File too small for given postscript length"
+            ),
+            "expected the ORC tail to be rejected as out of spec, got: {orc_error:?}"
+        );
     }
 
     #[tokio::test]

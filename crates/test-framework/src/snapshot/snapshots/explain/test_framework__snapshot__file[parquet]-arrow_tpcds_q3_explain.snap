@@ -21,8 +21,8 @@ description: "Query: tpcds_q3"
 |               |             Filter: item.i_manufact_id = Int32(445)                                                                                                                                               |
 |               |               TableScan: item projection=[i_item_sk, i_brand_id, i_brand, i_manufact_id]                                                                                                          |
 | physical_plan | SortPreservingMergeExec: [d_year@0 ASC NULLS LAST, sum_agg@3 DESC, brand_id@1 ASC NULLS LAST], fetch=100                                                                                          |
-|               |   SortExec: TopK(fetch=100), expr=[d_year@0 ASC NULLS LAST, sum_agg@3 DESC, brand_id@1 ASC NULLS LAST], preserve_partitioning=[true]                                                              |
-|               |     ProjectionExec: expr=[d_year@0 as d_year, i_brand_id@2 as brand_id, i_brand@1 as brand, sum(store_sales.ss_net_profit)@3 as sum_agg]                                                          |
+|               |   ProjectionExec: expr=[d_year@0 as d_year, i_brand_id@2 as brand_id, i_brand@1 as brand, sum(store_sales.ss_net_profit)@3 as sum_agg]                                                            |
+|               |     SortExec: TopK(fetch=100), expr=[d_year@0 ASC NULLS LAST, sum(store_sales.ss_net_profit)@3 DESC, i_brand_id@2 ASC NULLS LAST], preserve_partitioning=[true]                                   |
 |               |       AggregateExec: mode=FinalPartitioned, gby=[d_year@0 as d_year, i_brand@1 as i_brand, i_brand_id@2 as i_brand_id], aggr=[sum(store_sales.ss_net_profit)]                                     |
 |               |         RepartitionExec: partitioning=Hash([d_year@0, i_brand@1, i_brand_id@2], 32), input_partitions=32                                                                                          |
 |               |           AggregateExec: mode=Partial, gby=[d_year@0 as d_year, i_brand@3 as i_brand, i_brand_id@2 as i_brand_id], aggr=[sum(store_sales.ss_net_profit)]                                          |

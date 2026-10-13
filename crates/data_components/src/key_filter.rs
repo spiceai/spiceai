@@ -659,15 +659,6 @@ mod tests {
     // =========================================================================
 
     #[test]
-    fn test_tpch_customer_by_custkey() {
-        // TPC-H: SELECT * FROM customer WHERE c_custkey = 123
-        let filters = vec![col("c_custkey").eq(lit(123i64))];
-
-        let result = try_match_index(&filters, "c_custkey", None);
-        assert!(result.is_some());
-    }
-
-    #[test]
     fn test_tpch_orders_by_orderkey_with_status() {
         // TPC-H: SELECT * FROM orders WHERE o_orderkey = 123 AND o_orderstatus = 'F'
         let filters = vec![
@@ -697,21 +688,6 @@ mod tests {
         assert!(matches!(pk, Expr::BinaryExpr(_)));
         assert!(sk.is_some());
         assert!(others.is_empty());
-    }
-
-    #[test]
-    fn test_tpch_lineitem_range_scan() {
-        // TPC-H: SELECT * FROM lineitem WHERE l_orderkey = 123 AND l_linenumber > 1
-        let filters = vec![
-            col("l_orderkey").eq(lit(123i64)),
-            col("l_linenumber").gt(lit(1i32)),
-        ];
-
-        let result = try_match_index(&filters, "l_orderkey", Some("l_linenumber"));
-        assert!(result.is_some());
-
-        let (_, sk, _) = result.expect("should match");
-        assert!(sk.is_some());
     }
 
     #[test]

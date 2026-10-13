@@ -16,10 +16,7 @@ limitations under the License.
 
 //! Common test utilities for Cayenne with multiple metastore backends
 
-#![expect(
-    dead_code,
-    reason = "Shared test helper module compiled into multiple test crates; not every item is used by every crate"
-)]
+pub mod lookup_index;
 
 use std::sync::Arc;
 
@@ -130,6 +127,22 @@ pub fn single_batch_stream(batch: RecordBatch) -> SendableRecordBatchStream {
 /// reserved rather than memory committed.
 pub const TEST_STACK_SIZE: usize = 16 * 1024 * 1024;
 
+/// Fails the calling test unless it runs in a process of its own.
+///
+/// nextest runs every test in its own process; plain `cargo test` runs a
+/// binary's tests on threads of one process. A test that changes process-global
+/// state calls this before changing it, so under `cargo test` it fails with
+/// instructions instead of changing the state every neighbouring test runs under.
+/// `why` names that state.
+pub fn require_process_per_test(why: &str) {
+    assert!(
+        std::env::var("NEXTEST_EXECUTION_MODE").as_deref() == Ok("process-per-test"),
+        "{why}, so it must run in a process of its own. Run it with \
+         `cargo nextest run -p cayenne <test name>`: plain \
+         `cargo test` runs every test in the binary on threads of one process"
+    );
+}
+
 /// Run a test with all available backends
 #[macro_export]
 macro_rules! test_with_backends {
@@ -227,6 +240,18 @@ pub async fn insert_batches(
     provider: &CayenneTableProvider,
     batches: Vec<RecordBatch>,
 ) -> DFResult<u64> {
+    write_batches(provider, batches, InsertOp::Append).await
+}
+
+/// Write record batches through the `insert_into()` API with `op`, in one
+/// write; returns the row count the write reports.
+///
+/// Creates a temporary `SessionContext` internally.
+pub async fn write_batches(
+    provider: &CayenneTableProvider,
+    batches: Vec<RecordBatch>,
+    op: InsertOp,
+) -> DFResult<u64> {
     use datafusion::physical_plan::collect;
 
     if batches.is_empty() {
@@ -238,9 +263,7 @@ pub async fn insert_batches(
     let ctx = SessionContext::new();
     let schema = Arc::clone(batches[0].schema_ref());
     let input_exec = MemorySourceConfig::try_new_exec(&[batches], schema, None)?;
-    let insert_plan = provider
-        .insert_into(&ctx.state(), input_exec, InsertOp::Append)
-        .await?;
+    let insert_plan = provider.insert_into(&ctx.state(), input_exec, op).await?;
     let results = collect(insert_plan, ctx.task_ctx()).await?;
 
     Ok(extract_row_count(&results))
@@ -308,6 +331,25 @@ pub fn env_scale(var: &str) -> f64 {
         .and_then(|v| v.parse::<f64>().ok())
         .filter(|&v| v > 0.0)
         .unwrap_or(1.0)
+}
+
+/// The key a per-file statistics row is stored under: the object-store location,
+/// which is the store-relative path. The manifest carries only the bare filename.
+pub fn statistics_row_key(
+    data_path: &std::path::Path,
+    table_id: &str,
+    file: &cayenne::metadata::SnapshotFile,
+) -> String {
+    format!(
+        "{}/{}/{}/{}",
+        data_path
+            .to_string_lossy()
+            .trim_start_matches('/')
+            .trim_end_matches('/'),
+        table_id,
+        file.snapshot_id,
+        file.file_path
+    )
 }
 
 /// Extract the row count from insert result batches.

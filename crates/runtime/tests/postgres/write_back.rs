@@ -43,7 +43,7 @@ use runtime_table::accelerated::write::dual_write::{
 };
 use secrecy::ExposeSecret;
 use spice_table::LayerWalk;
-use spicepod::acceleration::{Acceleration, Mode, OnConflictBehavior, RefreshMode, WriteMode};
+use spicepod::acceleration::{Acceleration, Mode, RefreshMode, WriteMode};
 use spicepod::component::access::AccessMode;
 use spicepod::component::dataset::{Dataset, replication::Replication};
 use spicepod::param::Params;
@@ -135,10 +135,10 @@ async fn bigint_primary_key_write_back_reaches_the_source() -> Result<(), anyhow
 
     test_request_context()
         .scope(async {
-            let port = common::get_random_port()?;
-            let _container = common::start_postgres_docker_container_with_logical_wal(port)
+            let container = common::start_postgres_docker_container_with_logical_wal()
                 .await
                 .map_err(|e| anyhow!("start container: {e}"))?;
+            let port = usize::from(container.host_port(5432)?);
 
             let mut source = common::connect(u16::try_from(port)?).await?;
             seed_counter(&source).await?;
@@ -173,9 +173,6 @@ async fn bigint_primary_key_write_back_reaches_the_source() -> Result<(), anyhow
                 refresh_mode: Some(RefreshMode::Changes),
                 write_mode: WriteMode::WriteBack,
                 primary_key: Some("id".to_string()),
-                on_conflict: [("id".to_string(), OnConflictBehavior::Upsert)]
-                    .into_iter()
-                    .collect(),
                 params: Some(Params::from_string_map(accel_params)),
                 ..Acceleration::default()
             });

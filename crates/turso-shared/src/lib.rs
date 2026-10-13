@@ -129,8 +129,9 @@ pub fn is_retryable_write_conflict_message(message: &str) -> bool {
         || message.contains("sqlite_locked")
         || message.contains("database is busy")
         || message.contains("database is locked")
-        // Turso BEGIN CONCURRENT MVCC raises this on commit when another
-        // transaction has already written to overlapping rows. Cayenne's
+        // Turso BEGIN CONCURRENT MVCC raises this, from the statement that
+        // writes the row or from COMMIT, when another transaction has already
+        // written to overlapping rows. Cayenne's
         // existing retry-on-conflict loops (in `commit_inlined_mutation`,
         // `commit_on_conflict_deletions`, snapshot publish, etc.) need to
         // back off and retry these the same way they do for sqlite_busy,

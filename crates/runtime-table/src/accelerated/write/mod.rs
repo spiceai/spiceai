@@ -27,7 +27,7 @@ limitations under the License.
 //!   for `refresh_mode: changes`, periodic refresh otherwise). This is the
 //!   default and matches the user-facing `write_mode: write_through` contract.
 //! - [`WriteMode::AcceleratorOnly`]: writes go only to the local accelerator
-//!   (used when `on_conflict` upserts into the accelerator without CDC).
+//!   (used for a source that discards writes, `sink`).
 //! - [`WriteMode::WriteBack`]: writes commit to the local accelerator inside a
 //!   transaction and are carried to the federated source by the delivery worker,
 //!   from the dirty-key markers that commit writes. Writes outside a
@@ -43,6 +43,7 @@ limitations under the License.
 //! [`AcceleratedTable`]: super::AcceleratedTable
 
 pub mod dual_write;
+pub(crate) mod lock;
 pub(crate) mod write_back;
 
 use std::sync::Arc;
@@ -62,7 +63,7 @@ pub(crate) enum WriteMode {
     /// user-facing `write_mode: write_through` contract.
     WriteThrough,
     /// Writes go only to the local accelerator (not replicated to the source).
-    /// Used when `on_conflict` is configured or for internal tables.
+    /// Used for a source that discards writes (`sink`) and for internal tables.
     AcceleratorOnly,
     /// Writes commit to the local accelerator inside a transaction and are
     /// carried to the federated source by the delivery worker, from the
@@ -79,6 +80,20 @@ pub(crate) enum WriteMode {
 }
 
 impl WriteMode {
+    /// Whether a write in this mode reaches the local accelerator, and so has
+    /// to run under `lock::AcceleratorWriteLockExec` to serialize against
+    /// acceleration snapshot creation (#13548).
+    ///
+    /// This one predicate answers both halves of that: a guarded write also
+    /// gets its freshness marker stamped by the wrapper when it finishes, so
+    /// only an *unguarded* write stamps where its plan is built.
+    /// `WriteThrough` is the unguarded one — it writes to the federated source
+    /// alone, and the accelerator learns of the change through refresh or CDC,
+    /// both of which take that lock themselves.
+    pub(crate) fn reaches_accelerator(&self) -> bool {
+        !matches!(self, Self::WriteThrough)
+    }
+
     /// Returns `true` if this is the dual-write mode (Iceberg catalog cache path).
     #[must_use]
     pub fn is_dual_write(&self) -> bool {

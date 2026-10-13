@@ -1,0 +1,9 @@
+---
+source: crates/datafusion-optimizer-rules/src/physical_plan/flightsql/aggregate_pushdown.rs
+expression: pretty(&result)
+---
++-----------------+
+| sum(l_quantity) |
++-----------------+
+| 150.00          |
++-----------------+

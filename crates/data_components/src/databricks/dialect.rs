@@ -137,13 +137,13 @@ fn array_has_to_array_contains(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use datafusion::common::TableReference;
     use datafusion::common::{Column, Spans};
     use datafusion::functions_nested::array_has::array_has_udf;
     use datafusion::functions_nested::make_array::make_array_udf;
     use datafusion::logical_expr::expr::ScalarFunction;
     use datafusion::prelude::lit;
     use datafusion::scalar::ScalarValue;
-    use datafusion::sql::TableReference;
     use datafusion::sql::unparser::Unparser;
 
     fn create_dialect() -> DatabricksDialect {
@@ -289,11 +289,20 @@ mod tests {
         let dialect = create_dialect();
         let unparser = Unparser::new(&dialect);
 
-        // Only one argument - should fail
+        // Only one argument - should fail on the argument count, before the first argument (a
+        // non-array literal, which has its own error) is inspected.
         let args = vec![lit(1)];
 
-        let result = array_has_to_array_contains(&unparser, &args);
-        assert!(result.is_err(), "Expected error for wrong argument count");
+        let err = array_has_to_array_contains(&unparser, &args)
+            .expect_err("Expected error for wrong argument count");
+        assert!(
+            matches!(
+                &err,
+                DataFusionError::Plan(message)
+                    if message == "array_has requires exactly 2 arguments, got 1"
+            ),
+            "a one-argument array_has must be rejected for its argument count, got: {err:?}"
+        );
     }
 
     #[test]

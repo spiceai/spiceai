@@ -23,8 +23,8 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use byte_unit::Byte;
+use datafusion::common::TableReference;
 use datafusion::logical_expr::LogicalPlan;
-use datafusion::sql::TableReference;
 use fundu::ParseError;
 use key::CacheKey;
 use key::RawCacheKey;
@@ -114,6 +114,11 @@ pub enum Error {
         "Invalid hashing algorithm. Please refer to the documentation for supported algorithms: https://spiceai.org/docs/features/caching#choosing-a-hashing_algorithm"
     ))]
     InvalidHashingAlgorithm,
+
+    #[snafu(display(
+        "The query result ({size} bytes) is larger than the SQL results cache max_size ({max_size} bytes), so it was not cached"
+    ))]
+    ResultLargerThanMaxSize { size: u64, max_size: u64 },
 }
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
@@ -240,6 +245,11 @@ pub trait CacheProvider<V: Clone + Send + Sync + 'static>:
         is_valid: &(dyn for<'v> Fn(&'v V) -> bool + Send + Sync),
     ) -> Option<std::sync::Arc<V>>;
     async fn put_raw_key(&self, key: &u64, value: V);
+    /// Store `value`, which the caller has already sized: `weight` must be what
+    /// [`Sizeable::get_memory_size`] returns for it. A cache that bills entries
+    /// by size can then admit a small value on the calling task without walking
+    /// it again; one that bounds entries by count ignores `weight`.
+    async fn put_raw_key_with_weight(&self, key: &u64, value: V, weight: usize);
     /// Replace the value at `key` only when `should_replace` accepts the
     /// currently stored value. See [`crate::backend::CacheBackend::replace_if`].
     async fn replace_if(
@@ -247,6 +257,20 @@ pub trait CacheProvider<V: Clone + Send + Sync + 'static>:
         key: &u64,
         value: V,
         should_replace: &(dyn for<'v> Fn(&'v V) -> bool + Send + Sync),
+    ) -> bool;
+    /// Insert `value`, or replace the resident, only when `admit` accepts the
+    /// current value (`None` when the key is empty).
+    ///
+    /// Deliberately has no default. A default that always inserted would let a
+    /// slower read overwrite a later one on any wrapper that forgot to forward
+    /// the method. `weight` is what [`Sizeable::get_memory_size`] returns for
+    /// `value`; a cache that bounds entries by count ignores it.
+    async fn put_if(
+        &self,
+        key: &u64,
+        value: V,
+        weight: usize,
+        admit: &(dyn for<'v> Fn(Option<&'v V>) -> bool + Send + Sync),
     ) -> bool;
     async fn invalidate_all(&self);
     async fn size_bytes(&self) -> u64;
@@ -510,6 +534,16 @@ impl std::fmt::Debug for Caching {
     }
 }
 
+/// Reports the first failure among invalidations that have all already run.
+///
+/// The caches invalidated for one table are independent of each other — each keeps
+/// its own change clock — so a `?` between them would leave the later ones serving
+/// the table that the earlier one was told had gone. Every arm is therefore awaited
+/// before any error is returned, and the caller still sees a failure.
+fn first_error<const N: usize>(outcomes: [Result<()>; N]) -> Result<()> {
+    outcomes.into_iter().find(Result::is_err).unwrap_or(Ok(()))
+}
+
 impl Caching {
     #[must_use]
     pub fn new() -> Self {
@@ -561,18 +595,39 @@ impl Caching {
     ///
     /// If the cache invalidation fails for any of the caches.
     pub async fn invalidate_for_table(&self, table_ref: TableReference) -> Result<()> {
-        if let Some(results_cache) = &self.results {
-            results_cache
-                .invalidate_for_table(table_ref.clone())
-                .await?;
-        }
-        if let Some(plans_cache) = &self.plans {
-            plans_cache.invalidate_for_table(table_ref.clone()).await?;
-        }
-        if let Some(search_cache) = &self.search {
-            search_cache.invalidate_for_table(table_ref).await?;
-        }
-        Ok(())
+        let results = match &self.results {
+            Some(results_cache) => results_cache.invalidate_for_table(table_ref.clone()).await,
+            None => Ok(()),
+        };
+        first_error([results, self.invalidate_derived_for_table(table_ref).await])
+    }
+
+    /// [`Self::invalidate_for_table`], for a table that is going away rather than
+    /// changing. See [`QueryResultsCacheProvider::evict_for_table`].
+    ///
+    /// # Errors
+    ///
+    /// If the cache invalidation fails for any of the caches.
+    pub async fn evict_for_table(&self, table_ref: TableReference) -> Result<()> {
+        let results = match &self.results {
+            Some(results_cache) => results_cache.evict_for_table(table_ref.clone()).await,
+            None => Ok(()),
+        };
+        first_error([results, self.invalidate_derived_for_table(table_ref).await])
+    }
+
+    /// The plan and search caches, which both paths above invalidate identically —
+    /// neither has a stale-serving mode to choose between.
+    async fn invalidate_derived_for_table(&self, table_ref: TableReference) -> Result<()> {
+        let plans = match &self.plans {
+            Some(plans_cache) => plans_cache.invalidate_for_table(table_ref.clone()).await,
+            None => Ok(()),
+        };
+        let search = match &self.search {
+            Some(search_cache) => search_cache.invalidate_for_table(table_ref).await,
+            None => Ok(()),
+        };
+        first_error([plans, search])
     }
 
     /// Drives housekeeping on every configured cache. SQL results expire stale
@@ -818,6 +873,17 @@ pub struct QueryResultsCacheProvider {
     /// instance, not a fresh [`get_hash_builder`] call.
     hash_builder: HashBuilder,
     table_changes: TableChangeClock,
+    /// The subset of `table_changes` recorded because a table went *away* rather
+    /// than changed, which [`QueryResultsCacheProvider::entry_validity`] must rule
+    /// on differently — see [`QueryResultsCacheProvider::evict_for_table`].
+    ///
+    /// A second clock rather than a kind on the shared one, because the two collapse
+    /// independently: `TableChangeClock` folds itself into a conservative
+    /// `discarded_floor` past `MAX_TRACKED_TABLES`, and a floor on this clock reads as
+    /// "everything was unloaded", which turns stale serving off process-wide until it
+    /// ages out. Confined here that needs 4096 distinct *unloaded* tables; on the
+    /// shared clock any 4096 refreshed tables would do it.
+    unloaded_tables: TableChangeClock,
 }
 
 impl std::fmt::Debug for QueryResultsCacheProvider {
@@ -892,6 +958,7 @@ impl QueryResultsCacheProvider {
             hashing_algorithm: config.hashing_algorithm,
             hash_builder,
             table_changes: TableChangeClock::default(),
+            unloaded_tables: TableChangeClock::default(),
         };
 
         Ok(cache_provider)
@@ -1026,6 +1093,93 @@ impl QueryResultsCacheProvider {
         Ok(res)
     }
 
+    /// Like [`Self::put_raw_key`], for a caller that has already sized
+    /// `result`: `weight` must be `result.get_memory_size()`.
+    ///
+    /// # Errors
+    ///
+    /// Will return `Err` if method fails to access the cache
+    pub async fn put_raw_key_with_weight(
+        &self,
+        raw_key: &RawCacheKey,
+        result: CachedQueryResult,
+        weight: usize,
+    ) -> Result<()> {
+        self.cache
+            .put_raw_key_with_weight(&raw_key.as_u64(), result, weight)
+            .await;
+        Ok(())
+    }
+
+    /// Whether a result read at `read_started_at` could be served if stored
+    /// now, fresh or stale. Same ruling as a hit ([`Self::entry_validity`]).
+    #[must_use]
+    pub fn is_servable<S: std::hash::BuildHasher>(
+        &self,
+        tables: &HashSet<TableReference, S>,
+        read_started_at: std::time::Instant,
+    ) -> bool {
+        self.entry_validity(tables, read_started_at, std::time::Instant::now())
+            != EntryValidity::Invalidated
+    }
+
+    /// Stores `result`, ruled the way a hit is. Returns `false` only when no
+    /// lookup could serve it; keeping an entry that read later counts as stored.
+    ///
+    /// A result whose tables changed while it ran is stored only inside a
+    /// `stale_while_revalidate_ttl` window, to be served stale. Fresh and stale
+    /// admissions both use a timestamp-ordered insert, so a write that was
+    /// `Valid` when the query started cannot replace a later resident after
+    /// encoding. `weight` is `result.get_memory_size()` when already computed.
+    ///
+    /// # Errors
+    ///
+    /// Will return `Err` if method fails to access the cache, or
+    /// [`Error::ResultLargerThanMaxSize`] when `result` is heavier than `max_size`.
+    pub async fn store_raw_key(
+        &self,
+        raw_key: &RawCacheKey,
+        result: CachedQueryResult,
+        weight: Option<usize>,
+    ) -> Result<bool> {
+        let validity = self.entry_validity(
+            &result.input_tables,
+            result.read_started_at,
+            std::time::Instant::now(),
+        );
+        match validity {
+            EntryValidity::Invalidated => {
+                tracing::debug!(
+                    "A table read by this query changed while it ran and no stale-while-revalidate window could serve the result, skipping cache storage"
+                );
+                Ok(false)
+            }
+            EntryValidity::Valid | EntryValidity::StaleWhileRevalidate => {
+                let weight = weight.unwrap_or_else(|| result.get_memory_size());
+                // The cache refuses a result heavier than `max_size` before it consults
+                // the resident. That refusal is neither storage nor invalidation, and the
+                // key may stay empty, so it is an error the caller can tell apart.
+                let weight_bytes = u64::try_from(weight).unwrap_or(u64::MAX);
+                if weight_bytes > self.cache_max_size {
+                    return ResultLargerThanMaxSizeSnafu {
+                        size: weight_bytes,
+                        max_size: self.cache_max_size,
+                    }
+                    .fail();
+                }
+                let stored = self
+                    .put_raw_key_unless_older_read(raw_key, result, weight)
+                    .await?;
+                if !stored {
+                    tracing::debug!(
+                        "A result from a query that began later is already cached under this key, keeping it"
+                    );
+                }
+                Ok(true)
+            }
+        }
+    }
+
     /// Decode `result` for serving. The first successful decode of an encoded
     /// entry leaves it encoded, so a one-shot key does not inflate to Raw. The
     /// second successful decode replaces the stored value with
@@ -1117,16 +1271,29 @@ impl QueryResultsCacheProvider {
             .await;
     }
 
+    /// Drops every cached result.
+    ///
+    /// For a change no table change records: a result's key is the query, not
+    /// the definitions of the functions it called, so when a Spicepod reload
+    /// redefines or removes a user function, any entry may hold rows the old
+    /// definition computed. A `cache_key_type: sql` hit is answered before
+    /// planning, so discarding cached plans does not reach it; this does.
+    pub async fn invalidate_all(&self) {
+        self.cache.invalidate_all().await;
+    }
+
+    /// Invalidates the cached results that read `table_name`, because the table's
+    /// *contents* changed — an accelerated refresh, a DML write.
+    ///
+    /// Use [`Self::evict_for_table`] instead when the table itself is going away:
+    /// the stale-serving window below rests on a revalidation that can replace the
+    /// entry, and a table that no longer exists has none.
+    ///
     /// # Errors
     ///
     /// Will return `Err` if method fails to invalidate cache for the table provided
     pub async fn invalidate_for_table(&self, table_name: TableReference) -> Result<()> {
-        // Record the change before removing entries, never after. A
-        // writer that started before this point must be rejected by
-        // `tables_changed_since`, and stamping afterwards leaves exactly
-        // the same gap one step earlier.
-        self.table_changes
-            .record_change(&table_name, std::time::Instant::now());
+        self.mark_table_changed(&table_name, std::time::Instant::now());
 
         // With `stale_while_revalidate_ttl` configured, the mark *is* the
         // invalidation: dependent entries stay resident so that a hit inside
@@ -1148,6 +1315,52 @@ impl QueryResultsCacheProvider {
             return Ok(());
         }
 
+        self.evict_marked(table_name).await
+    }
+
+    /// Drops the cached results that read `table_name`, because the table is gone —
+    /// unloaded from the running app, or dropped.
+    ///
+    /// Unlike [`Self::invalidate_for_table`] this never defers to
+    /// `stale_while_revalidate_ttl`. That window is an agreement to serve one more
+    /// previous result *while a background revalidation replaces the entry*, and the
+    /// revalidation of a query over a table that no longer exists cannot land — so
+    /// deferring would serve rows from an unloaded dataset for the whole window, with
+    /// nothing able to end it early. spiceai/spiceai#14251: a `cache_key_type: sql`
+    /// hit is answered before planning, so discarding the logical plan does not reach
+    /// it and this is the only thing that does.
+    ///
+    /// This is the one place that argument is written out; the other sites that carry
+    /// it — the `unloaded_tables` clock, `entry_validity`, `Caching::evict_for_table`
+    /// — point here.
+    ///
+    /// # Errors
+    ///
+    /// Will return `Err` if method fails to invalidate cache for the table provided
+    pub async fn evict_for_table(&self, table_name: TableReference) -> Result<()> {
+        // The unload clock as well, from the same instant. Evicting only removes the
+        // entries that exist *now*: a query that passed the write-side check before
+        // this point can still publish its result afterwards — `put_raw_key` accepts
+        // it, because correctness is the read-time check and the write-side one is
+        // only an optimisation (`crates/cache/src/utils.rs`). Without this mark
+        // `entry_validity` would rule that late entry `StaleWhileRevalidate` and
+        // serve the unloaded dataset for the whole window.
+        let at = std::time::Instant::now();
+        self.unloaded_tables.record_change(&table_name, at);
+        self.mark_table_changed(&table_name, at);
+        self.evict_marked(table_name).await
+    }
+
+    /// Stamps the table-change clock. Recorded before entries are removed, never
+    /// after: a writer that started before this point must be rejected by
+    /// `tables_changed_since`, and stamping afterwards leaves exactly the same gap
+    /// one step earlier.
+    fn mark_table_changed(&self, table_name: &TableReference, at: std::time::Instant) {
+        self.table_changes.record_change(table_name, at);
+    }
+
+    /// The eviction both paths above share, once the clock is already stamped.
+    async fn evict_marked(&self, table_name: TableReference) -> Result<()> {
         CachedQueryResult::record_table_invalidation(InvalidationMode::Evict);
         // The entries each invalidation drops are counted by the underlying
         // cache, so that every cache type is counted the same way rather than
@@ -1203,17 +1416,31 @@ impl QueryResultsCacheProvider {
             return EntryValidity::Valid;
         }
 
-        match self.stale_serving_window() {
-            // A window long enough to overflow the clock is one that never
-            // closes, which is the answer `checked_add` is standing in for.
-            Some(stale_ttl)
-                if mark
-                    .checked_add(stale_ttl)
-                    .is_none_or(|window_ends| now <= window_ends) =>
-            {
-                EntryValidity::StaleWhileRevalidate
-            }
-            _ => EntryValidity::Invalidated,
+        // Asked before the unload clock, not after: without a window there is no
+        // staleness anyone has agreed to serve, so the answer is `Invalidated`
+        // whatever the unload clock says — and the second clock lookup, which is on
+        // the hit path, is skipped entirely for every deployment that has not opted
+        // into `stale_while_revalidate_ttl`.
+        let Some(stale_ttl) = self.stale_serving_window() else {
+            return EntryValidity::Invalidated;
+        };
+
+        // A table this entry read has been unloaded since the read began. No
+        // revalidation of this query can succeed, so there is nothing for the
+        // stale-serving window to bridge to and the entry is simply gone.
+        if self.unloaded_tables.changed_since(tables, read_started_at) {
+            return EntryValidity::Invalidated;
+        }
+
+        // A window long enough to overflow the clock is one that never closes, which
+        // is the answer `checked_add` is standing in for.
+        if mark
+            .checked_add(stale_ttl)
+            .is_none_or(|window_ends| now <= window_ends)
+        {
+            EntryValidity::StaleWhileRevalidate
+        } else {
+            EntryValidity::Invalidated
         }
     }
 
@@ -1232,10 +1459,8 @@ impl QueryResultsCacheProvider {
     /// meaning a result read at that point may predate the change and so cannot
     /// be stored as a fresh cache entry.
     ///
-    /// This is the coarse form of [`Self::entry_validity`], for the write side:
-    /// a result already known not to be storable as fresh is not worth encoding
-    /// and storing. The read side wants `entry_validity`, which additionally
-    /// says whether the entry can still be served stale.
+    /// This is the coarse form of [`Self::entry_validity`]; stores use
+    /// [`Self::is_servable`].
     ///
     /// Note this concerns *reusing* a result, never producing one: a query that
     /// read the committed state and returns it to its own caller is correct
@@ -1255,10 +1480,9 @@ impl QueryResultsCacheProvider {
     ///
     /// Tightening it would mean threading the true snapshot-acquisition instant
     /// out of every `TableProvider` scan and back up to the cache write — a
-    /// large amount of plumbing for a marginal hit-rate gain. The imprecision
-    /// spans planning plus execution startup (typically milliseconds) against
-    /// invalidations arriving on a refresh interval (typically minutes), so it
-    /// should rarely fire at all.
+    /// large amount of plumbing. Under CDC, where changes arrive faster than a
+    /// query runs, nearly every read is overtaken; a stale window keeps such
+    /// results cacheable.
     #[must_use]
     pub fn tables_changed_since<S: std::hash::BuildHasher>(
         &self,
@@ -1266,6 +1490,33 @@ impl QueryResultsCacheProvider {
         read_started_at: std::time::Instant,
     ) -> bool {
         self.table_changes.changed_since(tables, read_started_at)
+    }
+
+    /// Store `result` unless a resident of `raw_key` began reading at least as
+    /// late as `result`.
+    ///
+    /// The comparison and the write share the shard lock, so a slower result
+    /// cannot overwrite one the predicate has already rejected. Used for both
+    /// fresh and stale admissions: [`Self::entry_validity`] still refuses to
+    /// return a stale result as a fresh hit.
+    ///
+    /// # Errors
+    ///
+    /// Will return `Err` if the cache write fails.
+    pub async fn put_raw_key_unless_older_read(
+        &self,
+        raw_key: &RawCacheKey,
+        result: CachedQueryResult,
+        weight: usize,
+    ) -> Result<bool> {
+        let read_started_at = result.read_started_at;
+        let stored = self
+            .cache
+            .put_if(&raw_key.as_u64(), result, weight, &|current| {
+                current.is_none_or(|existing| existing.read_started_at < read_started_at)
+            })
+            .await;
+        Ok(stored)
     }
 
     #[must_use]
@@ -1342,43 +1593,160 @@ impl QueryResultsCacheProvider {
         }
     }
 
+    /// Whether results of `plan` may be stored in / served from the SQL
+    /// results cache.
+    ///
+    /// Caching policy for non-deterministic plans: only plans whose functions
+    /// are all `Volatility::Immutable` are cacheable. A plan is never cached if
+    /// any scalar, aggregate, or window function (including in subqueries) is
+    /// `Volatile` (`random()`, `uuid()`, ...) or `Stable`. `Stable` covers the
+    /// time functions (`now()`, `current_date`, `current_time`, ...; see
+    /// [`NON_CACHEABLE_TIME_FUNCTIONS`]) and remote HTTP UDFs, which are capped
+    /// at `Stable`. They are constant within one statement, but a cached result
+    /// would replay stale output across statements. A plan that scans a
+    /// `Temporary` table, anywhere including in a subquery, is never cached
+    /// either: that is how a table function whose rows can change between
+    /// executions is planned (remote and search table functions, and SQL and
+    /// WASM table functions not declared `immutable`). Such queries report no
+    /// results-cache status.
     #[must_use]
     pub fn cache_is_enabled_for_plan(&self, plan: &LogicalPlan) -> bool {
-        let mut plan_stack = vec![plan];
+        use datafusion::common::tree_node::TreeNodeRecursion;
 
-        while let Some(current_plan) = plan_stack.pop() {
-            match current_plan {
-                LogicalPlan::TableScan(source, ..) => {
-                    let schema_name = source.table_name.schema();
-                    let Some(schema) = schema_name else {
-                        continue;
-                    };
-                    for ignore_schema in &self.ignore_schemas {
-                        if *schema == **ignore_schema {
-                            return false;
-                        }
-                    }
-                }
-                LogicalPlan::Explain { .. }
-                | LogicalPlan::Analyze { .. }
-                | LogicalPlan::DescribeTable { .. }
-                | LogicalPlan::Ddl(..)
-                | LogicalPlan::Dml(..)
-                | LogicalPlan::Copy { .. }
-                | LogicalPlan::Statement(..) => return false,
-                LogicalPlan::Extension(ext)
-                    if WRITE_CAPABLE_EXTENSION_NAMES.contains(&ext.node.name()) =>
+        // `apply_with_subqueries`, not an `inputs()` walk: a subquery in an
+        // expression (`IN (SELECT ...)`, `EXISTS (...)`, a scalar subquery)
+        // is held in the node's expressions, so `inputs()` never reaches the
+        // scans inside it (see `utils::get_logical_plan_input_tables`).
+        let mut cacheable = true;
+        // The closure is infallible, so the returned Result cannot be an error.
+        let _ = plan.apply_with_subqueries(|node| {
+            if self.plan_node_is_cacheable(node) {
+                Ok(TreeNodeRecursion::Continue)
+            } else {
+                cacheable = false;
+                Ok(TreeNodeRecursion::Stop)
+            }
+        });
+
+        cacheable && !plan_is_non_deterministic(plan)
+    }
+
+    /// Checks one plan node, not its inputs or subqueries.
+    fn plan_node_is_cacheable(&self, node: &LogicalPlan) -> bool {
+        match node {
+            LogicalPlan::TableScan(source, ..) => {
+                // Table-function providers whose rows can change between
+                // executions (remote and search UDTFs, and SQL and WASM table
+                // functions not declared `immutable`) are planned as
+                // `Temporary` scans; never cache them. A recursive CTE's work
+                // table is `Temporary` too, but it holds only the rows the
+                // query itself derives, so it does not decide.
+                if source.source.table_type() == datafusion::datasource::TableType::Temporary
+                    && !is_cte_work_table(source)
                 {
                     return false;
                 }
-                _ => {}
+                let Some(schema) = source.table_name.schema() else {
+                    return true;
+                };
+                !self
+                    .ignore_schemas
+                    .iter()
+                    .any(|ignore_schema| *schema == **ignore_schema)
             }
-
-            plan_stack.extend(current_plan.inputs());
+            LogicalPlan::Explain { .. }
+            | LogicalPlan::Analyze { .. }
+            | LogicalPlan::DescribeTable { .. }
+            | LogicalPlan::Ddl(..)
+            | LogicalPlan::Dml(..)
+            | LogicalPlan::Copy { .. }
+            | LogicalPlan::Statement(..) => false,
+            LogicalPlan::Extension(ext) => {
+                !WRITE_CAPABLE_EXTENSION_NAMES.contains(&ext.node.name())
+            }
+            _ => true,
         }
-
-        true
     }
+}
+
+/// Whether `scan` reads the work table of a recursive CTE, which `DataFusion`
+/// plans as a `Temporary` scan of the rows the recursion has derived so far.
+fn is_cte_work_table(scan: &datafusion::logical_expr::TableScan) -> bool {
+    datafusion::datasource::source_as_provider(&scan.source).is_ok_and(|provider| {
+        provider
+            .downcast_ref::<datafusion::datasource::cte_worktable::CteWorkTable>()
+            .is_some()
+    })
+}
+
+/// Time functions that `DataFusion` marks `Volatility::Stable` (the value is
+/// fixed for one statement but changes between statements). Caching their
+/// results would serve a stale clock, so they are treated as uncacheable.
+pub const NON_CACHEABLE_TIME_FUNCTIONS: &[&str] = &[
+    "now",
+    "current_timestamp",
+    "current_date",
+    "current_time",
+    "localtime",
+    "localtimestamp",
+    "today",
+];
+
+/// Returns `true` when `plan` (including any subquery) contains a function
+/// whose result can differ between two executions of the same plan: any
+/// function that is not `Volatility::Immutable` (`random()`, `uuid()`,
+/// `now()`, remote UDFs, ...) or one of [`NON_CACHEABLE_TIME_FUNCTIONS`]. Results of such plans must not be served
+/// from the SQL results cache.
+#[must_use]
+pub fn plan_is_non_deterministic(plan: &LogicalPlan) -> bool {
+    use datafusion::common::tree_node::TreeNodeRecursion;
+
+    let mut found = false;
+    let _ = plan.apply_with_subqueries(|node| {
+        node.apply_expressions(|expr| {
+            if expr_is_non_deterministic(expr) {
+                found = true;
+                Ok(TreeNodeRecursion::Stop)
+            } else {
+                Ok(TreeNodeRecursion::Continue)
+            }
+        })
+    });
+    found
+}
+
+fn is_time_function_name(name: &str) -> bool {
+    NON_CACHEABLE_TIME_FUNCTIONS
+        .iter()
+        .any(|f| f.eq_ignore_ascii_case(name))
+}
+
+/// Checks a single expression tree (not descending into subquery plans,
+/// which [`plan_is_non_deterministic`] visits itself).
+fn expr_is_non_deterministic(expr: &datafusion::logical_expr::Expr) -> bool {
+    use datafusion::common::tree_node::{TreeNode, TreeNodeRecursion};
+    use datafusion::logical_expr::{Expr, Volatility};
+
+    let mut found = false;
+    let _ = expr.apply(|e| {
+        let hit = match e {
+            Expr::ScalarFunction(f) => {
+                f.func.signature().volatility != Volatility::Immutable
+                    || is_time_function_name(f.func.name())
+                    || f.func.aliases().iter().any(|a| is_time_function_name(a))
+            }
+            Expr::AggregateFunction(f) => f.func.signature().volatility != Volatility::Immutable,
+            Expr::WindowFunction(w) => w.fun.signature().volatility != Volatility::Immutable,
+            _ => false,
+        };
+        if hit {
+            found = true;
+            Ok(TreeNodeRecursion::Stop)
+        } else {
+            Ok(TreeNodeRecursion::Continue)
+        }
+    });
+    found
 }
 
 impl Display for QueryResultsCacheProvider {
@@ -1791,13 +2159,21 @@ mod tests {
             .await
             .expect("cache access should succeed");
 
-        assert!(
-            provider
-                .get_raw_key(&key)
-                .await
-                .expect("cache access should succeed")
-                .is_some(),
-            "an entry for an uninvalidated table must remain cached"
+        let served = provider
+            .get_raw_key(&key)
+            .await
+            .expect("cache access should succeed")
+            .expect("an entry for an uninvalidated table must remain cached");
+        // The served entry is the one stored, with the read start it was stored with:
+        // the `orders` invalidation, later than that read start, must not touch it.
+        assert_eq!(
+            *served.input_tables,
+            HashSet::from([TableReference::bare("customer")]),
+            "the served entry must be the result stored for `customer`"
+        );
+        assert_eq!(
+            served.read_started_at, read_started_at,
+            "the served entry must carry the read start it was stored with"
         );
     }
 
@@ -1824,7 +2200,9 @@ mod tests {
         );
     }
 
-    fn config_with_stale_window(stale_while_revalidate_ttl: &str) -> SQLResultsCacheConfig {
+    pub(crate) fn config_with_stale_window(
+        stale_while_revalidate_ttl: &str,
+    ) -> SQLResultsCacheConfig {
         SQLResultsCacheConfig {
             // Long enough that nothing in these tests expires on the ordinary
             // TTL, so the only thing under test is the invalidation clock.
@@ -1940,6 +2318,167 @@ mod tests {
         );
     }
 
+    /// spiceai/spiceai#14251: the same window must NOT absorb an unload. The
+    /// stale-serving agreement is to serve one more previous result while a
+    /// background revalidation replaces the entry, and a query over a dataset that
+    /// has been unloaded has no revalidation that can land — so the entry would be
+    /// served for the whole window with nothing able to end it early. A
+    /// `cache_key_type: sql` hit is answered before planning, so discarding the
+    /// logical plan does not reach this entry and only the eviction does.
+    ///
+    /// Measured against `invalidate_for_table` on the identical provider and key, so
+    /// this pins the asymmetry rather than just the eviction.
+    #[tokio::test]
+    async fn evict_for_table_drops_entries_the_stale_window_would_have_kept() {
+        let provider =
+            QueryResultsCacheProvider::try_new(&config_with_stale_window("5m"), Box::new([]))
+                .expect("valid cache provider");
+
+        // The control: the contents-changed path keeps the entry resident.
+        let refreshed = RawCacheKey::new(40);
+        provider
+            .put_raw_key(
+                &refreshed,
+                cached_result_for("customer", std::time::Instant::now()).await,
+            )
+            .await
+            .expect("cache access should succeed");
+        provider
+            .invalidate_for_table(TableReference::bare("customer"))
+            .await
+            .expect("invalidation should succeed");
+        provider.run_pending_tasks().await;
+        assert!(
+            provider
+                .get_raw_key_with_validity(&refreshed)
+                .await
+                .expect("cache access should succeed")
+                .is_some(),
+            "the premise: with a window configured, a contents change leaves the entry resident"
+        );
+
+        // The unload path, same provider, same window, same table.
+        let unloaded = RawCacheKey::new(41);
+        provider
+            .put_raw_key(
+                &unloaded,
+                cached_result_for("customer", std::time::Instant::now()).await,
+            )
+            .await
+            .expect("cache access should succeed");
+        provider
+            .evict_for_table(TableReference::bare("customer"))
+            .await
+            .expect("eviction should succeed");
+        provider.run_pending_tasks().await;
+
+        assert!(
+            provider
+                .get_raw_key_with_validity(&unloaded)
+                .await
+                .expect("cache access should succeed")
+                .is_none(),
+            "an unloaded dataset's cached result must be gone, not servable as stale"
+        );
+        assert!(
+            provider
+                .get_raw_key_with_validity(&refreshed)
+                .await
+                .expect("cache access should succeed")
+                .is_none(),
+            "and the eviction takes every entry that read the table, not only the newest"
+        );
+    }
+
+    /// The eviction stamps the same clock the mark-stale path does, so a write that
+    /// began before the unload still cannot store its result afterwards.
+    #[tokio::test]
+    async fn evict_for_table_records_the_invalidation() {
+        let provider =
+            QueryResultsCacheProvider::try_new(&config_with_stale_window("5m"), Box::new([]))
+                .expect("valid cache provider");
+
+        let read_started_at = std::time::Instant::now();
+        let tables: HashSet<TableReference> = HashSet::from([TableReference::bare("customer")]);
+        assert!(!provider.tables_changed_since(&tables, read_started_at));
+
+        provider
+            .evict_for_table(TableReference::bare("customer"))
+            .await
+            .expect("eviction should succeed");
+
+        assert!(
+            provider.tables_changed_since(&tables, read_started_at),
+            "a result whose read began before the unload must not be stored after it"
+        );
+    }
+
+    /// spiceai/spiceai#14251, the ordering the eviction alone does not cover: a query
+    /// that began before the unload can still *publish* afterwards. The write-side
+    /// `tables_changed_since` check is explicitly not the guard — `crates/cache/src/utils.rs`
+    /// says correctness comes from the read-time check — so `put_raw_key` accepts that
+    /// late entry, and with a window configured `entry_validity` would otherwise rule it
+    /// `StaleWhileRevalidate` and serve an unloaded dataset for the whole window, with no
+    /// revalidation able to end it early.
+    ///
+    /// The refresh path is asserted beside it on the same provider, because the window is
+    /// supposed to keep absorbing an ordinary contents change.
+    #[tokio::test]
+    async fn a_result_published_after_an_unload_is_not_servable_as_stale() {
+        let provider =
+            QueryResultsCacheProvider::try_new(&config_with_stale_window("5m"), Box::new([]))
+                .expect("valid cache provider");
+
+        // The read begins before either invalidation, as a query already in flight would.
+        let read_started_at = std::time::Instant::now();
+
+        provider
+            .invalidate_for_table(TableReference::bare("orders"))
+            .await
+            .expect("invalidation should succeed");
+        provider
+            .evict_for_table(TableReference::bare("customer"))
+            .await
+            .expect("eviction should succeed");
+
+        let now = std::time::Instant::now();
+
+        let unloaded: HashSet<TableReference> = HashSet::from([TableReference::bare("customer")]);
+        assert_eq!(
+            provider.entry_validity(&unloaded, read_started_at, now),
+            EntryValidity::Invalidated,
+            "a result that read an unloaded dataset must not be served, however long the stale window is"
+        );
+
+        let refreshed: HashSet<TableReference> = HashSet::from([TableReference::bare("orders")]);
+        assert_eq!(
+            provider.entry_validity(&refreshed, read_started_at, now),
+            EntryValidity::StaleWhileRevalidate,
+            "the control: an ordinary contents change still absorbs into the window"
+        );
+
+        // A query joining both is ruled by the unloaded one: any single table going away
+        // is enough to leave the whole result unservable.
+        let both: HashSet<TableReference> = HashSet::from([
+            TableReference::bare("customer"),
+            TableReference::bare("orders"),
+        ]);
+        assert_eq!(
+            provider.entry_validity(&both, read_started_at, now),
+            EntryValidity::Invalidated,
+            "one unloaded input is enough, even alongside a table that only changed"
+        );
+
+        // And a read that began *after* the unload is untouched by it — the watermark
+        // must not invalidate everything forever.
+        let after_unload = std::time::Instant::now();
+        assert_eq!(
+            provider.entry_validity(&unloaded, after_unload, after_unload),
+            EntryValidity::Valid,
+            "a read that began after the unload is unaffected by it"
+        );
+    }
+
     /// The window closing turns the same entry into a miss, so a result is
     /// never served indefinitely just because nothing evicted it.
     #[tokio::test]
@@ -2048,6 +2587,177 @@ mod tests {
         assert_eq!(validity, EntryValidity::Valid);
     }
 
+    /// A table provider that reports a fixed `TableType`.
+    #[derive(Debug)]
+    struct TypedTable(
+        datafusion::datasource::empty::EmptyTable,
+        datafusion::datasource::TableType,
+    );
+
+    #[async_trait::async_trait]
+    impl datafusion::catalog::TableProvider for TypedTable {
+        fn schema(&self) -> arrow::datatypes::SchemaRef {
+            self.0.schema()
+        }
+        fn table_type(&self) -> datafusion::datasource::TableType {
+            self.1
+        }
+        async fn scan(
+            &self,
+            state: &dyn datafusion::catalog::Session,
+            projection: Option<&Vec<usize>>,
+            filters: &[datafusion::logical_expr::Expr],
+            limit: Option<usize>,
+        ) -> datafusion::error::Result<Arc<dyn datafusion::physical_plan::ExecutionPlan>> {
+            self.0.scan(state, projection, filters, limit).await
+        }
+    }
+
+    /// A table function whose provider reports the given `TableType`, as a
+    /// table function whose rows can change between executions reports
+    /// `Temporary`.
+    #[derive(Debug)]
+    struct TypedTableFunction(datafusion::datasource::TableType);
+
+    impl datafusion::catalog::TableFunctionImpl for TypedTableFunction {
+        fn call(
+            &self,
+            _args: &[datafusion::logical_expr::Expr],
+        ) -> datafusion::error::Result<Arc<dyn datafusion::catalog::TableProvider>> {
+            use datafusion::arrow::datatypes::{DataType, Field, Schema};
+
+            let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
+            Ok(Arc::new(TypedTable(
+                datafusion::datasource::empty::EmptyTable::new(schema),
+                self.0,
+            )))
+        }
+    }
+
+    /// A `Temporary` scan is never cached, wherever the plan holds it:
+    /// directly, in a `FROM` subquery, or in an `IN`, `EXISTS`, or scalar
+    /// subquery, which a node keeps in its expressions rather than its inputs.
+    /// The same queries over a `Base` provider stay cacheable, so the scan's
+    /// table type is what decides.
+    #[tokio::test]
+    async fn test_cache_is_disabled_for_temporary_table_function_scan() {
+        use datafusion::datasource::TableType;
+
+        let cache_provider =
+            QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
+                .expect("valid cache provider");
+
+        for sql in [
+            "SELECT a FROM udtf()",
+            "SELECT a FROM (SELECT a FROM udtf()) t",
+            "SELECT * FROM customer WHERE id IN (SELECT a FROM udtf())",
+            "SELECT * FROM customer WHERE EXISTS (SELECT 1 FROM udtf() WHERE a = customer.id)",
+            "SELECT id, (SELECT max(a) FROM udtf()) AS m FROM customer",
+        ] {
+            for (table_type, cacheable) in [(TableType::Temporary, false), (TableType::Base, true)]
+            {
+                let ctx = utils::tests::create_session_context();
+                ctx.register_udtf("udtf", Arc::new(TypedTableFunction(table_type)));
+                let plan = ctx.state().create_logical_plan(sql).await.expect("plan");
+                assert_eq!(
+                    cache_provider.cache_is_enabled_for_plan(&plan),
+                    cacheable,
+                    "{table_type:?}: {sql}"
+                );
+            }
+        }
+    }
+
+    /// A recursive CTE's work table is a `Temporary` scan of the rows the query
+    /// derives itself, so it leaves a recursive query cacheable; a volatile
+    /// function or a `Temporary` table function inside the recursion still
+    /// keeps it out.
+    #[tokio::test]
+    async fn test_recursive_cte_work_table_does_not_disable_the_cache() {
+        use datafusion::common::tree_node::TreeNode;
+        use datafusion::datasource::TableType;
+
+        let cache_provider =
+            QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
+                .expect("valid cache provider");
+
+        for (sql, cacheable) in [
+            (
+                "WITH RECURSIVE nums(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM nums WHERE n < 3) SELECT n FROM nums",
+                true,
+            ),
+            (
+                "WITH RECURSIVE nums(n) AS (SELECT 1 UNION ALL SELECT n + 1 FROM nums WHERE n < 3 AND random() < 2) SELECT n FROM nums",
+                false,
+            ),
+            (
+                "WITH RECURSIVE nums(n) AS (SELECT a FROM udtf() UNION ALL SELECT n + 1 FROM nums WHERE n < 3) SELECT n FROM nums",
+                false,
+            ),
+        ] {
+            let ctx = utils::tests::create_session_context();
+            ctx.register_udtf("udtf", Arc::new(TypedTableFunction(TableType::Temporary)));
+            let plan = ctx.state().create_logical_plan(sql).await.expect("plan");
+            assert!(
+                plan.exists(|node| Ok(matches!(node, LogicalPlan::RecursiveQuery(_))))
+                    .expect("infallible"),
+                "{sql} must plan as a recursive query, or this test checks nothing"
+            );
+            assert_eq!(
+                cache_provider.cache_is_enabled_for_plan(&plan),
+                cacheable,
+                "{sql}"
+            );
+        }
+    }
+
+    /// A table in an ignored schema keeps a plan out of the cache when only a
+    /// subquery reads it, as it does when the outer query reads it.
+    #[test]
+    fn test_cache_is_disabled_for_ignored_schema_in_subquery() {
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+        use datafusion::common::TableReference;
+        use datafusion::datasource::{empty::EmptyTable, provider_as_source};
+        use datafusion::logical_expr::LogicalPlanBuilder;
+        use datafusion::prelude::{col, in_subquery};
+
+        let scan = |table: TableReference| {
+            let schema = Arc::new(Schema::new(vec![Field::new("a", DataType::Int32, true)]));
+            LogicalPlanBuilder::scan(
+                table,
+                provider_as_source(Arc::new(EmptyTable::new(schema))),
+                None,
+            )
+            .expect("scan")
+        };
+        let subquery = Arc::new(
+            scan(TableReference::partial("runtime", "task_history"))
+                .build()
+                .expect("subquery plan"),
+        );
+        let plan = scan(TableReference::bare("t"))
+            .filter(in_subquery(col("a"), subquery))
+            .expect("filter")
+            .build()
+            .expect("plan");
+
+        for (ignore_schemas, cacheable) in [(&["runtime"][..], false), (&[][..], true)] {
+            let cache_provider = QueryResultsCacheProvider::try_new(
+                &SQLResultsCacheConfig::default(),
+                ignore_schemas
+                    .iter()
+                    .map(|s| Box::<str>::from(*s))
+                    .collect(),
+            )
+            .expect("valid cache provider");
+            assert_eq!(
+                cache_provider.cache_is_enabled_for_plan(&plan),
+                cacheable,
+                "ignore_schemas={ignore_schemas:?}"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn test_cache_is_enabled_for_system_query_describe() {
         let sql = "describe customer";
@@ -2089,6 +2799,92 @@ mod tests {
             .cache_is_enabled_for_plan(&logical_plan)
             .then_some(())
             .expect("cache should be enabled for simple SELECT");
+    }
+
+    #[tokio::test]
+    async fn test_cache_is_disabled_for_non_deterministic_functions() {
+        let cache_provider =
+            QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
+                .expect("valid cache provider");
+
+        for sql in [
+            "SELECT uuid() u",
+            "SELECT random() r",
+            "SELECT uuid() u, random() r, now() t",
+            "SELECT now()",
+            "SELECT current_timestamp",
+            "SELECT current_date",
+            "SELECT current_time()",
+            "SELECT id, random() FROM customer",
+            "SELECT * FROM customer WHERE random() > 0.5",
+            "SELECT * FROM customer WHERE now() > to_timestamp(0)",
+            "SELECT * FROM customer WHERE id IN (SELECT id FROM customer WHERE random() > 0.5)",
+            "SELECT count(*) FROM customer GROUP BY id ORDER BY random()",
+        ] {
+            let logical_plan = parse_sql_to_logical_plan(sql).await;
+            assert!(
+                !cache_provider.cache_is_enabled_for_plan(&logical_plan),
+                "results cache must be disabled for non-deterministic query: {sql}"
+            );
+        }
+    }
+
+    /// `Stable` user functions (e.g. remote HTTP UDFs, which are capped at
+    /// `Stable`) can change between statements, so only `Immutable`
+    /// functions are cacheable.
+    #[tokio::test]
+    async fn test_cache_is_disabled_for_stable_udf() {
+        use datafusion::arrow::datatypes::DataType;
+        use datafusion::logical_expr::{ColumnarValue, Volatility, create_udf};
+
+        let cache_provider =
+            QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
+                .expect("valid cache provider");
+
+        for (volatility, cacheable) in [(Volatility::Stable, false), (Volatility::Immutable, true)]
+        {
+            let ctx = utils::tests::create_session_context();
+            ctx.register_udf(create_udf(
+                "probe",
+                vec![],
+                DataType::Int64,
+                volatility,
+                std::sync::Arc::new(|_: &[ColumnarValue]| {
+                    Ok(ColumnarValue::Scalar(
+                        datafusion::scalar::ScalarValue::Int64(Some(1)),
+                    ))
+                }),
+            ));
+            let plan = ctx
+                .state()
+                .create_logical_plan("SELECT probe()")
+                .await
+                .expect("plan");
+            assert_eq!(
+                cache_provider.cache_is_enabled_for_plan(&plan),
+                cacheable,
+                "{volatility:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_cache_is_enabled_for_deterministic_functions() {
+        let cache_provider =
+            QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
+                .expect("valid cache provider");
+
+        for sql in [
+            "SELECT abs(-1), upper('a')",
+            "SELECT id, lower(first_name) FROM customer WHERE id > 1",
+            "SELECT * FROM customer WHERE id IN (SELECT id FROM customer WHERE state = 'NY')",
+        ] {
+            let logical_plan = parse_sql_to_logical_plan(sql).await;
+            assert!(
+                cache_provider.cache_is_enabled_for_plan(&logical_plan),
+                "results cache must stay enabled for deterministic query: {sql}"
+            );
+        }
     }
 
     #[tokio::test]
@@ -2217,6 +3013,146 @@ mod tests {
             .await
             .expect("invalidation should succeed");
         caching.run_pending_maintenance().await;
+    }
+
+    /// A cache that fails every table invalidation, and one that records whether
+    /// it was asked — enough to tell "the later cache was skipped" from "the
+    /// later cache ran and the earlier failure was still reported".
+    struct RecordingCache<V> {
+        fails: bool,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+        _marker: std::marker::PhantomData<fn() -> V>,
+    }
+
+    impl<V> RecordingCache<V> {
+        fn new(fails: bool) -> (Arc<Self>, Arc<std::sync::atomic::AtomicUsize>) {
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            (
+                Arc::new(Self {
+                    fails,
+                    calls: Arc::clone(&calls),
+                    _marker: std::marker::PhantomData,
+                }),
+                calls,
+            )
+        }
+    }
+
+    impl<V> std::fmt::Debug for RecordingCache<V> {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("RecordingCache")
+                .field("fails", &self.fails)
+                .finish_non_exhaustive()
+        }
+    }
+
+    impl<V> std::fmt::Display for RecordingCache<V> {
+        fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
+            write!(f, "RecordingCache")
+        }
+    }
+
+    impl<V> HashProvider for RecordingCache<V> {
+        fn hasher(&self) -> Box<dyn Hasher> {
+            Box::new(std::collections::hash_map::DefaultHasher::new())
+        }
+    }
+
+    #[async_trait]
+    impl<V: AsTableRefs + Clone + Send + Sync + 'static> CacheProvider<V> for RecordingCache<V> {
+        async fn get_raw_key(&self, _key: &u64) -> Option<Arc<V>> {
+            None
+        }
+        async fn get_raw_key_validated(
+            &self,
+            _key: &u64,
+            _is_valid: &(dyn for<'v> Fn(&'v V) -> bool + Send + Sync),
+        ) -> Option<Arc<V>> {
+            None
+        }
+        async fn put_raw_key(&self, _key: &u64, _value: V) {}
+        async fn put_raw_key_with_weight(&self, _key: &u64, _value: V, _weight: usize) {}
+        async fn replace_if(
+            &self,
+            _key: &u64,
+            _value: V,
+            _should_replace: &(dyn for<'v> Fn(&'v V) -> bool + Send + Sync),
+        ) -> bool {
+            false
+        }
+        async fn put_if(
+            &self,
+            _key: &u64,
+            _value: V,
+            _weight: usize,
+            _admit: &(dyn for<'v> Fn(Option<&'v V>) -> bool + Send + Sync),
+        ) -> bool {
+            false
+        }
+        async fn invalidate_all(&self) {}
+        async fn size_bytes(&self) -> u64 {
+            0
+        }
+        async fn item_count(&self) -> u64 {
+            0
+        }
+        fn max_size(&self) -> usize {
+            0
+        }
+        async fn checkpoint(&self) {}
+    }
+
+    #[async_trait]
+    impl<V: AsTableRefs + Clone + Send + Sync + 'static> TabledCacheProvider<V> for RecordingCache<V> {
+        async fn invalidate_for_table(&self, _table_ref: TableReference) -> Result<()> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if self.fails {
+                Err(Error::FailedToInvalidateCacheGeneric {
+                    source: moka::PredicateError::InvalidationClosuresDisabled,
+                })
+            } else {
+                Ok(())
+            }
+        }
+        fn tables_changed_since(&self, _tables: &HashSet<TableReference>, _since: Instant) -> bool {
+            false
+        }
+    }
+
+    /// spiceai/spiceai#14251 review: the caches invalidated for one table each keep
+    /// their own change clock, so a `?` between them left the later ones serving a
+    /// table the earlier one had been told was gone. Every arm must run, and the
+    /// failure must still reach the caller.
+    ///
+    /// Before the fix the search cache saw no call at all: the plans failure
+    /// returned from `invalidate_derived_for_table` first.
+    #[tokio::test]
+    async fn a_failing_cache_does_not_skip_the_ones_after_it() {
+        let (plans, plans_calls) = RecordingCache::<LogicalPlan>::new(true);
+        let (search, search_calls) = RecordingCache::<CachedSearchResult>::new(false);
+
+        let caching = Caching::new()
+            .with_plans_cache(plans)
+            .with_search_cache(search);
+
+        let outcome = caching
+            .invalidate_for_table(TableReference::bare("unloaded"))
+            .await;
+
+        assert!(
+            outcome.is_err(),
+            "the plans failure must still be reported to the caller"
+        );
+        assert_eq!(
+            plans_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the failing cache is the one that ran first"
+        );
+        assert_eq!(
+            search_calls.load(std::sync::atomic::Ordering::SeqCst),
+            1,
+            "the search cache must be invalidated even though the plans cache failed"
+        );
     }
 
     #[tokio::test]
@@ -2701,6 +3637,452 @@ mod tests {
                 .expect("get after original ttl")
                 .is_none(),
             "promotion must not restart item_ttl"
+        );
+    }
+
+    /// Keeps two instants a test orders distinct: a tie counts as changed.
+    pub(crate) async fn tick() {
+        tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+    }
+
+    /// The resident entry's read start, bypassing the validity ruling.
+    async fn resident_read_started_at(
+        provider: &QueryResultsCacheProvider,
+        key: &RawCacheKey,
+    ) -> Option<Instant> {
+        provider
+            .cache
+            .get_raw_key(&key.as_u64())
+            .await
+            .map(|entry| entry.read_started_at)
+    }
+
+    /// An untouched result is stored and served fresh, with or without a window.
+    #[tokio::test]
+    async fn store_raw_key_stores_a_result_no_change_overtook() {
+        for config in [
+            SQLResultsCacheConfig::default(),
+            config_with_stale_window("5m"),
+        ] {
+            let provider =
+                QueryResultsCacheProvider::try_new(&config, Box::new([])).expect("valid provider");
+            let key = RawCacheKey::new(1);
+            let read_started_at = Instant::now();
+
+            assert!(
+                provider
+                    .store_raw_key(
+                        &key,
+                        cached_result_for("customer", read_started_at).await,
+                        None
+                    )
+                    .await
+                    .expect("cache access should succeed")
+            );
+            assert!(
+                provider
+                    .get_raw_key(&key)
+                    .await
+                    .expect("cache access should succeed")
+                    .is_some(),
+                "an untouched result must be served fresh"
+            );
+        }
+    }
+
+    /// A result heavier than `max_size` is refused before any resident is consulted.
+    /// That is reported as its own error, not as storage or invalidation, and the key
+    /// stays empty.
+    #[tokio::test]
+    async fn store_raw_key_reports_a_result_heavier_than_the_cache_as_an_error() {
+        let provider =
+            QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
+                .expect("valid provider");
+        let key = RawCacheKey::new(1);
+        let max_size = provider.max_size();
+        let too_heavy = usize::try_from(max_size).expect("max_size fits usize") + 1;
+
+        let err = provider
+            .store_raw_key(
+                &key,
+                cached_result_for("customer", Instant::now()).await,
+                Some(too_heavy),
+            )
+            .await
+            .expect_err("a result heavier than max_size is not stored");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "The query result ({too_heavy} bytes) is larger than the SQL results cache max_size ({max_size} bytes), so it was not cached"
+            )
+        );
+        assert!(
+            provider
+                .get_raw_key(&key)
+                .await
+                .expect("cache access should succeed")
+                .is_none(),
+            "the key stays empty"
+        );
+    }
+
+    /// Without a stale window, an overtaken result is not stored.
+    #[tokio::test]
+    async fn store_raw_key_drops_a_result_overtaken_by_a_change_without_a_stale_window() {
+        let provider =
+            QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
+                .expect("valid provider");
+        let key = RawCacheKey::new(2);
+        let read_started_at = Instant::now();
+        provider
+            .invalidate_for_table(TableReference::bare("customer"))
+            .await
+            .expect("invalidation should succeed");
+
+        assert!(
+            !provider
+                .store_raw_key(
+                    &key,
+                    cached_result_for("customer", read_started_at).await,
+                    None
+                )
+                .await
+                .expect("cache access should succeed")
+        );
+        assert!(
+            resident_read_started_at(&provider, &key).await.is_none(),
+            "an unservable result must not be resident"
+        );
+    }
+
+    /// Regression test for #14686: inside a stale window, an overtaken result is
+    /// stored and served stale, never fresh.
+    #[tokio::test]
+    async fn store_raw_key_keeps_a_result_overtaken_by_a_change_as_stale_inside_the_window() {
+        let provider =
+            QueryResultsCacheProvider::try_new(&config_with_stale_window("5m"), Box::new([]))
+                .expect("valid provider");
+        let key = RawCacheKey::new(3);
+        let read_started_at = Instant::now();
+        provider
+            .invalidate_for_table(TableReference::bare("customer"))
+            .await
+            .expect("invalidation should succeed");
+
+        assert!(
+            provider
+                .store_raw_key(
+                    &key,
+                    cached_result_for("customer", read_started_at).await,
+                    None
+                )
+                .await
+                .expect("cache access should succeed")
+        );
+
+        let (_, validity) = provider
+            .get_raw_key_with_validity(&key)
+            .await
+            .expect("cache access should succeed")
+            .expect("the result must be servable inside the window");
+        assert_eq!(validity, EntryValidity::StaleWhileRevalidate);
+        assert!(
+            provider
+                .get_raw_key(&key)
+                .await
+                .expect("cache access should succeed")
+                .is_none(),
+            "a result overtaken by a change must never be served as fresh"
+        );
+    }
+
+    /// Once the window after the change has closed, the result is not stored.
+    #[tokio::test]
+    async fn store_raw_key_drops_a_result_once_the_stale_window_has_closed() {
+        let provider =
+            QueryResultsCacheProvider::try_new(&config_with_stale_window("20ms"), Box::new([]))
+                .expect("valid provider");
+        let key = RawCacheKey::new(4);
+        let read_started_at = Instant::now();
+        provider
+            .invalidate_for_table(TableReference::bare("customer"))
+            .await
+            .expect("invalidation should succeed");
+        // Time is under test: the window is measured from the change.
+        tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+
+        assert!(!provider.is_servable(
+            &HashSet::from([TableReference::bare("customer")]),
+            read_started_at
+        ));
+        assert!(
+            !provider
+                .store_raw_key(
+                    &key,
+                    cached_result_for("customer", read_started_at).await,
+                    None
+                )
+                .await
+                .expect("cache access should succeed")
+        );
+        assert!(resident_read_started_at(&provider, &key).await.is_none());
+    }
+
+    /// An older stale result must not replace a newer one.
+    #[tokio::test]
+    async fn store_raw_key_keeps_a_newer_resident_over_an_older_stale_result() {
+        let provider =
+            QueryResultsCacheProvider::try_new(&config_with_stale_window("5m"), Box::new([]))
+                .expect("valid provider");
+        let key = RawCacheKey::new(5);
+
+        let older_read = Instant::now();
+        provider
+            .invalidate_for_table(TableReference::bare("customer"))
+            .await
+            .expect("invalidation should succeed");
+        tick().await;
+        let newer_read = Instant::now();
+
+        assert!(
+            provider
+                .store_raw_key(&key, cached_result_for("customer", newer_read).await, None)
+                .await
+                .expect("cache access should succeed")
+        );
+        assert!(
+            provider
+                .store_raw_key(&key, cached_result_for("customer", older_read).await, None)
+                .await
+                .expect("cache access should succeed")
+        );
+
+        assert_eq!(
+            resident_read_started_at(&provider, &key).await,
+            Some(newer_read),
+            "the newer result must stay resident"
+        );
+        assert!(
+            provider
+                .get_raw_key(&key)
+                .await
+                .expect("cache access should succeed")
+                .is_some(),
+            "the newer result read after the change and is still served fresh"
+        );
+    }
+
+    /// Both writes are still fresh (`Valid`) — no table change — so this is
+    /// the admission that used an unconditional insert. The later resident
+    /// must stay; overwriting it would move the cache backwards.
+    #[tokio::test]
+    async fn store_raw_key_keeps_a_newer_resident_over_an_older_fresh_result() {
+        let provider =
+            QueryResultsCacheProvider::try_new(&config_with_stale_window("5m"), Box::new([]))
+                .expect("valid provider");
+        let key = RawCacheKey::new(7);
+        let tables = HashSet::from([TableReference::bare("customer")]);
+
+        let older_read = Instant::now();
+        tick().await;
+        let newer_read = Instant::now();
+
+        assert_eq!(
+            provider.entry_validity(&tables, older_read, Instant::now()),
+            EntryValidity::Valid,
+            "the older write is still a fresh admission"
+        );
+        assert_eq!(
+            provider.entry_validity(&tables, newer_read, Instant::now()),
+            EntryValidity::Valid,
+            "the newer write is a fresh admission"
+        );
+
+        assert!(
+            provider
+                .store_raw_key(&key, cached_result_for("customer", newer_read).await, None)
+                .await
+                .expect("cache access should succeed")
+        );
+        assert!(
+            provider
+                .store_raw_key(&key, cached_result_for("customer", older_read).await, None)
+                .await
+                .expect("cache access should succeed")
+        );
+
+        assert_eq!(
+            resident_read_started_at(&provider, &key).await,
+            Some(newer_read),
+            "a fresh admission must not replace a resident that began reading later"
+        );
+        assert!(
+            provider
+                .get_raw_key(&key)
+                .await
+                .expect("cache access should succeed")
+                .is_some(),
+            "the newer result is still served fresh"
+        );
+    }
+
+    /// Q1 is Valid when it starts, a table then changes, Q2 stores, then Q1
+    /// writes. The newer resident must stay so the hit path cannot serve Q1
+    /// as stale.
+    #[tokio::test]
+    async fn store_raw_key_keeps_a_newer_resident_when_invalidation_lands_between_admission_and_write()
+     {
+        let provider =
+            QueryResultsCacheProvider::try_new(&config_with_stale_window("5m"), Box::new([]))
+                .expect("valid provider");
+        let key = RawCacheKey::new(8);
+        let tables = HashSet::from([TableReference::bare("customer")]);
+
+        let q1_started = Instant::now();
+        assert_eq!(
+            provider.entry_validity(&tables, q1_started, Instant::now()),
+            EntryValidity::Valid,
+            "Q1 is a fresh admission before the invalidation"
+        );
+
+        provider
+            .invalidate_for_table(TableReference::bare("customer"))
+            .await
+            .expect("invalidation should succeed");
+        tick().await;
+        let q2_started = Instant::now();
+
+        assert!(
+            provider
+                .store_raw_key(&key, cached_result_for("customer", q2_started).await, None)
+                .await
+                .expect("cache access should succeed")
+        );
+        assert!(
+            provider
+                .store_raw_key(&key, cached_result_for("customer", q1_started).await, None)
+                .await
+                .expect("cache access should succeed")
+        );
+
+        assert_eq!(
+            resident_read_started_at(&provider, &key).await,
+            Some(q2_started),
+            "Q1 finishing after encoding must not replace Q2"
+        );
+        let (entry, validity) = provider
+            .get_raw_key_with_validity(&key)
+            .await
+            .expect("cache access should succeed")
+            .expect("Q2 must remain servable");
+        assert_eq!(entry.read_started_at, q2_started);
+        assert_eq!(validity, EntryValidity::Valid);
+        assert!(
+            provider
+                .get_raw_key(&key)
+                .await
+                .expect("cache access should succeed")
+                .is_some(),
+            "Q2 read after the change and must still be served fresh, not Q1 as stale"
+        );
+    }
+
+    /// The table changes during every read, as under CDC; each result still
+    /// replaces the older entry.
+    #[tokio::test]
+    async fn store_raw_key_advances_the_entry_under_continuous_changes() {
+        let provider =
+            QueryResultsCacheProvider::try_new(&config_with_stale_window("5m"), Box::new([]))
+                .expect("valid provider");
+        let key = RawCacheKey::new(6);
+        let customer = TableReference::bare("customer");
+
+        let mut previous_read = None;
+        for _ in 0..3 {
+            tick().await;
+            let read_started_at = Instant::now();
+            // A change lands while this query runs.
+            provider
+                .invalidate_for_table(customer.clone())
+                .await
+                .expect("invalidation should succeed");
+
+            assert!(
+                provider
+                    .store_raw_key(
+                        &key,
+                        cached_result_for("customer", read_started_at).await,
+                        None
+                    )
+                    .await
+                    .expect("cache access should succeed")
+            );
+            let resident = resident_read_started_at(&provider, &key)
+                .await
+                .expect("an entry must be resident");
+            assert_eq!(resident, read_started_at);
+            if let Some(previous) = previous_read {
+                assert!(resident > previous, "the entry must move forward");
+            }
+            previous_read = Some(read_started_at);
+
+            let (_, validity) = provider
+                .get_raw_key_with_validity(&key)
+                .await
+                .expect("cache access should succeed")
+                .expect("servable inside the window");
+            assert_eq!(validity, EntryValidity::StaleWhileRevalidate);
+        }
+    }
+
+    /// `is_servable` matches the hit-time ruling.
+    #[tokio::test]
+    async fn is_servable_matches_the_hit_time_ruling() {
+        let customer = HashSet::from([TableReference::bare("customer")]);
+        let orders = HashSet::from([TableReference::bare("orders")]);
+
+        let hard =
+            QueryResultsCacheProvider::try_new(&SQLResultsCacheConfig::default(), Box::new([]))
+                .expect("valid provider");
+        let windowed =
+            QueryResultsCacheProvider::try_new(&config_with_stale_window("5m"), Box::new([]))
+                .expect("valid provider");
+
+        for provider in [&hard, &windowed] {
+            let read_started_at = Instant::now();
+            provider
+                .invalidate_for_table(TableReference::bare("customer"))
+                .await
+                .expect("invalidation should succeed");
+            assert!(
+                provider.is_servable(&orders, read_started_at),
+                "an unrelated table's change must not affect the result"
+            );
+            assert!(
+                provider.is_servable(&HashSet::new(), read_started_at),
+                "a table-less result is always servable"
+            );
+            tick().await;
+            assert!(
+                provider.is_servable(&customer, Instant::now()),
+                "a read that began after the change is servable"
+            );
+        }
+
+        let read_started_at = Instant::now();
+        for provider in [&hard, &windowed] {
+            provider
+                .invalidate_for_table(TableReference::bare("customer"))
+                .await
+                .expect("invalidation should succeed");
+        }
+        assert!(
+            !hard.is_servable(&customer, read_started_at),
+            "without a window, a result overtaken by a change is unservable"
+        );
+        assert!(
+            windowed.is_servable(&customer, read_started_at),
+            "inside a window, a result overtaken by a change is servable stale"
         );
     }
 }

@@ -1,0 +1,28 @@
+{
+  "description": "The release lines of each federated source database that Spice supports and tests: LTS lines only. PostgreSQL has no LTS label and supports every major for five years, so each supported major is listed; MySQL lists its LTS tracks (no innovation releases); MongoDB lists its major releases (no rapid or minor releases). Keep each list in ascending order: the last entry is the integration suite's default, and CI runs the suite again on every other entry (.github/workflows/integration.yml). Remove a line once it passes end_of_life.",
+  "postgres": {
+    "image": "docker.io/library/postgres",
+    "versions": [
+      { "version": "14", "end_of_life": "2026-11-12" },
+      { "version": "15", "end_of_life": "2027-11-11" },
+      { "version": "16", "end_of_life": "2028-11-09" },
+      { "version": "17", "end_of_life": "2029-11-08" },
+      { "version": "18", "end_of_life": "2030-11-14" }
+    ]
+  },
+  "mysql": {
+    "image": "docker.io/library/mysql",
+    "versions": [
+      { "version": "8.4", "end_of_life": "2032-04-30" },
+      { "version": "9.7", "end_of_life": "2034-04-30" }
+    ]
+  },
+  "mongodb": {
+    "image": "docker.io/library/mongo",
+    "versions": [
+      { "version": "7.0", "end_of_life": "2027-08-31" },
+      { "version": "8.0", "end_of_life": "2029-10-31" },
+      { "version": "9.0", "end_of_life": "2031-10-31" }
+    ]
+  }
+}

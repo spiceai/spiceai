@@ -14,7 +14,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 */
 
-//! Scheduler failover integration tests.
+//! Scheduler failover and shared-state layout integration tests.
 //!
 //! Validates that when the scheduler driving a distributed async query becomes
 //! unavailable, another scheduler sharing the same object-store job state
@@ -62,7 +62,9 @@ use runtime::jobs::{JobExecutor, JobState, JobStatus};
 use runtime::{Result as RuntimeResult, Runtime};
 use rustls::crypto::{CryptoProvider, aws_lc_rs};
 use spicepod::component::dataset::Dataset;
-use spicepod::component::runtime::{Runtime as SpicepodRuntime, Scheduler as SchedulerConfig};
+use spicepod::component::runtime::{
+    Runtime as SpicepodRuntime, RuntimeState, Scheduler as SchedulerConfig,
+};
 use test_framework::pki::{PkiConfig, init_pki};
 use tokio::task::JoinHandle;
 use tokio::time::{Instant, sleep};
@@ -101,33 +103,37 @@ struct SchedulerNode {
     cluster_addr: String,
 }
 
+/// Scheduler settings that keep cluster state at `state_location` through
+/// `runtime.scheduler.state_location`.
+fn scheduler_state_location(state_location: &str) -> SpicepodRuntime {
+    SpicepodRuntime {
+        scheduler: Some(SchedulerConfig {
+            state_location: Some(state_location.to_string()),
+            params: None,
+            partition_assignment_interval: "1s".to_string(),
+            max_partition_assignments_per_interval:
+                spicepod::component::runtime::default_max_partition_assignments_per_interval(),
+            max_partitions_per_executor: 10,
+            partition_discovery_timeout:
+                spicepod::component::runtime::default_partition_discovery_timeout(),
+        }),
+        ..SpicepodRuntime::default()
+    }
+}
+
 async fn build_scheduler(
     name: &str,
     pki: &PkiConfig,
-    state_location: &str,
+    runtime: SpicepodRuntime,
     csv_path: &str,
 ) -> Result<SchedulerNode, anyhow::Error> {
     let cert = pki.create_client_cert(name).map_err(anyhow::Error::msg)?;
     let (http, flight, cluster) = (alloc_port(), alloc_port(), alloc_port());
     let cluster_addr = format!("127.0.0.1:{cluster}");
 
-    let scheduler_cfg = SchedulerConfig {
-        state_location: state_location.to_string(),
-        params: None,
-        partition_assignment_interval: "1s".to_string(),
-        max_partition_assignments_per_interval:
-            spicepod::component::runtime::default_max_partition_assignments_per_interval(),
-        max_partitions_per_executor: 10,
-        partition_discovery_timeout:
-            spicepod::component::runtime::default_partition_discovery_timeout(),
-    };
-
     let app = AppBuilder::new(format!("failover_{name}"))
         .with_dataset(Dataset::new(format!("file:{csv_path}"), "names"))
-        .with_runtime(SpicepodRuntime {
-            scheduler: Some(scheduler_cfg),
-            ..SpicepodRuntime::default()
-        })
+        .with_runtime(runtime)
         .build();
 
     let config = Config {
@@ -371,8 +377,20 @@ async fn run_failover(recovery_timeout: Duration) -> Result<(), anyhow::Error> {
     // test is hermetic — no S3/AWS creds needed).
     let state_location = format!("file://{}", state_tempdir.path().display());
 
-    let s1 = build_scheduler("scheduler1", &pki, &state_location, &csv_path).await?;
-    let s2 = build_scheduler("scheduler2", &pki, &state_location, &csv_path).await?;
+    let s1 = build_scheduler(
+        "scheduler1",
+        &pki,
+        scheduler_state_location(&state_location),
+        &csv_path,
+    )
+    .await?;
+    let s2 = build_scheduler(
+        "scheduler2",
+        &pki,
+        scheduler_state_location(&state_location),
+        &csv_path,
+    )
+    .await?;
 
     // The single executor attaches to s2 only, so a job submitted to s1 stalls
     // (s1 has no executor to dispatch to) — this is the deterministic hold.
@@ -479,5 +497,107 @@ async fn recovers_job_after_scheduler_loss_sigkill() -> Result<(), anyhow::Error
     let _tracing = init_tracing(Some("integration=debug,info"));
     test_request_context()
         .scope(async { run_failover(Duration::from_secs(90)).await })
+        .await
+}
+
+/// Poll until `path` exists.
+async fn wait_for_path(path: &std::path::Path, timeout: Duration) -> Result<(), anyhow::Error> {
+    let start = Instant::now();
+    while !path.exists() {
+        if start.elapsed() > timeout {
+            return Err(anyhow::Error::msg(format!(
+                "timed out waiting for {} within {timeout:?}",
+                path.display()
+            )));
+        }
+        sleep(Duration::from_millis(150)).await;
+    }
+    Ok(())
+}
+
+/// With only `runtime.state` set, the scheduler keeps cluster membership,
+/// heartbeats, async-query jobs and job graphs in the location's `cluster/`
+/// folder.
+async fn run_runtime_state_layout() -> Result<(), anyhow::Error> {
+    let _ = CryptoProvider::install_default(aws_lc_rs::default_provider());
+    configure_test_datafusion();
+
+    let tempdir = tempfile::tempdir().expect("tempdir");
+    let state_tempdir = tempfile::tempdir().expect("state tempdir");
+    let pki = init_pki(tempdir.path()).map_err(anyhow::Error::msg)?;
+
+    let csv_path = tempdir.path().join("names.csv");
+    std::fs::write(&csv_path, build_names_csv()).expect("write csv");
+    let csv_path = csv_path.to_str().expect("csv path str").to_string();
+
+    let scheduler = build_scheduler(
+        "scheduler",
+        &pki,
+        SpicepodRuntime {
+            state: Some(RuntimeState {
+                location: format!("file://{}", state_tempdir.path().display()),
+                params: None,
+            }),
+            ..SpicepodRuntime::default()
+        },
+        &csv_path,
+    )
+    .await?;
+
+    // No executor is attached, so the job stays Running and its state stays in the store.
+    let job_executor = wait_for_job_executor(&scheduler.rt, Duration::from_mins(1)).await?;
+    let job_id = job_executor
+        .submit(
+            SubmitQueryRequest {
+                sql: "SELECT COUNT(*) AS c FROM names".to_string(),
+                parameters: None,
+                timeout_seconds: None,
+                maximum_size: None,
+            },
+            true,
+            runtime::jobs::PUBLIC_JOB_OWNER.to_string(),
+        )
+        .await
+        .map_err(|e| anyhow::Error::msg(format!("submit: {e}")))?
+        .job_id;
+    wait_for_job(
+        &job_executor,
+        &job_id,
+        Duration::from_mins(1),
+        "Running",
+        |s| s.status == JobStatus::Running,
+    )
+    .await?;
+
+    let cluster = state_tempdir.path().join("cluster");
+    for path in [
+        cluster.join("cluster.json"),
+        cluster.join(format!("heartbeats/{}.json", scheduler.cluster_addr)),
+        cluster.join(format!("jobs/{job_id}.json")),
+        cluster.join("scheduler/meta"),
+    ] {
+        wait_for_path(&path, Duration::from_mins(1)).await?;
+    }
+    let mut root: Vec<_> = std::fs::read_dir(state_tempdir.path())?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<Result<_, _>>()?;
+    root.retain(|name| name != ".spice-object-store-occ.lock");
+    assert_eq!(
+        root,
+        ["cluster"],
+        "the scheduler must write only under cluster/"
+    );
+
+    scheduler.rt.shutdown().await;
+    scheduler.handle.abort();
+    Ok(())
+}
+
+#[tokio::test(flavor = "multi_thread")]
+#[cfg(not(target_os = "windows"))]
+async fn runtime_state_scheduler_writes_under_cluster_folder() -> Result<(), anyhow::Error> {
+    let _tracing = init_tracing(Some("integration=debug,info"));
+    test_request_context()
+        .scope(async { run_runtime_state_layout().await })
         .await
 }

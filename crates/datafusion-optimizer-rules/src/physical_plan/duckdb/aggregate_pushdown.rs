@@ -3,7 +3,7 @@ use crate::concrete;
 use crate::physical_plan::duckdb::ConcreteDuckSqlExec;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::tree_node::{Transformed, TreeNode, TreeNodeRecursion};
-use datafusion::common::{Result, Statistics, exec_err, plan_err};
+use datafusion::common::{Result, Statistics, exec_err};
 use datafusion::config::ConfigOptions;
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::{
@@ -17,7 +17,9 @@ use datafusion::physical_plan::filter_pushdown::{
 use datafusion::physical_plan::metrics::MetricsSet;
 use datafusion::physical_plan::projection::ProjectionExec;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties, SortOrderPushdownResult,
+    ChildStats, DisplayAs, DisplayFormatType, ExecutionPlan, InputDistributionRequirements,
+    PlanProperties, ReplaceChildrenOptions, SortOrderPushdownResult, StatisticsArgs,
+    StatisticsContext,
 };
 use datafusion::sql::unparser::Unparser;
 use datafusion::sql::unparser::dialect::DuckDBDialect;
@@ -44,6 +46,16 @@ impl DuckDBAggregatePushdownMarkerExec {
 
     fn name() -> &'static str {
         "DuckDBAggregatePushdownMarkerExec"
+    }
+
+    fn with_input(&self, children: Vec<Arc<dyn ExecutionPlan>>) -> Result<Arc<dyn ExecutionPlan>> {
+        let [input]: [Arc<dyn ExecutionPlan>; 1] = children.try_into().map_err(|_| {
+            datafusion::error::DataFusionError::Plan(
+                "DuckDBAggregatePushdownMarkerExec is unary, but has more than one input"
+                    .to_string(),
+            )
+        })?;
+        Ok(Self::new(self.logical_plan.clone(), input))
     }
 }
 
@@ -84,6 +96,18 @@ impl ExecutionPlan for DuckDBAggregatePushdownMarkerExec {
         vec![Distribution::UnspecifiedDistribution; self.children().len()]
     }
 
+    fn input_distribution_requirements(&self) -> InputDistributionRequirements {
+        InputDistributionRequirements::new(vec![
+            Distribution::UnspecifiedDistribution;
+            self.children().len()
+        ])
+    }
+
+    /// A marker that is rewritten before execution; it owns no dynamic filters.
+    fn dynamic_expressions_produced(&self) -> Vec<Arc<dyn PhysicalExpr>> {
+        Vec::new()
+    }
+
     fn required_input_ordering(&self) -> Vec<Option<OrderingRequirements>> {
         self.input.required_input_ordering()
     }
@@ -96,24 +120,42 @@ impl ExecutionPlan for DuckDBAggregatePushdownMarkerExec {
         vec![false]
     }
 
+    fn apply_expressions(
+        &self,
+        _f: &mut dyn FnMut(
+            &Arc<dyn datafusion::physical_plan::PhysicalExpr>,
+        ) -> datafusion::error::Result<
+            datafusion::common::tree_node::TreeNodeRecursion,
+        >,
+    ) -> datafusion::error::Result<datafusion::common::tree_node::TreeNodeRecursion> {
+        Ok(datafusion::common::tree_node::TreeNodeRecursion::Continue)
+    }
+
     fn children(&self) -> Vec<&Arc<dyn ExecutionPlan>> {
         vec![&self.input]
+    }
+
+    fn replace_children(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+        _options: ReplaceChildrenOptions,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        // `properties()` is read from the input, so there is nothing to keep or recompute.
+        self.with_input(children)
     }
 
     fn with_new_children(
         self: Arc<Self>,
         children: Vec<Arc<dyn ExecutionPlan>>,
     ) -> Result<Arc<dyn ExecutionPlan>> {
-        if children.len() != 1 {
-            return plan_err!(
-                "DuckDBAggregatePushdownMarkerExec is unary, but has more than one input"
-            );
-        }
+        self.with_input(children)
+    }
 
-        Ok(Self::new(
-            self.logical_plan.clone(),
-            Arc::clone(&children[0]),
-        ))
+    fn with_new_children_and_same_properties(
+        self: Arc<Self>,
+        children: Vec<Arc<dyn ExecutionPlan>>,
+    ) -> Result<Arc<dyn ExecutionPlan>> {
+        self.with_input(children)
     }
 
     fn reset_state(self: Arc<Self>) -> Result<Arc<dyn ExecutionPlan>> {
@@ -146,7 +188,26 @@ impl ExecutionPlan for DuckDBAggregatePushdownMarkerExec {
     }
 
     fn partition_statistics(&self, partition: Option<usize>) -> Result<Arc<Statistics>> {
-        self.input.partition_statistics(partition)
+        StatisticsContext::new().compute(
+            self.input.as_ref(),
+            &StatisticsArgs::new().with_partition(partition),
+        )
+    }
+
+    fn child_stats_requests(&self, partition: Option<usize>) -> Vec<ChildStats> {
+        vec![ChildStats::At(partition)]
+    }
+
+    /// The marker stands in for its input subtree, so it reports the input's statistics.
+    fn statistics_from_inputs(
+        &self,
+        input_stats: &[Arc<Statistics>],
+        _args: &StatisticsArgs,
+    ) -> Result<Arc<Statistics>> {
+        let Some(stats) = input_stats.first() else {
+            return exec_err!("DuckDBAggregatePushdownMarkerExec requires exactly one input");
+        };
+        Ok(Arc::clone(stats))
     }
 
     fn supports_limit_pushdown(&self) -> bool {
@@ -177,7 +238,17 @@ impl ExecutionPlan for DuckDBAggregatePushdownMarkerExec {
         &self,
         projection: &ProjectionExec,
     ) -> Result<Option<Arc<dyn ExecutionPlan>>> {
-        if let Some(swapped) = self.input.try_swapping_with_projection(projection)? {
+        // Implementations of `try_swapping_with_projection` read the projection's
+        // input as the node being swapped with (a `ProjectionExec` collapses the
+        // chain starting there, `CoalescePartitionsExec` rebuilds from its child),
+        // so the projection is re-rooted on the input before it is handed down.
+        // This node's schema is its input's, so the expressions carry over.
+        let projection = ProjectionExec::try_new_with_schema_metadata(
+            projection.expr().iter().cloned(),
+            Arc::clone(&self.input),
+            projection.schema().as_ref(),
+        )?;
+        if let Some(swapped) = self.input.try_swapping_with_projection(&projection)? {
             Ok(Some(Self::new(self.logical_plan.clone(), swapped)))
         } else {
             Ok(None)
@@ -205,6 +276,14 @@ impl ExecutionPlan for DuckDBAggregatePushdownMarkerExec {
 
     fn with_new_state(&self, _state: Arc<dyn Any + Send + Sync>) -> Option<Arc<dyn ExecutionPlan>> {
         None
+    }
+
+    /// Not serializable: the marker must be rewritten into a `DuckSqlExec` before execution.
+    fn try_to_proto(
+        &self,
+        _ctx: &datafusion::physical_plan::proto::ExecutionPlanEncodeCtx<'_>,
+    ) -> Result<Option<datafusion_proto::protobuf::PhysicalPlanNode>> {
+        Ok(None)
     }
 }
 
@@ -271,5 +350,75 @@ impl PhysicalOptimizerRule for DuckDBAggregatePushdownRewriter {
 
     fn schema_check(&self) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::datasource::memory::MemorySourceConfig;
+    use datafusion::logical_expr::LogicalPlanBuilder;
+    use datafusion::physical_expr::expressions::col;
+    use datafusion::physical_optimizer::projection_pushdown::ProjectionPushdown;
+    use datafusion::physical_plan::displayable;
+
+    /// A projection above the marker, over a projection the marker holds, must
+    /// collapse beneath the marker. Delegated without re-rooting, the inner
+    /// `ProjectionExec` hands the projection back still above the marker, and
+    /// the projection pushdown nests markers on every step without bound.
+    #[test]
+    fn projection_over_marked_projection_collapses_beneath_the_marker() {
+        let schema = Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)]));
+        let scan = MemorySourceConfig::try_new_exec(&[vec![]], Arc::clone(&schema), None)
+            .expect("memory scan should be created");
+        let id = col("id", &schema).expect("id column should exist");
+        let inner = Arc::new(
+            ProjectionExec::try_new(
+                vec![(Arc::clone(&id), "a".to_string()), (id, "b".to_string())],
+                scan,
+            )
+            .expect("inner projection should be created"),
+        );
+        let logical_plan = LogicalPlanBuilder::empty(false)
+            .build()
+            .expect("empty logical plan should build");
+        let marker: Arc<dyn ExecutionPlan> =
+            DuckDBAggregatePushdownMarkerExec::new(logical_plan, inner);
+        let marker_schema = marker.schema();
+        let outer = ProjectionExec::try_new(
+            vec![
+                (col("b", &marker_schema).expect("b column"), "x".to_string()),
+                (col("a", &marker_schema).expect("a column"), "y".to_string()),
+            ],
+            Arc::clone(&marker),
+        )
+        .expect("outer projection should be created");
+
+        let swapped = marker
+            .try_swapping_with_projection(&outer)
+            .expect("projection swap should be attempted")
+            .expect("the projections should collapse");
+        let child = swapped.children()[0];
+        assert!(
+            swapped.is::<DuckDBAggregatePushdownMarkerExec>()
+                && child.is::<ProjectionExec>()
+                && !child.children()[0].is::<DuckDBAggregatePushdownMarkerExec>(),
+            "expected one projection beneath the marker, got:\n{}",
+            displayable(swapped.as_ref()).indent(true)
+        );
+        assert_eq!(swapped.schema(), outer.schema());
+
+        let optimized = ProjectionPushdown::new()
+            .optimize(Arc::new(outer), &ConfigOptions::default())
+            .expect("projection pushdown should succeed");
+        let rendered = displayable(optimized.as_ref()).indent(true).to_string();
+        assert_eq!(
+            rendered
+                .matches("DuckDBAggregatePushdownMarkerExec")
+                .count(),
+            1,
+            "projection pushdown must not nest markers:\n{rendered}"
+        );
     }
 }

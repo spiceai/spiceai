@@ -37,8 +37,8 @@ use ballista_core::serde::scheduler::PartitionLocation;
 use ballista_scheduler::scheduler_server::SchedulerServer;
 use ballista_scheduler::scheduler_server::job_state_event::JobState as BallistaJobState;
 use cache::key::RawCacheKey;
+use datafusion::common::TableReference;
 use datafusion::execution::SendableRecordBatchStream;
-use datafusion::sql::TableReference;
 use datafusion_proto::protobuf::{LogicalPlanNode, PhysicalPlanNode};
 use futures::{Stream, StreamExt};
 use parking_lot::Mutex;
@@ -374,7 +374,7 @@ impl QueryHandle {
 
         if let QueryHandleState::Running { scheduler } = &self.state {
             scheduler
-                .cancel_job(self.ballista_job_id.clone())
+                .cancel_job(JobId::from(self.ballista_job_id.as_str()))
                 .await
                 .map_err(|e| QueryHandleError::StatusError {
                     message: format!("Failed to cancel job: {e}"),
@@ -481,7 +481,7 @@ impl QueryHandle {
                 }
                 // Check for cancellation
                 () = cancel.cancelled() => {
-                    let _ = scheduler.cancel_job(self.ballista_job_id.clone()).await;
+                    let _ = scheduler.cancel_job(JobId::from(self.ballista_job_id.as_str())).await;
                     let err = QueryHandleError::JobCancelled;
                     self.finish_tracker_with_error(&err);
                     return Err(err);
@@ -807,7 +807,7 @@ impl QueryHandle {
                         // so a concurrent path (e.g. `wait_for_complete`
                         // reacting to `cancel_token`) cancelling first is OK.
                         if let Err(e) =
-                            scheduler_for_cancel.cancel_job(cancel_job_id.clone()).await
+                            scheduler_for_cancel.cancel_job(JobId::from(cancel_job_id.as_str())).await
                         {
                             tracing::warn!(
                                 target: "task_history",
@@ -1066,7 +1066,7 @@ impl PartitionResultStream {
             })?;
 
             let stream = client
-                .fetch_partition(
+                .fetch_partition_at_path(
                     &executor_meta.id,
                     &location.partition_id,
                     &location.path,

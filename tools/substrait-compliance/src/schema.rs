@@ -194,13 +194,96 @@ fn lineitem() -> SchemaRef {
 mod tests {
     use super::*;
 
+    /// Every TPC-H column as the Isthmus-produced plans type it: `i32` keys,
+    /// counts and sizes; `decimal(15,2)` money and quantities; `date` dates;
+    /// and `text` for every `fixedChar`/`varchar` column.
+    const PLAN_COLUMNS: &[(&str, &str)] = &[
+        ("region", "R_REGIONKEY i32, R_NAME text, R_COMMENT text"),
+        (
+            "nation",
+            "N_NATIONKEY i32, N_NAME text, N_REGIONKEY i32, N_COMMENT text",
+        ),
+        (
+            "part",
+            "P_PARTKEY i32, P_NAME text, P_MFGR text, P_BRAND text, P_TYPE text, P_SIZE i32, \
+             P_CONTAINER text, P_RETAILPRICE decimal(15,2), P_COMMENT text",
+        ),
+        (
+            "supplier",
+            "S_SUPPKEY i32, S_NAME text, S_ADDRESS text, S_NATIONKEY i32, S_PHONE text, \
+             S_ACCTBAL decimal(15,2), S_COMMENT text",
+        ),
+        (
+            "partsupp",
+            "PS_PARTKEY i32, PS_SUPPKEY i32, PS_AVAILQTY i32, PS_SUPPLYCOST decimal(15,2), \
+             PS_COMMENT text",
+        ),
+        (
+            "customer",
+            "C_CUSTKEY i32, C_NAME text, C_ADDRESS text, C_NATIONKEY i32, C_PHONE text, \
+             C_ACCTBAL decimal(15,2), C_MKTSEGMENT text, C_COMMENT text",
+        ),
+        (
+            "orders",
+            "O_ORDERKEY i32, O_CUSTKEY i32, O_ORDERSTATUS text, O_TOTALPRICE decimal(15,2), \
+             O_ORDERDATE date, O_ORDERPRIORITY text, O_CLERK text, O_SHIPPRIORITY i32, \
+             O_COMMENT text",
+        ),
+        (
+            "lineitem",
+            "L_ORDERKEY i32, L_PARTKEY i32, L_SUPPKEY i32, L_LINENUMBER i32, \
+             L_QUANTITY decimal(15,2), L_EXTENDEDPRICE decimal(15,2), L_DISCOUNT decimal(15,2), \
+             L_TAX decimal(15,2), L_RETURNFLAG text, L_LINESTATUS text, L_SHIPDATE date, \
+             L_COMMITDATE date, L_RECEIPTDATE date, L_SHIPINSTRUCT text, L_SHIPMODE text, \
+             L_COMMENT text",
+        ),
+    ];
+
+    fn arrow_type_for(plan_type: &str) -> DataType {
+        match plan_type {
+            "i32" => DataType::Int32,
+            "decimal(15,2)" => DataType::Decimal128(15, 2),
+            "date" => DataType::Date32,
+            "text" => DataType::Utf8,
+            other => panic!("unknown plan type '{other}' in PLAN_COLUMNS"),
+        }
+    }
+
     #[test]
     fn every_catalogued_table_has_a_schema() {
-        for table in TPCH_TABLES {
+        let catalogued: Vec<&str> = TPCH_TABLES.iter().map(|table| table.file_stem).collect();
+        let expected_tables: Vec<&str> = PLAN_COLUMNS.iter().map(|(stem, _)| *stem).collect();
+        assert_eq!(catalogued, expected_tables);
+
+        for (table, (_, columns)) in TPCH_TABLES.iter().zip(PLAN_COLUMNS) {
+            assert_eq!(table.plan_name, table.file_stem.to_ascii_uppercase());
             let schema = schema_for(table.file_stem).expect("schema for catalogued table");
+            // Plans name tables in upper case; both spellings resolve to one schema.
+            assert_eq!(
+                schema_for(table.plan_name).as_ref(),
+                Some(&schema),
+                "{} must resolve by its plan name",
+                table.plan_name
+            );
+
+            let actual: Vec<(String, DataType)> = schema
+                .fields()
+                .iter()
+                .map(|field| (field.name().clone(), field.data_type().clone()))
+                .collect();
+            let expected: Vec<(String, DataType)> = columns
+                .split(", ")
+                .map(|column| {
+                    let (name, plan_type) = column
+                        .split_once(' ')
+                        .expect("each expected column is '<NAME> <type>'");
+                    (name.to_string(), arrow_type_for(plan_type))
+                })
+                .collect();
+            assert_eq!(actual, expected, "{} columns", table.file_stem);
             assert!(
-                !schema.fields().is_empty(),
-                "{} schema must not be empty",
+                schema.fields().iter().all(|field| field.is_nullable()),
+                "{} columns must all be nullable",
                 table.file_stem
             );
         }

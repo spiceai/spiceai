@@ -46,6 +46,7 @@ schemars.workspace = true
 serde.workspace = true
 secrecy.workspace = true
 serde_json.workspace = true
+shell-words.workspace = true
 snafu.workspace = true
 spicepod = { path = "../spicepod" }
 tools = { path = "../tools" }
@@ -67,6 +68,7 @@ openapi = ["dep:utoipa"]
 [dev-dependencies]
 bytes.workspace = true
 http-body-util = "0.1"
+tracing-subscriber.workspace = true
 
 [lints]
 workspace = true
