@@ -2249,6 +2249,11 @@ pub struct CayenneTableProvider {
     /// in that window. Consumed on first fire.
     #[cfg(test)]
     test_post_inline_publish_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
+    /// Test-only seam fired by the inline write after it commits its rows to the
+    /// metastore and before it publishes them, so a test can land a checkpoint in
+    /// that window. Consumed on first fire.
+    #[cfg(test)]
+    test_pre_inline_publish_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
     /// Test-only seam fired by `rebuild_maintained_aggregates_from_visible_state`
     /// after its scan has been read, so a test can land a write inside that scan's
     /// window. Consumed on first fire.
@@ -9823,6 +9828,8 @@ impl CayenneTableProvider {
             #[cfg(test)]
             test_post_inline_publish_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
+            test_pre_inline_publish_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
             test_post_maintained_aggregate_scan_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
             test_checkpoint_union_hook: Arc::new(ParkingMutex::new(None)),
@@ -10433,6 +10440,23 @@ impl CayenneTableProvider {
     /// spills (only one checkpoint in flight at a time — the OOM-safety guard).
     pub(crate) fn mem_checkpoint_lock_for_writer(&self) -> Arc<tokio::sync::Mutex<()>> {
         Arc::clone(&self.mem_checkpoint_lock)
+    }
+
+    /// Hold the mem-tier checkpoint off for an inline write attempt, from the
+    /// validation that decides where each replaced row lives through the recording
+    /// of the written keys.
+    ///
+    /// The checkpoint folds the published inline corpus into its snapshot, clears
+    /// the corpus, and relabels the inline keys as file keys, and at one shard it
+    /// takes no `write_lock`. An inline write that recorded its keys after the
+    /// relabel would leave them `Inlined` while their rows sit in a file, and a
+    /// later upsert of one of those keys would tombstone only the absent inline
+    /// copy and leave two live rows. Taken after `write_lock`, in the order the
+    /// spill already uses.
+    pub(crate) async fn lock_mem_tier_checkpoint_for_inline_write(
+        &self,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        self.mem_checkpoint_lock_for_writer().lock_owned().await
     }
 
     /// Durably record a newly written snapshot's sequence number in the catalog
@@ -12135,6 +12159,8 @@ impl CayenneTableProvider {
             test_post_keyset_capture_hook: Arc::clone(&self.test_post_keyset_capture_hook),
             #[cfg(test)]
             test_post_inline_publish_hook: Arc::clone(&self.test_post_inline_publish_hook),
+            #[cfg(test)]
+            test_pre_inline_publish_hook: Arc::clone(&self.test_pre_inline_publish_hook),
             #[cfg(test)]
             test_post_maintained_aggregate_scan_hook: Arc::clone(
                 &self.test_post_maintained_aggregate_scan_hook,
@@ -29037,6 +29063,16 @@ impl CayenneTableProvider {
         }
     }
 
+    /// Fire (and consume) the test-only pre-inline-publish hook, if one is
+    /// installed. See [`Self::test_pre_inline_publish_hook`].
+    #[cfg(test)]
+    async fn run_test_pre_inline_publish_hook(&self) {
+        let hook = self.test_pre_inline_publish_hook.lock().take();
+        if let Some(hook) = hook {
+            hook().await;
+        }
+    }
+
     /// Fire (and consume) the test-only post-maintained-aggregate-scan hook, if one
     /// is installed. See [`Self::test_post_maintained_aggregate_scan_hook`].
     #[cfg(test)]
@@ -30190,6 +30226,9 @@ impl CayenneTableProvider {
             .await
             .map_err(|err| Error::Catalog { source: err })?;
         }
+
+        #[cfg(test)]
+        self.run_test_pre_inline_publish_hook().await;
 
         // Atomically publish both in-memory visibility changes: make the new inlined row visible (generation bump) and hide the superseded
         // file-backed row (deletion cache). Scans capture the (inlined view, deletion view) pair under `scan_state_lock.read()`,
@@ -75976,16 +76015,38 @@ mod tests {
         );
     }
 
-    /// Probe for a race Codex reported (hypothesis, not reproduced): a durable write
-    /// publishes a row inline and records its key afterwards, and a one-shard
-    /// checkpoint — which takes no `write_lock` — can move the row into a file in
-    /// between. The flip relabels only keys already in the resident keyset, so the
-    /// late recording adds key 7 as `Inlined` although its row is in a file, and a
-    /// later upsert of key 7 would tombstone only the (absent) inline copy and
-    /// leave the file copy live.
+    /// Arrange for `hook` to make one best-effort mem-tier checkpoint attempt when it
+    /// fires, and return where the attempt reports what it did.
+    fn install_checkpoint_attempt(
+        provider: &CayenneTableProvider,
+        hook: &ParkingMutex<Option<TestPostCaptureHook>>,
+    ) -> Arc<ParkingMutex<Option<String>>> {
+        let outcome = Arc::new(ParkingMutex::new(None));
+        let provider_in_hook = provider.clone_for_write();
+        let outcome_in_hook = Arc::clone(&outcome);
+        *hook.lock() = Some(Box::new(move || {
+            Box::pin(async move {
+                let attempt = match provider_in_hook
+                    .try_checkpoint_mem_tier()
+                    .await
+                    .expect("a best-effort checkpoint attempt")
+                {
+                    CheckpointAttempt::Completed(rows) => format!("ran and flushed {rows} rows"),
+                    CheckpointAttempt::Busy => "refused, its lock was held".to_string(),
+                };
+                *outcome_in_hook.lock() = Some(attempt);
+            })
+        }));
+        outcome
+    }
+
+    /// A one-shard checkpoint takes no `write_lock`. If it lands after an insert
+    /// publishes key 7 inline and before the insert records the key, its relabel of
+    /// the inline keys misses key 7, which then stays recorded `Inlined` while its
+    /// row sits in a file, and a later upsert of key 7 tombstones only the absent
+    /// inline copy and leaves two live rows.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "probe for a pre-existing race; run with --ignored to reproduce"]
-    async fn an_inline_key_recorded_after_a_checkpoint_moved_its_row_is_superseded() {
+    async fn an_upsert_replaces_a_row_a_checkpoint_flushed_before_its_key_was_recorded() {
         let ctx = SessionContext::new();
         let (provider, _catalog, _tmp) = create_sharded_cdc_upsert_table_with_cap(
             "pk_inline_record_race",
@@ -76006,39 +76067,28 @@ mod tests {
             "precondition: a resident Exact keyset"
         );
 
-        // A checkpoint lands after the insert publishes key 7 inline and before the
-        // insert records the key.
-        let checkpointed = Arc::new(AtomicBool::new(false));
-        {
-            let provider_in_hook = provider.clone_for_write();
-            let checkpointed = Arc::clone(&checkpointed);
-            *provider.test_post_inline_publish_hook.lock() = Some(Box::new(move || {
-                Box::pin(async move {
-                    provider_in_hook
-                        .checkpoint_mem_tier()
-                        .await
-                        .expect("checkpoint between the publication and the recording");
-                    checkpointed.store(true, Ordering::SeqCst);
-                })
-            }));
-        }
+        let attempt =
+            install_checkpoint_attempt(&provider, &provider.test_post_inline_publish_hook);
         insert_batch_with_context(
             &ctx,
             &provider,
             id_value_batch(Arc::clone(&schema), &[7], &[1]),
         )
         .await;
-        assert!(
-            checkpointed.load(Ordering::SeqCst),
-            "precondition: the checkpoint ran between the publication and the recording"
+        let attempt = attempt.lock().take().expect(
+            "precondition: the insert reached the window between publishing and recording its key",
         );
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("checkpoint after the insert");
         assert!(
             provider
                 .read_inlined_batches()
                 .await
                 .expect("read the inline corpus")
                 .is_empty(),
-            "precondition: the checkpoint moved key 7 out of the inline corpus"
+            "precondition: a checkpoint moved key 7 out of the inline corpus"
         );
 
         insert_batch_with_context(
@@ -76056,7 +76106,75 @@ mod tests {
         assert_eq!(
             rows_for_7,
             vec![(7, 2)],
-            "one live row for key 7, with its upserted value"
+            "one live row for key 7, with its upserted value (the checkpoint attempted between \
+             the publication and the recording {attempt})"
+        );
+    }
+
+    /// The checkpoint reads the published inline corpus, encodes it, and then clears
+    /// the whole corpus. An insert committed to the metastore in between, and not yet
+    /// published, is in neither what the checkpoint read nor anything it keeps.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn an_inline_insert_committed_during_a_checkpoint_survives_its_clear() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_sharded_cdc_upsert_table_with_cap(
+            "inline_commit_clear_race",
+            ctx.runtime_env(),
+            1,
+            0,
+        )
+        .await;
+        let schema = Arc::clone(&provider.table_metadata.schema);
+
+        // A RAM-tier row for the checkpoint to flush, and a published inline row so the
+        // checkpoint folds and clears the inline corpus.
+        apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), &[(100, 1)]).await;
+        insert_batch_with_context(
+            &ctx,
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[5], &[1]),
+        )
+        .await;
+        assert_eq!(
+            provider
+                .read_inlined_batches()
+                .await
+                .expect("read the inline corpus")
+                .iter()
+                .map(RecordBatch::num_rows)
+                .sum::<usize>(),
+            1,
+            "precondition: key 5 is published inline"
+        );
+
+        let attempt = install_checkpoint_attempt(&provider, &provider.test_pre_inline_publish_hook);
+        insert_batch_with_context(
+            &ctx,
+            &provider,
+            id_value_batch(Arc::clone(&schema), &[7], &[1]),
+        )
+        .await;
+        let attempt = attempt.lock().take().expect(
+            "precondition: the insert reached the window between committing and publishing its row",
+        );
+        provider
+            .checkpoint_mem_tier()
+            .await
+            .expect("checkpoint after the insert");
+        assert!(
+            provider
+                .read_inlined_batches()
+                .await
+                .expect("read the inline corpus")
+                .is_empty(),
+            "precondition: a checkpoint folded the inline corpus into a file"
+        );
+
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, "inline_commit_clear_race").await,
+            vec![(5, 1), (7, 1), (100, 1)],
+            "every acknowledged row, once (the checkpoint attempted between the commit and \
+             the publication {attempt})"
         );
     }
 
