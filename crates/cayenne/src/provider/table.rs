@@ -55228,8 +55228,7 @@ mod tests {
                     column(0).into_iter().zip(column(1))
                 })
                 .collect();
-            let leading: std::collections::BTreeSet<i64> =
-                pairs.iter().map(|(d, _)| *d).collect();
+            let leading: std::collections::BTreeSet<i64> = pairs.iter().map(|(d, _)| *d).collect();
             assert!(
                 leading.len() > 1 && pairs.len() > leading.len(),
                 "{name}: a range file holds several rows of several leading values: {leading:?}"
