@@ -26,13 +26,14 @@ use llms::chat::{Chat, Result as ChatResult};
 
 use async_openai::error::OpenAIError;
 use async_openai::types::chat::{
-    ChatChoiceStream, ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
-    ChatCompletionRequestAssistantMessage, ChatCompletionRequestAssistantMessageArgs,
-    ChatCompletionRequestMessage, ChatCompletionRequestToolMessageArgs,
-    ChatCompletionResponseStream, ChatCompletionTool, ChatCompletionToolChoiceOption,
-    ChatCompletionTools, CompletionTokensDetails, CompletionUsage, CreateChatCompletionRequest,
-    CreateChatCompletionResponse, CreateChatCompletionStreamResponse, FinishReason, FunctionCall,
-    FunctionObject, PromptTokensDetails, ToolChoiceAllowedMode, ToolChoiceOptions,
+    ChatChoiceLogprobs, ChatChoiceStream, ChatCompletionMessageToolCall,
+    ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessage,
+    ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
+    ChatCompletionRequestToolMessageArgs, ChatCompletionResponseStream, ChatCompletionTool,
+    ChatCompletionToolChoiceOption, ChatCompletionTools, CompletionTokensDetails, CompletionUsage,
+    CreateChatCompletionRequest, CreateChatCompletionResponse, CreateChatCompletionStreamResponse,
+    FinishReason, FunctionCall, FunctionObject, PromptTokensDetails, ToolChoiceAllowedMode,
+    ToolChoiceOptions,
 };
 
 use async_trait::async_trait;
@@ -328,6 +329,7 @@ impl ToolUsingChat {
                 .first()
                 .and_then(|c| c.message.content.clone())
                 .unwrap_or_default();
+            let logprobs = resp.choices.first().and_then(|c| c.logprobs.clone());
 
             // Extract inner ChatCompletionMessageToolCall from the ChatCompletionMessageToolCalls enum
             let tool_calls: Vec<ChatCompletionMessageToolCall> = tools_used
@@ -352,7 +354,7 @@ impl ToolUsingChat {
                         )
                         .await?;
                     resp.usage = combine_usage(usage, resp.usage);
-                    prepend_text(&mut resp, &text);
+                    prepend_text(&mut resp, &text, logprobs, inner_req.logprobs == Some(true));
                     Ok(resp)
                 }
                 None => Ok(resp),
@@ -550,7 +552,16 @@ fn paragraph_break(before: &str, after: &str) -> Option<&'static str> {
 
 /// Puts `text_before`, the text a model wrote beside the tool calls of an earlier round, ahead of
 /// the answer in `resp`, so a response carries the same text whether or not it is streamed.
-fn prepend_text(resp: &mut CreateChatCompletionResponse, text_before: &str) {
+///
+/// When the client asked for log probabilities, `logprobs_before` are that text's, and the
+/// response carries the text as the model wrote it: both rounds' tokens, and no paragraph break,
+/// which has no token of its own.
+fn prepend_text(
+    resp: &mut CreateChatCompletionResponse,
+    text_before: &str,
+    logprobs_before: Option<ChatChoiceLogprobs>,
+    wants_logprobs: bool,
+) {
     if text_before.is_empty() {
         return;
     }
@@ -558,8 +569,30 @@ fn prepend_text(resp: &mut CreateChatCompletionResponse, text_before: &str) {
         return;
     };
     let answer = choice.message.content.take().unwrap_or_default();
-    let separator = paragraph_break(text_before, &answer).unwrap_or_default();
+    let separator = if wants_logprobs {
+        ""
+    } else {
+        paragraph_break(text_before, &answer).unwrap_or_default()
+    };
     choice.message.content = Some(format!("{text_before}{separator}{answer}"));
+    if wants_logprobs {
+        choice.logprobs = concat_logprobs(logprobs_before, choice.logprobs.take());
+    }
+}
+
+/// The log probabilities of two rounds' text written one after the other, or `None` when either
+/// round has none: tokens that cover only part of the text would misdescribe it.
+fn concat_logprobs(
+    before: Option<ChatChoiceLogprobs>,
+    after: Option<ChatChoiceLogprobs>,
+) -> Option<ChatChoiceLogprobs> {
+    let (before, after) = (before?, after?);
+    let mut content = before.content?;
+    content.extend(after.content?);
+    Some(ChatChoiceLogprobs {
+        content: Some(content),
+        refusal: after.refusal,
+    })
 }
 
 pub fn combine_usage(
@@ -735,6 +768,7 @@ fn make_a_stream(
         .as_ref()
         .and_then(|o| o.include_usage)
         .unwrap_or(false);
+    let wants_logprobs = req.logprobs == Some(true);
 
     tokio::spawn(
         request_context
@@ -898,8 +932,14 @@ fn make_a_stream(
                         {
                             Ok(mut s) => {
                                 // The client receives this round's text and the answer's as one
-                                // message, so the answer's first text is set apart from it.
-                                let mut text_before = round_text;
+                                // message, so the answer's first text is set apart from it. A
+                                // client that asked for log probabilities gets the text as
+                                // written: a paragraph break has no token of its own.
+                                let mut text_before = if wants_logprobs {
+                                    String::new()
+                                } else {
+                                    round_text
+                                };
                                 while let Some(resp) = s.next().await {
                                     let resp = match resp {
                                         Ok(mut chunk) => {
@@ -1118,7 +1158,8 @@ mod tests {
     /// A model that writes `preamble` and calls `sql` in its first round, and answers with
     /// [`ANSWER`] in every round after. Streamed, it sends what the Anthropic adapter sends: a
     /// text block's empty opening chunk, the text in chunks with no finish, the call, then a
-    /// `tool_calls` finish that carries no text. It records every request.
+    /// `tool_calls` finish that carries no text. A request that asks for log probabilities gets
+    /// one token per piece of text. It records every request.
     struct ScriptedChat {
         preamble: &'static str,
         requests: parking_lot::Mutex<Vec<CreateChatCompletionRequest>>,
@@ -1153,12 +1194,38 @@ mod tests {
         })
     }
 
+    /// The `logprobs` of a choice carrying `text`: one token for all of it when `wanted`.
+    fn logprobs(text: &str, wanted: bool) -> Value {
+        if !wanted || text.is_empty() {
+            return Value::Null;
+        }
+        json!({
+            "content": [{ "token": text, "logprob": -0.5, "bytes": null, "top_logprobs": [] }],
+            "refusal": null,
+        })
+    }
+
     fn chunk(delta: &Value, finish_reason: Option<&str>) -> CreateChatCompletionStreamResponse {
+        chunk_with_logprobs(delta, &Value::Null, finish_reason)
+    }
+
+    fn chunk_with_logprobs(
+        delta: &Value,
+        logprobs: &Value,
+        finish_reason: Option<&str>,
+    ) -> CreateChatCompletionStreamResponse {
         serde_json::from_value(json!({
             "id": "scripted", "object": "chat.completion.chunk", "created": 0, "model": "scripted",
-            "choices": [{ "index": 0, "delta": delta, "finish_reason": finish_reason }],
+            "choices": [{
+                "index": 0, "delta": delta, "logprobs": logprobs, "finish_reason": finish_reason,
+            }],
         }))
         .expect("a valid stream chunk")
+    }
+
+    /// A chunk carrying `text`, with its log probabilities when `wanted`.
+    fn text_chunk(text: &str, wanted: bool) -> CreateChatCompletionStreamResponse {
+        chunk_with_logprobs(&json!({ "content": text }), &logprobs(text, wanted), None)
     }
 
     #[async_trait]
@@ -1172,20 +1239,21 @@ mod tests {
             req: CreateChatCompletionRequest,
         ) -> Result<ChatCompletionResponseStream, OpenAIError> {
             let (first, second) = self.preamble.split_at(self.preamble.len() / 2);
+            let wanted = req.logprobs == Some(true);
             let chunks = if self.next_round(req) == 0 {
                 let mut call = sql_call();
                 call["index"] = json!(0);
                 vec![
                     chunk(&json!({ "role": "assistant", "content": "" }), None),
-                    chunk(&json!({ "content": first }), None),
-                    chunk(&json!({ "content": second }), None),
+                    text_chunk(first, wanted),
+                    text_chunk(second, wanted),
                     chunk(&json!({ "tool_calls": [call] }), None),
                     chunk(&json!({}), Some("tool_calls")),
                 ]
             } else {
                 vec![
                     chunk(&json!({ "role": "assistant", "content": "" }), None),
-                    chunk(&json!({ "content": ANSWER }), None),
+                    text_chunk(ANSWER, wanted),
                     chunk(&json!({}), Some("stop")),
                 ]
             };
@@ -1196,17 +1264,26 @@ mod tests {
             &self,
             req: CreateChatCompletionRequest,
         ) -> Result<CreateChatCompletionResponse, OpenAIError> {
-            let (message, finish_reason) = if self.next_round(req) == 0 {
+            let wanted = req.logprobs == Some(true);
+            let (text, message, finish_reason) = if self.next_round(req) == 0 {
                 (
+                    self.preamble,
                     json!({ "role": "assistant", "content": self.preamble, "tool_calls": [sql_call()] }),
                     "tool_calls",
                 )
             } else {
-                (json!({ "role": "assistant", "content": ANSWER }), "stop")
+                (
+                    ANSWER,
+                    json!({ "role": "assistant", "content": ANSWER }),
+                    "stop",
+                )
             };
             Ok(serde_json::from_value(json!({
                 "id": "scripted", "object": "chat.completion", "created": 0, "model": "scripted",
-                "choices": [{ "index": 0, "message": message, "finish_reason": finish_reason }],
+                "choices": [{
+                    "index": 0, "message": message, "logprobs": logprobs(text, wanted),
+                    "finish_reason": finish_reason,
+                }],
             }))
             .expect("a valid response"))
         }
@@ -1227,6 +1304,21 @@ mod tests {
             "messages": [{ "role": "user", "content": "How many rows are there?" }],
         }))
         .expect("a valid request")
+    }
+
+    fn chat_request_with_logprobs(stream: bool) -> CreateChatCompletionRequest {
+        let mut req = chat_request(stream);
+        req.logprobs = Some(true);
+        req
+    }
+
+    fn tokens(logprobs: Option<&ChatChoiceLogprobs>) -> Vec<String> {
+        logprobs
+            .and_then(|l| l.content.as_ref())
+            .into_iter()
+            .flatten()
+            .map(|t| t.token.clone())
+            .collect()
     }
 
     /// The messages of the round after the tool call: the question, the model's turn as it wrote
@@ -1300,6 +1392,55 @@ mod tests {
             Some("Let me check.\n\nThere are 3 rows.")
         );
         assert_eq!(response.choices[0].finish_reason, Some(FinishReason::Stop));
+        assert_eq!(provider.messages(1), follow_up_messages("Let me check."));
+    }
+
+    #[tokio::test]
+    async fn test_streamed_logprobs_cover_exactly_the_streamed_text() {
+        let provider = ScriptedChat::new("Let me check.");
+        let tool = Arc::new(Sql(AtomicUsize::new(0)));
+        let chunks: Vec<CreateChatCompletionStreamResponse> = tool_using_chat(&provider, &tool)
+            .await
+            .chat_stream(chat_request_with_logprobs(true))
+            .await
+            .expect("a response stream")
+            .map(|chunk| chunk.expect("a chunk, not an error"))
+            .collect()
+            .await;
+        let choices = chunks.iter().flat_map(|c| &c.choices).collect_vec();
+        let text: String = choices
+            .iter()
+            .filter_map(|c| c.delta.content.as_deref())
+            .collect();
+        let tokens = choices
+            .iter()
+            .flat_map(|c| tokens(c.logprobs.as_ref()))
+            .collect_vec();
+
+        assert_eq!(tokens, ["Let me", " check.", "There are 3 rows."]);
+        assert_eq!(text, tokens.concat());
+        assert_eq!(provider.messages(1), follow_up_messages("Let me check."));
+    }
+
+    #[tokio::test]
+    async fn test_logprobs_cover_exactly_the_returned_text() {
+        let provider = ScriptedChat::new("Let me check.");
+        let tool = Arc::new(Sql(AtomicUsize::new(0)));
+        let response = tool_using_chat(&provider, &tool)
+            .await
+            .chat_request(chat_request_with_logprobs(false))
+            .await
+            .expect("a response");
+        let choice = &response.choices[0];
+
+        assert_eq!(
+            tokens(choice.logprobs.as_ref()),
+            ["Let me check.", "There are 3 rows."]
+        );
+        assert_eq!(
+            choice.message.content.as_deref(),
+            Some("Let me check.There are 3 rows.")
+        );
         assert_eq!(provider.messages(1), follow_up_messages("Let me check."));
     }
 
