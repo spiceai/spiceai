@@ -257,12 +257,20 @@ def resolve_child(mod_dir: Path, name: str, override: str | None) -> Path | None
 MOD_RS_NAMES = {"mod.rs", "lib.rs", "main.rs"}
 
 
-def walk_from_root(root: Path, reached: set[Path]) -> None:
+def walk_from_root(
+    root: Path, reached: set[Path], walked: set[tuple[Path, bool]] | None = None
+) -> None:
     """Mark `root` and everything its module tree reaches.
 
     `root` is a crate root — a target's `src_path` — and owns the directory it
     sits in whatever it is named: `mod common;` in `tests/integration.rs` finds
     `tests/common/mod.rs`, not `tests/integration/common/mod.rs`.
+
+    A file can be compiled in two contexts — as a target root, and as a module
+    of another target — and its `mod` declarations resolve differently in each.
+    `walked` therefore records (file, owns-its-directory) pairs rather than
+    files, so reaching a file in one context never skips walking it in the
+    other. Pass the same set for every root of a package to share that work.
 
     Two different directories are in play, and conflating them is what makes a
     naive version report live files:
@@ -277,17 +285,18 @@ def walk_from_root(root: Path, reached: set[Path]) -> None:
 
     Inside an inline `mod a { … }`, both forms descend through the inline names.
     """
-    root = root.resolve()
-    stack = [root]
+    if walked is None:
+        walked = set()
+    stack = [(root.resolve(), True)]
 
     while stack:
-        current = stack.pop()
-        if current in reached or not current.is_file():
+        current, owns_dir = stack.pop()
+        if (current, owns_dir) in walked or not current.is_file():
             continue
+        walked.add((current, owns_dir))
         reached.add(current)
 
         file_dir = current.parent
-        owns_dir = current == root or current.name in MOD_RS_NAMES
         module_dir = file_dir if owns_dir else file_dir / current.stem
 
         for name, _, overrides, inline in parse_mods(current):
@@ -301,7 +310,7 @@ def walk_from_root(root: Path, reached: set[Path]) -> None:
             for override in overrides or (None,):
                 child = resolve_child(base, name, override)
                 if child is not None:
-                    stack.append(child)
+                    stack.append((child, child.name in MOD_RS_NAMES))
 
 
 # The directories whose `.rs` files must each be compiled by some target. Cargo
@@ -323,8 +332,9 @@ def package_sources(package: dict) -> list[tuple[Path, bool]]:
     """
     crate_dir = Path(package["manifest_path"]).parent
     reached: set[Path] = set()
+    walked: set[tuple[Path, bool]] = set()
     for target in package.get("targets", []):
-        walk_from_root(Path(target["src_path"]), reached)
+        walk_from_root(Path(target["src_path"]), reached, walked)
 
     # No name is exempt: every genuine root is already seeded above from cargo's
     # own target list, and exempting `mod.rs` by name would hide a whole dead

@@ -374,6 +374,26 @@ with tempfile.TemporaryDirectory() as d:
         [],
     )
 
+# A file can be a target root and a module of another target at once, and its
+# `mod` declarations resolve differently in each: as the root of `tests/b.rs`,
+# `mod leaf;` is `tests/leaf.rs`; as a module of `tests/a.rs`, it is
+# `tests/b/leaf.rs`. Both compile. Recording visits by file alone skips the
+# second walk, and which file is wrongly reported depends on the target order.
+for order in (("tests/a.rs", "tests/b.rs"), ("tests/b.rs", "tests/a.rs")):
+    with tempfile.TemporaryDirectory() as d:
+        crate = Path(d).resolve()
+        write_tree(crate, {
+            "tests/a.rs": "mod b;\n",
+            "tests/b.rs": "mod leaf;\n",
+            "tests/leaf.rs": "",
+            "tests/b/leaf.rs": "",
+        })
+        check(
+            f"a file that is both a root and a module is walked in both contexts ({order[0]} first)",
+            unreached(crate, fake_package(crate, *order)),
+            [],
+        )
+
 # `src/bin/tool.rs` is a crate root too: its `mod helper;` is `src/bin/helper.rs`.
 with tempfile.TemporaryDirectory() as d:
     crate = Path(d).resolve()
