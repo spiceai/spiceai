@@ -223,9 +223,6 @@ enum InlineMutationOutcome {
     Inlined {
         rows: u64,
         post_validation: PostValidationState,
-        /// Held until the caller has recorded the inlined keys; see
-        /// [`CayenneTableProvider::lock_mem_tier_checkpoint_for_inline_write`].
-        checkpoint_guard: OwnedMutexGuard<()>,
     },
     Fallback {
         stream: SendableRecordBatchStream,
@@ -406,6 +403,10 @@ impl<'a> AppendMutationWriter<'a> {
                         // on-conflict validation against the single index — keeping
                         // conflict semantics intact without a second sharded apply.
                         let _write_guard = write_guard;
+                        let _checkpoint_guard = self
+                            .table
+                            .lock_mem_tier_checkpoint_for_durable_write()
+                            .await;
                         let raw = MemorySourceConfig::try_new_exec(&[batches], schema, None)
                             .and_then(|exec| execute_stream(exec, Arc::clone(self.task_context)))?;
                         let prepared = self.table.prepare_stream_for_insert(raw).await?;
@@ -475,6 +476,14 @@ impl<'a> AppendMutationWriter<'a> {
         } else {
             (data, write_guard)
         };
+        // Held from the validation's primary-key index checkout until this write's
+        // decisions about where replaced rows live are published (the synchronous
+        // and inline paths) or staged (the pipelined path, which then releases it
+        // with `write_lock`).
+        let checkpoint_guard = self
+            .table
+            .lock_mem_tier_checkpoint_for_durable_write()
+            .await;
         let prepared = self.table.prepare_stream_for_insert(data).await?;
         let post_validation = prepared.post_validation();
         let may_have_on_conflict_deletions = prepared.may_have_on_conflict_deletions();
@@ -518,6 +527,7 @@ impl<'a> AppendMutationWriter<'a> {
 
         if !can_stage_for_pipeline {
             let _write_guard = write_guard;
+            let _checkpoint_guard = checkpoint_guard;
             let rows = self
                 .write_prepared_stream(
                     prepared_stream,
@@ -559,7 +569,6 @@ impl<'a> AppendMutationWriter<'a> {
             InlineMutationOutcome::Inlined {
                 rows,
                 post_validation,
-                checkpoint_guard,
             } => {
                 // Mirror `write_prepared_stream`: this outcome arms retention (see the
                 // inline commit in `try_inline_or_restream`), which runs asynchronously
@@ -781,6 +790,7 @@ impl<'a> AppendMutationWriter<'a> {
                     &validated_keys,
                 );
                 drop(held_write_guard);
+                drop(checkpoint_guard);
 
                 tracing::debug!(
                     table = self.table.table_name(),
@@ -1185,6 +1195,13 @@ impl<'a> AppendMutationWriter<'a> {
         write_guard: OwnedMutexGuard<()>,
     ) -> Result<u64> {
         self.table.ensure_no_incomplete_write().await?;
+        // Held for the whole write: its validation decides from the primary-key
+        // index whether each replaced row is inline or in a file, and its
+        // publication acts on those decisions.
+        let _checkpoint_guard = self
+            .table
+            .lock_mem_tier_checkpoint_for_durable_write()
+            .await;
 
         let pending_pk_deletions = !self.table.pk_deletion_strategy().is_position_based()
             && self.table.has_pending_deletions();
@@ -1216,6 +1233,8 @@ impl<'a> AppendMutationWriter<'a> {
                 .await;
         }
         let prepared = self.table.prepare_stream_for_insert(data).await?;
+        #[cfg(test)]
+        self.table.run_test_post_prepare_hook().await;
         let post_validation = prepared.post_validation();
         let may_have_on_conflict_deletions = prepared.may_have_on_conflict_deletions();
         let prepared_stream = prepared.stream;
@@ -1359,14 +1378,12 @@ impl<'a> AppendMutationWriter<'a> {
                 InlineMutationOutcome::Inlined {
                     rows,
                     post_validation,
-                    checkpoint_guard,
                 } => {
                     #[cfg(test)]
                     self.table.run_test_post_inline_publish_hook().await;
                     let record_seq = self.table.sequence_high_water().await;
                     self.table
                         .record_inlined_pk_keys(&post_validation.validated_keys, record_seq);
-                    drop(checkpoint_guard);
                     return Ok(rows);
                 }
                 InlineMutationOutcome::Fallback {
@@ -1542,6 +1559,8 @@ impl<'a> AppendMutationWriter<'a> {
         } = take_post_validation(post_validation);
 
         let superseded = on_conflict_deletions.total_superseded();
+        #[cfg(test)]
+        self.table.run_test_pre_staged_publish_hook().await;
         self.publish_written_snapshot(&new_snapshot_id, rows, on_conflict_deletions)
             .await?;
         Ok((rows, stats_acc, validated_keys, superseded))
@@ -1625,10 +1644,6 @@ impl<'a> AppendMutationWriter<'a> {
         mut prepared_stream: SendableRecordBatchStream,
         post_validation: &Arc<ParkingMutex<Option<PostValidationState>>>,
     ) -> Result<InlineMutationOutcome> {
-        // Held through the validation the buffering below drives, the inline
-        // commit, and (in the caller) the key recording; released before a
-        // fallback reaches the staged write.
-        let checkpoint_guard = self.table.lock_mem_tier_checkpoint_for_inline_write().await;
         let schema = prepared_stream.schema();
         let mut buffer = InlineBatchBuffer::new(
             Arc::clone(&schema),
@@ -1650,7 +1665,6 @@ impl<'a> AppendMutationWriter<'a> {
                 return Ok(InlineMutationOutcome::Inlined {
                     rows: 0,
                     post_validation: state,
-                    checkpoint_guard,
                 });
             }
 
@@ -1728,7 +1742,6 @@ impl<'a> AppendMutationWriter<'a> {
                 return Ok(InlineMutationOutcome::Inlined {
                     rows: u64::try_from(buffer.total_rows()).unwrap_or(u64::MAX),
                     post_validation: state,
-                    checkpoint_guard,
                 });
             }
 
@@ -1771,7 +1784,6 @@ impl<'a> AppendMutationWriter<'a> {
             buffer.total_bytes() as u64,
         );
         let re_stream = buffer.into_chained_stream(prepared_stream);
-        drop(checkpoint_guard);
         Ok(InlineMutationOutcome::Fallback {
             stream: re_stream,
             estimated_bytes,
