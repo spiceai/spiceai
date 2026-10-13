@@ -77,8 +77,7 @@ async fn conditional_writes_to_the_same_file_have_one_winner() {
                 stored.first()
             );
             assert_eq!(
-                winners,
-                1,
+                winners, 1,
                 "conditional writes must have exactly one winner"
             );
             match (left, right) {
