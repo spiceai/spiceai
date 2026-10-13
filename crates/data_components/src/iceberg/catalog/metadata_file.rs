@@ -180,7 +180,8 @@ impl MetadataFileCatalog {
 /// `listing` is given and the hint does not exist, the listed file with the highest
 /// version number (`v<N>.metadata.json` or `<N>-<uuid>.metadata.json`). Files that
 /// share the highest version, as a failed commit can leave behind, are told apart
-/// by `last-updated-ms`, as the Iceberg spec directs.
+/// by `last-updated-ms`, as the Iceberg spec directs, then by file name, so the
+/// choice never depends on listing order.
 ///
 /// # Errors
 ///
@@ -285,7 +286,9 @@ async fn newest_metadata_file(
             .last_updated_ms();
         if newest
             .as_ref()
-            .is_none_or(|(newest_updated, _)| updated > *newest_updated)
+            .is_none_or(|(newest_updated, newest_location)| {
+                (updated, &location) > (*newest_updated, newest_location)
+            })
         {
             newest = Some((updated, location));
         }
@@ -1066,7 +1069,8 @@ mod tests {
     }
 
     /// Two files with the highest version, as a failed commit can leave behind, are
-    /// told apart by `last-updated-ms`, never by which one is listed first.
+    /// told apart by `last-updated-ms` and then by name, never by which one is
+    /// listed first.
     #[tokio::test]
     async fn a_duplicate_highest_version_reads_the_most_recently_updated_file() {
         let warehouse = tempfile::tempdir().expect("temp warehouse is created");
@@ -1087,6 +1091,24 @@ mod tests {
                 .expect("current metadata is found")
                 .location,
             format!("file://{}", files[2].display())
+        );
+
+        // Equal `last-updated-ms` too: the greater file name is read, whatever the
+        // listing order.
+        for name in ["00003-ffff.metadata.json", "00003-0000.metadata.json"] {
+            std::fs::copy(&files[2], table_root.join("metadata").join(name))
+                .expect("identical duplicate is written");
+        }
+        assert_eq!(
+            catalog
+                .current_metadata()
+                .await
+                .expect("current metadata is found")
+                .location,
+            format!(
+                "file://{}/metadata/00003-ffff.metadata.json",
+                table_root.display()
+            )
         );
     }
 
