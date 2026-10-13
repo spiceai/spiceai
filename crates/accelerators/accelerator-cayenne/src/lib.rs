@@ -861,7 +861,9 @@ fn configured_changes_scan_view_lag() -> Option<Duration> {
         match raw.trim().parse::<u64>() {
             Ok(ms) => Some(Duration::from_millis(ms)),
             Err(_) => {
-                tracing::warn!("Ignoring invalid CAYENNE_SCAN_VIEW_FRESHNESS_MS={raw:?}: expected a non-negative integer (milliseconds); using default {DEFAULT_CHANGES_SCAN_VIEW_LAG_MS} ms.");
+                tracing::warn!(
+                    "Ignoring invalid CAYENNE_SCAN_VIEW_FRESHNESS_MS={raw:?}: expected a non-negative integer (milliseconds); using default {DEFAULT_CHANGES_SCAN_VIEW_LAG_MS} ms."
+                );
                 None
             }
         }
@@ -885,7 +887,9 @@ fn changes_scan_view_lag(freshness_goal_secs: Option<f64>) -> Duration {
     freshness_goal_secs
         .filter(|secs| secs.is_finite() && *secs > 0.0)
         .map_or(default, |secs| {
-            default.min(Duration::from_secs_f64(secs * FRESHNESS_GOAL_SCAN_VIEW_SHARE))
+            default.min(Duration::from_secs_f64(
+                secs * FRESHNESS_GOAL_SCAN_VIEW_SHARE,
+            ))
         })
 }
 
@@ -2811,8 +2815,10 @@ impl CayenneAccelerator {
             .acceleration()
             .is_some_and(Acceleration::resolves_to_durable_write_back);
 
-        let scan_view_reuse =
-            scan_view_reuse_for(source, tuner_freshness_goal_secs(&table_options.vortex_config));
+        let scan_view_reuse = scan_view_reuse_for(
+            source,
+            tuner_freshness_goal_secs(&table_options.vortex_config),
+        );
 
         // Create CayenneTableProvider with object store for S3 Express One Zone
         let mut builder = CayenneTableProviderBuilder::new(catalog, runtime_env)
@@ -8627,7 +8633,10 @@ mod tests {
         assert_eq!(changes_scan_view_lag(Some(4.0)), Duration::from_millis(500));
         assert_eq!(changes_scan_view_lag(Some(30.0)), Duration::from_secs(1));
         assert_eq!(changes_scan_view_lag(Some(0.0)), Duration::from_secs(1));
-        assert_eq!(changes_scan_view_lag(Some(f64::NAN)), Duration::from_secs(1));
+        assert_eq!(
+            changes_scan_view_lag(Some(f64::NAN)),
+            Duration::from_secs(1)
+        );
 
         let mut config = cayenne::metadata::VortexConfig {
             goal_freshness_secs: Some(2.0),

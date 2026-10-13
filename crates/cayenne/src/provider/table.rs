@@ -53978,7 +53978,12 @@ mod tests {
             u64::try_from(ROWS).expect("rows fit u64")
         );
 
-        let snapshots: Vec<String> = provider.protected_snapshots.load().keys().cloned().collect();
+        let snapshots: Vec<String> = provider
+            .protected_snapshots
+            .load()
+            .keys()
+            .cloned()
+            .collect();
         let [snapshot_id] = snapshots.as_slice() else {
             panic!("one checkpoint registers one snapshot: {snapshots:?}");
         };
