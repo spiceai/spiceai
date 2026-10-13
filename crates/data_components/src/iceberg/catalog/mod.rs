@@ -17,6 +17,7 @@ limitations under the License.
 use snafu::prelude::*;
 
 pub mod hadoop;
+pub mod metadata_file;
 pub mod rest;
 
 #[derive(Debug, Snafu)]
