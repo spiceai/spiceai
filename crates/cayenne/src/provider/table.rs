@@ -24252,15 +24252,13 @@ impl CayenneTableProvider {
             (stream, scope, generation_before, snapshot_id_before)
         };
 
-        // An `auto` table on position deletes reclaims by rewriting itself whole
-        // only within its bound. The pass that scheduled this reclaim sized the
-        // table from the manifest, which can trail a just-published write, so size
-        // what this rewrite actually captured — the current snapshot and every
-        // protected snapshot it folds — before encoding any of it.
-        if reclaim
-            && let Some(auto) = self.pk_deletion_mode.auto()
-            && auto.uses_positions()
-        {
+        // The whole-table reclaim of an `auto` table sizes what it captured, the
+        // current snapshot and every protected snapshot it folds, before encoding
+        // any of it: the pass that scheduled it sized the table from the manifest,
+        // which can trail a just-published write. On position deletes the reclaim
+        // runs only within the bound; on either kind of delete, within the bound it
+        // takes no encode permit (below).
+        let captured_bytes = if reclaim && self.pk_deletion_mode.auto().is_some() {
             let folded = match &scope {
                 RewriteScope::Fenced { folded, .. }
                 | RewriteScope::AllTombstonesFoldedSnapshots { folded } => Some(folded),
@@ -24282,7 +24280,15 @@ impl CayenneTableProvider {
                     total.saturating_add(*size)
                 });
             }
-            if let Some(error) = sizing_error {
+            Some(sizing_error.map_or(Ok(captured_bytes), Err))
+        } else {
+            None
+        };
+        if let Some(auto) = self.pk_deletion_mode.auto()
+            && auto.uses_positions()
+            && let Some(sized) = &captured_bytes
+        {
+            if let Err(error) = sized {
                 // An I/O error says nothing about the table's size: decline this
                 // rewrite, keep the mode, and size it again on the next trigger.
                 drop(stream);
@@ -24299,7 +24305,7 @@ impl CayenneTableProvider {
                 );
                 return Ok(false);
             }
-            if !auto.fits(captured_bytes) {
+            if sized.as_ref().is_ok_and(|bytes| !auto.fits(*bytes)) {
                 drop(stream);
                 // The caller holds `compaction_lock`, as every caller of this
                 // rewrite does.
@@ -24327,20 +24333,20 @@ impl CayenneTableProvider {
             Self::ensure_snapshot_dir_exists(&snapshot_dir).await?;
         }
 
-        // The whole-table reclaim of an `auto` table on position deletes takes no
-        // permit from the global encode budget. It reads at most
-        // `MAX_POSITION_BYTES`, takes at most a tenth of the time, and in `spiced`
-        // runs on the low-priority compaction runtime, so it needs no share of
-        // the budget. Holding one, it made every write that asked for the
-        // budget's whole width wait out its encode: on four CPUs, a two-permit
-        // budget, a writer upserting 2,000 keys every 250 ms reached a 96 ms P99
-        // write, against 37–40 ms on key deletes.
-        let write_policy = if reclaim
-            && self
-                .pk_deletion_mode
-                .auto()
-                .is_some_and(|auto| auto.uses_positions())
-        {
+        // The whole-table reclaim of an `auto` table within its bound takes no
+        // permit from the global encode budget, on either kind of delete. It reads
+        // at most `MAX_POSITION_BYTES`, takes at most a tenth of the time, and in
+        // `spiced` runs on the compaction runtime, so it needs no share of the
+        // budget. Holding one, it made every write that asked for the budget's
+        // whole width wait out its encode: on four CPUs, a two-permit budget, a
+        // writer upserting 2,000 keys every 250 ms reached a 96 ms P99 write on
+        // position deletes, against 37–40 ms on key deletes. A larger table's
+        // reclaim, on key deletes, takes its permit.
+        let within_bound = matches!(
+            (self.pk_deletion_mode.auto(), &captured_bytes),
+            (Some(auto), Some(Ok(bytes))) if auto.fits(*bytes)
+        );
+        let write_policy = if within_bound {
             rewrite_write_policy(rewrite_is_sorted).without_encode_budget()
         } else {
             rewrite_write_policy(rewrite_is_sorted)

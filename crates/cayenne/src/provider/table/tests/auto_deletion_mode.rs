@@ -975,6 +975,71 @@ async fn an_auto_tables_position_reclaim_takes_no_encode_permit() {
     assert_eq!(rows, expected, "every key shows its latest row, once");
 }
 
+/// The whole-table reclaim of an auto table on key deletes takes no permit from
+/// the process-global encode budget either, while what it rewrites is within the
+/// bound: here a table that keeps key deletes from the start, as on a small host,
+/// seeded by an overwrite. A writer holds the budget's only permit while the
+/// reclaim runs; holding a permit itself, the reclaim would wait for that writer.
+#[tokio::test]
+async fn an_auto_tables_reclaim_on_key_deletes_within_its_bound_takes_no_encode_permit() {
+    struct InstalledBudget;
+    impl Drop for InstalledBudget {
+        fn drop(&mut self) {
+            crate::provider::write_budget::clear_global_encode_budget();
+        }
+    }
+    // Dropped after `_installed`, which removes the budget first.
+    let _serialized = crate::provider::write_budget::GLOBAL_ENCODE_BUDGET_TEST_LOCK
+        .lock()
+        .await;
+    crate::provider::write_budget::set_global_encode_concurrency(1);
+    let _installed = InstalledBudget;
+
+    let name = "auto_key_reclaim_unbudgeted";
+    let (provider, _catalog, _tmp) = auto_table_keeping_key_deletes(name).await;
+    let keys: Vec<i64> = (0..16).collect();
+    overwrite(&provider, &keys, 100).await;
+    for value in 200..206 {
+        write(&provider, &keys, value).await;
+    }
+    assert!(
+        !provider.should_capture_positions(),
+        "premise: the table is on key deletes"
+    );
+    assert!(
+        deletion_index_entries(&provider) >= 2,
+        "premise: the index is past its trigger"
+    );
+
+    let held = crate::provider::write_budget::acquire_encode_permits(
+        1,
+        crate::provider::delta_encoding::WriteClass::Delta,
+        false,
+    )
+    .await
+    .expect("the budget is installed");
+    let committed = tokio::time::timeout(Duration::from_secs(30), async {
+        provider
+            .compact_current_snapshot_small_files()
+            .await
+            .expect("reclaim pass")
+    })
+    .await
+    .expect("the reclaim waited for the encode permit a writer holds");
+    drop(held);
+
+    assert!(committed, "the table rewrote itself whole");
+    assert_eq!(
+        deletion_index_entries(&provider),
+        0,
+        "the reclaim cleared the index"
+    );
+    let ctx = SessionContext::new();
+    let rows = collect_id_value_pairs(&ctx, &provider, name).await;
+    let expected: Vec<(i64, i64)> = keys.iter().map(|id| (*id, 205)).collect();
+    assert_eq!(rows, expected, "every key shows its latest row, once");
+}
+
 /// A position-capture pass that began while an auto table was on position deletes
 /// and publishes after the switch to key deletes captures nothing: the switch
 /// forgot the table's positions, and the pass reads the mode again before it
