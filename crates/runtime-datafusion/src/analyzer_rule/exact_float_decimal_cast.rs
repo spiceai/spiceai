@@ -28,7 +28,8 @@ limitations under the License.
 //! that reads back as the same `f64` (Rust's `Display`) recovers it: `12345678.9`.
 //! This rule rewrites `CAST(<float literal> AS DECIMAL(p, s))` to the decimal
 //! literal parsed exactly from that string, at the cast's precision and scale. It
-//! only does so when the string fits the scale without rounding; anything else is
+//! only does so when that spelling has at most 15 significant digits (so no other
+//! decimal shares the float) and fits the scale without rounding; anything else is
 //! left to the cast as before, so overflow and out-of-range behaviour is unchanged.
 
 use datafusion::arrow::datatypes::{DataType, Decimal128Type, Decimal256Type};
@@ -89,6 +90,9 @@ pub(crate) fn exact_decimal(value: &ScalarValue, data_type: &DataType) -> Option
         ScalarValue::Float16(Some(v)) if v.is_finite() => v.to_string(),
         _ => return None,
     };
+    if !is_unambiguous_spelling(&spelling) {
+        return None;
+    }
     let fraction_digits = spelling.split_once('.').map_or(0, |(_, f)| f.len());
     match data_type {
         DataType::Decimal128(precision, scale) => {
@@ -113,6 +117,29 @@ pub(crate) fn exact_decimal(value: &ScalarValue, data_type: &DataType) -> Option
         }
         _ => None,
     }
+}
+
+/// Every decimal with at most [`f64::DIGITS`] (15) significant digits reads as a
+/// distinct `f64`, so a float whose shortest spelling is that short can only have
+/// come from that spelling (or one that differs below the float's precision).
+/// Longer spellings — `1e30` is `1000000000000000019884624838656.0` as well — are
+/// ambiguous, and those keep the cast's numeric conversion.
+fn is_unambiguous_spelling(spelling: &str) -> bool {
+    let unsigned = spelling.trim_start_matches('-');
+    let integer_digits = unsigned
+        .split_once('.')
+        .map_or(unsigned, |(integer, _)| integer)
+        .trim_start_matches('0')
+        .len();
+    let significant_digits = unsigned
+        .chars()
+        .filter(char::is_ascii_digit)
+        .collect::<String>()
+        .trim_start_matches('0')
+        .trim_end_matches('0')
+        .len();
+    let max = f64::DIGITS as usize;
+    integer_digits <= max && significant_digits <= max
 }
 
 #[cfg(test)]
@@ -164,6 +191,22 @@ mod tests {
             exact_decimal(
                 &ScalarValue::Float64(Some(123_456.0)),
                 &DataType::Decimal128(4, 0)
+            ),
+            None
+        );
+        // More significant digits than an f64 pins down: several decimals share
+        // this float, so the cast's numeric conversion decides.
+        assert_eq!(
+            exact_decimal(
+                &ScalarValue::Float64(Some(1e30)),
+                &DataType::Decimal128(38, 0)
+            ),
+            None
+        );
+        assert_eq!(
+            exact_decimal(
+                &ScalarValue::Float64(Some(0.1 + 0.2)),
+                &DataType::Decimal128(38, 18)
             ),
             None
         );
