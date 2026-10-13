@@ -1426,12 +1426,6 @@ mod tests {
         assert_eq!(result.to_string(), "random()");
     }
 
-    /// `trim` is an alias of `btrim` in `DataFusion`, so the planner resolves
-    /// `trim(x)` to a `btrim` call and the unparser emits the function's own
-    /// name. `DuckDB` has no `btrim`, which is what issue #13794 hits.
-    ///
-    /// The one-argument call must carry the trim set: a bare `trim(x)` puts
-    /// `DuckDB` on its Unicode-`Zs` path, which `btrim` is not.
     /// A filter value with a backslash before a quote must reach `DuckDB` as a
     /// literal it can parse and that means that value: `DuckDB` reads backslash
     /// literally, so the quote has to be doubled, and `sqlparser` alone skips it.
@@ -1461,6 +1455,12 @@ mod tests {
         }
     }
 
+    /// `trim` is an alias of `btrim` in `DataFusion`, so the planner resolves
+    /// `trim(x)` to a `btrim` call and the unparser emits the function's own
+    /// name. `DuckDB` has no `btrim`, which is what issue #13794 hits.
+    ///
+    /// The one-argument call must carry the trim set: a bare `trim(x)` puts
+    /// `DuckDB` on its Unicode-`Zs` path, which `btrim` is not.
     #[test]
     fn btrim_unparses_to_duckdb_trim() {
         let dialect = new_duckdb_dialect();
