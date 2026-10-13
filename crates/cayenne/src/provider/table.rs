@@ -5573,12 +5573,14 @@ impl RewriteOrder {
     }
 }
 
-/// In-memory bytes of rows each shard of a whole-table replace sorts by the
-/// routing key at a time (see `WriteShardConfig::run_sort_bytes`).
+/// In-memory bytes of rows each shard of a whole-table replace sorts by its
+/// key at a time (see `WriteShardConfig::run_sort_bytes`): the routing column,
+/// then the rest of the shard key.
 ///
 /// A file then holds a few key-sorted runs instead of arrival order, so an
 /// equality lookup reads about one zone per run rather than every zone of the
-/// key. This holds for a range-routed replace and for one that hashes the key
+/// key, including one that pins a composite key whose routing column has few
+/// values. This holds for a range-routed replace and for one that hashes the key
 /// (the first load of a table has no rows to sample split points from). One run
 /// per shard is resident at a time, charged to the query memory pool; a refused
 /// charge seals the run early rather than failing the write.
@@ -5609,10 +5611,10 @@ pub(crate) struct RangePartitioning<'a> {
 
 impl RangePartitioning<'_> {
     /// A whole-table replace with no split points to route on: the shard key
-    /// is hashed as before, and each shard's rows are still sorted by its
-    /// leading column, so the zone maps inside every file prune an equality on
-    /// the key. This is the shape of a table's first load, which has no rows
-    /// to sample split points from.
+    /// is hashed as before, and each shard's rows are still sorted by the key,
+    /// so the zone maps inside every file prune an equality on it. This is the
+    /// shape of a table's first load, which has no rows to sample split points
+    /// from.
     pub(crate) const fn hashed_run_sorted() -> Self {
         Self {
             column: None,
@@ -10939,7 +10941,7 @@ impl CayenneTableProvider {
                         lead_with_range_column(&mut config.shard_key_columns, column);
                     }
                     // Without bounds the write hashes the shard key; the run sort
-                    // then orders each shard by its leading column instead.
+                    // orders each shard by that key either way.
                     config.run_sort_bytes = range.run_sort_bytes;
                     config.range_bounds_estimated =
                         range.bounds_estimated && config.range_bounds.is_some();
@@ -55099,6 +55101,156 @@ mod tests {
         };
         assert_disjoint_sorted_key_range_files_in(&provider, snapshot_id, &schema, SHARDS, ROWS)
             .await;
+    }
+
+    /// A checkpoint of a composite key whose leading column takes few values
+    /// routes on that column, so each key-range file holds every row of its
+    /// leading values. Those rows must come out in order of the whole key: sorted
+    /// by the leading column alone they would keep the rest of the key in arrival
+    /// order, and a lookup that pins all of it would read every zone of its
+    /// leading value instead of one.
+    #[tokio::test]
+    async fn a_checkpoint_sorts_each_key_range_file_by_its_whole_key() {
+        use arrow::array::StringArray;
+
+        const ROWS: usize = 20_000;
+        const SHARDS: usize = 4;
+        const LEADING_VALUES: i64 = 8;
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("d", DataType::Int64, false),
+            Field::new("o", DataType::Int64, false),
+            Field::new("pad", DataType::Utf8, false),
+        ]));
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_table_with_schema(
+            "checkpoint_whole_key_sorted",
+            ctx.runtime_env(),
+            Arc::clone(&schema),
+            vec!["d".to_string(), "o".to_string()],
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                compaction_background_interval_ms: 0,
+                write_concurrency: Some(SHARDS),
+                // A 1 MiB target makes every ~1 MiB of rows an encode shard, so
+                // the ~4 MiB corpus below fills all four.
+                target_vortex_file_size_mb: 1,
+                ..VortexConfig::default()
+            },
+            OnConflict::Upsert(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(vec![
+                    "d".to_string(),
+                    "o".to_string(),
+                ]),
+            ),
+        )
+        .await;
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+
+        // Every (d, o) for d in 0..8 and o in 0..2500, in a scrambled order.
+        let keys: Vec<(i64, i64)> = (0..ROWS)
+            .map(|i| {
+                let key = i64::try_from((i * 7919) % ROWS).expect("key fits i64");
+                (key % LEADING_VALUES, key / LEADING_VALUES)
+            })
+            .collect();
+        let batch = RecordBatch::try_new(
+            Arc::clone(&schema),
+            vec![
+                Arc::new(Int64Array::from_iter_values(keys.iter().map(|(d, _)| *d))),
+                Arc::new(Int64Array::from_iter_values(keys.iter().map(|(_, o)| *o))),
+                Arc::new(StringArray::from_iter_values(
+                    keys.iter().map(|(d, o)| format!("{d}-{o:0>200}")),
+                )),
+            ],
+        )
+        .expect("corpus batch");
+        provider
+            .write_cdc_append_stream(single_batch_stream(batch), &ctx.task_ctx())
+            .await
+            .expect("CDC upsert")
+            .finish()
+            .await
+            .expect("CDC upsert published");
+        assert_eq!(
+            provider.checkpoint_mem_tier().await.expect("checkpoint"),
+            u64::try_from(ROWS).expect("rows fit u64")
+        );
+
+        let snapshots: Vec<String> = provider
+            .protected_snapshots
+            .load()
+            .keys()
+            .cloned()
+            .collect();
+        let [snapshot_id] = snapshots.as_slice() else {
+            panic!("one checkpoint registers one snapshot: {snapshots:?}");
+        };
+        let names: Vec<String> = provider
+            .list_snapshot_files_with_sizes(snapshot_id)
+            .await
+            .expect("list snapshot files")
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(names.len(), SHARDS, "one file per key range: {names:?}");
+        let file_ctx =
+            SessionContext::new_with_config(SessionConfig::new().with_target_partitions(1));
+        let mut total = 0_usize;
+        let mut leading_by_file = Vec::with_capacity(names.len());
+        for name in &names {
+            let path = provider.snapshot_dir_path_for(snapshot_id).join(name);
+            let table = CayenneTableProvider::create_listing_table(
+                &path.to_string_lossy(),
+                Arc::clone(&schema),
+                provider.context.file_format(),
+                &provider.pk_deletion_strategy,
+            )
+            .expect("single-file listing table");
+            let pairs: Vec<(i64, i64)> = file_ctx
+                .read_table(table)
+                .expect("read file")
+                .collect()
+                .await
+                .expect("scan file")
+                .iter()
+                .flat_map(|batch| {
+                    let column = |index: usize| {
+                        batch
+                            .column(index)
+                            .as_any()
+                            .downcast_ref::<Int64Array>()
+                            .expect("the key columns are Int64")
+                            .values()
+                            .to_vec()
+                    };
+                    column(0).into_iter().zip(column(1))
+                })
+                .collect();
+            let leading: std::collections::BTreeSet<i64> =
+                pairs.iter().map(|(d, _)| *d).collect();
+            assert!(
+                leading.len() > 1 && pairs.len() > leading.len(),
+                "{name}: a range file holds several rows of several leading values: {leading:?}"
+            );
+            assert!(
+                pairs.is_sorted(),
+                "{name}: a range file's rows are in order of the whole key"
+            );
+            total += pairs.len();
+            leading_by_file.push(leading);
+        }
+        assert_eq!(total, ROWS, "every row is written exactly once");
+        for (index, leading) in leading_by_file.iter().enumerate() {
+            for other in &leading_by_file[index + 1..] {
+                assert!(
+                    leading.is_disjoint(other),
+                    "files route on the leading column, so no leading value spans two: \
+                     {leading_by_file:?}"
+                );
+            }
+        }
     }
 
     /// A seq-prefix bake routes its merged output into key-range files: each file

@@ -15,10 +15,12 @@ use datafusion_common::arrow::array::ArrayRef as ArrowArrayRef;
 use datafusion_common::arrow::array::RecordBatch;
 use datafusion_common::arrow::array::RecordBatchOptions;
 use datafusion_common::arrow::array::UInt32Array;
+use datafusion_common::arrow::compute::SortColumn;
 use datafusion_common::arrow::compute::SortOptions;
 use datafusion_common::arrow::compute::concat;
 use datafusion_common::arrow::compute::interleave_record_batch;
 use datafusion_common::arrow::compute::kernels::cmp::gt;
+use datafusion_common::arrow::compute::lexsort_to_indices;
 use datafusion_common::arrow::compute::sort_to_indices;
 use datafusion_common::arrow::compute::take;
 use datafusion_common::arrow::datatypes::DataType;
@@ -94,13 +96,18 @@ pub(super) enum ShardSpec {
     /// encoders, because the sink's shard and file channels are depth-1 and the
     /// demux cannot run ahead of the encoder it is currently feeding.
     ///
-    /// `run_sort_bytes` additionally orders each shard's rows by `expr` in runs
-    /// of at most that many uncompressed bytes before they are encoded. A range
-    /// file then carries a handful of sorted runs instead of arrival order, so
-    /// the zone maps INSIDE it are narrow too and an equality on the key reads
-    /// about one zone per run — at a memory cost of one run per shard, rather
-    /// than the whole write a global sort would buffer. The runs are charged to
-    /// the task's memory pool and cut short when it refuses (see
+    /// `run_sort_bytes` additionally orders each shard's rows by `expr` and then
+    /// the rest of `hash_exprs` in runs of at most that many uncompressed bytes
+    /// before they are encoded. A range file then carries a handful of sorted
+    /// runs instead of arrival order, so the zone maps INSIDE it are narrow too
+    /// and an equality on the key reads about one zone per run — at a memory
+    /// cost of one run per shard, rather than the whole write a global sort
+    /// would buffer. Sorting on the whole key, not `expr` alone, is what keeps
+    /// the zones narrow on every key column: rows that share a value of `expr`
+    /// (all of them, in a range that holds one value of a low-cardinality key)
+    /// would otherwise stay in arrival order, and a lookup that pins the rest of
+    /// a composite key would read every zone of that value. The runs are charged
+    /// to the task's memory pool and cut short when it refuses (see
     /// [`RunSorter`]), so the sort never takes memory the pool does not have.
     ///
     /// `hash_fallback` marks bounds estimated from a sample that may not describe
@@ -125,10 +132,10 @@ pub(super) enum ShardSpec {
     ///
     /// A hash split gives every file the whole key domain, so file statistics
     /// cannot prune an equality on the key. `run_sort_bytes` orders each
-    /// shard's rows by the LEADING key expression in runs of at most that many
-    /// uncompressed bytes, exactly as for [`ShardSpec::Range`], so the zone maps
-    /// inside each file are narrow and an equality on the key reads about one
-    /// zone per run of every file instead of every zone.
+    /// shard's rows by the key expressions, leading one first, in runs of at
+    /// most that many uncompressed bytes, exactly as for [`ShardSpec::Range`],
+    /// so the zone maps inside each file are narrow and an equality on the key
+    /// reads about one zone per run of every file instead of every zone.
     Hash {
         exprs: Vec<PhysicalExprRef>,
         partitions: usize,
@@ -684,20 +691,22 @@ async fn write_record_batch_stream_to_files(
     let mut senders = Vec::with_capacity(num_shards);
     let mut handles = Vec::with_capacity(num_shards);
     let started_paths = Arc::new(Mutex::new(HashSet::new()));
-    // Run sorting orders each shard's rows by the key the rows were routed on:
-    // the range key, or the leading column of a hash key. Round-robin and
+    // Run sorting orders each shard's rows by the whole key the rows were routed
+    // on, leading with the column that chose the shard: the range key and then
+    // the rest of the shard key, or every column of a hash key. Round-robin and
     // single-writer writes have no key to sort by.
     let run_sort_key = match output_options.shard_spec {
         ShardSpec::Range {
             expr,
+            hash_exprs,
             run_sort_bytes: Some(bytes),
             ..
-        } => Some((Arc::clone(expr), *bytes)),
+        } => Some((run_sort_exprs(expr, hash_exprs), *bytes)),
         ShardSpec::Hash {
             exprs,
             run_sort_bytes: Some(bytes),
             ..
-        } => exprs.first().map(|expr| (Arc::clone(expr), *bytes)),
+        } => (!exprs.is_empty()).then(|| (exprs.clone(), *bytes)),
         _ => None,
     };
     let run_sort = run_sort_key.filter(|(_, bytes)| {
@@ -726,9 +735,9 @@ async fn write_record_batch_stream_to_files(
             num_shards,
             Arc::clone(&started_paths),
             write_observer.clone(),
-            run_sort.as_ref().map(|(expr, bytes)| {
+            run_sort.as_ref().map(|(exprs, bytes)| {
                 RunSorter::new(
-                    Arc::clone(expr),
+                    exprs.clone(),
                     *bytes,
                     MemoryConsumer::new(format!("VortexRunSort[{shard_id}]"))
                         .with_can_spill(true)
@@ -893,6 +902,19 @@ async fn write_record_batch_stream_to_files(
 /// for an unsorted shard.
 const RUN_SORT_OUTPUT_ROWS: usize = 8192;
 
+/// The key a range shard's runs are sorted by: the range column, then every
+/// other column of the shard key in its order.
+fn run_sort_exprs(expr: &PhysicalExprRef, hash_exprs: &[PhysicalExprRef]) -> Vec<PhysicalExprRef> {
+    std::iter::once(Arc::clone(expr))
+        .chain(
+            hash_exprs
+                .iter()
+                .filter(|other| other.as_ref() != expr.as_ref())
+                .map(Arc::clone),
+        )
+        .collect()
+}
+
 /// Whether a column of this type can be emitted from a sorted run, which
 /// interleaves rows from every batch the run buffered.
 ///
@@ -968,7 +990,8 @@ fn sort_scratch_bytes_per_row(data_type: &DataType) -> usize {
 }
 
 /// Buffers one shard's rows up to a byte budget, then emits them sorted by the
-/// shard key. See [`ShardSpec::Range`] and [`ShardSpec::Hash`].
+/// shard key, lexicographically over its columns. See [`ShardSpec::Range`] and
+/// [`ShardSpec::Hash`].
 ///
 /// Each batch is charged to the task's memory pool on arrival, together with
 /// the scratch its share of the sort will need, so a run that was admitted can
@@ -979,12 +1002,13 @@ fn sort_scratch_bytes_per_row(data_type: &DataType) -> usize {
 /// A sealed run is emitted a batch at a time, interleaved from the buffered
 /// batches, so it never holds a second, sorted copy of itself.
 struct RunSorter {
-    expr: PhysicalExprRef,
+    /// The sort key's columns, most significant first.
+    exprs: Vec<PhysicalExprRef>,
     max_bytes: usize,
     reservation: MemoryReservation,
     buffered: Vec<RecordBatch>,
-    /// The sort key of each buffered batch.
-    keys: Vec<ArrowArrayRef>,
+    /// The sort key of each buffered batch, one array per key column.
+    keys: Vec<Vec<ArrowArrayRef>>,
     /// Pool bytes of the buffered batches, which the byte budget counts.
     buffered_bytes: usize,
     /// Pool bytes reserved for sorting the buffered batches.
@@ -1033,9 +1057,9 @@ impl SortedRun {
 }
 
 impl RunSorter {
-    fn new(expr: PhysicalExprRef, max_bytes: u64, reservation: MemoryReservation) -> Self {
+    fn new(exprs: Vec<PhysicalExprRef>, max_bytes: u64, reservation: MemoryReservation) -> Self {
         Self {
-            expr,
+            exprs,
             max_bytes: usize::try_from(max_bytes).unwrap_or(usize::MAX),
             reservation,
             buffered: Vec::new(),
@@ -1053,12 +1077,24 @@ impl RunSorter {
     fn push(&mut self, batch: RecordBatch) -> DFResult<()> {
         self.ensure_drained()?;
         let rows = batch.num_rows();
-        let key = self.expr.evaluate(&batch)?.into_array(rows)?;
+        let key = self
+            .exprs
+            .iter()
+            .map(|expr| expr.evaluate(&batch)?.into_array(rows))
+            .collect::<DFResult<Vec<_>>>()?;
         let bytes = get_record_batch_memory_size(&batch);
-        // Sorting concatenates the keys, so each one is copied once.
-        let scratch = key
-            .get_array_memory_size()
-            .saturating_add(rows.saturating_mul(sort_scratch_bytes_per_row(key.data_type())));
+        // Sorting concatenates the keys, so each column is copied once; the sort's
+        // own scratch per row is the most a single column of the key needs, which
+        // covers the row-index vectors a sort over several columns allocates.
+        let scratch = key.iter().fold(
+            rows.saturating_mul(
+                key.iter()
+                    .map(|column| sort_scratch_bytes_per_row(column.data_type()))
+                    .max()
+                    .unwrap_or_default(),
+            ),
+            |scratch, column| scratch.saturating_add(column.get_array_memory_size()),
+        );
         if self
             .reservation
             .try_grow(bytes.saturating_add(scratch))
@@ -1115,7 +1151,8 @@ impl RunSorter {
     }
 
     /// Moves the buffered batches into `sealed` with their rows ordered by the
-    /// key. NULL keys sort first, which is where the range router put them.
+    /// key. NULL keys sort first in every column, which is where the range
+    /// router put them.
     fn seal(&mut self) -> DFResult<()> {
         let batches = std::mem::take(&mut self.buffered);
         let keys = std::mem::take(&mut self.keys);
@@ -1137,16 +1174,14 @@ impl RunSorter {
             return Ok(());
         }
         let order = {
-            let keys: Vec<&dyn Array> = keys.iter().map(AsRef::as_ref).collect();
-            let key = concat(&keys)?;
-            sort_to_indices(
-                &key,
-                Some(SortOptions {
-                    descending: false,
-                    nulls_first: true,
-                }),
-                None,
-            )?
+            let columns = (0..self.exprs.len())
+                .map(|column| {
+                    let parts: Vec<&dyn Array> =
+                        keys.iter().map(|key| key[column].as_ref()).collect();
+                    concat(&parts)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            run_order(&columns)?
         };
         drop(keys);
         // The concatenated key and the sort's pairs are freed; the order is kept
@@ -1160,6 +1195,36 @@ impl RunSorter {
             emitted: 0,
         });
         Ok(())
+    }
+}
+
+/// The order to emit a run's rows in: ascending by each key column in turn,
+/// NULLs first.
+fn run_order(columns: &[ArrowArrayRef]) -> DFResult<UInt32Array> {
+    let options = Some(SortOptions {
+        descending: false,
+        nulls_first: true,
+    });
+    let Some((leading, rest)) = columns.split_first() else {
+        return Err(exec_datafusion_err!(
+            "Vortex run sort needs at least one key column"
+        ));
+    };
+    if rest.is_empty() {
+        return Ok(sort_to_indices(leading, options, None)?);
+    }
+    let columns: Vec<SortColumn> = columns
+        .iter()
+        .map(|values| SortColumn {
+            values: Arc::clone(values),
+            options,
+        })
+        .collect();
+    // A trailing key column the lexicographic comparator cannot order costs the
+    // run its order on the trailing columns, never the write.
+    match lexsort_to_indices(&columns, None) {
+        Ok(order) => Ok(order),
+        Err(_) => Ok(sort_to_indices(leading, options, None)?),
     }
 }
 
@@ -3328,7 +3393,7 @@ mod tests {
 
     fn run_sorter(max_bytes: u64, pool: &Arc<dyn MemoryPool>) -> RunSorter {
         RunSorter::new(
-            Arc::new(Column::new("a", 0)),
+            vec![Arc::new(Column::new("a", 0))],
             max_bytes,
             MemoryConsumer::new("test run sort").register(pool),
         )
@@ -3834,6 +3899,154 @@ mod tests {
                 values.is_sorted(),
                 "{path}: a run-sorted hash shard is written in key order: {values:?}"
             );
+        }
+        Ok(())
+    }
+
+    fn two_col_schema() -> SchemaRef {
+        Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int64, true),
+            Field::new("b", DataType::Int64, true),
+        ]))
+    }
+
+    fn two_col_batch(schema: &SchemaRef, rows: &[(Option<i64>, Option<i64>)]) -> RecordBatch {
+        RecordBatch::try_new(
+            Arc::clone(schema),
+            vec![
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|(a, _)| *a).collect::<Vec<_>>(),
+                )),
+                Arc::new(Int64Array::from(
+                    rows.iter().map(|(_, b)| *b).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .expect("a two-column batch")
+    }
+
+    fn int64_pairs(batches: &[RecordBatch]) -> Vec<(Option<i64>, Option<i64>)> {
+        batches
+            .iter()
+            .flat_map(|batch| {
+                let column = |index: usize| {
+                    batch
+                        .column(index)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .expect("a column should be Int64Array")
+                        .iter()
+                        .collect::<Vec<_>>()
+                };
+                column(0).into_iter().zip(column(1))
+            })
+            .collect()
+    }
+
+    /// A run is ordered by every key column in turn, not only the first, with
+    /// NULLs first in each.
+    #[test]
+    fn run_sorter_orders_a_run_by_every_key_column() -> anyhow::Result<()> {
+        let schema = two_col_schema();
+        let pool: Arc<dyn MemoryPool> = Arc::new(UnboundedMemoryPool::default());
+        let mut sorter = RunSorter::new(
+            vec![Arc::new(Column::new("a", 0)), Arc::new(Column::new("b", 1))],
+            u64::MAX,
+            MemoryConsumer::new("test run sort").register(&pool),
+        );
+        sorter.push(two_col_batch(
+            &schema,
+            &[(Some(1), Some(5)), (Some(0), None), (Some(1), None)],
+        ))?;
+        sorter.push(two_col_batch(
+            &schema,
+            &[(Some(0), Some(3)), (Some(1), Some(2)), (None, Some(9))],
+        ))?;
+        sorter.finish()?;
+        assert_eq!(
+            int64_pairs(&drain(&mut sorter)?),
+            vec![
+                (None, Some(9)),
+                (Some(0), None),
+                (Some(0), Some(3)),
+                (Some(1), None),
+                (Some(1), Some(2)),
+                (Some(1), Some(5)),
+            ]
+        );
+        assert_eq!(pool.reserved(), 0);
+        Ok(())
+    }
+
+    /// A composite key whose leading column has few values: a range shard holds
+    /// every row of a value, so sorting it by that column alone would leave the
+    /// rest of the key in arrival order, and a lookup that pins the whole key
+    /// would read every zone of the value. Each shard must come out in order of
+    /// the whole key, for a range split and for a hash split alike.
+    #[tokio::test]
+    async fn test_sharding_with_run_sort_orders_each_shard_by_its_whole_key() -> anyhow::Result<()>
+    {
+        let schema = two_col_schema();
+        // (a, b) for a in 0..4 and b in 0..250, in a scrambled arrival order.
+        let rows: Vec<(Option<i64>, Option<i64>)> = (0..1000_i64)
+            .map(|i| (i * 7919) % 1000)
+            .map(|k| (Some(k % 4), Some(k / 4)))
+            .collect();
+        let key = || -> Vec<PhysicalExprRef> {
+            vec![Arc::new(Column::new("a", 0)), Arc::new(Column::new("b", 1))]
+        };
+        let specs = [
+            ShardSpec::Range {
+                expr: Arc::new(Column::new("a", 0)),
+                hash_exprs: key(),
+                bounds: vec![ScalarValue::Int64(Some(1))],
+                partitions: 2,
+                run_sort_bytes: Some(64 * 1024 * 1024),
+                hash_fallback: false,
+            },
+            ShardSpec::Hash {
+                exprs: key(),
+                partitions: 2,
+                run_sort_bytes: Some(64 * 1024 * 1024),
+            },
+        ];
+        for spec in specs {
+            let ctx = TestSessionContext::default();
+            let batches: Vec<RecordBatch> = rows
+                .chunks(100)
+                .map(|chunk| two_col_batch(&schema, chunk))
+                .collect();
+            let results = run_sharded_write(
+                ctx.store.clone(),
+                Arc::clone(&schema),
+                batches_to_stream(Arc::clone(&schema), batches),
+                None,
+                spec,
+            )
+            .await?;
+            let total_rows: u64 = results.iter().map(|(_, s)| s.row_count()).sum();
+            assert_eq!(total_rows, 1000, "no row may be dropped or duplicated");
+            assert_eq!(results.len(), 2, "one file per shard");
+            for (path, _) in &results {
+                let pairs = int64_pairs(
+                    &ctx.session
+                        .sql(&format!("SELECT a, b FROM '/{path}'"))
+                        .await?
+                        .collect()
+                        .await?,
+                );
+                let leading: std::collections::BTreeSet<_> =
+                    pairs.iter().map(|(a, _)| *a).collect();
+                assert!(
+                    leading.len() > 1 && pairs.len() > leading.len(),
+                    "{path}: the shard must hold several rows of several leading values, \
+                     or its order says nothing: {pairs:?}"
+                );
+                assert!(
+                    pairs.is_sorted(),
+                    "{path}: a run-sorted shard is written in order of its whole key: {pairs:?}"
+                );
+            }
         }
         Ok(())
     }
