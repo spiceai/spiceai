@@ -4970,7 +4970,7 @@ mod tests {
     }
 
     /// The same accounting for memory the allocator released with `MADV_FREE`.
-    /// Numbers are the spiced cgroup of a CH-benCHmark SF100 PostgreSQL run and
+    /// Numbers are the spiced cgroup of a CH-benCHmark SF100 `PostgreSQL` run and
     /// its `LazyFree`, read in one command: past `MEM_PRESSURE_HIGH` after the
     /// page cache is excluded, which shrank every table's memtable, while 33 GB
     /// of the charge was lazily freed and only 52 GB live. The `smaps_rollup`
