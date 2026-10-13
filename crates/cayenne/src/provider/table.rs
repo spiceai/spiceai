@@ -1614,9 +1614,24 @@ struct ScanViewCache {
     latest_complete: ArcSwapOption<CompletedScanView>,
     /// Builds still resolving. Self-trims on [`Self::drain_completed`].
     in_flight: ParkingMutex<Vec<InFlightScanView>>,
-    /// Admit a miss before capturing snapshots. The blocking build owns the
-    /// permit, so cancelling its caller cannot admit overlapping work.
+    /// Admit a miss before capturing snapshots. The build's driver task owns
+    /// the permit until it has published the view, so cancelling its caller
+    /// cannot admit overlapping work and the next scan admitted sees the result.
     build_lock: Arc<tokio::sync::Mutex<()>>,
+    /// The previous build's merged (file ∪ mem-tier) deletion snapshot with the
+    /// inputs it was computed from, so the next build folds in only the
+    /// segments appended since instead of re-merging every resident tombstone.
+    merged_deletions: ParkingMutex<Option<Arc<MergedDeletions>>>,
+    /// The previous build's visible mem-tier rows, so the next build filters
+    /// only appended segments and removes from the rest only the rows the
+    /// appended segments' tombstones hide.
+    visible_segments: ParkingMutex<Option<Arc<VisibleSegmentsCache>>>,
+    /// Segments a build carried from the previous build's visible rows.
+    #[cfg(test)]
+    carried_segments: AtomicU64,
+    /// Builds that extended the previous build's merged deletions.
+    #[cfg(test)]
+    extended_merges: AtomicU64,
 }
 
 impl Default for ScanViewCache {
@@ -1625,8 +1640,161 @@ impl Default for ScanViewCache {
             latest_complete: ArcSwapOption::empty(),
             in_flight: ParkingMutex::new(Vec::new()),
             build_lock: Arc::new(tokio::sync::Mutex::new(())),
+            merged_deletions: ParkingMutex::new(None),
+            visible_segments: ParkingMutex::new(None),
+            #[cfg(test)]
+            carried_segments: AtomicU64::new(0),
+            #[cfg(test)]
+            extended_merges: AtomicU64::new(0),
         }
     }
+}
+
+/// Identity of one mem-tier shard's segment list, for reusing work across
+/// scan-view builds: the data sequences of its first and last segment and its
+/// length. Data sequences are unique and increase with every append, and a tier
+/// only ever appends at the end or drops a prefix (a checkpoint's
+/// [`MemTier::retain_after`](crate::provider::mem_tier::MemTier::retain_after));
+/// `retain_rows` keeps every segment and its tombstones. So a later list whose
+/// first segment and `len - 1`-th segment match this lineage begins with
+/// exactly these segments.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct SegmentLineage {
+    first: Option<i64>,
+    last: Option<i64>,
+    len: usize,
+}
+
+impl SegmentLineage {
+    fn of(segments: &[crate::provider::mem_tier::MemSegment]) -> Self {
+        Self {
+            first: segments.first().map(|segment| segment.data_sequence),
+            last: segments.last().map(|segment| segment.data_sequence),
+            len: segments.len(),
+        }
+    }
+
+    /// Where the segments appended after this lineage start in `segments`, or
+    /// `None` when `segments` does not begin with this lineage's segments.
+    fn appended_from(&self, segments: &[crate::provider::mem_tier::MemSegment]) -> Option<usize> {
+        if self.len == 0 {
+            return Some(0);
+        }
+        let prefix = segments.get(..self.len)?;
+        (prefix.first().map(|segment| segment.data_sequence) == self.first
+            && prefix.last().map(|segment| segment.data_sequence) == self.last)
+            .then_some(self.len)
+    }
+}
+
+/// The file-side deletion index the mem-tier visibility filter consults,
+/// held so a later build can tell whether it changed.
+#[derive(Clone)]
+enum FileDeletionIndex {
+    Int64(Arc<DeletionIndex>),
+    RowKeys(Arc<KeyDeletionIndex>),
+}
+
+impl FileDeletionIndex {
+    fn same(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Int64(a), Self::Int64(b)) => Arc::ptr_eq(a, b),
+            (Self::RowKeys(a), Self::RowKeys(b)) => Arc::ptr_eq(a, b),
+            _ => false,
+        }
+    }
+
+    fn max_sequence_number(&self) -> Option<i64> {
+        match self {
+            Self::Int64(index) => index.max_sequence_number(),
+            Self::RowKeys(index) => index.max_sequence_number(),
+        }
+    }
+}
+
+/// One mem-tier segment's deletion-filtered rows from an earlier scan-view
+/// build, kept so a later build re-filters only the rows new tombstones touch.
+struct CachedVisibleSegment {
+    data_sequence: i64,
+    /// The segment's batches when they were filtered. Held rather than compared
+    /// by address: `retain_rows` replaces a segment's batches under the same
+    /// data sequence, and a held `Arc` cannot be reallocated at its address.
+    source: Arc<Vec<RecordBatch>>,
+    /// The visible rows of `source`, batch by batch; empty when all are hidden.
+    batches: Vec<RecordBatch>,
+    /// For the row-key strategy, each visible row's key digest
+    /// ([`hash_index::hash_key_128`] of its encoded primary key, the digest the
+    /// deletion index keys on), aligned with `batches`. Empty for `Int64Pk`,
+    /// whose key is the PK column itself.
+    digests: Vec<Arc<[u128]>>,
+}
+
+/// The visible mem-tier rows of the previous scan-view build and the
+/// file-side deletion index they were filtered against.
+struct VisibleSegmentsCache {
+    file: FileDeletionIndex,
+    /// Per shard, every segment of the captured tier in append order.
+    shards: Vec<Vec<CachedVisibleSegment>>,
+}
+
+/// The keys the appended segments' tombstones hide in every older segment of
+/// their shard: `Int64Pk` values, or row-key digests ([`hash_index::hash_key_128`]).
+enum AppendedKeys {
+    Int64(HashSet<i64, hash_index::XxHash3BuildHasher>),
+    Digests(HashSet<u128, PrehashedBuildHasher>),
+}
+
+impl AppendedKeys {
+    fn of(appended: &[crate::provider::mem_tier::MemSegment], digest_keys: bool) -> Self {
+        if digest_keys {
+            let mut keys = HashSet::with_hasher(PrehashedBuildHasher);
+            for segment in appended {
+                keys.extend(segment.tombstones.row_keys().map(hash_index::hash_key_128));
+            }
+            Self::Digests(keys)
+        } else {
+            let mut keys = HashSet::with_hasher(hash_index::XxHash3BuildHasher);
+            for segment in appended {
+                keys.extend(segment.tombstones.int64_keys());
+            }
+            Self::Int64(keys)
+        }
+    }
+}
+
+/// How the captured `segments` of a shard continue the previous build's list:
+/// `(start, carried)` where `segments[..carried]` are `previous[start..]`
+/// (the previous list minus a dropped prefix) and the rest were appended.
+/// `(0, 0)` when nothing is carried. Data sequences are unique and ascend in
+/// append order, so matching them identifies the same segment.
+fn carried_segments(
+    previous: &[CachedVisibleSegment],
+    segments: &[crate::provider::mem_tier::MemSegment],
+) -> (usize, usize) {
+    let Some(first) = segments.first() else {
+        return (0, 0);
+    };
+    let Ok(start) = previous.binary_search_by_key(&first.data_sequence, |cached| cached.data_sequence)
+    else {
+        return (0, 0);
+    };
+    let carried = previous.len() - start;
+    let continues = segments.len() >= carried
+        && previous[start..]
+            .iter()
+            .zip(segments)
+            .all(|(cached, segment)| cached.data_sequence == segment.data_sequence);
+    if continues { (start, carried) } else { (0, 0) }
+}
+
+/// A merged deletion snapshot and the inputs it was computed from.
+struct MergedDeletions {
+    /// The file-side snapshot the merge started from. Held, not just compared
+    /// by pointer, so no later snapshot can be allocated at its address.
+    file: PkDeletionSnapshot,
+    /// The lineage of each shard's segments whose tombstones are merged in.
+    shards: Vec<SegmentLineage>,
+    merged: PkDeletionSnapshot,
 }
 
 /// Unpruned snapshot-directory listing with per-file footer statistics.
@@ -1681,12 +1849,23 @@ impl ScanViewCache {
     /// and `version_after`; this does not load `latest_complete` again, so a
     /// write that publishes after `version_after` cannot swap in a different
     /// view that this check would still accept.
+    ///
+    /// [`ScanViewReuse::WithinLag`] freshness is measured from `requested_at`,
+    /// the instant the scan asked for a view, not from `now`: a view captured
+    /// at most `lag` before the request satisfies it however long the request
+    /// then waited for build admission, and a view captured after the request
+    /// arrived is fresher than any lag requires. Measuring from `now` would make
+    /// every scan that queued behind a build longer than `lag` reject the view
+    /// that build produced and rebuild in turn. With a zero lag only a view
+    /// captured at or after the request qualifies, so a scan still never reuses
+    /// state captured before it was issued.
     fn try_serve_latest(
         reuse: ScanViewReuse,
         version_before: u64,
         version_after: u64,
         structural: u64,
         now: Instant,
+        requested_at: Instant,
         candidate: Option<Arc<CompletedScanView>>,
     ) -> Option<Arc<ScanView>> {
         // A live schema-evolution leaves the generation odd; never serve across it.
@@ -1700,11 +1879,11 @@ impl ScanViewCache {
                     && current.order == version_after
                     && current.view.structural_version == structural
             }
-            ScanViewReuse::WithinLag(lag) if !lag.is_zero() => {
-                now.saturating_duration_since(current.captured_at) <= lag
+            ScanViewReuse::WithinLag(lag) => {
+                // Zero when the view was captured at or after the request.
+                requested_at.saturating_duration_since(current.captured_at) <= lag
                     && current.view.structural_version == structural
             }
-            ScanViewReuse::WithinLag(_) => false,
         };
         if !servable {
             return None;
@@ -30846,6 +31025,57 @@ impl CayenneTableProvider {
         deletion_snapshot.with_mem_tier_tombstones_map(&union)
     }
 
+    /// [`Self::merged_deletion_snapshot_sharded`] for a scan-view build, extending
+    /// the previous build's merge when this build's inputs continue it: the same
+    /// file-side snapshot and, per shard, the same segments followed by newly
+    /// appended ones. A merge is a per-key max over delete sequences, and a
+    /// segment's tombstones never change once appended, so folding only the
+    /// appended segments' tombstones into the previous result equals merging
+    /// every resident tombstone again. Any other change — a checkpoint or
+    /// compaction replacing the file-side snapshot, a checkpoint dropping
+    /// flushed segments — takes the full merge.
+    fn merged_deletions_for_build(
+        &self,
+        file: &PkDeletionSnapshot,
+        shards: &[Arc<crate::provider::mem_tier::MemTier>],
+    ) -> PkDeletionSnapshot {
+        let Some(file_ptr) = file.index_ptr() else {
+            return Self::merged_deletion_snapshot_sharded(file.clone(), shards);
+        };
+        let lineage: Vec<SegmentLineage> = shards
+            .iter()
+            .map(|shard| SegmentLineage::of(&shard.segments))
+            .collect();
+        let previous = self.scan_view_cache.merged_deletions.lock().clone();
+        let extended = previous.and_then(|previous| {
+            if previous.file.index_ptr() != Some(file_ptr) || previous.shards.len() != shards.len() {
+                return None;
+            }
+            let mut appended = crate::provider::mem_tier::InMemTombstones::default();
+            for (lineage, shard) in previous.shards.iter().zip(shards) {
+                let start = lineage.appended_from(&shard.segments)?;
+                for segment in &shard.segments[start..] {
+                    appended.merge_segment(&segment.tombstones);
+                }
+            }
+            #[cfg(test)]
+            self.scan_view_cache.extended_merges.fetch_add(1, Ordering::Relaxed);
+            Some(if appended.is_empty() {
+                previous.merged.clone()
+            } else {
+                previous.merged.with_mem_tier_tombstones_map(&appended)
+            })
+        });
+        let merged = extended
+            .unwrap_or_else(|| Self::merged_deletion_snapshot_sharded(file.clone(), shards));
+        *self.scan_view_cache.merged_deletions.lock() = Some(Arc::new(MergedDeletions {
+            file: file.clone(),
+            shards: lineage,
+            merged: merged.clone(),
+        }));
+        merged
+    }
+
     /// Bound on the inline-view capture retry (see [`Self::capture_raw_scan_input`]).
     /// On the final attempt the freshest rebuilt view is accepted even if the live
     /// generation advanced again, so a durable-publish burst cannot starve capture.
@@ -31244,13 +31474,11 @@ impl CayenneTableProvider {
                 hook();
             }
         }
-        // Clone the file-side snapshot for the merge (an `Arc` clone); `raw` keeps
-        // its own copy so the view carries the file-side source for reference.
-        let merged_deletions = Self::merged_deletion_snapshot_sharded(
-            raw.deletion_snapshot.clone(),
-            &raw.mem_tier_shards,
-        );
-        let visible_segments = self.visible_mem_tier_segments(&raw.mem_tier_shards)?;
+        // `raw` keeps its own copy of the file-side snapshot so the view carries
+        // the file-side source for reference.
+        let merged_deletions =
+            self.merged_deletions_for_build(&raw.deletion_snapshot, &raw.mem_tier_shards);
+        let visible_segments = self.visible_mem_tier_segments_for_build(&raw.mem_tier_shards)?;
         let union_tombstones =
             crate::provider::mem_tier::ShardedMemTier::union_tombstones(&raw.mem_tier_shards);
         Ok(ScanView {
@@ -31343,19 +31571,21 @@ impl CayenneTableProvider {
         use futures::FutureExt;
         let Some(provider) = self.weak_self.get().and_then(std::sync::Weak::upgrade) else {
             // Fallback (no `weak_self` — a provider never `Arc`-wrapped, i.e. the
-            // unit-test path): build inline and wrap the ready result. The
-            // awaiter publishes `latest_complete`.
+            // unit-test path): build inline and wrap the ready result, publishing
+            // it before `build_permit` drops at the end of this scope.
             let result = self
                 .build_scan_view(raw, structural_version)
                 .map(Arc::new)
                 .map_err(Arc::new);
+            if let Ok(view) = &result {
+                self.scan_view_cache
+                    .publish_completed(key, order, captured_at, Arc::clone(view));
+            }
+            drop(build_permit);
             return futures::future::ready(result).boxed().shared();
         };
         let build = async move {
-            task::spawn_blocking(move || {
-                let _build_permit = build_permit;
-                provider.build_scan_view(raw, structural_version)
-            })
+            task::spawn_blocking(move || provider.build_scan_view(raw, structural_version))
             .await
             .map_err(|join_error| {
                 Arc::new(datafusion_common::DataFusionError::Execution(format!(
@@ -31369,10 +31599,14 @@ impl CayenneTableProvider {
         .shared();
         // Independent driver: drives the shared build to completion and publishes
         // `latest_complete` even if the originating scan is cancelled, so the next
-        // hit is wait-free (no drain of `in_flight` required).
+        // hit is wait-free (no drain of `in_flight` required). It owns the build
+        // permit and releases it only after publishing: the next scan admitted
+        // then finds this view instead of racing the publish and rebuilding, and
+        // cancelling the originating scan cannot admit overlapping work.
         let driver_build = build.clone();
         let cache = Arc::clone(&self.scan_view_cache);
         task::spawn(async move {
+            let _build_permit = build_permit;
             if let Ok(view) = driver_build.await {
                 cache.publish_completed(key, order, captured_at, view);
             }
@@ -31381,8 +31615,13 @@ impl CayenneTableProvider {
     }
 
     /// Reuse a completed view only after validating its input and structural
-    /// versions against this lookup's time.
-    fn try_reuse_scan_view(&self, reuse: ScanViewReuse) -> Option<Arc<ScanView>> {
+    /// versions, judging `WithinLag` freshness against `requested_at` (see
+    /// [`ScanViewCache::try_serve_latest`]).
+    fn try_reuse_scan_view(
+        &self,
+        reuse: ScanViewReuse,
+        requested_at: Instant,
+    ) -> Option<Arc<ScanView>> {
         // Bracket the candidate with both versions. Ordinary writes invalidate
         // UntilInvalidated; a structural event rejects either reuse mode when it
         // straddles selection. No drain, no mutex.
@@ -31400,6 +31639,7 @@ impl CayenneTableProvider {
                 version_after,
                 structural,
                 now,
+                requested_at,
                 candidate,
             )
         {
@@ -31423,7 +31663,8 @@ impl CayenneTableProvider {
         &self,
         reuse: ScanViewReuse,
     ) -> datafusion_common::Result<Arc<ScanView>> {
-        if let Some(view) = self.try_reuse_scan_view(reuse) {
+        let requested_at = Instant::now();
+        if let Some(view) = self.try_reuse_scan_view(reuse, requested_at) {
             return Ok(view);
         }
 
@@ -31436,11 +31677,17 @@ impl CayenneTableProvider {
         }
         // Wait without pinning a raw snapshot. A queued query captures the
         // current input after admission, and can reuse a view completed while
-        // it waited only if the ordinary version and freshness checks permit it.
+        // it waited when the ordinary version check permits it and, for
+        // `WithinLag`, the view is fresh relative to when this query asked.
+        // A scan that arrived while a build ran is served by that build when
+        // its capture is within `lag` of the scan's arrival; otherwise the
+        // first such scan admitted rebuilds once, and because that capture
+        // happens after every scan still queued arrived, they are served by it
+        // rather than each rebuilding in turn.
         let build_permit = Arc::clone(&self.scan_view_cache.build_lock)
             .lock_owned()
             .await;
-        if let Some(view) = self.try_reuse_scan_view(reuse) {
+        if let Some(view) = self.try_reuse_scan_view(reuse, requested_at) {
             return Ok(view);
         }
 
@@ -34672,6 +34919,280 @@ impl CayenneTableProvider {
             }
         }
         Ok(out)
+    }
+
+    /// The live file-side deletion index the mem-tier visibility filter consults
+    /// (see [`Self::filter_inlined_batch_for_deletions`]), or `None` for the
+    /// position-based strategy, which keeps no key index.
+    fn live_file_deletion_index(&self) -> Option<FileDeletionIndex> {
+        match &self.pk_deletion_strategy {
+            PkDeletionStrategyWithCache::Int64Pk {
+                deletion_snapshot, ..
+            } => Some(FileDeletionIndex::Int64(Arc::clone(
+                &deletion_snapshot.load_full().tombstones,
+            ))),
+            PkDeletionStrategyWithCache::RowConverterBased {
+                deletion_snapshot, ..
+            } => Some(FileDeletionIndex::RowKeys(Arc::clone(
+                &deletion_snapshot.load_full().tombstones,
+            ))),
+            PkDeletionStrategyWithCache::PositionBased { .. } => None,
+        }
+    }
+
+    /// [`Self::visible_mem_tier_segments`] for a scan-view build, reusing the
+    /// previous build's visible rows instead of re-filtering every resident row.
+    ///
+    /// Per shard, the captured segments are the previous build's minus a
+    /// dropped prefix (a checkpoint's `retain_after`), followed by appended
+    /// segments. A tombstone hides only rows at or below its delete sequence, and
+    /// every appended segment's tombstones carry a sequence above the data
+    /// sequence of every segment before it, while a dropped segment's tombstones
+    /// only ever hid rows older than itself. So a carried segment's visible rows
+    /// are its previous visible rows minus those whose key an appended segment's
+    /// tombstones name; appended segments, and any segment whose batches
+    /// `retain_rows` replaced, are filtered in full. A file-side tombstone hides a
+    /// mem-tier row only at a delete sequence at or above the row's data
+    /// sequence, so carried rows stay valid across a changed file-side index only
+    /// when neither index holds a sequence that high; otherwise every segment is
+    /// filtered in full.
+    fn visible_mem_tier_segments_for_build(
+        &self,
+        shards: &[Arc<crate::provider::mem_tier::MemTier>],
+    ) -> datafusion_common::Result<Arc<[VisibleMemTierSegment]>> {
+        let visible = match (self.live_file_deletion_index(), self.primary_key_indices()) {
+            (Some(file), Ok(Some(pk_indices))) => {
+                self.visible_mem_tier_segments_incremental(shards, file, &pk_indices)
+            }
+            _ => return self.visible_mem_tier_segments(shards),
+        };
+        Ok(Arc::from(visible.map_err(|e| {
+            datafusion_common::DataFusionError::Execution(format!(
+                "Failed to apply in-memory CDC tier deletion visibility for table {}: {e}",
+                self.table_metadata.table_name
+            ))
+        })?))
+    }
+
+    fn visible_mem_tier_segments_incremental(
+        &self,
+        shards: &[Arc<crate::provider::mem_tier::MemTier>],
+        file: FileDeletionIndex,
+        pk_indices: &[usize],
+    ) -> Result<Vec<VisibleMemTierSegment>> {
+        let previous = self
+            .scan_view_cache
+            .visible_segments
+            .lock()
+            .clone()
+            .filter(|previous| previous.shards.len() == shards.len());
+        // Per shard: where its carried segments start in the previous build's
+        // list, and how many of the captured segments are carried.
+        let mut plans: Vec<(usize, usize)> = shards
+            .iter()
+            .enumerate()
+            .map(|(i, shard)| {
+                previous.as_ref().map_or((0, 0), |previous| {
+                    carried_segments(&previous.shards[i], &shard.segments)
+                })
+            })
+            .collect();
+        let oldest_carried = shards
+            .iter()
+            .zip(&plans)
+            .filter(|(_, (_, carried))| *carried > 0)
+            .filter_map(|(shard, _)| shard.segments.first().map(|s| s.data_sequence))
+            .min();
+        if let (Some(previous), Some(oldest_carried)) = (&previous, oldest_carried) {
+            let reusable = previous.file.same(&file)
+                || [&previous.file, &file].into_iter().all(|index| {
+                    index
+                        .max_sequence_number()
+                        .is_none_or(|max| max < oldest_carried)
+                });
+            if !reusable {
+                plans.iter_mut().for_each(|plan| *plan = (0, 0));
+            }
+        }
+        // Hiding a carried row by key alone requires every appended tombstone
+        // to sit at or above every carried row's data sequence. Appends within a
+        // shard follow sequence order, so this holds; a shard where it does not
+        // is filtered in full rather than trusted.
+        for (shard, plan) in shards.iter().zip(plans.iter_mut()) {
+            let carried = plan.1;
+            if carried == 0 {
+                continue;
+            }
+            let newest_carried = shard.segments[carried - 1].data_sequence;
+            let ordered = shard.segments[carried..].iter().all(|segment| {
+                let tombstones = &segment.tombstones;
+                (tombstones.is_int64_empty() && tombstones.is_row_keys_empty())
+                    || tombstones.delete_sequence() >= newest_carried
+            });
+            if !ordered {
+                *plan = (0, 0);
+            }
+        }
+
+        let digest_keys = matches!(file, FileDeletionIndex::RowKeys(_));
+        let mut visible = Vec::new();
+        let mut cache_shards = Vec::with_capacity(shards.len());
+        for (i, shard) in shards.iter().enumerate() {
+            let (start, carried) = plans[i];
+            let segments = shard.segments.as_slice();
+            let aggregate = Self::mem_tier_deletion_maps(shard);
+            let hidden = (carried > 0).then(|| AppendedKeys::of(&segments[carried..], digest_keys));
+            let mut cached_segments = Vec::with_capacity(segments.len());
+            for (j, segment) in segments.iter().enumerate() {
+                let carried_segment = previous
+                    .as_ref()
+                    .filter(|_| j < carried)
+                    .map(|previous| &previous.shards[i][start + j])
+                    .filter(|cached| Arc::ptr_eq(&cached.source, &segment.batches));
+                let cached = match (carried_segment, &hidden) {
+                    (Some(cached), Some(hidden)) => {
+                        #[cfg(test)]
+                        self.scan_view_cache.carried_segments.fetch_add(1, Ordering::Relaxed);
+                        self.hide_appended_keys(cached, hidden, pk_indices)?
+                    }
+                    _ => self.filter_segment_for_build(segment, &aggregate, digest_keys, pk_indices)?,
+                };
+                if !cached.batches.is_empty() {
+                    visible.push(VisibleMemTierSegment {
+                        statistics: Arc::clone(&segment.statistics),
+                        batches: cached.batches.clone(),
+                    });
+                }
+                cached_segments.push(cached);
+            }
+            cache_shards.push(cached_segments);
+        }
+        *self.scan_view_cache.visible_segments.lock() = Some(Arc::new(VisibleSegmentsCache {
+            file,
+            shards: cache_shards,
+        }));
+        Ok(visible)
+    }
+
+    /// Filter one segment in full against its shard's tombstones, recording each
+    /// visible row's key digest when the strategy keys on encoded rows.
+    fn filter_segment_for_build(
+        &self,
+        segment: &crate::provider::mem_tier::MemSegment,
+        aggregate: &InlinedDeletionMaps,
+        digest_keys: bool,
+        pk_indices: &[usize],
+    ) -> Result<CachedVisibleSegment> {
+        let mut batches = Vec::with_capacity(segment.batches.len());
+        let mut digests = Vec::new();
+        for batch in segment.batches.iter() {
+            if let Some(visible) = self.filter_inlined_batch_for_deletions(
+                batch.clone(),
+                segment.data_sequence,
+                aggregate,
+            )? {
+                if digest_keys {
+                    digests.push(self.row_key_digests(&visible, pk_indices)?);
+                }
+                batches.push(visible);
+            }
+        }
+        Ok(CachedVisibleSegment {
+            data_sequence: segment.data_sequence,
+            source: Arc::clone(&segment.batches),
+            batches,
+            digests,
+        })
+    }
+
+    /// [`hash_index::hash_key_128`] of each row's encoded primary key — the
+    /// same encoding the row-key tombstones and the deletion index use.
+    fn row_key_digests(&self, batch: &RecordBatch, pk_indices: &[usize]) -> Result<Arc<[u128]>> {
+        let converter = self.build_pk_converter(pk_indices)?;
+        let pk_columns: Vec<ArrayRef> = pk_indices
+            .iter()
+            .map(|idx| Arc::clone(batch.column(*idx)))
+            .collect();
+        let rows = converter.convert_columns(&pk_columns)?;
+        Ok(rows
+            .iter()
+            .map(|row| hash_index::hash_key_128(row.data()))
+            .collect())
+    }
+
+    /// A carried segment's visible rows minus those whose key `hidden` names.
+    /// Batches with no hidden row are reused as they are.
+    fn hide_appended_keys(
+        &self,
+        cached: &CachedVisibleSegment,
+        hidden: &AppendedKeys,
+        pk_indices: &[usize],
+    ) -> Result<CachedVisibleSegment> {
+        let mut batches = Vec::with_capacity(cached.batches.len());
+        let mut digests = Vec::with_capacity(cached.digests.len());
+        for (position, batch) in cached.batches.iter().enumerate() {
+            let keep: Option<Vec<bool>> = match hidden {
+                AppendedKeys::Int64(keys) if !keys.is_empty() => {
+                    let pk_index = *pk_indices.first().ok_or_else(|| Error::Internal {
+                        table: self.table_metadata.table_name.clone(),
+                        message: "Int64 PK strategy requires a primary key column".to_string(),
+                    })?;
+                    let pks = batch
+                        .column(pk_index)
+                        .as_any()
+                        .downcast_ref::<Int64Array>()
+                        .ok_or_else(|| Error::Internal {
+                            table: self.table_metadata.table_name.clone(),
+                            message: "Expected an Int64 primary key column".to_string(),
+                        })?;
+                    pks.values()
+                        .iter()
+                        .any(|pk| keys.contains(pk))
+                        .then(|| pks.values().iter().map(|pk| !keys.contains(pk)).collect())
+                }
+                AppendedKeys::Digests(keys) if !keys.is_empty() => {
+                    let row_digests = cached.digests.get(position).ok_or_else(|| Error::Internal {
+                        table: self.table_metadata.table_name.clone(),
+                        message: "Cached mem-tier batch has no key digests".to_string(),
+                    })?;
+                    row_digests
+                        .iter()
+                        .any(|digest| keys.contains(digest))
+                        .then(|| row_digests.iter().map(|digest| !keys.contains(digest)).collect())
+                }
+                _ => None,
+            };
+            match keep {
+                None => {
+                    batches.push(batch.clone());
+                    if let Some(row_digests) = cached.digests.get(position) {
+                        digests.push(Arc::clone(row_digests));
+                    }
+                }
+                Some(keep) if keep.iter().any(|kept| *kept) => {
+                    if let Some(row_digests) = cached.digests.get(position) {
+                        digests.push(
+                            row_digests
+                                .iter()
+                                .zip(&keep)
+                                .filter_map(|(digest, kept)| kept.then_some(*digest))
+                                .collect(),
+                        );
+                    }
+                    batches.push(arrow::compute::filter_record_batch(
+                        batch,
+                        &BooleanArray::from(keep),
+                    )?);
+                }
+                Some(_) => {}
+            }
+        }
+        Ok(CachedVisibleSegment {
+            data_sequence: cached.data_sequence,
+            source: Arc::clone(&cached.source),
+            batches,
+            digests,
+        })
     }
 
     /// Shared tail of the mem-tier scan plan: apply the effective projection and
@@ -67127,6 +67648,249 @@ mod tests {
             vec![(1, 12), (2, 20), (3, 30)],
             "queued query must capture the committed checkpoint and latest CDC upsert"
         );
+    }
+
+    /// SplitMix64, so a differential case reproduces from its printed seed.
+    struct SplitMix64(u64);
+
+    impl SplitMix64 {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+
+        fn below(&mut self, bound: u64) -> i64 {
+            i64::try_from(self.next() % bound).expect("bound fits i64")
+        }
+    }
+
+    /// Every scan-view build carries the previous build's merged deletions and
+    /// visible mem-tier rows forward. After each CDC upsert, delete and
+    /// checkpoint of a seeded history, the carried result must equal a build
+    /// from scratch — the same visible rows, and the same delete sequence for
+    /// every key ever written — and SQL must return exactly the modeled rows.
+    /// Runs for an `Int64` key and a composite key, and requires that builds
+    /// actually carried segments and extended a merge, so the fallback alone
+    /// cannot pass it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn incremental_scan_view_build_matches_full_build() {
+        for composite in [false, true] {
+            for seed in [0x5EED_0001_u64, 0x5EED_0002, 0x5EED_0003] {
+                incremental_scan_view_case(composite, seed).await;
+            }
+        }
+    }
+
+    async fn incremental_scan_view_case(composite: bool, seed: u64) {
+        let case = format!("{} key, seed {seed:#x}", if composite { "composite" } else { "Int64" });
+        let ctx = SessionContext::new();
+        let key_names: Vec<&str> = if composite { vec!["a", "b"] } else { vec!["a"] };
+        let mut fields: Vec<Field> = key_names
+            .iter()
+            .map(|name| Field::new(*name, DataType::Int64, false))
+            .collect();
+        let key_schema = Arc::new(Schema::new(fields.clone()));
+        fields.push(Field::new("value", DataType::Int64, false));
+        let schema = Arc::new(Schema::new(fields));
+        let key_columns: Vec<String> = key_names.iter().map(ToString::to_string).collect();
+        let (provider, _catalog, _tmp) = create_cdc_table_with_schema(
+            &format!("incremental_scan_view_{}_{seed:x}", key_names.len()),
+            ctx.runtime_env(),
+            Arc::clone(&schema),
+            key_columns.clone(),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                compaction_background_interval_ms: 0,
+                ..VortexConfig::default()
+            },
+            OnConflict::Upsert(
+                datafusion_table_providers::util::column_reference::ColumnReference::new(
+                    key_columns,
+                ),
+            ),
+        )
+        .await;
+        let provider = Arc::new(provider);
+        provider.init_scan_view_cache();
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+        ctx.register_table("t", Arc::clone(&provider) as Arc<dyn TableProvider>)
+            .expect("register real provider");
+
+        let columns = |keys: &[(i64, i64)], values: Option<&[i64]>| -> Vec<ArrayRef> {
+            let mut columns: Vec<ArrayRef> =
+                vec![Arc::new(Int64Array::from_iter_values(keys.iter().map(|k| k.0)))];
+            if composite {
+                columns.push(Arc::new(Int64Array::from_iter_values(keys.iter().map(|k| k.1))));
+            }
+            if let Some(values) = values {
+                columns.push(Arc::new(Int64Array::from(values.to_vec())));
+            }
+            columns
+        };
+        let mut rng = SplitMix64(seed);
+        let mut model: BTreeMap<(i64, i64), i64> = BTreeMap::new();
+        let mut written: std::collections::BTreeSet<(i64, i64)> = std::collections::BTreeSet::new();
+        for step in 0..48 {
+            let mut keys: std::collections::BTreeSet<(i64, i64)> = std::collections::BTreeSet::new();
+            for _ in 0..=rng.below(12) {
+                keys.insert(if composite {
+                    (rng.below(4), rng.below(12))
+                } else {
+                    (rng.below(40), 0)
+                });
+            }
+            let keys: Vec<(i64, i64)> = keys.into_iter().collect();
+            match rng.below(10) {
+                0..=5 => {
+                    let values: Vec<i64> = keys.iter().map(|_| rng.below(1_000_000)).collect();
+                    let batch = RecordBatch::try_new(
+                        Arc::clone(&schema),
+                        columns(&keys, Some(&values)),
+                    )
+                    .expect("upsert batch");
+                    provider
+                        .write_cdc_append_stream(single_batch_stream(batch), &ctx.task_ctx())
+                        .await
+                        .expect("CDC upsert")
+                        .finish()
+                        .await
+                        .expect("CDC upsert published");
+                    for (key, value) in keys.iter().zip(values) {
+                        model.insert(*key, value);
+                        written.insert(*key);
+                    }
+                }
+                6 | 7 => {
+                    let batch = RecordBatch::try_new(Arc::clone(&key_schema), columns(&keys, None))
+                        .expect("delete batch");
+                    provider
+                        .write_cdc_delete_keys_in_memory(&batch)
+                        .await
+                        .expect("CDC delete")
+                        .expect("the delete is absorbed in memory");
+                    for key in &keys {
+                        model.remove(key);
+                    }
+                }
+                8 => {
+                    provider.checkpoint_mem_tier().await.expect("checkpoint");
+                }
+                _ => {}
+            }
+
+            // The carried build against a from-scratch build of the same capture.
+            let raw = provider.capture_raw_scan_input().await.expect("capture");
+            let carried = provider
+                .visible_mem_tier_segments_for_build(&raw.mem_tier_shards)
+                .expect("carried visibility");
+            let full = provider
+                .visible_mem_tier_segments(&raw.mem_tier_shards)
+                .expect("full visibility");
+            let rows = |segments: &[VisibleMemTierSegment]| -> Vec<Vec<i64>> {
+                let mut rows: Vec<Vec<i64>> = segments
+                    .iter()
+                    .flat_map(|segment| segment.batches.iter())
+                    .flat_map(|batch| {
+                        (0..batch.num_rows()).map(move |row| {
+                            batch
+                                .columns()
+                                .iter()
+                                .map(|column| {
+                                    column
+                                        .as_any()
+                                        .downcast_ref::<Int64Array>()
+                                        .expect("Int64 column")
+                                        .value(row)
+                                })
+                                .collect()
+                        })
+                    })
+                    .collect();
+                rows.sort_unstable();
+                rows
+            };
+            assert_eq!(
+                rows(&carried[..]),
+                rows(&full[..]),
+                "{case}, step {step}: visible mem-tier rows"
+            );
+
+            let merged = provider.merged_deletions_for_build(&raw.deletion_snapshot, &raw.mem_tier_shards);
+            let rebuilt = CayenneTableProvider::merged_deletion_snapshot_sharded(
+                raw.deletion_snapshot.clone(),
+                &raw.mem_tier_shards,
+            );
+            let pk_indices: Vec<usize> = (0..key_names.len()).collect();
+            let converter = provider.build_pk_converter(&pk_indices).expect("key converter");
+            for key in &written {
+                let delete_sequence = |snapshot: &PkDeletionSnapshot| match snapshot {
+                    PkDeletionSnapshot::Int64Pk { tombstones } => {
+                        tombstones.get(key.0).map(|t| t.delete_sequence)
+                    }
+                    PkDeletionSnapshot::RowConverterBased { tombstones } => {
+                        let encoded = converter
+                            .convert_columns(&columns(&[*key], None))
+                            .expect("encode key");
+                        tombstones.get(encoded.row(0).data()).map(|t| t.delete_sequence)
+                    }
+                    PkDeletionSnapshot::PositionBased => None,
+                };
+                assert_eq!(
+                    delete_sequence(&merged),
+                    delete_sequence(&rebuilt),
+                    "{case}, step {step}: merged delete sequence for key {key:?}"
+                );
+            }
+
+            // And end to end through the scan path the queries use.
+            let order = if composite { "a, b" } else { "a" };
+            let batches = ctx
+                .sql(&format!("SELECT * FROM t ORDER BY {order}"))
+                .await
+                .expect("plan")
+                .collect()
+                .await
+                .expect("scan");
+            let expected: Vec<Vec<i64>> = model
+                .iter()
+                .map(|(key, value)| {
+                    let mut row = vec![key.0];
+                    if composite {
+                        row.push(key.1);
+                    }
+                    row.push(*value);
+                    row
+                })
+                .collect();
+            let actual: Vec<Vec<i64>> = batches
+                .iter()
+                .flat_map(|batch| {
+                    (0..batch.num_rows()).map(move |row| {
+                        batch
+                            .columns()
+                            .iter()
+                            .map(|column| {
+                                column
+                                    .as_any()
+                                    .downcast_ref::<Int64Array>()
+                                    .expect("Int64 column")
+                                    .value(row)
+                            })
+                            .collect()
+                    })
+                })
+                .collect();
+            assert_eq!(actual, expected, "{case}, step {step}: SQL rows");
+        }
+        let carried = provider.scan_view_cache.carried_segments.load(Ordering::Relaxed);
+        let extended = provider.scan_view_cache.extended_merges.load(Ordering::Relaxed);
+        assert!(carried > 0, "{case}: no build carried a segment forward");
+        assert!(extended > 0, "{case}: no build extended a previous merge");
     }
 
     /// [`ScanViewReuse::UntilInvalidated`] — the full/append path. A scan through

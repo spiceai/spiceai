@@ -263,15 +263,22 @@ impl SegmentTombstones {
     }
 
     /// The deleted `Int64Pk` keys in this segment (empty for the row-key strategy).
-    /// Test-only since the merged-scan-deletions lockstep that consumed it in
-    /// production was retired when the per-scan merge memos gave way to the
-    /// demand-driven scan-view cache.
-    #[cfg_attr(
-        not(test),
-        expect(dead_code, reason = "used only by mem-tier tombstone tests")
-    )]
+    /// A scan-view build hides exactly these keys in the segments it reuses from
+    /// its previous build.
     pub(crate) fn int64_keys(&self) -> impl Iterator<Item = i64> + '_ {
         self.int64_pk.keys().copied()
+    }
+
+    /// The deleted row keys in this segment, in the encoding the visibility
+    /// filter compares (empty for the `Int64Pk` strategy).
+    pub(crate) fn row_keys(&self) -> impl Iterator<Item = &[u8]> + '_ {
+        self.row_keys.keys().map(AsRef::as_ref)
+    }
+
+    /// The delete sequence stamped on every key of this segment. Meaningful only
+    /// when the segment carries keys (an empty set is never stamped).
+    pub(crate) fn delete_sequence(&self) -> i64 {
+        self.delete_sequence
     }
 
     /// Whether this segment carries no `Int64Pk` tombstone keys.
