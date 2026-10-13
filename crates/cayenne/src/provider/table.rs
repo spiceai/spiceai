@@ -28920,11 +28920,9 @@ impl CayenneTableProvider {
                 PkDeletionStrategyWithCache::PositionBased { .. } => return Ok(()),
             };
             match outcome {
-                OffFencePrune::Published => {
-                    self.refresh_deletion_memory_accounting();
-                    return Ok(());
-                }
-                OffFencePrune::NothingToPrune | OffFencePrune::OutputNotLive => return Ok(()),
+                OffFencePrune::Published
+                | OffFencePrune::NothingToPrune
+                | OffFencePrune::OutputNotLive => return Ok(()),
                 OffFencePrune::LostRace => {}
             }
         }
@@ -28961,11 +28959,14 @@ impl CayenneTableProvider {
             return Ok(OffFencePrune::OutputNotLive);
         }
         let previous = cell.compare_and_swap(&current, Arc::new(pruned));
-        Ok(if Arc::ptr_eq(&previous, &current) {
-            OffFencePrune::Published
-        } else {
-            OffFencePrune::LostRace
-        })
+        if !Arc::ptr_eq(&previous, &current) {
+            return Ok(OffFencePrune::LostRace);
+        }
+        // Still under the fence: refreshed after it, this smaller figure could
+        // overwrite the larger one a fenced writer (checkpoint, inline or staged
+        // publish) accounted for an index it grew in between.
+        self.refresh_deletion_memory_accounting();
+        Ok(OffFencePrune::Published)
     }
 
     /// Whether a seq-prefix bake's swap is still what scans see: the table keeps
