@@ -20,6 +20,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from check_module_reachability import (  # noqa: E402
     blank_source,
+    package_sources,
     parse_mods,
     resolve_child,
     walk_from_root,
@@ -283,6 +284,107 @@ with tempfile.TemporaryDirectory() as d:
             "platform/unix/unix_leaf.rs",
             "platform/windows.rs",
         ],
+    )
+
+print()
+print("package_sources (tests/, benches/, examples/)")
+
+
+def fake_package(crate: Path, *src_paths: str) -> dict:
+    """A `cargo metadata` package whose targets are exactly `src_paths`."""
+    (crate / "Cargo.toml").write_text("", encoding="utf-8")
+    return {
+        "name": "fake",
+        "manifest_path": str(crate / "Cargo.toml"),
+        "targets": [{"src_path": str(crate / p)} for p in src_paths],
+    }
+
+
+def write_tree(crate: Path, files: dict[str, str]) -> None:
+    for rel, text in files.items():
+        path = crate / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text, encoding="utf-8")
+
+
+def unreached(crate: Path, package: dict) -> list[str]:
+    return [p.relative_to(crate).as_posix() for p, ok in package_sources(package) if not ok]
+
+
+# The shape every crate with an integration binary has: `autotests = false`, one
+# declared `tests/integration.rs` root, and one module per test file. A crate
+# root owns its own directory whatever it is named, so `mod common;` in
+# `tests/integration.rs` is `tests/common/mod.rs`. Resolving it under
+# `tests/integration/` instead reports every test file in the crate as dead.
+with tempfile.TemporaryDirectory() as d:
+    crate = Path(d).resolve()
+    write_tree(crate, {
+        "src/lib.rs": "",
+        "tests/integration.rs": "mod common;\nmod alpha;\nmod suite;\n",
+        "tests/common/mod.rs": "",
+        "tests/alpha.rs": "",
+        "tests/suite/mod.rs": "mod case_a;\n",
+        "tests/suite/case_a.rs": "",
+    })
+    check(
+        "a test target root owns its directory, so its modules are reached",
+        unreached(crate, fake_package(crate, "src/lib.rs", "tests/integration.rs")),
+        [],
+    )
+
+# What the per-crate check missed (#15005 review): with `autotests = false` a
+# new top-level file is not a target, and a file inside a test module's
+# directory is never one. Neither is compiled unless a `mod` reaches it.
+with tempfile.TemporaryDirectory() as d:
+    crate = Path(d).resolve()
+    write_tree(crate, {
+        "src/lib.rs": "",
+        "tests/integration.rs": "mod suite;\n",
+        "tests/suite/mod.rs": "mod case_a;\n",
+        "tests/suite/case_a.rs": "",
+        "tests/suite/case_b.rs": "#[test]\nfn never_runs() {}\n",
+        "tests/undeclared.rs": "#[test]\nfn never_runs() {}\n",
+        "benches/utils/mod.rs": "",
+        "examples/demo.rs": "",
+        "fixtures/not_source.rs": "",
+    })
+    check(
+        "an undeclared top-level test, a nested test, a bench helper and an example are reported",
+        unreached(crate, fake_package(crate, "src/lib.rs", "tests/integration.rs")),
+        ["benches/utils/mod.rs", "examples/demo.rs", "tests/suite/case_b.rs", "tests/undeclared.rs"],
+    )
+
+# Auto-discovered targets are in cargo's target list too, so a crate that keeps
+# one binary per test file reports nothing.
+with tempfile.TemporaryDirectory() as d:
+    crate = Path(d).resolve()
+    write_tree(crate, {
+        "src/lib.rs": "",
+        "tests/one.rs": "mod common;\n",
+        "tests/two.rs": "",
+        "tests/common/mod.rs": "",
+        "benches/speed.rs": "",
+        "examples/demo.rs": "",
+    })
+    check(
+        "auto-discovered tests, benches and examples are reached from their own roots",
+        unreached(crate, fake_package(
+            crate, "src/lib.rs", "tests/one.rs", "tests/two.rs", "benches/speed.rs", "examples/demo.rs",
+        )),
+        [],
+    )
+
+# `src/bin/tool.rs` is a crate root too: its `mod helper;` is `src/bin/helper.rs`.
+with tempfile.TemporaryDirectory() as d:
+    crate = Path(d).resolve()
+    write_tree(crate, {
+        "src/bin/tool.rs": "mod helper;\n",
+        "src/bin/helper.rs": "",
+    })
+    check(
+        "a binary root's modules resolve beside it",
+        unreached(crate, fake_package(crate, "src/bin/tool.rs")),
+        [],
     )
 
 print()
