@@ -1229,15 +1229,52 @@ fn rejects_stored_table(error: &(dyn std::error::Error + 'static)) -> bool {
     })
 }
 
-/// The warning an operator reads when a dataset's acceleration was rebuilt at a new data
-/// location, and the files of the previous one, in an object store, are left in place.
-fn previous_location_left_in_place_warning(
+/// The object-store prefixes holding a stored table's files: the table's own, and each
+/// of its partitions' child tables', which write under `{path}/{table_id}/`. Read before
+/// the table is dropped, while the catalog still has the child tables.
+async fn object_store_table_prefixes(
+    catalog: &dyn cayenne::MetadataCatalog,
     table_name: &str,
-    data_dir: &str,
-    previous_dir: &str,
-) -> String {
+    table: &cayenne::metadata::TableMetadata,
+) -> Vec<String> {
+    let prefix = |path: &str, table_id: &str| format!("{}/{table_id}/", path.trim_end_matches('/'));
+    let mut prefixes = vec![prefix(&table.path, &table.table_id)];
+    for partition in catalog
+        .get_partitions(&table.table_id)
+        .await
+        .unwrap_or_default()
+    {
+        for child_name in [
+            cayenne::partition_naming::partition_child_table_name(
+                table_name,
+                &partition.composite_key(),
+            ),
+            cayenne::partition_naming::legacy_partition_child_table_name(
+                table_name,
+                &partition.partition_values,
+            ),
+        ] {
+            if let Ok(child) = catalog.get_table(&child_name).await
+                && child.path == partition.path
+            {
+                prefixes.push(prefix(&child.path, &child.table_id));
+                break;
+            }
+        }
+    }
+    prefixes
+}
+
+/// The warning an operator reads when a dataset's acceleration was recreated, and the
+/// files of the previous one, in an object store, are left in place under `prefixes`.
+fn previous_acceleration_left_in_place_warning(table_name: &str, prefixes: &[String]) -> String {
     format!(
-        "Dataset '{table_name}' moved its acceleration to '{data_dir}', and the files of its previous acceleration at '{previous_dir}' were not removed, so they keep using storage. Delete them to reclaim it."
+        "Dataset '{table_name}' recreated its acceleration, and the files of the previous one were not removed from the object store, so they keep using storage. Delete the objects under {} to reclaim it.",
+        prefixes
+            .iter()
+            .map(|prefix| format!("'{prefix}'"))
+            .collect::<Vec<_>>()
+            .join(", ")
     )
 }
 
@@ -4554,9 +4591,9 @@ impl DataAccelerator for CayenneAccelerator {
         // changed data location — that is the stored location, never the
         // configured one: removing the configured directory would orphan the
         // table's files and delete whatever the new location already holds. A
-        // stored object-store location is not removed here, since this teardown
-        // deletes local directories only, so its files are left where they are
-        // and the log says so.
+        // table stored in an object store keeps its files, wherever the dataset
+        // now puts its data, since this teardown deletes local directories only;
+        // the log names the prefixes they are under.
         let mut removed_dir = Some(dir_path.clone());
         let mut left_in_place = None;
         if let Some(acceleration) = source.acceleration() {
@@ -4568,22 +4605,16 @@ impl DataAccelerator for CayenneAccelerator {
             let catalog = self
                 .get_or_create_catalog(&metadata_dir, metastore_type)
                 .await?;
-            if let Some(stored_dir) = catalog
-                .get_table(table_name)
-                .await
-                .ok()
-                .map(|table| table.path)
-                .filter(|stored_dir| {
-                    stored_dir.trim_end_matches('/') != dir_path.trim_end_matches('/')
-                })
-            {
-                if stored_dir.starts_with("s3://") {
+            if let Ok(stored) = catalog.get_table(table_name).await {
+                if stored.path.starts_with("s3://") {
                     removed_dir = None;
-                    left_in_place = Some(stored_dir);
-                } else {
-                    Self::ensure_metastore_outside_data_dir(source, &stored_dir).await?;
-                    Self::ensure_no_catalog_under_data_dir(source, &stored_dir).await?;
-                    removed_dir = Some(stored_dir);
+                    left_in_place = Some(
+                        object_store_table_prefixes(catalog.as_ref(), table_name, &stored).await,
+                    );
+                } else if stored.path.trim_end_matches('/') != dir_path.trim_end_matches('/') {
+                    Self::ensure_metastore_outside_data_dir(source, &stored.path).await?;
+                    Self::ensure_no_catalog_under_data_dir(source, &stored.path).await?;
+                    removed_dir = Some(stored.path);
                 }
             }
             catalog.drop_table(table_name).await.boxed()?;
@@ -4597,10 +4628,10 @@ impl DataAccelerator for CayenneAccelerator {
                 "Removed the Cayenne data directory '{removed_dir}' of dataset '{table_name}' to recreate its acceleration"
             );
         }
-        if let Some(stored_dir) = left_in_place {
+        if let Some(prefixes) = left_in_place {
             tracing::warn!(
                 "{}",
-                previous_location_left_in_place_warning(table_name, &dir_path, &stored_dir)
+                previous_acceleration_left_in_place_warning(table_name, &prefixes)
             );
         }
 
@@ -6721,6 +6752,38 @@ mod tests {
             })
             .await
             .expect("create the stored table");
+        // With one partition, a child table of its own under the partition's directory.
+        let parent_id = catalog
+            .get_table("orders")
+            .await
+            .expect("the stored table")
+            .table_id;
+        let partition = cayenne::metadata::PartitionMetadata::new_single(
+            parent_id,
+            "expr0".to_string(),
+            "v1".to_string(),
+            "s3://old-bucket--usw2-az1--x-s3/orders/expr0=v1/".to_string(),
+            false,
+        );
+        catalog
+            .create_table(CreateTableOptions {
+                table_name: cayenne::partition_naming::partition_child_table_name(
+                    "orders",
+                    &partition.composite_key(),
+                ),
+                schema: Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+                primary_key: vec![],
+                on_conflict: None,
+                base_path: partition.path.clone(),
+                partition_column: None,
+                vortex_config: cayenne::metadata::VortexConfig::default(),
+            })
+            .await
+            .expect("create the partition's child table");
+        catalog
+            .add_partition(partition)
+            .await
+            .expect("record the partition");
         drop(catalog);
 
         // The dataset now puts its data under `new/`, which already holds a file.
@@ -6745,6 +6808,38 @@ mod tests {
             .collect(),
             ..Default::default()
         });
+
+        let stored_catalog = CayenneCatalog::new(format!(
+            "sqlite://{}",
+            metadata_dir.join("cayenne.db").display()
+        ))
+        .expect("catalog");
+        stored_catalog.init().await.expect("init catalog");
+        let stored = stored_catalog
+            .get_table("orders")
+            .await
+            .expect("the stored table");
+        let child = stored_catalog
+            .get_table(&cayenne::partition_naming::partition_child_table_name(
+                "orders", "v1:2:v1",
+            ))
+            .await
+            .expect("the partition's child table");
+        assert_eq!(
+            object_store_table_prefixes(&stored_catalog, "orders", &stored).await,
+            vec![
+                format!(
+                    "s3://old-bucket--usw2-az1--x-s3/orders/{}/",
+                    stored.table_id
+                ),
+                format!(
+                    "s3://old-bucket--usw2-az1--x-s3/orders/expr0=v1/{}/",
+                    child.table_id
+                ),
+            ],
+            "the warning names the stored table's prefix and its partition's"
+        );
+        drop(stored_catalog);
 
         CayenneAccelerator::new()
             .drop_table("orders", &dataset)
@@ -6771,14 +6866,16 @@ mod tests {
     }
 
     #[test]
-    fn previous_location_warning_names_the_dataset_both_locations_and_the_fix() {
+    fn previous_acceleration_warning_names_the_dataset_every_prefix_and_the_fix() {
         assert_eq!(
-            previous_location_left_in_place_warning(
+            previous_acceleration_left_in_place_warning(
                 "orders",
-                "/var/spice/data/orders",
-                "s3://old-bucket--usw2-az1--x-s3/orders/"
+                &[
+                    "s3://old-bucket--usw2-az1--x-s3/orders/0190a1/".to_string(),
+                    "s3://old-bucket--usw2-az1--x-s3/orders/expr0=v1.i64.v1/0190a2/".to_string(),
+                ]
             ),
-            "Dataset 'orders' moved its acceleration to '/var/spice/data/orders', and the files of its previous acceleration at 's3://old-bucket--usw2-az1--x-s3/orders/' were not removed, so they keep using storage. Delete them to reclaim it."
+            "Dataset 'orders' recreated its acceleration, and the files of the previous one were not removed from the object store, so they keep using storage. Delete the objects under 's3://old-bucket--usw2-az1--x-s3/orders/0190a1/', 's3://old-bucket--usw2-az1--x-s3/orders/expr0=v1.i64.v1/0190a2/' to reclaim it."
         );
     }
 

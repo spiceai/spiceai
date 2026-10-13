@@ -91,7 +91,7 @@ pub fn is_clusterable_type(data_type: &arrow_schema::DataType) -> bool {
 pub mod optimizer_rules;
 #[cfg(feature = "partition-table-provider")]
 pub(crate) mod partition_creator;
-pub(crate) mod partition_naming;
+pub mod partition_naming;
 pub mod provider;
 pub(crate) mod resource_starvation;
 /// Probe and build accounting for a table's secondary indexes (the
