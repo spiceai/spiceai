@@ -2124,7 +2124,9 @@ mod tests {
                         .leaves
                         .iter()
                         .all(|leaf| prefix.source_leaves.contains(leaf))
-                    && !prefix_time_runs.iter().any(|source| Arc::ptr_eq(source, run))
+                    && !prefix_time_runs
+                        .iter()
+                        .any(|source| Arc::ptr_eq(source, run))
             }) {
                 internal_trials += 1;
             }

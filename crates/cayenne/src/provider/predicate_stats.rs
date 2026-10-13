@@ -240,10 +240,7 @@ fn pins_of(expr: &Expr) -> HashMap<String, Pin> {
 }
 
 /// Both sides hold: each column keeps the narrower of its two pins.
-fn and_pins(
-    mut left: HashMap<String, Pin>,
-    right: HashMap<String, Pin>,
-) -> HashMap<String, Pin> {
+fn and_pins(mut left: HashMap<String, Pin>, right: HashMap<String, Pin>) -> HashMap<String, Pin> {
     for (column, pin) in right {
         let narrower = match left.remove(&column) {
             None => pin,
@@ -259,10 +256,7 @@ fn and_pins(
 }
 
 /// Either side holds: only columns both sides pin stay pinned, to the union.
-fn or_pins(
-    left: HashMap<String, Pin>,
-    mut right: HashMap<String, Pin>,
-) -> HashMap<String, Pin> {
+fn or_pins(left: HashMap<String, Pin>, mut right: HashMap<String, Pin>) -> HashMap<String, Pin> {
     let mut union = HashMap::new();
     for (column, pin) in left {
         let Some(other) = right.remove(&column) else {
@@ -386,8 +380,16 @@ mod tests {
             0,
             "fifteen values, and then ten, are too many"
         );
-        assert_eq!(observations.pinned_hits("region"), 1, "a two-value list pins");
-        assert_eq!(observations.pinned_hits("ts"), 1, "a literal bound pins a range");
+        assert_eq!(
+            observations.pinned_hits("region"),
+            1,
+            "a two-value list pins"
+        );
+        assert_eq!(
+            observations.pinned_hits("ts"),
+            1,
+            "a literal bound pins a range"
+        );
         assert_eq!(
             (
                 observations.hits("pk"),
