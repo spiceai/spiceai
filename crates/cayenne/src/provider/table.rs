@@ -1790,6 +1790,9 @@ type TestPostCaptureHook = Box<dyn FnOnce() -> futures::future::BoxFuture<'stati
 #[cfg(test)]
 type TestCheckpointUnionHook = Box<dyn FnOnce() + Send>;
 
+#[cfg(test)]
+type TestScanViewBuildHook = Box<dyn FnOnce() + Send>;
+
 /// Cayenne table provider that reads from Vortex virtual files.
 ///
 /// This provider manages a table composed of multiple "virtual files", where each file
@@ -2068,6 +2071,12 @@ pub struct CayenneTableProvider {
     /// fire.
     #[cfg(test)]
     test_checkpoint_union_hook: Arc<ParkingMutex<Option<TestCheckpointUnionHook>>>,
+    /// One-shot pause inside the blocking scan-view build.
+    #[cfg(test)]
+    test_scan_view_build_hook: Arc<ParkingMutex<Option<TestScanViewBuildHook>>>,
+    /// One-shot signal before a scan waits for build admission.
+    #[cfg(test)]
+    test_pre_scan_view_admission_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
     /// Test-only seam fired after a full current-snapshot rewrite finishes its
     /// off-fence re-encode and before it takes the listing fence to commit, so a
     /// test can publish a protected snapshot the rewrite's scan never folded.
@@ -9621,6 +9630,10 @@ impl CayenneTableProvider {
             #[cfg(test)]
             test_checkpoint_union_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
+            test_scan_view_build_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
+            test_pre_scan_view_admission_hook: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
             test_pre_rewrite_commit_hook: Arc::new(ParkingMutex::new(None)),
             table_schema: Arc::new(ArcSwap::new(Arc::<arrow_schema::Schema>::clone(
                 &table_metadata.schema,
@@ -11927,6 +11940,10 @@ impl CayenneTableProvider {
             ),
             #[cfg(test)]
             test_checkpoint_union_hook: Arc::clone(&self.test_checkpoint_union_hook),
+            #[cfg(test)]
+            test_scan_view_build_hook: Arc::clone(&self.test_scan_view_build_hook),
+            #[cfg(test)]
+            test_pre_scan_view_admission_hook: Arc::clone(&self.test_pre_scan_view_admission_hook),
             #[cfg(test)]
             test_pre_rewrite_commit_hook: Arc::clone(&self.test_pre_rewrite_commit_hook),
             protected_snapshots: Arc::clone(&self.protected_snapshots),
@@ -31216,6 +31233,13 @@ impl CayenneTableProvider {
         raw: RawScanInput,
         structural_version: u64,
     ) -> datafusion_common::Result<ScanView> {
+        #[cfg(test)]
+        {
+            let hook = self.test_scan_view_build_hook.lock().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         // Clone the file-side snapshot for the merge (an `Arc` clone); `raw` keeps
         // its own copy so the view carries the file-side source for reference.
         let merged_deletions = Self::merged_deletion_snapshot_sharded(
@@ -31388,6 +31412,13 @@ impl CayenneTableProvider {
             return Ok(view);
         }
 
+        #[cfg(test)]
+        {
+            let hook = self.test_pre_scan_view_admission_hook.lock().take();
+            if let Some(hook) = hook {
+                hook().await;
+            }
+        }
         // Capture the CURRENT state under the structural seqlock, retrying across a
         // (rare) live schema-evolution that leaves the generation odd/torn, and
         // across a write that advanced `scan_input_version` while we captured.
@@ -66937,6 +66968,128 @@ mod tests {
         }
         pairs.sort_unstable();
         pairs
+    }
+
+    /// A cancelled SQL request must not free admission while its blocking build
+    /// still holds snapshots. A queued query captures writes and a checkpoint
+    /// committed during the wait, without starting another view build.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn scan_view_admission_survives_cancelled_query() {
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            "scan_view_cancelled_query",
+            ctx.runtime_env(),
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                compaction_background_interval_ms: 0,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let provider = Arc::new(provider);
+        provider.init_scan_view_cache();
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
+        let schema = Arc::clone(&provider.table_metadata.schema);
+        ctx.register_table("t", Arc::clone(&provider) as Arc<dyn TableProvider>)
+            .expect("register real provider");
+        provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1, 2], &[10, 20])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("initial CDC rows");
+
+        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
+        *provider.test_scan_view_build_hook.lock() = Some(Box::new(move || {
+            entered_tx.send(()).expect("report blocking build entry");
+            release_rx
+                .recv_timeout(Duration::from_secs(30))
+                .expect("release blocking build");
+        }));
+        let first_ctx = ctx.clone();
+        let first = tokio::spawn(async move {
+            first_ctx
+                .sql("SELECT id, value FROM t")
+                .await?
+                .collect()
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(10), entered_rx)
+            .await
+            .expect("first query enters blocking build")
+            .expect("build entry signal");
+        first.abort();
+        assert!(first.await.expect_err("request cancelled").is_cancelled());
+
+        provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(Arc::clone(&schema), &[1, 3], &[11, 30])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("CDC upsert while build is paused");
+        tokio::time::timeout(Duration::from_secs(10), provider.checkpoint_mem_tier())
+            .await
+            .expect("checkpoint does not wait for scan-view admission")
+            .expect("checkpoint completes");
+
+        let (captured_tx, mut captured_rx) = tokio::sync::oneshot::channel();
+        *provider.test_post_scan_input_capture_hook.lock() = Some(Box::new(move || {
+            Box::pin(async move {
+                captured_tx.send(()).expect("report queued scan capture");
+            })
+        }));
+        let (admission_tx, admission_rx) = tokio::sync::oneshot::channel();
+        *provider.test_pre_scan_view_admission_hook.lock() = Some(Box::new(move || {
+            Box::pin(async move {
+                admission_tx.send(()).expect("report queued scan admission");
+            })
+        }));
+        let second_ctx = ctx.clone();
+        let second = tokio::spawn(async move {
+            second_ctx
+                .sql("SELECT id, value FROM t")
+                .await?
+                .collect()
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(10), admission_rx)
+            .await
+            .expect("second query reaches build admission")
+            .expect("admission signal");
+        // Time itself is under test: the unfinished blocking build must retain
+        // admission even though its originating SQL request was cancelled.
+        let early_capture =
+            tokio::time::timeout(Duration::from_millis(100), &mut captured_rx).await;
+        provider
+            .write_cdc_append_stream(
+                single_batch_stream(id_value_batch(schema, &[1], &[12])),
+                &ctx.task_ctx(),
+            )
+            .await
+            .expect("CDC upsert while second query waits");
+        release_tx.send(()).expect("release first build");
+        let rows = tokio::time::timeout(Duration::from_secs(10), second)
+            .await
+            .expect("queued query completes")
+            .expect("query task joins")
+            .expect("query succeeds");
+        assert!(
+            early_capture.is_err(),
+            "a cancelled request must not admit another snapshot capture while its build runs"
+        );
+        captured_rx
+            .await
+            .expect("queued query captures after admission");
+        assert_eq!(
+            collect_id_value_pairs_from_batches(&rows),
+            vec![(1, 12), (2, 20), (3, 30)],
+            "queued query must capture the committed checkpoint and latest CDC upsert"
+        );
     }
 
     /// [`ScanViewReuse::UntilInvalidated`] — the full/append path. A scan through
