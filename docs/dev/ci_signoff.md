@@ -226,23 +226,29 @@ runs first — a clean tree exercises only the shapes it happens to contain.
 ### The unreachable-module guard
 
 `make lint-rust` also runs `scripts/check_module_reachability.py`, which fails
-when a file under a workspace crate's `src/` is not reachable from that crate's
-roots through `mod` declarations. Such a file compiles into nothing, so
+when a file under a workspace crate's `src/`, `tests/`, `benches/` or
+`examples/` is not reachable through `mod` declarations from any of that
+crate's targets. Such a file compiles into nothing, so
 `cargo build`, `cargo clippy`, `cargo fmt --all` and `cargo test` are all silent
 about it — it looks like source and ships nothing. Four stale trees had
 accumulated this way, together holding ~2,200 lines and 26 tests that had never
 run ([#12735](https://github.com/spiceai/spiceai/issues/12735),
 [#12737](https://github.com/spiceai/spiceai/issues/12737)).
 
-Roots come from `cargo metadata`, so a `path = "…"` target override in a
-`Cargo.toml` is honoured without the script parsing manifests. Only `src/` is in
-scope: cargo auto-discovers `benches/`, `tests/` and `examples/` files as their
-own targets, so they are reachable with no `mod` declaration and including them
-reports ~200 files that are all fine.
+Roots are every target `cargo metadata` lists — library, binaries, tests,
+benches and examples — so auto-discovered targets, `autotests = false`, and a
+`path = "…"` target override are all honoured without the script parsing
+manifests. That is what catches a test that silently runs nothing: a top-level
+`tests/*.rs` that a crate with `autotests = false` never declares, or a file in
+a `tests/` subdirectory no `mod` reaches (see
+[`integration_test_layout.md`](integration_test_layout.md)).
 
 The walk handles the cases a regex over `mod` alone gets wrong — `#[path = "…"]`
-redirects, declarations behind `#[cfg(…)]` (still declarations), inline
-`mod x { … }` nesting, and `mod` tokens inside comments and string literals.
+redirects (a file loaded this way owns its directory, like `mod.rs`), every
+target root owning its directory whatever it is named, a file compiled both as
+a root and as another target's module (walked in each context), declarations
+behind `#[cfg(…)]` (still declarations), inline `mod x { … }` nesting, and
+`mod` tokens inside comments and string literals.
 `scripts/test_check_module_reachability.py` covers each one.
 
 ### Dependabot bumps are fast-tracked
