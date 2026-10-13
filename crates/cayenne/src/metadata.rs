@@ -507,10 +507,12 @@ pub enum DeletionMode {
     /// size on disk, and never more than 8 MiB — and switches to [`Self::Key`]
     /// deletes once it outgrows that. The switch holds until the table is next
     /// opened, which sizes it again. On a runtime with fewer than 8 CPU cores
-    /// the accelerator, and a Cayenne catalog for its own tables, resolve `Auto`
-    /// to [`Self::Key`] before the table opens.
-    /// A table on object storage, in `mode: memory`, partitioned, or with a
-    /// cold tier uses key deletes throughout.
+    /// an `Auto` table keeps key deletes from the start
+    /// ([`VortexConfig::auto_keeps_key_deletes`]); it is still `Auto`, so it still
+    /// reclaims, by its paced whole-table rewrite, deletes of rows the bake
+    /// cannot reach. A table on object storage, in `mode: memory`, partitioned,
+    /// or with a cold tier uses key deletes throughout, as does a
+    /// `refresh_mode: changes` table, which the accelerator pins to [`Self::Key`].
     /// While it uses position deletes, `Auto` rewrites alongside writers rather
     /// than holding them off, and folds a key repeated within one write out of
     /// the files as key mode does. A table without a primary key has no key to
@@ -961,6 +963,15 @@ pub struct VortexConfig {
     /// position deletes. `key` and `position` pin the mode.
     #[serde(default)]
     pub deletion_mode: DeletionMode,
+    /// Whether `deletion_mode: auto` keeps key deletes from the start on this
+    /// runtime. The accelerator and the Cayenne catalog set it on a runtime with
+    /// fewer than the cores that keep a small table compacted whole alongside its
+    /// writes (`CpuBudget::cayenne_keeps_small_tables_compacted`). Such a table is
+    /// still `auto`, as one past its bound is, so it still reclaims, by the paced
+    /// whole-table rewrite, deletes of rows the bake cannot reach. Never stored
+    /// with the table, so a table chooses again wherever it next opens.
+    #[serde(skip)]
+    pub auto_keeps_key_deletes: bool,
     /// Whether this table is a pure in-memory (`mode: memory`) accelerator: all
     /// data lives in the RAM mem-tier (the in-memory metastore holds only metadata), no Vortex
     /// data files are ever written (checkpoint + compaction disabled), it is
@@ -1541,6 +1552,7 @@ impl Default for VortexConfig {
             pk_conflict_detection: PkConflictDetection::default(),
             pk_keyset_cache_mb: None,
             deletion_mode: DeletionMode::default(),
+            auto_keeps_key_deletes: false,
             memory_mode: false,
             cdc_durability: CdcDurability::default(),
             cdc_mem_tier_max_bytes: default_cdc_mem_tier_max_bytes(),

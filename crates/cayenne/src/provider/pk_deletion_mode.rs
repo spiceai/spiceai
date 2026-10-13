@@ -65,9 +65,9 @@ use crate::metadata::{DeletionMode, ResolvedDeletionMode};
 /// a Linux virtual machine held to four CPUs, a 250K-row table rewrote itself
 /// every 1.8 s for 236 ms, 13% of the time, and its write P99 was 16% above key
 /// deletes'; paced to a tenth, its writes were even with key deletes'. On a
-/// runtime with fewer than 8 CPU cores the accelerator, and a Cayenne catalog for
-/// its own tables, resolve `auto` to key deletes before the table opens
-/// (`CpuBudget::cayenne_keeps_small_tables_compacted`).
+/// runtime with fewer than 8 CPU cores an `auto` table keeps key deletes from the
+/// start (`CpuBudget::cayenne_keeps_small_tables_compacted`), so there the pace
+/// bounds only the rewrites that reclaim rows the bake cannot reach.
 ///
 /// The pace costs reads while it holds a reclaim back, because the index grows
 /// past the trigger: a 1M-row table under 8,000 upserts a second read at a 10 ms
@@ -96,19 +96,29 @@ impl PkDeletionMode {
     /// partitioned table, a table with a datalake tier, or one on object storage,
     /// which keep key deletes. An `auto` table starts on position deletes until it
     /// is sized ([`AutoDeletionMode::size_at_open`]).
+    ///
+    /// With `keeps_key_deletes` an `auto` table starts, and stays, on key deletes
+    /// (see [`crate::metadata::VortexConfig::auto_keeps_key_deletes`]).
     pub(crate) fn for_table(
         mode: DeletionMode,
         has_primary_key: bool,
         adapts: bool,
+        keeps_key_deletes: bool,
         target_file_size_bytes: usize,
     ) -> Self {
         match mode.resolved(has_primary_key) {
             ResolvedDeletionMode::Key => Self::Key,
             ResolvedDeletionMode::Position => Self::Position,
             ResolvedDeletionMode::Adaptive if !adapts => Self::Key,
-            ResolvedDeletionMode::Adaptive => Self::Auto(Arc::new(AutoDeletionMode::new(
-                AutoDeletionMode::max_position_bytes_for(target_file_size_bytes),
-            ))),
+            ResolvedDeletionMode::Adaptive => {
+                let max_position_bytes =
+                    AutoDeletionMode::max_position_bytes_for(target_file_size_bytes);
+                Self::Auto(Arc::new(if keeps_key_deletes {
+                    AutoDeletionMode::on_key_deletes(max_position_bytes)
+                } else {
+                    AutoDeletionMode::new(max_position_bytes)
+                }))
+            }
         }
     }
 
@@ -181,6 +191,15 @@ impl AutoDeletionMode {
             reclaims: Mutex::new(ReclaimPace::default()),
             kept_compacted: AtomicBool::new(false),
         }
+    }
+
+    /// An `auto` table on key deletes from the start, in the state one opened past
+    /// its bound is in: `auto` on a runtime with too few cores to keep a small
+    /// table compacted whole alongside its writes. Opening it records no switch.
+    pub(crate) fn on_key_deletes(max_position_bytes: u64) -> Self {
+        let auto = Self::new(max_position_bytes);
+        auto.position.store(false, Ordering::Release);
+        auto
     }
 
     /// Choose the starting mode for a table of `table_bytes` on-disk bytes (`None`
@@ -401,7 +420,7 @@ mod tests {
     #[test]
     fn for_table_resolves_each_configuration() {
         let resolve = |mode, has_pk, adapts| {
-            PkDeletionMode::for_table(mode, has_pk, adapts, TARGET).uses_positions()
+            PkDeletionMode::for_table(mode, has_pk, adapts, false, TARGET).uses_positions()
         };
         // Explicit modes ignore eligibility.
         assert!(!resolve(DeletionMode::Key, true, true));
@@ -412,14 +431,27 @@ mod tests {
         // `auto` on a table it does not adapt keeps key deletes.
         assert!(!resolve(DeletionMode::Auto, true, false));
         assert!(matches!(
-            PkDeletionMode::for_table(DeletionMode::Auto, true, false, TARGET),
+            PkDeletionMode::for_table(DeletionMode::Auto, true, false, false, TARGET),
             PkDeletionMode::Key
         ));
         let PkDeletionMode::Auto(auto) =
-            PkDeletionMode::for_table(DeletionMode::Auto, true, true, TARGET)
+            PkDeletionMode::for_table(DeletionMode::Auto, true, true, false, TARGET)
         else {
             panic!("an eligible primary-key table is auto");
         };
         assert_eq!(auto.max_position_bytes(), BOUND);
+        // On a runtime that keeps key deletes, an eligible table is still `auto`,
+        // starting on key deletes, so it keeps `auto`'s reclaim of rows the bake
+        // cannot reach. Explicit modes are unaffected.
+        let PkDeletionMode::Auto(auto) =
+            PkDeletionMode::for_table(DeletionMode::Auto, true, true, true, TARGET)
+        else {
+            panic!("an eligible primary-key table that keeps key deletes is still auto");
+        };
+        assert!(!auto.uses_positions());
+        assert!(
+            PkDeletionMode::for_table(DeletionMode::Position, true, true, true, TARGET)
+                .uses_positions()
+        );
     }
 }

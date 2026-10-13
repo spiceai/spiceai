@@ -36,8 +36,9 @@ use arrow::array::{Float64Array, Int64Array, StringArray};
 use arrow::datatypes::{DataType, Field, Schema};
 use arrow::record_batch::RecordBatch;
 use cayenne::metadata::{CreateTableOptions, DeletionMode, VortexConfig};
-use cayenne::{CayenneTableProvider, MetadataCatalog};
+use cayenne::{CayenneContext, CayenneTableProvider, CayenneTableProviderBuilder, MetadataCatalog};
 use datafusion::datasource::TableProvider;
+use datafusion::execution::runtime_env::RuntimeEnv;
 use datafusion::prelude::SessionContext;
 use datafusion_expr::dml::InsertOp;
 use datafusion_table_providers::util::{
@@ -211,15 +212,59 @@ fn dir_bytes(dir: &std::path::Path) -> u64 {
         .sum()
 }
 
-/// The deletion mode `HARNESS_MODE` names (`key` when unset). Any other value
-/// fails the run, so a typo cannot label one mode's numbers with another's name.
+/// The deletion mode `HARNESS_MODE` names (`key` when unset). `auto-keeps-key` is
+/// `auto` as it opens on a runtime with fewer than 8 CPU cores, on key deletes from
+/// the start (see [`auto_keeps_key_deletes_from_env`]). Any other value fails the
+/// run, so a typo cannot label one mode's numbers with another's name.
 fn mode_from_env() -> DeletionMode {
     match env_string("HARNESS_MODE", "key").as_str() {
         "key" => DeletionMode::Key,
         "position" => DeletionMode::Position,
-        "auto" => DeletionMode::Auto,
-        other => panic!("HARNESS_MODE must be `auto`, `key` or `position`, not {other:?}"),
+        "auto" | "auto-keeps-key" => DeletionMode::Auto,
+        other => panic!(
+            "HARNESS_MODE must be `auto`, `auto-keeps-key`, `key` or `position`, not {other:?}"
+        ),
     }
+}
+
+/// Whether `HARNESS_MODE` names `auto` on key deletes from the start.
+fn auto_keeps_key_deletes_from_env() -> bool {
+    env_string("HARNESS_MODE", "key") == "auto-keeps-key"
+}
+
+/// Create a harness table. One that keeps key deletes from the start opens with a
+/// context that says so, as the accelerator opens it: the stored configuration
+/// never carries `auto_keeps_key_deletes`.
+async fn create_harness_table(
+    catalog: Arc<dyn MetadataCatalog>,
+    options: CreateTableOptions,
+    runtime_env: Arc<RuntimeEnv>,
+) -> Result<CayenneTableProvider, Box<dyn std::error::Error>> {
+    if options.vortex_config.auto_keeps_key_deletes {
+        let context = CayenneContext::new(
+            &options.vortex_config,
+            Arc::clone(&runtime_env),
+            &options.table_name,
+        );
+        return Ok(CayenneTableProviderBuilder::new(catalog, runtime_env)
+            .with_context(context)
+            .create(options)
+            .await?);
+    }
+    Ok(CayenneTableProvider::create_table(catalog, options, runtime_env).await?)
+}
+
+/// How many rounds a fixed-rate reader started against how many its interval
+/// scheduled within the run. A reader that keeps up starts that many, or one more
+/// when a round falls due at the deadline itself. One whose rounds take longer than
+/// the interval falls behind and starts fewer, putting less read load on its run
+/// than on one that kept up.
+fn report_read_rounds(mode: &str, started: usize, duration_s: u64, read_interval_ms: u64) {
+    if read_interval_ms == 0 {
+        return;
+    }
+    let scheduled = duration_s * 1000 / read_interval_ms;
+    eprintln!("HARNESS mode={mode} metric=c_read_rounds started={started} scheduled={scheduled}");
 }
 
 /// Sets up Cayenne's process-wide compaction the way `spiced` does before any
@@ -289,6 +334,7 @@ async fn deletion_mode_steady_state_harness() -> Result<(), Box<dyn std::error::
     let schema = schema();
     let mut vortex_config = VortexConfig {
         deletion_mode: mode,
+        auto_keeps_key_deletes: auto_keeps_key_deletes_from_env(),
         bake_deletion_index_trigger: trigger,
         ..VortexConfig::default()
     };
@@ -308,8 +354,7 @@ async fn deletion_mode_steady_state_harness() -> Result<(), Box<dyn std::error::
     };
     let catalog: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
     let ctx = SessionContext::new();
-    let table =
-        Arc::new(CayenneTableProvider::create_table(catalog, options, ctx.runtime_env()).await?);
+    let table = Arc::new(create_harness_table(catalog, options, ctx.runtime_env()).await?);
     ctx.register_table("t", Arc::clone(&table) as Arc<dyn TableProvider>)?;
 
     eprintln!(
@@ -527,6 +572,7 @@ async fn deletion_mode_concurrent_harness() -> Result<(), Box<dyn std::error::Er
     let schema = schema();
     let vortex_config = VortexConfig {
         deletion_mode: mode,
+        auto_keeps_key_deletes: auto_keeps_key_deletes_from_env(),
         bake_deletion_index_trigger: trigger,
         compaction_trigger_files: 4,
         compaction_trigger_protected_snapshots: 4,
@@ -547,8 +593,7 @@ async fn deletion_mode_concurrent_harness() -> Result<(), Box<dyn std::error::Er
     };
     let catalog: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
     let ctx = SessionContext::new();
-    let table =
-        Arc::new(CayenneTableProvider::create_table(catalog, options, ctx.runtime_env()).await?);
+    let table = Arc::new(create_harness_table(catalog, options, ctx.runtime_env()).await?);
     table.spawn_background_compaction(Arc::new(tokio::sync::Semaphore::new(2)));
     ctx.register_table("t", Arc::clone(&table) as Arc<dyn TableProvider>)?;
     eprintln!(
@@ -684,6 +729,7 @@ async fn deletion_mode_concurrent_harness() -> Result<(), Box<dyn std::error::Er
     let mut write_ms = writer.await?;
     let (mut agg, mut filter, mut point, mut count) = reader.await?;
     let (index, memory) = sampler.await?;
+    report_read_rounds(&mode_label, agg.len(), duration_s, read_interval_ms);
     summarize("c_write", &mode_label, &mut write_ms);
     summarize("c_scan_agg", &mode_label, &mut agg);
     summarize("c_scan_filter", &mode_label, &mut filter);
@@ -771,6 +817,7 @@ async fn deletion_mode_many_tables_harness() -> Result<(), Box<dyn std::error::E
             partition_column: None,
             vortex_config: VortexConfig {
                 deletion_mode: mode,
+                auto_keeps_key_deletes: auto_keeps_key_deletes_from_env(),
                 bake_deletion_index_trigger: trigger,
                 compaction_trigger_files: 4,
                 compaction_trigger_protected_snapshots: 4,
@@ -780,9 +827,7 @@ async fn deletion_mode_many_tables_harness() -> Result<(), Box<dyn std::error::E
             },
         };
         let catalog: Arc<dyn MetadataCatalog> = fixture.catalog.clone();
-        let table = Arc::new(
-            CayenneTableProvider::create_table(catalog, options, ctx.runtime_env()).await?,
-        );
+        let table = Arc::new(create_harness_table(catalog, options, ctx.runtime_env()).await?);
         table.spawn_background_compaction(Arc::clone(&compactions));
         ctx.register_table(name.as_str(), Arc::clone(&table) as Arc<dyn TableProvider>)?;
         let mut next = 0usize;
@@ -896,6 +941,7 @@ async fn deletion_mode_many_tables_harness() -> Result<(), Box<dyn std::error::E
         write_by_table.push(table_ms);
     }
     let (mut agg, mut filter, mut point, mut count, mut by_table) = reader.await?;
+    report_read_rounds(&mode_label, agg.len(), duration_s, read_interval_ms.max(1));
     summarize("c_write", &mode_label, &mut write_ms);
     summarize("c_scan_agg", &mode_label, &mut agg);
     summarize("c_scan_filter", &mode_label, &mut filter);

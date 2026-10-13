@@ -33,18 +33,64 @@ async fn table(
     create_cdc_upsert_table_with_vortex_config(
         name,
         ctx.runtime_env(),
-        VortexConfig {
-            deletion_mode,
-            target_vortex_file_size_mb,
-            bake_deletion_index_trigger: 2,
-            inline_max_rows: 0,
-            inline_max_bytes: 0,
-            inline_max_buffer_bytes: 0,
-            compaction_background_interval_ms: 3_600_000,
-            ..VortexConfig::default()
-        },
+        table_config(deletion_mode, target_vortex_file_size_mb),
     )
     .await
+}
+
+/// The configuration [`table`] creates its table with.
+fn table_config(deletion_mode: DeletionMode, target_vortex_file_size_mb: usize) -> VortexConfig {
+    VortexConfig {
+        deletion_mode,
+        target_vortex_file_size_mb,
+        bake_deletion_index_trigger: 2,
+        inline_max_rows: 0,
+        inline_max_bytes: 0,
+        inline_max_buffer_bytes: 0,
+        compaction_background_interval_ms: 3_600_000,
+        ..VortexConfig::default()
+    }
+}
+
+/// [`table`] with `deletion_mode: auto`, opened as the accelerator opens it on a
+/// runtime with too few cores to keep a small table compacted whole: its context
+/// sets `auto_keeps_key_deletes`, which the stored configuration never carries.
+async fn auto_table_keeping_key_deletes(
+    name: &str,
+) -> (CayenneTableProvider, Arc<dyn MetadataCatalog>, TempDir) {
+    let (created, catalog, tmp) = table(name, DeletionMode::Auto, 256).await;
+    drop(created);
+    let config = VortexConfig {
+        auto_keeps_key_deletes: true,
+        ..table_config(DeletionMode::Auto, 256)
+    };
+    let runtime_env = SessionContext::new().runtime_env();
+    let provider = CayenneTableProviderBuilder::new(Arc::clone(&catalog), Arc::clone(&runtime_env))
+        .with_context(CayenneContext::new(&config, runtime_env, name))
+        .open(name)
+        .await
+        .expect("the table opens");
+    (provider, catalog, tmp)
+}
+
+/// Replace the table's rows with `ids` at `value`, as a full refresh does.
+async fn overwrite(provider: &CayenneTableProvider, ids: &[i64], value: i64) {
+    let schema = Arc::clone(&provider.table_metadata.schema);
+    let ctx = SessionContext::new();
+    let batch = id_value_batch(Arc::clone(&schema), ids, &vec![value; ids.len()]);
+    let plan = provider
+        .insert_into(
+            &ctx.state(),
+            MemorySourceConfig::try_new_exec(&[vec![batch]], schema, None).expect("source"),
+            InsertOp::Overwrite,
+        )
+        .await
+        .expect("plan");
+    collect(plan, ctx.task_ctx()).await.expect("overwrite");
+    provider
+        .flush_pending_maintenance()
+        .await
+        .expect("post-write maintenance");
 }
 
 async fn write(provider: &CayenneTableProvider, ids: &[i64], value: i64) {
@@ -602,6 +648,74 @@ async fn an_auto_table_on_key_deletes_reclaims_rows_the_bake_cannot_reach() {
     assert!(
         !provider.should_capture_positions(),
         "the reclaim did not move the table back to position deletes"
+    );
+    let ctx = SessionContext::new();
+    let rows = collect_id_value_pairs(&ctx, &provider, name).await;
+    let expected: Vec<(i64, i64)> = keys.iter().map(|id| (*id, 205)).collect();
+    assert_eq!(rows, expected, "every key shows its latest row, once");
+}
+
+/// An auto table that keeps key deletes from the start, as one does on a runtime
+/// with too few cores to keep a small table compacted whole, records no position
+/// delete and still reclaims rows its current snapshot holds, where an overwrite
+/// leaves them, by rewriting itself whole. The bake cannot reach those rows, and an
+/// explicit `deletion_mode: key` table would keep every delete of them.
+#[tokio::test]
+async fn an_auto_table_keeping_key_deletes_from_the_start_reclaims_rows_the_bake_cannot_reach() {
+    let name = "auto_small_host";
+    let (provider, _catalog, _tmp) = auto_table_keeping_key_deletes(name).await;
+    assert!(
+        !provider.should_capture_positions(),
+        "the table is on key deletes from the start"
+    );
+    let keys: Vec<i64> = (0..16).collect();
+    overwrite(&provider, &keys, 100).await;
+    assert!(
+        !provider
+            .list_snapshot_files_with_sizes(&provider.get_current_snapshot_id())
+            .await
+            .expect("list the current snapshot")
+            .is_empty(),
+        "premise: the overwrite left its rows in the current snapshot"
+    );
+
+    // Enough protected snapshots for the bake to pick a prefix.
+    for value in 200..206 {
+        write(&provider, &keys, value).await;
+    }
+    assert_eq!(
+        position_deletes(&provider),
+        0,
+        "no position delete recorded"
+    );
+    let pending = deletion_index_entries(&provider);
+    assert!(
+        pending >= 2,
+        "premise: the index is past its trigger ({pending})"
+    );
+    assert!(
+        !provider
+            .bake_seq_prefix_protected_snapshots()
+            .await
+            .expect("bake pass"),
+        "premise: the bake cannot reach rows in the current snapshot"
+    );
+
+    assert!(
+        provider
+            .compact_current_snapshot_small_files()
+            .await
+            .expect("reclaim pass"),
+        "the table rewrites itself whole"
+    );
+    assert_eq!(
+        deletion_index_entries(&provider),
+        0,
+        "the reclaim cleared the index"
+    );
+    assert!(
+        !provider.should_capture_positions(),
+        "the reclaim did not move the table to position deletes"
     );
     let ctx = SessionContext::new();
     let rows = collect_id_value_pairs(&ctx, &provider, name).await;

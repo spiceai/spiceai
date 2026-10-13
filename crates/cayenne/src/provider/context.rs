@@ -602,6 +602,13 @@ impl CayenneContext {
         self.config.deletion_mode
     }
 
+    /// Whether `auto` keeps key deletes from the start on this runtime (see
+    /// [`VortexConfig::auto_keeps_key_deletes`]).
+    #[must_use]
+    pub(crate) fn auto_keeps_key_deletes(&self) -> bool {
+        self.config.auto_keeps_key_deletes
+    }
+
     /// Byte budget for the in-memory PK keyset cache used during upsert conflict
     /// detection. See [`DEFAULT_PK_KEYSET_CACHE_MAX_BYTES`].
     #[must_use]

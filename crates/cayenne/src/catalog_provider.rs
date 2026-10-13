@@ -830,13 +830,12 @@ impl SchemaProvider for CayenneSchemaProvider {
 }
 
 /// A builder that opens a table of a Cayenne catalog with its stored
-/// configuration, except that `deletion_mode: auto` is resolved for this runtime
-/// as the accelerator resolves it for a dataset. On a runtime with fewer than the
-/// cores that keep a small table compacted whole alongside its writes
-/// (`CpuBudget::cayenne_keeps_small_tables_compacted`), `auto` opens as `key`; a
-/// table without a primary key resolves `key` to position deletes, as it does
-/// `auto`. The resolution is not stored, so the table chooses again wherever it
-/// next opens.
+/// configuration, and with `deletion_mode: auto` set up for this runtime as the
+/// accelerator sets it up for a dataset. On a runtime with fewer than the cores
+/// that keep a small table compacted whole alongside its writes
+/// (`CpuBudget::cayenne_keeps_small_tables_compacted`), an `auto` table keeps key
+/// deletes from the start ([`VortexConfig::auto_keeps_key_deletes`]). The setting is
+/// not stored, so the table chooses again wherever it next opens.
 pub(crate) fn catalog_table_builder(
     catalog: &Arc<dyn MetadataCatalog>,
     runtime_env: &Arc<RuntimeEnv>,
@@ -847,7 +846,7 @@ pub(crate) fn catalog_table_builder(
     if config.deletion_mode == DeletionMode::Auto
         && !cpu_budget::cpu_budget().cayenne_keeps_small_tables_compacted()
     {
-        config.deletion_mode = DeletionMode::Key;
+        config.auto_keeps_key_deletes = true;
     }
     CayenneTableProviderBuilder::new(Arc::clone(catalog), Arc::clone(runtime_env)).with_context(
         CayenneContext::new(&config, Arc::clone(runtime_env), table_name),
@@ -1163,9 +1162,10 @@ mod tests {
     }
 
     /// On a runtime with fewer than 8 CPU cores, a primary-key table that a Cayenne
-    /// catalog loads opens on key deletes, as the accelerator resolves `auto` for a
-    /// dataset. Its stored configuration keeps `auto`, so it chooses again wherever
-    /// it next opens. Runs under an installed budget of two or three cores.
+    /// catalog loads opens as `auto` on key deletes, as the accelerator opens a
+    /// dataset, so it keeps `auto`'s reclaim of rows the bake cannot reach. Its stored
+    /// configuration is unchanged, so it chooses again wherever it next opens. Runs
+    /// under an installed budget of two or three cores.
     #[tokio::test]
     async fn a_catalog_table_loads_on_key_deletes_on_a_small_host() {
         use std::sync::Arc;
@@ -1216,8 +1216,8 @@ mod tests {
         .expect("the table exists");
         assert_eq!(
             deletion_mode_of(&loaded),
-            (false, false),
-            "the catalog loads it on key deletes: (records position deletes, is auto)"
+            (false, true),
+            "the catalog loads it as `auto` on key deletes: (records position deletes, is auto)"
         );
         let stored = provider
             .metadata_catalog()
@@ -1232,8 +1232,8 @@ mod tests {
     }
 
     /// On a runtime with fewer than 8 CPU cores, a primary-key table that `CREATE
-    /// TABLE` makes in a Cayenne catalog opens on key deletes. Runs under an
-    /// installed budget of two or three cores.
+    /// TABLE` makes in a Cayenne catalog opens as `auto` on key deletes. Runs under
+    /// an installed budget of two or three cores.
     #[cfg(feature = "partition-table-provider")]
     #[tokio::test]
     async fn a_table_created_in_a_catalog_opens_on_key_deletes_on_a_small_host() {
@@ -1285,8 +1285,8 @@ mod tests {
             .expect("the created table");
         assert_eq!(
             deletion_mode_of(&created),
-            (false, false),
-            "CREATE TABLE opens it on key deletes: (records position deletes, is auto)"
+            (false, true),
+            "CREATE TABLE opens it as `auto` on key deletes: (records position deletes, is auto)"
         );
     }
 }

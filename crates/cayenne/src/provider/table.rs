@@ -13731,6 +13731,7 @@ impl CayenneTableProvider {
             context.deletion_mode(),
             has_primary_key,
             adapts,
+            context.auto_keeps_key_deletes(),
             context.target_file_size_bytes(),
         )
     }
