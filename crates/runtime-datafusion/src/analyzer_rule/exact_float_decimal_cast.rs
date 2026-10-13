@@ -28,9 +28,10 @@ limitations under the License.
 //! that reads back as the same `f64` (Rust's `Display`) recovers it: `12345678.9`.
 //! This rule rewrites `CAST(<float literal> AS DECIMAL(p, s))` to the decimal
 //! literal parsed exactly from that string, at the cast's precision and scale. It
-//! only does so when that spelling has at most 15 significant digits (so no other
-//! decimal shares the float) and fits the scale without rounding; anything else is
-//! left to the cast as before, so overflow and out-of-range behaviour is unchanged.
+//! only does so when that spelling has at most the float type's decimal digits
+//! (`f64::DIGITS` / `f32::DIGITS` / ~3 for `f16`) so no other decimal shares the
+//! float, and fits the scale without rounding; anything else is left to the cast
+//! as before, so overflow and out-of-range behaviour is unchanged.
 
 use datafusion::arrow::datatypes::{DataType, Decimal128Type, Decimal256Type};
 use datafusion::common::tree_node::{Transformed, TreeNode};
@@ -84,13 +85,17 @@ fn rewrite_expr(expr: Expr) -> Transformed<Expr> {
 /// The decimal `value` spells, at `data_type`'s precision and scale, when it is a
 /// finite float literal whose shortest round-trip spelling fits that scale.
 pub(crate) fn exact_decimal(value: &ScalarValue, data_type: &DataType) -> Option<ScalarValue> {
-    let spelling = match value {
-        ScalarValue::Float64(Some(v)) if v.is_finite() => v.to_string(),
-        ScalarValue::Float32(Some(v)) if v.is_finite() => v.to_string(),
-        ScalarValue::Float16(Some(v)) if v.is_finite() => v.to_string(),
+    // Cap significant digits by the source float's precision. Reusing
+    // `f64::DIGITS` for f32/f16 rewrites values past those types' reliable
+    // decimal range (e.g. `Float32(123456.79)` → a spelling unequal to the
+    // stored binary value).
+    let (spelling, max_digits) = match value {
+        ScalarValue::Float64(Some(v)) if v.is_finite() => (v.to_string(), f64::DIGITS as usize),
+        ScalarValue::Float32(Some(v)) if v.is_finite() => (v.to_string(), f32::DIGITS as usize),
+        ScalarValue::Float16(Some(v)) if v.is_finite() => (v.to_string(), 3),
         _ => return None,
     };
-    if !is_unambiguous_spelling(&spelling) {
+    if !is_unambiguous_spelling(&spelling, max_digits) {
         return None;
     }
     let fraction_digits = spelling.split_once('.').map_or(0, |(_, f)| f.len());
@@ -119,12 +124,14 @@ pub(crate) fn exact_decimal(value: &ScalarValue, data_type: &DataType) -> Option
     }
 }
 
-/// Every decimal with at most [`f64::DIGITS`] (15) significant digits reads as a
-/// distinct `f64`, so a float whose shortest spelling is that short can only have
-/// come from that spelling (or one that differs below the float's precision).
-/// Longer spellings — `1e30` is `1000000000000000019884624838656.0` as well — are
-/// ambiguous, and those keep the cast's numeric conversion.
-fn is_unambiguous_spelling(spelling: &str) -> bool {
+/// Every decimal with at most `max_digits` significant digits reads as a
+/// distinct value of that float width, so a float whose shortest spelling is
+/// that short can only have come from that spelling (or one that differs below
+/// the float's precision). Longer spellings — `1e30` is
+/// `1000000000000000019884624838656.0` as well — are ambiguous, and those keep
+/// the cast's numeric conversion. `max_digits` is [`f64::DIGITS`],
+/// [`f32::DIGITS`], or 3 for `f16`.
+fn is_unambiguous_spelling(spelling: &str, max_digits: usize) -> bool {
     let unsigned = spelling.trim_start_matches('-');
     let integer_digits = unsigned
         .split_once('.')
@@ -138,8 +145,7 @@ fn is_unambiguous_spelling(spelling: &str) -> bool {
         .trim_start_matches('0')
         .trim_end_matches('0')
         .len();
-    let max = f64::DIGITS as usize;
-    integer_digits <= max && significant_digits <= max
+    integer_digits <= max_digits && significant_digits <= max_digits
 }
 
 #[cfg(test)]
@@ -220,6 +226,24 @@ mod tests {
         assert_eq!(
             exact_decimal(&ScalarValue::Float64(None), &DataType::Decimal128(10, 2)),
             None
+        );
+        // Float32 has only 6 reliable decimal digits; 123456.79 displays as
+        // that spelling but stores 123456.7890625, so rewriting would compare
+        // against the wrong decimal.
+        assert_eq!(
+            exact_decimal(
+                &ScalarValue::Float32(Some(123_456.79)),
+                &DataType::Decimal128(38, 10)
+            ),
+            None
+        );
+        // A short Float32 spelling within f32::DIGITS still rewrites.
+        assert_eq!(
+            exact_decimal(
+                &ScalarValue::Float32(Some(4.07)),
+                &DataType::Decimal128(10, 2)
+            ),
+            Some(ScalarValue::Decimal128(Some(407), 10, 2))
         );
     }
 
