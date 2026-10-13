@@ -67027,7 +67027,10 @@ mod tests {
                 &ctx.task_ctx(),
             )
             .await
-            .expect("initial CDC rows");
+            .expect("initial CDC rows")
+            .finish()
+            .await
+            .expect("initial CDC rows published");
 
         let (entered_tx, entered_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::sync_channel(1);
@@ -67058,7 +67061,10 @@ mod tests {
                 &ctx.task_ctx(),
             )
             .await
-            .expect("CDC upsert while build is paused");
+            .expect("CDC upsert while build is paused")
+            .finish()
+            .await
+            .expect("CDC upsert published while build is paused");
         tokio::time::timeout(Duration::from_secs(10), provider.checkpoint_mem_tier())
             .await
             .expect("checkpoint does not wait for scan-view admission")
@@ -67098,7 +67104,10 @@ mod tests {
                 &ctx.task_ctx(),
             )
             .await
-            .expect("CDC upsert while second query waits");
+            .expect("CDC upsert while second query waits")
+            .finish()
+            .await
+            .expect("CDC upsert published while second query waits");
         release_tx.send(()).expect("release first build");
         let rows = tokio::time::timeout(Duration::from_secs(10), second)
             .await
