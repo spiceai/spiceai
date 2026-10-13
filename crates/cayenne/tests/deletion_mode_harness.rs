@@ -134,6 +134,57 @@ fn summarize(label: &str, mode: &str, samples: &mut [f64]) {
     );
 }
 
+/// Install an SDK meter provider whose reader the harness collects from, so a run
+/// can report Cayenne's compaction outcomes. Call it before any table is built:
+/// Cayenne binds its instruments to the global provider on first use.
+fn install_compaction_metrics() -> telemetry::metrics_reader::MetricsReader {
+    let reader = telemetry::metrics_reader::MetricsReader::new_cumulative();
+    opentelemetry::global::set_meter_provider(
+        opentelemetry_sdk::metrics::SdkMeterProvider::builder()
+            .with_reader(reader.clone())
+            .build(),
+    );
+    reader
+}
+
+/// Every `cayenne_compaction_outcome_total` count, summed over tables, by kind and
+/// outcome.
+fn report_compaction_outcomes(mode: &str, reader: &telemetry::metrics_reader::MetricsReader) {
+    use opentelemetry_sdk::metrics::data::{AggregatedMetrics, MetricData, ResourceMetrics};
+    use opentelemetry_sdk::metrics::reader::MetricReader as _;
+    let mut resource_metrics = ResourceMetrics::default();
+    if let Err(error) = reader.collect(&mut resource_metrics) {
+        eprintln!("HARNESS mode={mode} metric=c_outcome error={error}");
+        return;
+    }
+    let mut totals = std::collections::BTreeMap::<(String, String), u64>::new();
+    for metric in resource_metrics
+        .scope_metrics()
+        .flat_map(opentelemetry_sdk::metrics::data::ScopeMetrics::metrics)
+    {
+        if metric.name() != "cayenne_compaction_outcome_total" {
+            continue;
+        }
+        if let AggregatedMetrics::U64(MetricData::Sum(sum)) = metric.data() {
+            for point in sum.data_points() {
+                let label = |key: &str| {
+                    point
+                        .attributes()
+                        .find(|attribute| attribute.key.as_str() == key)
+                        .map(|attribute| attribute.value.as_str().to_string())
+                        .unwrap_or_default()
+                };
+                *totals.entry((label("kind"), label("outcome"))).or_default() += point.value();
+            }
+        }
+    }
+    for ((kind, outcome), count) in totals {
+        eprintln!(
+            "HARNESS mode={mode} metric=c_outcome kind={kind} outcome={outcome} count={count}"
+        );
+    }
+}
+
 /// Each table's P99, reported as the smallest, the median and the largest across
 /// tables, so one table falling behind shows even when the pooled P99 does not.
 fn summarize_per_table(label: &str, mode: &str, per_table: &mut [Vec<f64>]) {
@@ -787,11 +838,13 @@ async fn deletion_mode_concurrent_harness() -> Result<(), Box<dyn std::error::Er
 /// and written like the others but never read: a large table rewriting itself whole
 /// alongside the small ones. Every table's deletion index is sampled every 100 ms;
 /// how far past its trigger it grows says how long its reclaims were held back.
+/// The run ends with every `cayenne_compaction_outcome_total` count.
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
 #[ignore = "timing harness; run explicitly with HARNESS_* variables"]
 async fn deletion_mode_many_tables_harness() -> Result<(), Box<dyn std::error::Error>> {
     let mode = mode_from_env();
     install_compaction_runtime_from_env();
+    let outcome_metrics = install_compaction_metrics();
     let compaction_runtime = env_string("HARNESS_COMPACTION_RUNTIME", "dedicated");
     let mode_label = env_string("HARNESS_MODE", "key");
     let tables = env_usize("HARNESS_TABLES", 20).max(1);
@@ -1044,6 +1097,7 @@ async fn deletion_mode_many_tables_harness() -> Result<(), Box<dyn std::error::E
         dir_bytes(&fixture.data_path),
         if rewritten_whole > 0 { "Full" } else { "None" }
     );
+    report_compaction_outcomes(&mode_label, &outcome_metrics);
     let union = specs
         .iter()
         .map(|(name, _, _)| format!("SELECT id, generation, qty FROM {name}"))

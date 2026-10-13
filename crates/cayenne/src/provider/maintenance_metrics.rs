@@ -140,7 +140,7 @@ pub(crate) enum CompactionOutcome {
     /// whole-table reclaims in use, so it declined a `deletion_mode: auto` table's
     /// reclaim rather than wait holding its compaction permit. A later tick tries
     /// again. A sustained rate says many tables are reclaiming at once.
-    DeclinedReclaimBudget,
+    DeclinedReclaimBudgetBusy,
     /// A `deletion_mode: auto` table on position deletes captured more than its
     /// position-delete bound for a whole-table reclaim, so it moved to key
     /// deletes instead of rewriting itself whole.
@@ -175,7 +175,7 @@ impl CompactionOutcome {
         Self::DeclinedSizingFailed,
         Self::DeclinedNoCleanPrefix,
         Self::DeclinedPaced,
-        Self::DeclinedReclaimBudget,
+        Self::DeclinedReclaimBudgetBusy,
         Self::DeclinedOverPositionBound,
     ];
 
@@ -199,7 +199,7 @@ impl CompactionOutcome {
             Self::DeclinedSizingFailed => "declined_sizing_failed",
             Self::DeclinedNoCleanPrefix => "declined_no_clean_prefix",
             Self::DeclinedPaced => "declined_paced",
-            Self::DeclinedReclaimBudget => "declined_reclaim_budget",
+            Self::DeclinedReclaimBudgetBusy => "declined_reclaim_budget_busy",
             Self::DeclinedOverPositionBound => "declined_over_position_bound",
         }
     }

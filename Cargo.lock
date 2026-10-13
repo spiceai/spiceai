@@ -3783,6 +3783,8 @@ dependencies = [
  "libc",
  "loom",
  "object_store 0.13.2",
+ "opentelemetry",
+ "opentelemetry_sdk",
  "parking_lot",
  "paste",
  "roaring",

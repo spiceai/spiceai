@@ -1074,7 +1074,7 @@ async fn hold_every_reclaim_permit() -> tokio::sync::OwnedSemaphorePermit {
 
 /// A background compaction pass holds a compaction permit, so while every reclaim
 /// permit is held its whole-table reclaim of an auto table declines, as
-/// `declined_reclaim_budget`, instead of waiting with that permit held, and rewrites
+/// `declined_reclaim_budget_busy`, instead of waiting with that permit held, and rewrites
 /// nothing.
 #[tokio::test]
 async fn a_background_pass_declines_an_auto_reclaim_while_the_reclaim_budget_is_in_use() {
@@ -1117,8 +1117,8 @@ async fn a_background_pass_declines_an_auto_reclaim_while_the_reclaim_budget_is_
     drop(held);
     assert_eq!(
         (declined, rewrote),
-        (Some(CompactionOutcome::DeclinedReclaimBudget), false),
-        "the background pass declined as declined_reclaim_budget and rewrote nothing"
+        (Some(CompactionOutcome::DeclinedReclaimBudgetBusy), false),
+        "the background pass declined as declined_reclaim_budget_busy and rewrote nothing"
     );
     assert_eq!(
         provider.last_small_file_compact_path(),
@@ -1195,6 +1195,103 @@ async fn an_auto_reclaim_over_the_memory_ceiling_takes_no_reclaim_permit() {
     let rows = collect_id_value_pairs(&ctx, &provider, name).await;
     let expected: Vec<(i64, i64)> = keys.iter().map(|id| (*id, 100)).collect();
     assert_eq!(rows, expected, "every row is still there, once");
+}
+
+/// A reclaim waiting for a permit holds back no reclaim over the memory ceiling.
+/// It waits before it takes the table's compaction lock, so the lock stays free
+/// for another pass, and it re-checks the deletion index while it waits, so once
+/// the table crosses its ceiling it reclaims without a permit, every permit still
+/// held.
+#[tokio::test]
+async fn a_reclaim_waiting_for_a_permit_holds_back_no_reclaim_over_the_memory_ceiling() {
+    use datafusion::execution::memory_pool::GreedyMemoryPool;
+    use datafusion_execution::runtime_env::RuntimeEnvBuilder;
+
+    // ~32 bytes a tombstone, so 1M tombstones (≈32 MiB) sit over 25% of a 64 MiB
+    // pool, which still leaves the rewrite room to scan the table.
+    const POOL_BYTES: usize = 64 * 1024 * 1024;
+    let runtime_env = Arc::new(
+        RuntimeEnvBuilder::new()
+            .with_memory_pool(Arc::new(GreedyMemoryPool::new(POOL_BYTES)))
+            .build()
+            .expect("finite-pool runtime env"),
+    );
+    let name = "auto_waiting_reclaim_ceiling";
+    let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+        name,
+        runtime_env,
+        table_config(DeletionMode::Auto, 256),
+    )
+    .await;
+    let keys: Vec<i64> = (0..16).collect();
+    write(&provider, &keys, 100).await;
+    // Delete-only tombstones for keys the table never held, at the first
+    // sequence: they hide no row, and the rewrite's cutoff covers every one. 16
+    // put the index past its trigger; the million below, past its ceiling.
+    let absent = |count: i64| -> Vec<(i64, i64)> {
+        (1_000_000..1_000_000 + count).map(|key| (key, 1)).collect()
+    };
+    install_int64_deletes(&provider, &absent(16));
+    assert!(
+        provider.should_capture_positions(),
+        "premise: the table is on position deletes"
+    );
+    assert!(
+        provider.deletion_index_reclaim_trigger().is_some(),
+        "premise: the whole-table reclaim is due"
+    );
+    assert!(
+        !provider.deletion_index_over_memory_ceiling(),
+        "premise: the index is under its memory ceiling"
+    );
+
+    let provider = Arc::new(provider);
+    let held = hold_every_reclaim_permit().await;
+    let waiting = tokio::spawn({
+        let provider = Arc::clone(&provider);
+        async move { provider.compact_current_snapshot_small_files().await }
+    });
+    // Let the pass run up to its wait for a permit.
+    for _ in 0..20 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !waiting.is_finished(),
+        "premise: the pass waits for a permit"
+    );
+    let lock_free = provider.compaction_lock.try_write().is_ok();
+    assert!(lock_free, "the waiting pass holds no compaction lock");
+
+    install_int64_deletes(&provider, &absent(1_000_000));
+    assert!(
+        provider.deletion_index_over_memory_ceiling(),
+        "premise: 1M tombstones exceed 25% of the {POOL_BYTES}-byte pool"
+    );
+
+    let committed = tokio::time::timeout(Duration::from_secs(30), waiting)
+        .await
+        .expect("the waiting pass reclaimed over the ceiling without a permit")
+        .expect("the pass's task")
+        .expect("reclaim pass");
+    assert!(
+        committed,
+        "the whole-table reclaim committed, every permit still held"
+    );
+    drop(held);
+    assert_eq!(
+        provider.last_small_file_compact_path(),
+        LastSmallFileCompactPath::Full,
+        "the reclaim rewrote the table whole"
+    );
+    assert_eq!(
+        provider.deletion_index_len(),
+        0,
+        "the reclaim cleared the index"
+    );
+    let ctx = SessionContext::new();
+    let rows = collect_id_value_pairs(&ctx, &provider, name).await;
+    let expected: Vec<(i64, i64)> = keys.iter().map(|id| (*id, 100)).collect();
+    assert_eq!(rows, expected, "every key shows its row, once");
 }
 
 /// The whole-table reclaim of an auto table on key deletes takes no permit from

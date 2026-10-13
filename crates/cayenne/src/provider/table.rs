@@ -20496,6 +20496,27 @@ impl CayenneTableProvider {
             },
         );
 
+        // An `auto` table's whole-table reclaim takes its permit from the
+        // process-wide reclaim budget before this pass takes the table's
+        // `compaction_lock`, so a pass that waits for one holds nothing another
+        // pass needs, least of all the lock a reclaim over the memory ceiling
+        // takes without a permit. Held for the rewrite, and taken before it is
+        // timed: a wait is not reclaim time, and does not count toward the pace.
+        let _reclaim_permit = match deletion_index_trigger {
+            Some(trigger) => match self.whole_table_reclaim_permit(trigger).await {
+                Ok(permit) => permit,
+                Err(declined) => {
+                    maintenance_metrics::track_compaction(
+                        table_name,
+                        CompactionKind::SubsetCurrent,
+                        declined,
+                    );
+                    return Ok(false);
+                }
+            },
+            None => None,
+        };
+
         let Ok(_guard) = self.compaction_lock.try_write() else {
             maintenance_metrics::track_compaction(
                 table_name,
@@ -20519,7 +20540,23 @@ impl CayenneTableProvider {
         // deletes instead, and the seq-prefix bake reclaims the index from the next
         // trigger on. The size is read here, under `compaction_lock`, because this
         // pass is the one about to pay for the rewrite.
-        let mut deletion_index_trigger = deletion_index_trigger;
+        // The trigger was read before this pass took the lock, and before any wait
+        // for a reclaim permit: another pass may have reclaimed the index since,
+        // or the table may have crossed its memory ceiling. Read it again.
+        let mut deletion_index_trigger = if deletion_index_trigger.is_some() {
+            let reclaim = self.deletion_index_reclaim_decision();
+            if reclaim.trigger().is_none() && !small_files {
+                maintenance_metrics::track_compaction(
+                    table_name,
+                    CompactionKind::SubsetCurrent,
+                    reclaim.declined_outcome(),
+                );
+                return Ok(false);
+            }
+            reclaim.trigger()
+        } else {
+            None
+        };
         if let Some(auto) = self.pk_deletion_mode.auto()
             && auto.uses_positions()
         {
@@ -20615,19 +20652,6 @@ impl CayenneTableProvider {
         // hold a single settled file while the index carries every tombstone the
         // table has recorded. Only the full rewrite clears the index.
         if let Some(trigger) = deletion_index_trigger {
-            // Held for the rewrite, and taken before it is timed: a wait for a permit
-            // is not reclaim time, and does not count toward the table's pace.
-            let _reclaim_permit = match self.whole_table_reclaim_permit(trigger).await {
-                Ok(permit) => permit,
-                Err(declined) => {
-                    maintenance_metrics::track_compaction(
-                        table_name,
-                        CompactionKind::SubsetCurrent,
-                        declined,
-                    );
-                    return Ok(false);
-                }
-            };
             self.log_snapshot_maintenance_trigger(trigger);
             let committed = self
                 .rewrite_current_snapshot_for_reclaim_tracked(position_guards)
@@ -23873,10 +23897,12 @@ impl CayenneTableProvider {
     /// where the rewrite is the OOM guard and nothing may hold it back.
     ///
     /// A background pass already holds a compaction permit, so when no reclaim
-    /// permit is free it declines as `declined_reclaim_budget` and a later tick
-    /// tries again:
-    /// waiting, it would hold the compaction permit other tables' background
-    /// compaction needs. Any other pass waits for one.
+    /// permit is free it declines as `declined_reclaim_budget_busy` and a later
+    /// tick tries again: waiting, it would hold the compaction permit other
+    /// tables' background compaction needs. Any other pass waits for one, before
+    /// it takes the table's `compaction_lock`, and re-checks the deletion index
+    /// every [`RECLAIM_PERMIT_CEILING_RECHECK`] while it waits: a table that
+    /// crosses its memory ceiling meanwhile reclaims without a permit.
     async fn whole_table_reclaim_permit(
         &self,
         trigger: SnapshotMaintenanceTrigger,
@@ -23897,9 +23923,22 @@ impl CayenneTableProvider {
             return budget
                 .try_acquire_owned()
                 .map(Some)
-                .map_err(|_| CompactionOutcome::DeclinedReclaimBudget);
+                .map_err(|_| CompactionOutcome::DeclinedReclaimBudgetBusy);
         }
-        Ok(budget.acquire_owned().await.ok())
+        // One acquisition for the whole wait, so the pass keeps its place in the
+        // queue across the re-checks.
+        let acquire = budget.acquire_owned();
+        tokio::pin!(acquire);
+        loop {
+            tokio::select! {
+                permit = &mut acquire => return Ok(permit.ok()),
+                () = tokio::time::sleep(RECLAIM_PERMIT_CEILING_RECHECK) => {
+                    if self.deletion_index_over_memory_ceiling() {
+                        return Ok(None);
+                    }
+                }
+            }
+        }
     }
 
     async fn rewrite_current_snapshot_tracked(
@@ -41176,6 +41215,11 @@ fn auto_switched_to_key_deletes_message(dataset: &str, max_position_bytes: u64) 
         "Dataset '{dataset}' grew past {bound} on disk, the largest size `cayenne_deletion_mode: auto` keeps on position deletes, so it now uses key deletes: queries still see every write, applying recent updates and deletes as they read until compaction merges them in. See: https://spiceai.org/docs/components/data-accelerators/cayenne#deletion-strategies"
     )
 }
+
+/// How often a pass waiting for a whole-table reclaim permit re-checks its
+/// table's deletion index against the memory ceiling: over it, the reclaim is the
+/// OOM guard and runs without a permit.
+const RECLAIM_PERMIT_CEILING_RECHECK: Duration = Duration::from_secs(1);
 
 /// The line a table logs when `deletion_mode: auto` cannot size it as it loads,
 /// and so starts it on key deletes until it next loads.
