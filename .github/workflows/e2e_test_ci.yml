@@ -1950,24 +1950,21 @@ jobs:
           working-directory: test_app
 
   test_results_caching_source_down:
-    name: 'Test results caching with the source down on ${{ matrix.target.name }}'
-    runs-on: ${{ matrix.target.runner }}
+    name: 'Test results caching with the source down'
+    # Linux only: what it checks, that a cache miss reads the acceleration while the
+    # source is unreadable, does not depend on the platform.
+    runs-on: spiceai-dev-runners
     needs:
       - build
-      - setup-matrix
     timeout-minutes: 5
-
-    strategy:
-      matrix:
-        target: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
-      - name: download artifacts - build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+      - name: download artifacts - build_linux_x86_64
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
-          name: build_${{ matrix.target.target_os }}_${{ matrix.target.target_arch }}
+          name: build_linux_x86_64
           path: ./build
 
       - name: Install spice
