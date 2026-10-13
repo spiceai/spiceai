@@ -942,6 +942,99 @@ async fn an_auto_table_folds_a_key_repeated_within_one_write() {
     }
 }
 
+/// A writer-concurrent full rewrite holds `write_lock` only to capture what it
+/// reads. A write can land after that capture, before the rewrite builds its plan,
+/// and the rewrite then reads none of that write's rows and keeps the deletes that
+/// hide the rows it replaced.
+#[tokio::test]
+async fn a_write_landing_after_a_rewrites_capture_stays_right() {
+    for mode in [DeletionMode::Key, DeletionMode::Auto] {
+        let name = format!("post_capture_write_{}", mode.as_str());
+        let ctx = SessionContext::new();
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
+            &name,
+            ctx.runtime_env(),
+            VortexConfig {
+                deletion_mode: mode,
+                cdc_durability: crate::metadata::CdcDurability::File,
+                inline_max_rows: 0,
+                inline_max_bytes: 0,
+                inline_max_buffer_bytes: 0,
+                compaction_background_interval_ms: 3_600_000,
+                ..VortexConfig::default()
+            },
+        )
+        .await;
+        let ids: Vec<i64> = (0..8).collect();
+        write(&provider, &ids, 100).await;
+        provider
+            .rewrite_current_snapshot_for_compaction_tracked(None)
+            .await
+            .expect("fold the seed into the current snapshot");
+        // Deletes for the rewrite to fold: every key upserted once more.
+        write(&provider, &ids, 200).await;
+
+        // After the rewrite releases `write_lock` and before it builds its plan,
+        // upsert half the keys again and add new ones.
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel::<()>();
+        let (resume_tx, resume_rx) = tokio::sync::oneshot::channel::<()>();
+        *provider.test_rewrite_post_capture_hook.lock() = Some(Box::new(move || {
+            Box::pin(async move {
+                let _ = reached_tx.send(());
+                let _ = resume_rx.await;
+            })
+        }));
+        let late: Vec<i64> = (0..4).collect();
+        let added: Vec<i64> = (100..104).collect();
+        let rewrite = async {
+            let _pass = provider.compaction_lock.write().await;
+            provider
+                .rewrite_current_snapshot_for_compaction()
+                .await
+                .expect("rewrite")
+        };
+        let late_writes = async {
+            reached_rx
+                .await
+                .expect("the rewrite reaches the point after its capture");
+            let schema = Arc::clone(&provider.table_metadata.schema);
+            let wrote = tokio::time::timeout(Duration::from_secs(10), async {
+                insert_batch(
+                    &provider,
+                    id_value_batch(Arc::clone(&schema), &late, &vec![300; late.len()]),
+                )
+                .await;
+                insert_batch(
+                    &provider,
+                    id_value_batch(schema, &added, &vec![400; added.len()]),
+                )
+                .await;
+            })
+            .await
+            .is_ok();
+            resume_tx.send(()).expect("resume the rewrite");
+            wrote
+        };
+        let (committed, wrote) = tokio::join!(rewrite, late_writes);
+        assert!(
+            wrote,
+            "{mode:?}: the writes waited for the rewrite, which still held write_lock after its capture"
+        );
+        assert!(
+            committed,
+            "{mode:?}: premise: the rewrite commits with the writes landed after its capture"
+        );
+        let mut expected: Vec<(i64, i64)> = late.iter().map(|id| (*id, 300)).collect();
+        expected.extend((4..8).map(|id| (id, 200)));
+        expected.extend(added.iter().map(|id| (*id, 400)));
+        assert_eq!(
+            collect_id_value_pairs(&ctx, &provider, &name).await,
+            expected,
+            "{mode:?}: every key has its latest value after the rewrite"
+        );
+    }
+}
+
 /// A pipelined staged upsert reserves its sequences under `write_lock` (stage A)
 /// and publishes its replacement rows and tombstones later, without it (stage B).
 /// A writer-concurrent full rewrite that captured its cutoff while such a write

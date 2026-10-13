@@ -2126,6 +2126,11 @@ pub struct CayenneTableProvider {
     /// can order a staged write's publish against it. Consumed on first fire.
     #[cfg(test)]
     pub(crate) test_rewrite_capture_probe: Arc<ParkingMutex<Option<TestRewriteCaptureProbe>>>,
+    /// Test-only hook run by the writer-concurrent full rewrite after it releases
+    /// `write_lock`, before it builds its plan from the captured view. Consumed on
+    /// first fire.
+    #[cfg(test)]
+    pub(crate) test_rewrite_post_capture_hook: Arc<ParkingMutex<Option<TestPostCaptureHook>>>,
     /// Protected snapshot IDs that should skip deletion filtering.
     ///
     /// When data is inserted while pending deletions exist, the new data is written
@@ -9677,6 +9682,8 @@ impl CayenneTableProvider {
             test_pre_rewrite_commit_hook: Arc::new(ParkingMutex::new(None)),
             #[cfg(test)]
             test_rewrite_capture_probe: Arc::new(ParkingMutex::new(None)),
+            #[cfg(test)]
+            test_rewrite_post_capture_hook: Arc::new(ParkingMutex::new(None)),
             table_schema: Arc::new(ArcSwap::new(Arc::<arrow_schema::Schema>::clone(
                 &table_metadata.schema,
             ))),
@@ -12013,6 +12020,8 @@ impl CayenneTableProvider {
             test_pre_rewrite_commit_hook: Arc::clone(&self.test_pre_rewrite_commit_hook),
             #[cfg(test)]
             test_rewrite_capture_probe: Arc::clone(&self.test_rewrite_capture_probe),
+            #[cfg(test)]
+            test_rewrite_post_capture_hook: Arc::clone(&self.test_rewrite_post_capture_hook),
             protected_snapshots: Arc::clone(&self.protected_snapshots),
             protected_snapshot_age_warning_keys: Arc::clone(
                 &self.protected_snapshot_age_warning_keys,
@@ -23992,84 +24001,99 @@ impl CayenneTableProvider {
                 snapshot_id_before,
             )
         } else {
-            let _capture_guard = self.write_lock_arc().lock_owned().await;
-            #[cfg(test)]
-            let capture_probe =
-                self.test_rewrite_capture_probe
-                    .lock()
-                    .take()
-                    .map(|(write_lock_held, captured)| {
+            let (scan_view, scope, generation_before, snapshot_id_before) = {
+                let _capture_guard = self.write_lock_arc().lock_owned().await;
+                #[cfg(test)]
+                let capture_probe = self.test_rewrite_capture_probe.lock().take().map(
+                    |(write_lock_held, captured)| {
                         let _ = write_lock_held.send(());
                         captured
-                    });
-            // A pipelined staged write reserves its sequences under `write_lock`
-            // (stage A) and publishes its rows and tombstones later without it
-            // (stage B). One that reserved before the cutoff below and published
-            // after it would land tombstones at or below that cutoff, which the
-            // commit then prunes, while the rows they hide sit in this rewrite's
-            // output. Holding `write_lock` blocks new stage A commits and stage B
-            // needs only the visibility lock and listing fence, so draining here
-            // leaves no write straddling the cutoff.
-            if !self
-                .drain_inflight_staged_writes(STAGED_WRITE_DRAIN_TIMEOUT)
-                .await
-            {
-                tracing::debug!(
-                    target: "cayenne::compaction",
-                    table = self.table_metadata.table_name.as_str(),
-                    "Aborting full rewrite: in-flight staged writes did not drain; will retry on a later trigger",
+                    },
                 );
-                maintenance_metrics::track_compaction(
-                    table_name,
-                    CompactionKind::Full,
-                    CompactionOutcome::AbortedConcurrentChange,
-                );
-                return Ok(false);
-            }
-            // Defense-in-depth for table replacement while this pass encodes.
-            // Promotion is serialized by `compaction_lock`; overwrite/reopened
-            // providers may still flip `current_snapshot_id` without moving the
-            // current-dir generation, so revalidate before catalog publish.
-            let snapshot_id_before = self.get_current_snapshot_id();
-            self.drain_mem_tier_before_rewrite_scan().await?;
-            if self.cached_inlined_row_count() > 0 {
-                self.checkpoint_inlined_data().await?;
-            }
-            let folded_before = self.protected_snapshot_ids();
-            let (stream, generation_before) =
-                self.visible_file_stream_for_rewrite(&ctx, &order).await?;
-            let cutoff = self.sequence_high_water().await;
+                // A pipelined staged write reserves its sequences under `write_lock`
+                // (stage A) and publishes its rows and tombstones later without it
+                // (stage B). One that reserved before the cutoff below and published
+                // after it would land tombstones at or below that cutoff, which the
+                // commit then prunes, while the rows they hide sit in this rewrite's
+                // output. Holding `write_lock` blocks new stage A commits and stage B
+                // needs only the visibility lock and listing fence, so draining here
+                // leaves no write straddling the cutoff.
+                if !self
+                    .drain_inflight_staged_writes(STAGED_WRITE_DRAIN_TIMEOUT)
+                    .await
+                {
+                    tracing::debug!(
+                        target: "cayenne::compaction",
+                        table = self.table_metadata.table_name.as_str(),
+                        "Aborting full rewrite: in-flight staged writes did not drain; will retry on a later trigger",
+                    );
+                    maintenance_metrics::track_compaction(
+                        table_name,
+                        CompactionKind::Full,
+                        CompactionOutcome::AbortedConcurrentChange,
+                    );
+                    return Ok(false);
+                }
+                // Defense-in-depth for table replacement while this pass encodes.
+                // Promotion is serialized by `compaction_lock`; overwrite/reopened
+                // providers may still flip `current_snapshot_id` without moving the
+                // current-dir generation, so revalidate before catalog publish.
+                let snapshot_id_before = self.get_current_snapshot_id();
+                self.drain_mem_tier_before_rewrite_scan().await?;
+                if self.cached_inlined_row_count() > 0 {
+                    self.checkpoint_inlined_data().await?;
+                }
+                let folded_before = self.protected_snapshot_ids();
+                // Only the capture holds `write_lock`. The view pins the files,
+                // deletions and tiers this rewrite reads, as of the cutoff below; its
+                // plan is built after the lock is released, from the view alone, as a
+                // query's plan is, so writers wait for the capture but not for the plan
+                // build, which under load took most of the time this held the lock.
+                let (scan_view, generation_before) = self.rewrite_scan_view(&ctx).await?;
+                let cutoff = self.sequence_high_water().await;
+                #[cfg(test)]
+                if let Some(captured) = capture_probe {
+                    let _ = captured.send(());
+                }
+                let folded_after = self.protected_snapshot_ids();
+                if folded_before != folded_after {
+                    // A concurrent finalize published a protected snapshot during the
+                    // scan; we can no longer tell which snapshots the scan folded.
+                    // Abort before any new snapshot dir is created; retry next trigger.
+                    tracing::debug!(
+                        target: "cayenne::compaction",
+                        table = self.table_metadata.table_name.as_str(),
+                        "Aborting full rewrite: protected-snapshot set changed during scan \
+                         (concurrent finalize); will retry on the next trigger",
+                    );
+                    maintenance_metrics::track_compaction(
+                        table_name,
+                        CompactionKind::Full,
+                        CompactionOutcome::AbortedConcurrentChange,
+                    );
+                    return Ok(false);
+                }
+                (
+                    scan_view,
+                    RewriteScope::Fenced {
+                        cutoff,
+                        folded: folded_before,
+                    },
+                    generation_before,
+                    snapshot_id_before,
+                )
+            };
             #[cfg(test)]
-            if let Some(captured) = capture_probe {
-                let _ = captured.send(());
+            {
+                let hook = self.test_rewrite_post_capture_hook.lock().take();
+                if let Some(hook) = hook {
+                    hook().await;
+                }
             }
-            let folded_after = self.protected_snapshot_ids();
-            if folded_before != folded_after {
-                // A concurrent finalize published a protected snapshot during the
-                // scan; we can no longer tell which snapshots the scan folded.
-                // Abort before any new snapshot dir is created; retry next trigger.
-                tracing::debug!(
-                    target: "cayenne::compaction",
-                    table = self.table_metadata.table_name.as_str(),
-                    "Aborting full rewrite: protected-snapshot set changed during scan \
-                     (concurrent finalize); will retry on the next trigger",
-                );
-                maintenance_metrics::track_compaction(
-                    table_name,
-                    CompactionKind::Full,
-                    CompactionOutcome::AbortedConcurrentChange,
-                );
-                return Ok(false);
-            }
-            (
-                stream,
-                RewriteScope::Fenced {
-                    cutoff,
-                    folded: folded_before,
-                },
-                generation_before,
-                snapshot_id_before,
-            )
+            let stream = self
+                .rewrite_stream_from_view(&ctx, &order, scan_view)
+                .await?;
+            (stream, scope, generation_before, snapshot_id_before)
         };
 
         // An `auto` table on position deletes reclaims by rewriting itself whole
@@ -24617,6 +24641,37 @@ impl CayenneTableProvider {
     /// deliberately tracks ONLY current-dir publishes — not the rewrite's own
     /// output write or background mem-tier checkpoints — so the fence does not
     /// abort on changes that leave the current dir untouched.
+    /// The scan view a writer-concurrent full rewrite reads, captured as a query
+    /// captures one, and the current-dir generation sampled before it. Flushes the
+    /// inline memtable first, so the view covers every visible row.
+    async fn rewrite_scan_view(&self, ctx: &SessionContext) -> Result<(Arc<ScanView>, u64)> {
+        if self.cached_inlined_row_count() > 0 {
+            self.checkpoint_inlined_data().await?;
+        }
+        let generation_before = self.current_dir_generation.load(Ordering::Relaxed);
+        let state = ctx.state();
+        let reuse = self.prepare_scan(&state, &[]).await?;
+        let scan_view = self.scan_view_at_current_input(reuse).await?;
+        Ok((scan_view, generation_before))
+    }
+
+    /// The rewrite's stream over `scan_view` (see [`Self::rewrite_scan_view`]), in
+    /// `order`.
+    async fn rewrite_stream_from_view(
+        &self,
+        ctx: &SessionContext,
+        order: &RewriteOrder,
+        scan_view: Arc<ScanView>,
+    ) -> Result<SendableRecordBatchStream> {
+        let state = ctx.state();
+        let plan = self
+            .plan_scan_from_view(&state, None, &[], None, scan_view)
+            .await?;
+        let task_ctx = ctx.task_ctx();
+        let ordered = self.order_rewrite_plan(plan, order, &task_ctx)?;
+        Ok(datafusion_physical_plan::execute_stream(ordered, task_ctx)?)
+    }
+
     async fn visible_file_stream_for_rewrite(
         &self,
         ctx: &SessionContext,
@@ -39329,32 +39384,14 @@ fn i64_eq_literal_on_schema(schema: &SchemaRef, filters: &[Expr]) -> Option<(usi
     None
 }
 
-#[async_trait]
-impl TableProvider for CayenneTableProvider {
-    fn schema(&self) -> SchemaRef {
-        // Advertise the view-typed read schema (string/binary -> view) so
-        // DataFusion plans the whole query — joins, aggregates, sorts — on view
-        // arrays, avoiding the i32 2 GiB offset overflow in hash-join build-side
-        // `concat_batches`. The stored schema (table_schema) stays Utf8/Binary
-        // for writes/CDC/stats; scan() decodes the matching view types.
-        self.read_schema()
-    }
-
-    fn table_type(&self) -> TableType {
-        TableType::Base
-    }
-
-    fn constraints(&self) -> Option<&Constraints> {
-        self.pk_constraints.as_ref()
-    }
-
-    async fn scan(
+impl CayenneTableProvider {
+    /// What a scan does before it captures its view (see [`Self::plan_scan_from_view`]),
+    /// and how that capture may reuse a cached view.
+    async fn prepare_scan(
         &self,
         state: &dyn Session,
-        projection: Option<&Vec<usize>>,
         filters: &[Expr],
-        limit: Option<usize>,
-    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+    ) -> datafusion_common::Result<ScanViewReuse> {
         // F4 default-on layout: record which columns this scan filters on so
         // background compaction can cluster cold files without spicepod setup.
         // Cheap (mutex + HashMap bump); empty filters are a no-op.
@@ -39403,31 +39440,27 @@ impl TableProvider for CayenneTableProvider {
         // or once every file has been verified this process.
         self.verify_data_file_integrity().await?;
 
-        // Obtain the scan-view bundle from the demand cache. See
-        // [`Self::scan_view_at_current_input`]. The KDI merge + visible mem-tier
-        // segments are computed OFF the query path (in `spawn_blocking`) and
-        // deduplicated across concurrent scans on the same state, so the scan no
-        // longer recomputes them per-scan (the retired memos' job).
-        // Everything below descends from that ONE capture, so it is internally
-        // consistent (the merged deletions hide the old copies of the exact rows this
-        // scan sees), and the bundle's `scan_guard` pins the captured snapshot dirs
-        // for the full scan lifetime, so plan-build runs WITHOUT the listing fence.
-        //
-        // The fields are cloned out (cheap `Arc` / short-`String` / `im`-HAMT clones)
-        // so downstream plan-build owns them exactly as when it captured inline.
-        let reuse = if state.config().get_extension::<CurrentScanView>().is_some() {
-            ScanViewReuse::UntilInvalidated
-        } else {
-            self.scan_view_reuse
-        };
-        let scan_view = self.scan_view_at_current_input(reuse).await?;
-        #[cfg(test)]
-        {
-            let hook = self.test_post_scan_view_selection_hook.lock().take();
-            if let Some(hook) = hook {
-                hook().await;
-            }
-        }
+        Ok(
+            if state.config().get_extension::<CurrentScanView>().is_some() {
+                ScanViewReuse::UntilInvalidated
+            } else {
+                self.scan_view_reuse
+            },
+        )
+    }
+
+    /// A scan's plan over `scan_view`. Everything the plan reads descends from that
+    /// one capture, and its `scan_guard` pins the captured snapshot dirs, so the plan
+    /// can be built after any lock the capture was taken under is released: it reads
+    /// exactly the captured state whatever lands meanwhile.
+    async fn plan_scan_from_view(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+        scan_view: Arc<ScanView>,
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
         let warm_files = scan_view.raw.warm_files.clone();
         let mem_tier_any_rows = scan_view.raw.mem_tier_shards.iter().any(|s| !s.is_empty());
         let maintained_aggregate_epoch = scan_view.raw.maintained_aggregate_epoch;
@@ -39932,6 +39965,58 @@ impl TableProvider for CayenneTableProvider {
             maintained_aggregate_epoch,
             lookup_index_explain,
         ))
+    }
+}
+
+#[async_trait]
+impl TableProvider for CayenneTableProvider {
+    fn schema(&self) -> SchemaRef {
+        // Advertise the view-typed read schema (string/binary -> view) so
+        // DataFusion plans the whole query — joins, aggregates, sorts — on view
+        // arrays, avoiding the i32 2 GiB offset overflow in hash-join build-side
+        // `concat_batches`. The stored schema (table_schema) stays Utf8/Binary
+        // for writes/CDC/stats; scan() decodes the matching view types.
+        self.read_schema()
+    }
+
+    fn table_type(&self) -> TableType {
+        TableType::Base
+    }
+
+    fn constraints(&self) -> Option<&Constraints> {
+        self.pk_constraints.as_ref()
+    }
+
+    async fn scan(
+        &self,
+        state: &dyn Session,
+        projection: Option<&Vec<usize>>,
+        filters: &[Expr],
+        limit: Option<usize>,
+    ) -> datafusion_common::Result<Arc<dyn ExecutionPlan>> {
+        let reuse = self.prepare_scan(state, filters).await?;
+        // Obtain the scan-view bundle from the demand cache. See
+        // [`Self::scan_view_at_current_input`]. The KDI merge + visible mem-tier
+        // segments are computed OFF the query path (in `spawn_blocking`) and
+        // deduplicated across concurrent scans on the same state, so the scan no
+        // longer recomputes them per-scan (the retired memos' job).
+        // Everything below descends from that ONE capture, so it is internally
+        // consistent (the merged deletions hide the old copies of the exact rows this
+        // scan sees), and the bundle's `scan_guard` pins the captured snapshot dirs
+        // for the full scan lifetime, so plan-build runs WITHOUT the listing fence.
+        //
+        // The fields are cloned out (cheap `Arc` / short-`String` / `im`-HAMT clones)
+        // so downstream plan-build owns them exactly as when it captured inline.
+        let scan_view = self.scan_view_at_current_input(reuse).await?;
+        #[cfg(test)]
+        {
+            let hook = self.test_post_scan_view_selection_hook.lock().take();
+            if let Some(hook) = hook {
+                hook().await;
+            }
+        }
+        self.plan_scan_from_view(state, projection, filters, limit, scan_view)
+            .await
     }
 
     // Filter-pushdown exactness contract (read before changing the arms below):
