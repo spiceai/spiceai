@@ -27236,9 +27236,15 @@ impl CayenneTableProvider {
             });
         }
         if clean_prefix_holds {
+            // Capped at the delete fence: every tombstone at or below it was in the
+            // index the merge applied, so it hides no row of the merged output, while
+            // one published after the capture with a sequence between the fence and
+            // the prefix cutoff may still hide one (the output applies deletions
+            // above the fence).
+            let off_fence_cutoff = prune_cutoff.min(fence_max_delete_seq);
             // Boxed: the bake is one of the crate's largest futures (see
             // `snapshot_bytes_for_merge_budget`), and the prune's state need not grow it.
-            Box::pin(self.prune_deletion_index_after_bake(prune_cutoff, &snapshot_at_capture))
+            Box::pin(self.prune_deletion_index_after_bake(off_fence_cutoff, &snapshot_at_capture))
                 .await?;
         }
 
