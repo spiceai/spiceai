@@ -76397,21 +76397,34 @@ mod tests {
         );
     }
 
-    /// A statement upsert too large to inline validates the rows it buffers, falls
-    /// back to writing a new snapshot, and publishes that snapshot with the deletions
-    /// its validation chose. A one-shard checkpoint that moves key 7's inline row into
-    /// a file between the fallback and the publication leaves the write superseding
-    /// key 7 only in the inline corpus, beside its new row.
+    /// A statement upsert whose rows fit the inline row cap but whose encoding exceeds
+    /// `inline_max_bytes` validates its rows while buffering them, falls back to
+    /// writing a new snapshot, and publishes that snapshot with the deletions its
+    /// validation chose. A one-shard checkpoint that moves key 7's inline row into a
+    /// file between the fallback and the publication leaves the write superseding key
+    /// 7 only in the inline corpus, beside its new row.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn an_upsert_published_after_a_checkpoint_moved_its_key_replaces_the_flushed_row() {
         let ctx = SessionContext::new();
-        let (provider, _catalog, _tmp) = create_sharded_cdc_upsert_table_with_cap(
+        // `create_sharded_cdc_upsert_table_with_cap`'s one-shard table, with an inline
+        // byte cap a few hundred rows exceed.
+        let (provider, _catalog, _tmp) = create_cdc_upsert_table_with_vortex_config(
             "pk_fallback_checkpoint_race",
             ctx.runtime_env(),
-            1,
-            0,
+            VortexConfig {
+                cdc_durability: crate::metadata::CdcDurability::Memory,
+                deletion_mode: crate::metadata::DeletionMode::Key,
+                inline_max_rows: 1024,
+                inline_max_bytes: 4096,
+                cdc_mem_tier_min_flush_bytes: 0,
+                cdc_mem_tier_max_bytes: 0,
+                cdc_mem_tier_shards: 1,
+                ..VortexConfig::default()
+            },
         )
         .await;
+        assert!(provider.is_cdc_memory_mode(), "memory mode must be active");
+        provider.install_slot_advancer(Arc::new(NoopSlotAdvancer));
         let schema = Arc::clone(&provider.table_metadata.schema);
 
         apply_upsert_burst(&ctx, &provider, Arc::clone(&schema), &[(100, 1)]).await;
@@ -76422,9 +76435,9 @@ mod tests {
         )
         .await;
 
-        // More rows than the table's `inline_max_rows` (1024), so the upsert falls back
-        // to a new snapshot.
-        let ids: Vec<i64> = std::iter::once(7).chain(10_000..11_100).collect();
+        // Within `inline_max_rows`, so the write is collapsed and tries to inline, but
+        // its encoding exceeds `inline_max_bytes`, so it falls back to a new snapshot.
+        let ids: Vec<i64> = std::iter::once(7).chain(10_000..10_500).collect();
         let values = vec![2; ids.len()];
         let attempt = install_checkpoint_attempt(&provider, &provider.test_pre_staged_publish_hook);
         insert_batch_with_context(
@@ -76459,8 +76472,8 @@ mod tests {
         );
         assert_eq!(
             rows.len(),
-            1 + 1 + 1100,
-            "key 100, key 7 and the 1,100 new keys"
+            1 + 1 + 500,
+            "key 100, key 7 and the 500 new keys"
         );
     }
 
