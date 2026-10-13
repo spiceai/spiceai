@@ -47,7 +47,9 @@ pub fn quote_safe_string_literal(s: &str) -> Option<ast::Expr> {
             pieces.push(ast::Expr::value(Value::SingleQuotedString("'".to_string())));
         }
         if !part.is_empty() {
-            pieces.push(ast::Expr::value(Value::SingleQuotedString(part.to_string())));
+            pieces.push(ast::Expr::value(Value::SingleQuotedString(
+                part.to_string(),
+            )));
         }
     }
 

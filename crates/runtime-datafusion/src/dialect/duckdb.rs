@@ -1446,10 +1446,13 @@ mod tests {
         });
 
         for (value, expected) in [
-            (r"a\b", r#""t"."customer_id" = 'a\b'"#),
-            ("a'b", r#""t"."customer_id" = 'a''b'"#),
-            (r"a\'b", r#""t"."customer_id" = ('a\' || '''' || 'b')"#),
-            ("a''b", r#""t"."customer_id" = ('a' || '''' || '''' || 'b')"#),
+            (r"a\b", r#"("t"."customer_id" = 'a\b')"#),
+            ("a'b", r#"("t"."customer_id" = 'a''b')"#),
+            (r"a\'b", r#"("t"."customer_id" = ('a\' || '''' || 'b'))"#),
+            (
+                "a''b",
+                r#"("t"."customer_id" = ('a' || '''' || '''' || 'b'))"#,
+            ),
         ] {
             let rendered = unparser
                 .expr_to_sql(&column.clone().eq(lit(value)))
