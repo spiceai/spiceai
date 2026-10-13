@@ -123,11 +123,12 @@ fn percentile(sorted: &[f64], pct: f64) -> f64 {
 fn summarize(label: &str, mode: &str, samples: &mut [f64]) {
     samples.sort_by(f64::total_cmp);
     eprintln!(
-        "HARNESS mode={mode} metric={label} n={} p50_ms={:.3} p90_ms={:.3} p99_ms={:.3} max_ms={:.3}",
+        "HARNESS mode={mode} metric={label} n={} p50_ms={:.3} p90_ms={:.3} p99_ms={:.3} p999_ms={:.3} max_ms={:.3}",
         samples.len(),
         percentile(samples, 50.0),
         percentile(samples, 90.0),
         percentile(samples, 99.0),
+        percentile(samples, 99.9),
         samples.last().copied().unwrap_or(f64::NAN),
     );
 }
