@@ -37,8 +37,11 @@ use runtime::{
 };
 use runtime_acceleration::{sidecar::OpenOption, snapshot::SnapshotBehavior};
 use spicepod::{
-    acceleration::{Acceleration, Mode, RefreshMode},
-    component::dataset::{Dataset, TimeFormat},
+    acceleration::{Acceleration, Mode, RefreshMode, WriteMode},
+    component::{
+        access::AccessMode,
+        dataset::{Dataset, TimeFormat},
+    },
     param::Params,
     partitioning::PartitionedBy,
 };
@@ -134,42 +137,16 @@ impl Fixture {
         name: &str,
         settings: &Settings,
     ) -> Result<Vec<i64>, anyhow::Error> {
-        let dataset = self.dataset(name, settings);
-        let app = AppBuilder::new("settings_change_cayenne")
-            .with_dataset(dataset.clone())
-            .build();
-        crate::configure_test_datafusion();
-        let rt = Arc::new(Runtime::builder().with_app(app).build().await);
-        tokio::select! {
-            () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
-                return Err(anyhow::anyhow!("Timed out waiting for dataset '{name}' to load"));
-            }
-            () = Arc::clone(&rt).load_components() => {}
-        }
-        runtime_ready_check(&rt).await;
-
-        let batches: Vec<RecordBatch> = rt
-            .datafusion()
-            .query_builder(&format!("SELECT id FROM {name} ORDER BY id"))
-            .build()
-            .run()
+        self.ids_after_restart_with(self.dataset(name, settings))
             .await
-            .map_err(|e| anyhow::anyhow!("Query of dataset '{name}' failed: {e}"))?
-            .data
-            .try_collect()
-            .await?;
+    }
+
+    /// [`Self::ids_after_restart`] for a dataset built by the caller.
+    async fn ids_after_restart_with(&self, dataset: Dataset) -> Result<Vec<i64>, anyhow::Error> {
+        let rt = start(dataset.clone()).await?;
+        let ids = ids(&rt, &dataset.name).await?;
         wait_for_checkpoint(&rt, dataset).await?;
         rt.shutdown().await;
-
-        let mut ids = Vec::new();
-        for batch in &batches {
-            let column = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int64Array>()
-                .ok_or_else(|| anyhow::anyhow!("`id` is not Int64: {:?}", batch.schema()))?;
-            ids.extend(column.iter().flatten());
-        }
         Ok(ids)
     }
 
@@ -182,6 +159,53 @@ impl Fixture {
         catalog.init().await?;
         Ok(catalog.get_table(name).await?)
     }
+}
+
+/// Starts a runtime serving `dataset` and waits for it to be ready.
+async fn start(dataset: Dataset) -> Result<Arc<Runtime>, anyhow::Error> {
+    let name = dataset.name.clone();
+    let app = AppBuilder::new("settings_change_cayenne")
+        .with_dataset(dataset)
+        .build();
+    crate::configure_test_datafusion();
+    let rt = Arc::new(Runtime::builder().with_app(app).build().await);
+    tokio::select! {
+        () = tokio::time::sleep(std::time::Duration::from_mins(1)) => {
+            return Err(anyhow::anyhow!("Timed out waiting for dataset '{name}' to load"));
+        }
+        () = Arc::clone(&rt).load_components() => {}
+    }
+    runtime_ready_check(&rt).await;
+    Ok(rt)
+}
+
+/// Runs `sql` to completion and returns its batches; a write only happens once its
+/// stream is drained.
+async fn run(rt: &Arc<Runtime>, sql: &str) -> Result<Vec<RecordBatch>, anyhow::Error> {
+    Ok(rt
+        .datafusion()
+        .query_builder(sql)
+        .build()
+        .run()
+        .await
+        .map_err(|e| anyhow::anyhow!("`{sql}` failed: {e}"))?
+        .data
+        .try_collect()
+        .await?)
+}
+
+/// The ids of `name`'s rows, in order.
+async fn ids(rt: &Arc<Runtime>, name: &str) -> Result<Vec<i64>, anyhow::Error> {
+    let mut ids = Vec::new();
+    for batch in &run(rt, &format!("SELECT id FROM {name} ORDER BY id")).await? {
+        let column = batch
+            .column(0)
+            .as_any()
+            .downcast_ref::<Int64Array>()
+            .ok_or_else(|| anyhow::anyhow!("`id` is not Int64: {:?}", batch.schema()))?;
+        ids.extend(column.iter().flatten());
+    }
+    Ok(ids)
 }
 
 /// Waits for the checkpoint the runtime writes once `dataset` has loaded, after it is
@@ -351,6 +375,67 @@ async fn append_acceleration_keeps_stored_identity_settings_on_restart() -> Resu
             let stored = fixture.stored("events").await?;
             assert_eq!(stored.table_id, built.table_id);
             assert_eq!(stored.vortex_config.sort_columns, vec!["id".to_string()]);
+            Ok(())
+        })
+        .await
+}
+
+/// Writes to a `write_mode: acceleration` dataset stay in the acceleration and never reach
+/// the source, so a reload would not bring them back: a primary-key change keeps the stored
+/// settings, and the written rows, even under `refresh_mode: full`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn accelerator_only_writes_keep_their_acceleration_on_a_key_change()
+-> Result<(), anyhow::Error> {
+    let _tracing = crate::init_tracing(Some("integration=debug,info"));
+    test_request_context()
+        .scope(async {
+            let fixture = Fixture::new()?;
+            let dataset = |primary_key: Option<&'static str>| {
+                let mut dataset = fixture.dataset(
+                    "trips",
+                    &Settings {
+                        refresh_mode: Some(RefreshMode::Full),
+                        primary_key,
+                        ..Settings::default()
+                    },
+                );
+                dataset.access = AccessMode::ReadWrite;
+                if let Some(acceleration) = dataset.acceleration.as_mut() {
+                    acceleration.write_mode = WriteMode::Acceleration;
+                }
+                dataset
+            };
+
+            // Built from the source, then given a row only the acceleration holds.
+            let rt = start(dataset(None)).await?;
+            run(
+                &rt,
+                "INSERT INTO trips (id, name, ts) VALUES (9, 'z', 1704499200)",
+            )
+            .await?;
+            let written = ids(&rt, "trips").await?;
+            let checkpointed = wait_for_checkpoint(&rt, dataset(None)).await;
+            rt.shutdown().await;
+            assert_eq!(written, vec![1, 1, 2, 2, 3, 9]);
+            checkpointed?;
+            let built = fixture.stored("trips").await?;
+
+            // A primary key would rebuild a write-through dataset; this one keeps its rows.
+            let ids = fixture.ids_after_restart_with(dataset(Some("id"))).await?;
+            assert_eq!(
+                ids,
+                vec![1, 1, 2, 2, 3, 9],
+                "a row written only to the acceleration must survive the restart"
+            );
+            let kept = fixture.stored("trips").await?;
+            assert_eq!(
+                kept.table_id, built.table_id,
+                "an accelerator-only dataset must not be rebuilt"
+            );
+            assert!(
+                kept.primary_key.is_empty(),
+                "an accelerator-only dataset keeps the primary key it was built with"
+            );
             Ok(())
         })
         .await

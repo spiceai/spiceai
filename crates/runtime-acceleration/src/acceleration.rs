@@ -662,12 +662,15 @@ impl Acceleration {
     /// ([`crate::acceleration_source::resolved_refresh_mode`]), not the raw field.
     ///
     /// Only `refresh_mode: full`, in a storage mode that keeps a table across restarts
-    /// (`file` or `file_update`), qualifies: every full refresh rewrites every row from
-    /// the source, so dropping the stored rows loses nothing the next refresh would not
-    /// replace. Every other refresh mode can hold rows a reload would not bring back — an
-    /// append window, or a change stream that resumes from a position recorded outside
-    /// the table and so never re-delivers what was dropped — and `mode: memory` and
-    /// `mode: file_create` keep no table across a restart.
+    /// (`file` or `file_update`), with `write_mode: write_through`, qualifies: every full
+    /// refresh rewrites every row from the source, and every acknowledged write is in the
+    /// source too, so dropping the stored rows loses nothing a reload does not bring back.
+    /// Every other refresh mode can hold rows a reload would not bring back — an append
+    /// window, or a change stream that resumes from a position recorded outside the table
+    /// and so never re-delivers what was dropped — as can `write_mode: acceleration`, whose
+    /// writes never reach the source, and `write_mode: write_back`, whose writes reach it
+    /// only once delivered. `mode: memory` and `mode: file_create` keep no table across a
+    /// restart.
     ///
     /// A registration that cannot read its source on the acceleration's schema never
     /// rebuilds ([`SettingsRebuild::HeldUntilSourceReadable`]).
@@ -676,6 +679,7 @@ impl Acceleration {
         self.settings_rebuild == SettingsRebuild::Allowed
             && matches!(self.mode, Mode::File | Mode::FileUpdate)
             && refresh_mode == RefreshMode::Full
+            && self.write_mode == spicepod_acceleration::WriteMode::WriteThrough
     }
 
     #[must_use]
@@ -2304,6 +2308,16 @@ mod tests {
                 settings_rebuild: SettingsRebuild::HeldUntilSourceReadable,
                 ..acceleration.clone()
             };
+            // Writes that only the acceleration holds, for good or until delivered, are
+            // rows no reload brings back, whatever the refresh mode.
+            let writes_only_here = [
+                spicepod_acceleration::WriteMode::Acceleration,
+                spicepod_acceleration::WriteMode::WriteBack,
+            ]
+            .map(|write_mode| Acceleration {
+                write_mode,
+                ..acceleration.clone()
+            });
             for (refresh_mode, expected) in refresh_modes.iter().zip(expected) {
                 assert_eq!(
                     acceleration.rebuilds_on_settings_change(*refresh_mode),
@@ -2314,6 +2328,13 @@ mod tests {
                     !held.rebuilds_on_settings_change(*refresh_mode),
                     "a source that cannot be read holds the rebuild: mode: {mode}, refresh_mode: {refresh_mode:?}"
                 );
+                for writes in &writes_only_here {
+                    assert!(
+                        !writes.rebuilds_on_settings_change(*refresh_mode),
+                        "write_mode: {:?} keeps writes a reload would not bring back: mode: {mode}, refresh_mode: {refresh_mode:?}",
+                        writes.write_mode
+                    );
+                }
             }
         }
     }

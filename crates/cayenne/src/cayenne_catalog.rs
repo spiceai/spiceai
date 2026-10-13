@@ -6304,7 +6304,7 @@ fn settings_kept_warning(table_name: &str, changes: &[SettingChange], memory_mod
         );
     }
     format!(
-        "Dataset '{table_name}' keeps the settings its existing acceleration was built with, so the changed settings ({}) do not take effect: they cannot be applied to stored rows in place, and an acceleration is rebuilt from the source automatically only under `refresh_mode: full`, since otherwise it can hold rows a reload would not bring back. To rebuild it with the new settings, restart once with `mode: file_create` (and `write_mode: write_through` if the dataset uses `write_mode: write_back`), then set them back; rows that exist only in the acceleration are not kept. See: https://spiceai.org/docs/components/data-accelerators/cayenne",
+        "Dataset '{table_name}' keeps the settings its existing acceleration was built with, so the changed settings ({}) do not take effect: they cannot be applied to stored rows in place, and an acceleration is rebuilt from the source automatically only when a reload brings back every row it holds (`refresh_mode: full` with `write_mode: write_through`, from a source other than `sink`). To rebuild it with the new settings, restart once with `mode: file_create` (and `write_mode: write_through` if the dataset uses `write_mode: write_back`), then set them back; rows that exist only in the acceleration are not kept. See: https://spiceai.org/docs/components/data-accelerators/cayenne",
         describe_setting_changes(changes)
     )
 }
@@ -11737,7 +11737,7 @@ mod tests {
         );
         assert_eq!(
             settings_kept_warning("trips", &changes, false),
-            "Dataset 'trips' keeps the settings its existing acceleration was built with, so the changed settings (`primary_key`: none -> ['id']) do not take effect: they cannot be applied to stored rows in place, and an acceleration is rebuilt from the source automatically only under `refresh_mode: full`, since otherwise it can hold rows a reload would not bring back. To rebuild it with the new settings, restart once with `mode: file_create` (and `write_mode: write_through` if the dataset uses `write_mode: write_back`), then set them back; rows that exist only in the acceleration are not kept. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
+            "Dataset 'trips' keeps the settings its existing acceleration was built with, so the changed settings (`primary_key`: none -> ['id']) do not take effect: they cannot be applied to stored rows in place, and an acceleration is rebuilt from the source automatically only when a reload brings back every row it holds (`refresh_mode: full` with `write_mode: write_through`, from a source other than `sink`). To rebuild it with the new settings, restart once with `mode: file_create` (and `write_mode: write_through` if the dataset uses `write_mode: write_back`), then set them back; rows that exist only in the acceleration are not kept. See: https://spiceai.org/docs/components/data-accelerators/cayenne"
         );
 
         let changes = [SettingChange::new(
