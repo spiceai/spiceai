@@ -29169,13 +29169,12 @@ impl CayenneTableProvider {
     /// memory and probe work, and it may be published whenever it is ready.
     ///
     /// Pruning costs a pass over every entry of the index's frozen runs, which are
-    /// immutable, so it runs once on a blocking thread however long it takes, and
-    /// only the result is spliced over the index then live — which keeps every
-    /// run frozen and every entry written meanwhile (a mem-tier checkpoint
-    /// publishes every few seconds) — and swapped in by compare-and-swap. The
-    /// splice costs a pass over the newer tiers alone, so a writer that wins the
-    /// swap only costs a re-splice; a fold that merged the pruned runs costs a
-    /// rebuild. It is the deletion reservation's only shrink (see
+    /// immutable, so that part runs once on a blocking thread however long it
+    /// takes; the result is spliced over the index then live — the runs frozen
+    /// since and the active tier (a mem-tier checkpoint publishes every few
+    /// seconds) pruned at the same cutoff in a pass over that tail alone — and
+    /// swapped in by compare-and-swap. A writer that wins the swap only costs a
+    /// re-splice; a fold that merged the pruned runs costs a rebuild. It is the deletion reservation's only shrink (see
     /// [`Self::deletion_index_over_memory_ceiling`]), so after
     /// [`BAKE_PRUNE_OFF_FENCE_ATTEMPTS`] lost swaps it falls back to pruning under
     /// the write fence, which no writer of the index runs concurrently with.
@@ -54871,15 +54870,27 @@ mod tests {
     /// A seq-prefix bake routes its merged output into key-range files: each file
     /// holds one slice of the key in key order and the slices do not overlap, so a
     /// lookup on the key opens one file of the merged snapshot rather than every
-    /// one. Five checkpoints of scrambled keys, each small enough to be one hashed
-    /// file; the bake folds the oldest two into an output large enough for several
-    /// encode shards.
+    /// one. Five checkpoints of scrambled keys; the bake folds the oldest two into
+    /// an output large enough on disk — the padding is incompressible hex — for
+    /// several encode shards.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn a_bake_routes_its_merged_output_into_key_range_files() {
         use arrow::array::StringArray;
 
-        const ROWS_PER_CHECKPOINT: usize = 4_000;
+        const ROWS_PER_CHECKPOINT: usize = 10_000;
         const CHECKPOINTS: usize = 5;
+        // Pseudo-random hex per key, so the file sizes the bake shards by stay large.
+        let pad = |id: i64| {
+            let mut x = u64::try_from(id).expect("non-negative key") ^ 0x9E37_79B9_7F4A_7C15;
+            (0..6)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    format!("{x:016x}{:016x}", x.rotate_left(29))
+                })
+                .collect::<String>()
+        };
 
         let schema = Arc::new(Schema::new(vec![
             Field::new("id", DataType::Int64, false),
@@ -54896,8 +54907,8 @@ mod tests {
                 deletion_mode: crate::metadata::DeletionMode::Key,
                 compaction_background_interval_ms: 0,
                 write_concurrency: Some(4),
-                // ~0.8 MiB per checkpoint stays one hashed file; the bake's
-                // ~1.6 MiB merge fills at least two encode shards.
+                // ~2 MiB of hex per checkpoint; the bake's merge of two fills at
+                // least two 1 MiB encode shards on disk.
                 target_vortex_file_size_mb: 1,
                 ..VortexConfig::default()
             },
@@ -54921,9 +54932,7 @@ mod tests {
                 Arc::clone(&schema),
                 vec![
                     Arc::new(Int64Array::from(keys.clone())),
-                    Arc::new(StringArray::from_iter_values(
-                        keys.iter().map(|id| format!("{id:0>200}")),
-                    )),
+                    Arc::new(StringArray::from_iter_values(keys.iter().map(|id| pad(*id)))),
                 ],
             )
             .expect("checkpoint batch");

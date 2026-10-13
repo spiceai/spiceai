@@ -923,20 +923,27 @@ where
         PrunedPrefix {
             source_runs: self.runs.clone(),
             pruned: frozen.prune_deletes_at_or_below(cutoff, bloom_hash_of),
+            cutoff,
         }
     }
 
-    /// This index with the frozen runs `prefix` was built from replaced by its
-    /// pruned form, keeping every run frozen and every entry written since; `None`
-    /// once a fold has merged one of those runs.
+    /// [`Self::prune_deletes_at_or_below`] of this index — a later version of the
+    /// one `prefix` was taken from — reusing the prefix's pruned frozen runs:
+    /// everything this index holds beyond them (runs frozen since, and the active
+    /// tier) is fused, pruned at the same cutoff and frozen into one more run, so
+    /// only that tail is paid for here. `None` once a fold has merged one of the
+    /// runs the prefix was built from.
     ///
-    /// Each key fuses as under a full prune, except that a delete at or below the
-    /// cutoff written after the prefix was taken is kept: the cutoff commutes with
-    /// the per-side max, and a kept delete only costs memory, never visibility.
-    /// The counters and the newest delete sequence are recomputed exactly over the
-    /// spliced tiers; the Blooms and the deleted-key range are kept from `self`,
+    /// The cutoff commutes with the per-side max, so pruning the prefix and the
+    /// tail apart and fusing them answers every key as one prune of the whole
+    /// index does. The counters and the newest delete sequence are recomputed
+    /// exactly; the global Bloom and the deleted-key range are kept from `self`,
     /// which covers every deletion the result holds.
-    fn with_pruned_prefix(&self, prefix: &PrunedPrefix<K, S>) -> Option<Self> {
+    fn with_pruned_prefix(
+        &self,
+        prefix: &PrunedPrefix<K, S>,
+        bloom_hash_of: impl Fn(&K) -> u64,
+    ) -> Option<Self> {
         let kept = prefix.source_runs.len();
         if self.runs.len() < kept
             || !self
@@ -947,18 +954,23 @@ where
         {
             return None;
         }
-        let newer_runs = &self.runs[kept..];
-        let mut newer: HashMap<K, TombstoneEntry, S> = HashMap::default();
-        for run in newer_runs {
+        let mut tail: HashMap<K, TombstoneEntry, S> = HashMap::default();
+        for run in &self.runs[kept..] {
             for (key, entry) in run.map.iter() {
-                let m = merged_entry(newer.get(key).copied(), entry.delete_seq, entry.insert_seq);
-                newer.insert(*key, m.entry);
+                let m = merged_entry(tail.get(key).copied(), entry.delete_seq, entry.insert_seq);
+                tail.insert(*key, m.entry);
             }
         }
         for (key, entry) in self.active.iter() {
-            let m = merged_entry(newer.get(key).copied(), entry.delete_seq, entry.insert_seq);
-            newer.insert(*key, m.entry);
+            let m = merged_entry(tail.get(key).copied(), entry.delete_seq, entry.insert_seq);
+            tail.insert(*key, m.entry);
         }
+        tail.retain(|_, entry| {
+            if entry.delete_seq != SEQUENCE_ABSENT && entry.delete_seq <= prefix.cutoff {
+                entry.delete_seq = SEQUENCE_ABSENT;
+            }
+            entry.delete_seq != SEQUENCE_ABSENT || entry.insert_seq != SEQUENCE_ABSENT
+        });
 
         let base = &prefix.pruned;
         let base_map = base.runs.first().map(|run| &run.map);
@@ -966,7 +978,9 @@ where
         let mut delete_count = base.delete_count;
         let mut insert_count = base.insert_count;
         let mut max_sequence_number = base.max_sequence_number;
-        for (key, entry) in &newer {
+        let mut tail_max_delete_seq = SEQUENCE_ABSENT;
+        let mut tail_deletes = 0_usize;
+        for (key, entry) in &tail {
             let merged = merged_entry(
                 base_map.and_then(|map| map.get(key)).copied(),
                 entry.delete_seq,
@@ -981,20 +995,34 @@ where
             if merged.new_insert {
                 insert_count += 1;
             }
-            if entry.delete_seq != SEQUENCE_ABSENT
-                && max_sequence_number.is_none_or(|max| entry.delete_seq > max)
-            {
-                max_sequence_number = Some(entry.delete_seq);
+            if entry.delete_seq != SEQUENCE_ABSENT {
+                tail_deletes += 1;
+                tail_max_delete_seq = tail_max_delete_seq.max(entry.delete_seq);
+                if max_sequence_number.is_none_or(|max| entry.delete_seq > max) {
+                    max_sequence_number = Some(entry.delete_seq);
+                }
             }
         }
 
-        let mut runs = Vec::with_capacity(base.runs.len() + newer_runs.len());
-        runs.extend(base.runs.iter().cloned());
-        runs.extend(newer_runs.iter().cloned());
+        let mut runs = base.runs.clone();
+        if !tail.is_empty() {
+            let bloom = SplitBlockBloomFilter::new(bloom_capacity_for(tail_deletes.max(1)));
+            for (key, entry) in &tail {
+                if entry.delete_seq != SEQUENCE_ABSENT {
+                    bloom.insert(bloom_hash_of(key));
+                }
+            }
+            runs.push(Arc::new(RunData {
+                max_delete_seq: tail_max_delete_seq,
+                bloom: Arc::new(bloom),
+                has_insert_only_entries: tail_deletes < tail.len(),
+                map: Arc::new(tail),
+            }));
+        }
         Some(Self {
             runs,
-            active: self.active.clone(),
-            active_bloom: self.active_bloom.clone(),
+            active: PersistentHashMap::default(),
+            active_bloom: None,
             bloom: Arc::clone(&self.bloom),
             max_sequence_number,
             min_deleted_key: self.min_deleted_key,
@@ -1017,6 +1045,7 @@ where
 {
     source_runs: Vec<Arc<RunData<K, S>>>,
     pruned: LayeredRuns<K, S>,
+    cutoff: i64,
 }
 
 // =============================================================================
@@ -1401,13 +1430,14 @@ impl DeletionIndex {
         }
     }
 
-    /// This index with the frozen runs `prefix` was built from replaced by their
-    /// pruned form, keeping everything written since; `None` once a fold has
-    /// merged one of those runs. See [`LayeredRuns::with_pruned_prefix`].
+    /// [`Self::prune_deletes_at_or_below`] of this index — a later version of the
+    /// one `prefix` was taken from — reusing the prefix's pruned frozen runs;
+    /// `None` once a fold has merged one of those runs. See
+    /// [`LayeredRuns::with_pruned_prefix`].
     #[must_use]
     pub fn with_pruned_prefix(&self, prefix: &PrunedDeletionPrefix) -> Option<Self> {
         self.core
-            .with_pruned_prefix(&prefix.core)
+            .with_pruned_prefix(&prefix.core, |pk| hash_key_i64(*pk))
             .map(|core| Self { core })
     }
 }
@@ -1795,7 +1825,7 @@ impl KeyDeletionIndex {
     #[must_use]
     pub fn with_pruned_prefix(&self, prefix: &PrunedKeyDeletionPrefix) -> Option<Self> {
         self.core
-            .with_pruned_prefix(&prefix.core)
+            .with_pruned_prefix(&prefix.core, |key_hash| bloom_half(*key_hash))
             .map(|core| Self { core })
     }
 }
@@ -1873,12 +1903,11 @@ mod tests {
     }
 
     /// Splicing a frozen prefix pruned at `cutoff` over a later version of the
-    /// index gives every key what pruning only the prefix and keeping everything
-    /// written since would: the prefix's per-side max with deletes at or below the
-    /// cutoff cleared, merged with the then-active tier and every later write. The
-    /// counters match a recount, and the splice declines exactly when a fold has
-    /// merged one of the prefix's runs. Seeded histories; the trial is named on
-    /// failure.
+    /// index answers every key as one prune of that later index at the cutoff
+    /// does — the per-side max over every write, with deletes at or below the
+    /// cutoff cleared. The counters match a recount, and the splice declines
+    /// exactly when a fold has merged one of the prefix's runs. Seeded histories;
+    /// the trial is named on failure.
     #[test]
     fn a_spliced_pruned_prefix_matches_its_model_over_random_histories() {
         type Model = std::collections::BTreeMap<i64, (i64, i64)>;
@@ -1940,7 +1969,7 @@ mod tests {
                 idx = idx.extend(adds.into_iter(), hash);
             }
 
-            // Take the prefix; model its frozen runs and the active tier apart.
+            // Take the prefix; the model is every write so far.
             let cutoff = (rng() as i64).rem_euclid(seq.max(1) + 2) - 1;
             let prefix = idx.prune_frozen_prefix(cutoff, hash);
             let mut model: Model = Model::new();
@@ -1949,12 +1978,6 @@ mod tests {
                     naive_merge(&mut model, *key, entry.delete_seq, entry.insert_seq);
                 }
             }
-            for (delete, _) in model.values_mut() {
-                if *delete != SEQUENCE_ABSENT && *delete <= cutoff {
-                    *delete = SEQUENCE_ABSENT;
-                }
-            }
-            model.retain(|_, (d, i)| *d != SEQUENCE_ABSENT || *i != SEQUENCE_ABSENT);
             for (key, entry) in idx.active.iter() {
                 naive_merge(&mut model, *key, entry.delete_seq, entry.insert_seq);
             }
@@ -1974,7 +1997,14 @@ mod tests {
                     .iter()
                     .zip(&prefix.source_runs)
                     .all(|(run, source)| Arc::ptr_eq(run, source));
-            let Some(spliced) = idx.with_pruned_prefix(&prefix) else {
+            // One prune of the whole final index at the cutoff.
+            for (delete, _) in model.values_mut() {
+                if *delete != SEQUENCE_ABSENT && *delete <= cutoff {
+                    *delete = SEQUENCE_ABSENT;
+                }
+            }
+            model.retain(|_, (d, i)| *d != SEQUENCE_ABSENT || *i != SEQUENCE_ABSENT);
+            let Some(spliced) = idx.with_pruned_prefix(&prefix, hash) else {
                 assert!(
                     !prefix_intact,
                     "trial {trial}: declined over an intact prefix"
