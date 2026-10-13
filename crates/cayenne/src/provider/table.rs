@@ -33579,6 +33579,11 @@ impl CayenneTableProvider {
         let Some(mut guards) = self.try_acquire_capture_locks() else {
             return Ok(CheckpointAttempt::Busy);
         };
+        // A guaranteed checkpoint would wait for staged inline tombstones to publish
+        // (`wait_for_staged_inline_tombstones`); a best-effort one retries instead.
+        if self.pending_inline_tombstones.load(Ordering::Acquire) > 0 {
+            return Ok(CheckpointAttempt::Busy);
+        }
         // Keep `guards` alive across `inner`; pass only the `write` guard.
         let write = guards.write.take();
         let rows = self.checkpoint_mem_tier_inner(write).await?;
@@ -33624,6 +33629,15 @@ impl CayenneTableProvider {
         if self.is_memory_resident_mode() {
             return Ok(0);
         }
+        // A staged change-stream upsert that superseded an inline row holds an
+        // unpublished tombstone for it until its publication (`CayenneCdcWrite::finish`).
+        // Folding the inline corpus before then would write the superseded row into this
+        // checkpoint's file and delete the tombstone meant to hide it, leaving two live
+        // rows once the write publishes. Every durable write takes `mem_checkpoint_lock`,
+        // which this checkpoint holds, before it stages such a tombstone, so none can
+        // appear while it runs; wait for the ones already staged, whose publication takes
+        // neither this lock nor `write_lock`.
+        self.wait_for_staged_inline_tombstones().await?;
         let checkpoint_start = Instant::now();
         // Capture the corpus to flush AND reserve this checkpoint's
         // snapshot_sequence ATOMICALLY under ALL shard `mem_tier_publish_locks`
@@ -34661,6 +34675,26 @@ impl CayenneTableProvider {
     /// locks — order: fence → publish) so the durable file becoming visible and the
     /// RAM rows clearing are indivisible w.r.t. scans. At N==1 this acquires the one
     /// publish lock and clears the one shard — byte-identical to the pre-shard path.
+    /// Wait until no staged inline tombstone is awaiting its publication; see
+    /// `checkpoint_mem_tier_inner`. Bounded by [`STAGED_WRITE_DRAIN_TIMEOUT`], as
+    /// [`Self::drain_inflight_staged_writes`] is, because a publication that never runs
+    /// would otherwise stall every checkpoint of the table without a word.
+    async fn wait_for_staged_inline_tombstones(&self) -> Result<()> {
+        let deadline = Instant::now() + STAGED_WRITE_DRAIN_TIMEOUT;
+        while self.pending_inline_tombstones.load(Ordering::Acquire) > 0 {
+            if Instant::now() >= deadline {
+                return Err(Error::Internal {
+                    table: self.table_metadata.table_name.clone(),
+                    message: "Timed out waiting for staged inline tombstones to publish before \
+                              checkpointing the in-memory tier"
+                        .to_string(),
+                });
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        Ok(())
+    }
+
     async fn clear_flushed_mem_tier_state_all_shards(
         &self,
         flushed_counts: &[usize],
@@ -76477,14 +76511,12 @@ mod tests {
         );
     }
 
-    /// Probe for a race Codex reported (hypothesis, not reproduced): a change-stream
-    /// upsert too large to inline stages a new snapshot and an unpublished tombstone
-    /// for key 7's inline row, releases `write_lock`, and publishes both later. The
-    /// one-shard checkpoint does not wait for unpublished inline tombstones, so it
-    /// can move key 7's inline row into a file and delete the tombstone in between,
-    /// and the later publication then hides nothing.
+    /// A change-stream upsert too large to inline stages a new snapshot and an
+    /// unpublished tombstone for key 7's inline row, releases `write_lock`, and
+    /// publishes both later. A one-shard checkpoint that folded the inline corpus in
+    /// between would write key 7's old row into its file and delete the tombstone
+    /// meant to hide it, so the publication would leave two live rows.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    #[ignore = "probe for a pre-existing race; run with --ignored to reproduce"]
     async fn a_staged_upsert_replaces_a_row_a_checkpoint_flushed_before_it_published() {
         let ctx = SessionContext::new();
         let (provider, _catalog, _tmp) = create_sharded_cdc_upsert_table_with_cap(
@@ -76524,11 +76556,35 @@ mod tests {
             "precondition: the upsert staged an unpublished tombstone for key 7's inline row"
         );
 
-        provider
-            .checkpoint_mem_tier()
-            .await
-            .expect("checkpoint while the upsert is staged");
+        // A checkpoint starts while the upsert is staged. One that does not wait for the
+        // publication completes within this bounded join attempt.
+        let checkpointing = provider.clone_for_write();
+        let mut checkpoint = tokio::spawn(async move { checkpointing.checkpoint_mem_tier().await });
+        let completed_before_publication =
+            match tokio::time::timeout(Duration::from_secs(2), &mut checkpoint).await {
+                Ok(joined) => {
+                    joined
+                        .expect("join the checkpoint")
+                        .expect("checkpoint while the upsert is staged");
+                    true
+                }
+                Err(_) => false,
+            };
         write.finish().await.expect("publish the staged upsert");
+        if !completed_before_publication {
+            checkpoint
+                .await
+                .expect("join the checkpoint")
+                .expect("checkpoint after the publication");
+        }
+        assert!(
+            provider
+                .read_inlined_batches()
+                .await
+                .expect("read the inline corpus")
+                .is_empty(),
+            "precondition: the checkpoint folded the inline corpus"
+        );
 
         let rows =
             collect_id_value_pairs(&ctx, &provider, "pk_staged_tombstone_checkpoint_race").await;
@@ -76536,7 +76592,8 @@ mod tests {
         assert_eq!(
             rows_for_7,
             vec![(7, 2)],
-            "one live row for key 7, with its upserted value"
+            "one live row for key 7, with its upserted value (the checkpoint completed before \
+             the publication: {completed_before_publication})"
         );
     }
 
