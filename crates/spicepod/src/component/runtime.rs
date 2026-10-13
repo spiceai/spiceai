@@ -106,7 +106,7 @@ pub struct Runtime {
     pub metrics: Option<Metrics>,
 
     /// Shared object-store location for runtime state (`file://`, `s3://`,
-    /// `abfs://`, `abfss://`). Used for SQL results-cache warmup, cluster
+    /// `abfs://`, `abfss://`, `gs://`). Used for SQL results-cache warmup, cluster
     /// source rate control, distributed query state and acceleration snapshots.
     /// Each feature writes under its own folder: `results-cache/`,
     /// `rate-control/`, `cluster/` and `snapshots/`. A
@@ -1607,7 +1607,7 @@ pub enum SpillCompression {
 #[serde(deny_unknown_fields)]
 #[cfg_attr(feature = "schemars", derive(JsonSchema))]
 pub struct RuntimeState {
-    /// Root URI (`file://`, `s3://`, `abfs://`, `abfss://`).
+    /// Root URI (`file://`, `s3://`, `abfs://`, `abfss://`, `gs://`).
     pub location: String,
 
     /// Optional object store params (for example S3 `s3_region` / `s3_auth`).
