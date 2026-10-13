@@ -985,19 +985,23 @@ mod tests {
 
     #[test]
     fn series_hash_distinguishes_every_identity_part() {
-        let base = series_hash("m", "{}", "s", "1", r#"{"a":"1"}"#);
-        assert_ne!(base, series_hash("n", "{}", "s", "1", r#"{"a":"1"}"#));
+        let base = series_hash("m", "{}", "s", "1", "{}", r#"{"a":"1"}"#);
+        assert_ne!(base, series_hash("n", "{}", "s", "1", "{}", r#"{"a":"1"}"#));
         assert_ne!(
             base,
-            series_hash("m", r#"{"x":1}"#, "s", "1", r#"{"a":"1"}"#)
+            series_hash("m", r#"{"x":1}"#, "s", "1", "{}", r#"{"a":"1"}"#)
         );
-        assert_ne!(base, series_hash("m", "{}", "t", "1", r#"{"a":"1"}"#));
-        assert_ne!(base, series_hash("m", "{}", "s", "2", r#"{"a":"1"}"#));
-        assert_ne!(base, series_hash("m", "{}", "s", "1", r#"{"a":"2"}"#));
+        assert_ne!(base, series_hash("m", "{}", "t", "1", "{}", r#"{"a":"1"}"#));
+        assert_ne!(base, series_hash("m", "{}", "s", "2", "{}", r#"{"a":"1"}"#));
+        assert_ne!(
+            base,
+            series_hash("m", "{}", "s", "1", r#"{"sa":"1"}"#, r#"{"a":"1"}"#)
+        );
+        assert_ne!(base, series_hash("m", "{}", "s", "1", "{}", r#"{"a":"2"}"#));
         // Length prefixes keep part boundaries from shifting into each other.
         assert_ne!(
-            series_hash("ab", "", "", "", ""),
-            series_hash("a", "b", "", "", "")
+            series_hash("ab", "", "", "", "", ""),
+            series_hash("a", "b", "", "", "", "")
         );
     }
 
