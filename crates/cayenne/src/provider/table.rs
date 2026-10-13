@@ -55841,6 +55841,125 @@ mod tests {
         );
     }
 
+    /// Listings that do not share a scan view — a protected snapshot's, an
+    /// internal read's, two views over the same files — still share each file's
+    /// statistics collection: concurrent cold listings read each footer once and
+    /// persist each file's statistics once, and later ones wait on the collection
+    /// already in flight rather than starting their own.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn listings_outside_a_scan_view_share_each_files_statistics() {
+        const LISTINGS: usize = 4;
+        const FILES: usize = 3;
+        let (provider, ctx, _dir) = shared_listing_table("per_file_statistics_sharing", 0).await;
+        for file in 0..FILES {
+            let start = i64::try_from(file).expect("file index") * 100;
+            insert_batch_with_context(
+                &ctx,
+                &provider,
+                id_value_batch_for_range(provider.table_schema(), start, 100),
+            )
+            .await;
+        }
+        // Cold: no persisted statistics and nothing cached, so every file goes
+        // to its footer.
+        provider
+            .catalog
+            .clear_snapshot_file_statistics(provider.table_id())
+            .await
+            .expect("clear persisted statistics");
+        provider.clear_scan_file_statistics_cache();
+        let before = provider.scan_file_statistics_counters();
+
+        // Hold the first footer collection until another listing has joined it.
+        let (entered, on_entered) = tokio::sync::oneshot::channel::<()>();
+        let (release, released) = tokio::sync::oneshot::channel::<()>();
+        *provider.test_file_statistics_publish_hook.lock() = Some(Box::new(move || {
+            Box::pin(async move {
+                let _ = entered.send(());
+                let _ = released.await;
+            })
+        }));
+        let snapshot_id = provider.get_current_snapshot_id();
+        let listings: Vec<_> = (0..LISTINGS)
+            .map(|_| {
+                let provider = Arc::clone(&provider);
+                let state = ctx.state();
+                let snapshot_id = snapshot_id.clone();
+                tokio::spawn(async move {
+                    let url = ListingTableUrl::parse(CayenneTableProvider::snapshot_dir_url(
+                        &provider.table_metadata.path,
+                        &provider.table_metadata.table_id,
+                        &snapshot_id,
+                    ))
+                    .expect("snapshot URL");
+                    let options = CayenneTableProvider::create_listing_options(
+                        provider.context.file_format(),
+                        &provider.pk_deletion_strategy,
+                        state.config(),
+                    )
+                    .with_collect_stat(true);
+                    let schema = provider.table_schema();
+                    let listed = provider
+                        .list_files_for_snapshot_scan(&SnapshotScanListingRequest {
+                            state: &state,
+                            table_url: &url,
+                            options: &options,
+                            partition_filters: &[],
+                            data_filters: &[],
+                            snapshot_id: &snapshot_id,
+                            limit: None,
+                            scan_schema: CayenneTableProvider::snapshot_scan_schema(
+                                &schema, &options,
+                            ),
+                            file_statistics_schema: schema,
+                            captured_files: None,
+                        })
+                        .await
+                        .expect("listing");
+                    let mut paths: Vec<String> = file_group_paths(&listed.file_groups)
+                        .into_iter()
+                        .flatten()
+                        .collect();
+                    paths.sort();
+                    paths
+                })
+            })
+            .collect();
+        on_entered.await.expect("a footer collection started");
+        tokio::time::timeout(Duration::from_secs(30), async {
+            while provider.scan_file_statistics_counters().joined_in_flight
+                == before.joined_in_flight
+            {
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("another listing must join the held collection");
+        release.send(()).expect("the held collection is waiting");
+
+        let mut listed = Vec::new();
+        for listing in listings {
+            listed.push(listing.await.expect("listing task"));
+        }
+        assert_eq!(listed[0].len(), FILES, "every listing sees every file");
+        assert!(
+            listed.iter().all(|paths| paths == &listed[0]),
+            "every listing sees the same files"
+        );
+        let after = provider.scan_file_statistics_counters();
+        assert_eq!(
+            after.footer_reads - before.footer_reads,
+            u64::try_from(FILES).expect("file count"),
+            "{LISTINGS} concurrent cold listings must read each footer once: {after:?}"
+        );
+        assert_eq!(
+            after.persisted_upserts - before.persisted_upserts,
+            u64::try_from(FILES).expect("file count"),
+            "{LISTINGS} concurrent cold listings must persist each file's statistics once: {after:?}"
+        );
+        assert!(after.joined_in_flight > before.joined_in_flight);
+    }
+
     /// Scans that reach a snapshot state nothing has listed yet wait on one shared
     /// listing build instead of each building their own.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
