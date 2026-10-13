@@ -985,9 +985,8 @@ where
     /// The cutoff commutes with the per-side max, so pruning the prefix and the
     /// tail apart and fusing them answers every key as one prune of the whole
     /// index does; a key in both halves fuses to the value it has here. The
-    /// counters and the newest delete sequence are recomputed exactly; the global
-    /// Bloom and the deleted-key range are kept from `self`, which covers every
-    /// deletion the result holds.
+    /// counters, the newest delete sequence, the deleted-key range and the global
+    /// Bloom are the result's own, as a full prune's are.
     fn with_pruned_prefix(
         &self,
         prefix: &PrunedPrefix<K, S>,
@@ -1061,17 +1060,59 @@ where
             }
         }
 
+        // The result's global Bloom covers its own deletions only: the pruned
+        // prefix's, filtered when the prefix was built, and the tail's. `self`'s
+        // never shrinks — extends add to it in place, and a prune that lowers
+        // the deletion count never resizes it — so keeping it would pass more
+        // and more probes on to the runs as pruned keys pile up in it.
+        let mut min_deleted_key = base.min_deleted_key;
+        let mut max_deleted_key = base.max_deleted_key;
+        let tail_delete_keys = || {
+            tail.iter()
+                .filter(|(_, entry)| entry.delete_seq != SEQUENCE_ABSENT)
+                .map(|(key, _)| key)
+        };
+        for key in tail_delete_keys() {
+            if min_deleted_key.is_none_or(|min| *key < min) {
+                min_deleted_key = Some(*key);
+            }
+            if max_deleted_key.is_none_or(|max| *key > max) {
+                max_deleted_key = Some(*key);
+            }
+        }
+        let (bloom, bloom_capacity) = if delete_count <= base.bloom_capacity {
+            // In place, as an extend adds to it; the prefix's run shares it and
+            // gains only false positives.
+            for key in tail_delete_keys() {
+                base.bloom.insert(bloom_hash_of(key));
+            }
+            (Arc::clone(&base.bloom), base.bloom_capacity)
+        } else {
+            // The tail outgrew the prefix's sizing: one filter sized for both.
+            let capacity = bloom_capacity_for(delete_count);
+            let fresh = SplitBlockBloomFilter::new(capacity);
+            for run in &base.runs {
+                for (key, entry) in run.map.iter() {
+                    if entry.delete_seq != SEQUENCE_ABSENT {
+                        fresh.insert(bloom_hash_of(key));
+                    }
+                }
+            }
+            for key in tail_delete_keys() {
+                fresh.insert(bloom_hash_of(key));
+            }
+            (Arc::new(fresh), capacity)
+        };
+
         let mut runs = base.runs.clone();
         if !tail.is_empty() {
-            let bloom = SplitBlockBloomFilter::new(bloom_capacity_for(tail_deletes.max(1)));
-            for (key, entry) in &tail {
-                if entry.delete_seq != SEQUENCE_ABSENT {
-                    bloom.insert(bloom_hash_of(key));
-                }
+            let run_bloom = SplitBlockBloomFilter::new(bloom_capacity_for(tail_deletes.max(1)));
+            for key in tail_delete_keys() {
+                run_bloom.insert(bloom_hash_of(key));
             }
             runs.push(Arc::new(RunData {
                 max_delete_seq: tail_max_delete_seq,
-                bloom: Arc::new(bloom),
+                bloom: Arc::new(run_bloom),
                 has_insert_only_entries: tail_deletes < tail.len(),
                 map: Arc::new(tail),
                 leaves: Arc::new([next_run_leaf()]),
@@ -1081,14 +1122,14 @@ where
             runs,
             active: PersistentHashMap::default(),
             active_bloom: None,
-            bloom: Arc::clone(&self.bloom),
+            bloom,
             max_sequence_number,
-            min_deleted_key: self.min_deleted_key,
-            max_deleted_key: self.max_deleted_key,
+            min_deleted_key,
+            max_deleted_key,
             entry_count,
             delete_count,
             insert_count,
-            bloom_capacity: self.bloom_capacity,
+            bloom_capacity,
         })
     }
 }
@@ -2217,6 +2258,53 @@ mod tests {
             "the histories must fold the prefix's runs ({folded_trials} folded, \
              {straddled_trials} across its edge, {internal_trials} among its own) and give \
              the sibling a run of its own ({sibling_trials})"
+        );
+    }
+
+    /// A spliced index's global Bloom holds its surviving deletions, as a full
+    /// prune's does, not every key the prune dropped: a probe for a pruned key is
+    /// turned away by the Bloom instead of walked down the runs, and the
+    /// deleted-key range shrinks to the survivors.
+    #[test]
+    fn a_spliced_index_forgets_its_pruned_keys_in_its_bloom() {
+        let hash = |pk: &i64| hash_key_i64(*pk);
+        let deleted: Vec<(i64, i64)> = (0..2_000_i64).map(|key| (key, key + 1)).collect();
+        let index: LayeredRuns<i64, DeletionIndexHasher> =
+            LayeredRuns::from_iters(deleted.into_iter(), std::iter::empty(), hash);
+        let index = index.extend(
+            (10_000..10_010_i64).map(|key| (key, 5_000 + key, SEQUENCE_ABSENT)),
+            hash,
+        );
+        let prefix = index.prune_frozen_prefix(2_000, hash);
+        let spliced = index
+            .with_pruned_prefix(&prefix, hash)
+            .expect("splices over the index it was taken from");
+        let full = index.prune_deletes_at_or_below(2_000, hash);
+        let admitted = |pruned: &LayeredRuns<i64, DeletionIndexHasher>| {
+            (0..2_000_i64)
+                .filter(|key| pruned.bloom.might_contain(hash(key)))
+                .count()
+        };
+        let (full_admitted, spliced_admitted) = (admitted(&full), admitted(&spliced));
+        assert!(
+            full_admitted < 200,
+            "precondition: a full prune's Bloom turns pruned keys away ({full_admitted} of 2000 admitted)"
+        );
+        assert!(
+            spliced_admitted < 200,
+            "a spliced index's Bloom must turn pruned keys away as a full prune's does \
+             ({spliced_admitted} of 2000 admitted, the full prune's {full_admitted})"
+        );
+        for key in 10_000..10_010_i64 {
+            assert!(
+                spliced.bloom.might_contain(hash(&key)),
+                "the surviving delete of key {key} must stay in the Bloom"
+            );
+        }
+        assert_eq!(
+            (spliced.min_deleted_key, spliced.max_deleted_key),
+            (Some(10_000), Some(10_009)),
+            "the deleted-key range is the survivors'"
         );
     }
 
