@@ -75659,9 +75659,9 @@ mod tests {
             Some(CachedPkIndex::Exact(_)) => {
                 panic!("precondition: a zero keyset budget leaves a Bloom index")
             }
-            None => panic!(
-                "the rebuilt table-wide Bloom must survive the checkpoint's inline flush"
-            ),
+            None => {
+                panic!("the rebuilt table-wide Bloom must survive the checkpoint's inline flush")
+            }
         }
 
         // The next apply reuses the index instead of rebuilding it, and its upsert of
